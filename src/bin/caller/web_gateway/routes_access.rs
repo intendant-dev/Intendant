@@ -254,6 +254,7 @@ pub(crate) async fn handle_access_iam_grants(
     body_text: String,
     req_method: &str,
     req_path: &str,
+    cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
     fleet_cors_origin: Option<String>,
 ) {
@@ -281,9 +282,14 @@ pub(crate) async fn handle_access_iam_grants(
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
             let (status, body) = if req_path == "/api/access/iam/grants/update" {
-                access_iam_update_grant_response_body(&body_text, &http_access_context.principal)
+                access_iam_update_grant_response_body(
+                    &cert_dir,
+                    &body_text,
+                    &http_access_context.principal,
+                )
             } else {
                 access_iam_upsert_user_client_grant_response_body(
+                    &cert_dir,
                     &body_text,
                     &http_access_context.principal,
                 )
@@ -303,6 +309,7 @@ pub(crate) async fn handle_access_org_manage(
     body_text: String,
     req_method: &str,
     req_path: &str,
+    cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
     fleet_cors_origin: Option<String>,
 ) {
@@ -332,7 +339,10 @@ pub(crate) async fn handle_access_org_manage(
             let handler = match req_path {
                 "/api/access/orgs/trust" => {
                     access_org_trust_response_value
-                        as fn(serde_json::Value) -> Result<serde_json::Value, String>
+                        as fn(
+                            &std::path::Path,
+                            serde_json::Value,
+                        ) -> Result<serde_json::Value, String>
                 }
                 "/api/access/orgs/revoke" => access_org_revoke_response_value,
                 "/api/access/org-grants/revoke-member" => access_org_revoke_member_response_value,
@@ -347,7 +357,7 @@ pub(crate) async fn handle_access_org_manage(
             };
             let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
                 .map_err(|e| format!("invalid request body: {e}"))
-                .and_then(handler)
+                .and_then(|params| handler(&cert_dir, params))
             {
                 Ok(value) => (200, value.to_string()),
                 Err(error) => (400, serde_json::json!({"error": error}).to_string()),
@@ -366,6 +376,7 @@ pub(crate) async fn handle_access_enrollment_decide(
     mut stream: DemuxStream,
     body_text: String,
     req_method: &str,
+    cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
     fleet_cors_origin: Option<String>,
 ) {
@@ -392,8 +403,11 @@ pub(crate) async fn handle_access_enrollment_decide(
             );
             let _ = stream.write_all(response.as_bytes()).await;
         } else {
-            let (status, body) =
-                access_enrollment_decide_response_body(&body_text, &http_access_context.principal);
+            let (status, body) = access_enrollment_decide_response_body(
+                &cert_dir,
+                &body_text,
+                &http_access_context.principal,
+            );
             let response = with_fleet_cors(
                 json_response(status_reason(status), body),
                 fleet_cors_origin.as_deref(),
@@ -1290,14 +1304,6 @@ pub(crate) fn access_iam_state_response_body(cert_dir: &std::path::Path) -> Stri
     access_iam_state_response_value(cert_dir).to_string()
 }
 
-pub(crate) fn access_iam_upsert_user_client_grant_response_value(
-    params: serde_json::Value,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> Result<serde_json::Value, String> {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    access_iam_upsert_user_client_grant_response_value_with_cert_dir(&cert_dir, params, actor)
-}
-
 pub(crate) fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
@@ -1587,7 +1593,10 @@ pub(crate) fn access_org_present_response_value(
     Ok(response)
 }
 
+/// `cert_dir` arrives from the transport edges (hermeticity convention)
+/// — as on every org fn below.
 pub(crate) fn access_org_trust_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1601,8 +1610,7 @@ pub(crate) fn access_org_trust_response_value(
         .unwrap_or("")
         .to_string();
     let max_role = params.get("max_role").and_then(|v| v.as_str());
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let entry = crate::access::org::trust_org(
         &mut state,
@@ -1613,9 +1621,9 @@ pub(crate) fn access_org_trust_response_value(
         crate::access::client_key::now_unix_ms() as u64,
     )
     .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
+    crate::access::iam::save_state(cert_dir, &state)
         .map_err(|e| format!("save local IAM state: {e}"))?;
-    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
         "org": entry,
@@ -1624,6 +1632,7 @@ pub(crate) fn access_org_trust_response_value(
 }
 
 pub(crate) fn access_org_revoke_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1631,19 +1640,18 @@ pub(crate) fn access_org_revoke_response_value(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let revoked = crate::access::org::revoke_org(
         &mut state,
-        &cert_dir,
+        cert_dir,
         &handle,
         crate::access::client_key::now_unix_ms() as u64,
     )
     .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
+    crate::access::iam::save_state(cert_dir, &state)
         .map_err(|e| format!("save local IAM state: {e}"))?;
-    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
         "revoked_grants": revoked,
@@ -1652,6 +1660,7 @@ pub(crate) fn access_org_revoke_response_value(
 }
 
 pub(crate) fn access_org_issue_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1660,12 +1669,11 @@ pub(crate) fn access_org_issue_response_value(
         .unwrap_or("")
         .trim()
         .to_string();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let root_identity = crate::access::org::load_org_identity(&cert_dir, &handle)?;
+    let root_identity = crate::access::org::load_org_identity(cert_dir, &handle)?;
     let deputy = if root_identity.is_none() {
         match (
-            crate::access::org::load_issuer_identity(&cert_dir, &handle)?,
-            crate::access::org::load_issuer_cert(&cert_dir, &handle)?,
+            crate::access::org::load_issuer_identity(cert_dir, &handle)?,
+            crate::access::org::load_issuer_cert(cert_dir, &handle)?,
         ) {
             (Some(issuer), Some(cert)) => Some((issuer, cert)),
             _ => None,
@@ -1678,7 +1686,7 @@ pub(crate) fn access_org_issue_response_value(
             "this daemon holds no root key or installed issuer certificate for org {handle:?}; run `intendant org init {handle}` on the org's designated daemon, or initialize + install a delegated issuer here"
         ));
     }
-    let state = crate::access::iam::load_state(&cert_dir)
+    let state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let targets = params
         .get("targets")
@@ -1736,6 +1744,7 @@ pub(crate) fn access_org_issue_response_value(
 /// org. The key grants nothing until the org root signs a certificate
 /// for it and it is installed here.
 pub(crate) fn access_org_issuer_init_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1744,9 +1753,8 @@ pub(crate) fn access_org_issuer_init_response_value(
         .unwrap_or("")
         .trim()
         .to_string();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let issuer = crate::access::org::load_or_create_issuer_identity(&cert_dir, &handle)?;
-    let cert = crate::access::org::load_issuer_cert(&cert_dir, &handle)?;
+    let issuer = crate::access::org::load_or_create_issuer_identity(cert_dir, &handle)?;
+    let cert = crate::access::org::load_issuer_cert(cert_dir, &handle)?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "handle": handle,
@@ -1757,6 +1765,7 @@ pub(crate) fn access_org_issuer_init_response_value(
 
 /// Root-daemon action: sign a delegation certificate for an issuer key.
 pub(crate) fn access_org_issuer_delegate_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1765,8 +1774,7 @@ pub(crate) fn access_org_issuer_delegate_response_value(
         .unwrap_or("")
         .trim()
         .to_string();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+    let identity = crate::access::org::load_org_identity(cert_dir, &handle)?.ok_or_else(|| {
         format!("this daemon holds no root key for org {handle:?}; delegate from the org's designated daemon")
     })?;
     let cert = crate::access::org::delegate_org_issuer(
@@ -1793,6 +1801,7 @@ pub(crate) fn access_org_issuer_delegate_response_value(
 /// Deputy action: install the root-signed certificate for the local
 /// issuer key.
 pub(crate) fn access_org_issuer_install_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1808,9 +1817,8 @@ pub(crate) fn access_org_issuer_install_response_value(
             .ok_or_else(|| "certificate is required".to_string())?,
     )
     .map_err(|e| format!("invalid issuer certificate: {e}"))?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     crate::access::org::install_issuer_cert(
-        &cert_dir,
+        cert_dir,
         &handle,
         &cert,
         crate::access::client_key::now_unix_ms() as u64,
@@ -1877,6 +1885,7 @@ pub(crate) fn access_org_orl_apply_response_value(
 /// it to this daemon's own IAM as a best-effort courtesy when it trusts
 /// its own org, so the org daemon never lags its own list.
 pub(crate) fn access_org_revoke_member_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let handle = params
@@ -1927,8 +1936,7 @@ pub(crate) fn access_org_revoke_member_response_value(
     if let Some(key) = params.get("issuer_key").and_then(|v| v.as_str()) {
         issuer_keys.push(key.to_string());
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+    let identity = crate::access::org::load_org_identity(cert_dir, &handle)?.ok_or_else(|| {
         format!(
             "this daemon holds no root key for org {handle:?}; revoke members from the org's designated daemon"
         )
@@ -1936,19 +1944,19 @@ pub(crate) fn access_org_revoke_member_response_value(
     let now = crate::access::client_key::now_unix_ms() as u64;
     let orl = crate::access::org::orl_revoke(
         &identity,
-        &cert_dir,
+        cert_dir,
         &handle,
         &grant_ids,
         &subjects,
         &issuer_keys,
         now,
     )?;
-    let applied = crate::access::iam::load_state(&cert_dir)
+    let applied = crate::access::iam::load_state(cert_dir)
         .ok()
         .and_then(|mut state| {
-            let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now).ok()?;
+            let applied = crate::access::org::apply_orl(&mut state, cert_dir, &orl, now).ok()?;
             if applied.changed {
-                crate::access::iam::save_state(&cert_dir, &state).ok()?;
+                crate::access::iam::save_state(cert_dir, &state).ok()?;
             }
             Some(applied)
         });
@@ -2040,6 +2048,7 @@ pub(crate) fn access_enrollment_requests_response_body(cert_dir: &std::path::Pat
 /// route origin attached, so ceilings and audit behave exactly as if the
 /// owner had typed the grant by hand.
 pub(crate) fn access_enrollment_decide_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> Result<serde_json::Value, String> {
@@ -2092,7 +2101,8 @@ pub(crate) fn access_enrollment_decide_response_value(
             if pending.transport.is_empty() { "dashboard" } else { pending.transport.as_str() }
         ),
     });
-    let mut value = access_iam_upsert_user_client_grant_response_value(upsert, actor)?;
+    let mut value =
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(cert_dir, upsert, actor)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("decided".to_string(), serde_json::json!(true));
         object.insert("approved".to_string(), serde_json::json!(true));
@@ -2101,6 +2111,7 @@ pub(crate) fn access_enrollment_decide_response_value(
 }
 
 pub(crate) fn access_enrollment_decide_response_body(
+    cert_dir: &std::path::Path,
     body_text: &str,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> (u16, String) {
@@ -2113,13 +2124,14 @@ pub(crate) fn access_enrollment_decide_response_body(
             );
         }
     };
-    match access_enrollment_decide_response_value(params, actor) {
+    match access_enrollment_decide_response_value(cert_dir, params, actor) {
         Ok(value) => (200, value.to_string()),
         Err(error) => (400, serde_json::json!({"error": error}).to_string()),
     }
 }
 
 pub(crate) fn access_iam_upsert_user_client_grant_response_body(
+    cert_dir: &std::path::Path,
     body_text: &str,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> (u16, String) {
@@ -2132,18 +2144,11 @@ pub(crate) fn access_iam_upsert_user_client_grant_response_body(
             );
         }
     };
-    match access_iam_upsert_user_client_grant_response_value(params, actor) {
+    match access_iam_upsert_user_client_grant_response_value_with_cert_dir(cert_dir, params, actor)
+    {
         Ok(value) => (200, value.to_string()),
         Err(error) => (400, serde_json::json!({"error": error}).to_string()),
     }
-}
-
-pub(crate) fn access_iam_update_grant_response_value(
-    params: serde_json::Value,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> Result<serde_json::Value, String> {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    access_iam_update_grant_response_value_with_cert_dir(&cert_dir, params, actor)
 }
 
 pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
@@ -2170,6 +2175,7 @@ pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
 }
 
 pub(crate) fn access_iam_update_grant_response_body(
+    cert_dir: &std::path::Path,
     body_text: &str,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> (u16, String) {
@@ -2182,7 +2188,7 @@ pub(crate) fn access_iam_update_grant_response_body(
             );
         }
     };
-    match access_iam_update_grant_response_value(params, actor) {
+    match access_iam_update_grant_response_value_with_cert_dir(cert_dir, params, actor) {
         Ok(value) => (200, value.to_string()),
         Err(error) => (400, serde_json::json!({"error": error}).to_string()),
     }
@@ -3851,6 +3857,375 @@ mod tests {
                 r#"{"error":"role_id is required"}"#,
                 None
             )
+        );
+    }
+
+    // ── S6 golden transcripts (second slice): IAM grants / enrollment
+    // decide / org manage ──
+    //
+    // Same discipline as the first S6 slice above: framing hand-written,
+    // fleet-origin echo covered on the family shapes, store-backed
+    // bodies over injected tempdir cert stores only, and the historical
+    // PLAIN-tail belt-403 pinned per handler. Store-mutating successes
+    // pin the framing and assert the mutation's own fields (the `iam`
+    // metadata carries store fingerprints); the org signing successes
+    // need real org keys and stay smoke-covered (validate-org-grants).
+
+    fn golden_root_context() -> HttpAccessContext {
+        HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "golden", "https",
+            ),
+            iam_state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_access_iam_grants_transcripts() {
+        access_route_cors(
+            "POST",
+            "/api/access/iam/user-client-grants",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        access_route_cors(
+            "POST",
+            "/api/access/iam/grants/update",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+
+        // Denied: the belt-and-suspenders re-check, PLAIN tail even with
+        // an allowlisted origin present.
+        let denied_dir = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(denied_dir.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_access_iam_grants(
+                stream,
+                "{}".to_string(),
+                "POST",
+                "/api/access/iam/user-client-grants",
+                denied_dir.path().to_path_buf(),
+                context,
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
+        );
+
+        // Parse error: 400 under the fleet tail (this family's parse
+        // errors ride the same decoration as its value errors).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_iam_grants(
+                stream,
+                invalid.to_string(),
+                "POST",
+                "/api/access/iam/user-client-grants",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Upsert success over the injected store: framing pinned, body
+        // asserted through the parse.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_iam_grants(
+                stream,
+                serde_json::json!({
+                    "kind": "browser_certificate",
+                    "label": "Golden browser",
+                    "fingerprint": "AB:CD",
+                    "role_id": "role:observer"
+                })
+                .to_string(),
+                "POST",
+                "/api/access/iam/user-client-grants",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        let text = golden_access_transcript(&response);
+        let (_, body) = split_transcript(&text);
+        assert_eq!(
+            text,
+            golden_access_fleet_json_transcript("200 OK", body, Some(GOLDEN_FLEET_ORIGIN))
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["created_grant"], serde_json::json!(true), "{body}");
+
+        // Update with an undecodable request: the value-level decode 400
+        // (deterministic serde wording), fleet tail without an origin.
+        let update_error = serde_json::from_value::<crate::access::iam::IamGrantUpdateRequest>(
+            serde_json::json!({}),
+        )
+        .expect_err("empty update request must not decode");
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {update_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_iam_grants(
+                stream,
+                "{}".to_string(),
+                "POST",
+                "/api/access/iam/grants/update",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript("400 Bad Request", &expected_body, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_access_enrollment_decide_transcripts() {
+        access_route_cors(
+            "POST",
+            "/api/access/enrollment-requests/decide",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Unknown fingerprint: deterministic 400 before any store access
+        // (the pending-enrollment queue is in-process), fleet echo case.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_enrollment_decide(
+                stream,
+                serde_json::json!({
+                    "fingerprint": "60:1D:EN",
+                    "approve": true
+                })
+                .to_string(),
+                "POST",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"no pending enrollment for fingerprint 60:1D:EN"}"#,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Missing approve flag: the validation 400.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_enrollment_decide(
+                stream,
+                serde_json::json!({ "fingerprint": "60:1D:EN" }).to_string(),
+                "POST",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"approve must be true or false"}"#,
+                None
+            )
+        );
+
+        // Denied: the belt 403, PLAIN tail.
+        let denied_dir = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(denied_dir.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_access_enrollment_decide(
+                stream,
+                "{}".to_string(),
+                "POST",
+                denied_dir.path().to_path_buf(),
+                context,
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_access_org_manage_transcripts() {
+        for path in [
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
+            "/api/access/org-grants/issue",
+            "/api/access/org-grants/revoke-member",
+            "/api/access/org-grants/issuers/init",
+            "/api/access/org-grants/issuers/delegate",
+            "/api/access/org-grants/issuers/install",
+        ] {
+            let expected =
+                if matches!(path, "/api/access/orgs/trust" | "/api/access/orgs/revoke") {
+                    crate::gateway_routes::CorsPosture::FleetAllowlist
+                } else {
+                    crate::gateway_routes::CorsPosture::OwnOrigin
+                };
+            access_route_cors("POST", path, expected);
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Issue without a root key or issuer cert in the injected store:
+        // the deterministic 400 under the fleet tail (echo case).
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_manage(
+                stream,
+                serde_json::json!({ "handle": "golden-org" }).to_string(),
+                "POST",
+                "/api/access/org-grants/issue",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        let expected_body = serde_json::json!({
+            "error": "this daemon holds no root key or installed issuer certificate for org \"golden-org\"; run `intendant org init golden-org` on the org's designated daemon, or initialize + install a delegated issuer here"
+        })
+        .to_string();
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Delegate without a root key: the deterministic 400. (The
+        // issue/delegate rows are own-origin — deliberately not fleet
+        // rows — so no echo shapes exist for them.)
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_manage(
+                stream,
+                serde_json::json!({ "handle": "golden-org" }).to_string(),
+                "POST",
+                "/api/access/org-grants/issuers/delegate",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                None,
+            )
+        })
+        .await;
+        let expected_body = serde_json::json!({
+            "error": "this daemon holds no root key for org \"golden-org\"; delegate from the org's designated daemon"
+        })
+        .to_string();
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript("400 Bad Request", &expected_body, None)
+        );
+
+        // Issuer init over the injected store: creates the deputy key in
+        // the tempdir — framing pinned, generated key asserted through
+        // the parse.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_manage(
+                stream,
+                serde_json::json!({ "handle": "golden-org" }).to_string(),
+                "POST",
+                "/api/access/org-grants/issuers/init",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                None,
+            )
+        })
+        .await;
+        let text = golden_access_transcript(&response);
+        let (_, body) = split_transcript(&text);
+        assert_eq!(
+            text,
+            golden_access_fleet_json_transcript("200 OK", body, None)
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["handle"], "golden-org");
+        assert_eq!(parsed["certificate_installed"], serde_json::json!(false));
+        assert!(
+            parsed["issuer_key"].as_str().is_some_and(|k| !k.is_empty()),
+            "{body}"
+        );
+
+        // Parse error: 400 under the fleet tail.
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_manage(
+                stream,
+                invalid.to_string(),
+                "POST",
+                "/api/access/orgs/trust",
+                tmp.path().to_path_buf(),
+                golden_root_context(),
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Denied: the belt 403, PLAIN tail.
+        let denied_dir = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(denied_dir.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_manage(
+                stream,
+                "{}".to_string(),
+                "POST",
+                "/api/access/orgs/trust",
+                denied_dir.path().to_path_buf(),
+                context,
+                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
         );
     }
 }

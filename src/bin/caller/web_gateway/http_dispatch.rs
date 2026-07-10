@@ -830,6 +830,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     req_method,
                     req_path,
+                    cert_dir,
                     http_access_context,
                     fleet_cors_origin,
                 )
@@ -841,6 +842,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     req_method,
                     req_path,
+                    cert_dir,
                     http_access_context,
                     fleet_cors_origin,
                 )
@@ -851,6 +853,7 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     req_method,
+                    cert_dir,
                     http_access_context,
                     fleet_cors_origin,
                 )
