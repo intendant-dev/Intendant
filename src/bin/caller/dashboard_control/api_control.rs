@@ -642,13 +642,11 @@ pub(crate) async fn active_replay_log_dir(runtime: &ControlRuntime) -> Option<Pa
 }
 
 pub(crate) async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let body = runtime
-        .worktree_inventory_cache
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(crate::web_gateway::empty_worktree_inventory_response);
-    json_body_response(id, body, "worktrees")
+    frame_api_json_body_response(
+        id,
+        crate::web_gateway::worktrees_list_api_response(&runtime.worktree_inventory_cache),
+        "worktrees",
+    )
 }
 
 pub(crate) async fn api_worktrees_inspect_response(
@@ -657,15 +655,12 @@ pub(crate) async fn api_worktrees_inspect_response(
     _runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::inspect_worktree_inventory_response(&home, &body_text)
+        crate::web_gateway::worktrees_inspect_api_response(&body_text)
     })
     .await;
     match result {
-        Ok((status_line, body)) => {
-            http_body_response(id, status_line_code(status_line), body, "worktree inspect")
-        }
+        Ok(response) => frame_api_response(id, response, "worktree inspect"),
         Err(e) => http_body_response(
             id,
             500,
@@ -680,20 +675,14 @@ pub(crate) async fn api_worktrees_inspect_response(
 }
 
 pub(crate) async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let project_root = runtime.project_root.clone();
     let cache = runtime.worktree_inventory_cache.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let body =
-            crate::web_gateway::scan_worktree_inventory_response(&home, project_root.as_deref());
-        if let Ok(mut guard) = cache.lock() {
-            *guard = Some(body.clone());
-        }
-        body
+        crate::web_gateway::worktrees_scan_api_response(project_root.as_deref(), &cache)
     })
     .await;
     match result {
-        Ok(body) => json_body_response(id, body, "worktree scan"),
+        Ok(response) => frame_api_json_body_response(id, response, "worktree scan"),
         Err(e) => http_body_response(
             id,
             500,
@@ -712,22 +701,13 @@ pub(crate) async fn api_worktrees_remove_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let cache = runtime.worktree_inventory_cache.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let result = crate::web_gateway::remove_worktree_inventory_response(&home, &body_text);
-        if result.0 == "200 OK" {
-            if let Ok(mut guard) = cache.lock() {
-                *guard = None;
-            }
-        }
-        result
+        crate::web_gateway::worktrees_remove_api_response(&body_text, &cache)
     })
     .await;
     match result {
-        Ok((status_line, body)) => {
-            http_body_response(id, status_line_code(status_line), body, "worktree remove")
-        }
+        Ok(response) => frame_api_response(id, response, "worktree remove"),
         Err(e) => http_body_response(
             id,
             500,
@@ -1698,6 +1678,142 @@ pub(crate) async fn api_coordinator_route_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S4b tunnel/HTTP parity: worktrees (design §8) ──
+    //
+    // Extends the S4a enumeration (api_sessions.rs). The S4b-specific
+    // envelope differences, deliberate and pinned across this slice's
+    // fixtures (worktrees here; delete/report in api_sessions.rs;
+    // recordings in api_media.rs):
+    //
+    //  1. Body-only envelopes again: api_session_delete, api_worktrees
+    //     (list), and api_worktrees_scan predate the injected-status
+    //     envelope — plain `{t,id,ok:true,result}` frames; worktrees
+    //     inspect/remove and api_session_recordings ride the
+    //     injected-status envelope, whose keys only decorate OBJECT
+    //     bodies (the recordings array passes through untouched).
+    //  2. BYTES lane: the report zip and the recording listing assets
+    //     serve identical bytes on both lanes; HTTP renders meta as its
+    //     attachment/no-cache header tails, the tunnel emits the meta
+    //     object verbatim as byte_stream_end.result. The delete tail
+    //     orders the wildcard CORS header first (HTTP-lane decoration
+    //     only).
+    //  3. Transport-owned asset carriage: segment/frame FILES stream
+    //     ranged and capped on the tunnel (offset/length params,
+    //     UPLOAD_MAX_BYTES cap, 413/416 shapes) but serve as one
+    //     unbounded body on HTTP; tunnel asset validators are stricter
+    //     (trim, backslash) than the HTTP leaves' historical inline
+    //     checks, and each lane keeps its historical error wording
+    //     (json `{"ok":false,…}` vs text/plain).
+    //  4. Transport-owned params: the tunnel's report id defaults to
+    //     "current" and delete's target to "session"; HTTP addresses
+    //     both by path segment (five delete wire shapes).
+    //  5. Task-failure shapes stay per-lane (scan answers 200 with an
+    //     error body on HTTP, an ok:false frame on the tunnel).
+
+    fn parity_worktrees_http_body(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, serde_json::Value) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        (status, serde_json::from_slice(&bytes[split + 4..]).expect("json body"))
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_list_serves_the_same_body_on_both_transports() {
+        let rt = crate::dashboard_control::tests::runtime();
+        {
+            let mut guard = rt.worktree_inventory_cache.lock().unwrap();
+            *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
+        }
+        let (status, http_body) = parity_worktrees_http_body(
+            crate::web_gateway::worktrees_list_api_response(&rt.worktree_inventory_cache),
+        );
+        assert_eq!(status, 200);
+        let frame = api_worktrees_response("parity-wt-list".to_string(), &rt).await;
+        assert_eq!(frame["ok"], true);
+        // Body-only envelope: no injected status metadata.
+        assert!(frame["result"]
+            .as_object()
+            .is_none_or(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_inspect_shares_bodies_with_status_metadata() {
+        let rt = crate::dashboard_control::tests::runtime();
+        // Invalid request body: deterministic serde wording on both lanes.
+        let (status, http_body) = parity_worktrees_http_body(
+            crate::web_gateway::worktrees_inspect_api_response("not json"),
+        );
+        assert_eq!(status, 400);
+        let frame = api_worktrees_inspect_response(
+            "parity-wt-inspect".to_string(),
+            Some(&serde_json::json!("not json")),
+            &rt,
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        // The tunnel serializes its params value as the request body —
+        // "not json" arrives quoted, so the serde wording differs in the
+        // offending token but both are the invalid-request shape.
+        assert_eq!(result["ok"], http_body["ok"]);
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid worktree inspect request:"));
+        assert!(http_body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid worktree inspect request:"));
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_scan_rides_the_shared_core_and_plain_envelope() {
+        // Both lanes call the ONE neutral scan (worktrees_scan_api_response)
+        // by construction; live worktree state moves between scans on a
+        // multi-agent box, so this fixture runs a single tunnel scan and
+        // pins the envelope mapping plus the shared cache side-effect
+        // (byte-equal double scans would race the fleet).
+        let rt = crate::dashboard_control::tests::runtime();
+        let frame = api_worktrees_scan_response("parity-wt-scan".to_string(), &rt).await;
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // Body-only envelope: no injected status metadata.
+        let result = frame["result"].as_object().expect("inventory object");
+        assert!(!result.contains_key("_httpStatus"), "{frame}");
+        assert!(result.contains_key("worktrees"), "{frame}");
+        let cached = rt
+            .worktree_inventory_cache
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("scan must warm the shared cache");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cached).unwrap(),
+            frame["result"],
+            "the cache holds the served body"
+        );
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 

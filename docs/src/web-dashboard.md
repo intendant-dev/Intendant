@@ -2006,6 +2006,10 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
 | GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |
+| GET | `/api/session/{id}/report` | SessionInspect | own origin | none | Session report zip (text artifacts; id=current targets the live session) |
+| GET | `/api/session/{id}/recordings` | SessionInspect | own origin | none | List a session's recording streams |
+| GET | `/api/session/{id}/recordings/{stream}/{asset}` | SessionInspect | own origin | none | Recording assets: segments listing, playlist.m3u8, or a segment file |
+| GET | `/api/session/{id}/frames/{filename}` | SessionInspect | own origin | none | Session frame image asset |
 | GET | `/api/session/{id}` | SessionInspect | own origin | none | Session detail (paged replay entries; limit/before/source) |
 | GET | `/api/session[/…]` | SessionInspect | own origin | none | Session artifact sub-routes: recordings (+segments/playlist), report zip, frames |
 | POST | `/api/session[/…]` | SessionManage | own origin | none | Session detail sub-routes (POST fallback callers) |
