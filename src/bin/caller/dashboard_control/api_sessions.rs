@@ -624,27 +624,12 @@ pub(crate) async fn api_session_report_task_response(
             };
         }
     };
-    let size = report.bytes.len();
-    let filename = report.filename;
-    let content_type = "application/zip".to_string();
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: serde_json::Value::Null,
-        byte_stream: Some(ControlByteStream {
-            id: id.clone(),
-            stream_id: format!("{id}:session-report"),
-            content_type: content_type.clone(),
-            filename: Some(filename.clone()),
-            bytes: report.bytes,
-            result: serde_json::json!({
-                "ok": true,
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-            }),
-        }),
-        done: true,
-    }
+    frame_api_task_response(
+        id,
+        crate::web_gateway::session_report_api_response(report),
+        "session-report",
+        "session report",
+    )
 }
 
 pub(crate) async fn api_session_current_upload_raw_task_response(
@@ -955,11 +940,11 @@ pub(crate) async fn api_session_delete_response(
     let target =
         optional_string_param(&params, &["target"]).unwrap_or_else(|| "session".to_string());
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::delete_session_data(&session_id, &target)
+        crate::web_gateway::session_delete_api_response(&session_id, &target)
     })
     .await;
     match result {
-        Ok(body) => json_body_response(id, body, "session delete"),
+        Ok(response) => frame_api_json_body_response(id, response, "session delete"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -1953,6 +1938,101 @@ mod tests {
         )
         .await;
         assert_eq!(tunnel_result_body(&frame, 400), http_body);
+    }
+
+    // ── S4b parity: deletes + report (see the S4a enumeration above; the
+    // S4b-specific envelope differences are enumerated on the worktrees
+    // fixture set in api_control.rs) ──
+
+    #[tokio::test]
+    async fn parity_session_delete_serves_the_same_body_on_both_transports() {
+        // Invalid id: deterministic, store-free; the delete trio rides the
+        // pre-_httpStatus envelope (difference #1).
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::session_delete_api_response("..", "session"),
+        );
+        assert_eq!(status, 200);
+        let frame = api_session_delete_response(
+            "parity-delete".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+        )
+        .await;
+        assert_eq!(tunnel_plain_body(&frame), http_body);
+
+        // A real deletion under identical pre-state on each lane.
+        let (session_id, log_dir) = parity_session_fixture("parity-delete-http");
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::session_delete_api_response(&session_id, "session"),
+        );
+        assert_eq!(status, 200);
+        assert!(!log_dir.exists(), "http-lane delete must remove the dir");
+        assert_eq!(http_body["ok"], true);
+        assert_eq!(http_body["deleted"], "session");
+
+        let (session_id, log_dir) = parity_session_fixture("parity-delete-rpc");
+        let frame = api_session_delete_response(
+            "parity-delete-2".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+        )
+        .await;
+        assert!(!log_dir.exists(), "tunnel delete must remove the dir");
+        let tunnel_body = tunnel_plain_body(&frame);
+        assert_eq!(tunnel_body["ok"], true);
+        assert_eq!(tunnel_body["deleted"], "session");
+        // bytes_freed varies with the fixture inode sizes; the shape keys
+        // are the parity claim.
+        assert_eq!(
+            tunnel_body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            http_body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_session_report_serves_the_same_zip_and_meta_on_both_transports() {
+        let (session_id, log_dir) = parity_session_fixture("parity-report");
+        std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+
+        let report = crate::web_gateway::session_report_zip_for_request(&session_id, None, None)
+            .unwrap_or_else(|_| panic!("fixture report must build"));
+        let response = crate::web_gateway::session_report_api_response(report);
+        let (http_bytes, http_meta) = match &response {
+            crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
+                let crate::web_gateway::BytesPayload::InMemory(payload) = bytes;
+                (payload.clone(), meta.clone())
+            }
+            _ => panic!("report must ride the bytes lane"),
+        };
+
+        let task = api_session_report_task_response(
+            "parity-report".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+            &runtime(),
+        )
+        .await;
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        let stream = task.byte_stream.expect("tunnel byte stream");
+        assert_eq!(stream.stream_id, "parity-report:session-report");
+        assert_eq!(stream.content_type, "application/zip");
+        assert_eq!(stream.bytes.len(), http_bytes.len());
+        assert_eq!(stream.result, http_meta);
+        assert_eq!(
+            stream.filename.as_deref(),
+            http_meta["filename"].as_str(),
+            "byte-stream filename lifts from the shared meta"
+        );
+
+        // Invalid id: per-lane error framing — the tunnel answers the
+        // injected-status envelope; HTTP answers wildcard json (pinned by
+        // the goldens).
+        let invalid = api_session_report_task_response(
+            "parity-report-invalid".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+            &runtime(),
+        )
+        .await;
+        assert!(invalid.byte_stream.is_none());
+        assert_eq!(invalid.frame["result"]["_httpStatus"], 400);
+        cleanup.expect("parity report fixture cleanup");
     }
 
     #[tokio::test]

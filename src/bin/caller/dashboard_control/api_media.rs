@@ -11,8 +11,7 @@ use super::*;
 // byte-stream carriage.
 pub(crate) use crate::web_gateway::{
     read_frame_asset_file_range, read_recording_asset_bytes_range,
-    read_recording_asset_file_range, recording_asset_range,
-    recording_asset_name_is_safe, recording_segment_filename_is_safe,
+    read_recording_asset_file_range, recording_asset_name_is_safe,
     recording_stream_name_is_safe, resolve_recording_asset_from_dir_pair,
     resolve_session_recording_asset, session_frame_filename_is_safe,
     RecordingAsset,
@@ -653,12 +652,9 @@ pub(crate) async fn api_session_recordings_response(
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
-    let (status_line, body) =
-        crate::web_gateway::session_recordings_list_response_body(&session_id);
-    http_body_response(
+    frame_api_response(
         id,
-        status_line_code(status_line),
-        body,
+        crate::web_gateway::session_recordings_api_response(&session_id),
         "session recordings",
     )
 }
@@ -998,6 +994,128 @@ pub(crate) fn session_frame_asset_error_task_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live-store recordings fixture (unique id; caller removes).
+    fn parity_recordings_fixture(prefix: &str) -> (String, std::path::PathBuf) {
+        let session_id = format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let log_dir = crate::platform::intendant_home()
+            .join("logs")
+            .join(&session_id);
+        let stream_dir = log_dir.join("recordings").join("screen");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        std::fs::write(stream_dir.join("seg_00001.mp4"), b"parity segment bytes").unwrap();
+        std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        (session_id, log_dir)
+    }
+
+    fn parity_http_json_body(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, serde_json::Value) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        (status, serde_json::from_slice(&bytes[split + 4..]).expect("json body"))
+    }
+
+    // ── S4b parity: recordings list + the listing-asset vocabulary ──
+
+    #[tokio::test]
+    async fn parity_session_recordings_list_shares_bodies_with_status_metadata() {
+        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-list");
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(&session_id),
+        );
+        assert_eq!(status, 200);
+        let frame = api_session_recordings_response(
+            "parity-rec-list".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+        )
+        .await;
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // The list body is a json ARRAY: the injected-status envelope
+        // only decorates objects, so the array passes through untouched.
+        assert!(frame["result"].is_array(), "{frame}");
+        assert_eq!(frame["result"], http_body);
+        cleanup.expect("parity recordings fixture cleanup");
+
+        // Invalid id: an object body — the injection appears and matches
+        // the HTTP status.
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(".."),
+        );
+        assert_eq!(status, 400);
+        let frame = api_session_recordings_response(
+            "parity-rec-list-invalid".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_recording_listing_assets_share_bytes_on_both_transports() {
+        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-assets");
+        for asset in ["segments", "playlist.m3u8"] {
+            // HTTP: the shared resolver under the canonical tail.
+            let response = crate::web_gateway::session_recording_listing_asset_api_response(
+                &session_id,
+                "screen",
+                asset,
+            );
+            let (http_bytes, http_ct) = match response {
+                crate::web_gateway::ApiResponse::Bytes {
+                    bytes: crate::web_gateway::BytesPayload::InMemory(payload),
+                    content_type,
+                    ..
+                } => (payload, content_type),
+                _ => panic!("listing asset must ride the bytes lane"),
+            };
+            // Tunnel: the same asset vocabulary through the ranged
+            // byte-stream carriage (offset 0, unbounded).
+            let task = api_session_recording_asset_task_response(
+                format!("parity-asset-{asset}"),
+                Some(&serde_json::json!({
+                    "session_id": session_id,
+                    "stream_name": "screen",
+                    "asset": asset,
+                })),
+            )
+            .await;
+            let stream = task.byte_stream.expect("tunnel byte stream");
+            assert_eq!(stream.bytes, http_bytes, "{asset}");
+            assert_eq!(stream.content_type, http_ct, "{asset}");
+            assert_eq!(stream.result["ok"], true);
+            assert_eq!(stream.result["total_size"], http_bytes.len());
+        }
+        std::fs::remove_dir_all(&log_dir).expect("parity assets fixture cleanup");
+    }
+
     use crate::dashboard_control::tests::{runtime, test_upload_state};
 
     #[tokio::test]
