@@ -667,7 +667,9 @@ function loadSessions(options = {}) {
     })
     .catch(err => {
       if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
-      if (err?.name === 'AbortError') {
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the pre-facade stream threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') {
         if (token === _sessionsLoadToken) {
           setSessionsHydrationState({ active: false, done: false, error: '', phase: 'idle' });
         }

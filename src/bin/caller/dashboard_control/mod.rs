@@ -3492,7 +3492,8 @@ mod tests {
 
         // Coverage pin: the F1 family's twinned methods (fs + staged
         // uploads) plus the F2 sessions-family reads converted so far
-        // (managed-context + worktrees). The `api_transfer_*` methods join
+        // (managed-context + worktrees + the session list and its NDJSON
+        // stream). The `api_transfer_*` methods join
         // when their HTTP rows land (task #6, /api/transfers); adding or
         // dropping an entry updates this list in the same change,
         // deliberately.
@@ -3508,6 +3509,8 @@ mod tests {
             "api_session_current_upload",
             "api_session_current_upload_raw",
             "api_session_current_upload_delete",
+            "api_sessions",
+            "api_sessions_stream",
             "api_managed_context_records",
             "api_managed_context_anchors",
             "api_managed_context_fission",

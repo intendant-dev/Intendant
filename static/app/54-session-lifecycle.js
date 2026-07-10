@@ -185,19 +185,14 @@ async function hydrateSessionWorktreeFinishInfo(sid) {
   const existing = sessionWorktreeFinishInfo(sid);
   if (existing) return existing;
   let sessions = null;
-  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
-    try {
-      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
-    } catch (_) {}
-  }
-  if (!sessions) {
-    try {
-      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
-      if (!r.ok) return null;
-      sessions = await r.json();
-    } catch (_) {
-      return null;
-    }
+  try {
+    // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+    // fallback policy — this helper always tolerated a missing list.
+    const resp = await daemonApi.request('api_sessions', { ids: [sid] });
+    if (!resp.ok) return null;
+    sessions = resp.body;
+  } catch (_) {
+    return null;
   }
   if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
   return sessionWorktreeFinishInfo(sid);
