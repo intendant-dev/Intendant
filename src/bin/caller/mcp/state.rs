@@ -128,6 +128,14 @@ pub struct McpAppState {
     /// reaches rewind-only, keyed by Intendant/backend session id.
     density_maintenance_satisfied:
         std::collections::HashMap<String, DensityMaintenanceSatisfaction>,
+    /// Whether a human-facing frontend can (now or later) answer blocking
+    /// questions raised through this server: the web-gateway shape sets it
+    /// (a dashboard can always attach while the ask waits) and the stdio
+    /// MCP shape sets it (the client supervisor sees the question and can
+    /// answer). Defaults to `false` — with no answerable frontend,
+    /// `ask_user` auto-answers immediately with best-judgment guidance
+    /// instead of blocking on nobody.
+    pub interactive_frontends: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +235,7 @@ impl McpAppState {
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
             insufficient_rewind_notices: std::collections::HashMap::new(),
             density_maintenance_satisfied: std::collections::HashMap::new(),
+            interactive_frontends: false,
         }
     }
 

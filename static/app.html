@@ -10792,6 +10792,16 @@ body.display-fullscreen-open {
 .log-entry[data-kind="session_note"] > .log-level {
   color: var(--mauve);
 }
+/* Agent→user notifications (notify_user / ctl notify): same treatment in
+   the alert accent so they read apart from notes and run output. */
+.log-entry[data-kind="user_notification"] {
+  border-left: 2px solid var(--peach);
+  background: color-mix(in srgb, var(--peach) 6%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.log-entry[data-kind="user_notification"] > .log-level {
+  color: var(--peach);
+}
 .pending-attachment-chip .chip-remove {
   width: 14px;
   height: 14px;
@@ -25595,6 +25605,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'shared_view',
   // Unique note_id per note makes the JSON.stringify dedupe key exact.
   'session_note',
+  // Same shape: unique notification id per event.
+  'user_notification',
   'recording_started',
   'recording_stopped',
   'recording_deleted',
@@ -37124,6 +37136,13 @@ async function main() {
         handleSessionNoteEvent(d);
         return;
       }
+      if (d.event === 'user_notification') {
+        // Agent→user notification: toast + transcript row, end to end in
+        // JS like session notes (the attention center already saw it via
+        // attentionObserveServerMessage above).
+        handleUserNotificationEvent(d);
+        return;
+      }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
         handleBrowserWorkspaceMessage(d);
         return;
@@ -37145,12 +37164,15 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          // session_note entries ride the WASM pipeline as note-styled
-          // log_entry rows (see sessionNoteReplayEntryToLogEntry) so the
-          // replayed transcript keeps chronological order.
+          // session_note / user_notification entries ride the WASM
+          // pipeline as styled log_entry rows (see
+          // sessionNoteReplayEntryToLogEntry and its notification twin) so
+          // the replayed transcript keeps chronological order.
           const cmds = app.handle_server_message({
             ...filtered,
-            entries: filtered.entries.map(sessionNoteReplayEntryToLogEntry),
+            entries: filtered.entries
+              .map(sessionNoteReplayEntryToLogEntry)
+              .map(userNotificationReplayEntryToLogEntry),
           });
           if (cmds) processCommands(cmds);
         } finally {
@@ -43892,6 +43914,11 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
       attachment_previews: sessionNoteAttachmentPreviews(entry),
     };
   }
+  if (event === 'user_notification') {
+    const command = userNotificationLogCommand(entry);
+    if (!command) return null;
+    return { ...base, ...command };
+  }
   if (event === 'model_response') {
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
@@ -49980,11 +50007,15 @@ function handleSessionNoteEvent(d) {
 // QA readback (window.qa convention): the dashboard validator exercises
 // the note rail's module-scoped pieces directly — the attachment strip
 // (including its deleted-blob chip degradation) and the wire-event
-// normalizer. Side-effect-free beyond the DOM node the caller passes in.
+// normalizers. Side-effect-free beyond the DOM node the caller passes in.
 window.qa = Object.assign(window.qa || {}, {
   sessionNotes: {
     renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
     logCommand: (d) => sessionNoteLogCommand(d),
+  },
+  userNotifications: {
+    logCommand: (d) => userNotificationLogCommand(d),
+    toastText: (d) => userNotificationToastText(d),
   },
 });
 
@@ -50004,6 +50035,79 @@ function sessionNoteReplayEntryToLogEntry(entry) {
     source: String(entry.source || '').trim() || 'note',
     kind: 'session_note',
     content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
+// ── Agent→user notifications (notify_user) ──
+// Wire shape: { event: 'user_notification', session_id, id, title?, text,
+// urgency: 'info'|'attention'|'urgent', ts }. Display-only like session
+// notes: a transcript row (kind 'user_notification') plus a toast; the
+// attention center (fragment 57) separately badges the escalated
+// urgencies, and the daemon's attention monitor owns the urgent push.
+
+function userNotificationToastText(d) {
+  const title = String(d?.title || '').trim();
+  const text = String(d?.text || '').trim();
+  return title ? `${title}: ${text}` : text;
+}
+
+// Normalize a user_notification wire event (live WS or a raw
+// replay/session-detail entry) into the log-command shape renderLogEntry
+// consumes.
+function userNotificationLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const urgency = String(d?.urgency || 'info');
+  const title = String(d?.title || '').trim();
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  const id = d?.id || d?.notification_id || d?.notificationId || '';
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: urgency === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
+    event_id: d?.event_id || d?.eventId || (id ? `user-notification:${id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+  };
+}
+
+// Live-path handler for the user_notification WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleUserNotificationEvent(d) {
+  const c = userNotificationLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+  // Toast for at-a-glance visibility; urgent renders in the alarm style.
+  const urgency = String(d?.urgency || 'info');
+  if (typeof showControlToast === 'function') {
+    showControlToast(urgency === 'urgent' ? 'error' : 'info', userNotificationToastText(d));
+  }
+}
+
+// Bootstrap-replay adapter (same contract as
+// sessionNoteReplayEntryToLogEntry): notifications replay as plain
+// notify-styled text rows; no toast for history.
+function userNotificationReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'user_notification') return entry;
+  const title = String(entry.title || '').trim();
+  const text = String(entry.text || '').trim();
+  return {
+    event: 'log_entry',
+    level: String(entry.urgency || '') === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
     session_id: entry.session_id || '',
     ts: entry.ts,
     event_id: entry.event_id || '',
@@ -87615,6 +87719,13 @@ function buildSessionDetailRows(entries) {
       if (!note) continue;
       e = { ...e, ...note };
     }
+    // Agent→user notifications normalize the same way (title folded into
+    // the content, urgency mapped to the row level).
+    if (e && e.event === 'user_notification') {
+      const notification = userNotificationLogCommand(e);
+      if (!notification) continue;
+      e = { ...e, ...notification };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -88195,6 +88306,16 @@ function attentionApplyEvent(d, live) {
     attentionAdd('approval', d.session_id, d.id, live);
   } else if (ev === 'user_question') {
     attentionAdd('question', d.session_id, d.id, live);
+  } else if (ev === 'user_notification') {
+    // Fire-and-forget notifications register only for the escalated
+    // urgencies, only live (history never badges), and only while the tab
+    // is hidden — a visible tab already rendered the toast. Unlike pending
+    // requests nothing "resolves" them: they self-clear when the tab next
+    // becomes visible (see the visibilitychange hook below).
+    const urgency = d.urgency || 'info';
+    if ((urgency === 'attention' || urgency === 'urgent') && live && document.hidden) {
+      attentionAdd('notify', d.session_id, d.id, live);
+    }
   } else if (ev === 'approval_resolved') {
     // Approvals and questions share the id space; resolve either.
     attentionRemove('approval', d.session_id, d.id);
@@ -88206,6 +88327,16 @@ function attentionApplyEvent(d, live) {
     attentionClearSession(d.session_id);
     attentionRepaint();
   }
+}
+
+// Notifications deliver by being seen: when the tab becomes visible the
+// toast/transcript row is on screen, so their attention items retire.
+function attentionClearNotifyKind() {
+  let changed = false;
+  for (const [key, item] of [...attentionItems]) {
+    if (item.kind === 'notify') { attentionItems.delete(key); changed = true; }
+  }
+  if (changed) attentionRepaint();
 }
 
 // Event-stream connection state (fragment 36's set_on_server_state): a
@@ -88281,19 +88412,25 @@ function attentionQueueNotification(key) {
 function attentionShowNotification(items) {
   const approvals = items.filter((i) => i.kind === 'approval').length;
   const questions = items.filter((i) => i.kind === 'question').length;
+  const notifies = items.filter((i) => i.kind === 'notify').length;
   let title;
   if (items.length === 1) {
-    title = questions ? 'Intendant: the agent has a question' : 'Intendant: approval needed';
+    title = questions ? 'Intendant: the agent has a question'
+      : notifies ? 'Intendant: the agent sent a notification'
+      : 'Intendant: approval needed';
   } else {
     const parts = [];
     if (approvals) parts.push(`${approvals} approval${approvals > 1 ? 's' : ''}`);
     if (questions) parts.push(`${questions} question${questions > 1 ? 's' : ''}`);
+    if (notifies) parts.push(`${notifies} notification${notifies > 1 ? 's' : ''}`);
     title = `Intendant: ${parts.join(' and ')} waiting`;
   }
   const total = attentionItems.size;
   const body = total > items.length
     ? `${total} requests are waiting for you.`
-    : 'The agent is waiting for you.';
+    : notifies === items.length
+      ? 'The agent wants your attention.'
+      : 'The agent is waiting for you.';
   const focusSessionId = items[0].sessionId || '';
   try {
     const notification = new Notification(title, {
@@ -88321,6 +88458,7 @@ document.addEventListener('visibilitychange', () => {
     for (const notification of attentionOpenNotifications.splice(0)) {
       try { notification.close(); } catch (_) {}
     }
+    attentionClearNotifyKind();
   }
 });
 
@@ -88359,7 +88497,7 @@ function attentionBuildSettingsCard() {
   h3.textContent = 'Notifications';
   const sub = document.createElement('div');
   sub.className = 'ui-section-sub';
-  sub.textContent = 'When the agent waits on you — approvals and questions. These apply to this browser only.';
+  sub.textContent = 'When the agent needs you — approvals, questions, and agent notifications. These apply to this browser only.';
   head.append(h3, sub);
   card.appendChild(head);
 

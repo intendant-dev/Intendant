@@ -266,6 +266,64 @@ impl SessionLog {
         });
     }
 
+    /// Persist a fire-and-forget agent→user notification
+    /// (`AppEvent::UserNotification`).
+    ///
+    /// The full text/title/urgency live in `data`; `message` carries a
+    /// short preview for plain-log readers. Replay reconstructs the event
+    /// via `session_log_entry_to_app_event` so a rehydrated session
+    /// renders the notification row exactly like the live path.
+    pub fn user_notification(
+        &mut self,
+        session_id: Option<&str>,
+        notification_id: &str,
+        title: Option<&str>,
+        text: &str,
+        urgency: crate::types::NotificationUrgency,
+        ts_ms: u64,
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        data.insert(
+            "notification_id".to_string(),
+            serde_json::Value::String(notification_id.to_string()),
+        );
+        if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "title".to_string(),
+                serde_json::Value::String(title.to_string()),
+            );
+        }
+        data.insert(
+            "text".to_string(),
+            serde_json::Value::String(text.to_string()),
+        );
+        data.insert(
+            "urgency".to_string(),
+            serde_json::Value::String(urgency.as_str().to_string()),
+        );
+        data.insert("ts_ms".to_string(), serde_json::Value::from(ts_ms));
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "user_notification".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Notification: {}", log_preview(text, 160))),
+            data: Some(serde_json::Value::Object(data)),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a new session starting (MCP multi-task).
     pub fn session_started(&mut self, session_id: &str, task: Option<&str>) {
         self.emit(LogEvent {

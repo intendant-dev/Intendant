@@ -105,6 +105,13 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     // travel as base64 tool arguments), so they ride in
                     // the small profile next to the shared-view set.
                     | "post_session_note"
+                    // The agent→user primitives: blocking structured
+                    // questions and fire-and-forget notifications are core
+                    // collaboration affordances for every supervised
+                    // backend (also reachable as `intendant ctl ask` /
+                    // `ctl notify`).
+                    | "ask_user"
+                    | "notify_user"
                     | "show_shared_view"
                     | "focus_shared_view"
                     | "request_shared_view_input"
@@ -198,8 +205,11 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // own display-only transcript notes, which are the same
         // session-surface write from the other direction (low-risk session
         // output; deliberately reachable by session-scoped supervised
-        // agents, the tool's primary callers).
-        "respond" | "post_session_note" => PeerOperation::Message,
+        // agents, the tool's primary callers). ask_user and notify_user
+        // classify alike: agent→user session-surface writes for the same
+        // session-scoped callers — a question requests input, never
+        // permission, and answering one never widens autonomy.
+        "respond" | "post_session_note" | "ask_user" | "notify_user" => PeerOperation::Message,
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -351,6 +361,22 @@ pub(crate) fn append_manual_http_tool_definitions(
             "post_session_note",
             "Post a display-only note into the session transcript, with optional base64 images. The note renders live in the dashboard transcript and persists for replay; it never enters any model's context. Images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total.",
             PostSessionNoteParams
+        ),
+    );
+    push(
+        "ask_user",
+        manual_http_tool_definition!(
+            "ask_user",
+            "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform.",
+            AskUserParams
+        ),
+    );
+    push(
+        "notify_user",
+        manual_http_tool_definition!(
+            "notify_user",
+            "Send the user a fire-and-forget notification and return immediately (never blocks, never enters model context). urgency escalates delivery: \"info\" (default) renders a dashboard toast + transcript row; \"attention\" additionally badges the tab and raises a browser notification when the tab is hidden; \"urgent\" additionally pushes an immediate content-free nudge to the owner's opted-in browsers via the rendezvous — reserve urgent for being blocked or something requiring prompt human action. Caps: 4 KB text. Use ask_user instead when you need an answer.",
+            NotifyUserParams
         ),
     );
     push(
@@ -610,6 +636,40 @@ mod tests {
     }
 
     #[test]
+    fn ask_and_notify_tools_are_advertised_to_supervised_profiles() {
+        // The agent→user primitives exist to be called by supervised
+        // session-scoped agents (and `intendant ctl` on their behalf):
+        // both must ride the small `core` profile and the permissive
+        // default/full lists, with manual HTTP definitions that match
+        // their #[tool] attributes.
+        for name in ["ask_user", "notify_user"] {
+            for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+                assert!(
+                    tool_allowed_for_profile(name, false, profile),
+                    "{name} must be listed for profile {profile:?}"
+                );
+            }
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        for (name, attr) in [
+            ("ask_user", IntendantServer::ask_user_tool_attr()),
+            ("notify_user", IntendantServer::notify_user_tool_attr()),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            assert_eq!(
+                manual_description,
+                attr.description.as_deref().unwrap_or_default(),
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+    }
+
+    #[test]
     fn fission_tool_profile_gating_matrix() {
         for name in [
             "fission_spawn",
@@ -671,6 +731,14 @@ mod tests {
             mcp_tool_operation("post_session_note"),
             PeerOperation::Message
         );
+        // The agent→user primitives ride the same message-surface class:
+        // session-scoped supervised agents are their primary callers, a
+        // question is input (not permission), and a notification is
+        // display-only output. Pinned so a refactor can't silently drop
+        // them to the RuntimeControl default and lock supervised agents
+        // out of asking their own user.
+        assert_eq!(mcp_tool_operation("ask_user"), PeerOperation::Message);
+        assert_eq!(mcp_tool_operation("notify_user"), PeerOperation::Message);
         assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);
         assert_eq!(
             mcp_tool_operation("rewind_context"),

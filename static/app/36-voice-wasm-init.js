@@ -397,6 +397,13 @@ async function main() {
         handleSessionNoteEvent(d);
         return;
       }
+      if (d.event === 'user_notification') {
+        // Agent→user notification: toast + transcript row, end to end in
+        // JS like session notes (the attention center already saw it via
+        // attentionObserveServerMessage above).
+        handleUserNotificationEvent(d);
+        return;
+      }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
         handleBrowserWorkspaceMessage(d);
         return;
@@ -418,12 +425,15 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          // session_note entries ride the WASM pipeline as note-styled
-          // log_entry rows (see sessionNoteReplayEntryToLogEntry) so the
-          // replayed transcript keeps chronological order.
+          // session_note / user_notification entries ride the WASM
+          // pipeline as styled log_entry rows (see
+          // sessionNoteReplayEntryToLogEntry and its notification twin) so
+          // the replayed transcript keeps chronological order.
           const cmds = app.handle_server_message({
             ...filtered,
-            entries: filtered.entries.map(sessionNoteReplayEntryToLogEntry),
+            entries: filtered.entries
+              .map(sessionNoteReplayEntryToLogEntry)
+              .map(userNotificationReplayEntryToLogEntry),
           });
           if (cmds) processCommands(cmds);
         } finally {

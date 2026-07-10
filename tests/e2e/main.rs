@@ -1167,6 +1167,219 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     .await;
 }
 
+/// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
+/// renders the question on the rail (`user_question` on /ws), a frontend
+/// answers via `answer_question`, and the blocked ctl returns the exact
+/// answer — plus `approval_resolved` so every other dashboard clears.
+/// This is the codex/MCP/ctl path to the question rail that previously
+/// only the native loop and supervised Claude Code could reach.
+#[tokio::test]
+async fn ctl_ask_blocks_until_the_dashboard_answers() {
+    const QUESTION: &str = "Which color should the widget be?";
+    const ANSWER: &str = "cerulean";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before asking so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Spawn `ctl ask` WITHOUT awaiting: it must stay blocked until the
+    // answer lands (same construction as the ctl() helper).
+    let mut cmd = daemon.rig.command();
+    cmd.env_remove("INTENDANT_MCP_URL")
+        .env_remove("INTENDANT_PORT")
+        .env_remove("INTENDANT_SESSION_ID")
+        .env_remove("INTENDANT_MANAGED_CONTEXT");
+    cmd.arg("ctl")
+        .arg("--port")
+        .arg(daemon.port.to_string())
+        .args([
+            "--json",
+            "ask",
+            QUESTION,
+            "--option",
+            "red:Warm and bold",
+            "--option",
+            "blue",
+            "--header",
+            "Paint",
+            "--session",
+            "ask-e2e-session",
+        ]);
+    let ask_child = cmd.spawn().expect("spawn ctl ask");
+
+    // (1) The existing question rail event announces the structured ask.
+    let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+    })
+    .await
+    .unwrap_or_else(|| panic!("user_question never broadcast on /ws:\n{}", daemon.log_tail()));
+    assert_eq!(question["session_id"], "ask-e2e-session", "{question}");
+    assert_eq!(question["questions"][0]["question"], QUESTION, "{question}");
+    assert_eq!(question["questions"][0]["header"], "Paint", "{question}");
+    assert_eq!(
+        question["questions"][0]["options"][0]["label"], "red",
+        "{question}"
+    );
+    assert_eq!(
+        question["questions"][0]["options"][0]["description"], "Warm and bold",
+        "{question}"
+    );
+    assert_eq!(
+        question["questions"][0]["options"][1]["label"], "blue",
+        "{question}"
+    );
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("user_question must carry an id, got {question}"));
+
+    // (2) Answer from the dashboard wire (free text — always allowed).
+    {
+        use futures_util::SinkExt;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "answer_question",
+                "session_id": "ask-e2e-session",
+                "id": question_id,
+                "answers": { QUESTION: ANSWER },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send answer_question");
+    }
+
+    // (3) The blocked ctl returns the structured outcome with the answer.
+    let output = tokio::time::timeout(RUN_TIMEOUT, ask_child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("ctl ask did not return after the answer:\n{}", daemon.log_tail()))
+        .expect("collect ctl ask output");
+    assert!(output.status.success(), "{}", text_of(&output));
+    let outcome = stdout_json(&output);
+    assert_eq!(outcome["status"], "answered", "{outcome}");
+    assert_eq!(outcome["answer"], ANSWER, "{outcome}");
+    assert_eq!(outcome["answers"][QUESTION], ANSWER, "{outcome}");
+    assert_eq!(outcome["id"], question_id, "{outcome}");
+
+    // (4) The resolution broadcast clears the rail on other dashboards.
+    let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("approval_resolved")
+            && json.get("id").and_then(|v| v.as_u64()) == Some(question_id)
+    })
+    .await
+    .unwrap_or_else(|| panic!("approval_resolved never broadcast:\n{}", daemon.log_tail()));
+    assert_eq!(resolved["action"], "answer", "{resolved}");
+}
+
+/// `intendant ctl notify` end to end: fire-and-forget returns immediately,
+/// the `user_notification` event reaches /ws with its urgency, and the
+/// notification persists into the session log for replay.
+#[tokio::test]
+async fn ctl_notify_broadcasts_and_persists() {
+    const TEXT: &str = "E2E_NOTIFY deploy finished";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before notifying so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "notify",
+            TEXT,
+            "--title",
+            "CI",
+            "--urgency",
+            "attention",
+            "--session",
+            "notify-e2e-session",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let sent = stdout_json(&output);
+    assert_eq!(sent["status"], "sent", "{sent}");
+    assert_eq!(sent["session_id"], "notify-e2e-session", "{sent}");
+    assert_eq!(sent["urgency"], "attention", "{sent}");
+    let notification_id = sent["id"].as_str().expect("notification id").to_string();
+
+    // (1) The /ws broadcast carries the notification for toast/attention.
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_notification")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "user_notification never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["id"], notification_id.as_str(), "{event}");
+    assert_eq!(event["text"], TEXT, "{event}");
+    assert_eq!(event["title"], "CI", "{event}");
+    assert_eq!(event["urgency"], "attention", "{event}");
+    assert_eq!(event["session_id"], "notify-e2e-session", "{event}");
+
+    // (2) The notification persisted to the session log for replay.
+    poll_until(
+        "the user_notification row in the session log",
+        RUN_TIMEOUT,
+        || {
+            let logs = daemon.rig.session_logs();
+            let notification_id = notification_id.clone();
+            async move {
+                (logs.contains("\"event\":\"user_notification\"")
+                    && logs.contains(&notification_id))
+                .then_some(())
+            }
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+}
+
 /// `intendant ctl peer …` against a live federated pair: daemon A federates
 /// to daemon B over `POST /api/peers` (the peer-sessions smoke's pattern),
 /// then the ctl surface — which reaches A's `/mcp` over tokenless loopback —

@@ -91,6 +91,34 @@ pub(crate) fn session_note_peer_log_text(text: &str, attachment_count: usize) ->
     }
 }
 
+/// Peer-facing text for an agent→user notification: `title: text`, with an
+/// urgency marker for the escalated levels.
+pub(crate) fn user_notification_peer_log_text(
+    title: Option<&str>,
+    text: &str,
+    urgency: crate::types::NotificationUrgency,
+) -> String {
+    let body = match title {
+        Some(title) => format!("{title}: {text}"),
+        None => text.to_string(),
+    };
+    match urgency {
+        crate::types::NotificationUrgency::Info => body,
+        other => format!("[{}] {body}", other.as_str()),
+    }
+}
+
+/// Urgent notifications surface as warnings in the peer activity log;
+/// everything else is plain info.
+pub(crate) fn user_notification_peer_log_level(
+    urgency: crate::types::NotificationUrgency,
+) -> LogLevel {
+    match urgency {
+        crate::types::NotificationUrgency::Urgent => LogLevel::Warn,
+        _ => LogLevel::Info,
+    }
+}
+
 /// Map Intendant's internal multi-source `LogLevel` to the peer
 /// module's 5-level vocabulary. Source-specific variants
 /// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
@@ -1533,6 +1561,19 @@ impl AppEventUpcaster {
                 source.as_deref().unwrap_or("note"),
                 session_note_peer_log_text(text, attachments.len()),
             )],
+            // Fire-and-forget agent→user notification: forward as peer log
+            // activity (the peer dashboard's own toast/attention machinery
+            // is for its local daemon, not relayed sessions).
+            AppEvent::UserNotification {
+                title,
+                text,
+                urgency,
+                ..
+            } => vec![log_event(
+                user_notification_peer_log_level(*urgency),
+                "notify",
+                user_notification_peer_log_text(title.as_deref(), text, *urgency),
+            )],
             AppEvent::UserMessageRewind {
                 user_turn_index,
                 turns_removed,
@@ -2828,6 +2869,18 @@ impl WireEventUpcaster {
                 LogLevel::Info,
                 source.as_deref().unwrap_or("note"),
                 session_note_peer_log_text(text, attachments.len()),
+            )],
+            // Same treatment as the AppEvent-side arm: notification text as
+            // peer log activity.
+            OutboundEvent::UserNotification {
+                title,
+                text,
+                urgency,
+                ..
+            } => vec![log_event(
+                user_notification_peer_log_level(*urgency),
+                "notify",
+                user_notification_peer_log_text(title.as_deref(), text, *urgency),
             )],
             OutboundEvent::UserMessageRewind {
                 user_turn_index,

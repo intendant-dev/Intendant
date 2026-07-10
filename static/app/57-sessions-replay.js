@@ -2634,6 +2634,13 @@ function buildSessionDetailRows(entries) {
       if (!note) continue;
       e = { ...e, ...note };
     }
+    // Agent→user notifications normalize the same way (title folded into
+    // the content, urgency mapped to the row level).
+    if (e && e.event === 'user_notification') {
+      const notification = userNotificationLogCommand(e);
+      if (!notification) continue;
+      e = { ...e, ...notification };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;

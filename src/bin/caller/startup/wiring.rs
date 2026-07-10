@@ -298,6 +298,10 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.session_registry = Some(session_registry.clone());
     mcp_http_state.peer_registry = Some(peer_registry.clone());
     mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    // The gateway shape always has an answerable frontend: a dashboard can
+    // attach while an `ask_user` blocks, so asks wait instead of
+    // auto-answering.
+    mcp_http_state.interactive_frontends = true;
     let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
         Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
         bus.clone(),
