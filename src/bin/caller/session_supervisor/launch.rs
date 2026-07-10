@@ -482,10 +482,15 @@ impl SessionSupervisor {
             // requested kind — `side` for /btw conversations).
             if let Some(config) = session_agent_config.as_mut() {
                 config.forked_from = Some(resume_token.clone());
+                // Only vetted lineage kinds may ride the wire into persisted
+                // lineage: the kind drives frontend gating (side-window
+                // affordances), so an arbitrary string from any ResumeSession
+                // sender must not masquerade as e.g. "subagent". Unknown
+                // kinds degrade to the plain "fork" emit (None).
                 config.fork_relationship = relationship_kind
                     .as_deref()
                     .map(str::trim)
-                    .filter(|kind| !kind.is_empty() && *kind != "fork")
+                    .filter(|kind| *kind == "side")
                     .map(str::to_string);
             }
         }

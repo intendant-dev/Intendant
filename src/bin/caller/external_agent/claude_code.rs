@@ -848,6 +848,14 @@ impl CcReader {
             .filter(|s| !s.is_empty())?
             .to_string();
         if !self.task_children.contains_key(&ptid) {
+            // The lazy path exists for resume replays whose Agent tool_use
+            // was never observed. An id currently open as an ordinary tool
+            // is that command's own tool_use, never a spawn scope — route
+            // such envelopes to the main thread instead of materializing a
+            // ghost child (the task_started guard's belt, mirrored here).
+            if self.open_tools.contains_key(&ptid) {
+                return None;
+            }
             let spawn = CcTaskSpawn {
                 description: msg
                     .get("task_description")
@@ -1150,17 +1158,20 @@ impl CcReader {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
         }
-        let is_agent_task = match msg.get("task_type").and_then(|v| v.as_str()) {
-            Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
-            // Pre-task_type CLIs (< 2.1.206) emitted task_started only for
-            // Agent spawns, and those payloads carried `subagent_type` +
-            // `prompt` (live-probed); Bash payloads carry neither, so this
-            // affirmative check stays fail-closed for unknown task kinds.
-            None => {
-                msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
-                    || msg.get("prompt").and_then(|v| v.as_str()).is_some()
-            }
-        };
+        // `subagent_type` only ever rides agent spawns (live-probed: Bash
+        // payloads carry neither it nor `prompt`), so its presence is
+        // affirmative regardless of task_type — a future CLI renaming the
+        // agent task kind (e.g. "subagent") must not drop registration
+        // while the field still identifies the spawn.
+        let is_agent_task = msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
+            || match msg.get("task_type").and_then(|v| v.as_str()) {
+                Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
+                // Pre-task_type CLIs (< 2.1.206) emitted task_started only
+                // for Agent spawns, and those payloads carried `prompt`
+                // (live-probed) — the affirmative check stays fail-closed
+                // for unknown task kinds.
+                None => msg.get("prompt").and_then(|v| v.as_str()).is_some(),
+            };
         if !is_agent_task || self.open_tools.contains_key(tool_use_id) {
             return;
         }
@@ -3430,6 +3441,42 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
         );
         assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn subagent_typed_task_started_registers_despite_unknown_task_type() {
+        // subagent_type identifies a spawn even if a future CLI renames the
+        // agent task_type to something outside the *_agent vocabulary.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz9","tool_use_id":"toolu_01RENAMEDAGENT0000","description":"probe","subagent_type":"general-purpose","task_type":"subagent","prompt":"go","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, .. } if status == "inProgress"
+        )));
+    }
+
+    #[test]
+    fn lazy_scope_for_an_open_tool_never_materializes_a_child() {
+        // An envelope parented to an id that is currently open as an
+        // ordinary tool must not ghost a child through the lazy
+        // resume-replay path; it routes to the main thread instead.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENLAZY00000000","name":"Bash","input":{"command":"sleep 5","description":"slow"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"partial output"}]},"parent_tool_use_id":"toolu_01OPENLAZY00000000","session_id":"s1"}"#,
+        );
+        assert!(!reader.task_children.contains_key("toolu_01OPENLAZY00000000"));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "lazy path spawned: {:?}",
+            out.events
+        );
     }
 
     #[test]
