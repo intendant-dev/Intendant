@@ -33,10 +33,12 @@ CACHE_ROOTS="${CACHE_ROOTS:-}"      # space-separated cache roots
 VOLUME="${VOLUME:-/}"               # volume free space is measured on
 STATE_DIR="${STATE_DIR:-/var/db/intendant-ci}"
 LOG="${LOG:-/var/log/intendant-ci-watchdog.log}"
-RUNNER_USER="${RUNNER_USER:-}"      # account the listeners run as
-RUNNER_UID="${RUNNER_UID:-}"        # its uid (macOS launchctl domain)
-RUNNER_LABELS="${RUNNER_LABELS:-}"  # macOS: LaunchAgent labels
+RUNNER_USER="${RUNNER_USER:-}"      # account(s) the listeners run as (space-separated)
+RUNNER_UID="${RUNNER_UID:-}"        # LaunchAgent account uid (macOS gui domain)
+RUNNER_LABELS="${RUNNER_LABELS:-}"  # macOS: LaunchAgent labels (gui domain)
 RUNNER_PLIST_DIR="${RUNNER_PLIST_DIR:-}"  # macOS: dir holding those plists
+RUNNER_DAEMON_LABELS="${RUNNER_DAEMON_LABELS:-}"  # macOS: LaunchDaemon labels (system domain)
+RUNNER_DAEMON_PLIST_DIR="${RUNNER_DAEMON_PLIST_DIR:-/Library/LaunchDaemons}"
 RUNNER_UNITS="${RUNNER_UNITS:-}"    # Linux: systemd units
 
 PAUSED_MARKER="$STATE_DIR/listeners.paused"
@@ -59,8 +61,14 @@ is_macos() { [ "$(uname -s)" = "Darwin" ]; }
 
 job_running() {
     # Runner.Worker only exists while a job executes on a listener.
+    # RUNNER_USER may list several accounts (mid-migration a host runs
+    # LaunchAgent listeners as the operator and LaunchDaemon listeners as
+    # the CI service account at the same time).
     if [ -n "$RUNNER_USER" ]; then
-        pgrep -u "$RUNNER_USER" -f 'Runner\.Worker' >/dev/null 2>&1
+        for u in $RUNNER_USER; do
+            pgrep -u "$u" -f 'Runner\.Worker' >/dev/null 2>&1 && return 0
+        done
+        return 1
     else
         pgrep -f 'Runner\.Worker' >/dev/null 2>&1
     fi
@@ -72,6 +80,11 @@ stop_listeners() {
             launchctl bootout "gui/$RUNNER_UID/$label" 2>/dev/null \
                 && log "stopped listener $label" \
                 || log "listener $label was not running"
+        done
+        for label in $RUNNER_DAEMON_LABELS; do
+            launchctl bootout "system/$label" 2>/dev/null \
+                && log "stopped daemon listener $label" \
+                || log "daemon listener $label was not running"
         done
     else
         for unit in $RUNNER_UNITS; do
@@ -89,6 +102,11 @@ start_listeners() {
             launchctl bootstrap "gui/$RUNNER_UID" "$RUNNER_PLIST_DIR/$label.plist" 2>/dev/null \
                 && log "resumed listener $label" \
                 || log "listener $label already running (or bootstrap failed — check manually)"
+        done
+        for label in $RUNNER_DAEMON_LABELS; do
+            launchctl bootstrap system "$RUNNER_DAEMON_PLIST_DIR/$label.plist" 2>/dev/null \
+                && log "resumed daemon listener $label" \
+                || log "daemon listener $label already running (or bootstrap failed — check manually)"
         done
     else
         for unit in $RUNNER_UNITS; do

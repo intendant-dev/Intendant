@@ -371,7 +371,9 @@ not half-hours.
 our hardware, yet its required checks really run. Fork-PR workflows also
 need maintainer approval before anything runs (all outside collaborators,
 not just first-timers). The Dell and Windows runners run as dedicated
-non-admin `ci` users, and the check *names* stay pinned to the
+non-admin `ci` users — the Mac joins them as the `scripts/ci` service-account
+kit (`_intendant-ci`: hidden role account, LaunchDaemon listeners, job hooks)
+is cut over — and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
 - **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); everything else — non-Linux PR legs, every push-to-main warm run — is `cargo check` only. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Headless-safe: needs no display or API keys. **Required check.**

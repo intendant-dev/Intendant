@@ -23,15 +23,25 @@ STATE_DIR="/var/db/intendant-ci"        # /var/lib/intendant-ci on Linux
 LOG="/var/log/intendant-ci-watchdog.log"
 
 # Listener control.
-RUNNER_USER=""    # account the listeners run as
+# RUNNER_USER may list several accounts space-separated (mid-migration a
+# host runs LaunchAgent listeners as the operator and LaunchDaemon
+# listeners as the CI service account at the same time).
+RUNNER_USER=""    # account(s) the listeners run as
 
-# macOS (LaunchAgent listeners):
+# macOS (LaunchAgent listeners, gui domain):
 #RUNNER_UID=501
 #RUNNER_LABELS="actions.runner.<org>-<repo>.<runner-name> actions.runner.<org>-<repo>.<runner-name>-b"
 #RUNNER_PLIST_DIR="/Users/<runner-account>/Library/LaunchAgents"
 RUNNER_UID=""
 RUNNER_LABELS=""
 RUNNER_PLIST_DIR=""
+
+# macOS (LaunchDaemon listeners, system domain — the service-account shape
+# migrate-runner-macos.sh installs; it edits these lines itself):
+#RUNNER_DAEMON_LABELS="actions.runner.<org>-<repo>.<runner-name>"
+#RUNNER_DAEMON_PLIST_DIR="/Library/LaunchDaemons"
+RUNNER_DAEMON_LABELS=""
+RUNNER_DAEMON_PLIST_DIR="/Library/LaunchDaemons"
 
 # Linux (systemd listeners):
 #RUNNER_UNITS="actions.runner.<org>-<repo>.<runner-name>.service"
