@@ -390,6 +390,101 @@ pub(crate) fn control_frame_response(
                         Err(error) => dashboard_control_error_response(id, error.message()),
                     })
                 }
+                "api_daemon_vault_deposit_key_fetch" => {
+                    let result = match crate::vault_deposits::load_deposit_key_in(
+                        &crate::vault_deposits::deposit_key_path(),
+                    ) {
+                        Ok(Some(key)) => serde_json::json!({
+                            "present": true,
+                            "alg": key.alg,
+                            "pub_raw_b64u": key.pub_raw_b64u,
+                            "published_unix_ms": key.published_unix_ms,
+                        }),
+                        Ok(None) => serde_json::json!({ "present": false }),
+                        Err(error) => {
+                            return Some(dashboard_control_error_response(id, error))
+                        }
+                    };
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": result,
+                    }))
+                }
+                "api_daemon_vault_deposit_key_publish" => {
+                    let params_ref = params.as_ref();
+                    let pub_raw_b64u = params_ref
+                        .and_then(|p| p.get("pub_raw_b64u"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    let alg = params_ref
+                        .and_then(|p| p.get("alg"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ECDH-P256")
+                        .to_string();
+                    let key = crate::vault_deposits::DepositKey {
+                        alg,
+                        pub_raw_b64u,
+                        published_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    };
+                    Some(
+                        match crate::vault_deposits::save_deposit_key_in(
+                            &crate::vault_deposits::deposit_key_path(),
+                            &key,
+                        ) {
+                            Ok(()) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": { "stored": true },
+                            }),
+                            Err(error) => dashboard_control_error_response(id, error),
+                        },
+                    )
+                }
+                "api_daemon_vault_deposits_fetch" => {
+                    Some(
+                        match crate::vault_deposits::list_deposits_in(
+                            &crate::vault_deposits::deposits_dir(),
+                        ) {
+                            Ok(deposits) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": {
+                                    "deposits": serde_json::to_value(&deposits)
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                            }),
+                            Err(error) => dashboard_control_error_response(id, error),
+                        },
+                    )
+                }
+                "api_daemon_vault_deposits_consume" => {
+                    let ids: Vec<String> = params
+                        .as_ref()
+                        .and_then(|p| p.get("ids"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let removed = crate::vault_deposits::consume_deposits_in(
+                        &crate::vault_deposits::deposits_dir(),
+                        &ids,
+                    );
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "removed": removed },
+                    }))
+                }
                 "api_credential_egress_register" => {
                     let kinds: Vec<String> = params
                         .as_ref()

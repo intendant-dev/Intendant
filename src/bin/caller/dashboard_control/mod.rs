@@ -179,6 +179,14 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // and revision history are custody-sensitive.
     method("api_daemon_vault_fetch", PeerOperation::CredentialsManage),
     method("api_daemon_vault_publish", PeerOperation::CredentialsManage),
+    // Write-only vault deposits (vault_deposits.rs): the dashboard
+    // publishes the vault's deposit public key here and folds queued
+    // deposits into the blob on unlock. All ciphertext/public material —
+    // the daemon can neither read deposits nor mint vault entries.
+    method("api_daemon_vault_deposit_key_fetch", PeerOperation::CredentialsManage),
+    method("api_daemon_vault_deposit_key_publish", PeerOperation::CredentialsManage),
+    method("api_daemon_vault_deposits_fetch", PeerOperation::CredentialsManage),
+    method("api_daemon_vault_deposits_consume", PeerOperation::CredentialsManage),
     method(
         "api_credential_egress_register",
         PeerOperation::CredentialsManage,
@@ -3049,6 +3057,26 @@ mod tests {
             ),
             (
                 "api_daemon_vault_publish",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposit_key_fetch",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposit_key_publish",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposits_fetch",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposits_consume",
                 Residue,
                 Some(Op::CredentialsManage),
             ),
