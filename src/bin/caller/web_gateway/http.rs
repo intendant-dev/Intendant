@@ -48,10 +48,6 @@ pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
     let _ = stream.shutdown().await;
 }
 
-pub(crate) fn json_response_body(body: String) -> String {
-    HttpResponse::json("200 OK", body).into_string()
-}
-
 /// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
 pub(crate) fn gzip_compress(data: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};

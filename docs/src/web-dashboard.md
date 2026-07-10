@@ -1993,7 +1993,9 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
-| GET | `/api/session[/…]` | SessionInspect | own origin | none | Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames |
+| GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |
+| GET | `/api/session/{id}` | SessionInspect | own origin | none | Session detail (paged replay entries; limit/before/source) |
+| GET | `/api/session[/…]` | SessionInspect | own origin | none | Session artifact sub-routes: recordings (+segments/playlist), report zip, frames |
 | POST | `/api/session[/…]` | SessionManage | own origin | none | Session detail sub-routes (POST fallback callers) |
 | GET | `/api/managed-context/anchors` | SessionInspect | own origin | none | Managed-context anchor catalog |
 | GET | `/api/managed-context/records` | SessionInspect | own origin | none | Managed-context record index |

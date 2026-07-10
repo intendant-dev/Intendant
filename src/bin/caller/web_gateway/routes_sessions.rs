@@ -2494,16 +2494,25 @@ pub(crate) async fn handle_session_sub_router(
         let raw_id = rest_parts[0];
         let session_id = raw_id.split('?').next().unwrap_or(raw_id);
         let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
-        let response = match context_snapshot_selector_parts_from_request(request_line) {
-            Ok((file, request_id, request_index, ts)) => session_context_snapshot_api_response(
-                session_id,
-                &source,
-                file,
-                request_id,
-                request_index,
-                ts,
-            ),
-            Err(error) => ApiResponse::json_error(400, error),
+        // Historical HTTP precedence: the bare-id check answers before
+        // the selector decode (the tunnel's transport-owned decode keeps
+        // its own historical index-error-first order).
+        let response = if !session_lookup_id_is_safe(session_id) {
+            ApiResponse::json_error(400, "invalid session id")
+        } else {
+            match context_snapshot_selector_parts_from_request(request_line) {
+                Ok((file, request_id, request_index, ts)) => {
+                    session_context_snapshot_api_response(
+                        session_id,
+                        &source,
+                        file,
+                        request_id,
+                        request_index,
+                        ts,
+                    )
+                }
+                Err(error) => ApiResponse::json_error(400, error),
+            }
         };
         let bytes = api_response_http_bytes(
             response,
@@ -5035,6 +5044,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn golden_session_context_snapshot_double_error_precedence_transcript() {
+        // Invalid id AND invalid request_index: the bare-id check answers
+        // first on the HTTP lane (historical precedence, kept through the
+        // S4a conversion; the tunnel's decode keeps index-error-first).
+        let request_line = "GET /api/session/../context-snapshot?request_index=abc HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"invalid session id"}"#)
+        );
+    }
+
+    #[tokio::test]
     async fn golden_session_context_snapshot_not_found_transcript() {
         let session_id = golden_unique_session_id("golden-snapshot-missing");
         let request_line =
@@ -5050,5 +5075,4 @@ mod tests {
                 r#"{"error":"context snapshot not found"}"#
             )
         );
-    }
-}
+    }}

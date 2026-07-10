@@ -685,15 +685,14 @@ pub(crate) static ROUTES: &[Route] = &[
         "Delete one data kind for a session (POST fallback)",
     ),
     // POST-shaped read: the body carries output ids and the handler
-    // (`session_agent_output_post_response`) only fetches persisted
+    // (`session_agent_output_api_response`) only fetches persisted
     // stdout/stderr chunks back out of the session's log — nothing is
     // appended, so it is inspect-grade like every other by-id session
     // read. The legacy verb-shaped classifier (POST under /api/session ⇒
-    // manage) mis-tagged it and diverged from the tunnel twin
-    // `api_session_agent_output`. Keep the two lanes' operations equal
-    // (pinned by dashboard_control's
-    // `formerly_divergent_twins_gate_identically_on_both_lanes`) until
-    // transport unification derives the tunnel op from this row.
+    // manage) mis-tagged it and diverged from the tunnel twin — now the
+    // twin is this row's tunnel column and its operation derives from
+    // here (`formerly_divergent_twins_gate_identically_on_both_lanes`
+    // stays as the end-to-end assertion).
     op_route(
         RouteMethod::Post,
         PathPattern::Segments(
@@ -707,7 +706,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::SessionAgentOutput,
         "Fetch a session's persisted agent output by id (POST-shaped read)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_agent_output")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
     //    split (current/* manage-gated on every method; {id} inspect on
@@ -728,13 +728,43 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::SessionSubRouter,
         "Current-session detail sub-routes (POST fallback callers)",
     ),
+    // Converted read leaves of the method-blind catch-all, carved as
+    // method-explicit rows so each can carry its datachannel twin
+    // (transport-unification S4a; one tunnel name per row). Same
+    // operation and shared handler as the Under rows they were served by
+    // — classification-preserving; the generic rows below keep the
+    // unconverted artifact leaves and the POST-fallback callers.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("context-snapshot"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Replay one archived context snapshot (file/request_id/request_index/ts selector)",
+    )
+    .with_tunnel(tunnel_method("api_session_context_snapshot")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments("/api/session", &[SegmentSpec::Capture("id")]),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session detail (paged replay entries; limit/before/source)",
+    )
+    .with_tunnel(tunnel_method("api_session_detail")),
     op_route(
         RouteMethod::Get,
         PathPattern::Under("/api/session"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionSubRouter,
-        "Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames",
+        "Session artifact sub-routes: recordings (+segments/playlist), report zip, frames",
     ),
     op_route(
         RouteMethod::Post,
@@ -822,7 +852,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionsSearch,
         "Search sessions (q, source, mode, project filters)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_sessions_search")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
@@ -830,7 +861,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionsList,
         "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_sessions")),
     // ── Settings / info endpoints. Ported method-blind from the legacy
     //    chain as `Any` rows, then tightened to their real methods: an
     //    undeclared method on a declared path now gets the dispatch-level
