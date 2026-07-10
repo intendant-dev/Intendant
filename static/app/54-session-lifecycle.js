@@ -116,7 +116,15 @@ function onSessionEnded(sessionId, reason, errorKind) {
   } else if (explicitStop) {
     clearPendingFollowUpsForSession(sid, reason || 'session stopped');
     removeSessionRelationshipsForSession(sid);
-    removeSessionWindow(sid);
+    // A worktree-backed session leaves a decision behind (merge / remove /
+    // keep the worktree), so its window survives an explicit stop to host
+    // the finish card; dismissing the card completes the removal.
+    if (sessionWorktreeFinishInfo(sid)) {
+      updateSessionWindow(sid, { phase: 'done', ended: true });
+      maybeShowWorktreeFinishCard(sid, { removeWindowOnDismiss: true });
+    } else {
+      removeSessionWindow(sid);
+    }
   } else if (restarting) {
     clearPendingFollowUpsForSession(sid, reason || 'restarting session');
     updateSessionWindow(sid, { phase: 'idle', ended: false });
@@ -126,6 +134,7 @@ function onSessionEnded(sessionId, reason, errorKind) {
     setSessionWindowDetached(sid, true, reason || 'session ended');
   } else if (sid) {
     updateSessionWindow(sid, { phase: 'done', ended: true });
+    maybeShowWorktreeFinishCard(sid);
   }
   if (!keepExternalDetached && (!sessionId || sessionId === currentSessionFullId)) {
     currentSessionFullId = '';
@@ -153,6 +162,197 @@ function onSessionEnded(sessionId, reason, errorKind) {
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
+}
+
+// ── Worktree finish card ───────────────────────────────────────────────────
+// When a session that ran in a git worktree ends, its window offers the
+// three explicit outcomes for the branch it leaves behind: merge it back
+// into the base checkout (and remove the checkout), remove the checkout
+// via the same safety-checked path as the Worktrees tab, or keep it.
+// Nothing is ever automatic — the worktree persists until a click.
+
+const worktreeFinishCardDismissed = new Set();
+
+function sessionWorktreeFinishInfo(sid) {
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return meta.worktree && meta.worktree.branch && meta.worktree.path ? meta.worktree : null;
+}
+
+// The linkage rides the session catalog row (from session_meta.json); it is
+// normally hydrated well before the session ends, but fetch once on demand
+// for windows that never saw a metadata refresh.
+async function hydrateSessionWorktreeFinishInfo(sid) {
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) return existing;
+  let sessions = null;
+  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
+    try {
+      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
+    } catch (_) {}
+  }
+  if (!sessions) {
+    try {
+      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
+      if (!r.ok) return null;
+      sessions = await r.json();
+    } catch (_) {
+      return null;
+    }
+  }
+  if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
+  return sessionWorktreeFinishInfo(sid);
+}
+
+function maybeShowWorktreeFinishCard(sid, options = {}) {
+  if (!sid || worktreeFinishCardDismissed.has(sid)) return;
+  const attach = info => {
+    if (!info || worktreeFinishCardDismissed.has(sid)) return;
+    const win = sessionWindows.get(sid);
+    if (!win || win.worktreeCard) return;
+    renderWorktreeFinishCard(win, sid, info, options);
+  };
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) {
+    attach(existing);
+    return;
+  }
+  hydrateSessionWorktreeFinishInfo(sid).then(attach).catch(() => {});
+}
+
+function dismissWorktreeFinishCard(sid, options = {}) {
+  worktreeFinishCardDismissed.add(sid);
+  const win = sessionWindows.get(sid);
+  if (win?.worktreeCard) {
+    win.worktreeCard.remove();
+    win.worktreeCard = null;
+  }
+  // An explicitly stopped session only kept its window to host this card;
+  // finishing the decision completes the original removal.
+  if (options.removeWindowOnDismiss) removeSessionWindow(sid);
+}
+
+function renderWorktreeFinishCard(win, sid, info, options = {}) {
+  const card = document.createElement('div');
+  card.className = 'session-worktree-card';
+  card.setAttribute('role', 'status');
+
+  const text = document.createElement('div');
+  text.className = 'session-worktree-card-text';
+  const title = document.createElement('div');
+  title.className = 'session-worktree-card-title';
+  title.textContent = `Session ended — worktree branch ${info.branch} is still checked out.`;
+  const detail = document.createElement('div');
+  detail.className = 'session-worktree-card-detail';
+  detail.textContent = info.path;
+  detail.title = info.path;
+  text.appendChild(title);
+  text.appendChild(detail);
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'session-worktree-card-status hidden';
+
+  const actions = document.createElement('div');
+  actions.className = 'session-worktree-card-actions';
+  const mergeBtn = document.createElement('button');
+  mergeBtn.type = 'button';
+  mergeBtn.className = 'ui-btn session-worktree-card-btn primary';
+  mergeBtn.textContent = info.baseBranch
+    ? `Merge into ${info.baseBranch} & remove worktree`
+    : 'Merge & remove worktree';
+  mergeBtn.title = info.baseBranch
+    ? `git merge ${info.branch} in ${info.baseRoot || 'the base checkout'} (on ${info.baseBranch}), then remove the worktree checkout. Aborts cleanly on conflict.`
+    : 'Merge the worktree branch into the base checkout, then remove the checkout.';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'ui-btn session-worktree-card-btn';
+  removeBtn.textContent = 'Remove worktree';
+  removeBtn.title = 'Remove the checkout without merging (refused if it has uncommitted or unmerged work). The branch ref is kept.';
+  const keepBtn = document.createElement('button');
+  keepBtn.type = 'button';
+  keepBtn.className = 'ui-btn session-worktree-card-btn';
+  keepBtn.textContent = 'Keep';
+  keepBtn.title = 'Keep the worktree and dismiss. It stays available in Sessions -> Worktrees.';
+  actions.appendChild(mergeBtn);
+  actions.appendChild(removeBtn);
+  actions.appendChild(keepBtn);
+
+  const setBusy = busy => {
+    for (const btn of [mergeBtn, removeBtn, keepBtn]) btn.disabled = busy;
+    card.classList.toggle('busy', busy);
+  };
+  const showStatus = (kind, message) => {
+    statusLine.className = `session-worktree-card-status ${kind}`;
+    statusLine.textContent = message;
+  };
+  const finishResolved = message => {
+    card.classList.remove('busy');
+    showStatus('ok', message);
+    actions.replaceChildren();
+    const dismissBtn = document.createElement('button');
+    dismissBtn.type = 'button';
+    dismissBtn.className = 'ui-btn session-worktree-card-btn';
+    dismissBtn.textContent = 'Dismiss';
+    dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+    actions.appendChild(dismissBtn);
+  };
+  const callWorktreeAction = async (method, url, payload) => {
+    const r = await dashboardTransport.jsonFetch(method, payload, () => (
+      authedFetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    ), method, { fallbackAfterRpcFailure: false });
+    const textBody = await r.text();
+    let result = {};
+    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `${url} returned ${r.status}`);
+    }
+    return result;
+  };
+
+  mergeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', `Merging ${info.branch}...`);
+    try {
+      const result = await callWorktreeAction(
+        'api_worktrees_merge',
+        '/api/worktrees/merge',
+        { session_id: sid },
+      );
+      showControlToast('success', `Merged ${info.branch} into ${result.merged_into || info.baseBranch || 'the base branch'}.`);
+      finishResolved(result.removed
+        ? `Merged into ${result.merged_into || 'the base branch'} and removed the worktree.`
+        : `Merged into ${result.merged_into || 'the base branch'}. Worktree kept: ${result.removal_error || 'removal was refused'}.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree merge failed.');
+    }
+  });
+  removeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', 'Removing the worktree...');
+    try {
+      await callWorktreeAction(
+        'api_worktrees_remove',
+        '/api/worktrees/remove',
+        { repo_root: info.baseRoot || '', path: info.path },
+      );
+      showControlToast('success', 'Worktree removed.');
+      finishResolved(`Removed the worktree. Branch ${info.branch} is kept.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree removal was refused.');
+    }
+  });
+  keepBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+
+  card.appendChild(text);
+  card.appendChild(statusLine);
+  card.appendChild(actions);
+  win.el.insertBefore(card, win.log);
+  win.worktreeCard = card;
 }
 
 const TASK_TEXTAREA_MIN_HEIGHT_PX = 28;

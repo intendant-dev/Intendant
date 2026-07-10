@@ -2330,10 +2330,20 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
             } else {
                 grant.status.as_str()
             };
+            // Stored grants carry the literal "local" sentinel when the
+            // upsert request named no target (`upsert_user_client_grant`
+            // defaults to it); it means "this daemon", never a peer.
+            // Project it — like the empty default — to the daemon's real
+            // target id so the dashboard resolves the row to this daemon's
+            // label instead of echoing the raw sentinel ("on local").
+            let target_id = match grant.target_id.as_str() {
+                "" | "local" => default_target_id,
+                other => other,
+            };
             json!({
                 "id": grant.id.clone(),
                 "principal_id": grant.principal_id.clone(),
-                "target_id": if grant.target_id.is_empty() { default_target_id } else { grant.target_id.as_str() },
+                "target_id": target_id,
                 "kind": "user_client_local_iam",
                 "kind_label": "Local IAM user/client grant",
                 "policy_id": if grant.policy_id.is_empty() { "policy:scoped-human" } else { grant.policy_id.as_str() },
@@ -3402,6 +3412,32 @@ mod tests {
         assert_eq!(grants[0]["target_id"], "local-daemon");
         assert_eq!(grants[0]["status"], "draft");
         assert_eq!(grants[0]["enforced"], false);
+    }
+
+    /// `upsert_user_client_grant` stores the literal "local" sentinel when
+    /// the request names no target. The overview projection must map that
+    /// sentinel — exactly like the empty default — to the daemon's real
+    /// target id, or the dashboard's grant rows echo the raw string
+    /// ("Scoped human on local") instead of resolving this daemon's label
+    /// (seen in the design-overhaul QA fleet access audit, FR-3 evidence).
+    #[test]
+    fn overview_values_map_local_sentinel_target_to_default_target_id() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("alice-key".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(state.grants[0].target_id, "local", "stored sentinel");
+
+        let grants = grant_overview_values(&state, "intendant:qa-host");
+
+        assert_eq!(grants[0]["target_id"], "intendant:qa-host");
     }
 
     fn active_browser_cert_state() -> LocalIamState {

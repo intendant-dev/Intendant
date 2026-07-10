@@ -39,6 +39,17 @@ MCP / `intendant ctl` expose the same choices ([MCP Server](./mcp-server.md)):
 approve, skip (continue with the next command), approve-all (which also flips
 autonomy to Full), or deny (and stop).
 
+A pending request does not depend on someone happening to look at a
+dashboard: an open-but-hidden tab badges its title/favicon with the pending
+count and can raise a browser notification
+([Web Dashboard](./web-dashboard.md)), and when *no* dashboard has been
+connected since the request appeared, a claimed daemon nudges the Connect
+rendezvous after a grace period so opted-in browsers get a Web Push that
+names only the request kind and the daemon/session labels — never the
+command or question itself (`attention_nudge.rs`;
+[Hosted rendezvous](./self-hosted-rendezvous.md)). Headless daemons with no
+frontend at all still auto-deny as before.
+
 ## How `needs_approval` actually resolves
 
 The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:

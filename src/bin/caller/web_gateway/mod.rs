@@ -287,7 +287,7 @@ impl Default for WebGatewayConfig {
 // ---------------------------------------------------------------------------
 
 
-// Same-origin by default; see `json_response_body` for the CORS rationale.
+// Same-origin by default (the canonical json tail carries no CORS header).
 
 
 /// Check whether it is safe to mutate the project tree (rollback/redo) right

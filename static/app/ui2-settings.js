@@ -245,7 +245,6 @@ function ui2SettingsRenderRules() {
 // Hook target: called at the end of renderControlPane() (fragment 37) so
 // a rules refresh from ANY surface re-paints this card too.
 function ui2SettingsSyncFromControl() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   ui2SettingsRenderRules();
 }
 
@@ -268,7 +267,7 @@ function ui2SettingsSyncMirrors() {
 // Hook target: called from switchSettingsSubtab (fragment 48) after the
 // pane toggle so section-shown work runs on real switches.
 function ui2SettingsOnSubtabShown(name) {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled() || !ui2SettingsBuilt) return;
+  if (!ui2SettingsBuilt) return;
   // Sections share one scroll container — land each switch at its top,
   // not wherever the previous section was scrolled to. (Deep-link scrolls
   // like focusSettingsApiKeys run after this, in their own rAF.)
@@ -293,7 +292,6 @@ function ui2SettingsApplyActive() {
 
 function ui2SettingsBuild() {
   if (ui2SettingsBuilt) return;
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   const tab = document.getElementById('tab-settings');
   if (!tab) return;
 
@@ -585,6 +583,4 @@ function ui2SettingsBuild() {
   refreshControlPane();
 }
 
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-  ui2SettingsBuild();
-}
+ui2SettingsBuild();

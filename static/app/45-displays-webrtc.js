@@ -1631,7 +1631,7 @@ function applyDisplayStripState() {
 // authority copy: taking control is last-take-wins displacement between
 // viewers (no request/approve ceremony), and "another viewer has input"
 // is a first-class rendered state.
-if (typeof ui2Enabled === 'function' && ui2Enabled()) (() => {
+(() => {
   const tab = document.getElementById('tab-displays');
   if (!tab) return;
   const rail = document.createElement('aside');
