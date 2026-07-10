@@ -920,10 +920,11 @@ function loadWorktrees(options = {}) {
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
   const rpcMethod = forceScan ? 'api_worktrees_scan' : 'api_worktrees';
-  const promise = dashboardJsonFetch(rpcMethod, {}, () => (
-    authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
-  ), rpcMethod)
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): the cached read is a GET twin (tunnel first,
+  // HTTP fallback allowed); the forced scan is a POST twin, so the facade
+  // never replays it over HTTP after an attempted tunnel send.
+  const promise = daemonApi.request(rpcMethod, {})
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(scan => {
       if (requestSerial !== worktreesRequestSerial) return;
       worktreesLoaded = true;
@@ -1090,16 +1091,11 @@ async function openWorktreeInspect(wt) {
   renderWorktreeInspectLoading(wt);
   try {
     const payload = worktreeInspectPayload(wt);
-    const resp = await dashboardTransport.jsonFetch('api_worktrees_inspect', payload, () => (
-      authedFetch('/api/worktrees/inspect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), 'api_worktrees_inspect', { fallbackAfterRpcFailure: false });
-    const text = await resp.text();
-    let inspect = {};
-    try { inspect = text ? JSON.parse(text) : {}; } catch (_) {}
+    // daemonApi (transport F2): a POST twin — the facade's no-replay
+    // policy covers the fallbackAfterRpcFailure:false this call passed by
+    // hand.
+    const resp = await daemonApi.request('api_worktrees_inspect', payload);
+    const inspect = (resp.body && typeof resp.body === 'object') ? resp.body : {};
     if (!resp.ok || inspect.ok === false) {
       throw new Error(inspect.error || `worktree inspect returned ${resp.status}`);
     }
@@ -1443,16 +1439,11 @@ async function drainWorktreeRemovalQueue() {
         path: wt.path,
         expected_head: wt.head || null,
       };
-      const r = await dashboardTransport.jsonFetch('api_worktrees_remove', payload, () => (
-        authedFetch('/api/worktrees/remove', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
-      ), 'api_worktrees_remove', { fallbackAfterRpcFailure: false });
-      const text = await r.text();
-      let result = {};
-      try { result = text ? JSON.parse(text) : {}; } catch (_) {}
+      // daemonApi (transport F2): a POST twin — the facade's no-replay
+      // policy covers the fallbackAfterRpcFailure:false this call passed
+      // by hand.
+      const r = await daemonApi.request('api_worktrees_remove', payload);
+      const result = (r.body && typeof r.body === 'object') ? r.body : {};
       if (!r.ok || result.ok === false) {
         throw new Error(result.error || `worktree removal returned ${r.status}`);
       }

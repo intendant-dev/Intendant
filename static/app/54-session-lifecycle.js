@@ -295,17 +295,12 @@ function renderWorktreeFinishCard(win, sid, info, options = {}) {
     dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
     actions.appendChild(dismissBtn);
   };
+  // daemonApi (transport F2): POST twins — the facade's no-replay policy
+  // covers the fallbackAfterRpcFailure:false these calls passed by hand.
+  // `url` survives only as the error label the card always showed.
   const callWorktreeAction = async (method, url, payload) => {
-    const r = await dashboardTransport.jsonFetch(method, payload, () => (
-      authedFetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), method, { fallbackAfterRpcFailure: false });
-    const textBody = await r.text();
-    let result = {};
-    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    const r = await daemonApi.request(method, payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
     if (!r.ok || result.ok === false) {
       throw new Error(result.error || `${url} returned ${r.status}`);
     }

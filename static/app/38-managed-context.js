@@ -605,13 +605,14 @@ async function fetchManagedContextFission() {
 }
 
 async function fetchManagedContextHistoryJson(kind, query) {
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy. The tunnel contract is one pre-encoded query string
+  // (`{ query }`); the descriptor's rawQuery column turns it back into the
+  // HTTP twin's URL query.
   const method = `api_managed_context_${kind}`;
-  const resp = await dashboardTransport.jsonFetch(method, { query }, () => (
-    authedFetch(`/api/managed-context/${kind}?${query}`)
-  ), method);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `${kind} HTTP ${resp.status}`);
-  return payload;
+  const resp = await daemonApi.request(method, { query });
+  if (!resp.ok) throw new Error(resp.body?.error || `${kind} HTTP ${resp.status}`);
+  return resp.body;
 }
 
 function settleManagedContextPromise(promise) {
