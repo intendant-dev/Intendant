@@ -716,7 +716,10 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
 function setNewSessionProjectRoot(root) {
   dashboardProjectRoot = String(root || '').trim();
   const input = document.getElementById('new-session-project-root');
-  if (input && dashboardProjectRoot && !input.value.trim()) input.value = dashboardProjectRoot;
+  if (input && dashboardProjectRoot && !input.value.trim()
+      && newSessionPathPrefillable(dashboardProjectRoot)) {
+    input.value = dashboardProjectRoot;
+  }
   updateNewSessionProjectPrefills();
   if (input) input.title = input.value.trim() || dashboardProjectRoot;
   scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
@@ -868,9 +871,21 @@ async function ensureNewSessionProjectDirectory(projectRoot) {
   return createdPath;
 }
 
+// Temp-shaped paths (agent rigs, e2e homes, OS temp) dominate recent
+// sessions on busy machines; never suggest one, and never auto-fill the
+// project input with one. Typing a temp path stays possible — this only
+// stops the dashboard from proposing it. (sessionPathLooksTemporary is
+// declared in a later fragment; calls here run at event time, after all
+// fragments are parsed.)
+function newSessionPathPrefillable(path) {
+  if (!path) return false;
+  return !(typeof sessionPathLooksTemporary === 'function' && sessionPathLooksTemporary(path));
+}
+
 function addNewSessionProjectPrefill(options, seen, value, source, sessionId = '') {
   const path = String(value || '').trim();
   if (!path || seen.has(path)) return;
+  if (!newSessionPathPrefillable(path)) return;
   seen.add(path);
   const sid = shortSessionId(sessionId);
   options.push({
