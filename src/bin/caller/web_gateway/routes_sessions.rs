@@ -3431,20 +3431,23 @@ pub(crate) async fn handle_worktrees_list(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// GET /api/displays + the tunnel's `api_displays`: the OS display
+/// enumeration annotated with live capture state, under the
+/// wildcard-CORS tail (transport-unification design §2.1, S5).
+pub(crate) async fn displays_api_response(
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) -> ApiResponse {
+    session_wildcard_json_response(200, displays_response_body(session_registry).await)
+}
+
 pub(crate) async fn handle_displays(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     session_registry: Option<crate::display::SharedSessionRegistry>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    // Display enumeration endpoint
-    use tokio::io::AsyncWriteExt;
-    let body = displays_response_body(&session_registry).await;
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = displays_api_response(&session_registry).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 #[cfg(test)]
@@ -6132,6 +6135,36 @@ mod tests {
         assert_eq!(
             fission,
             golden_session_json_transcript("200 OK", r#"{"groups":[]}"#)
+        );
+    }
+
+    // ── S5 golden transcript: displays ──
+    // Second S5 slice (info/displays/diagnostics), same discipline as
+    // the sets above: captured before the transport-neutral conversion.
+
+    #[tokio::test]
+    async fn golden_displays_transcript() {
+        // The display list is an OS enumeration (machine-dependent
+        // body), so it is computed through the untouched builder with
+        // no session registry and spliced — the wildcard-CORS 200
+        // framing is the byte-exact pin.
+        let body = displays_response_body(&None).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["displays"].is_array(), "displays array: {body}");
+        assert!(
+            parsed.get("virtual_displays_available").is_some(),
+            "capability flag: {body}"
+        );
+        let cors = crate::gateway_routes::match_route("GET", "/api/displays")
+            .expect("displays route declared")
+            .0
+            .cors;
+        let response =
+            collect_session_handler_response(|stream| handle_displays(stream, None, cors, None))
+                .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", &body)
         );
     }
 

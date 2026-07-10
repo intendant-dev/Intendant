@@ -762,13 +762,39 @@ pub(crate) async fn serve_http_request(
                     .await;
             }
             RouteHandlerId::ExternalAgents => {
-                return handle_external_agents(stream, project_root).await;
+                // The transport edge resolves the ambient home; the
+                // handler below it is path-parameterized (hermeticity
+                // convention).
+                return handle_external_agents(
+                    stream,
+                    project_root,
+                    crate::platform::home_dir(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::DiagnosticsVisualFreshness => {
-                return handle_diagnostics_visual_freshness(stream, route_body, request_line).await;
+                // Same seam: dispatch resolves the state dir the sink
+                // appends under.
+                return handle_diagnostics_visual_freshness(
+                    stream,
+                    route_body,
+                    request_line,
+                    crate::platform::intendant_home(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::Displays => {
-                return handle_displays(stream, session_registry).await;
+                return handle_displays(
+                    stream,
+                    session_registry,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::Doorbell => {
                 return handle_doorbell(

@@ -459,16 +459,18 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
 /// when this daemon last ran a session with it. Deliberately independent
 /// of provider fueling — external agents bring their own credentials, so
 /// the dashboard pairs this with the `fueled` flag instead of letting the
-/// first-run nudge claim an unfueled daemon can't do anything.
-pub(crate) fn external_agents_response_body(project_root: Option<&Path>) -> String {
+/// first-run nudge claim an unfueled daemon can't do anything. `home`
+/// arrives from the transport edge (last-run recency and local-login
+/// probes read under it), so tests inject a tempdir instead of reading
+/// the live account (the CLAUDE.md tests-are-hermetic convention).
+pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &Path) -> String {
     let agent_config = project_root
         .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
         .map(|project| project.config.agent)
         .unwrap_or_default();
-    let home = crate::platform::home_dir();
     serde_json::json!({
         "external_agents":
-            crate::external_agent::backend_availability_json(&agent_config, &home),
+            crate::external_agent::backend_availability_json(&agent_config, home),
     })
     .to_string()
 }
@@ -522,7 +524,7 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
     }
 
     // Read existing content (may not exist yet).
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let existing = std::fs::read_to_string(env_path).unwrap_or_default();
 
     // Build updated content: replace existing lines, append new ones.
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
@@ -551,7 +553,7 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
 
     let new_content = lines.join("\n") + "\n";
 
-    if let Err(e) = crate::file_watcher::atomic_write(&env_path, new_content.as_bytes()) {
+    if let Err(e) = crate::file_watcher::atomic_write(env_path, new_content.as_bytes()) {
         return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
     }
 
@@ -633,6 +635,18 @@ pub(crate) fn project_root_api_response(project_root: Option<&Path>) -> ApiRespo
     )
 }
 
+/// GET /api/external-agents + the tunnel's `api_external_agents`.
+/// `home` arrives from the transport edge (hermeticity convention).
+pub(crate) fn external_agents_api_response(
+    project_root: Option<&Path>,
+    home: &Path,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(external_agents_response_body(project_root, home)),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // MCP-over-HTTP (Streamable HTTP) types
 // ---------------------------------------------------------------------------
@@ -698,15 +712,15 @@ pub(crate) async fn handle_api_key_status(
     write_api_response(stream, api_key_status_api_response(), cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<PathBuf>) {
-    use tokio::io::AsyncWriteExt;
-    let body = external_agents_response_body(project_root.as_deref());
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_external_agents(
+    stream: DemuxStream,
+    project_root: Option<PathBuf>,
+    home: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = external_agents_api_response(project_root.as_deref(), &home);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 #[cfg(test)]
@@ -1225,6 +1239,48 @@ mod tests {
         assert_eq!(
             set_api_keys_result(None, &body),
             r#"{"error":"Cannot determine config directory"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_external_agents_transcripts() {
+        // S5 second slice (info/displays/diagnostics). The availability
+        // body probes the configured commands on PATH, so it is
+        // computed through the untouched builder over an injected temp
+        // home (no live-account reads) and spliced — the canonical 200
+        // framing is the byte-exact pin.
+        let home = tempfile::tempdir().unwrap();
+        let body = external_agents_response_body(None, home.path());
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed["external_agents"].is_array(),
+            "availability array expected: {body}"
+        );
+        let cors = settings_route_cors("GET", "/api/external-agents");
+        let home_path = home.path().to_path_buf();
+        let response = collect_settings_handler_response(|stream| {
+            handle_external_agents(stream, None, home_path, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+
+        // A tempdir project root loads the default agent config — same
+        // framing, same builder.
+        let root = tempfile::tempdir().unwrap();
+        let body =
+            external_agents_response_body(Some(root.path()), home.path());
+        let root_path = root.path().to_path_buf();
+        let home_path = home.path().to_path_buf();
+        let response = collect_settings_handler_response(|stream| {
+            handle_external_agents(stream, Some(root_path), home_path, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
         );
     }
 
