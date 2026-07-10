@@ -1050,7 +1050,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::ExternalAgents,
         "Detected external coding agents (codex, claude)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_external_agents")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/diagnostics/visual-freshness"),
@@ -1058,7 +1059,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES),
         RouteHandlerId::DiagnosticsVisualFreshness,
         "Visual-freshness diagnostics transcript sink (NDJSON body)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_diagnostics_visual_freshness")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/displays"),
@@ -1066,7 +1068,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::Displays,
         "Enumerate active displays",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_displays")),
     // ── Public doorbell + signed org endpoints. The payload's own
     //    signature/shape is the authority; RouteAuthz::Public makes the
     //    no-IAM-gate decision explicit (these paths are also exempted by

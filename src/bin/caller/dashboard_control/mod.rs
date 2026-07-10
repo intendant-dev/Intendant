@@ -283,7 +283,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
-    method("api_displays", PeerOperation::DisplayView),
+    // api_displays and api_diagnostics_visual_freshness live as tunnel
+    // columns on their route rows (S5); the signaling/authority methods
+    // below stay residue (their HTTP-era twin is /ws, not a route).
     method(
         "api_display_input_authority_snapshot",
         PeerOperation::DisplayInput,
@@ -294,10 +296,6 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     ),
     method(
         "api_display_input_authority_release",
-        PeerOperation::DisplayInput,
-    ),
-    method(
-        "api_diagnostics_visual_freshness",
         PeerOperation::DisplayInput,
     ),
     method("api_control_msg", PeerOperation::Message),
@@ -325,8 +323,8 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     ),
     method("api_dashboard_bootstrap", PeerOperation::SessionInspect),
     // The api_managed_context_* trio lives as tunnel columns on the
-    // /api/managed-context/* route rows (S4c).
-    method("api_external_agents", PeerOperation::SessionInspect),
+    // /api/managed-context/* route rows (S4c); api_external_agents on
+    // its row (S5).
 ];
 
 /// The effective method table: route-row tunnel specs first (in ROUTES
@@ -3288,7 +3286,7 @@ mod tests {
             ("api_fs_delete", Row, Some(Op::FilesystemWrite)),
             ("api_display_bootstrap", Residue, Some(Op::DisplayView)),
             ("api_display_webrtc_signal", Residue, Some(Op::DisplayView)),
-            ("api_displays", Residue, Some(Op::DisplayView)),
+            ("api_displays", Row, Some(Op::DisplayView)),
             (
                 "api_display_input_authority_snapshot",
                 Residue,
@@ -3306,7 +3304,7 @@ mod tests {
             ),
             (
                 "api_diagnostics_visual_freshness",
-                Residue,
+                Row,
                 Some(Op::DisplayInput),
             ),
             ("api_control_msg", Residue, Some(Op::Message)),
@@ -3367,7 +3365,7 @@ mod tests {
                 Row,
                 Some(Op::SessionInspect),
             ),
-            ("api_external_agents", Residue, Some(Op::SessionInspect)),
+            ("api_external_agents", Row, Some(Op::SessionInspect)),
         ];
 
         // Live partition: rows first (the resolution order), then the

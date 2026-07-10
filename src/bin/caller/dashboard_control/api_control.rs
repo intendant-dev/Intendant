@@ -27,9 +27,9 @@ pub(crate) async fn api_displays_response(id: String, runtime: &ControlRuntime) 
         let session = runtime.shared_session.read().await;
         session.session_registry.clone()
     };
-    json_body_response(
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::displays_response_body(&session_registry).await,
+        crate::web_gateway::displays_api_response(&session_registry).await,
         "displays",
     )
 }
@@ -1114,9 +1114,14 @@ pub(crate) async fn api_dashboard_action_msg_response(
     })
 }
 
+/// `state_dir` arrives from the dispatch arm — the transport edge
+/// resolves `platform::intendant_home()`, so tests inject a tempdir
+/// instead of appending to the live diagnostics store (the CLAUDE.md
+/// tests-are-hermetic convention).
 pub(crate) async fn api_diagnostics_visual_freshness_response(
     id: String,
     params: Option<&serde_json::Value>,
+    state_dir: PathBuf,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
@@ -1134,25 +1139,23 @@ pub(crate) async fn api_diagnostics_visual_freshness_response(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::diagnostics::append_visual_freshness_record(&session_id, body.as_bytes())
+        crate::web_gateway::diagnostics_visual_freshness_api_response(
+            &state_dir,
+            &session_id,
+            body.as_bytes(),
+        )
     })
     .await;
-    let (status, body) = match result {
-        Ok(Ok(written)) => (
-            200,
-            serde_json::json!({"ok": true, "written": written}).to_string(),
-        ),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            (400, serde_json::json!({"error": e.to_string()}).to_string())
-        }
-        Ok(Err(e)) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
-        Err(e) => (
+    match result {
+        Ok(response) => frame_api_response(id, response, "diagnostics visual freshness"),
+        Err(e) => http_body_response(
+            id,
             500,
             serde_json::json!({"error": format!("diagnostics append task failed: {e}")})
                 .to_string(),
+            "diagnostics visual freshness",
         ),
-    };
-    http_body_response(id, status, body, "diagnostics visual freshness")
+    }
 }
 
 pub(crate) fn dashboard_control_msg_from_params(
@@ -2138,6 +2141,144 @@ mod tests {
         }
     }
 
+    // ── S5 second slice: info/displays/diagnostics (design §8) ──
+    //
+    // Extends the S5 enumeration above:
+    //
+    //  6. api_displays and api_external_agents ride the body-only
+    //     envelope; api_diagnostics_visual_freshness the
+    //     injected-status envelope — all over one neutral core each.
+    //  7. Transport-owned diagnostics decode: the tunnel pre-rejects a
+    //     missing/empty session_id and a missing body (missing-param
+    //     frames) and runs the sink on a blocking task whose failure
+    //     is its own 500 shape; HTTP hands an empty session id to the
+    //     sanitizer (400 "sanitizes to empty") and accepts an empty
+    //     body as a zero-byte append (200 written:0).
+    //  8. Header tails stay HTTP-lane decoration: displays the
+    //     wildcard-CORS-with-Cache-Control tail, the sink the bare
+    //     wildcard tail, external-agents the canonical tail.
+    //  9. The sink's state dir and external-agents' home resolve at
+    //     each transport edge; the cores are path-parameterized.
+
+    #[tokio::test]
+    async fn parity_displays_serves_the_same_body_on_both_transports() {
+        // No session registry on either lane: both render the ONE
+        // neutral enumeration (annotations need a registry; the OS
+        // display set is stable across the two back-to-back calls).
+        let rt = runtime();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response(&None).await,
+        );
+        assert_eq!(status, 200);
+        assert!(http_body["displays"].is_array(), "{http_body}");
+        let frame = api_displays_response("parity-displays".to_string(), &rt).await;
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_external_agents_shares_the_availability_body() {
+        // Injected temp home on both lanes (a fixture must never scan
+        // the live account's last-run state); the tunnel frames the
+        // one neutral fn body-only.
+        let home = tempfile::tempdir().expect("temp home");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::external_agents_api_response(None, home.path()),
+        );
+        assert_eq!(status, 200);
+        assert!(http_body["external_agents"].is_array(), "{http_body}");
+        let frame = frame_api_json_body_response(
+            "parity-external-agents".to_string(),
+            crate::web_gateway::external_agents_api_response(None, home.path()),
+            "external agents",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_diagnostics_sink_shares_bodies_with_status_metadata() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let ndjson = "{\"t\":\"session_start\"}\n";
+
+        // Success: same written count from the one sink core; the
+        // tunnel adds the injected-status metadata.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::diagnostics_visual_freshness_api_response(
+                state_dir.path(),
+                "vf-parity-http",
+                ndjson.as_bytes(),
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"ok": true, "written": ndjson.len()})
+        );
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "vf-parity-tunnel",
+                "body": ndjson,
+            })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+
+        // Unusable (but present) session id: the shared sanitizer 400,
+        // identical bodies (difference #7 — the empty id never reaches
+        // the tunnel core; this one does on both lanes).
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::diagnostics_visual_freshness_api_response(
+                state_dir.path(),
+                "///",
+                ndjson.as_bytes(),
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-bad".to_string(),
+            Some(&serde_json::json!({ "session_id": "///", "body": ndjson })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Tunnel-only pre-rejections (difference #7): missing params
+        // never reach the sink core.
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-missing".to_string(),
+            None,
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing session_id");
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-nobody".to_string(),
+            Some(&serde_json::json!({ "session_id": "vf-parity-tunnel" })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing body");
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 
@@ -2529,17 +2670,19 @@ mod tests {
 
     #[tokio::test]
     async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
-        let session_id = format!("dashboard-control-test-vf-{}", std::process::id());
-        if let Some(path) = crate::diagnostics::visual_freshness_path(&session_id) {
-            let _ = std::fs::remove_file(&path);
-        }
+        // Injected state dir: the append lands in the fixture's tempdir,
+        // never the live diagnostics store (hermeticity convention; the
+        // dispatch arm resolves the real dir in production).
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let session_id = "dashboard-control-test-vf";
         let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
         let response = api_diagnostics_visual_freshness_response(
             "diag-vf".to_string(),
             Some(&serde_json::json!({
-                "session_id": session_id.clone(),
+                "session_id": session_id,
                 "body": ndjson,
             })),
+            state_dir.path().to_path_buf(),
         )
         .await;
         assert_eq!(response["t"], "response");
@@ -2548,11 +2691,10 @@ mod tests {
         assert_eq!(response["result"]["_httpStatus"], 200);
         assert_eq!(response["result"]["written"], ndjson.len());
 
-        let path =
-            crate::diagnostics::visual_freshness_path(&session_id).expect("diagnostics path");
+        let path = crate::diagnostics::visual_freshness_path_in(state_dir.path(), session_id)
+            .expect("diagnostics path");
         let written = std::fs::read_to_string(&path).expect("diagnostics transcript");
         assert_eq!(written, ndjson);
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
