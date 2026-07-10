@@ -177,6 +177,52 @@ pub struct UserQuestion {
     pub multi_select: bool,
 }
 
+/// Urgency of an agent→user notification (`notify_user`). A closed
+/// vocabulary — each level opts into strictly more delivery surfaces:
+/// `info` renders in the dashboard (toast + transcript row) only;
+/// `attention` additionally registers in the attention center (tab badge +
+/// hidden-tab browser Notification); `urgent` additionally nudges the
+/// Connect rendezvous immediately (Web Push to opted-in browsers, no
+/// pending-grace wait — still per-session cooldown-paced). `urgent` is
+/// also the designed attach point for future audible/voice escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationUrgency {
+    Info,
+    Attention,
+    Urgent,
+}
+
+impl NotificationUrgency {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotificationUrgency::Info => "info",
+            NotificationUrgency::Attention => "attention",
+            NotificationUrgency::Urgent => "urgent",
+        }
+    }
+
+    /// Parse a wire/CLI urgency string. `None`/empty defaults to `Info`;
+    /// unknown values are an error (closed vocabulary, never guessed).
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(NotificationUrgency::Info),
+            Some("info") => Ok(NotificationUrgency::Info),
+            Some("attention") => Ok(NotificationUrgency::Attention),
+            Some("urgent") => Ok(NotificationUrgency::Urgent),
+            Some(other) => Err(format!(
+                "unknown urgency '{other}'; expected info, attention, or urgent"
+            )),
+        }
+    }
+}
+
+impl Default for NotificationUrgency {
+    fn default() -> Self {
+        NotificationUrgency::Info
+    }
+}
+
 /// Serde default for fields whose wire absence means `true` (lines
 /// written before the field existed keep their historical meaning).
 fn default_true() -> bool {
@@ -248,6 +294,20 @@ pub enum OutboundEvent {
     },
     AskHuman {
         question: String,
+    },
+    /// Fire-and-forget agent→user notification (`notify_user`). Display
+    /// only — never enters any model context and never blocks the agent.
+    /// `urgency` steers delivery escalation (see [`NotificationUrgency`]).
+    UserNotification {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        text: String,
+        #[serde(default)]
+        urgency: NotificationUrgency,
+        ts: u64,
     },
     TaskComplete {
         #[serde(default, skip_serializing_if = "Option::is_none")]

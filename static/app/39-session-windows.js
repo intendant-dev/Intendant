@@ -1342,6 +1342,11 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
       attachment_previews: sessionNoteAttachmentPreviews(entry),
     };
   }
+  if (event === 'user_notification') {
+    const command = userNotificationLogCommand(entry);
+    if (!command) return null;
+    return { ...base, ...command };
+  }
   if (event === 'model_response') {
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();

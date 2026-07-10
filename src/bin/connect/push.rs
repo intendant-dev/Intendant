@@ -388,9 +388,11 @@ pub(crate) fn notify_signing_payload(
 }
 
 /// Request kinds a nudge may name. A closed vocabulary — extending it is a
-/// deliberate act on both binaries (planned: display requests, agent
-/// notify), never free text from the wire.
-const NOTIFY_KINDS: &[&str] = &["approval", "question"];
+/// deliberate act on both binaries (planned: display requests), never free
+/// text from the wire. `notify` is an urgent `notify_user` agent
+/// notification escalated by the daemon's attention monitor
+/// (`src/bin/caller/attention_nudge.rs`).
+const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify"];
 
 /// Compose the Web Push payload for a pending-request nudge.
 ///
@@ -412,6 +414,12 @@ pub(crate) fn attention_push_payload(
         "question" => (
             format!("{daemon_label}: the agent has a question"),
             format!("Session \u{201c}{session_label}\u{201d} is waiting for your answer."),
+        ),
+        // Deliberately content-free: the notification text itself never
+        // leaves the daemon — only the fact that an urgent one exists.
+        "notify" => (
+            format!("{daemon_label}: urgent agent notification"),
+            format!("Session \u{201c}{session_label}\u{201d} needs your attention."),
         ),
         _ => (
             format!("{daemon_label}: approval needed"),
@@ -890,6 +898,16 @@ mod tests {
             question["body"],
             "Session \u{201c}s-1\u{201d} is waiting for your answer."
         );
+
+        // The urgent-notification kind stays content-free too: the
+        // notification's own text/title never ride the push — only the
+        // fact that an urgent one exists in a labeled session.
+        let notify = attention_push_payload("notify", "workshop", "s-1", "daemon-1");
+        assert_eq!(notify["title"], "workshop: urgent agent notification");
+        assert_eq!(
+            notify["body"],
+            "Session \u{201c}s-1\u{201d} needs your attention."
+        );
     }
 
     /// The nudge request wire shape has no content-bearing fields: an old
@@ -899,7 +917,7 @@ mod tests {
     #[test]
     fn notify_request_kinds_are_a_closed_vocabulary() {
         for kind in NOTIFY_KINDS {
-            assert!(matches!(*kind, "approval" | "question"));
+            assert!(matches!(*kind, "approval" | "question" | "notify"));
         }
         let parsed: DaemonNotifyRequest = serde_json::from_value(json!({
             "protocol": "intendant-connect-daemon-notify-v1",

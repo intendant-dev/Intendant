@@ -870,6 +870,16 @@ body.display-fullscreen-open {
 .log-entry[data-kind="session_note"] > .log-level {
   color: var(--mauve);
 }
+/* Agent→user notifications (notify_user / ctl notify): same treatment in
+   the alert accent so they read apart from notes and run output. */
+.log-entry[data-kind="user_notification"] {
+  border-left: 2px solid var(--peach);
+  background: color-mix(in srgb, var(--peach) 6%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.log-entry[data-kind="user_notification"] > .log-level {
+  color: var(--peach);
+}
 .pending-attachment-chip .chip-remove {
   width: 14px;
   height: 14px;
