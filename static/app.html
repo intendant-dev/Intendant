@@ -50129,6 +50129,17 @@ function handleSessionNoteEvent(d) {
   stationScheduleUpdate();
 }
 
+// QA readback (window.qa convention): the dashboard validator exercises
+// the note rail's module-scoped pieces directly — the attachment strip
+// (including its deleted-blob chip degradation) and the wire-event
+// normalizer. Side-effect-free beyond the DOM node the caller passes in.
+window.qa = Object.assign(window.qa || {}, {
+  sessionNotes: {
+    renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
+    logCommand: (d) => sessionNoteLogCommand(d),
+  },
+});
+
 // Bootstrap-replay adapter: the WASM activity-feed pipeline only carries
 // log_entry-shaped replay rows (AddLogEntry has no attachment fields), so
 // session_note entries replay as note-styled text entries; the session
