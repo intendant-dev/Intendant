@@ -533,8 +533,17 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   respawned `--fork-session` child whose first prompt carries the side
   boundary (inherited history is reference-only, no mutations) plus the
   question, and whose lineage persists as `fork_relationship: "side"` —
-  the identity upgrade emits a `side` relationship, so the dashboard
-  renders a side child window, fully conversable for follow-ups. Both
+  the identity upgrade emits an ephemeral `side` relationship (same flag
+  as Codex's in-process side start), so the dashboard renders a side
+  child window, fully conversable for follow-ups. The side contract text
+  is `external_agent::SIDE_CONVERSATION_CONTRACT`, shared verbatim with
+  Codex's side-thread developer instructions; display surfaces (session
+  meta, `SessionStarted`) strip the contract and show the bare question.
+  Unlike a Codex side thread there is no `side-close` — the respawned
+  child is its own live backend, so the dashboard offers **Stop session**
+  for it (the kebab's Close side appears only when the parent advertises
+  `side-close`). With `max_budget_usd` set, forks and side children
+  inherit the parent's counted spend (see the config reference). Both
   dispatch sites (the external drain and the presence loop's inline
   mirror) share `respawn_resume_thread_action`.
 - **Live reconfig** (wired): `control_request` subtypes `set_model` and

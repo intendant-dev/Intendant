@@ -672,7 +672,12 @@ impl SessionSupervisor {
             )
         });
 
-        write_session_meta(&session_log, &project.root, Some(&resume_task), None);
+        // A respawned side child's task is the contract prologue + question;
+        // display surfaces (session meta, SessionStarted) get the bare
+        // question while the agent still receives the full blob.
+        let display_task = crate::thread_actions::side_respawn_display_task(&resume_task)
+            .unwrap_or_else(|| resume_task.clone());
+        write_session_meta(&session_log, &project.root, Some(&display_task), None);
         if let Some(config) = effective_session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
@@ -684,8 +689,17 @@ impl SessionSupervisor {
             .and_then(|config| config.codex_home.clone());
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
-            session_id: live_session_id.clone(),
-            task: Some(resume_task.clone()),
+            // A fork materializes a NEW wrapper session: announce it under
+            // the child's own id — the resume token is the PARENT's native
+            // id, and stamping the parent's window with the fork's task
+            // mislabels it. (Non-fork resumes keep addressing the resumed
+            // session itself.)
+            session_id: if fork {
+                intendant_session_id.clone()
+            } else {
+                live_session_id.clone()
+            },
+            task: Some(display_task.clone()),
         });
 
         let session_dir = session_log

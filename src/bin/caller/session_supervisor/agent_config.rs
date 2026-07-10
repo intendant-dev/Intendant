@@ -708,6 +708,12 @@ pub(crate) fn apply_session_codex_context_archive(
     }
 }
 
+/// Rebuild the effective per-session config from the project, re-applying
+/// the per-session facts a project can never supply. This enumerates fields
+/// by hand (the pin policy): when adding a `SessionAgentConfig` field that
+/// isn't project-derivable, extend BOTH `merge_missing_from` and this
+/// copy-over, plus the preservation test below — a field missed here
+/// silently reverts to the project default on the rebuild.
 pub(crate) fn effective_session_agent_config_from_project(
     backend: &external_agent::AgentBackend,
     project: &Project,

@@ -1250,8 +1250,10 @@ pub enum ControlMsg {
         model: Option<String>,
     },
     /// Set the Claude Code permission mode (`--permission-mode`):
-    /// `"default" | "acceptEdits" | "plan" | "bypassPermissions"` (legacy
-    /// `"auto"` normalizes to `"default"`). Applies to the NEXT task.
+    /// `"default" | "acceptEdits" | "plan" | "auto" | "dontAsk" |
+    /// "bypassPermissions"` (`"manual"` and empty normalize to `"default"`;
+    /// see `project::normalize_claude_permission_mode`). Applies to the
+    /// NEXT task.
     SetClaudePermissionMode {
         mode: String,
     },

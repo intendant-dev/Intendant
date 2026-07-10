@@ -2118,7 +2118,12 @@ function cacheSessionUsage(c) {
 }
 
 function usageForForegroundSession() {
-  const sid = resolvePromptTargetSessionId();
+  // Explicit focus, not the prompt-target resolver: its "best usable
+  // window" fallbacks would render some other session's usage while the
+  // user looks at an unfocused/ended window (global usage is the honest
+  // answer when nothing is focused).
+  const sid = typeof explicitForegroundSessionId === 'function'
+    ? explicitForegroundSessionId() : '';
   if (sid) {
     if (sessionUsageById.has(sid)) return sessionUsageById.get(sid);
     // External sessions re-key the foreground to the backend-native id
@@ -2168,26 +2173,29 @@ function applyMainBackendStatus() {
 }
 
 function updateStatusBar(d) {
-  if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
-  if (d.model) document.getElementById('sb-model').textContent = d.model;
-  if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
-  if (d.budget_pct !== undefined && d.budget_pct !== null) {
-    // Status events are session-scoped: only the foreground session's
-    // budget may drive the header meter. Unscoped ticks (daemon primary)
-    // apply only while no session window is focused — a busy background
-    // session used to stomp the meter on every status tick, freezing the
-    // number across grid-window switches.
-    const statusSid = String(d.session_id || '').trim();
-    const foreground = typeof resolvePromptTargetSessionId === 'function'
-      ? resolvePromptTargetSessionId() : '';
-    const drivesForeground = !foreground
-      ? true
-      : (statusSid
-          ? (statusSid === foreground
-             || (typeof relatedSessionIdsForSession === 'function'
-                 && relatedSessionIdsForSession(statusSid).has(foreground)))
-          : false);
-    if (drivesForeground) setContextUsagePct(d.budget_pct);
+  // Status events are session-scoped: only the explicitly focused session
+  // may drive the session-scoped header chips (provider, model, turn,
+  // context meter). Unscoped ticks (daemon primary) apply only while no
+  // session window is focused — a busy background session used to stomp
+  // the chips on every status tick, freezing them across grid-window
+  // switches. Explicit focus, not the prompt-target resolver: its
+  // "best usable window" fallbacks would hand the header to a session the
+  // user is not looking at.
+  const statusSid = String(d.session_id || '').trim();
+  const foreground = typeof explicitForegroundSessionId === 'function'
+    ? explicitForegroundSessionId() : '';
+  const drivesForeground = !foreground
+    ? true
+    : (statusSid
+        ? (statusSid === foreground
+           || (typeof relatedSessionIdsForSession === 'function'
+               && relatedSessionIdsForSession(statusSid).has(foreground)))
+        : false);
+  if (drivesForeground) {
+    if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
+    if (d.model) document.getElementById('sb-model').textContent = d.model;
+    if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
+    if (d.budget_pct !== undefined && d.budget_pct !== null) setContextUsagePct(d.budget_pct);
   }
   if (d.autonomy) {
     const el = document.getElementById('sb-autonomy');

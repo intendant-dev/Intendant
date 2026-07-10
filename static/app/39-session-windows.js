@@ -192,6 +192,14 @@ function discardPromptTargetReference(sessionId) {
   if (currentSessionFullId === sid) currentSessionFullId = '';
 }
 
+// Explicit focus only — none of resolvePromptTargetSessionId's routing
+// fallbacks: the status-bar gate must never let a "best guess" session
+// drive the header chips while the user is looking at a different window.
+// Empty when no session window is explicitly focused.
+function explicitForegroundSessionId() {
+  return String(foregroundSessionFullId || currentSessionFullId || '').trim();
+}
+
 function resolvePromptTargetSessionId() {
   for (const sid of [foregroundSessionFullId, currentSessionFullId]) {
     if (!sid) continue;

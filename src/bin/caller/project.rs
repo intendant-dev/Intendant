@@ -484,6 +484,23 @@ pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
 /// coerced to `default` here (pre-2.1.83 CLIs silently coerced it); now
 /// that it is a documented mode it passes through. Unknown values pass
 /// through trimmed for forward compatibility with newer CLIs.
+/// Canonical Claude Code permission-mode vocabulary — the normalizer's
+/// output set, in display order. The frontend mirrors (the dashboard
+/// selects in `static/app/20-shell.html` and `static/app/21-access-dialogs.html`,
+/// the Station pane mode gate in `static/app/34-station-panes.js`, and the
+/// station-web pill row in `crates/station-web/src/hud/panels.rs`) are
+/// pinned to this list by
+/// `claude_permission_mode_mirrors_carry_the_canonical_vocabulary` — extend
+/// the list and every mirror in the same change.
+pub const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
+
 pub fn normalize_claude_permission_mode(mode: &str) -> String {
     let trimmed = mode.trim();
     match trimmed.to_ascii_lowercase().as_str() {
@@ -1250,6 +1267,28 @@ impl Project {
                     config.agent.codex.context_archive
                 );
             }
+            // "auto" changed meaning when Claude Code 2.1.206 made it a real
+            // CLI mode: older Intendant coerced it to "default" (prompt for
+            // everything), so a pre-existing config now silently escalates
+            // to classifier auto-approval without this notice.
+            if config
+                .agent
+                .claude_code
+                .permission_mode
+                .trim()
+                .eq_ignore_ascii_case("auto")
+            {
+                eprintln!(
+                    "[project] intendant.toml [agent.claude_code] permission_mode = \"auto\" now selects the claude CLI's auto-approval mode (2.1.206+); older Intendant treated it as \"default\" (prompt for everything) — set \"default\" explicitly if you want prompting"
+                );
+            }
+            if let Some(budget) = config.agent.claude_code.max_budget_usd {
+                if !(budget.is_finite() && budget > 0.0) {
+                    eprintln!(
+                        "[project] intendant.toml [agent.claude_code] max_budget_usd = {budget} is not a positive dollar amount; Claude Code sessions will refuse to spawn until it is fixed or unset"
+                    );
+                }
+            }
             config
         } else {
             ProjectConfig::default()
@@ -1328,6 +1367,51 @@ mod tests {
         // Whitespace-only entries behave like unset.
         cfg.managed_command = Some("   ".to_string());
         assert_eq!(cfg.effective_command(true), "codex");
+    }
+
+    #[test]
+    fn claude_permission_mode_mirrors_carry_the_canonical_vocabulary() {
+        // The canonical list is the normalizer's own output set…
+        for mode in CLAUDE_PERMISSION_MODES {
+            assert_eq!(
+                normalize_claude_permission_mode(mode),
+                mode,
+                "canonical mode {mode} must survive normalization"
+            );
+        }
+        // …and every static frontend mirror must carry all of it, so a mode
+        // added to the vocabulary without extending a mirror fails here
+        // instead of shipping as silent frontend drift.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+        let shell = read("static/app/20-shell.html");
+        let dialogs = read("static/app/21-access-dialogs.html");
+        let panes = read("static/app/34-station-panes.js");
+        let pills = read("crates/station-web/src/hud/panels.rs");
+        for mode in CLAUDE_PERMISSION_MODES {
+            for (name, hay, needle) in [
+                ("static/app/20-shell.html", &shell, format!("value=\"{mode}\"")),
+                (
+                    "static/app/21-access-dialogs.html",
+                    &dialogs,
+                    format!("value=\"{mode}\""),
+                ),
+                ("static/app/34-station-panes.js", &panes, format!("'{mode}'")),
+                (
+                    "crates/station-web/src/hud/panels.rs",
+                    &pills,
+                    format!("\"{mode}\""),
+                ),
+            ] {
+                assert!(
+                    hay.contains(&needle),
+                    "{name} is missing permission mode {mode} (looked for {needle}); \
+                     extend the mirror alongside CLAUDE_PERMISSION_MODES"
+                );
+            }
+        }
     }
 
     #[test]

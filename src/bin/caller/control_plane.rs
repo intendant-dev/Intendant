@@ -491,6 +491,15 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
         }
         ControlMsg::SetClaudePermissionMode { mode } => {
             let normalized = crate::project::normalize_claude_permission_mode(mode);
+            // Unknown values deliberately pass through to `--permission-mode`
+            // (future CLI modes stay usable without an Intendant update), but
+            // a typo would only surface at the NEXT spawn — warn at ingestion.
+            if !crate::project::CLAUDE_PERMISSION_MODES.contains(&normalized.as_str()) {
+                eprintln!(
+                    "[control_plane] claude_code.permission_mode {normalized:?} is not a known mode; passing it to the CLI as-is (known: {})",
+                    crate::project::CLAUDE_PERMISSION_MODES.join(", ")
+                );
+            }
             {
                 let mut guard = state.claude_config.write().await;
                 guard.permission_mode = normalized.clone();

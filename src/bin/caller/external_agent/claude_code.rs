@@ -1152,6 +1152,10 @@ impl CcReader {
         }
         let is_agent_task = match msg.get("task_type").and_then(|v| v.as_str()) {
             Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
+            // Pre-task_type CLIs (< 2.1.206) emitted task_started only for
+            // Agent spawns, and those payloads carried `subagent_type` +
+            // `prompt` (live-probed); Bash payloads carry neither, so this
+            // affirmative check stays fail-closed for unknown task kinds.
             None => {
                 msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
                     || msg.get("prompt").and_then(|v| v.as_str()).is_some()
@@ -1648,7 +1652,9 @@ impl CcReader {
                 // The budget backstop is cumulative for the process AND its
                 // resumes — without a hint this reads as a mystery failure.
                 let recovery_hint = (subtype == "error_max_budget_usd").then(|| {
-                    "The session hit its --max-budget-usd backstop; raise \
+                    "The session hit its --max-budget-usd backstop (spend is \
+                     cumulative across resumes, and forks/side conversations \
+                     inherit the parent session's counted spend); raise \
                      [agent.claude_code] max_budget_usd (or unset it) and \
                      restart the session"
                         .to_string()
@@ -1896,7 +1902,10 @@ pub struct ClaudeCodeAgent {
     /// Hard dollar backstop for `--max-budget-usd`; `None` omits the flag.
     /// On exceed the CLI fails every further turn with a `result` of
     /// subtype `error_max_budget_usd` (probed 2.1.206) — cumulative across
-    /// the process and its resumes.
+    /// the process, its resumes, AND forks (a forked child inherits the
+    /// parent's counted spend, probed: forking an over-budget parent fails
+    /// immediately). Deliberately still armed on forks — an uncapped
+    /// side/fork child would violate the operator's explicit ceiling.
     max_budget_usd: Option<f64>,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
@@ -1967,9 +1976,20 @@ impl ClaudeCodeAgent {
 
     /// Arm the CLI-enforced dollar backstop (`--max-budget-usd`). Kept out
     /// of `new()` so the many existing constructor sites stay unchanged.
+    /// The value is kept verbatim and validated at `initialize`: a
+    /// non-positive or non-finite cap refuses the spawn instead of silently
+    /// disarming (fail-closed — and the CLI itself crashes on
+    /// `--max-budget-usd 0`, probed 2.1.206).
     pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
-        self.max_budget_usd = budget.filter(|b| b.is_finite() && *b > 0.0);
+        self.max_budget_usd = budget;
         self
+    }
+
+    /// The configured budget when it cannot be passed to the CLI (zero,
+    /// negative, or non-finite). `initialize` refuses to spawn on `Some`.
+    fn invalid_max_budget(&self) -> Option<f64> {
+        self.max_budget_usd
+            .filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
     /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
@@ -2169,6 +2189,13 @@ impl ExternalAgent for ClaudeCodeAgent {
         &mut self,
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+        if let Some(budget) = self.invalid_max_budget() {
+            return Err(CallerError::ExternalAgent(format!(
+                "claude-code max_budget_usd must be a positive dollar amount, got {budget}; \
+                 unset [agent.claude_code] max_budget_usd to run without the backstop \
+                 (the claude CLI itself rejects --max-budget-usd 0)"
+            )));
+        }
         self.working_dir = Some(config.working_dir.clone());
         self.resume_session = config
             .resume_session
@@ -2582,16 +2609,28 @@ mod tests {
     }
 
     #[test]
-    fn with_max_budget_usd_rejects_nonpositive() {
+    fn invalid_max_budget_flags_nonpositive_for_spawn_refusal() {
+        // A bad cap must refuse the spawn (initialize errors on
+        // `invalid_max_budget().is_some()`), never silently disarm: the CLI
+        // crashes on --max-budget-usd 0, and dropping the flag would run the
+        // session uncapped against the operator's explicit ceiling.
         let base = || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
-        assert_eq!(base().with_max_budget_usd(Some(2.5)).max_budget_usd, Some(2.5));
-        assert_eq!(base().with_max_budget_usd(Some(0.0)).max_budget_usd, None);
-        assert_eq!(base().with_max_budget_usd(Some(-1.0)).max_budget_usd, None);
+        assert_eq!(base().with_max_budget_usd(Some(2.5)).invalid_max_budget(), None);
+        assert_eq!(base().with_max_budget_usd(None).invalid_max_budget(), None);
         assert_eq!(
-            base().with_max_budget_usd(Some(f64::NAN)).max_budget_usd,
-            None
+            base().with_max_budget_usd(Some(0.0)).invalid_max_budget(),
+            Some(0.0)
         );
-        assert_eq!(base().with_max_budget_usd(None).max_budget_usd, None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(-1.0)).invalid_max_budget(),
+            Some(-1.0)
+        );
+        assert!(base()
+            .with_max_budget_usd(Some(f64::NAN))
+            .invalid_max_budget()
+            .is_some_and(f64::is_nan));
+        // The raw value is preserved so the refusal names what was configured.
+        assert_eq!(base().with_max_budget_usd(Some(0.0)).max_budget_usd, Some(0.0));
     }
 
     #[test]
