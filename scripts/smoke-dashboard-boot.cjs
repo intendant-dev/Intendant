@@ -729,7 +729,13 @@ async function main() {
       await Promise.race([new Promise((resolve) => child.once('exit', resolve)), delay(2000)]);
       if (child.exitCode === null) child.kill('SIGKILL');
     }
-    fs.rmSync(userDataDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (cleanupError) {
+      // Chromium helper processes can still be flushing the profile dir
+      // after the kill above; teardown must never outvote the verdict.
+      console.error(`profile-dir cleanup failed (ignored): ${cleanupError.message}`);
+    }
   }
   process.exit(verdict);
 }
