@@ -2305,16 +2305,19 @@ function setPhase(phase) {
   stationScheduleUpdate();
 }
 
-// Cross-tab pending-approval indicator: badge the favicon + prefix the page
-// title so a pending approval is visible even when this tab is in the
-// background. Browsers (esp. Chrome) ignore an in-place href change on the
-// existing <link rel=icon>, so we remove it and append a fresh <link> each
-// time. The badged icon is composited on a canvas (app icon + attention dot),
-// with a solid-tile fallback if the base icon can't load; the title change
-// signals it regardless of canvas support.
-const _origDocTitle = document.title;
-let _approvalIndicatorOn = false;
+// Cross-tab pending-request indicator: SUPERSEDED by the attention center
+// (57-attention-notifications.js), which tracks the full pending set
+// (approvals + questions, across sessions, from the event stream) and owns
+// the title prefix + favicon count badge. The panel show/clear paths still
+// call this hook; it just nudges the center to repaint so panel-driven
+// transitions repaint promptly.
+function setApprovalIndicator(_pending) {
+  try { attentionRepaint(); } catch (_) {}
+}
 
+// Browsers (esp. Chrome) ignore an in-place href change on the existing
+// <link rel=icon>, so replace the element wholesale. Used by the attention
+// center's favicon badge.
 function _swapFavicon(href) {
   document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
   const link = document.createElement('link');
@@ -2323,42 +2326,6 @@ function _swapFavicon(href) {
   link.type = 'image/png';
   link.href = href;
   document.head.appendChild(link);
-}
-
-function _drawApprovalBadge(ctx, size) {
-  // bottom-right attention dot with a dark ring so it reads on any icon
-  const r = size * 0.30, cx = size - r - 1, cy = size - r - 1;
-  ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, 2 * Math.PI);
-  ctx.fillStyle = '#1e1e2e'; ctx.fill();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-  ctx.fillStyle = '#f38ba0'; ctx.fill();
-}
-
-function setApprovalIndicator(pending) {
-  if (pending === _approvalIndicatorOn) return;
-  _approvalIndicatorOn = pending;
-  document.title = pending ? '● Approval needed — ' + _origDocTitle : _origDocTitle;
-  if (!pending) { _swapFavicon('/icon-128.png'); return; }
-  const size = 64;
-  const c = document.createElement('canvas');
-  c.width = size; c.height = size;
-  const ctx = c.getContext('2d');
-  const finish = function() {
-    try { if (_approvalIndicatorOn) _swapFavicon(c.toDataURL('image/png')); } catch (_) {}
-  };
-  const img = new Image();
-  img.onload = function() {
-    try { ctx.drawImage(img, 0, 0, size, size); } catch (_) {}
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.onerror = function() {
-    ctx.fillStyle = '#313244';
-    ctx.fillRect(0, 0, size, size);
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.src = '/icon-128.png';
 }
 
 function clearPendingApproval() {

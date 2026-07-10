@@ -1415,8 +1415,7 @@ pub(crate) async fn verified_daemon_request(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     rate: (&str, u32, u64),
-    protocol: &str,
-    expected_protocol: &str,
+    protocol: (&str, &str),
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
@@ -1424,7 +1423,8 @@ pub(crate) async fn verified_daemon_request(
     require_daemon_auth(state, headers)?;
     let (rate_key, rate_limit, rate_window_ms) = rate;
     check_rate_limit(state, headers, rate_key, rate_limit, rate_window_ms).await?;
-    if protocol != expected_protocol {
+    let (got_protocol, expected_protocol) = protocol;
+    if got_protocol != expected_protocol {
         return Err(ApiError::bad_request("unsupported protocol"));
     }
     let now = now_unix_ms();
@@ -1469,8 +1469,7 @@ async fn dns_request_daemon(
         state,
         headers,
         (rate_key, 30, 60_000),
-        protocol,
-        expected_protocol,
+        (protocol, expected_protocol),
         daemon_id,
         daemon_public_key,
         issued_at_unix_ms,

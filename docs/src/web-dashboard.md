@@ -202,6 +202,20 @@ Five subtabs:
   the old approve-all — it lifts every gate, and is labeled for what it is.
   Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
   input sends a message after a round completes.
+
+  Pending requests also escalate beyond the open tab (the **attention
+  center**, `static/app/57-attention-notifications.js`): every pending
+  approval/question across sessions counts into a `(N)` document-title
+  prefix and favicon badge (on by default; toggle under Settings →
+  Appearance → Notifications), and — strictly opt-in from the same
+  card, which is the only place notification permission is ever
+  requested — a browser Notification fires when a request arrives while
+  the tab is hidden; clicking it focuses the tab and the owning session.
+  The badge clears as requests resolve and drops on stream disconnect
+  (the reconnect bootstrap rebuilds what still stands). For closed tabs
+  entirely, the daemon nudges the Connect rendezvous and opted-in
+  browsers get a Web Push (see `self-hosted-rendezvous.md` —
+  Notifications; payloads never carry work content).
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
