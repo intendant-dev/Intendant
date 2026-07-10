@@ -449,19 +449,45 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::WorktreesInspect => {
-                return handle_worktrees_inspect(stream, route_body).await;
+                return handle_worktrees_inspect(
+                    stream,
+                    route_body,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesRemove => {
-                return handle_worktrees_remove(stream, route_body, worktree_inventory_cache).await;
+                return handle_worktrees_remove(
+                    stream,
+                    route_body,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesMerge => {
                 return handle_worktrees_merge(stream, route_body, worktree_inventory_cache).await;
             }
             RouteHandlerId::WorktreesScan => {
-                return handle_worktrees_scan(stream, project_root, worktree_inventory_cache).await;
+                return handle_worktrees_scan(
+                    stream,
+                    project_root,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesList => {
-                return handle_worktrees_list(stream, worktree_inventory_cache).await;
+                return handle_worktrees_list(
+                    stream,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsList => {
                 return handle_sessions_list(
@@ -586,7 +612,13 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::SessionDelete => {
-                return handle_session_delete(stream, request_line).await;
+                return handle_session_delete(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionAgentOutput => {
                 return handle_session_agent_output(
