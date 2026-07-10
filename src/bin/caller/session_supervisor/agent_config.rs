@@ -729,6 +729,12 @@ pub(crate) fn effective_session_agent_config_from_project(
         if overrides.forked_from.is_some() {
             config.forked_from = overrides.forked_from.clone();
         }
+        // The lineage KIND rides with it (side conversations emit `side`
+        // instead of `fork` at the child's identity upgrade) — verified
+        // live: dropping it here relabeled a /btw child as a plain fork.
+        if overrides.fork_relationship.is_some() {
+            config.fork_relationship = overrides.fork_relationship.clone();
+        }
     }
     config
 }
@@ -756,6 +762,29 @@ pub(crate) fn persist_external_session_name(bus: &EventBus, source: &str, sessio
 mod tests {
     use super::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    #[test]
+    fn effective_config_preserves_fork_lineage_and_kind() {
+        // The effective config is rebuilt from project defaults; fork
+        // lineage (parent id + relationship kind) must survive the rebuild
+        // or a /btw child re-labels as a plain fork (caught live).
+        let project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: Default::default(),
+        };
+        let overrides = crate::session_config::SessionAgentConfig {
+            forked_from: Some("parent-native".to_string()),
+            fork_relationship: Some("side".to_string()),
+            ..Default::default()
+        };
+        let config = effective_session_agent_config_from_project(
+            &external_agent::AgentBackend::ClaudeCode,
+            &project,
+            Some(&overrides),
+        );
+        assert_eq!(config.forked_from.as_deref(), Some("parent-native"));
+        assert_eq!(config.fork_relationship.as_deref(), Some("side"));
+    }
 
     #[tokio::test]
     async fn external_identity_moves_wrapper_session_to_backend_id() {
