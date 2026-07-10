@@ -369,6 +369,9 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
+      // Attention center (57-attention-notifications.js): tab badge +
+      // hidden-tab notifications for pending approvals/questions.
+      try { attentionObserveServerMessage(d); } catch (_) {}
       if (d.t === 'ws_denied') {
         const frame = String(d.frame || '');
         if (!wsDeniedToastShown.has(frame)) {
@@ -712,6 +715,9 @@ async function main() {
   app.set_on_server_state((connected) => {
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
+    // A dead event stream can't retract pending-request items — drop the
+    // attention badge; the reconnect bootstrap rebuilds what still stands.
+    try { attentionOnServerState(connected); } catch (_) {}
   });
 
   // ── Voice Callbacks ──

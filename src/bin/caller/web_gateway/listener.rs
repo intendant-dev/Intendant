@@ -487,6 +487,9 @@ pub fn spawn_web_gateway(
         dashboard_control.clone(),
         tcp_advertised_port,
     );
+    // Pending-request attention nudges: watch approvals/questions on the bus
+    // and ping the Connect rendezvous when they age with no dashboard around.
+    crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
     // Fleet certificates: restore any stored certificate into the live
     // SNI resolver and keep it renewed (fleet_cert.rs).
     crate::fleet_cert::refresh_installed_state();
@@ -1683,6 +1686,10 @@ pub fn spawn_web_gateway(
                     };
                     let inbound = tokio::spawn(ws_inbound_task(inbound_ctx, ws_rx, peer_id));
 
+                    // Attention-nudge presence: a live `/ws` client is the
+                    // "somebody is watching" signal that suppresses pushes.
+                    crate::attention_nudge::dashboard_connected();
+
                     // Phase 5a.1 outbound personalization plumbing: the authority
                     // change channel carries the holder's server-internal
                     // connection_id; ws_outbound_task converts each incoming change
@@ -1702,6 +1709,7 @@ pub fn spawn_web_gateway(
                     ));
 
                     let _ = tokio::join!(inbound, outbound);
+                    crate::attention_nudge::dashboard_disconnected();
                 } else {
                     let http_ctx = HttpRequestCtx {
                         bus: bus.clone(),

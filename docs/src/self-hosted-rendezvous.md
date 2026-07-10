@@ -275,13 +275,36 @@ anything that is not already org-public.
 ## Notifications
 
 Signed-in browsers can opt into Web Push alerts (Advanced →
-Notifications): the service notifies when a claimed daemon stops polling
-(default: offline for 3 minutes; `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS`)
-and when it returns. Alerts are composed purely from the polling
-presence the rendezvous already sees, payloads are encrypted to each
-browser subscription (RFC 8291 — the push relay carries ciphertext), and
-the VAPID signing key is generated automatically into the state file on
-first start. Dead subscriptions are pruned on 404/410.
+Notifications). Two alert kinds exist, flagged per subscription
+(`GET /api/push/subscriptions` lists yours;
+`POST /api/push/preferences` flips `notify_presence` /
+`notify_requests` per endpoint):
+
+- **Presence** (`notify_presence`, on by default when you enable push):
+  a claimed daemon stopped polling (default: offline for 3 minutes;
+  `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS`) or came back. Composed purely
+  from the polling presence the rendezvous already sees.
+- **Pending agent requests** (`notify_requests`, strictly opt-in): a
+  daemon reports that an agent→user request — a command approval or a
+  question — has sat unanswered with no dashboard connected
+  (`POST /api/daemon/notify`, signed with the daemon's registered
+  identity key like unclaim/DNS publishes, rate-limited, claimed daemons
+  only). **Privacy posture, load-bearing:** the nudge wire and the push
+  payload carry only the request *kind*, the daemon's display label, and
+  a session display label — never command text, question text, file
+  paths, or any other work content. The service stays zero-knowledge
+  about the work itself; the payload constructor in `push.rs` pins this
+  by test. The daemon side is conservative by construction: a 45-second
+  grace period, only when no dashboard has connected since the request
+  appeared, one nudge per session per 10 minutes, silent degrade when
+  unclaimed or offline (`attention_nudge.rs`).
+
+Payloads are encrypted to each browser subscription (RFC 8291 — the
+push relay carries ciphertext), and the VAPID signing key is generated
+automatically into the state file on first start. Dead subscriptions
+are pruned on 404/410. Self-hosters get both kinds with zero extra
+configuration — daemons pointed at your rendezvous nudge it exactly as
+they would the hosted one.
 
 ## Transparency log and attestations
 
