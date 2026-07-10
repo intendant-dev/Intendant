@@ -174,85 +174,59 @@ pub(crate) async fn handle_dashboard_targets(
 }
 
 pub(crate) async fn handle_access_org_grant_present(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     cert_dir: std::path::PathBuf,
     agent_card_value_for_targets: serde_json::Value,
+    cors: crate::gateway_routes::CorsPosture,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let response = if req_method != "POST" {
-        json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        )
-    } else {
-        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-            .map_err(|e| format!("invalid JSON: {e}"))
-            .and_then(|params| {
-                access_org_present_response_value(&cert_dir, params, &agent_card_value_for_targets)
-            }) {
-            Ok(value) => (200, value.to_string()),
-            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-        };
-        with_public_cors(json_response(status_reason(status), body))
+    // Transport-owned body decode; the doorbell's parse-error 400 rides
+    // the same public tail as its value errors.
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) => access_org_present_api_response(
+            &cert_dir,
+            params,
+            &agent_card_value_for_targets,
+        ),
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, None).await;
 }
 
 pub(crate) async fn handle_access_org_revocations(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     req_path: &str,
     cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
 ) {
-    use tokio::io::AsyncWriteExt;
     let handle = req_path
         .strip_prefix("/api/access/orgs/")
         .and_then(|rest| rest.strip_suffix("/revocations"))
         .unwrap_or("");
-    let (status, body) = match access_org_orl_response_value(&cert_dir, handle) {
-        Ok(value) => (200, value.to_string()),
-        Err(error) => (404, serde_json::json!({"error": error}).to_string()),
-    };
-    let response = with_public_cors(json_response(status_reason(status), body));
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = access_org_orl_api_response(&cert_dir, handle);
+    write_api_response(stream, response, cors, None).await;
 }
 
 pub(crate) async fn handle_access_org_apply_renew(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     req_path: &str,
     cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let response = if req_method != "POST" {
-        json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        )
-    } else {
-        // The per-path caps (ORL vs grant-doc) live on the two table rows;
-        // dispatch already read under the right one.
-        let handler = if req_path == "/api/access/orgs/revocations/apply" {
-            access_org_orl_apply_response_value
-                as fn(&std::path::Path, serde_json::Value) -> Result<serde_json::Value, String>
-        } else {
-            access_org_renew_response_value
-        };
-        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-            .map_err(|e| format!("invalid JSON: {e}"))
-            .and_then(|params| handler(&cert_dir, params))
-        {
-            Ok(value) => (200, value.to_string()),
-            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-        };
-        with_public_cors(json_response(status_reason(status), body))
+    // The per-path caps (ORL vs grant-doc) live on the two table rows;
+    // dispatch already read under the right one.
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) => {
+            if req_path == "/api/access/orgs/revocations/apply" {
+                access_org_orl_apply_api_response(&cert_dir, params)
+            } else {
+                access_org_renew_api_response(&cert_dir, params)
+            }
+        }
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, None).await;
 }
 
 pub(crate) async fn handle_access_iam_grants(
@@ -879,6 +853,47 @@ pub(crate) fn access_org_manage_api_response(
         OrgManageLeaf::IssuerInstall => access_org_issuer_install_response_value(cert_dir, params),
     };
     access_result_api_response(result, 400)
+}
+
+/// POST /api/access/org-grants + the tunnel's `api_access_org_present`
+/// (the doorbell class: the signed document is the authorization).
+pub(crate) fn access_org_present_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    agent_card: &serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(
+        access_org_present_response_value(cert_dir, params, agent_card),
+        400,
+    )
+}
+
+/// GET /api/access/orgs/{handle}/revocations + the tunnel's
+/// `api_access_org_orl` — the one doorbell leaf whose error is the
+/// historical 404 (unknown org / no root key held).
+pub(crate) fn access_org_orl_api_response(
+    cert_dir: &std::path::Path,
+    handle: &str,
+) -> ApiResponse {
+    access_result_api_response(access_org_orl_response_value(cert_dir, handle), 404)
+}
+
+/// POST /api/access/orgs/revocations/apply + the tunnel's
+/// `api_access_org_orl_apply`.
+pub(crate) fn access_org_orl_apply_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(access_org_orl_apply_response_value(cert_dir, params), 400)
+}
+
+/// POST /api/access/org-grants/renew + the tunnel's
+/// `api_access_org_renew`.
+pub(crate) fn access_org_renew_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(access_org_renew_response_value(cert_dir, params), 400)
 }
 
 pub(crate) async fn handle_access_overview(
@@ -1525,23 +1540,17 @@ pub(crate) async fn handle_access_tier_settings(
 /// used by harmless bootstrap endpoints. The same allowlist doubles as a
 /// write-side origin gate: browser-attached mTLS certificates would
 /// otherwise let any website fire state-changing requests cross-site.
+///
+/// Derived from the route table (derive, don't mirror): a path is
+/// fleet-scoped exactly when its rows declare
+/// [`crate::gateway_routes::CorsPosture::FleetAllowlist`] — the same
+/// declaration that drives dispatch rendering and the preflight, so a
+/// new fleet row's write-side origin gate can never lag its posture
+/// (the hand-kept list this replaces silently missed exactly that way).
 pub(crate) fn is_fleet_cors_access_path(req_path: &str) -> bool {
     matches!(
-        req_path,
-        "/api/access/overview"
-            | "/api/access/iam/state"
-            | "/api/access/enrollment-requests"
-            | "/api/access/enrollment-requests/decide"
-            | "/api/access/iam/user-client-grants"
-            | "/api/access/iam/grants/update"
-            | "/api/access/orgs/trust"
-            | "/api/access/orgs/revoke"
-            | "/api/access/connect/status"
-            | "/api/access/connect/claim-code"
-            | "/api/access/connect/config"
-            | "/api/access/connect/unclaim"
-            | "/api/access/tier"
-            | "/api/access/hosted-ceiling"
+        crate::gateway_routes::preflight_posture(req_path),
+        Some(crate::gateway_routes::CorsPosture::FleetAllowlist)
     )
 }
 
@@ -4270,13 +4279,16 @@ mod tests {
 
     #[tokio::test]
     async fn golden_access_org_doorbell_transcripts() {
+        let public_cors = |method: &str, path: &str| {
+            access_route_cors(method, path, crate::gateway_routes::CorsPosture::Public)
+        };
         for (method, path) in [
             ("POST", "/api/access/org-grants"),
             ("GET", "/api/access/orgs/golden-org/revocations"),
             ("POST", "/api/access/orgs/revocations/apply"),
             ("POST", "/api/access/org-grants/renew"),
         ] {
-            access_route_cors(method, path, crate::gateway_routes::CorsPosture::Public);
+            public_cors(method, path);
         }
         let tmp = tempfile::TempDir::new().unwrap();
         let cert_dir = tmp.path().to_path_buf();
@@ -4293,9 +4305,9 @@ mod tests {
             handle_access_org_grant_present(
                 stream,
                 "{}".to_string(),
-                "POST",
                 cert_dir.clone(),
                 card.clone(),
+                public_cors("POST", "/api/access/org-grants"),
             )
         })
         .await;
@@ -4313,9 +4325,9 @@ mod tests {
             handle_access_org_grant_present(
                 stream,
                 invalid.to_string(),
-                "POST",
                 cert_dir.clone(),
                 card.clone(),
+                public_cors("POST", "/api/access/org-grants"),
             )
         })
         .await;
@@ -4331,6 +4343,7 @@ mod tests {
                 stream,
                 "/api/access/orgs/golden-org/revocations",
                 cert_dir.clone(),
+                public_cors("GET", "/api/access/orgs/golden-org/revocations"),
             )
         })
         .await;
@@ -4356,9 +4369,9 @@ mod tests {
             handle_access_org_apply_renew(
                 stream,
                 "{}".to_string(),
-                "POST",
                 "/api/access/orgs/revocations/apply",
                 cert_dir.clone(),
+                public_cors("POST", "/api/access/orgs/revocations/apply"),
             )
         })
         .await;
@@ -4379,9 +4392,9 @@ mod tests {
             handle_access_org_apply_renew(
                 stream,
                 "{}".to_string(),
-                "POST",
                 "/api/access/org-grants/renew",
                 cert_dir.clone(),
+                public_cors("POST", "/api/access/org-grants/renew"),
             )
         })
         .await;
