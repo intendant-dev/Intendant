@@ -52731,9 +52731,16 @@ function accessModelLabel(value, fallback = '') {
 
 function accessOverviewTargetLabelMap(overview) {
   const map = new Map();
+  // First writer wins on BOTH keys. The daemon emits the local target as
+  // the first targets[] row, and a manually added same-host peer can carry
+  // the very same id/host_id (PeerId is `intendant:<host label>`, and host
+  // labels collide when two daemons share a hostname). Letting a later peer
+  // row overwrite the key relabelled every local-daemon grant with the
+  // peer's name — "Root on qa-peer-b" for a grant on this daemon
+  // (design-overhaul QA fleet, access finding FR-3).
   for (const target of Array.isArray(overview.targets) ? overview.targets : []) {
     const id = accessModelLabel(target.id || target.host_id);
-    if (id) map.set(id, accessModelLabel(target.label, id));
+    if (id && !map.has(id)) map.set(id, accessModelLabel(target.label, id));
     const hostId = accessModelLabel(target.host_id);
     if (hostId && !map.has(hostId)) map.set(hostId, accessModelLabel(target.label, hostId));
   }
