@@ -64,14 +64,22 @@ const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
 static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
-/// One dashboard-control method's declared surface. `CONTROL_METHODS` is the
-/// single source the method authorizer (`authorize_dashboard_control_method`),
-/// the advertised feature list (`control_features`), the per-method
-/// `<method>_available` status booleans, and the upload-frame allowlist
-/// (`authorize_dashboard_control_upload`) all derive from — a method added or
-/// re-gated in one place cannot drift out of sync in the others. Composite
-/// rollup booleans the SPA also reads (peer mutations, managed context, …)
-/// stay hand-written next to the derived block in `status_response_frame`.
+/// One dashboard-control method's declared surface. The effective method
+/// table (`all_control_methods`) is the single source the method authorizer
+/// (`authorize_dashboard_control_method`), the advertised feature list
+/// (`control_features`), the per-method `<method>_available` status booleans,
+/// and the upload-frame allowlist (`authorize_dashboard_control_upload`) all
+/// derive from — a method added or re-gated in one place cannot drift out of
+/// sync in the others. It is the union of two declaration sources, resolved
+/// rows-first: tunnel columns on `gateway_routes::ROUTES` rows (twinned
+/// methods, whose IAM operation derives from the route row — transport-
+/// unification design §2.2) and the residue `CONTROL_METHODS` below (methods
+/// whose family has not yet ported, plus tunnel-only methods with no HTTP
+/// twin). The `tunnel_method_partition_is_pinned` differential test freezes
+/// which methods live on which side. Composite rollup booleans the SPA also
+/// reads (peer mutations, managed context, …) stay hand-written next to the
+/// derived block in `status_response_frame`.
+#[derive(Clone, Copy)]
 struct ControlMethodSpec {
     name: &'static str,
     /// Operation gating the method; `None` = any bound session (ping).
@@ -124,6 +132,14 @@ const fn upload_only(name: &'static str, op: PeerOperation) -> ControlMethodSpec
     }
 }
 
+/// The residue half of the tunnel method table: methods not (yet) declared
+/// as a `tunnel:` column on a `gateway_routes::ROUTES` row. Do NOT add a
+/// method here if its HTTP twin has a route row — declare it on the row
+/// (`Route::with_tunnel`) so its IAM operation derives from the shared
+/// declaration; this list is for tunnel-only methods and families the
+/// migration has not reached. Never read directly outside this module's
+/// union plumbing and pins — consume `all_control_methods()` /
+/// `control_method_spec()`.
 const CONTROL_METHODS: &[ControlMethodSpec] = &[
     ControlMethodSpec {
         name: "ping",
@@ -286,9 +302,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     upload_only("api_session_current_upload", PeerOperation::SessionManage),
     method("api_transfer_jobs", PeerOperation::FilesystemRead),
     method("api_transfer_download_read", PeerOperation::FilesystemRead),
-    method("api_fs_stat", PeerOperation::FilesystemRead),
-    method("api_fs_list", PeerOperation::FilesystemRead),
-    method("api_fs_read", PeerOperation::FilesystemRead),
+    // The api_fs_* methods live as tunnel columns on their route rows
+    // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
+    // ops derive from the rows instead of entries here. The api_transfer_*
+    // methods join them when their HTTP rows land (design §4, task #6).
     method("api_transfer_job_create", PeerOperation::FilesystemWrite),
     method("api_transfer_job_delete", PeerOperation::FilesystemWrite),
     // Transfer chunks arrive only as upload frames; their destination was
@@ -296,10 +313,6 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // only needs the write operation (`authorize_dashboard_control_upload`).
     uploadable("api_transfer_upload_chunk", PeerOperation::FilesystemWrite),
     method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
-    method("api_fs_mkdir", PeerOperation::FilesystemWrite),
-    uploadable("api_fs_write", PeerOperation::FilesystemWrite),
-    method("api_fs_rename", PeerOperation::FilesystemWrite),
-    method("api_fs_delete", PeerOperation::FilesystemWrite),
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
     method("api_displays", PeerOperation::DisplayView),
@@ -351,8 +364,39 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_external_agents", PeerOperation::SessionInspect),
 ];
 
+/// The effective method table: route-row tunnel specs first (in ROUTES
+/// declaration order, with the IAM operation derived from each row —
+/// `Route::tunnel_operation`), then the residue `CONTROL_METHODS`.
+/// Materialized once; every consumer sees the same union. Resolution is
+/// deterministic — rows win — so even the (unlandable, pin-tested) state
+/// of a method declared on both sides cannot flap between operations. A
+/// tunnel row without a fail-closed operation derivation (non-Operation
+/// authz and no override; equally unlandable per the gateway invariant
+/// test) is skipped entirely, leaving the authorizer's unknown-method
+/// deny as the runtime backstop.
+fn all_control_methods() -> &'static [ControlMethodSpec] {
+    static METHODS: std::sync::OnceLock<Vec<ControlMethodSpec>> = std::sync::OnceLock::new();
+    METHODS.get_or_init(|| {
+        let mut methods: Vec<ControlMethodSpec> = crate::gateway_routes::tunnel_specs()
+            .filter_map(|(route, spec)| {
+                let op = route.tunnel_operation()?;
+                Some(ControlMethodSpec {
+                    name: spec.name,
+                    op: Some(op),
+                    advertised: spec.advertised,
+                    upload: spec.upload,
+                })
+            })
+            .collect();
+        methods.extend_from_slice(CONTROL_METHODS);
+        methods
+    })
+}
+
 fn control_method_spec(method: &str) -> Option<&'static ControlMethodSpec> {
-    CONTROL_METHODS.iter().find(|spec| spec.name == method)
+    all_control_methods()
+        .iter()
+        .find(|spec| spec.name == method)
 }
 
 /// Transport/frame-family features that aren't request methods (chunking,
@@ -371,15 +415,16 @@ const CONTROL_WIRE_FEATURES: &[&str] = &[
     "presence_tool_request",
 ];
 
-/// The advertised `features` list: every advertised method in
-/// `CONTROL_METHODS` plus the wire features. Consumers membership-test —
-/// order carries no meaning.
+/// The advertised `features` list: every advertised method in the
+/// effective table (route-row tunnel specs ∪ the `CONTROL_METHODS`
+/// residue) plus the wire features. Consumers membership-test — order
+/// carries no meaning.
 fn control_features() -> &'static [&'static str] {
     static FEATURES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     FEATURES.get_or_init(|| {
         let mut features: Vec<&'static str> = CONTROL_WIRE_FEATURES.to_vec();
         features.extend(
-            CONTROL_METHODS
+            all_control_methods()
                 .iter()
                 .filter(|spec| spec.advertised)
                 .map(|spec| spec.name),
@@ -1567,9 +1612,10 @@ fn authorize_dashboard_control_method(
     method: &str,
     params: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    // Fail closed: a method must be declared in `CONTROL_METHODS` to be
-    // callable at all — a dispatch arm added without a table row is denied
-    // here instead of shipping ungated.
+    // Fail closed: a method must be declared — as a route row's tunnel
+    // column or a residue `CONTROL_METHODS` entry — to be callable at
+    // all; a dispatch arm added without a declaration is denied here
+    // instead of shipping ungated.
     let Some(spec) = control_method_spec(method) else {
         return Err(format!("unknown dashboard-control method: {method}"));
     };
@@ -1661,7 +1707,8 @@ fn authorize_dashboard_control_upload(
     method: &str,
 ) -> Result<(), String> {
     // Fail closed twice over: the method must be declared upload-deliverable
-    // in `CONTROL_METHODS`, and upload methods are always operation-gated.
+    // (route-row tunnel column or residue `CONTROL_METHODS` entry), and
+    // upload methods are always operation-gated.
     let Some(op) = control_method_spec(method)
         .filter(|spec| spec.upload)
         .and_then(|spec| spec.op)
@@ -2887,7 +2934,8 @@ mod tests {
         assert!(pending.get("q1").is_none());
     }
 
-    /// The operation a method's `CONTROL_METHODS` row declares.
+    /// The operation a method's declaration carries (route-row tunnel
+    /// column or residue `CONTROL_METHODS` entry — the effective table).
     fn method_operation(method: &str) -> Option<crate::peer::access_policy::PeerOperation> {
         control_method_spec(method).and_then(|spec| spec.op)
     }
@@ -2928,8 +2976,11 @@ mod tests {
 
     #[test]
     fn control_method_table_is_coherent() {
+        // Coherence holds over the effective union (route-row tunnel
+        // specs ∪ the CONTROL_METHODS residue): a name declared on both
+        // sides is a duplicate here just like two residue rows were.
         let mut seen = HashSet::new();
-        for spec in CONTROL_METHODS {
+        for spec in all_control_methods() {
             assert!(
                 seen.insert(spec.name),
                 "duplicate method row: {}",
@@ -2948,6 +2999,461 @@ mod tests {
             features.len(),
             "wire features must not collide with method names"
         );
+    }
+
+    /// Transport-unification S3 differential pin (design §8, risks
+    /// R2/R4): the complete tunnel-method partition — every wire method
+    /// name, the declaration source that carries it (`Row` = a `tunnel:`
+    /// column on a `gateway_routes::ROUTES` row, `Residue` = a
+    /// `CONTROL_METHODS` entry), and the IAM operation gating it —
+    /// frozen as a literal table. Re-gating a method (operation change
+    /// on either side), losing one (gone from both sources), duplicating
+    /// one (declared on both), or moving one between sources fails here
+    /// until this table is updated in the same change, deliberately.
+    /// Permanent program infrastructure: the migration stages move
+    /// families from `Residue` to `Row` by flipping tags here alongside
+    /// their declarations, and the removal stage shrinks the residue to
+    /// the tunnel-only set — the union below never changes by accident.
+    #[test]
+    fn tunnel_method_partition_is_pinned() {
+        use crate::peer::access_policy::PeerOperation as Op;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Source {
+            Row,
+            Residue,
+        }
+        use Source::{Residue, Row};
+        let frozen: &[(&str, Source, Option<Op>)] = &[
+            ("ping", Residue, None),
+            ("config", Residue, Some(Op::RuntimeControl)),
+            ("status", Residue, Some(Op::PresenceRead)),
+            ("api_agent_card", Residue, Some(Op::PresenceRead)),
+            (
+                "api_cached_bootstrap_events",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("subscribe_events", Residue, Some(Op::SessionInspect)),
+            ("unsubscribe_events", Residue, Some(Op::SessionInspect)),
+            ("api_access_overview", Residue, Some(Op::AccessInspect)),
+            ("api_access_iam_state", Residue, Some(Op::AccessInspect)),
+            (
+                "api_access_enrollment_requests",
+                Residue,
+                Some(Op::AccessInspect),
+            ),
+            ("api_dashboard_targets", Residue, Some(Op::AccessInspect)),
+            (
+                "api_access_connect_status",
+                Residue,
+                Some(Op::AccessInspect),
+            ),
+            (
+                "api_access_connect_claim_code",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_access_connect_config", Residue, Some(Op::AccessManage)),
+            (
+                "api_access_connect_unclaim",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_access_set_tier", Residue, Some(Op::AccessManage)),
+            (
+                "api_access_set_hosted_ceiling",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_fleet_cert_request", Residue, Some(Op::AccessManage)),
+            (
+                "api_credential_lease_grant",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_lease_renew",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_lease_revoke",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_lease_status",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_custody_trail",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_fetch",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_publish",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_egress_register",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_egress_unregister",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_credential_egress_probe",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_access_iam_upsert_user_client_grant",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_access_iam_update_grant",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_access_enrollment_decide",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_access_org_trust", Residue, Some(Op::AccessManage)),
+            ("api_access_org_revoke", Residue, Some(Op::AccessManage)),
+            ("api_access_org_issue", Residue, Some(Op::AccessManage)),
+            (
+                "api_access_org_revoke_member",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_access_org_issuer_init",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_access_org_issuer_delegate",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_access_org_issuer_install",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_access_org_present", Residue, Some(Op::AccessInspect)),
+            ("api_access_org_orl", Residue, Some(Op::AccessInspect)),
+            ("api_access_org_renew", Residue, Some(Op::AccessInspect)),
+            ("api_access_org_orl_apply", Residue, Some(Op::PresenceRead)),
+            (
+                "api_peer_pairing_requests",
+                Residue,
+                Some(Op::AccessInspect),
+            ),
+            (
+                "api_peer_pairing_identities",
+                Residue,
+                Some(Op::AccessInspect),
+            ),
+            (
+                "api_peer_pairing_request_decision",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            (
+                "api_peer_pairing_identity_revoke",
+                Residue,
+                Some(Op::AccessManage),
+            ),
+            ("api_peer_pairing_invite", Residue, Some(Op::AccessManage)),
+            ("api_peers", Residue, Some(Op::PeerInspect)),
+            ("api_peer_eligible", Residue, Some(Op::PeerInspect)),
+            ("api_peer_webrtc_signal", Residue, Some(Op::PeerUse)),
+            ("api_peer_file_transfer_signal", Residue, Some(Op::PeerUse)),
+            (
+                "api_peer_dashboard_control_signal",
+                Residue,
+                Some(Op::PeerUse),
+            ),
+            ("api_peer_message", Residue, Some(Op::PeerUse)),
+            ("api_peer_task", Residue, Some(Op::PeerUse)),
+            ("api_peer_approval", Residue, Some(Op::PeerUse)),
+            ("api_peer_add", Residue, Some(Op::PeerManage)),
+            ("api_peer_remove", Residue, Some(Op::PeerManage)),
+            ("api_peer_pairing_join", Residue, Some(Op::PeerManage)),
+            (
+                "api_peer_pairing_request_access",
+                Residue,
+                Some(Op::PeerManage),
+            ),
+            (
+                "api_peer_pairing_request_access_poll",
+                Residue,
+                Some(Op::PeerManage),
+            ),
+            ("api_coordinator_route", Residue, Some(Op::PeerManage)),
+            ("api_sessions", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
+            ("api_session_detail", Residue, Some(Op::SessionInspect)),
+            ("api_session_report", Residue, Some(Op::SessionInspect)),
+            (
+                "api_session_agent_output",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            (
+                "api_session_context_snapshot",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("api_sessions_search", Residue, Some(Op::SessionInspect)),
+            ("api_session_recordings", Residue, Some(Op::SessionInspect)),
+            (
+                "api_session_recording_asset",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("api_session_frame_asset", Residue, Some(Op::SessionInspect)),
+            ("api_worktrees", Residue, Some(Op::SessionInspect)),
+            ("api_worktrees_inspect", Residue, Some(Op::SessionInspect)),
+            ("api_session_delete", Residue, Some(Op::SessionManage)),
+            (
+                "api_session_current_history",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_rollback",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            ("api_session_current_redo", Residue, Some(Op::SessionManage)),
+            (
+                "api_session_current_prune",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_changes",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_uploads",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_upload_raw",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_upload_delete",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            (
+                "api_session_current_agent_output",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            ("api_session_control_msg", Residue, Some(Op::SessionManage)),
+            ("api_worktrees_scan", Residue, Some(Op::SessionManage)),
+            ("api_worktrees_remove", Residue, Some(Op::SessionManage)),
+            (
+                "api_session_current_upload",
+                Residue,
+                Some(Op::SessionManage),
+            ),
+            ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
+            (
+                "api_transfer_download_read",
+                Residue,
+                Some(Op::FilesystemRead),
+            ),
+            ("api_fs_stat", Row, Some(Op::FilesystemRead)),
+            ("api_fs_list", Row, Some(Op::FilesystemRead)),
+            ("api_fs_read", Row, Some(Op::FilesystemRead)),
+            (
+                "api_transfer_job_create",
+                Residue,
+                Some(Op::FilesystemWrite),
+            ),
+            (
+                "api_transfer_job_delete",
+                Residue,
+                Some(Op::FilesystemWrite),
+            ),
+            (
+                "api_transfer_upload_chunk",
+                Residue,
+                Some(Op::FilesystemWrite),
+            ),
+            (
+                "api_transfer_upload_commit",
+                Residue,
+                Some(Op::FilesystemWrite),
+            ),
+            ("api_fs_mkdir", Row, Some(Op::FilesystemWrite)),
+            ("api_fs_write", Row, Some(Op::FilesystemWrite)),
+            ("api_fs_rename", Row, Some(Op::FilesystemWrite)),
+            ("api_fs_delete", Row, Some(Op::FilesystemWrite)),
+            ("api_display_bootstrap", Residue, Some(Op::DisplayView)),
+            ("api_display_webrtc_signal", Residue, Some(Op::DisplayView)),
+            ("api_displays", Residue, Some(Op::DisplayView)),
+            (
+                "api_display_input_authority_snapshot",
+                Residue,
+                Some(Op::DisplayInput),
+            ),
+            (
+                "api_display_input_authority_request",
+                Residue,
+                Some(Op::DisplayInput),
+            ),
+            (
+                "api_display_input_authority_release",
+                Residue,
+                Some(Op::DisplayInput),
+            ),
+            (
+                "api_diagnostics_visual_freshness",
+                Residue,
+                Some(Op::DisplayInput),
+            ),
+            ("api_control_msg", Residue, Some(Op::Message)),
+            ("api_dashboard_action_msg", Residue, Some(Op::Message)),
+            ("api_mcp_tool_call", Residue, Some(Op::Message)),
+            ("api_settings", Residue, Some(Op::Settings)),
+            ("api_settings_save", Residue, Some(Op::Settings)),
+            ("api_key_status", Residue, Some(Op::Settings)),
+            ("api_api_keys_save", Residue, Some(Op::Settings)),
+            ("api_project_root", Residue, Some(Op::Settings)),
+            ("api_voice_session", Residue, Some(Op::RuntimeControl)),
+            (
+                "api_presence_video_frame",
+                Residue,
+                Some(Op::RuntimeControl),
+            ),
+            (
+                "api_media_annotation_attach",
+                Residue,
+                Some(Op::RuntimeControl),
+            ),
+            (
+                "api_media_annotation_submit",
+                Residue,
+                Some(Op::RuntimeControl),
+            ),
+            ("api_media_clip_start", Residue, Some(Op::RuntimeControl)),
+            ("api_media_clip_frame", Residue, Some(Op::RuntimeControl)),
+            ("api_media_clip_end", Residue, Some(Op::RuntimeControl)),
+            ("api_media_clip_cancel", Residue, Some(Op::RuntimeControl)),
+            ("api_recordings", Residue, Some(Op::RuntimeControl)),
+            ("api_recording_asset", Residue, Some(Op::RuntimeControl)),
+            (
+                "api_browser_workspace_snapshot",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("api_state_snapshot", Residue, Some(Op::SessionInspect)),
+            ("api_session_log_replay", Residue, Some(Op::SessionInspect)),
+            (
+                "api_external_session_activity_replay",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("api_dashboard_bootstrap", Residue, Some(Op::SessionInspect)),
+            (
+                "api_managed_context_records",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            (
+                "api_managed_context_anchors",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            (
+                "api_managed_context_fission",
+                Residue,
+                Some(Op::SessionInspect),
+            ),
+            ("api_external_agents", Residue, Some(Op::SessionInspect)),
+        ];
+
+        // Live partition: rows first (the resolution order), then the
+        // residue; a name on both sides is declared twice — an error.
+        let mut live: BTreeMap<&str, (Source, Option<Op>)> = BTreeMap::new();
+        for (route, spec) in crate::gateway_routes::tunnel_specs() {
+            let op = route.tunnel_operation();
+            assert!(
+                op.is_some(),
+                "{}: tunnel row must derive an IAM operation",
+                spec.name
+            );
+            assert!(
+                live.insert(spec.name, (Row, op)).is_none(),
+                "{} is declared on more than one route row",
+                spec.name
+            );
+        }
+        for spec in CONTROL_METHODS {
+            assert!(
+                live.insert(spec.name, (Residue, spec.op)).is_none(),
+                "{} is declared BOTH as a route-row tunnel column and in \
+                 CONTROL_METHODS — remove the residue entry",
+                spec.name
+            );
+        }
+
+        let mut pinned: BTreeMap<&str, (Source, Option<Op>)> = BTreeMap::new();
+        for (name, source, op) in frozen.iter().copied() {
+            assert!(
+                pinned.insert(name, (source, op)).is_none(),
+                "frozen partition lists {name} twice"
+            );
+        }
+        for (name, (source, op)) in &pinned {
+            let Some((live_source, live_op)) = live.get(name) else {
+                panic!(
+                    "{name} vanished from the live declarations (frozen as \
+                     {source:?} {op:?}); if the removal is deliberate, drop \
+                     it from the frozen partition in the same change"
+                );
+            };
+            assert_eq!(
+                live_source, source,
+                "{name} moved declaration source; update the frozen \
+                 partition deliberately"
+            );
+            assert_eq!(
+                live_op, op,
+                "{name} was re-gated; an IAM operation change must update \
+                 the frozen partition deliberately"
+            );
+        }
+        for name in live.keys() {
+            assert!(
+                pinned.contains_key(name),
+                "{name} is a new tunnel method not in the frozen partition; \
+                 add it (source + operation) deliberately"
+            );
+        }
     }
 
     /// The SPA's `daemonApi` facade mirrors the HTTP twins of its tunnel

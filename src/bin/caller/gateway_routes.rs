@@ -18,6 +18,13 @@
 //! 4. **Docs** — [`render_endpoint_docs`] renders the endpoint table in
 //!    `docs/src/web-dashboard.md`; the `endpoint_docs_match_chapter`
 //!    drift test pins the chapter to it.
+//! 5. **Tunnel exposure** — a row's optional [`TunnelSpec`] declares its
+//!    dashboard-control datachannel twin. The tunnel's method table
+//!    (`dashboard_control::control_method_spec`) resolves these rows
+//!    first, then its residue `CONTROL_METHODS`, so a twinned method's
+//!    IAM operation derives from the same declaration HTTP gates on
+//!    (transport-unification design §2.2) instead of a second table that
+//!    can drift.
 //!
 //! **Never add an API route by editing the dispatch chain**: declare it
 //! here and give it a handler arm in `web_gateway.rs`'s table-dispatch
@@ -271,6 +278,58 @@ pub(crate) enum RouteHandlerId {
     McpStream,
 }
 
+/// Datachannel (dashboard-control tunnel) twin of a route row — the
+/// `tunnel:` column of the transport-unification design (§2.2). The wire
+/// method name is unchanged from its legacy `CONTROL_METHODS` entry: the
+/// datachannel wire never changes; the name becomes an alias of this
+/// row. The IAM operation gating the tunnel method is **derived from the
+/// row** ([`Route::tunnel_operation`]) — declaring it once is the point
+/// of the column: the two transports cannot drift apart again. (§2.2's
+/// `lanes`/`http_params` fields arrive with the migration stages that
+/// consume them; adding them before a consumer exists would be dead
+/// weight.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TunnelSpec {
+    /// Wire method name (e.g. `"api_fs_write"`), exactly as datachannel
+    /// clients send it in `t:"request"` frames.
+    pub(crate) name: &'static str,
+    /// Documented divergent-by-design IAM override. `None` — the default
+    /// and the point — derives the operation from the row's
+    /// [`RouteAuthz::Operation`]. `Some((op, reason))` gates the tunnel
+    /// method on `op` instead; the reason string is mandatory, and the
+    /// `tunnel_op_overrides_are_a_closed_documented_enumeration` test
+    /// pins the override list closed (design §2.7: the signed-org
+    /// doorbell rows — Public on HTTP, session-gated on the tunnel — are
+    /// the intended occupants when their family ports).
+    pub(crate) op_override: Option<(PeerOperation, &'static str)>,
+    /// Advertised in the tunnel `features` handshake (the legacy
+    /// `advertised` flag).
+    pub(crate) advertised: bool,
+    /// May also (or only) be delivered as an upload frame (the legacy
+    /// `upload` flag; feeds `authorize_dashboard_control_upload`).
+    pub(crate) upload: bool,
+}
+
+/// Advertised, non-upload tunnel twin (the common shape).
+const fn tunnel_method(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: true,
+        upload: false,
+    }
+}
+
+/// Advertised tunnel twin that may also arrive as an upload frame.
+const fn tunnel_uploadable(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: true,
+        upload: true,
+    }
+}
+
 pub(crate) struct Route {
     pub(crate) method: RouteMethod,
     pub(crate) pattern: PathPattern,
@@ -281,6 +340,42 @@ pub(crate) struct Route {
     /// One line, becomes the docs endpoint-table row. Required — an
     /// empty doc string fails the invariant test.
     pub(crate) doc: &'static str,
+    /// Datachannel exposure of this row. `None` = HTTP-only, or the
+    /// tunnel twin has not yet ported out of `CONTROL_METHODS` (the
+    /// transitional state the migration drains family by family; the
+    /// differential pin test in `dashboard_control` freezes which
+    /// methods live where).
+    pub(crate) tunnel: Option<TunnelSpec>,
+}
+
+impl Route {
+    /// Attach the row's datachannel twin (builder-style; rows are const).
+    const fn with_tunnel(mut self, spec: TunnelSpec) -> Route {
+        self.tunnel = Some(spec);
+        self
+    }
+
+    /// The IAM operation this row's tunnel twin gates on: the documented
+    /// override when declared, otherwise the row's own
+    /// [`RouteAuthz::Operation`]. `None` means no fail-closed derivation
+    /// exists (a non-`Operation` row without an override): the tunnel
+    /// method table skips such a row entirely, so the authorizer's
+    /// unknown-method deny is the runtime backstop, and the
+    /// `tunnel_specs_are_unique_and_derive_operations_fail_closed`
+    /// invariant test keeps the state unlandable. `PeerFederation` rows
+    /// will derive from `federation_http_operation` on the row's
+    /// canonical leaf when the peers family ports (design §2.2 / S7);
+    /// until then they too must declare an override to carry a tunnel.
+    pub(crate) fn tunnel_operation(&self) -> Option<PeerOperation> {
+        let spec = self.tunnel.as_ref()?;
+        if let Some((op, _reason)) = spec.op_override {
+            return Some(op);
+        }
+        match self.authz {
+            RouteAuthz::Operation(op) => Some(op),
+            RouteAuthz::Public | RouteAuthz::McpToken | RouteAuthz::PeerFederation => None,
+        }
+    }
 }
 
 /// Compact constructor for the common row shape: IAM-gated via a
@@ -301,6 +396,7 @@ const fn op_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -321,6 +417,7 @@ const fn fleet_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -340,6 +437,7 @@ const fn public_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -360,6 +458,7 @@ const fn federation_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -370,6 +469,9 @@ const fn federation_route(
 pub(crate) static ROUTES: &[Route] = &[
     // ── Filesystem (scoped by authorize_http_filesystem_access; the GET
     //    trio is additionally pre-gated by peer_filesystem_query_request).
+    //    First family carrying the tunnel column: the datachannel twins'
+    //    IAM operations derive from these rows (their legacy
+    //    CONTROL_METHODS entries are gone).
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/stat"),
@@ -377,7 +479,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsStat,
         "Stat a filesystem path (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_stat")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/list"),
@@ -385,7 +488,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsList,
         "List a directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_list")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/read"),
@@ -393,7 +497,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsRead,
         "Read file bytes (scope-checked; supports byte ranges)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_read")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/mkdir"),
@@ -401,7 +506,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsMkdir,
         "Create a directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_mkdir")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/write"),
@@ -413,7 +519,10 @@ pub(crate) static ROUTES: &[Route] = &[
         ),
         RouteHandlerId::FsWrite,
         "Write file bytes (scope-checked; sha256-guarded overwrite)",
-    ),
+    )
+    // Tunnel-side the content may also ride upload frames (the JSON
+    // `content_b64` / upload-frame asymmetry is preserved by design).
+    .with_tunnel(tunnel_uploadable("api_fs_write")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/rename"),
@@ -421,7 +530,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsRename,
         "Move/rename a file or directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_rename")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/delete"),
@@ -429,7 +539,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsDelete,
         "Delete a file or directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_delete")),
     // ── Current-session routes (exact/subtree rows precede the generic
     //    session sub-router rows below).
     op_route(
@@ -1034,6 +1145,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::Capped(MCP_BODY_CAP_BYTES),
         handler: RouteHandlerId::McpPost,
         doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
+        tunnel: None,
     },
     Route {
         method: RouteMethod::Get,
@@ -1043,6 +1155,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::None,
         handler: RouteHandlerId::McpStream,
         doc: "MCP SSE stream (405: stateless server)",
+        tunnel: None,
     },
     Route {
         method: RouteMethod::Delete,
@@ -1052,6 +1165,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::None,
         handler: RouteHandlerId::McpStream,
         doc: "MCP session delete (405: stateless server)",
+        tunnel: None,
     },
 ];
 
@@ -1145,6 +1259,17 @@ pub(crate) fn classify(req_method: &str, req_path: &str) -> TableClassification 
         }),
         None => TableClassification::NoMatch,
     }
+}
+
+/// Every (route, tunnel spec) pair, in declaration order — the ROW half
+/// of the tunnel method partition. `dashboard_control` unions this with
+/// its residue `CONTROL_METHODS` (rows first) to build the effective
+/// method table; its differential pin test freezes exactly which methods
+/// live on which side.
+pub(crate) fn tunnel_specs() -> impl Iterator<Item = (&'static Route, &'static TunnelSpec)> {
+    ROUTES
+        .iter()
+        .filter_map(|route| route.tunnel.as_ref().map(|spec| (route, spec)))
 }
 
 /// CORS/preflight posture for a path: the first row matching it on any
@@ -1733,6 +1858,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tunnel_specs_are_unique_and_derive_operations_fail_closed() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (route, spec) in tunnel_specs() {
+            assert!(
+                seen.insert(spec.name),
+                "tunnel method {} is declared on more than one row",
+                spec.name,
+            );
+            // The status `<method>_available` derivation keys on the
+            // api_ prefix; a differently-named tunnel method would
+            // silently lose its availability boolean.
+            assert!(
+                spec.name.starts_with("api_"),
+                "tunnel method {} must be api_-prefixed",
+                spec.name,
+            );
+            // Fail-closed derivation must exist: a Public / McpToken /
+            // PeerFederation row may only carry a tunnel twin with an
+            // explicit documented op override — otherwise the method
+            // would resolve to nothing and (correctly, but uselessly) be
+            // denied as unknown.
+            assert!(
+                route.tunnel_operation().is_some(),
+                "tunnel method {} has no derivable IAM operation: \
+                 non-Operation rows must declare an op_override",
+                spec.name,
+            );
+        }
+    }
+
+    /// The op-override slot is a closed, documented enumeration (design
+    /// §2.7 / risk R2): every override names its reason, and this test
+    /// pins the exact set so a tunnel/HTTP divergence can only ever be
+    /// added deliberately. Empty today — S0 (PR #128) settled the two
+    /// formerly-divergent twins identically on both lanes, so the first
+    /// legitimate entries arrive with the signed-org doorbell rows
+    /// (Public on HTTP, session-gated on the tunnel) when their family
+    /// ports.
+    #[test]
+    fn tunnel_op_overrides_are_a_closed_documented_enumeration() {
+        let documented: &[&str] = &[];
+        let mut actual: Vec<&str> = Vec::new();
+        for (_, spec) in tunnel_specs() {
+            if let Some((_, reason)) = spec.op_override {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "tunnel op override on {} must state a non-empty reason",
+                    spec.name,
+                );
+                actual.push(spec.name);
+            }
+        }
+        actual.sort_unstable();
+        assert_eq!(
+            actual, documented,
+            "tunnel op overrides drifted from the documented divergence set",
+        );
     }
 
     /// The docs chapter's generated endpoint table must equal the one

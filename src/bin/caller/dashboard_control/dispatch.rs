@@ -2189,11 +2189,12 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
 
     // Every gated api_* method derives its `<method>_available` boolean from
-    // `CONTROL_METHODS`: operation granted && backing subsystem wired
+    // the effective method table (route-row tunnel specs ∪ the
+    // CONTROL_METHODS residue): operation granted && backing subsystem wired
     // (`control_method_runtime_ready`). One boolean per advertised RPC lets
     // the SPA distinguish "denied for this session" from "unsupported
     // daemon" (feature list) without probing calls.
-    for spec in CONTROL_METHODS {
+    for spec in all_control_methods() {
         if !spec.name.starts_with("api_") {
             continue;
         }
@@ -2208,7 +2209,7 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 
     // Operation aggregates, composite rollups, and frame-transport
     // availability the SPA reads — none has a single backing method in
-    // `CONTROL_METHODS`, so they stay hand-written.
+    // the method table, so they stay hand-written.
     let capabilities = [
         ("access_inspect_available", access_inspect),
         ("access_manage_available", access_manage),
@@ -2345,7 +2346,7 @@ mod tests {
     fn status_advertises_an_availability_boolean_for_every_gated_api_method() {
         let rt = runtime();
         let status = status_response_frame("s1".to_string(), &rt);
-        for spec in CONTROL_METHODS {
+        for spec in all_control_methods() {
             if !spec.name.starts_with("api_") || spec.op.is_none() {
                 continue;
             }
