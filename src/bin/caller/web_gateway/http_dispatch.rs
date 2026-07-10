@@ -857,20 +857,37 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessEnrollmentRequests => {
-                return handle_access_enrollment_requests(stream, cert_dir, fleet_cors_origin)
-                    .await;
+                return handle_access_enrollment_requests(
+                    stream,
+                    cert_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessIamState => {
-                return handle_access_iam_state(stream, cert_dir, fleet_cors_origin).await;
+                return handle_access_iam_state(
+                    stream,
+                    cert_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessConnectStatus => {
-                return handle_access_connect_status(stream, fleet_cors_origin).await;
+                return handle_access_connect_status(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessConnectClaimCode => {
                 return handle_access_connect_claim_code(
                     stream,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -878,20 +895,20 @@ pub(crate) async fn serve_http_request(
                 return handle_access_connect_config(
                     stream,
                     route_body,
-                    req_method,
                     http_access_context,
                     project_root,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::AccessConnectUnclaim => {
                 return handle_access_connect_unclaim(
                     stream,
-                    req_method,
                     http_access_context,
                     project_root,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -899,11 +916,11 @@ pub(crate) async fn serve_http_request(
                 return handle_access_tier_settings(
                     stream,
                     route_body,
-                    req_method,
                     req_path,
                     cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -912,9 +929,10 @@ pub(crate) async fn serve_http_request(
                     stream,
                     cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
                     peer_registry,
                     agent_card_value_for_targets,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -923,6 +941,8 @@ pub(crate) async fn serve_http_request(
                     stream,
                     peer_registry,
                     agent_card_value_for_targets,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
