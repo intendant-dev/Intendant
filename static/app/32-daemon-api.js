@@ -21,9 +21,11 @@
 //     exactly this no-legacy-fallback behavior).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
-// staged uploads), the F2 sessions-family reads, and the F3 settings/keys
+// staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
-// external-agents, displays); the remaining `rpcOrHttp`/`jsonFetch` call
+// external-agents, displays), and the F4 access dialogs family
+// (overview/enrollment/connect/tier + IAM grant writes); the remaining
+// `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
 // evaluates.
@@ -52,9 +54,12 @@
 //
 // Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots), and the
+// its NDJSON stream, search, detail, report, context snapshots), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
-// project-root, external-agents, displays). The
+// project-root, external-agents, displays), and the F4 access dialogs
+// family (overview, IAM state, enrollment reads + decide, IAM grant
+// upsert/update, the connect admin quartet, the tier pair, fleet-cert
+// request, dashboard targets). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -105,6 +110,20 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_project_root: { verb: 'GET', path: '/api/project-root' },
   api_external_agents: { verb: 'GET', path: '/api/external-agents' },
   api_displays: { verb: 'GET', path: '/api/displays' },
+  api_access_overview: { verb: 'GET', path: '/api/access/overview' },
+  api_access_iam_state: { verb: 'GET', path: '/api/access/iam/state' },
+  api_access_enrollment_requests: { verb: 'GET', path: '/api/access/enrollment-requests' },
+  api_access_enrollment_decide: { verb: 'POST', path: '/api/access/enrollment-requests/decide' },
+  api_access_iam_upsert_user_client_grant: { verb: 'POST', path: '/api/access/iam/user-client-grants' },
+  api_access_iam_update_grant: { verb: 'POST', path: '/api/access/iam/grants/update' },
+  api_access_connect_status: { verb: 'GET', path: '/api/access/connect/status' },
+  api_access_connect_claim_code: { verb: 'GET', path: '/api/access/connect/claim-code' },
+  api_access_connect_config: { verb: 'POST', path: '/api/access/connect/config' },
+  api_access_connect_unclaim: { verb: 'POST', path: '/api/access/connect/unclaim' },
+  api_access_set_tier: { verb: 'POST', path: '/api/access/tier' },
+  api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
+  api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
+  api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
