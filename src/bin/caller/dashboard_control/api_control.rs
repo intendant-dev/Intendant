@@ -2504,6 +2504,199 @@ mod tests {
         assert_eq!(frame["error"], "no rendezvous_url configured");
     }
 
+    // ── S6 tunnel/HTTP parity (second slice): IAM grants / enrollment
+    // decide / org manage ──
+    //
+    // Extends the S6 enumeration above (#10–#14 all apply). The
+    // slice-specific differences, deliberate and pinned:
+    //
+    //  15. Org-manage leaf addressing is transport-owned: HTTP maps the
+    //      request path (issue is the historical default arm), the
+    //      tunnel maps the method name — both land on the ONE
+    //      OrgManageLeaf fan-out over the shared cores.
+    //  16. The HTTP org-manage handler renders EVERY leaf through the
+    //      fleet decorator (the own-origin leaves' inert `Vary: Origin`
+    //      tail, golden-pinned in routes_access.rs) — pure HTTP-lane
+    //      decoration; the tunnel's ok/error envelope carries none of
+    //      it.
+
+    #[tokio::test]
+    async fn parity_iam_grant_mutations_share_cores_over_an_injected_cert_dir() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+
+        // Upsert success: same body from the one core on both lanes
+        // (fresh store per lane call is NOT possible — the second call
+        // updates rather than creates — so the pin compares the
+        // mutation's own fields).
+        let upsert = || {
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Parity browser",
+                "fingerprint": "PA:R1",
+                "role_id": "role:observer"
+            })
+        };
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                tmp.path(),
+                upsert(),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body["created_grant"], serde_json::json!(true));
+        let frame = frame_api_ok_error_response(
+            "parity-iam-upsert".to_string(),
+            crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                tmp.path(),
+                upsert(),
+                &actor,
+            ),
+            "iam grant upsert",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        // Second upsert of the same fingerprint updates in place.
+        assert_eq!(frame["result"]["created_grant"], serde_json::json!(false));
+        assert_eq!(frame["result"]["schema_version"], http_body["schema_version"]);
+
+        // Update decode error: deterministic serde wording as the HTTP
+        // {"error"} body and the tunnel frame-level error.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_iam_update_grant_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-iam-update".to_string(),
+            crate::web_gateway::access_iam_update_grant_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &actor,
+            ),
+            "iam grant update",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Enrollment decide, unknown fingerprint: deterministic error on
+        // both lanes before any store access.
+        let decide = || serde_json::json!({ "fingerprint": "PA:R1:EN", "approve": true });
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_enrollment_decide_api_response(
+                tmp.path(),
+                decide(),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "no pending enrollment for fingerprint PA:R1:EN"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-enroll-decide".to_string(),
+            crate::web_gateway::access_enrollment_decide_api_response(
+                tmp.path(),
+                decide(),
+                &actor,
+            ),
+            "enrollment decide",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "no pending enrollment for fingerprint PA:R1:EN");
+    }
+
+    #[tokio::test]
+    async fn parity_org_manage_leaves_share_the_one_fan_out() {
+        use crate::web_gateway::OrgManageLeaf;
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+
+        // Leaf addressing agrees across transports (difference #15).
+        for (method, path) in [
+            ("api_access_org_trust", "/api/access/orgs/trust"),
+            ("api_access_org_revoke", "/api/access/orgs/revoke"),
+            ("api_access_org_issue", "/api/access/org-grants/issue"),
+            (
+                "api_access_org_revoke_member",
+                "/api/access/org-grants/revoke-member",
+            ),
+            (
+                "api_access_org_issuer_init",
+                "/api/access/org-grants/issuers/init",
+            ),
+            (
+                "api_access_org_issuer_delegate",
+                "/api/access/org-grants/issuers/delegate",
+            ),
+            (
+                "api_access_org_issuer_install",
+                "/api/access/org-grants/issuers/install",
+            ),
+        ] {
+            assert_eq!(
+                OrgManageLeaf::from_control_method(method),
+                Some(OrgManageLeaf::from_req_path(path)),
+                "{method} vs {path}"
+            );
+        }
+        assert_eq!(OrgManageLeaf::from_control_method("api_access_org_present"), None);
+
+        // Issue without keys: the deterministic error body on both lanes
+        // from the one fan-out (the signing successes need real org keys
+        // and stay smoke-covered — validate-org-grants).
+        let params = || serde_json::json!({ "handle": "parity-org" });
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::Issue,
+                params(),
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-issue".to_string(),
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::Issue,
+                params(),
+            ),
+            "org manage",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Issuer init: both lanes create/read the deputy key under the
+        // injected store — the SAME key once created, so the bodies are
+        // equal across the two calls.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::IssuerInit,
+                params(),
+            ),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-org-issuer-init".to_string(),
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::IssuerInit,
+                params(),
+            ),
+            "org manage",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 
