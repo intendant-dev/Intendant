@@ -5435,4 +5435,377 @@ mod tests {
                 r#"{"error":"context snapshot not found"}"#
             )
         );
-    }}
+    }
+
+    // ── S4b golden transcripts: session artifacts / deletes / worktrees ──
+    //
+    // Same discipline as the S4a set above: byte-exact pins of the HTTP
+    // wire bytes captured before the transport-neutral conversion
+    // (design §6 S4, risk R1). The five session-delete wire shapes have
+    // routing pins in gateway_routes; these pin the response bytes.
+
+    /// The session-delete json framing — its wildcard tail historically
+    /// orders `Access-Control-Allow-Origin` BEFORE `Cache-Control`,
+    /// unlike the list/search/upload-error tail.
+    fn golden_delete_json_transcript(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The text/plain framing (report/asset error bodies), spelled out.
+    fn golden_text_plain_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The immutable-asset framing (recording segments, frame images).
+    fn golden_public_asset_transcript(content_type: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .into_bytes();
+        expected.extend_from_slice(bytes);
+        expected
+    }
+
+    #[tokio::test]
+    async fn golden_session_delete_five_wire_shapes_transcripts() {
+        // All five accepted shapes answer 200 with the wildcard-CORS tail;
+        // `..` fails the bare-id policy so the body is deterministic.
+        for request_line in [
+            "DELETE /api/session/.. HTTP/1.1",
+            "DELETE /api/session/../recordings HTTP/1.1",
+            "DELETE /api/session/../recordings/delete HTTP/1.1",
+            "POST /api/session/../delete HTTP/1.1",
+            "POST /api/session/../recordings/delete HTTP/1.1",
+        ] {
+            let response = collect_session_handler_response(|stream| {
+                handle_session_delete(stream, request_line)
+            })
+            .await;
+            assert_eq!(
+                golden_transcript(&response),
+                golden_delete_json_transcript(r#"{"error":"invalid session id","ok":false}"#),
+                "{request_line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_session_delete_missing_session_transcript() {
+        let session_id = golden_unique_session_id("golden-delete-missing");
+        let request_line = format!("DELETE /api/session/{session_id} HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_delete(stream, &request_line)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_delete_json_transcript(r#"{"error":"session not found","ok":false}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_report_invalid_id_transcript() {
+        let request_line = "GET /api/session/../report HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"invalid session id"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_report_missing_transcript() {
+        let session_id = golden_unique_session_id("golden-report-missing");
+        let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_text_plain_transcript("404 Not Found", "Session not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_report_success_transcript() {
+        let session_id = golden_unique_session_id("golden-report");
+        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        std::fs::create_dir_all(log_dir.join("turns")).unwrap();
+        std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+        std::fs::write(log_dir.join("turns").join("turn_001_stdout.txt"), "hi\n").unwrap();
+
+        let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        // Zip bytes from the store layer (same-run mtimes make the two
+        // builds byte-identical); the framing around them is the pin.
+        let bytes = build_session_report_zip(&log_dir).unwrap();
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"intendant-session-{session_id}.zip\"\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .into_bytes();
+        expected.extend_from_slice(&bytes);
+        assert_eq!(golden_transcript(&response), golden_transcript(&expected));
+        cleanup.expect("golden report fixture cleanup");
+    }
+
+    /// Live-store recordings fixture: one stream with one playable
+    /// segment (csv row + on-disk file).
+    fn golden_recordings_fixture(session_id: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let log_dir = crate::platform::intendant_home().join("logs").join(session_id);
+        let stream_dir = log_dir.join("recordings").join("screen");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        let seg_bytes = b"golden fake mp4 segment bytes".to_vec();
+        std::fs::write(stream_dir.join("seg_00001.mp4"), &seg_bytes).unwrap();
+        std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        (log_dir, seg_bytes)
+    }
+
+    #[tokio::test]
+    async fn golden_session_recordings_list_transcripts() {
+        // Invalid id: the branch precheck answers under the wildcard tail.
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, "GET /api/session/../recordings HTTP/1.1", None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"invalid session id"}"#
+            )
+        );
+
+        // Missing session: empty list under the canonical tail.
+        let missing = golden_unique_session_id("golden-recordings-missing");
+        let request_line = format!("GET /api/session/{missing}/recordings HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", "[]")
+        );
+
+        // Fixture stream: body from the store layer.
+        let session_id = golden_unique_session_id("golden-recordings");
+        let (log_dir, _seg) = golden_recordings_fixture(&session_id);
+        let request_line = format!("GET /api/session/{session_id}/recordings HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        let (status, body) = session_recordings_list_response_body(&session_id);
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(status, "200 OK");
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", &body)
+        );
+        cleanup.expect("golden recordings fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_recording_segments_and_playlist_transcripts() {
+        let session_id = golden_unique_session_id("golden-rec-assets");
+        let (log_dir, _seg) = golden_recordings_fixture(&session_id);
+
+        // Segments listing: json array under the canonical tail.
+        let request_line =
+            format!("GET /api/session/{session_id}/recordings/screen/segments HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        let body = r#"[{"end_secs":2.0,"filename":"seg_00001.mp4","start_secs":0.0}]"#;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", body)
+        );
+
+        // Playlist: HLS body under the mpegurl content type.
+        let request_line =
+            format!("GET /api/session/{session_id}/recordings/screen/playlist.m3u8 HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\nseg_00001.mp4\n#EXT-X-ENDLIST\n";
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{m3u8}",
+            m3u8.len()
+        );
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(golden_transcript(&response), expected);
+        cleanup.expect("golden rec-assets fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_recording_segment_file_transcripts() {
+        let session_id = golden_unique_session_id("golden-seg-file");
+        let (log_dir, seg_bytes) = golden_recordings_fixture(&session_id);
+
+        // Success: video content type under the immutable-asset tail.
+        let request_line =
+            format!("GET /api/session/{session_id}/recordings/screen/seg_00001.mp4 HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_transcript(&golden_public_asset_transcript("video/mp4", &seg_bytes))
+        );
+
+        // Invalid filename / missing segment: text/plain errors.
+        let request_line =
+            format!("GET /api/session/{session_id}/recordings/screen/evil.txt HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_text_plain_transcript("400 Bad Request", "Invalid filename")
+        );
+
+        let request_line =
+            format!("GET /api/session/{session_id}/recordings/screen/seg_09999.mp4 HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(
+            golden_transcript(&response),
+            golden_text_plain_transcript("404 Not Found", "Segment not found")
+        );
+        cleanup.expect("golden seg-file fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_session_frame_asset_transcripts() {
+        let session_id = golden_unique_session_id("golden-frame");
+        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        std::fs::create_dir_all(log_dir.join("frames")).unwrap();
+        let frame_bytes = b"golden fake jpeg bytes".to_vec();
+        std::fs::write(log_dir.join("frames").join("frame_0001.jpg"), &frame_bytes).unwrap();
+
+        let request_line = format!("GET /api/session/{session_id}/frames/frame_0001.jpg HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_transcript(&golden_public_asset_transcript("image/jpeg", &frame_bytes))
+        );
+
+        let request_line = format!("GET /api/session/{session_id}/frames/evil.exe HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_text_plain_transcript("400 Bad Request", "Invalid filename")
+        );
+
+        let request_line = format!("GET /api/session/{session_id}/frames/frame_9.jpg HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(
+            golden_transcript(&response),
+            golden_text_plain_transcript("404 Not Found", "Frame not found")
+        );
+        cleanup.expect("golden frame fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_worktrees_transcripts() {
+        // List with a cold cache: the empty inventory scan body.
+        let cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let response = collect_session_handler_response(|stream| {
+            handle_worktrees_list(stream, cache.clone())
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", &empty_worktree_inventory_response())
+        );
+
+        // List with a warm cache: served verbatim.
+        {
+            let mut guard = cache.lock().unwrap();
+            *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
+        }
+        let response = collect_session_handler_response(|stream| {
+            handle_worktrees_list(stream, cache.clone())
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", r#"{"worktrees":[],"cached":true}"#)
+        );
+
+        // Inspect / remove with invalid bodies: serde error wordings.
+        let response = collect_session_handler_response(|stream| {
+            handle_worktrees_inspect(stream, "not json".to_string())
+        })
+        .await;
+        let body = serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "invalid worktree inspect request: {}",
+                serde_json::from_str::<crate::worktree_inventory::WorktreeInspectRequest>("not json")
+                    .unwrap_err()
+            ),
+        })
+        .to_string();
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("400 Bad Request", &body)
+        );
+
+        let cache2: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let response = collect_session_handler_response(|stream| {
+            handle_worktrees_remove(stream, "not json".to_string(), cache2)
+        })
+        .await;
+        let body = serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "invalid worktree removal request: {}",
+                serde_json::from_str::<crate::worktree_inventory::WorktreeRemoveRequest>("not json")
+                    .unwrap_err()
+            ),
+        })
+        .to_string();
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("400 Bad Request", &body)
+        );
+    }
+}
