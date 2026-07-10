@@ -1072,10 +1072,15 @@ async function accessFleetSignRecord(record) {
   if (!identity) return record;
   const signedAt = Date.now();
   try {
+    // Sign at the lowest version that covers the record's fields: a
+    // tier-less record keeps its v2/v3 shape, so a hosted store that
+    // predates the tier field (and would strip it) only downgrades
+    // tier-carrying records to 'unverified', not the whole fleet.
+    const version = String(record.tier || '').trim() ? 4 : (record.enc_fields ? 3 : 2);
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
-      accessFleetRecordPayload(record, signedAt, 4)
+      accessFleetRecordPayload(record, signedAt, version)
     );
     return {
       ...record,
