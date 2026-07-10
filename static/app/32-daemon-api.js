@@ -7,7 +7,8 @@
 //   daemonApi.upload(method, params, source, opts)   -> {ok, status, body}   (source: Blob | Uint8Array)
 //   daemonApi.stream(method, params, opts, onEvent)  -> completion summary
 //   daemonApi.availability(method, target)           -> {ok, reason}
-//   // opts: { target?: hostId|null, signal?, timeoutMs?, retries?, fallback?: 'auto'|'never' }
+//   // opts: { target?: hostId|{remoteHttp: origin}|null, signal?,
+//   //         timeoutMs?, retries?, fallback?: 'auto'|'never' }
 //
 // `method` is always the tunnel method name; DAEMON_API_HTTP_MAP maps it to
 // the HTTP twin when the direct lane serves the call. Adapters:
@@ -18,7 +19,11 @@
 //     authenticates to a peer over HTTP);
 //   - HTTP: `authedFetch` + the descriptor table. Connect mode is policy,
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
-//     exactly this no-legacy-fallback behavior).
+//     exactly this no-legacy-fallback behavior);
+//   - remote-http (F4): `{remoteHttp: origin}` targets name a FLEET
+//     daemon's own HTTP origin — direct cross-origin fetch under the
+//     fleet-CORS rows, never a tunnel, never a fallback (design §5's F4
+//     caveat: fleet fan-out is explicit, not ambiguous).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
 // staged uploads), the F2 sessions-family reads, the F3 settings/keys
@@ -56,10 +61,13 @@
 // sessions-family reads (managed-context, worktrees, the session list and
 // its NDJSON stream, search, detail, report, context snapshots), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
-// project-root, external-agents, displays), and the F4 access dialogs
-// family (overview, IAM state, enrollment reads + decide, IAM grant
-// upsert/update, the connect admin quartet, the tier pair, fleet-cert
-// request, dashboard targets). The
+// project-root, external-agents, displays), and the F4 access family:
+// the dialogs set (overview, IAM state, enrollment reads + decide, IAM
+// grant upsert/update, the connect admin quartet, the tier pair,
+// fleet-cert request, dashboard targets) plus the org set (trust/revoke,
+// issuance, issuer key management, and the signed-org doorbell quartet —
+// present, renew, ORL read, ORL apply, whose HTTP rows are Public by
+// design: the signed document is the authorization). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -124,6 +132,17 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
   api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
   api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
+  api_access_org_trust: { verb: 'POST', path: '/api/access/orgs/trust' },
+  api_access_org_revoke: { verb: 'POST', path: '/api/access/orgs/revoke' },
+  api_access_org_issue: { verb: 'POST', path: '/api/access/org-grants/issue' },
+  api_access_org_revoke_member: { verb: 'POST', path: '/api/access/org-grants/revoke-member' },
+  api_access_org_issuer_init: { verb: 'POST', path: '/api/access/org-grants/issuers/init' },
+  api_access_org_issuer_delegate: { verb: 'POST', path: '/api/access/org-grants/issuers/delegate' },
+  api_access_org_issuer_install: { verb: 'POST', path: '/api/access/org-grants/issuers/install' },
+  api_access_org_present: { verb: 'POST', path: '/api/access/org-grants' },
+  api_access_org_renew: { verb: 'POST', path: '/api/access/org-grants/renew' },
+  api_access_org_orl: { verb: 'GET', path: '/api/access/orgs/{org_handle}/revocations', alias: { org_handle: 'handle' } },
+  api_access_org_orl_apply: { verb: 'POST', path: '/api/access/orgs/revocations/apply' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -522,6 +541,78 @@ async function daemonApiHttpStream(method, params, opts, onEvent) {
   return null;
 }
 
+// ── Remote-http adapter (transport F4) ────────────────────────────────────
+// Cross-daemon fleet calls: the anchor page applies access changes to
+// OTHER daemons by direct cross-origin HTTP — the fleet-CORS rows, with
+// the browser's own identity to that origin (mTLS certificate) as the
+// authentication. This daemon's `authedFetch` bearer stays out of the
+// lane on purpose: nothing minted here carries authority there
+// (trust-architecture: authority is only ever minted by the target
+// daemon's local IAM). Naming the target names the transport — no tunnel
+// is ever attempted, no fallback is ever taken, and a delivered error is
+// final (design §5's F4 caveat: explicit remote-http, never fallback
+// ambiguity). JSON lane only: every fleet-CORS twin is a JSON verb, so
+// the bytes/upload/stream verbs refuse remote-http targets loudly.
+
+// The normalized origin for a `{remoteHttp: origin}` target: '' when the
+// target is not remote-http-shaped (null and string peer ids pass
+// through to the tunnel adapters); a throw when the shape is right but
+// the origin is not a usable absolute http(s) origin — a mis-built
+// target must fail loudly, never drift into another lane.
+function daemonApiRemoteHttpOrigin(target) {
+  if (!target || typeof target !== 'object') return '';
+  const raw = String(target.remoteHttp || '').trim();
+  let origin = '';
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'https:' || url.protocol === 'http:') origin = url.origin;
+    } catch { /* rejected below */ }
+  }
+  if (!origin) {
+    throw new TypeError(
+      `daemonApi: object targets must carry an absolute http(s) remoteHttp origin (got ${raw || 'nothing'})`
+    );
+  }
+  return origin;
+}
+
+// Fleet links cross networks the local per-method defaults (5 s for the
+// access family) were never sized for — floor the composed timeout at
+// the peer-dial default unless the caller sets one. Still never
+// signal-less (§3.6).
+function daemonApiRemoteHttpSignal(method, opts) {
+  const timeout = Number(opts && opts.timeoutMs);
+  const ms = Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : Math.max(daemonApiTimeoutMs(method, opts), 30000);
+  return dashboardComposeFetchSignal(opts && opts.signal, ms);
+}
+
+async function daemonApiRemoteHttpRequest(origin, method, params, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (!spec) {
+    throw new DaemonApiError(
+      'unavailable', method, origin,
+      `${method} has no HTTP twin (remote-http targets are direct-HTTP only)`
+    );
+  }
+  const { url, rest } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, mode: 'cors', signal: daemonApiRemoteHttpSignal(method, opts) };
+  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(rest);
+  }
+  let resp;
+  try {
+    resp = await fetch(`${origin}${url}`, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method, origin);
+  }
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
 // ── Tunnel adapters ───────────────────────────────────────────────────────
 // Local and peer speak the same DashboardControlTransport protocol; the
 // peer adapter resolves (or dials) the per-host connection first. A peer
@@ -567,6 +658,8 @@ async function daemonApiTunnelBytes(transport, method, params, opts, target) {
 
 // ── The four verbs ────────────────────────────────────────────────────────
 async function daemonApiRequest(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) return daemonApiRemoteHttpRequest(remoteOrigin, method, params, opts);
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -593,6 +686,13 @@ async function daemonApiRequest(method, params = {}, opts = {}) {
 }
 
 async function daemonApiBytes(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS byte twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -616,6 +716,13 @@ async function daemonApiBytes(method, params = {}, opts = {}) {
 }
 
 async function daemonApiUpload(method, params = {}, source, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS upload twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -644,6 +751,13 @@ async function daemonApiUpload(method, params = {}, source, opts = {}) {
 }
 
 async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS stream twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -712,6 +826,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
 }
 
 function daemonApiAvailability(method, target = null) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(target);
+  if (remoteOrigin) {
+    // A REMOTE origin's reachability is unknowable without a request;
+    // the honest answer is lane presence — the descriptor names the
+    // methods fleet daemons serve over direct HTTP.
+    return DAEMON_API_HTTP_MAP[method]
+      ? { ok: true, reason: 'http-only' }
+      : { ok: false, reason: 'never' };
+  }
   if (target) {
     const conn = peerDashboardControlConnectionsByHost.get(String(target));
     if (conn && conn.canUseRpc()) return daemonApiTunnelMethodAvailability(conn, method);

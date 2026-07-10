@@ -583,8 +583,8 @@ document.getElementById('sb-dashboard-transport')?.addEventListener('click', () 
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
-// endpoint is public by design (the document is the authorization); using
-// authedFetch keeps it working identically on the trusted paths.
+// HTTP row is public by design (the document is the authorization); the
+// facade rides the tunnel when one is bound and the public row otherwise.
 document.getElementById('access-org-join-btn')?.addEventListener('click', async () => {
   const status = document.getElementById('access-org-join-status');
   const raw = document.getElementById('access-org-join-doc')?.value?.trim();
@@ -602,7 +602,7 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
   const stored = orgGrantStore(doc);
   if (status) status.textContent = 'Presenting…';
   try {
-    const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
+    const data = await accessOrgCall('api_access_org_present', doc);
     const summary = data.peer_identity
       ? `peer profile ${data.peer_identity.profile} for ${data.peer_identity.label} until ${new Date(Number(data.peer_identity.expires_at_unix || 0) * 1000).toLocaleString()}`
       : `${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}`;

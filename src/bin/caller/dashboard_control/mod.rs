@@ -3438,7 +3438,9 @@ mod tests {
     /// (api_control.rs). Four facts per entry: the tunnel twin exists in
     /// `CONTROL_METHODS`; the verb + instantiated path resolve to a
     /// declared route whose verb is declared exactly (never via `Any`);
-    /// the row's IAM operation equals the tunnel method's; and the path
+    /// the row's IAM operation equals the tunnel method's (the signed-org
+    /// doorbell rows are Public on HTTP by design and instead pin their
+    /// documented tunnel op-override); and the path
     /// template restates the row's declared pattern (captures by name).
     /// Plus the exact coverage set, so entries appear and disappear
     /// deliberately. When the route table grows its `tunnel:` column
@@ -3494,9 +3496,11 @@ mod tests {
         // detail, report, context snapshots), the F3 settings/keys
         // family (settings GET/POST, api-keys save, key-status,
         // project-root, external-agents, displays), and the F4 access
-        // dialogs family (overview, IAM state, enrollment reads + decide,
-        // IAM grant upsert/update, the connect admin quartet, the tier
-        // pair, fleet-cert request, dashboard targets). The `api_transfer_*`
+        // family: the dialogs set (overview, IAM state, enrollment reads
+        // + decide, IAM grant upsert/update, the connect admin quartet,
+        // the tier pair, fleet-cert request, dashboard targets) plus the
+        // org set (trust/revoke, issuance, issuer keys, and the
+        // signed-org doorbell quartet). The `api_transfer_*`
         // methods join when their HTTP rows land (task #6, /api/transfers);
         // adding or dropping an entry updates this list in the same change,
         // deliberately.
@@ -3547,6 +3551,17 @@ mod tests {
             "api_access_set_hosted_ceiling",
             "api_fleet_cert_request",
             "api_dashboard_targets",
+            "api_access_org_trust",
+            "api_access_org_revoke",
+            "api_access_org_issue",
+            "api_access_org_revoke_member",
+            "api_access_org_issuer_init",
+            "api_access_org_issuer_delegate",
+            "api_access_org_issuer_install",
+            "api_access_org_present",
+            "api_access_org_renew",
+            "api_access_org_orl",
+            "api_access_org_orl_apply",
         ]
         .into_iter()
         .collect();
@@ -3600,6 +3615,34 @@ mod tests {
                     op, tunnel_op,
                     "{method_name}: tunnel op {tunnel_op:?} != route op {op:?}"
                 ),
+                // The signed-org doorbell rows are Public on HTTP by
+                // design (the signed document is the authorization)
+                // while their tunnel twins gate stricter through
+                // documented op-overrides (F4). Require the row to carry
+                // this method's tunnel column with an override matching
+                // the effective tunnel operation; the override list
+                // itself is pinned closed by the gateway's
+                // tunnel_op_overrides_are_a_closed_documented_enumeration.
+                RouteAuthz::Public => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: Public descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved Public row carries a different tunnel method"
+                    );
+                    let (override_op, _reason) = tunnel.op_override.unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: Public twinned rows must carry a \
+                             documented tunnel op-override"
+                        )
+                    });
+                    assert_eq!(
+                        override_op, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != declared override {override_op:?}"
+                    );
+                }
                 _ => panic!("{method_name}: twinned rows must be Operation-gated"),
             }
 
