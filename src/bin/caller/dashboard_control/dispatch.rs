@@ -768,17 +768,24 @@ pub(crate) fn control_frame_response(
                 | "api_access_org_orl_apply"
                 | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
                     let result = match method {
                         "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                            &cert_dir,
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
                         "api_access_org_orl_apply" => {
-                            crate::web_gateway::access_org_orl_apply_response_value(params)
+                            crate::web_gateway::access_org_orl_apply_response_value(
+                                &cert_dir, params,
+                            )
                         }
                         "api_access_org_renew" => {
-                            crate::web_gateway::access_org_renew_response_value(params)
+                            crate::web_gateway::access_org_renew_response_value(&cert_dir, params)
                         }
                         _ => crate::web_gateway::access_org_present_response_value(
+                            &cert_dir,
                             params,
                             &runtime.agent_card,
                         ),

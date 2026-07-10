@@ -1064,6 +1064,7 @@ pub fn present_org_grant_state(
 /// document is the authorization on all of them, and a failure changes
 /// nothing.
 pub fn present_org_grant_value(
+    cert_dir: &std::path::Path,
     doc_value: &serde_json::Value,
     extra_daemon_ids: &[String],
     now_unix_ms: u64,
@@ -1071,18 +1072,17 @@ pub fn present_org_grant_value(
     if !presentation_rate_ok(now_unix_ms) {
         return Err("too many org grant presentations; retry shortly".to_string());
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let outcome = present_org_grant_state(
         &mut state,
-        &cert_dir,
+        cert_dir,
         doc_value,
         extra_daemon_ids,
         now_unix_ms,
     )?;
     if outcome.changed() {
-        crate::access::iam::save_state(&cert_dir, &state)
+        crate::access::iam::save_state(cert_dir, &state)
             .map_err(|e| format!("save local IAM state: {e}"))?;
     }
     Ok(outcome)

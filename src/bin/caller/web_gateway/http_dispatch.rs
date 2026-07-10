@@ -813,16 +813,23 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     req_method,
+                    cert_dir,
                     agent_card_value_for_targets,
                 )
                 .await;
             }
             RouteHandlerId::AccessOrgRevocations => {
-                return handle_access_org_revocations(stream, req_path).await;
+                return handle_access_org_revocations(stream, req_path, cert_dir).await;
             }
             RouteHandlerId::AccessOrgApplyRenew => {
-                return handle_access_org_apply_renew(stream, route_body, req_method, req_path)
-                    .await;
+                return handle_access_org_apply_renew(
+                    stream,
+                    route_body,
+                    req_method,
+                    req_path,
+                    cert_dir,
+                )
+                .await;
             }
             RouteHandlerId::AccessIamGrants => {
                 return handle_access_iam_grants(

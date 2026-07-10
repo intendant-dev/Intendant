@@ -55,6 +55,7 @@ pub(crate) async fn connect_dashboard_offer_response(
         .filter(|doc| !doc.is_null())
         .and_then(|doc| {
             crate::access::org::present_org_grant_value(
+                &crate::access::backend::select_backend().cert_dir(),
                 doc,
                 &org_target_agent_card_ids(agent_card),
                 crate::access::client_key::now_unix_ms() as u64,
