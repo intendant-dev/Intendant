@@ -1128,7 +1128,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessIamGrants,
         "Upsert a user-client grant",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_iam_upsert_user_client_grant")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/iam/grants/update"),
@@ -1136,7 +1137,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessIamGrants,
         "Update an IAM grant",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_iam_update_grant")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/trust"),
@@ -1144,7 +1146,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Trust an org root key on this daemon",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_trust")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revoke"),
@@ -1152,7 +1155,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Withdraw trust in an org root key",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_revoke")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issue"),
@@ -1160,7 +1164,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Issue an org grant (org root/issuer key on this daemon)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_issue")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/revoke-member"),
@@ -1168,7 +1173,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Revoke an org member (appends to the ORL)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_revoke_member")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/init"),
@@ -1176,7 +1182,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Initialize an org issuer key",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_issuer_init")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/delegate"),
@@ -1184,7 +1191,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Delegate to an org issuer",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_issuer_delegate")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/issuers/install"),
@@ -1192,7 +1200,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessOrgManage,
         "Install a delegated org issuer key",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_org_issuer_install")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/enrollment-requests/decide"),
@@ -1200,7 +1209,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessEnrollmentDecide,
         "Approve or deny a pending enrollment request",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_enrollment_decide")),
     fleet_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/access/enrollment-requests"),

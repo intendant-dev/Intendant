@@ -187,19 +187,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         PeerOperation::CredentialsManage,
     ),
     method("api_credential_egress_probe", PeerOperation::CredentialsManage),
-    method(
-        "api_access_iam_upsert_user_client_grant",
-        PeerOperation::AccessManage,
-    ),
-    method("api_access_iam_update_grant", PeerOperation::AccessManage),
-    method("api_access_enrollment_decide", PeerOperation::AccessManage),
-    method("api_access_org_trust", PeerOperation::AccessManage),
-    method("api_access_org_revoke", PeerOperation::AccessManage),
-    method("api_access_org_issue", PeerOperation::AccessManage),
-    method("api_access_org_revoke_member", PeerOperation::AccessManage),
-    method("api_access_org_issuer_init", PeerOperation::AccessManage),
-    method("api_access_org_issuer_delegate", PeerOperation::AccessManage),
-    method("api_access_org_issuer_install", PeerOperation::AccessManage),
+    // The IAM grant mutations (upsert/update), enrollment decide, and
+    // the seven org-manage methods live as tunnel columns on their route
+    // rows — their IAM operations derive from the rows (S6).
     // Presenting a signed org document (or list) only requires a session;
     // the document itself is the authorization and is fully re-verified.
     // Same for reading the org's public revocation list and renewing a
@@ -3084,40 +3074,40 @@ mod tests {
             ),
             (
                 "api_access_iam_upsert_user_client_grant",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_access_iam_update_grant",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_access_enrollment_decide",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_access_org_trust", Residue, Some(Op::AccessManage)),
-            ("api_access_org_revoke", Residue, Some(Op::AccessManage)),
-            ("api_access_org_issue", Residue, Some(Op::AccessManage)),
+            ("api_access_org_trust", Row, Some(Op::AccessManage)),
+            ("api_access_org_revoke", Row, Some(Op::AccessManage)),
+            ("api_access_org_issue", Row, Some(Op::AccessManage)),
             (
                 "api_access_org_revoke_member",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_access_org_issuer_init",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_access_org_issuer_delegate",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_access_org_issuer_install",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             ("api_access_org_present", Residue, Some(Op::AccessInspect)),
