@@ -255,16 +255,6 @@ pub(crate) fn session_agent_output_api_response(
     }
 }
 
-/// Raw-string bridge for the tunnel twin until it delegates through the
-/// neutral fn (removed with that conversion).
-pub(crate) fn session_agent_output_post_response(
-    body: &str,
-    session_id: &str,
-    source: &str,
-) -> String {
-    api_response_to_http_string(session_agent_output_api_response(body, session_id, source))
-}
-
 /// Build a zip containing the current session's text artifacts for the
 /// Settings → "Download session report" feature. Includes session.jsonl,
 /// session_meta.json, transcript.jsonl, summary.json, daemon.log,

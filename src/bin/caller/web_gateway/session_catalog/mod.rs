@@ -683,16 +683,6 @@ pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
 }
 
-pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) -> String {
-    if !ids.is_empty() {
-        cached_list_sessions_for_ids(ids)
-    } else if let Some(limit) = limit {
-        cached_list_sessions_with_limit(limit)
-    } else {
-        cached_list_sessions()
-    }
-}
-
 /// Strip session rows down to what the Stats tab folds: usage, costs,
 /// per-day buckets, disk sizes, and the model name (the ui-v2 Usage
 /// screen aggregates cost by model client-side). Full rows carry tasks,
