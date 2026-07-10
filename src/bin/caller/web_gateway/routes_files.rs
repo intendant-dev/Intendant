@@ -107,7 +107,13 @@ pub(crate) fn pending_upload_session_dir(
     scope.store_base().join("pending_uploads")
 }
 
+/// `state_root` scopes the projectless (daemon-global) fallback store —
+/// the transport edge resolves the real `intendant_home()`, tests inject
+/// a tempdir so a projectless commit never writes the machine's real
+/// global store. Project-rooted commits never read it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn current_upload_commit_response_body(
+    state_root: &std::path::Path,
     project_root: Option<&std::path::Path>,
     session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
     daemon_session_id: Option<&str>,
@@ -118,7 +124,7 @@ pub(crate) fn current_upload_commit_response_body(
     size: usize,
     bus: &crate::event::EventBus,
 ) -> (&'static str, String) {
-    let scope = crate::global_store::StoreScope::resolve(project_root);
+    let scope = crate::global_store::StoreScope::resolve_in(project_root, state_root);
 
     let (session_dir, session_id) = if let Some(slog) = session_log {
         match slog.lock() {
@@ -206,6 +212,7 @@ pub(crate) fn current_upload_delete_response_body(
 /// commit, `UploadReady` broadcast — under the wildcard-CORS tail.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn current_upload_commit_api_response(
+    state_root: &std::path::Path,
     project_root: Option<&std::path::Path>,
     session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
     daemon_session_id: Option<&str>,
@@ -217,6 +224,7 @@ pub(crate) fn current_upload_commit_api_response(
     bus: &crate::event::EventBus,
 ) -> ApiResponse {
     let (status, body) = current_upload_commit_response_body(
+        state_root,
         project_root,
         session_log,
         daemon_session_id,
@@ -2604,6 +2612,38 @@ pub(crate) async fn handle_fs_delete(
 // shared per-connection arguments (open cleanup; not load-bearing).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_current_uploads_post(
+    stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    discard: Vec<u8>,
+    bus: EventBus,
+    project_root_for_changes: Option<PathBuf>,
+    session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    daemon_session_id: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    // Transport edge: resolve the real state root once (projectless
+    // commits fall back to the daemon-global store under it); the golden
+    // drives the `_in_state_root` variant with an injected tempdir.
+    handle_current_uploads_post_in_state_root(
+        stream,
+        header_text,
+        request_line,
+        discard,
+        bus,
+        project_root_for_changes,
+        session_log,
+        daemon_session_id,
+        cors,
+        fleet_origin,
+        &crate::platform::intendant_home(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_current_uploads_post_in_state_root(
     mut stream: DemuxStream,
     header_text: &str,
     request_line: &str,
@@ -2614,6 +2654,7 @@ pub(crate) async fn handle_current_uploads_post(
     daemon_session_id: Option<String>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
+    state_root: &std::path::Path,
 ) {
     // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
     //   Content-Type: <mime>
@@ -2653,6 +2694,7 @@ pub(crate) async fn handle_current_uploads_post(
                 session_wildcard_json_error(status, &e)
             }
             Ok((tmp, size)) => current_upload_commit_api_response(
+                state_root,
                 project_root_for_changes.as_deref(),
                 session_log.as_ref(),
                 daemon_session_id.as_deref(),
@@ -3960,24 +4002,22 @@ mod tests {
     }
 
     /// POST success on a projectless daemon: the commit resolves the
-    /// daemon-global store (PR #129 semantics), same wire framing.
+    /// daemon-global store (PR #129 semantics), same wire framing. The
+    /// `_in_state_root` handler variant takes an injected temp root, so
+    /// the commit lands in the test's own scratch global store instead of
+    /// the machine's real `~/.intendant/global-store`.
     #[tokio::test]
     async fn golden_current_uploads_post_projectless_transcript() {
+        let state = tempfile::tempdir().unwrap();
         let body = b"golden projectless upload bytes".to_vec();
-        let session_id = format!(
-            "golden-projectless-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let session_id = "golden-projectless";
         let header_text = format!(
             "POST /api/session/current/uploads?name=global.txt HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let bus = crate::event::EventBus::new();
         let response = collect_upload_handler_response(|stream| {
-            handle_current_uploads_post(
+            handle_current_uploads_post_in_state_root(
                 stream,
                 &header_text,
                 "POST /api/session/current/uploads?name=global.txt HTTP/1.1",
@@ -3985,9 +4025,10 @@ mod tests {
                 bus,
                 None,
                 None,
-                Some(session_id.clone()),
+                Some(session_id.to_string()),
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
+                state.path(),
             )
         })
         .await;
@@ -3996,14 +4037,12 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
         assert!(text.contains(upload_golden_tail()), "{head}");
         let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
-        let store_root = crate::global_store::global_store_root();
+        let store_root = crate::global_store::global_store_root_in(state.path());
         let path = descriptor["path"].as_str().unwrap().to_string();
         assert!(
             path.starts_with(&store_root.to_string_lossy().to_string()),
             "projectless upload must land in the global store: {path}"
         );
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{path}.json"));
     }
 
     #[tokio::test]

@@ -47,15 +47,12 @@ impl SessionSupervisor {
         } else {
             backend_session_id.as_deref().unwrap_or(&session_id)
         };
-        let result = match dirs::home_dir() {
-            Some(home) => crate::session_names::rename_session(
-                &home,
-                &normalized_source,
-                persistence_session_id,
-                &name,
-            ),
-            None => Err("could not resolve home directory".to_string()),
-        };
+        let result = crate::session_names::rename_session(
+            &self.logs_home(),
+            &normalized_source,
+            persistence_session_id,
+            &name,
+        );
 
         match result {
             Ok(name) => {
@@ -430,7 +427,13 @@ impl SessionSupervisor {
         };
 
         if let Some(name) = name_to_persist {
-            persist_external_session_name(&self.config.bus, &source, &backend_session_id, &name);
+            persist_external_session_name(
+                &self.logs_home(),
+                &self.config.bus,
+                &source,
+                &backend_session_id,
+                &name,
+            );
         }
     }
 }
@@ -733,14 +736,18 @@ pub(crate) fn effective_session_agent_config_from_project(
     config
 }
 
-pub(crate) fn persist_external_session_name(bus: &EventBus, source: &str, session_id: &str, name: &str) {
+pub(crate) fn persist_external_session_name(
+    home: &std::path::Path,
+    bus: &EventBus,
+    source: &str,
+    session_id: &str,
+    name: &str,
+) {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" || name.trim().is_empty() {
         return;
     }
-    let result = dirs::home_dir()
-        .ok_or_else(|| "could not resolve home directory".to_string())
-        .and_then(|home| crate::session_names::rename_session(&home, &source, session_id, name));
+    let result = crate::session_names::rename_session(home, &source, session_id, name);
     if let Err(message) = result {
         bus.send(AppEvent::LogEntry {
             session_id: Some(session_id.to_string()),

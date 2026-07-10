@@ -84,25 +84,27 @@ impl StoreScope {
         if let Some(root) = project_root {
             return StoreScope::Project(root.to_path_buf());
         }
-        let scope = Self::resolve_in(None, &crate::platform::intendant_home());
-        if let StoreScope::Global(base) = &scope {
-            static FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
-            FALLBACK_LOGGED.call_once(|| {
-                eprintln!(
-                    "[uploads] projectless daemon — using global store at {}",
-                    base.display()
-                );
-            });
-        }
-        scope
+        Self::resolve_in(None, &crate::platform::intendant_home())
     }
 
-    /// Pure resolution against an explicit state root (no logging) — the
-    /// unit-test seam for [`StoreScope::resolve`].
+    /// Resolution against an explicit state root — the injectable seam for
+    /// [`StoreScope::resolve`] (callers with a threaded state root, tests).
+    /// The projectless fallback is announced once per process regardless of
+    /// which entry point resolved it.
     pub(crate) fn resolve_in(project_root: Option<&Path>, state_root: &Path) -> Self {
         match project_root {
             Some(root) => StoreScope::Project(root.to_path_buf()),
-            None => StoreScope::Global(global_store_root_in(state_root)),
+            None => {
+                let base = global_store_root_in(state_root);
+                static FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+                FALLBACK_LOGGED.call_once(|| {
+                    eprintln!(
+                        "[uploads] projectless daemon — using global store at {}",
+                        base.display()
+                    );
+                });
+                StoreScope::Global(base)
+            }
         }
     }
 

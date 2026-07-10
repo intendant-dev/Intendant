@@ -219,9 +219,21 @@ pub(crate) fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
     entry.key.matches(key).then_some(entry.value)
 }
 
+/// The persisted (on-disk) tier of the session index is DISABLED in
+/// unit-test builds, at these ambient wrappers: the index is the daemon's
+/// own derived cache under its state root, so every row a test's catalog
+/// scan parses would otherwise write a JSON blob into the machine's real
+/// `~/.intendant/cache/session_index` — the write-through leak the
+/// empty-HOME acceptance run catches (tests-are-hermetic). Same shape as
+/// listener.rs's `#[cfg(not(test))]` warm-scan gate; the in-memory tiers
+/// stay fully exercised and the `_in`-suffixed fns remain the persisted
+/// tier's testable seam (see this file's round-trip tests).
 pub(crate) fn load_persisted_session_entry<T: serde::de::DeserializeOwned>(
     key: &SessionListCacheKey,
 ) -> Option<T> {
+    if cfg!(test) {
+        return None;
+    }
     load_persisted_session_entry_in(&session_index_dir(), key)
 }
 
@@ -243,12 +255,20 @@ pub(crate) fn store_persisted_session_entry_in<T: Serialize>(
 }
 
 pub(crate) fn store_persisted_session_entry<T: Serialize>(key: &SessionListCacheKey, value: &T) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     store_persisted_session_entry_in(&session_index_dir(), key, value);
 }
 
 pub(crate) fn load_persisted_intendant_row(
     fingerprint: &SessionDirFingerprint,
 ) -> Option<serde_json::Value> {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return None;
+    }
     let path = session_index_entry_path("intendant-row", &fingerprint.path);
     let bytes = std::fs::read(path).ok()?;
     let entry: PersistedIntendantSessionEntry = serde_json::from_slice(&bytes).ok()?;
@@ -259,6 +279,10 @@ pub(crate) fn store_persisted_intendant_row(
     fingerprint: &SessionDirFingerprint,
     row: &serde_json::Value,
 ) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     let entry = PersistedIntendantSessionEntry {
         fingerprint: fingerprint.clone(),
         row: row.clone(),
@@ -271,6 +295,10 @@ pub(crate) fn store_persisted_intendant_row(
 }
 
 pub(crate) fn remove_persisted_intendant_row(dir: &Path) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     let path = session_index_entry_path("intendant-row", &session_list_path_key(dir));
     let _ = std::fs::remove_file(path);
 }

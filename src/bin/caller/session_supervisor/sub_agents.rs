@@ -210,7 +210,7 @@ impl SessionSupervisor {
         let session_name = normalize_session_name_option(params.name.as_deref())
             .map_err(|e| format!("invalid sub-agent name: {e}"))?;
 
-        let log_dir = session_log::SessionLog::resolve_path(None);
+        let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
         let session_log = session_log::SessionLog::open(log_dir.clone())
             .map(|log| Arc::new(std::sync::Mutex::new(log)))
             .map_err(|e| format!("sub-agent session log failed: {e}"))?;

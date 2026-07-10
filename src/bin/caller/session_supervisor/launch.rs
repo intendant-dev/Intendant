@@ -36,7 +36,7 @@ impl SessionSupervisor {
                 return;
             }
         };
-        let log_dir = session_log::SessionLog::resolve_path(None);
+        let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
             Err(e) => {
@@ -1357,7 +1357,7 @@ pub(crate) fn external_resume_log_dir_in_home(home: &Path, session_id: &str, for
             return dir;
         }
     }
-    session_log::SessionLog::resolve_path(None)
+    session_log::SessionLog::resolve_path_in_home(home, None)
 }
 
 pub(crate) fn effective_external_resume_token_in_home(

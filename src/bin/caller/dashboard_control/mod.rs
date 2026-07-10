@@ -1152,6 +1152,7 @@ impl DashboardControlPeer {
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
             grant,
+            state_root: crate::platform::intendant_home(),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -1237,6 +1238,12 @@ pub(crate) struct ControlRuntime {
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
     grant: DashboardControlGrant,
+    /// The daemon state root (`intendant_home()`), resolved once at the
+    /// control-channel edge. Adapters that fall back to the daemon-global
+    /// store (uploads, transfers) resolve their scope against this instead
+    /// of ambient state, so the test runtime's scratch root keeps
+    /// projectless fixtures out of the machine's real `~/.intendant`.
+    state_root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -2304,6 +2311,17 @@ mod tests {
             control_frames_tx: None,
             display_peer_id: 1,
             grant: DashboardControlGrant::TrustedLocal,
+            // Per-instance scratch (never the machine's real ~/.intendant):
+            // projectless adapters resolve the daemon-global store under
+            // this root. PID+nanos, per the state_paths uniqueness rule.
+            state_root: std::env::temp_dir().join(format!(
+                "intendant-test-state-root-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            )),
         }
     }
 

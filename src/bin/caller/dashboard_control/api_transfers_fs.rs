@@ -10,7 +10,10 @@ use super::*;
 /// (see `global_store.rs`). Infallible — projectless daemons are served,
 /// not refused.
 pub(crate) fn transfer_store_scope(runtime: &ControlRuntime) -> crate::global_store::StoreScope {
-    crate::global_store::StoreScope::resolve(runtime.project_root.as_deref())
+    crate::global_store::StoreScope::resolve_in(
+        runtime.project_root.as_deref(),
+        &runtime.state_root,
+    )
 }
 
 pub(crate) fn transfer_http_error_response(
@@ -1782,6 +1785,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),

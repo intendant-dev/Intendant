@@ -1128,6 +1128,21 @@ pub(crate) async fn api_diagnostics_visual_freshness_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real state dir once; the RPC fixture
+    // drives the `_in_state_dir` variant with an injected tempdir.
+    api_diagnostics_visual_freshness_response_in_state_dir(
+        id,
+        params,
+        &crate::platform::intendant_home(),
+    )
+    .await
+}
+
+pub(crate) async fn api_diagnostics_visual_freshness_response_in_state_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    state_dir: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if session_id.is_empty() {
@@ -1143,8 +1158,13 @@ pub(crate) async fn api_diagnostics_visual_freshness_response(
         return missing_param_response(id, "body");
     }
 
+    let state_dir = state_dir.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::diagnostics::append_visual_freshness_record(&session_id, body.as_bytes())
+        crate::diagnostics::append_visual_freshness_record_in(
+            &state_dir,
+            &session_id,
+            body.as_bytes(),
+        )
     })
     .await;
     let (status, body) = match result {
@@ -2330,17 +2350,19 @@ mod tests {
 
     #[tokio::test]
     async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
-        let session_id = format!("dashboard-control-test-vf-{}", std::process::id());
-        if let Some(path) = crate::diagnostics::visual_freshness_path(&session_id) {
-            let _ = std::fs::remove_file(&path);
-        }
+        // Injected tempdir state dir: the append lands in the test's own
+        // scratch, never the machine's real ~/.intendant/diagnostics — and
+        // the fixture no longer needs the pre/post remove_file dance.
+        let state = tempfile::tempdir().expect("temp state dir");
+        let session_id = "dashboard-control-test-vf";
         let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
-        let response = api_diagnostics_visual_freshness_response(
+        let response = api_diagnostics_visual_freshness_response_in_state_dir(
             "diag-vf".to_string(),
             Some(&serde_json::json!({
-                "session_id": session_id.clone(),
+                "session_id": session_id,
                 "body": ndjson,
             })),
+            state.path(),
         )
         .await;
         assert_eq!(response["t"], "response");
@@ -2349,11 +2371,10 @@ mod tests {
         assert_eq!(response["result"]["_httpStatus"], 200);
         assert_eq!(response["result"]["written"], ndjson.len());
 
-        let path =
-            crate::diagnostics::visual_freshness_path(&session_id).expect("diagnostics path");
+        let path = crate::diagnostics::visual_freshness_path_in(state.path(), session_id)
+            .expect("diagnostics path");
         let written = std::fs::read_to_string(&path).expect("diagnostics transcript");
         assert_eq!(written, ndjson);
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

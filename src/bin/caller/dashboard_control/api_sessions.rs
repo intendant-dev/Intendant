@@ -708,7 +708,10 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             };
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(runtime.project_root.as_deref());
+    let scope = crate::global_store::StoreScope::resolve_in(
+        runtime.project_root.as_deref(),
+        &runtime.state_root,
+    );
     let session_log = {
         let session = runtime.shared_session.read().await;
         session.session_log.clone()
@@ -813,7 +816,10 @@ pub(crate) async fn api_session_current_uploads_response(
             );
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+    let scope = crate::global_store::StoreScope::resolve_in(
+        project_root.as_deref(),
+        &runtime.state_root,
+    );
     let session_dir =
         session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&scope));
     let result = tokio::task::spawn_blocking(move || {
@@ -856,9 +862,11 @@ pub(crate) async fn api_session_current_upload_task_response(
         )
     };
     let project_root = runtime.project_root.clone();
+    let state_root = runtime.state_root.clone();
     let bus = runtime.bus.clone();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::current_upload_commit_api_response(
+            &state_root,
             project_root.as_deref(),
             session_log.as_ref(),
             daemon_session_id.as_deref(),
@@ -1363,6 +1371,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
@@ -1397,6 +1406,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
@@ -1468,22 +1478,15 @@ mod tests {
     /// Route-level proof for projectless daemons (task "Wave 1F"): with no
     /// project root anywhere, a staged upload POST commits into the
     /// daemon-global store and the raw read streams the same bytes back.
-    /// Fixture writes go through the process state root (the live
-    /// `~/.intendant` in bin unit tests — same convention as the
-    /// session-frame transfer test), so the session id is unique per run
-    /// and the store dir is removed afterwards.
+    /// Both legs resolve the store under the test runtime's scratch
+    /// state root, so the fixture never touches the machine's real
+    /// `~/.intendant/global-store` and needs no unique ids or cleanup.
     #[tokio::test]
     async fn projectless_staged_upload_posts_and_reads_raw_from_global_store() {
         let mut rt = runtime();
         assert!(rt.project_root.is_none());
-        rt.session_id = format!(
-            "projectless-upload-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let session_store_dir = crate::global_store::global_store_root()
+        rt.session_id = "projectless-upload-test".to_string();
+        let session_store_dir = crate::global_store::global_store_root_in(&rt.state_root)
             .join("uploads")
             .join(&rt.session_id);
 
@@ -1493,6 +1496,7 @@ mod tests {
 
         // POST: commit with no project root resolves the global store.
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             None,
             None,
             Some(rt.session_id.as_str()),
@@ -1519,13 +1523,11 @@ mod tests {
             &rt,
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&session_store_dir);
         assert!(response.done);
         let stream = response.byte_stream.expect("raw read must stream bytes");
         assert_eq!(stream.bytes, bytes);
         assert_eq!(stream.result["ok"], true);
         assert_eq!(stream.result["id"], descriptor.id);
-        cleanup.expect("global-store session dir cleanup");
     }
 
     #[tokio::test]
@@ -2310,6 +2312,7 @@ mod tests {
         tmp.write_all(&payload).unwrap();
         let (status, http_descriptor) = http_status_and_body(
             crate::web_gateway::current_upload_commit_api_response(
+                &rt.state_root,
                 Some(project.path()),
                 None,
                 Some("parity-session"),
