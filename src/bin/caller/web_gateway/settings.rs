@@ -873,6 +873,250 @@ mod tests {
         assert!(saved.contains("managed_context = \"managed\""));
     }
 
+    // ── S5 golden transcripts: settings / keys family ──
+    //
+    // Byte-exact pins of the settings GET/POST, api-keys POST,
+    // api-key-status, and project-root HTTP responses, captured before
+    // the transport-neutral conversion (transport-unification design
+    // §6 S5, risk R1) and kept as the conversion's proof. The expected
+    // framing is hand-written below — never built through the response
+    // helpers under conversion. Environment-dependent bodies (the
+    // key-status booleans read process env / leases; the settings
+    // payload mirrors env overrides) are computed through the body
+    // builders the conversion does not touch and spliced into the
+    // hand-written framing — the framing is the pin, and the fixtures
+    // never write outside their tempdirs (the api-keys pins use the
+    // pre-persist rejection paths, which return before any config-dir
+    // resolution).
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_settings_handler_response<Fut>(
+        run: impl FnOnce(DemuxStream) -> Fut,
+    ) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The canonical JSON framing (`Cache-Control` + `Connection` tail):
+    /// settings GET/POST, key-status, and project-root, spelled out
+    /// literally.
+    fn golden_settings_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The bare wildcard-CORS JSON framing (`Access-Control-Allow-Origin:
+    /// *` + `Connection` tail, NO `Cache-Control`): the api-keys POST
+    /// shape, spelled out literally.
+    fn golden_settings_bare_wildcard_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn golden_settings_transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn golden_project_root_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let root_json = serde_json::json!(root.to_string_lossy()).to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_project_root(stream, Some(root.clone()))
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript(
+                "200 OK",
+                &format!(r#"{{"project_root":{root_json}}}"#)
+            )
+        );
+
+        let response =
+            collect_settings_handler_response(|stream| handle_project_root(stream, None)).await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"project_root":null}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_get_no_root_transcript() {
+        // Historical shape: the missing-project-root ERROR body still
+        // answers 200 OK on the GET lane.
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_get(stream, None, RuntimeSettingsState::default())
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"error":"No project root"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_get_temp_root_transcript() {
+        // A tempdir project root loads the default config; the payload
+        // body mirrors process env (env_overrides), so it is computed
+        // through the payload builder and spliced — the 200 framing is
+        // the byte-exact pin.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let runtime_settings = RuntimeSettingsState::default();
+        let body = settings_get_response_body(Some(&root), &runtime_settings).await;
+        assert!(
+            body.contains("cu_backend"),
+            "default-config payload expected: {body}"
+        );
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_get(stream, Some(root.clone()), runtime_settings.clone())
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_post_transcripts() {
+        // Missing project root: 400 under the canonical tail.
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("400 Bad Request", r#"{"error":"No project root"}"#)
+        );
+
+        // Invalid payload: 400 with serde's wording for this exact input
+        // (derived through the same parse, framing hand-written). The
+        // parse rejects before the project root is ever read.
+        let parse_dir = tempfile::tempdir().unwrap();
+        let invalid = "{\"external_agent\":";
+        let serde_error = serde_json::from_str::<SettingsPayload>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("Invalid settings: {}", serde_error)})
+                .to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(
+                stream,
+                invalid.to_string(),
+                EventBus::new(),
+                Some(parse_dir.path().to_path_buf()),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Success on a tempdir root: 200 {"ok":true} and the TOML written.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": null
+        })
+        .to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(stream, body, EventBus::new(), Some(root.clone()))
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"ok":true}"#)
+        );
+        assert!(root.join("intendant.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn golden_api_keys_post_transcripts() {
+        // Unknown key: rejected before any config-dir resolution — and
+        // still 200 OK (the historical always-200 POST lane) under the
+        // bare wildcard tail.
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_keys_post(stream, r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string())
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_bare_wildcard_json_transcript(
+                "200 OK",
+                r#"{"error":"Unknown key: NOT_A_KNOWN_KEY"}"#
+            )
+        );
+
+        // Invalid payload: serde wording derived through the same parse
+        // (match instead of unwrap_err — the payload type has no Debug).
+        let invalid = "not json";
+        let serde_error = match serde_json::from_str::<SetApiKeysPayload>(invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("fixture input must not parse"),
+        };
+        let expected_body =
+            serde_json::json!({"error": format!("Invalid payload: {}", serde_error)}).to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_keys_post(stream, invalid.to_string())
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_bare_wildcard_json_transcript("200 OK", &expected_body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_api_key_status_transcript() {
+        // The per-provider booleans read process env + lease state; the
+        // body is computed through the status builder and spliced — the
+        // 200 canonical framing is the byte-exact pin.
+        let body = api_key_status_response_body();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.is_object(), "status body is an object: {body}");
+        let response =
+            collect_settings_handler_response(|stream| handle_api_key_status(stream)).await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+    }
+
     /// Codex fields absent from the payload must not be re-dispatched —
     /// a partial settings save must not clobber live state with defaults.
     #[test]
