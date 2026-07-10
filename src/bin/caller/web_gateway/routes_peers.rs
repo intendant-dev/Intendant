@@ -77,6 +77,7 @@ fn peers_family_api_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_peers_sub_router(
     stream: DemuxStream,
     body_text: String,
