@@ -434,6 +434,8 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -496,6 +498,8 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -506,6 +510,8 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -516,6 +522,8 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
