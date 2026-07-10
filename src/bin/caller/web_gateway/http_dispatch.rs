@@ -1319,6 +1319,28 @@ pub(crate) async fn serve_http_request(
                 let _ = stream.write_all(&bytes).await;
             }
         }
+    } else if let Some(asset) = static_asset_arm(req_method, req_path, &["/vault-kernel.js"]) {
+        // The vault crypto kernel — embedded like every static asset, so
+        // the dashboard's VAULT_KERNEL_SHA256 pin (assembled into the same
+        // binary) always matches. Under the INTENDANT_APP_HTML_PATH dev
+        // override the disk sibling wins instead: the overridden app.html
+        // pins THAT file's hash.
+        let response = app_html_override
+            .as_deref()
+            .and_then(|path| {
+                vault_kernel_override_response(req_method, header_text, req_query, path)
+            })
+            .unwrap_or_else(|| {
+                build_static_asset_response(
+                    req_method,
+                    header_text,
+                    req_query,
+                    asset_version(),
+                    asset.view(),
+                )
+            });
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.write_all(&response).await;
     } else if let Some(asset) = static_asset_arm(
         req_method,
         req_path,

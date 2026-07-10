@@ -7,6 +7,14 @@ use super::*;
 
 pub(crate) const APP_HTML: &str = include_str!("../../../../static/app.html");
 
+// The vault crypto kernel: the small, separately served worker that owns
+// the vault's key material. app.html pins its sha256 (VAULT_KERNEL_SHA256,
+// minted by crates/app-html-assembler) and the page refuses to instantiate
+// a kernel whose bytes hash differently — the embedded pair below is
+// therefore always self-consistent, and the parity test in this module
+// re-derives the hash to catch a kernel edit that skipped regeneration.
+pub(crate) const VAULT_KERNEL_JS: &str = include_str!("../../../../static/vault-kernel.js");
+
 pub(crate) const AUDIO_PROCESSOR_JS: &str = include_str!("../../../../static/audio-processor.js");
 
 pub(crate) const ICON_128_PNG: &[u8] = include_bytes!("../../../../static/icon-128.png");
@@ -191,6 +199,12 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             "/audio-processor.js",
             "application/javascript",
             AUDIO_PROCESSOR_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/vault-kernel.js",
+            "application/javascript",
+            VAULT_KERNEL_JS.as_bytes(),
             true,
         );
         insert(
@@ -490,6 +504,38 @@ pub(crate) fn app_html_override_response(
     }
 }
 
+/// Under the `INTENDANT_APP_HTML_PATH` dev override, serve /vault-kernel.js
+/// from the override file's sibling `vault-kernel.js` when one exists (fresh
+/// disk read per request, like the app.html override itself). The pin inside
+/// the overridden app.html was minted from that sibling by the assembler, so
+/// serving the embedded — possibly stale — kernel would trip the page's
+/// integrity check mid-iteration. `None` (no override dir, no sibling, read
+/// error) falls back to the embedded kernel: fail-open here is correct
+/// because the page's hash check is the enforcement point either way.
+pub(crate) fn vault_kernel_override_response(
+    method: &str,
+    header_text: &str,
+    query: &str,
+    app_html_path: &std::path::Path,
+) -> Option<Vec<u8>> {
+    let sibling = app_html_path.parent()?.join("vault-kernel.js");
+    let body = std::fs::read(&sibling).ok()?;
+    let etag = asset_etag(&body);
+    Some(build_static_asset_response(
+        method,
+        header_text,
+        query,
+        asset_version(),
+        StaticAssetView {
+            content_type: "application/javascript",
+            body: &body,
+            etag: &etag,
+            gzip: None,
+            cache_control: Some("no-cache"),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +544,71 @@ mod tests {
         "/wasm-web/presence_web_bg.wasm",
         "/wasm-station/station_web_bg.wasm",
     ];
+
+    /// Lowercase-hex sha256, matching the assembler's pin encoding.
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(data)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// The vault-kernel hash pin: the embedded app.html must pin exactly the
+    /// sha256 of the embedded kernel bytes. This is the daemon-side parity
+    /// gate for the pinned-kernel design (the page refuses to instantiate a
+    /// kernel whose hash differs): an edit to static/vault-kernel.js that
+    /// skips `cargo run -p app-html-assembler` (any cargo build also
+    /// reassembles) fails here instead of shipping a dashboard whose vault
+    /// refuses to unlock.
+    #[test]
+    fn vault_kernel_hash_pin_matches_embedded_kernel() {
+        let marker = "const VAULT_KERNEL_SHA256 = '";
+        let start = APP_HTML
+            .find(marker)
+            .expect("app.html must carry the VAULT_KERNEL_SHA256 pin");
+        let rest = &APP_HTML[start + marker.len()..];
+        let end = rest.find('\'').expect("pin constant must be quoted");
+        let pinned = &rest[..end];
+        assert_eq!(
+            pinned.len(),
+            64,
+            "pin must be a full lowercase-hex sha256, got {pinned:?} — \
+             was app.html assembled without static/vault-kernel.js?"
+        );
+        assert_eq!(
+            pinned,
+            sha256_hex(VAULT_KERNEL_JS.as_bytes()),
+            "static/app.html pins a different kernel hash than \
+             static/vault-kernel.js — regenerate with `cargo run -p \
+             app-html-assembler` and commit both files together"
+        );
+        // The placeholder itself must never ship.
+        assert!(
+            !APP_HTML.contains("__VAULT_KERNEL_SHA256__"),
+            "unsubstituted vault-kernel placeholder in app.html"
+        );
+        // The kernel is served at the path the page fetches.
+        let asset = embedded_static_asset("/vault-kernel.js").expect("kernel must be embedded");
+        assert_eq!(asset.content_type, "application/javascript");
+        assert_eq!(asset.body, VAULT_KERNEL_JS.as_bytes());
+    }
+
+    #[test]
+    fn vault_kernel_override_serves_disk_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_html_path = dir.path().join("app.html");
+        // No sibling yet: fall back to the embedded kernel.
+        assert!(vault_kernel_override_response("GET", "", "", &app_html_path).is_none());
+        std::fs::write(dir.path().join("vault-kernel.js"), b"self.onmessage=null;\n").unwrap();
+        let resp = vault_kernel_override_response("GET", "", "", &app_html_path)
+            .expect("sibling kernel must be served");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Type: application/javascript"));
+        assert!(text.contains("Cache-Control: no-cache"));
+        assert!(text.ends_with("self.onmessage=null;\n"));
+    }
 
     #[test]
     fn test_app_html_embedded() {

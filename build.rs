@@ -273,6 +273,12 @@ fn main() {
     // a silently dropped fragment would embed a broken dashboard.
     println!("cargo:rerun-if-changed={}/", app_html_assembler::FRAGMENT_DIR);
     println!("cargo:rerun-if-changed={}", app_html_assembler::OUTPUT);
+    // The vault crypto kernel's sha256 is pinned into the assembled
+    // app.html (VAULT_KERNEL_SHA256), so a kernel edit must re-assemble.
+    println!(
+        "cargo:rerun-if-changed={}",
+        app_html_assembler::VAULT_KERNEL_PATH
+    );
     // The wasm-pack pin gates artifact rebuilds; a pin bump must re-run
     // the staleness/version checks.
     println!("cargo:rerun-if-changed=.wasm-pack-version");

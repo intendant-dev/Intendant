@@ -148,6 +148,48 @@ credential lease is already scoped, time-boxed, and revocable (below).
 Users who refuse hosted-origin unsealing browse from an anchor origin —
 both escape hatches stay first-class.
 
+### The crypto kernel
+
+Within the browser, the key material lives one layer deeper than the
+page: all key-touching crypto — master-key generation and (un)wrapping,
+KEK derivation from PRF secrets and the phrase, body AES-GCM, the blob
+MAC, the deposit-lane ECIES — runs inside **`static/vault-kernel.js`**,
+a small dependency-free dedicated Worker driven over a postMessage RPC
+(`unlock-phrase`, `unlock-prf`, `create`, `encrypt-body`, `verify-mac`,
+`open-deposit`, …). The master key, the KEKs, and the MAC key exist only
+in the worker and are wiped on `lock`; the page holds an opaque unlock
+token, and `32-vault-custody.js` keeps only policy and state — envelope
+choice, the MAC-downgrade ratchet, storage, rendering.
+
+The point is *pinned instantiation*: the app.html assembler hashes the
+kernel at build time and injects the sha256 as `VAULT_KERNEL_SHA256`
+(a placeholder in the fragment source, substituted at assembly — see
+`crates/app-html-assembler`); at first vault use the page fetches
+`/vault-kernel.js` (served embedded by the daemon gateway and from the
+static root by the hosted service), hashes the bytes, and instantiates a
+worker from them (blob URL) **only on a hash match** — a mismatch is a
+loud hard-refusal with no inline-crypto fallback. On the hosted service
+the kernel file is part of the artifact-transparency manifest
+(`artifact_manifest` log entries), so the pinning chain runs assembler
+hash → served bytes → public log → out-of-band verification by
+`intendant hosted-verify` and the daemon tripwires. A tampered bundle
+that once could exfiltrate the master key at unlock now has to tamper
+with one small, manifest-committed, humanly auditable file instead of
+hiding in ~3.4 MB of dashboard.
+
+Honest limits: the kernel kills silent **key** exfiltration and offline
+future-decryption, not live abuse — a malicious page can still call the
+kernel's RPC while unlocked (read entries, encrypt attacker-chosen
+bodies), bounded by the page's own transparency story, not the kernel.
+WebAuthn must run on the page, so the PRF secret transits page memory
+inbound (and stays in sessionStorage for reload-unlock, as before); the
+decrypted body plaintext — entries, settings, the deposit lane's private
+JWK, which must ride the sealed blob — flows to the page because the UI
+renders it. `scripts/vault-kernel-exercise.cjs` drives the kernel's RPC
+end to end under node's WebCrypto; the daemon-side parity test
+(`web_gateway/static_assets.rs`) fails the suite when the kernel is
+edited without regenerating the app.html pin.
+
 **The write-only deposit lane** (`intendant vault deposit <label>`) is
 the asymmetric sealing half, shipped: a P-256 deposit keypair lives
 *inside* the sealed body (`settings.deposit_lane`, so it reaches every
@@ -167,9 +209,10 @@ limits: the depositing CLI trusts the machine it runs on — a malicious
 daemon could swap the deposit key and capture *future* deposits (it
 still can never read the vault), and deposits are write-only by
 construction: nothing on the CLI side can read an entry back out. The
-implementation pair is `vault_deposits.rs` (seal) and
-`32-vault-custody.js` (open); `scripts/vault-deposit-parity.cjs`
-cross-checks the two against real WebCrypto.
+implementation pair is `vault_deposits.rs` (seal) and the crypto
+kernel's `open-deposit` op (driven by `32-vault-custody.js`);
+`scripts/vault-deposit-parity.cjs` cross-checks the two against real
+WebCrypto.
 
 **Still reserved, not v1:** deriving the deposit keypair from the PRF
 secret itself (today it is generated randomly and rides the blob), and
