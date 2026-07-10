@@ -719,19 +719,47 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::ProjectRoot => {
-                return handle_project_root(stream, project_root).await;
+                return handle_project_root(
+                    stream,
+                    project_root,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SettingsPost => {
-                return handle_settings_post(stream, route_body, bus, project_root).await;
+                return handle_settings_post(
+                    stream,
+                    route_body,
+                    bus,
+                    project_root,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SettingsGet => {
-                return handle_settings_get(stream, project_root, runtime_settings).await;
+                return handle_settings_get(
+                    stream,
+                    project_root,
+                    runtime_settings,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::ApiKeysPost => {
-                return handle_api_keys_post(stream, route_body).await;
+                return handle_api_keys_post(
+                    stream,
+                    route_body,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::ApiKeyStatus => {
-                return handle_api_key_status(stream).await;
+                return handle_api_key_status(stream, route.cors, fleet_cors_origin.as_deref())
+                    .await;
             }
             RouteHandlerId::ExternalAgents => {
                 return handle_external_agents(stream, project_root).await;

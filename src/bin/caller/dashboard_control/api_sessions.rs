@@ -238,9 +238,9 @@ pub(crate) async fn control_request_response(
         "api_diagnostics_visual_freshness" => {
             api_diagnostics_visual_freshness_response(id, params.as_ref()).await
         }
-        "api_key_status" => json_body_response(
+        "api_key_status" => frame_api_json_body_response(
             id,
-            crate::web_gateway::api_key_status_response_body(),
+            crate::web_gateway::api_key_status_api_response(),
             "api key status",
         ),
         "api_external_agents" => json_body_response(
@@ -250,9 +250,9 @@ pub(crate) async fn control_request_response(
         ),
         "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
         "api_voice_session" => api_voice_session_response(id, &runtime).await,
-        "api_project_root" => json_body_response(
+        "api_project_root" => frame_api_json_body_response(
             id,
-            crate::web_gateway::project_root_response_body(runtime.project_root.as_deref()),
+            crate::web_gateway::project_root_api_response(runtime.project_root.as_deref()),
             "project root",
         ),
         "api_displays" => api_displays_response(id, &runtime).await,
