@@ -141,3 +141,49 @@ agent-facing display lookup (a second fence, independent of the flag —
 see [Computer Use](./computer-use-and-audio.md)). Revoking *any*
 user-display session — shared or private — clears the per-daemon grant
 flag: over-revocation is the fail-closed direction.
+
+## The display request rail (doorbell)
+
+Scoped callers — supervised external agents, session-scoped grants,
+federated peers — cannot perform the owner's opt-in themselves
+(`grant_user_display` refuses them). What they can do is **ask**: the
+`request_user_display` MCP tool (`intendant ctl display request`) raises a
+dedicated dashboard popup with the agent's short reason and the requested
+access level, then blocks until the user decides or the wait window
+(default 120 s, max 600 s) closes.
+
+**Never auto-approved, by construction.** Display requests live in their
+own registry and id space, deliberately outside the approval registry:
+`approve` / `approve_all` / any autonomy level or per-category rule cannot
+reach them. The only resolution is the dedicated
+`resolve_display_request` control message — the popup's **Allow** /
+**Deny** / **Deny for this session** buttons — accepted from owner
+surfaces and classified `display.input` exactly like `GrantUserDisplay`
+(resolving a request is as powerful as granting directly). On approve, the
+control plane mints the grant through the same state flip and events the
+owner's own grant takes.
+
+Two access levels:
+
+- **`view`** — the display stream activates agent-visible (dashboard tile
+  + `list_frames`/`read_frame`), but the `DisplayControl` grant flag stays
+  **off**: computer-use input and screenshots against `user_session`
+  remain denied at the CU executor's fail-closed gate.
+- **`view_and_control`** — the full session grant described above.
+
+Three durations, chosen by the user at approval: **this session**
+(auto-revokes when the requesting session ends), **15 minutes** (a timer
+revokes through the normal revoke path; superseded if the owner grants or
+revokes manually in the meantime), **until revoked**.
+
+Spam resistance: one pending request per session (a second call reports
+the existing one); a deny — or a timeout, which counts as declined by
+absence — starts a 5-minute per-session cooldown during which new
+requests are refused without a popup; **Deny for this session**
+suppresses the session server-side until it ends. Pending requests feed
+the attention chain (tab badge, hidden-tab notification, and the
+Connect Web Push nudge with kind `display_request` — the push carries
+only the kind and session label, never the reason text). On a headless
+daemon with no owner surface, requests are refused immediately
+(`unavailable`) instead of blocking — the same fail-closed posture as
+headless approvals.

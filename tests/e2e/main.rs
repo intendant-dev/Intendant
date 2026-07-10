@@ -1167,6 +1167,261 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     .await;
 }
 
+/// The display-request rail end to end: a caller rings the user-display
+/// doorbell (`ctl display request` → the `request_user_display` tool), a
+/// dashboard surface (here: a raw `/ws` client) receives the dedicated
+/// `display_request_raised` event and resolves it with the dedicated
+/// `resolve_display_request` action — approve mints the real grant
+/// (`user_display_granted` broadcast) and the blocked ctl call returns the
+/// structured approved result. The daemon runs at `--autonomy full`, which
+/// proves the rail's core invariant live: even full autonomy never
+/// auto-approves a display request — it waits for the click. The deny leg
+/// exercises deny + the per-session cooldown (the following ask is refused
+/// without raising anything).
+///
+/// Leg 0 pins the held-grant short-circuit, which is also what makes the
+/// test platform-uniform: a Windows daemon auto-registers the user desktop
+/// and holds the grant from startup
+/// (`display_glue::auto_activate_windows_user_display` — capture consent
+/// is implicit there by design), so a request on a fresh Windows daemon
+/// correctly answers `already_granted` without ringing. Granting
+/// explicitly first makes every platform take that same path, and the
+/// revoke that follows gives the popup legs one clean, grantless starting
+/// state everywhere.
+#[tokio::test]
+async fn display_request_rail_round_trips_over_ws() {
+    use futures_util::SinkExt;
+
+    const REASON: &str = "E2E_DISPLAY_REQUEST verify the deploy output";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before requesting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // ── Leg 0: a held grant short-circuits without ringing ──
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "is the door already open?",
+            "--session",
+            "display-e2e-pregrant",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "already_granted", "{result}");
+
+    // Clean slate for the popup legs (this also revokes the Windows
+    // startup auto-grant like any other grant).
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    // ── Leg 1: request(view_and_control) → user approves ──
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            REASON,
+            "--access",
+            "control",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-approve",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_raised never broadcast on /ws:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["session_id"], "display-e2e-approve", "{raised}");
+        assert_eq!(raised["access"], "view_and_control", "{raised}");
+        assert_eq!(raised["reason"], REASON, "{raised}");
+        assert!(
+            raised["expires_unix_ms"].as_u64().unwrap_or(0) > 0,
+            "{raised}"
+        );
+        let id = raised["id"].as_u64().expect("request id");
+
+        // The user's click: the dedicated resolution action (a display
+        // request is NEVER resolvable through approve/approve_all).
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-approve",
+                "id": id,
+                "decision": "approve",
+                "duration": "until_revoked",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send resolve_display_request");
+
+        // The approval minted the real grant through the existing path.
+        // Emission order inside the control plane's approve arm: the grant
+        // event first, then the resolution — and a /ws reader consumes
+        // frames in order, so wait for them in that order.
+        let granted = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_display_granted")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "user_display_granted never broadcast after approval:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(granted["display_id"], 0, "{granted}");
+        assert_eq!(granted["agent_visible"], true, "{granted}");
+
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["id"], id, "{resolved}");
+        assert_eq!(resolved["outcome"], "approved", "{resolved}");
+        assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "approved", "{result}");
+    assert_eq!(result["access"], "view_and_control", "{result}");
+    assert_eq!(result["duration"], "until_revoked", "{result}");
+
+    // ── Leg 2: revoke, then a request the user denies ──
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "second look please",
+            "--access",
+            "view",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-deny",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+                && json.get("session_id").and_then(|v| v.as_str()) == Some("display-e2e-deny")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_raised never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["access"], "view", "{raised}");
+        let id = raised["id"].as_u64().expect("request id");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-deny",
+                "id": id,
+                "decision": "deny",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send deny");
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+                && json.get("id").and_then(|v| v.as_u64()) == Some(id)
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["outcome"], "denied", "{resolved}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "denied", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+
+    // ── Leg 3: the cooldown refuses the next ask without a popup ──
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "asking again immediately",
+            "--session",
+            "display-e2e-deny",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "cooldown", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+}
+
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
 /// renders the question on the rail (`user_question` on /ws), a frontend
 /// answers via `answer_question`, and the blocked ctl returns the exact

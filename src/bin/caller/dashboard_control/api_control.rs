@@ -1292,6 +1292,7 @@ pub(crate) const DASHBOARD_ACTION_MSG_ACTIONS: &[&str] = &[
     "release_display",
     "grant_user_display",
     "revoke_user_display",
+    "resolve_display_request",
     "create_virtual_display",
     "create_browser_workspace",
     "close_browser_workspace",
@@ -1366,6 +1367,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::ReleaseDisplay { .. } => "release_display",
         ControlMsg::GrantUserDisplay { .. } => "grant_user_display",
         ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
+        ControlMsg::ResolveDisplayRequest { .. } => "resolve_display_request",
         ControlMsg::CreateVirtualDisplay { .. } => "create_virtual_display",
         ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
         ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
@@ -1879,6 +1881,10 @@ mod tests {
         (
             "take_display",
             || serde_json::json!({"action": "take_display", "display_id": 1}),
+        ),
+        (
+            "resolve_display_request",
+            || serde_json::json!({"action": "resolve_display_request", "session_id": "s", "id": 1, "decision": "approve", "duration": "this_session"}),
         ),
         (
             "release_display",

@@ -706,6 +706,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'display_approval_pending',
   'user_display_granted',
   'user_display_revoked',
+  'display_request_raised',
+  'display_request_resolved',
   'shared_view',
   // Unique note_id per note makes the JSON.stringify dedupe key exact.
   'session_note',
@@ -787,6 +789,7 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'release_display',
   'grant_user_display',
   'revoke_user_display',
+  'resolve_display_request',
   'create_virtual_display',
   'create_browser_workspace',
   'close_browser_workspace',

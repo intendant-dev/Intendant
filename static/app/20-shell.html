@@ -280,6 +280,22 @@
             </div>
           </div>
 
+          <!-- Display Request Panel (the user-display doorbell): a scoped
+               agent asked to access display 0 via request_user_display.
+               Body is rendered by showDisplayRequest() in
+               58-display-request.js: requesting session, reason, access
+               level, a duration select, and Allow / Deny / Deny-for-this-
+               session actions. Deliberately NOT the approval panel: display
+               requests have no Approve-all and are never auto-approved. -->
+          <div class="bottom-panel" id="display-request-panel">
+            <div class="panel-body">
+              <div class="approval-card">
+                <div class="approval-icon">&#x1F5B5;</div>
+                <div class="approval-content" id="display-request-content"></div>
+              </div>
+            </div>
+          </div>
+
           <!-- Follow-up is handled by the always-visible activity-task-input
                at the top of this pane. No separate follow-up panel needed. -->
         </div>

@@ -87,12 +87,15 @@ fn last_dashboard_seen() -> Option<u64> {
 
 /// The kind of agent→user request pending. This is the whole vocabulary the
 /// nudge wire carries about the request — deliberately a category, not a
-/// payload. New attention kinds (display requests) extend this enum + the
-/// service-side whitelist (`NOTIFY_KINDS` in `src/bin/connect/push.rs`).
+/// payload. New attention kinds extend this enum + the service-side
+/// whitelist (`NOTIFY_KINDS` in `src/bin/connect/push.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionKind {
     Approval,
     Question,
+    /// A scoped agent asked to access the user's display
+    /// (`request_user_display`); the popup waits for the owner's click.
+    DisplayRequest,
     /// An urgent `notify_user` notification — an explicit agent escalation,
     /// not a pending request: it skips the grace period (nothing to
     /// "answer quickly"), fires at most once, and still respects the
@@ -105,9 +108,21 @@ impl AttentionKind {
         match self {
             AttentionKind::Approval => "approval",
             AttentionKind::Question => "question",
+            AttentionKind::DisplayRequest => "display_request",
             AttentionKind::Notify => "notify",
         }
     }
+}
+
+/// Which id space a pending entry's `id` belongs to. Approvals and
+/// questions share the approval registry's id space (one `ApprovalResolved`
+/// clears either); display requests have their own registry and counter,
+/// so `id` values can collide numerically — the space keeps a display
+/// request's resolution from clearing an unrelated approval and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IdSpace {
+    Approval,
+    DisplayRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -195,8 +210,8 @@ fn fallback_label(key: &str) -> String {
 }
 
 struct MonitorState {
-    /// (session key, request id) → pending request.
-    pending: HashMap<(String, u64), PendingRequest>,
+    /// (session key, id space, request id) → pending request.
+    pending: HashMap<(String, IdSpace, u64), PendingRequest>,
     /// session key → oldest undelivered urgent-notification escalation
     /// (unix-ms it appeared). One slot per session: an urgent burst
     /// collapses into one nudge like every other burst.
@@ -221,7 +236,7 @@ impl MonitorState {
         match event {
             AppEvent::ApprovalRequired { session_id, id, .. } => {
                 self.pending
-                    .entry((session_key(session_id), *id))
+                    .entry((session_key(session_id), IdSpace::Approval, *id))
                     .or_insert(PendingRequest {
                         kind: AttentionKind::Approval,
                         since_unix_ms: now_unix_ms(),
@@ -229,11 +244,26 @@ impl MonitorState {
             }
             AppEvent::UserQuestionRequired { session_id, id, .. } => {
                 self.pending
-                    .entry((session_key(session_id), *id))
+                    .entry((session_key(session_id), IdSpace::Approval, *id))
                     .or_insert(PendingRequest {
                         kind: AttentionKind::Question,
                         since_unix_ms: now_unix_ms(),
                     });
+            }
+            // The display-request doorbell has its own registry and id
+            // counter (deliberately outside the approval registry), so its
+            // raise/resolve pair tracks in its own id space.
+            AppEvent::DisplayRequestRaised { session_id, id, .. } => {
+                self.pending
+                    .entry((session_key(session_id), IdSpace::DisplayRequest, *id))
+                    .or_insert(PendingRequest {
+                        kind: AttentionKind::DisplayRequest,
+                        since_unix_ms: now_unix_ms(),
+                    });
+            }
+            AppEvent::DisplayRequestResolved { session_id, id, .. } => {
+                self.pending
+                    .remove(&(session_key(session_id), IdSpace::DisplayRequest, *id));
             }
             // Only urgent notifications escalate off the machine; info and
             // attention stay browser-side by design.
@@ -247,20 +277,25 @@ impl MonitorState {
                     .or_insert_with(now_unix_ms);
             }
             AppEvent::ApprovalResolved { session_id, id, .. } => {
-                self.pending.remove(&(session_key(session_id), *id));
+                self.pending
+                    .remove(&(session_key(session_id), IdSpace::Approval, *id));
             }
             // A finished/ended/interrupted session cannot still be waiting:
             // its blocked loop returned. Some exit paths (interrupt drain,
             // headless deny) skip ApprovalResolved, so clear by session.
-            // A dead session's undelivered escalation dies with it too.
+            // Display requests deliberately survive TaskComplete/Interrupted
+            // — their waiter is the blocked MCP call, not the agent loop's
+            // turn — and clear on SessionEnded like everything else. A dead
+            // session's undelivered escalation dies with it too.
             AppEvent::TaskComplete { session_id, .. }
             | AppEvent::Interrupted { session_id, .. } => {
                 let key = session_key(session_id);
-                self.pending.retain(|(k, _), _| *k != key);
+                self.pending
+                    .retain(|(k, space, _), _| *k != key || *space == IdSpace::DisplayRequest);
                 self.escalations.remove(&key);
             }
             AppEvent::SessionEnded { session_id, .. } => {
-                self.pending.retain(|(k, _), _| k != session_id);
+                self.pending.retain(|(k, _, _), _| k != session_id);
                 self.escalations.remove(session_id);
                 self.names.remove(session_id);
                 self.last_nudge.remove(session_id);
@@ -326,7 +361,7 @@ impl MonitorState {
     /// the oldest pending request per session that passes [`should_nudge`].
     fn due(&self, now: u64, connected: bool, last_seen: Option<u64>) -> Vec<(String, AttentionKind, String)> {
         let mut oldest: HashMap<&str, &PendingRequest> = HashMap::new();
-        for ((key, _), request) in &self.pending {
+        for ((key, _, _), request) in &self.pending {
             let slot = oldest.entry(key.as_str()).or_insert(request);
             if request.since_unix_ms < slot.since_unix_ms {
                 *slot = request;
@@ -511,6 +546,91 @@ mod tests {
             error_kind: None,
         });
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn display_requests_track_in_their_own_id_space() {
+        let mut state = MonitorState::new();
+        let sid = Some("sess-1".to_string());
+        // Same numeric id in both spaces: a display request and a command
+        // approval must not clobber each other.
+        state.observe(&AppEvent::ApprovalRequired {
+            session_id: sid.clone(),
+            id: 1,
+            command_preview: String::new(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        state.observe(&AppEvent::DisplayRequestRaised {
+            session_id: sid.clone(),
+            id: 1,
+            access: "view".to_string(),
+            reason: "verify the fix on your screen".to_string(),
+            expires_unix_ms: now_unix_ms() + 120_000,
+        });
+        assert_eq!(state.pending.len(), 2);
+
+        // The nudge label carries only the KIND, never the reason text.
+        let now = now_unix_ms() + NUDGE_GRACE_MS + 1;
+        let due = state.due(now, false, None);
+        assert_eq!(due.len(), 1, "one nudge per session");
+
+        // Resolving the display request leaves the approval pending…
+        state.observe(&AppEvent::DisplayRequestResolved {
+            session_id: sid.clone(),
+            id: 1,
+            outcome: "denied".to_string(),
+            access: None,
+            duration: None,
+        });
+        assert_eq!(state.pending.len(), 1);
+        // …and its surviving entry is the approval, not the request.
+        assert!(state
+            .pending
+            .contains_key(&("sess-1".to_string(), IdSpace::Approval, 1)));
+
+        // ApprovalResolved on the same id clears the approval only.
+        state.observe(&AppEvent::DisplayRequestRaised {
+            session_id: sid.clone(),
+            id: 2,
+            access: "view".to_string(),
+            reason: "again".to_string(),
+            expires_unix_ms: now_unix_ms() + 120_000,
+        });
+        state.observe(&AppEvent::ApprovalResolved {
+            session_id: sid.clone(),
+            id: 1,
+            action: "approve".to_string(),
+        });
+        assert_eq!(state.pending.len(), 1);
+        assert!(state
+            .pending
+            .contains_key(&("sess-1".to_string(), IdSpace::DisplayRequest, 2)));
+
+        // TaskComplete clears loop-blocked requests but NOT the display
+        // request (its waiter is the blocked MCP call, not the turn).
+        state.observe(&AppEvent::TaskComplete {
+            session_id: sid.clone(),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert!(state
+            .pending
+            .contains_key(&("sess-1".to_string(), IdSpace::DisplayRequest, 2)));
+        // SessionEnded clears everything for the session.
+        state.observe(&AppEvent::SessionEnded {
+            session_id: "sess-1".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn display_request_kind_rides_the_nudge_wire_vocabulary() {
+        // The Connect service whitelists kinds (NOTIFY_KINDS in
+        // src/bin/connect/push.rs); this pin keeps the daemon-side string
+        // in lockstep with the service-side vocabulary.
+        assert_eq!(AttentionKind::DisplayRequest.as_str(), "display_request");
     }
 
     #[test]

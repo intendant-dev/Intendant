@@ -388,11 +388,12 @@ pub(crate) fn notify_signing_payload(
 }
 
 /// Request kinds a nudge may name. A closed vocabulary — extending it is a
-/// deliberate act on both binaries (planned: display requests), never free
-/// text from the wire. `notify` is an urgent `notify_user` agent
-/// notification escalated by the daemon's attention monitor
-/// (`src/bin/caller/attention_nudge.rs`).
-const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify"];
+/// deliberate act on both binaries, never free text from the wire.
+/// `notify` is an urgent `notify_user` agent notification escalated by the
+/// daemon's attention monitor (`src/bin/caller/attention_nudge.rs`);
+/// `display_request` is the user-display doorbell
+/// (`request_user_display`) waiting on the owner's click.
+const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify", "display_request"];
 
 /// Compose the Web Push payload for a pending-request nudge.
 ///
@@ -420,6 +421,12 @@ pub(crate) fn attention_push_payload(
         "notify" => (
             format!("{daemon_label}: urgent agent notification"),
             format!("Session \u{201c}{session_label}\u{201d} needs your attention."),
+        ),
+        "display_request" => (
+            format!("{daemon_label}: agent asks to view your screen"),
+            format!(
+                "Session \u{201c}{session_label}\u{201d} is asking for display access. Open the dashboard to allow or deny."
+            ),
         ),
         _ => (
             format!("{daemon_label}: approval needed"),
@@ -908,6 +915,21 @@ mod tests {
             notify["body"],
             "Session \u{201c}s-1\u{201d} needs your attention."
         );
+
+        // Display requests keep the same discipline: kind + labels only —
+        // the agent's reason text never rides the push.
+        let display = attention_push_payload("display_request", "workshop", "s-1", "daemon-1");
+        let display_keys: Vec<&str> = {
+            let mut keys: Vec<&str> = display.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(display_keys, vec!["body", "tag", "title", "url"]);
+        assert_eq!(display["title"], "workshop: agent asks to view your screen");
+        assert_eq!(
+            display["body"],
+            "Session \u{201c}s-1\u{201d} is asking for display access. Open the dashboard to allow or deny."
+        );
     }
 
     /// The nudge request wire shape has no content-bearing fields: an old
@@ -917,7 +939,10 @@ mod tests {
     #[test]
     fn notify_request_kinds_are_a_closed_vocabulary() {
         for kind in NOTIFY_KINDS {
-            assert!(matches!(*kind, "approval" | "question" | "notify"));
+            assert!(matches!(
+                *kind,
+                "approval" | "question" | "notify" | "display_request"
+            ));
         }
         let parsed: DaemonNotifyRequest = serde_json::from_value(json!({
             "protocol": "intendant-connect-daemon-notify-v1",

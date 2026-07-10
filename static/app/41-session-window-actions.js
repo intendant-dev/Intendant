@@ -2754,6 +2754,9 @@ function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.
 function hidePanel(id) {
   if (id === 'approval-panel') clearPendingApproval();
   if (id === 'question-panel') clearPendingQuestion();
+  // Display-request state lives in 58-display-request.js (same module
+  // scope — function declarations hoist across fragments).
+  if (id === 'display-request-panel') clearPendingDisplayRequest();
   if (id === 'human-panel') {
     stationCurrentHumanQuestion = '';
     stationScheduleUpdate();
@@ -2763,6 +2766,7 @@ function hidePanel(id) {
 function hideAllPanels() {
   clearPendingApproval();
   clearPendingQuestion();
+  clearPendingDisplayRequest();
   stationCurrentHumanQuestion = '';
   document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
   stationScheduleUpdate();

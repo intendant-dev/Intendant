@@ -124,6 +124,9 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
                     | "grant_user_display"
+                    // The doorbell for the user's own display — exists
+                    // precisely for these scoped supervised callers.
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -146,6 +149,7 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
                     | "grant_user_display"
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -209,7 +213,14 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // classify alike: agent→user session-surface writes for the same
         // session-scoped callers — a question requests input, never
         // permission, and answering one never widens autonomy.
-        "respond" | "post_session_note" | "ask_user" | "notify_user" => PeerOperation::Message,
+        //
+        // request_user_display classifies here too: the tool only ASKS the
+        // user (a popup with a reason — the same risk class as messaging
+        // them) and can grant nothing itself. The grant is minted by the
+        // owner's click, whose ControlMsg (`resolve_display_request`) is
+        // classified DisplayInput like grant_user_display.
+        "respond" | "post_session_note" | "ask_user" | "notify_user"
+        | "request_user_display" => PeerOperation::Message,
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -444,6 +455,14 @@ pub(crate) fn append_manual_http_tool_definitions(
         ),
     );
     push(
+        "request_user_display",
+        manual_http_tool_definition!(
+            "request_user_display",
+            "Ask the user for access to their real display (display 0, user_session). Raises a dedicated dashboard popup with your reason and blocks up to wait_seconds for their click — the user's click is the only thing that can grant it (no autonomy setting or approval action can). access=\"view\" shares the display stream (frames + dashboard visibility) without computer-use input; access=\"view_and_control\" requests the full grant. Returns a structured JSON result: approved (with granted duration), denied, denied_for_session, timed_out, cooldown, already_pending, already_granted, or unavailable.",
+            RequestUserDisplayParams
+        ),
+    );
+    push(
         "take_screenshot",
         manual_http_tool_definition!(
             "take_screenshot",
@@ -636,6 +655,57 @@ mod tests {
     }
 
     #[test]
+    fn manual_http_request_user_display_description_matches_tool_attribute() {
+        // Same drift guard as the rewind/peer/session-note tools:
+        // request_user_display lives in a non-router impl block, so the
+        // HTTP transport serves the manual definition while the #[tool]
+        // attribute documents the method; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "request_user_display")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for request_user_display");
+        let attr = IntendantServer::request_user_display_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "request_user_display manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn request_user_display_is_advertised_to_supervised_profiles() {
+        // The doorbell exists FOR scoped supervised callers: it must be
+        // listed in the small core profile, the display profile, and the
+        // permissive default/full lists.
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+            Some("screen"),
+            Some("display"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("request_user_display", false, profile),
+                "request_user_display must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual
+                .iter()
+                .any(|tool| tool["name"] == "request_user_display"),
+            "core-profile manual definitions must include request_user_display"
+        );
+    }
+
+    #[test]
     fn ask_and_notify_tools_are_advertised_to_supervised_profiles() {
         // The agent→user primitives exist to be called by supervised
         // session-scoped agents (and `intendant ctl` on their behalf):
@@ -739,6 +809,15 @@ mod tests {
         // out of asking their own user.
         assert_eq!(mcp_tool_operation("ask_user"), PeerOperation::Message);
         assert_eq!(mcp_tool_operation("notify_user"), PeerOperation::Message);
+        // The display-request doorbell classifies as Message too: it only
+        // ASKS the user (popup + reason) and can grant nothing — scoped
+        // supervised agents, its primary callers, must be able to ring it.
+        // The grant itself is minted by the owner's resolve_display_request
+        // control message, which classifies DisplayInput.
+        assert_eq!(
+            mcp_tool_operation("request_user_display"),
+            PeerOperation::Message
+        );
         assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);
         assert_eq!(
             mcp_tool_operation("rewind_context"),

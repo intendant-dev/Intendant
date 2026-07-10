@@ -168,6 +168,8 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
                     | AppEvent::SharedView { .. }
+                    | AppEvent::DisplayRequestRaised { .. }
+                    | AppEvent::DisplayRequestResolved { .. }
                     | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..

@@ -1018,6 +1018,10 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
         | AppEvent::SharedView { .. }
+        // The display-request doorbell rings on dashboards (popup +
+        // attention chain), not through presence narration.
+        | AppEvent::DisplayRequestRaised { .. }
+        | AppEvent::DisplayRequestResolved { .. }
         | AppEvent::BrowserWorkspaceChanged { .. }
 
         // Pull-only events — not pushed to presence
