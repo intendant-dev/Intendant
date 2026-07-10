@@ -3490,10 +3490,12 @@ mod tests {
             );
         }
 
-        // Coverage pin: exactly the F1 family's twinned methods (fs +
-        // staged uploads). The `api_transfer_*` methods join when their
-        // HTTP rows land (task #6, /api/transfers); adding or dropping an
-        // entry updates this list in the same change, deliberately.
+        // Coverage pin: the F1 family's twinned methods (fs + staged
+        // uploads) plus the F2 sessions-family reads converted so far
+        // (managed-context + worktrees). The `api_transfer_*` methods join
+        // when their HTTP rows land (task #6, /api/transfers); adding or
+        // dropping an entry updates this list in the same change,
+        // deliberately.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3506,6 +3508,14 @@ mod tests {
             "api_session_current_upload",
             "api_session_current_upload_raw",
             "api_session_current_upload_delete",
+            "api_managed_context_records",
+            "api_managed_context_anchors",
+            "api_managed_context_fission",
+            "api_worktrees",
+            "api_worktrees_inspect",
+            "api_worktrees_scan",
+            "api_worktrees_remove",
+            "api_worktrees_merge",
         ]
         .into_iter()
         .collect();

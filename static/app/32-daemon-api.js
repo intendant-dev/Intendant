@@ -20,11 +20,11 @@
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
 //     exactly this no-legacy-fallback behavior).
 //
-// STATUS (F0): wired to NOTHING. No existing call site consumes this yet —
-// the F1+ family migrations (transfers/fs first, per the design's frontend
-// track) move `rpcOrHttp`/`jsonFetch`/`filesIdeRpc`/pump call sites onto
-// these verbs family by family; the boot smoke's window.qa.daemonApi()
-// probe is the only reader today.
+// STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
+// staged uploads) and the F2 sessions-family reads as they migrate; the
+// remaining `rpcOrHttp`/`jsonFetch` call sites move onto these verbs family
+// by family per the design's frontend track. The boot smoke's
+// window.qa.daemonApi() probe asserts the facade evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -48,15 +48,18 @@
 // the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
-// Coverage (F0): the F1 family's twinned methods only — filesystem and
-// staged uploads. The `api_transfer_*` methods are deliberately absent:
-// they have no HTTP rows until the server-track stage that adds
-// /api/transfers (task #6); F1 adds their entries when those rows land.
+// Coverage: the F1 family (filesystem + staged uploads) and the F2
+// sessions-family reads (managed-context + worktrees so far). The
+// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
+// until the server-track stage that adds /api/transfers (task #6); F1 adds
+// their entries when those rows land.
 // Entry shape: verb + path template (`{name}` segments are lifted from
 // params), `query` = param keys lifted into the query string, `lane` =
 // non-JSON response/request lane ('bytes' | 'upload'), `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
-// content_b64). `mutation` is DERIVED from the verb (POST/DELETE), never
+// content_b64), `rawQuery` = the named param is a pre-encoded query STRING
+// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_stat: { verb: 'GET', path: '/api/fs/stat', query: ['path'] },
@@ -70,6 +73,14 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
   api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
+  api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
+  api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
+  api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
+  api_worktrees: { verb: 'GET', path: '/api/worktrees' },
+  api_worktrees_inspect: { verb: 'POST', path: '/api/worktrees/inspect' },
+  api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
+  api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
+  api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -269,6 +280,16 @@ function daemonApiHttpTarget(spec, method, params) {
     used.add(key);
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
+  // rawQuery twins: the tunnel method takes one pre-encoded query-string
+  // param (the managed-context handlers rebuild a request line from it);
+  // the HTTP twin takes that same string as the URL query verbatim.
+  if (spec.rawQuery) {
+    const raw = source[spec.rawQuery];
+    used.add(spec.rawQuery);
+    if (raw !== undefined && raw !== null && String(raw) !== '') {
+      query.push(String(raw));
+    }
+  }
   const rest = {};
   for (const [key, value] of Object.entries(source)) {
     if (!used.has(key)) rest[key] = value;
@@ -280,7 +301,10 @@ async function daemonApiHttpRequest(method, params, opts) {
   const spec = DAEMON_API_HTTP_MAP[method];
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
-  if (spec.verb === 'POST') {
+  // Body-less POST twins stay body-less (api_worktrees_scan rides a
+  // BodyPolicy::None row, and every legacy empty-payload POST call site
+  // sent no body/Content-Type either).
+  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
