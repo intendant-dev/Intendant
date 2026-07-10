@@ -149,10 +149,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // trust-tier pair (set_tier, set_hosted_ceiling) live as tunnel
     // columns on their route rows — their IAM operations derive from the
     // rows (S6).
-    // Fleet certificate: publish this daemon's addresses for its fleet
-    // name and run the ACME DNS-01 order (fleet_cert.rs). Slow flow,
-    // started async; progress rides the connect status payload.
-    method("api_fleet_cert_request", PeerOperation::AccessManage),
+    // api_fleet_cert_request lives as a tunnel column on its ROW-NEW
+    // (POST /api/access/fleet-cert/request — S6 closed the family's one
+    // missing HTTP twin).
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
@@ -190,17 +189,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // The IAM grant mutations (upsert/update), enrollment decide, and
     // the seven org-manage methods live as tunnel columns on their route
     // rows — their IAM operations derive from the rows (S6).
-    // Presenting a signed org document (or list) only requires a session;
-    // the document itself is the authorization and is fully re-verified.
-    // Same for reading the org's public revocation list and renewing a
-    // still-valid document.
-    method("api_access_org_present", PeerOperation::AccessInspect),
-    method("api_access_org_orl", PeerOperation::AccessInspect),
-    method("api_access_org_renew", PeerOperation::AccessInspect),
-    // Applying a root-signed revocation list mirrors a PUBLIC doorbell
-    // (`POST /api/access/orgs/revocations/apply`): the signature is the
-    // authority, so any session may courier one through the tunnel.
-    method("api_access_org_orl_apply", PeerOperation::PresenceRead),
+    // The signed-org doorbell methods (present, orl, orl_apply, renew)
+    // live as tunnel columns on their PUBLIC route rows with documented
+    // op overrides — session-gated on the tunnel by design (S6; the
+    // override enumeration test in gateway_routes pins the set).
     method("api_peer_pairing_requests", PeerOperation::AccessInspect),
     method("api_peer_pairing_identities", PeerOperation::AccessInspect),
     method(
@@ -3030,7 +3022,7 @@ mod tests {
                 Row,
                 Some(Op::AccessManage),
             ),
-            ("api_fleet_cert_request", Residue, Some(Op::AccessManage)),
+            ("api_fleet_cert_request", Row, Some(Op::AccessManage)),
             (
                 "api_credential_lease_grant",
                 Residue,
@@ -3139,10 +3131,10 @@ mod tests {
                 Row,
                 Some(Op::AccessManage),
             ),
-            ("api_access_org_present", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_orl", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_renew", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_orl_apply", Residue, Some(Op::PresenceRead)),
+            ("api_access_org_present", Row, Some(Op::AccessInspect)),
+            ("api_access_org_orl", Row, Some(Op::AccessInspect)),
+            ("api_access_org_renew", Row, Some(Op::AccessInspect)),
+            ("api_access_org_orl_apply", Row, Some(Op::PresenceRead)),
             (
                 "api_peer_pairing_requests",
                 Residue,

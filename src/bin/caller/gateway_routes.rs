@@ -267,6 +267,9 @@ pub(crate) enum RouteHandlerId {
     /// tier label and the hosted-control ceiling knob. One handler, two
     /// paths, switched on `req_path`.
     AccessTierSettings,
+    /// Fleet certificate request (async-start; progress rides the
+    /// connect status payload).
+    AccessFleetCertRequest,
     DashboardTargets,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
@@ -316,6 +319,23 @@ const fn tunnel_method(name: &'static str) -> TunnelSpec {
     TunnelSpec {
         name,
         op_override: None,
+        advertised: true,
+        upload: false,
+    }
+}
+
+/// Advertised tunnel twin whose IAM operation deliberately diverges
+/// from the row (design §2.7): `op` gates the tunnel method, `reason`
+/// documents why, and the override enumeration test pins the set
+/// closed.
+const fn tunnel_method_with_op(
+    name: &'static str,
+    op: PeerOperation,
+    reason: &'static str,
+) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: Some((op, reason)),
         advertised: true,
         upload: false,
     }
@@ -1091,7 +1111,12 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgGrantPresent,
         "Present a signed org grant document (verified against locally trusted org keys)",
-    ),
+    )
+    .with_tunnel(tunnel_method_with_op(
+        "api_access_org_present",
+        PeerOperation::AccessInspect,
+        "Public doorbell on HTTP (the signed document is the authorization); the tunnel requires a bound session — stricter on purpose",
+    )),
     public_route(
         RouteMethod::Get,
         PathPattern::Segments(
@@ -1104,21 +1129,36 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessOrgRevocations,
         "Org revocation list (ORL) for a trusted org",
-    ),
+    )
+    .with_tunnel(tunnel_method_with_op(
+        "api_access_org_orl",
+        PeerOperation::AccessInspect,
+        "Public read on HTTP; the tunnel requires a bound session — stricter on purpose",
+    )),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/orgs/revocations/apply"),
         BodyPolicy::Capped(crate::access::org::MAX_ORG_ORL_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Apply a signed org revocation list",
-    ),
+    )
+    .with_tunnel(tunnel_method_with_op(
+        "api_access_org_orl_apply",
+        PeerOperation::PresenceRead,
+        "Public doorbell on HTTP (the root signature is the authority); any bound session may courier one through the tunnel",
+    )),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants/renew"),
         BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
         RouteHandlerId::AccessOrgApplyRenew,
         "Renew an org grant document (signed payload)",
-    ),
+    )
+    .with_tunnel(tunnel_method_with_op(
+        "api_access_org_renew",
+        PeerOperation::AccessInspect,
+        "Public doorbell on HTTP (the signed document is the authorization); the tunnel requires a bound session — stricter on purpose",
+    )),
     // ── Access administration (fleet-CORS where the anchor page needs
     //    to read responses; own-origin otherwise).
     fleet_route(
@@ -1296,6 +1336,15 @@ pub(crate) static ROUTES: &[Route] = &[
         "Set the hosted-control ceiling role for hosted-provenance sessions",
     )
     .with_tunnel(tunnel_method("api_access_set_hosted_ceiling")),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/fleet-cert/request"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessFleetCertRequest,
+        "Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start)",
+    )
+    .with_tunnel(tunnel_method("api_fleet_cert_request")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),
@@ -2104,14 +2153,18 @@ mod tests {
     /// The op-override slot is a closed, documented enumeration (design
     /// §2.7 / risk R2): every override names its reason, and this test
     /// pins the exact set so a tunnel/HTTP divergence can only ever be
-    /// added deliberately. Empty today — S0 (PR #128) settled the two
-    /// formerly-divergent twins identically on both lanes, so the first
-    /// legitimate entries arrive with the signed-org doorbell rows
-    /// (Public on HTTP, session-gated on the tunnel) when their family
-    /// ports.
+    /// added deliberately. The occupants are the signed-org doorbell
+    /// twins (S6): Public rows on HTTP — the signed document/list is
+    /// the authorization — while the tunnel methods deliberately gate
+    /// on a bound session's operation.
     #[test]
     fn tunnel_op_overrides_are_a_closed_documented_enumeration() {
-        let documented: &[&str] = &[];
+        let documented: &[&str] = &[
+            "api_access_org_orl",
+            "api_access_org_orl_apply",
+            "api_access_org_present",
+            "api_access_org_renew",
+        ];
         let mut actual: Vec<&str> = Vec::new();
         for (_, spec) in tunnel_specs() {
             if let Some((_, reason)) = spec.op_override {

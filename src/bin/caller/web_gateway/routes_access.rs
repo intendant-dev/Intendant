@@ -174,79 +174,59 @@ pub(crate) async fn handle_dashboard_targets(
 }
 
 pub(crate) async fn handle_access_org_grant_present(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
+    cert_dir: std::path::PathBuf,
     agent_card_value_for_targets: serde_json::Value,
+    cors: crate::gateway_routes::CorsPosture,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let response = if req_method != "POST" {
-        json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        )
-    } else {
-        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-            .map_err(|e| format!("invalid JSON: {e}"))
-            .and_then(|params| {
-                access_org_present_response_value(params, &agent_card_value_for_targets)
-            }) {
-            Ok(value) => (200, value.to_string()),
-            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-        };
-        with_public_cors(json_response(status_reason(status), body))
+    // Transport-owned body decode; the doorbell's parse-error 400 rides
+    // the same public tail as its value errors.
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) => access_org_present_api_response(
+            &cert_dir,
+            params,
+            &agent_card_value_for_targets,
+        ),
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, None).await;
 }
 
-pub(crate) async fn handle_access_org_revocations(mut stream: DemuxStream, req_path: &str) {
-    use tokio::io::AsyncWriteExt;
+pub(crate) async fn handle_access_org_revocations(
+    stream: DemuxStream,
+    req_path: &str,
+    cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+) {
     let handle = req_path
         .strip_prefix("/api/access/orgs/")
         .and_then(|rest| rest.strip_suffix("/revocations"))
         .unwrap_or("");
-    let (status, body) = match access_org_orl_response_value(handle) {
-        Ok(value) => (200, value.to_string()),
-        Err(error) => (404, serde_json::json!({"error": error}).to_string()),
-    };
-    let response = with_public_cors(json_response(status_reason(status), body));
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = access_org_orl_api_response(&cert_dir, handle);
+    write_api_response(stream, response, cors, None).await;
 }
 
 pub(crate) async fn handle_access_org_apply_renew(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     req_path: &str,
+    cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let response = if req_method != "POST" {
-        json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        )
-    } else {
-        // The per-path caps (ORL vs grant-doc) live on the two table rows;
-        // dispatch already read under the right one.
-        let handler = if req_path == "/api/access/orgs/revocations/apply" {
-            access_org_orl_apply_response_value
-                as fn(serde_json::Value) -> Result<serde_json::Value, String>
-        } else {
-            access_org_renew_response_value
-        };
-        let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-            .map_err(|e| format!("invalid JSON: {e}"))
-            .and_then(handler)
-        {
-            Ok(value) => (200, value.to_string()),
-            Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-        };
-        with_public_cors(json_response(status_reason(status), body))
+    // The per-path caps (ORL vs grant-doc) live on the two table rows;
+    // dispatch already read under the right one.
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) => {
+            if req_path == "/api/access/orgs/revocations/apply" {
+                access_org_orl_apply_api_response(&cert_dir, params)
+            } else {
+                access_org_renew_api_response(&cert_dir, params)
+            }
+        }
+        Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, None).await;
 }
 
 pub(crate) async fn handle_access_iam_grants(
@@ -873,6 +853,118 @@ pub(crate) fn access_org_manage_api_response(
         OrgManageLeaf::IssuerInstall => access_org_issuer_install_response_value(cert_dir, params),
     };
     access_result_api_response(result, 400)
+}
+
+/// POST /api/access/org-grants + the tunnel's `api_access_org_present`
+/// (the doorbell class: the signed document is the authorization).
+pub(crate) fn access_org_present_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    agent_card: &serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(
+        access_org_present_response_value(cert_dir, params, agent_card),
+        400,
+    )
+}
+
+/// GET /api/access/orgs/{handle}/revocations + the tunnel's
+/// `api_access_org_orl` — the one doorbell leaf whose error is the
+/// historical 404 (unknown org / no root key held).
+pub(crate) fn access_org_orl_api_response(
+    cert_dir: &std::path::Path,
+    handle: &str,
+) -> ApiResponse {
+    access_result_api_response(access_org_orl_response_value(cert_dir, handle), 404)
+}
+
+/// POST /api/access/orgs/revocations/apply + the tunnel's
+/// `api_access_org_orl_apply`.
+pub(crate) fn access_org_orl_apply_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(access_org_orl_apply_response_value(cert_dir, params), 400)
+}
+
+/// POST /api/access/org-grants/renew + the tunnel's
+/// `api_access_org_renew`.
+pub(crate) fn access_org_renew_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(access_org_renew_response_value(cert_dir, params), 400)
+}
+
+/// POST /api/access/fleet-cert/request + the tunnel's
+/// `api_fleet_cert_request` (the S6 ROW-NEW: the tunnel method finally
+/// gets its HTTP twin): publish this daemon's routable addresses under
+/// its fleet name and start the ACME DNS-01 order (fleet_cert.rs).
+/// Async-start semantics preserved — the flow is spawned and progress
+/// rides the connect status payload. Explicit `addresses` in params
+/// override the routable-local-address default.
+pub(crate) fn fleet_cert_request_api_response(params: serde_json::Value) -> ApiResponse {
+    let addresses: Vec<String> = params
+        .get("addresses")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .filter(|list: &Vec<String>| !list.is_empty())
+        .unwrap_or_else(crate::fleet_cert::default_publish_addresses);
+    if crate::fleet_cert::status_snapshot().name.is_none() {
+        return ApiResponse::json_error(
+            400,
+            "this daemon has no fleet name — enable Connect against a \
+             rendezvous with fleet DNS and let it register first",
+        );
+    }
+    let spawned_addresses = addresses.clone();
+    tokio::spawn(async move {
+        if let Err(error) = crate::fleet_cert::request_certificate(spawned_addresses).await {
+            eprintln!("[fleet-cert] request failed: {error}");
+        }
+    });
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "started": true, "addresses": addresses })),
+    )
+}
+
+/// HTTP shim for the fleet-cert request row: manage-belt + empty-body
+/// tolerance (`{}`), matching the access admin family.
+pub(crate) async fn handle_fleet_cert_request(
+    stream: DemuxStream,
+    body_text: String,
+    http_access_context: HttpAccessContext,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
+    }
+    let response = if body_text.trim().is_empty() {
+        fleet_cert_request_api_response(serde_json::json!({}))
+    } else {
+        match parse_access_request_body(&body_text) {
+            Ok(params) => fleet_cert_request_api_response(params),
+            Err(error) => *error,
+        }
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_overview(
@@ -1519,23 +1611,17 @@ pub(crate) async fn handle_access_tier_settings(
 /// used by harmless bootstrap endpoints. The same allowlist doubles as a
 /// write-side origin gate: browser-attached mTLS certificates would
 /// otherwise let any website fire state-changing requests cross-site.
+///
+/// Derived from the route table (derive, don't mirror): a path is
+/// fleet-scoped exactly when its rows declare
+/// [`crate::gateway_routes::CorsPosture::FleetAllowlist`] — the same
+/// declaration that drives dispatch rendering and the preflight, so a
+/// new fleet row's write-side origin gate can never lag its posture
+/// (the hand-kept list this replaces silently missed exactly that way).
 pub(crate) fn is_fleet_cors_access_path(req_path: &str) -> bool {
     matches!(
-        req_path,
-        "/api/access/overview"
-            | "/api/access/iam/state"
-            | "/api/access/enrollment-requests"
-            | "/api/access/enrollment-requests/decide"
-            | "/api/access/iam/user-client-grants"
-            | "/api/access/iam/grants/update"
-            | "/api/access/orgs/trust"
-            | "/api/access/orgs/revoke"
-            | "/api/access/connect/status"
-            | "/api/access/connect/claim-code"
-            | "/api/access/connect/config"
-            | "/api/access/connect/unclaim"
-            | "/api/access/tier"
-            | "/api/access/hosted-ceiling"
+        crate::gateway_routes::preflight_posture(req_path),
+        Some(crate::gateway_routes::CorsPosture::FleetAllowlist)
     )
 }
 
@@ -1637,11 +1723,15 @@ pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
 /// is the authorization (verified against locally trusted org keys), so
 /// this sits in the doorbell class: unauthenticated, rate-limited, and
 /// size-capped; a failure changes nothing.
+/// `cert_dir` arrives from the transport edges (hermeticity convention)
+/// — as on the other doorbell fns below.
 pub(crate) fn access_org_present_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let outcome = crate::access::org::present_org_grant_value(
+        cert_dir,
         &params,
         &org_target_agent_card_ids(agent_card),
         crate::access::client_key::now_unix_ms() as u64,
@@ -1904,15 +1994,17 @@ pub(crate) fn access_org_issuer_install_response_value(
 /// Public: the org daemon's current signed revocation list (signed empty
 /// seq-0 list when nothing was revoked yet). Only meaningful on the
 /// daemon holding the org root key.
-pub(crate) fn access_org_orl_response_value(handle: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn access_org_orl_response_value(
+    cert_dir: &std::path::Path,
+    handle: &str,
+) -> Result<serde_json::Value, String> {
     let handle = handle.trim();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let identity = crate::access::org::load_org_identity(&cert_dir, handle)?.ok_or_else(|| {
+    let identity = crate::access::org::load_org_identity(cert_dir, handle)?.ok_or_else(|| {
         format!("this daemon holds no root key for org {handle:?}; fetch the revocation list from the org's daemon")
     })?;
     let orl = crate::access::org::load_or_init_orl(
         &identity,
-        &cert_dir,
+        cert_dir,
         handle,
         crate::access::client_key::now_unix_ms() as u64,
     )?;
@@ -1923,6 +2015,7 @@ pub(crate) fn access_org_orl_response_value(handle: &str) -> Result<serde_json::
 /// signature is the authority and a stale `seq` is refused, so the
 /// courier is irrelevant. A failure changes nothing.
 pub(crate) fn access_org_orl_apply_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let now = crate::access::client_key::now_unix_ms() as u64;
@@ -1938,13 +2031,12 @@ pub(crate) fn access_org_orl_apply_response_value(
     }
     let orl: crate::access::org::OrgRevocationList =
         serde_json::from_value(params).map_err(|e| format!("invalid org revocation list: {e}"))?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
-    let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now)
+    let applied = crate::access::org::apply_orl(&mut state, cert_dir, &orl, now)
         .map_err(|e| e.to_string())?;
     if applied.changed {
-        crate::access::iam::save_state(&cert_dir, &state)
+        crate::access::iam::save_state(cert_dir, &state)
             .map_err(|e| format!("save local IAM state: {e}"))?;
     }
     Ok(serde_json::json!({ "schema_version": 1, "applied": applied }))
@@ -2041,6 +2133,7 @@ pub(crate) fn access_org_revoke_member_response_value(
 /// a fresh window. Same grant_id, original lifetime span; the org's own
 /// revocation list gates it.
 pub(crate) fn access_org_renew_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let now = crate::access::client_key::now_unix_ms() as u64;
@@ -2057,13 +2150,12 @@ pub(crate) fn access_org_renew_response_value(
     let doc: crate::access::org::OrgGrantDocument =
         serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
     let handle = doc.org.handle.trim().to_string();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+    let identity = crate::access::org::load_org_identity(cert_dir, &handle)?.ok_or_else(|| {
         format!(
             "this daemon holds no root key for org {handle:?}; renew against the org's designated daemon"
         )
     })?;
-    let orl = crate::access::org::load_or_init_orl(&identity, &cert_dir, &handle, now)?;
+    let orl = crate::access::org::load_or_init_orl(&identity, cert_dir, &handle, now)?;
     let renewed = crate::access::org::renew_org_grant(&identity, &orl, &doc, now)?;
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -4226,6 +4318,239 @@ mod tests {
                 "/api/access/orgs/trust",
                 denied_dir.path().to_path_buf(),
                 context,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
+        );
+    }
+
+    // ── S6 golden transcripts (third slice): the signed-org doorbell
+    // quartet ──
+    //
+    // Public rows by design (the signed document/list is the
+    // authorization): the historical framing is the canonical tail plus
+    // the wildcard `Access-Control-Allow-Origin: *` appended LAST
+    // (`with_public_cors`), pinned byte-exact here. Error bodies whose
+    // wording rises from the shared cores are derived through those
+    // same cores over injected tempdir stores; the verify/materialize
+    // successes need real signed documents and stay smoke-covered
+    // (validate-org-grants).
+
+    /// The public-CORS JSON framing: canonical tail, wildcard ACAO last.
+    fn golden_access_public_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn golden_access_org_doorbell_transcripts() {
+        let public_cors = |method: &str, path: &str| {
+            access_route_cors(method, path, crate::gateway_routes::CorsPosture::Public)
+        };
+        for (method, path) in [
+            ("POST", "/api/access/org-grants"),
+            ("GET", "/api/access/orgs/golden-org/revocations"),
+            ("POST", "/api/access/orgs/revocations/apply"),
+            ("POST", "/api/access/org-grants/renew"),
+        ] {
+            public_cors(method, path);
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        // Present, undecodable document: the error wording rises from
+        // the shared present core (derived through it over the same
+        // tempdir store); 400 under the public tail.
+        let card = serde_json::json!({});
+        let expected_error =
+            access_org_present_response_value(&cert_dir, serde_json::json!({}), &card)
+                .expect_err("empty org grant document must not verify");
+        let expected_body = serde_json::json!({"error": expected_error}).to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_grant_present(
+                stream,
+                "{}".to_string(),
+                cert_dir.clone(),
+                card.clone(),
+                public_cors("POST", "/api/access/org-grants"),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_public_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Present, unparseable body: the handler's own decode 400.
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid JSON: {serde_error}")}).to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_grant_present(
+                stream,
+                invalid.to_string(),
+                cert_dir.clone(),
+                card.clone(),
+                public_cors("POST", "/api/access/org-grants"),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_public_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Served revocation list for an org this daemon holds no root
+        // key for: the deterministic 404 under the public tail.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_revocations(
+                stream,
+                "/api/access/orgs/golden-org/revocations",
+                cert_dir.clone(),
+                public_cors("GET", "/api/access/orgs/golden-org/revocations"),
+            )
+        })
+        .await;
+        let expected_body = serde_json::json!({
+            "error": "this daemon holds no root key for org \"golden-org\"; fetch the revocation list from the org's daemon"
+        })
+        .to_string();
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_public_json_transcript("404 Not Found", &expected_body)
+        );
+
+        // Apply, undecodable list: the shared core's serde wording,
+        // derived through the same decode; 400 under the public tail.
+        let orl_error = serde_json::from_value::<crate::access::org::OrgRevocationList>(
+            serde_json::json!({}),
+        )
+        .expect_err("empty revocation list must not decode");
+        let expected_body =
+            serde_json::json!({"error": format!("invalid org revocation list: {orl_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_apply_renew(
+                stream,
+                "{}".to_string(),
+                "/api/access/orgs/revocations/apply",
+                cert_dir.clone(),
+                public_cors("POST", "/api/access/orgs/revocations/apply"),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_public_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Renew, undecodable document: same discipline on the renew leaf.
+        let doc_error = serde_json::from_value::<crate::access::org::OrgGrantDocument>(
+            serde_json::json!({}),
+        )
+        .expect_err("empty org grant document must not decode");
+        let expected_body =
+            serde_json::json!({"error": format!("invalid org grant document: {doc_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_org_apply_renew(
+                stream,
+                "{}".to_string(),
+                "/api/access/org-grants/renew",
+                cert_dir.clone(),
+                public_cors("POST", "/api/access/org-grants/renew"),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_public_json_transcript("400 Bad Request", &expected_body)
+        );
+    }
+
+    // ── S6 golden transcripts: the fleet-cert ROW-NEW ──
+    //
+    // A new HTTP surface (design §2.7 ROW-NEW), so these pins DEFINE the
+    // wire rather than preserve one: the family-standard fleet framing,
+    // the belt-403, and the deterministic no-fleet-name error. Explicit
+    // addresses keep every fixture off the NIC-enumeration default, and
+    // the no-name error path never spawns the ACME flow — the live
+    // order stays smoke-covered.
+
+    #[tokio::test]
+    async fn golden_fleet_cert_request_transcripts() {
+        let cors = access_route_cors(
+            "POST",
+            "/api/access/fleet-cert/request",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+
+        // No fleet name in the process-global status (the test process
+        // never registered against a rendezvous): the deterministic 400
+        // under the fleet tail, both origin shapes.
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let response = collect_access_handler_response(|stream| {
+                handle_fleet_cert_request(
+                    stream,
+                    serde_json::json!({ "addresses": ["192.0.2.10"] }).to_string(),
+                    golden_root_context(),
+                    cors,
+                    origin,
+                )
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript(
+                    "400 Bad Request",
+                    r#"{"error":"this daemon has no fleet name — enable Connect against a rendezvous with fleet DNS and let it register first"}"#,
+                    origin
+                )
+            );
+        }
+
+        // Parse error: the family-standard 400 under the fleet tail.
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_fleet_cert_request(
+                stream,
+                invalid.to_string(),
+                golden_root_context(),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Denied: the belt 403, PLAIN tail (family convention).
+        let denied_dir = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(denied_dir.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_fleet_cert_request(
+                stream,
+                serde_json::json!({ "addresses": ["192.0.2.10"] }).to_string(),
+                context,
+                cors,
                 Some(GOLDEN_FLEET_ORIGIN),
             )
         })

@@ -703,40 +703,12 @@ pub(crate) fn control_frame_response(
                     ))
                 }
                 "api_fleet_cert_request" => {
-                    // Optional explicit addresses; default = every
-                    // routable local address (the LAN is the point).
-                    let addresses: Vec<String> = params
-                        .as_ref()
-                        .and_then(|p| p.get("addresses"))
-                        .and_then(|v| v.as_array())
-                        .map(|list| {
-                            list.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .filter(|list: &Vec<String>| !list.is_empty())
-                        .unwrap_or_else(crate::fleet_cert::default_publish_addresses);
-                    if crate::fleet_cert::status_snapshot().name.is_none() {
-                        return Some(dashboard_control_error_response(
-                            id,
-                            "this daemon has no fleet name — enable Connect against a \
-                             rendezvous with fleet DNS and let it register first",
-                        ));
-                    }
-                    let spawned_addresses = addresses.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::fleet_cert::request_certificate(spawned_addresses).await
-                        {
-                            eprintln!("[fleet-cert] request failed: {error}");
-                        }
-                    });
-                    Some(serde_json::json!({
-                        "t": "response",
-                        "id": id,
-                        "ok": true,
-                        "result": { "started": true, "addresses": addresses },
-                    }))
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::fleet_cert_request_api_response(params),
+                        "fleet cert request",
+                    ))
                 }
                 // The seven org-manage twins delegate to the S6 neutral
                 // core (leaf addressed by method name); the signed-org
@@ -763,40 +735,43 @@ pub(crate) fn control_frame_response(
                         "org manage",
                     ))
                 }
+                // The signed-org doorbell twins delegate to the S6
+                // neutral cores under the family's ok/error envelope.
+                // Their route rows are Public — the tunnel methods gate
+                // stricter on purpose (documented op overrides on the
+                // rows): a bound session is required to courier a
+                // document through the tunnel.
                 "api_access_org_present"
                 | "api_access_org_orl"
                 | "api_access_org_orl_apply"
                 | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    let result = match method {
-                        "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    let response = match method {
+                        "api_access_org_orl" => crate::web_gateway::access_org_orl_api_response(
+                            &cert_dir,
+                            // Transport-owned addressing: the tunnel
+                            // names the org in params; HTTP by path
+                            // capture.
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
                         "api_access_org_orl_apply" => {
-                            crate::web_gateway::access_org_orl_apply_response_value(params)
+                            crate::web_gateway::access_org_orl_apply_api_response(
+                                &cert_dir, params,
+                            )
                         }
                         "api_access_org_renew" => {
-                            crate::web_gateway::access_org_renew_response_value(params)
+                            crate::web_gateway::access_org_renew_api_response(&cert_dir, params)
                         }
-                        _ => crate::web_gateway::access_org_present_response_value(
+                        _ => crate::web_gateway::access_org_present_api_response(
+                            &cert_dir,
                             params,
                             &runtime.agent_card,
                         ),
                     };
-                    match result {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    Some(frame_api_ok_error_response(id, response, "org doorbell"))
                 }
                 "api_access_iam_upsert_user_client_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));

@@ -812,17 +812,25 @@ pub(crate) async fn serve_http_request(
                 return handle_access_org_grant_present(
                     stream,
                     route_body,
-                    req_method,
+                    cert_dir,
                     agent_card_value_for_targets,
+                    route.cors,
                 )
                 .await;
             }
             RouteHandlerId::AccessOrgRevocations => {
-                return handle_access_org_revocations(stream, req_path).await;
+                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors)
+                    .await;
             }
             RouteHandlerId::AccessOrgApplyRenew => {
-                return handle_access_org_apply_renew(stream, route_body, req_method, req_path)
-                    .await;
+                return handle_access_org_apply_renew(
+                    stream,
+                    route_body,
+                    req_path,
+                    cert_dir,
+                    route.cors,
+                )
+                .await;
             }
             RouteHandlerId::AccessIamGrants => {
                 return handle_access_iam_grants(
@@ -920,6 +928,16 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     req_path,
                     cert_dir,
+                    http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AccessFleetCertRequest => {
+                return handle_fleet_cert_request(
+                    stream,
+                    route_body,
                     http_access_context,
                     route.cors,
                     fleet_cors_origin.as_deref(),
