@@ -168,16 +168,16 @@ pub(crate) async fn run_daemon(
         },
     );
 
-    // Vitals chips for the daemon's primary session: git state of the
-    // project root (statusline port). A projectless daemon has no repo to
-    // report on — no producer.
-    let _vitals_producer = match (session_log_id(&session_log), project_root.clone()) {
-        (Some(session_id), Some(root)) => Some(session_vitals::spawn_session_vitals_producer(
-            bus.clone(),
-            vec![(session_id, root)],
-        )),
-        _ => None,
+    // Session vitals: cache/limits are usage-driven and cover every
+    // session on any backend, so the producer always runs. The git segment
+    // additionally needs a repo target — the daemon's primary session when
+    // a project root exists (a projectless daemon just has no git row).
+    let vitals_git_targets = match (session_log_id(&session_log), project_root.clone()) {
+        (Some(session_id), Some(root)) => vec![(session_id, root)],
+        _ => Vec::new(),
     };
+    let _vitals_producer =
+        session_vitals::spawn_session_vitals_producer(bus.clone(), vitals_git_targets);
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     // Covers supervisor-spawned native children too.

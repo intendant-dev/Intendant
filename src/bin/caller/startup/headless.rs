@@ -495,15 +495,16 @@ pub(crate) async fn run_headless_mode(
         None
     };
 
-    // Vitals chips for the primary session: git state of the project
-    // root (statusline port).
+    // Session vitals: cache/limits are usage-driven and always produced;
+    // the git segment probes the project root for the primary session.
     let _vitals_producer = if use_web {
-        session_log_id(&session_log).map(|session_id| {
-            session_vitals::spawn_session_vitals_producer(
-                bus.clone(),
-                vec![(session_id, project.root.clone())],
-            )
-        })
+        let targets = session_log_id(&session_log)
+            .map(|session_id| vec![(session_id, project.root.clone())])
+            .unwrap_or_default();
+        Some(session_vitals::spawn_session_vitals_producer(
+            bus.clone(),
+            targets,
+        ))
     } else {
         None
     };
