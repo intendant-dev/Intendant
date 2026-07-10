@@ -49,15 +49,19 @@
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
 // Coverage: the F1 family (filesystem + staged uploads) and the F2
-// sessions-family reads (managed-context + worktrees + the session list
-// and its NDJSON stream so far). The `api_transfer_*` methods are
-// deliberately absent: they have no HTTP rows
+// sessions-family reads (managed-context, worktrees, the session list and
+// its NDJSON stream, search, detail, report, context snapshots). The
+// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
 // Entry shape: verb + path template (`{name}` segments are lifted from
-// params), `query` = param keys lifted into the query string (arrays
-// comma-join; empty arrays stay absent), `lane` =
-// non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
+// params), `alias` = capture-name -> param-key lift map (the session rows
+// capture `id` while the tunnel's canonical param is `session_id` — the
+// handlers accept both, so the wire never changes), `query` = param keys
+// lifted into the query string (arrays comma-join; empty arrays stay
+// absent), `queryJson` = query keys whose array value JSON-encodes instead
+// (the search `projects` filter, which the HTTP handler serde-parses),
+// `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
@@ -78,6 +82,10 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
   api_sessions: { verb: 'GET', path: '/api/sessions', query: ['ids', 'limit', 'view'] },
   api_sessions_stream: { verb: 'GET', path: '/api/sessions/stream', query: ['limit'], lane: 'stream' },
+  api_sessions_search: { verb: 'GET', path: '/api/sessions/search', query: ['q', 'source', 'mode', 'projects'], queryJson: ['projects'] },
+  api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
+  api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
+  api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
   api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
   api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
   api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
@@ -265,17 +273,19 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
 
 // ── HTTP adapter ──────────────────────────────────────────────────────────
 // Builds verb/path/query/body from the descriptor. `{name}` path segments
-// lift (and consume) params[name]; `query` keys lift into the query
+// lift (and consume) params[name] — or params[alias[name]] when the entry
+// declares a capture alias; `query` keys lift into the query
 // string; for JSON POSTs the remaining params become the body verbatim.
 function daemonApiHttpTarget(spec, method, params) {
   const source = params && typeof params === 'object' ? params : {};
   const used = new Set();
   const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
-    const value = source[key];
+    const paramKey = (spec.alias && spec.alias[key]) || key;
+    const value = source[paramKey];
     if (value === undefined || value === null || String(value) === '') {
-      throw new TypeError(`daemonApi: ${method} requires params.${key} for ${spec.path}`);
+      throw new TypeError(`daemonApi: ${method} requires params.${paramKey} for ${spec.path}`);
     }
-    used.add(key);
+    used.add(paramKey);
     return encodeURIComponent(String(value));
   });
   const query = [];
@@ -283,13 +293,18 @@ function daemonApiHttpTarget(spec, method, params) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     used.add(key);
-    // Array params comma-join (api_sessions ids); an empty list stays
-    // absent — the tunnel vocabulary cannot express HTTP's
-    // present-but-empty filter, and no legacy call site sent one.
     if (Array.isArray(value)) {
-      if (value.length) {
-        query.push(`${encodeURIComponent(key)}=${encodeURIComponent(value.join(','))}`);
-      }
+      // Empty lists stay absent on every array key — the tunnel
+      // vocabulary cannot express HTTP's present-but-empty filter, and no
+      // legacy call site sent one.
+      if (!value.length) continue;
+      // queryJson keys JSON-encode (the search `projects` filter, which
+      // the HTTP handler serde-parses); other arrays comma-join
+      // (api_sessions ids).
+      const encoded = (spec.queryJson || []).includes(key)
+        ? JSON.stringify(value)
+        : value.join(',');
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(encoded)}`);
       continue;
     }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
@@ -315,6 +330,9 @@ async function daemonApiHttpRequest(method, params, opts) {
   const spec = DAEMON_API_HTTP_MAP[method];
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
+  // Caller cache posture passes through (session detail/metadata reads
+  // send 'no-store', exactly as their pre-facade fetches did).
+  if (opts && opts.cache) init.cache = opts.cache;
   // Body-less POST twins stay body-less (api_worktrees_scan rides a
   // BodyPolicy::None row, and every legacy empty-payload POST call site
   // sent no body/Content-Type either).

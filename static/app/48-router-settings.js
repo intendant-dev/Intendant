@@ -689,30 +689,26 @@ function ensureExactContextSnapshot(snapshot) {
   const sessionId = contextSnapshotLazySessionId(snapshot);
   const file = contextSnapshotFile(snapshot);
   if (!sessionId) return null;
-  const params = new URLSearchParams();
   const source = contextSnapshotLazySource(snapshot);
   const rpcParams = { session_id: sessionId, source };
   if (file) {
-    params.set('file', file);
     rpcParams.file = file;
   }
-  params.set('source', source);
   if (snapshot.request_id) {
-    params.set('request_id', snapshot.request_id);
     rpcParams.request_id = snapshot.request_id;
   }
   if (snapshot.request_index !== undefined && snapshot.request_index !== null) {
-    params.set('request_index', String(snapshot.request_index));
     rpcParams.request_index = snapshot.request_index;
   }
   if (snapshot.ts) {
-    params.set('ts', snapshot.ts);
     rpcParams.ts = snapshot.ts;
   }
-  const url = `/api/session/${encodeURIComponent(sessionId)}/context-snapshot?${params.toString()}`;
-  const promise = dashboardJsonFetch('api_session_context_snapshot', rpcParams, () => authedFetch(url), 'api_session_context_snapshot')
-    .then(async resp => {
-      const data = await resp.json().catch(() => ({}));
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy; the descriptor lifts the selector params into the
+  // /api/session/{id}/context-snapshot query the legacy URL carried.
+  const promise = daemonApi.request('api_session_context_snapshot', rpcParams)
+    .then(resp => {
+      const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
       if (!resp.ok || data?.error) {
         throw new Error(data?.error || `context snapshot fetch returned ${resp.status}`);
       }
