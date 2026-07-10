@@ -1,18 +1,29 @@
-name: AGENTS.md sync
+name: Repo integrity
 
-# AGENTS.md is a tracked, byte-for-byte copy of CLAUDE.md (so every checkout and
-# worktree gets the same agent guidance, including on Windows where symlinks are
-# unreliable). This guard fails the build if the two ever drift. To resync:
-#   cp CLAUDE.md AGENTS.md && git add AGENTS.md
+# Fast repo-integrity gates sharing the required "check" context (the
+# ruleset pins the job name, so new seconds-long gates extend this job
+# instead of minting new contexts):
+#
+# - AGENTS.md is a tracked, byte-for-byte copy of CLAUDE.md (so every
+#   checkout and worktree gets the same agent guidance, including on
+#   Windows where symlinks are unreliable). This guard fails the build
+#   if the two ever drift. To resync:
+#     cp CLAUDE.md AGENTS.md && git add AGENTS.md
+# - actionlint validates the workflow files themselves (expression
+#   typos, bad needs/if wiring, unknown runner labels — the class of
+#   error that otherwise ships broken gates and wedges the merge
+#   queue). The file keeps its historical agents-md-sync.yml name; the
+#   push paths below are why it still fires on doc-only pushes.
 on:
   push:
     paths:
       - "CLAUDE.md"
       - "AGENTS.md"
-      - ".github/workflows/agents-md-sync.yml"
+      - ".github/workflows/**"
+      - ".github/actionlint.yaml"
   # Required-check triggers — unfiltered on purpose: a paths-skipped
   # required check blocks queue entry (PRs) or wedges the group
-  # (merge_group); see windows.yml. `cmp` runs in seconds.
+  # (merge_group); see windows.yml. Both steps run in seconds.
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -33,3 +44,14 @@ jobs:
             exit 1
           fi
           echo "AGENTS.md matches CLAUDE.md"
+      # Version- and checksum-pinned binary (house rule: everything CI
+      # executes is pinned). shellcheck/pyflakes passes are deliberately
+      # OFF for now — enabling them is a separate baseline pass over the
+      # existing run: blocks, same staged rollout as fmt/clippy gating.
+      - name: actionlint (workflow lint)
+        run: |
+          curl -sSLo /tmp/actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color -shellcheck= -pyflakes=
