@@ -110,6 +110,7 @@ pub async fn serve(
         .map_err(|e| AccessError(format!("bind {bind_addr}: {e}")))?;
 
     let gate = Arc::new(EnrollmentGate::default());
+    warn_if_access_host_missing_from_cert(&cert_path, access_host);
     print_client_setup_banner(access_host, port, https_port);
 
     let prompt_gate = Arc::clone(&gate);
@@ -134,7 +135,7 @@ pub async fn serve(
 
     tokio::select! {
         _ = shutdown => {}
-        _ = accept_loop(listener, acceptor, cert_dir, p12_password, host_label, access_host, https_port, gate) => {}
+        _ = accept_loop(listener, acceptor, cert_dir, p12_password, host_label, access_host, port, https_port, gate) => {}
     }
 
     Ok(())
@@ -193,6 +194,7 @@ async fn prompt_for_pairing(expected_fingerprint: String, gate: Arc<EnrollmentGa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -200,6 +202,7 @@ async fn accept_loop(
     p12_password: String,
     host_label: String,
     access_host: String,
+    cert_port: u16,
     https_port: u16,
     gate: Arc<EnrollmentGate>,
 ) {
@@ -273,6 +276,34 @@ async fn accept_loop(
         let access_host = access_host.clone();
         let gate = Arc::clone(&gate);
         tokio::spawn(async move {
+            // Phones dialing a bare `host:port` try plain http:// first;
+            // feeding that into the TLS accept used to die with
+            // InvalidContentType and leave the browser on a blank page.
+            // Peek the first byte (TLS handshake records start 0x16; HTTP
+            // methods are ASCII letters — same demux the web gateway
+            // uses) and bounce cleartext HTTP to the https URL instead.
+            // Nothing sensitive rides the enrollment URL: auth is the
+            // fingerprint ceremony plus the one-time secret typed on the
+            // page, so the redirect leaks nothing the cleartext request
+            // didn't already.
+            let mut head = [0u8; 1];
+            match stream.peek(&mut head).await {
+                Ok(n) if n > 0 && head[0] != 0x16 => {
+                    if let Err(err) =
+                        redirect_plaintext_to_https(stream, &access_host, cert_port).await
+                    {
+                        eprintln!(
+                            "[access/cert-server] plaintext redirect for {peer} failed: {err}"
+                        );
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("[access/cert-server] peek from {peer} failed: {err}");
+                    return;
+                }
+            }
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -1333,6 +1364,119 @@ fn escape_html(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Answer a cleartext HTTP request on the TLS-only enrollment port with a
+/// permanent redirect to the same URL over https. Prefers the host the
+/// client actually dialed (this machine may be reachable on several
+/// addresses); falls back to the advertised access host.
+async fn redirect_plaintext_to_https<S>(
+    mut stream: S,
+    access_host: &str,
+    cert_port: u16,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(req) = read_request(&mut stream).await? else {
+        return Ok(());
+    };
+    let dialed = req
+        .header("host")
+        .map(host_without_port)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(access_host)
+        .to_string();
+    let path = if req.path.starts_with('/') {
+        req.path.clone()
+    } else {
+        "/".to_string()
+    };
+    let location = format!("https://{dialed}:{cert_port}{path}");
+    let response = format!(
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// `Host` header without its port: `name:8443` → `name`,
+/// `[::1]:8443` → `[::1]` (brackets kept — they go back into a URL).
+fn host_without_port(host: &str) -> &str {
+    let host = host.trim();
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return &host[..=end];
+        }
+        return host;
+    }
+    match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    }
+}
+
+/// Whether the server certificate's SANs cover the advertised access
+/// host, plus the SAN labels for the operator message. `None` when the
+/// cert cannot be read or parsed (the acceptor build already failed
+/// loudly in that case, so no separate warning is useful).
+fn cert_sans_cover_access_host(cert_path: &Path, access_host: &str) -> Option<(bool, Vec<String>)> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::*;
+
+    let der = super::certs::read_cert_der(cert_path).ok()?;
+    let (_, cert) = X509Certificate::from_der(&der).ok()?;
+    let san = cert.subject_alternative_name().ok().flatten()?;
+    let target_ip: Option<std::net::IpAddr> = access_host.parse().ok();
+    let mut labels = Vec::new();
+    let mut covered = false;
+    for name in &san.value.general_names {
+        match name {
+            GeneralName::DNSName(dns) => {
+                labels.push(dns.to_string());
+                if dns.eq_ignore_ascii_case(access_host) {
+                    covered = true;
+                }
+            }
+            GeneralName::IPAddress(bytes) => {
+                let ip: Option<std::net::IpAddr> = match bytes.len() {
+                    4 => <[u8; 4]>::try_from(*bytes).ok().map(std::net::IpAddr::from),
+                    16 => <[u8; 16]>::try_from(*bytes).ok().map(std::net::IpAddr::from),
+                    _ => None,
+                };
+                if let Some(ip) = ip {
+                    labels.push(ip.to_string());
+                    if target_ip == Some(ip) {
+                        covered = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((covered, labels))
+}
+
+/// CertificateUnknown triage, before the ceremony instead of after it
+/// fails: enrolling clients hard-reject TLS when the host they dial is
+/// not in the server certificate's SANs — the common case is a cert
+/// minted before an address existed (new tailnet IP, renamed host).
+/// Warn the operator up front with the fix.
+fn warn_if_access_host_missing_from_cert(cert_path: &Path, access_host: &str) {
+    if let Some((false, sans)) = cert_sans_cover_access_host(cert_path, access_host) {
+        eprintln!();
+        eprintln!("!! The advertised enrollment host {access_host} is NOT covered by the");
+        eprintln!("!! server certificate (SANs: {}).", sans.join(", "));
+        eprintln!("!! Enrolling devices will refuse the connection (CertificateUnknown).");
+        eprintln!("!! Run `intendant access setup --force` to mint certificates covering");
+        eprintln!("!! this machine's current addresses, then rerun `intendant access serve-certs`.");
+        eprintln!();
+    }
+}
+
 fn print_client_setup_banner(access_host: &str, cert_port: u16, https_port: u16) {
     println!();
     println!("============================================================");
@@ -1366,6 +1510,91 @@ fn print_client_setup_banner(access_host: &str, cert_port: u16, https_port: u16)
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn host_without_port_handles_names_ips_and_bracketed_v6() {
+        assert_eq!(host_without_port("daemon.local:8443"), "daemon.local");
+        assert_eq!(host_without_port("192.168.1.50:8443"), "192.168.1.50");
+        assert_eq!(host_without_port("[fd7a::1]:8443"), "[fd7a::1]");
+        assert_eq!(host_without_port("daemon.local"), "daemon.local");
+        assert_eq!(host_without_port("[fd7a::1]"), "[fd7a::1]");
+    }
+
+    #[test]
+    fn plaintext_http_gets_redirected_to_https_on_the_dialed_host() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut client, server) = tokio::io::duplex(4096);
+            client
+                .write_all(
+                    b"GET /?k=v HTTP/1.1\r\nHost: 100.101.102.103:8443\r\nUser-Agent: x\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            redirect_plaintext_to_https(server, "fallback.host", 8443)
+                .await
+                .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 301"), "{response}");
+            assert!(
+                response.contains("Location: https://100.101.102.103:8443/?k=v"),
+                "redirect must target the dialed host and keep the path/query: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn plaintext_redirect_falls_back_to_the_access_host_without_a_host_header() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut client, server) = tokio::io::duplex(4096);
+            client
+                .write_all(b"GET / HTTP/1.0\r\n\r\n")
+                .await
+                .unwrap();
+            redirect_plaintext_to_https(server, "10.0.0.42", 9000)
+                .await
+                .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(
+                response.contains("Location: https://10.0.0.42:9000/"),
+                "{response}"
+            );
+        });
+    }
+
+    #[test]
+    fn san_preflight_flags_hosts_the_cert_does_not_cover() {
+        let tmp = TempDir::new().unwrap();
+        let server_names = super::super::certs::ServerNames::new(
+            "10.0.0.42".parse().unwrap(),
+            vec!["192.168.1.42".parse().unwrap()],
+            vec!["station.example.test".to_string()],
+        )
+        .unwrap();
+        super::super::certs::ensure_certs(tmp.path(), &server_names, "label", false).unwrap();
+        let cert_path = tmp.path().join("server.crt");
+
+        let (covered, _) = cert_sans_cover_access_host(&cert_path, "10.0.0.42").unwrap();
+        assert!(covered, "primary IP SAN must count as covered");
+        let (covered, _) =
+            cert_sans_cover_access_host(&cert_path, "station.example.test").unwrap();
+        assert!(covered, "DNS SAN must count as covered (case-insensitive)");
+        let (covered, sans) = cert_sans_cover_access_host(&cert_path, "100.64.0.7").unwrap();
+        assert!(
+            !covered,
+            "an address minted after the cert must be flagged; SANs: {sans:?}"
+        );
+        assert!(!sans.is_empty());
+    }
 
     #[test]
     fn fingerprint_input_accepts_browser_colon_uppercase_format() {

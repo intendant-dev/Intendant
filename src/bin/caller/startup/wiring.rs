@@ -250,7 +250,18 @@ pub(crate) fn spawn_mode_web_gateway(
         project.config.webrtc.federation_allow_h264,
     );
     config.peer_access_requests = project.config.server.peer_access_requests.clone();
-    config.connect = project.config.connect.clone().effective_with_env();
+    // Connect config follows the same store the dashboard toggle writes:
+    // the project's intendant.toml when rooted, the daemon-scoped
+    // connect.toml when projectless — otherwise the bundled app's toggle
+    // would not survive a daemon restart.
+    let connect_base = match &project_root {
+        Some(_) => project.config.connect.clone(),
+        None => crate::project::load_daemon_connect_config().unwrap_or_else(|e| {
+            eprintln!("[connect] daemon-scoped connect.toml unreadable: {e}");
+            Default::default()
+        }),
+    };
+    config.connect = connect_base.effective_with_env();
     config.presence_enabled = runtime_presence_enabled;
     config.external_agent = initial_agent_backend
         .as_ref()
