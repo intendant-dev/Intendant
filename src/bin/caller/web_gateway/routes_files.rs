@@ -199,6 +199,205 @@ pub(crate) fn current_upload_delete_response_body(
     }
 }
 
+/// Transport-neutral core of the staged-upload commit (`POST
+/// /api/session/current/uploads` once its transport has spooled the raw
+/// body; tunnel twin `api_session_current_upload`'s upload_end leg): the
+/// shared (status, body) commit core — session-dir resolution, store
+/// commit, `UploadReady` broadcast — under the wildcard-CORS tail.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn current_upload_commit_api_response(
+    project_root: Option<&std::path::Path>,
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    daemon_session_id: Option<&str>,
+    name: &str,
+    mime: &str,
+    requested_destination: crate::upload_store::UploadDestination,
+    tmp: tempfile::NamedTempFile,
+    size: usize,
+    bus: &crate::event::EventBus,
+) -> ApiResponse {
+    let (status, body) = current_upload_commit_response_body(
+        project_root,
+        session_log,
+        daemon_session_id,
+        name,
+        mime,
+        requested_destination,
+        tmp,
+        size,
+        bus,
+    );
+    session_wildcard_json_response(status_line_code(status), body)
+}
+
+/// Transport-neutral core of the staged-uploads list (`GET
+/// /api/session/current/uploads`; tunnel twin
+/// `api_session_current_uploads`): the store listing under the
+/// wildcard-CORS tail. The session dir arrives lane-resolved.
+pub(crate) fn current_uploads_list_api_response(
+    session_dir: &std::path::Path,
+    scope: &crate::global_store::StoreScope,
+) -> ApiResponse {
+    let uploads = crate::upload_store::list_uploads(session_dir, scope);
+    let body = serde_json::to_string(&uploads).unwrap_or_else(|_| "[]".to_string());
+    session_wildcard_json_response(200, body)
+}
+
+/// Content-core error of the staged-upload raw read. Each lane frames it
+/// in its historical shape — HTTP as wildcard `{"error":…}` bodies, the
+/// tunnel as `{"ok":false,"error":…}` objects under the injected-status
+/// envelope (with `total_size` riding the 416 as a body sidecar) — so
+/// the framing difference stays deliberate and enumerated instead of
+/// converging by accident.
+pub(crate) enum CurrentUploadRawError {
+    NotFound,
+    RangeBeyondSize { total_size: u64 },
+    RangeTooLarge { requested: u64 },
+    RangeUnrepresentable,
+    Io { message: String },
+}
+
+impl CurrentUploadRawError {
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            CurrentUploadRawError::NotFound => 404,
+            CurrentUploadRawError::RangeBeyondSize { .. } => 416,
+            CurrentUploadRawError::RangeTooLarge { .. }
+            | CurrentUploadRawError::RangeUnrepresentable => 413,
+            CurrentUploadRawError::Io { .. } => 500,
+        }
+    }
+
+    /// The human wording both lanes share.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            CurrentUploadRawError::NotFound => "upload not found".to_string(),
+            CurrentUploadRawError::RangeBeyondSize { .. } => {
+                "range start beyond upload size".to_string()
+            }
+            CurrentUploadRawError::RangeTooLarge { requested } => format!(
+                "range too large: {requested} bytes (cap is {UPLOAD_MAX_BYTES})"
+            ),
+            CurrentUploadRawError::RangeUnrepresentable => {
+                "range too large for this platform".to_string()
+            }
+            CurrentUploadRawError::Io { message } => message.clone(),
+        }
+    }
+}
+
+/// Transport-neutral content core of the staged-upload raw read (`GET
+/// /api/session/current/uploads/{id}/raw`; tunnel twin
+/// `api_session_current_upload_raw`, BYTES lane). `range: None` is the
+/// HTTP form — one unbounded full-body read; `Some((offset, length))` is
+/// the tunnel's resumable form — seek plus a read capped at
+/// [`UPLOAD_MAX_BYTES`] per request (`length: None` reads to end of
+/// file). The success carries both lanes' decoration: the inline
+/// `Content-Disposition` header tail for HTTP, the range/descriptor meta
+/// object for the tunnel's `byte_stream_end.result`.
+pub(crate) fn current_upload_raw_api_response(
+    upload_id: &str,
+    range: Option<(u64, Option<u64>)>,
+    session_dir: &std::path::Path,
+    scope: &crate::global_store::StoreScope,
+) -> Result<ApiResponse, CurrentUploadRawError> {
+    use std::io::{Read, Seek};
+    let Some(descriptor) = crate::upload_store::find_upload(upload_id, session_dir, scope) else {
+        return Err(CurrentUploadRawError::NotFound);
+    };
+    let (bytes, offset, requested, total_size) = match range {
+        None => {
+            let bytes =
+                std::fs::read(&descriptor.path).map_err(|e| CurrentUploadRawError::Io {
+                    message: format!("read upload: {e}"),
+                })?;
+            let total_size = bytes.len() as u64;
+            (bytes, 0u64, total_size, total_size)
+        }
+        Some((offset, length)) => {
+            let metadata =
+                std::fs::metadata(&descriptor.path).map_err(|e| CurrentUploadRawError::Io {
+                    message: format!("stat upload: {e}"),
+                })?;
+            let total_size = metadata.len();
+            if offset > total_size {
+                return Err(CurrentUploadRawError::RangeBeyondSize { total_size });
+            }
+            let available = total_size.saturating_sub(offset);
+            let requested = length.unwrap_or(available).min(available);
+            if requested > UPLOAD_MAX_BYTES as u64 {
+                return Err(CurrentUploadRawError::RangeTooLarge { requested });
+            }
+            let transfer_len = usize::try_from(requested)
+                .map_err(|_| CurrentUploadRawError::RangeUnrepresentable)?;
+            let mut file =
+                std::fs::File::open(&descriptor.path).map_err(|e| CurrentUploadRawError::Io {
+                    message: format!("open upload: {e}"),
+                })?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| CurrentUploadRawError::Io {
+                    message: format!("seek upload: {e}"),
+                })?;
+            let mut bytes = vec![0u8; transfer_len];
+            file.read_exact(&mut bytes)
+                .map_err(|e| CurrentUploadRawError::Io {
+                    message: format!("read upload: {e}"),
+                })?;
+            (bytes, offset, requested, total_size)
+        }
+    };
+    let end = offset.saturating_add(requested);
+    let meta = serde_json::json!({
+        "ok": true,
+        "id": descriptor.id,
+        "name": descriptor.name,
+        "filename": descriptor.name,
+        "mime": descriptor.mime,
+        "content_type": descriptor.mime,
+        "size": requested,
+        "total_size": total_size,
+        "offset": offset,
+        "range_start": offset,
+        "range_end": end,
+        "resumable": true,
+    });
+    Ok(ApiResponse::Bytes {
+        status: 200,
+        content_type: descriptor.mime.clone(),
+        headers: vec![
+            (
+                "Content-Disposition",
+                format!("inline; filename=\"{}\"", descriptor.name.replace('"', "")),
+            ),
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        bytes: BytesPayload::InMemory(bytes),
+        meta,
+    })
+}
+
+/// Transport-neutral core of the staged-upload delete (`DELETE
+/// /api/session/current/uploads/{id}`; tunnel twin
+/// `api_session_current_upload_delete`): the shared delete core plus its
+/// `UploadDeleted` broadcast, under the canonical json tail — the delete
+/// answers same-origin, unlike the rest of its family (pinned by the
+/// golden transcripts).
+pub(crate) fn current_upload_delete_api_response(
+    project_root: Option<&std::path::Path>,
+    session_dir: Option<&std::path::Path>,
+    upload_id: &str,
+    bus: &crate::event::EventBus,
+) -> ApiResponse {
+    let (status, body, deleted_id) =
+        current_upload_delete_response_body(project_root, session_dir, upload_id);
+    if let Some(id) = deleted_id {
+        bus.send(crate::event::AppEvent::UploadDeleted { id });
+    }
+    ApiResponse::json(status_line_code(status), JsonBody::PreSerialized(body))
+}
+
 pub(crate) fn dashboard_source_request_from_line(
     request_line: &str,
 ) -> Option<DashboardSourceRequest> {
@@ -2413,17 +2612,19 @@ pub(crate) async fn handle_current_uploads_post(
     project_root_for_changes: Option<PathBuf>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     daemon_session_id: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
     //   Content-Type: <mime>
     //   <raw bytes>
     //
-    // Streams the body into a tempfile, commits it into
-    // the upload store for this daemon's scope (the
-    // project-local ignored `.intendant/uploads/<session-id>/`,
-    // or the daemon-global store on projectless daemons),
-    // and broadcasts UploadReady so all connected
-    // browsers see it.
+    // Streams the body into a tempfile (transport-owned carriage), then
+    // commits it through the shared neutral fn — the upload store for
+    // this daemon's scope (the project-local ignored
+    // `.intendant/uploads/<session-id>/`, or the daemon-global store on
+    // projectless daemons) — which broadcasts UploadReady so all
+    // connected browsers see it.
     //
     // Route sits in the `/api/session/current/*` family
     // alongside `changes`, `history`, `rollback`, etc.
@@ -2432,209 +2633,119 @@ pub(crate) async fn handle_current_uploads_post(
     // doesn't apply. If a WAN-exposed deploy wants to
     // protect uploads, gate the whole family at once.
     use tokio::io::AsyncWriteExt;
-    let response = 'upload: {
-        let scope = crate::global_store::StoreScope::resolve(project_root_for_changes.as_deref());
+    let name = query_param(request_line, "name").unwrap_or_else(|| "upload.bin".to_string());
+    let requested_destination = query_param(request_line, "destination")
+        .as_deref()
+        .and_then(crate::upload_store::UploadDestination::from_str)
+        .unwrap_or(crate::upload_store::UploadDestination::Task);
+    let mime = content_type_header(header_text);
+    if header_text
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
+    {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+    }
 
-        let name = query_param(request_line, "name").unwrap_or_else(|| "upload.bin".to_string());
-        let requested_destination = query_param(request_line, "destination")
-            .as_deref()
-            .and_then(crate::upload_store::UploadDestination::from_str)
-            .unwrap_or(crate::upload_store::UploadDestination::Task);
-        let mime = content_type_header(header_text);
-        if header_text
-            .lines()
-            .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
-        {
-            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
-        }
-
+    let response =
         match stream_body_to_tempfile(header_text, &discard, &mut stream, UPLOAD_MAX_BYTES).await {
             Err(e) => {
-                let status = if e.contains("too large") {
-                    "413 Payload Too Large"
-                } else {
-                    "400 Bad Request"
-                };
-                break 'upload upload_error_response(status, &e);
+                let status = if e.contains("too large") { 413 } else { 400 };
+                session_wildcard_json_error(status, &e)
             }
-            Ok((tmp, size)) => {
-                let (session_dir, session_id) = {
-                    if let Some(ref slog) = session_log {
-                        match slog.lock() {
-                            Ok(l) => (l.dir().to_path_buf(), l.session_id().to_string()),
-                            Err(_) => {
-                                break 'upload upload_error_response(
-                                    "500 Internal Server Error",
-                                    "session log lock poisoned",
-                                );
-                            }
-                        }
-                    } else {
-                        (
-                            pending_upload_session_dir(&scope),
-                            daemon_session_id
-                                .clone()
-                                .unwrap_or_else(|| "pending".to_string()),
-                        )
-                    }
-                };
-                let destination =
-                    effective_upload_destination(requested_destination, session_log.is_some());
-                match crate::upload_store::commit_upload(
-                    tmp,
-                    &name,
-                    &mime,
-                    size as u64,
-                    destination,
-                    &session_dir,
-                    &session_id,
-                    &scope,
-                ) {
-                    Ok(descriptor) => {
-                        bus.send(crate::event::AppEvent::UploadReady {
-                            descriptor: descriptor.clone(),
-                        });
-                        let body =
-                            serde_json::to_string(&descriptor).unwrap_or_else(|_| "{}".to_string());
-                        HttpResponse::with_content("200 OK", "application/json", body)
-                            .header("Cache-Control", "no-cache")
-                            .header("Access-Control-Allow-Origin", "*")
-                            .header("Connection", "close")
-                            .into_string()
-                    }
-                    Err(e) => upload_error_response(
-                        "500 Internal Server Error",
-                        &format!("commit upload: {e}"),
-                    ),
-                }
-            }
-        }
-    };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+            Ok((tmp, size)) => current_upload_commit_api_response(
+                project_root_for_changes.as_deref(),
+                session_log.as_ref(),
+                daemon_session_id.as_deref(),
+                &name,
+                &mime,
+                requested_destination,
+                tmp,
+                size,
+                &bus,
+            ),
+        };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_current_uploads_get(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     project_root_for_changes: Option<PathBuf>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // GET /api/session/current/uploads           — list uploads for the current session
     // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
-    use tokio::io::AsyncWriteExt;
-    let response = 'get_upload: {
-        let scope = crate::global_store::StoreScope::resolve(project_root_for_changes.as_deref());
-        let session_dir = if let Some(ref slog) = session_log {
-            match slog.lock() {
-                Ok(l) => l.dir().to_path_buf(),
-                Err(_) => {
-                    break 'get_upload upload_error_response(
-                        "500 Internal Server Error",
-                        "session log lock poisoned",
-                    );
-                }
-            }
-        } else {
-            pending_upload_session_dir(&scope)
-        };
-        // Path after /api/session/current/uploads
-        let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-        let path = path_and_q.split('?').next().unwrap_or("");
-        let suffix = path
-            .trim_start_matches("/api/session/current/uploads")
-            .trim_matches('/');
-        if suffix.is_empty() {
-            let uploads = crate::upload_store::list_uploads(&session_dir, &scope);
-            let body = serde_json::to_string(&uploads).unwrap_or_else(|_| "[]".to_string());
-            HttpResponse::with_content("200 OK", "application/json", body)
-                .header("Cache-Control", "no-cache")
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Connection", "close")
-                .into_string()
-        } else if let Some(id) = suffix.strip_suffix("/raw") {
-            // GET raw bytes for one upload.
-            match crate::upload_store::find_upload(id, &session_dir, &scope) {
-                None => upload_error_response("404 Not Found", "upload not found"),
-                Some(d) => {
-                    match std::fs::read(&d.path) {
-                        Ok(bytes) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", d.mime)
-                                .header("Content-Length", bytes.len().to_string())
-                                .header(
-                                    "Content-Disposition",
-                                    format!("inline; filename=\"{}\"", d.name.replace('"', ""),),
-                                )
-                                .header("Cache-Control", "no-cache")
-                                .header("Access-Control-Allow-Origin", "*")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(&bytes).await;
-                            // Skip the trailing write_all below.
-                            break 'get_upload String::new();
-                        }
-                        Err(e) => upload_error_response(
-                            "500 Internal Server Error",
-                            &format!("read upload: {e}"),
-                        ),
-                    }
-                }
-            }
-        } else {
-            upload_error_response("404 Not Found", "unknown upload route")
+    let scope = crate::global_store::StoreScope::resolve(project_root_for_changes.as_deref());
+    let session_dir = match session_log.as_ref() {
+        Some(slog) => match slog.lock() {
+            Ok(l) => Ok(l.dir().to_path_buf()),
+            Err(_) => Err("session log lock poisoned"),
+        },
+        None => Ok(pending_upload_session_dir(&scope)),
+    };
+    let session_dir = match session_dir {
+        Ok(dir) => dir,
+        Err(error) => {
+            let response = session_wildcard_json_error(500, error);
+            return write_api_response(stream, response, cors, fleet_origin).await;
         }
     };
-    if !response.is_empty() {
-        let _ = stream.write_all(response.as_bytes()).await;
-    }
-    finalize_http_stream(&mut stream).await;
+    // Path after /api/session/current/uploads
+    let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
+    let path = path_and_q.split('?').next().unwrap_or("");
+    let suffix = path
+        .trim_start_matches("/api/session/current/uploads")
+        .trim_matches('/');
+    let response = if suffix.is_empty() {
+        current_uploads_list_api_response(&session_dir, &scope)
+    } else if let Some(id) = suffix.strip_suffix("/raw") {
+        // GET raw bytes for one upload (the HTTP form: one full read).
+        match current_upload_raw_api_response(id, None, &session_dir, &scope) {
+            Ok(response) => response,
+            Err(err) => session_wildcard_json_error(err.status(), &err.message()),
+        }
+    } else {
+        session_wildcard_json_error(404, "unknown upload route")
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_current_upload_delete(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     bus: EventBus,
     project_root_for_changes: Option<PathBuf>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
-    use tokio::io::AsyncWriteExt;
-    let response = {
-        let session_dir = if let Some(ref slog) = session_log {
-            match slog.lock() {
-                Ok(l) => Ok(Some(l.dir().to_path_buf())),
-                Err(_) => Err("session log lock poisoned"),
-            }
-        } else {
-            Ok(None)
-        };
-        match session_dir {
-            Err(error) => json_response(
-                "500 Internal Server Error",
-                serde_json::json!({ "error": error }).to_string(),
-            ),
-            Ok(session_dir) => {
-                let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-                let path = path_and_q.split('?').next().unwrap_or("");
-                let id = path
-                    .trim_start_matches("/api/session/current/uploads/")
-                    .trim_matches('/');
-                let (status, body, deleted_id) = current_upload_delete_response_body(
-                    project_root_for_changes.as_deref(),
-                    session_dir.as_deref(),
-                    id,
-                );
-                if let Some(id) = deleted_id {
-                    bus.send(crate::event::AppEvent::UploadDeleted { id });
-                }
-                json_response(status, body)
-            }
+    let session_dir = match session_log.as_ref() {
+        Some(slog) => match slog.lock() {
+            Ok(l) => Ok(Some(l.dir().to_path_buf())),
+            Err(_) => Err("session log lock poisoned"),
+        },
+        None => Ok(None),
+    };
+    let response = match session_dir {
+        Err(error) => ApiResponse::json_error(500, error),
+        Ok(session_dir) => {
+            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
+            let path = path_and_q.split('?').next().unwrap_or("");
+            let id = path
+                .trim_start_matches("/api/session/current/uploads/")
+                .trim_matches('/');
+            current_upload_delete_api_response(
+                project_root_for_changes.as_deref(),
+                session_dir.as_deref(),
+                id,
+                &bus,
+            )
         }
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 #[cfg(test)]
@@ -3788,4 +3899,180 @@ mod tests {
         );
         assert!(target.join("kept.txt").exists());
     }
+    // ── S4c golden transcripts: the staged-upload family (design §6 S4,
+    // risk R1). The POST body rides the `discard` prefix (dispatch's
+    // already-read bytes), so the duplex harness needs no writer side.
+
+    async fn collect_upload_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    fn upload_golden_tail() -> &'static str {
+        "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+    }
+
+    /// POST success over a project-rooted store: framing pinned exactly
+    /// around the store-generated descriptor body.
+    #[tokio::test]
+    async fn golden_current_uploads_post_project_rooted_transcript() {
+        let project = tempfile::tempdir().unwrap();
+        let body = b"golden staged upload bytes".to_vec();
+        let header_text = format!(
+            "POST /api/session/current/uploads?name=golden.txt HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let bus = crate::event::EventBus::new();
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_post(
+                stream,
+                &header_text,
+                "POST /api/session/current/uploads?name=golden.txt HTTP/1.1",
+                [header_text.as_bytes(), body.as_slice()].concat(),
+                bus,
+                Some(root),
+                None,
+                Some("golden-session".to_string()),
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(text.contains(upload_golden_tail()), "{head}");
+        let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert_eq!(descriptor["name"], "golden.txt");
+        assert_eq!(descriptor["size"], body.len());
+        assert!(descriptor["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(&project.path().to_string_lossy().to_string()));
+    }
+
+    /// POST success on a projectless daemon: the commit resolves the
+    /// daemon-global store (PR #129 semantics), same wire framing.
+    #[tokio::test]
+    async fn golden_current_uploads_post_projectless_transcript() {
+        let body = b"golden projectless upload bytes".to_vec();
+        let session_id = format!(
+            "golden-projectless-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let header_text = format!(
+            "POST /api/session/current/uploads?name=global.txt HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let bus = crate::event::EventBus::new();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_post(
+                stream,
+                &header_text,
+                "POST /api/session/current/uploads?name=global.txt HTTP/1.1",
+                [header_text.as_bytes(), body.as_slice()].concat(),
+                bus,
+                None,
+                None,
+                Some(session_id.clone()),
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(text.contains(upload_golden_tail()), "{head}");
+        let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        let store_root = crate::global_store::global_store_root();
+        let path = descriptor["path"].as_str().unwrap().to_string();
+        assert!(
+            path.starts_with(&store_root.to_string_lossy().to_string()),
+            "projectless upload must land in the global store: {path}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.json"));
+    }
+
+    #[tokio::test]
+    async fn golden_current_uploads_get_and_delete_transcripts() {
+        let project = tempfile::tempdir().unwrap();
+        // Empty list.
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_get(
+                stream,
+                "GET /api/session/current/uploads HTTP/1.1",
+                Some(root),
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{}[]",
+            upload_golden_tail()
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+
+        // Raw fetch of a missing upload.
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_get(
+                stream,
+                "GET /api/session/current/uploads/nope/raw HTTP/1.1",
+                Some(root),
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let body = r#"{"error":"upload not found"}"#;
+        let expected = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}{}",
+            body.len(),
+            upload_golden_tail(),
+            body
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+
+        // Delete of an id that is not there stays idempotent-ok, under
+        // the canonical json tail (json_response framing).
+        let root = project.path().to_path_buf();
+        let bus = crate::event::EventBus::new();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_upload_delete(
+                stream,
+                "DELETE /api/session/current/uploads/nope HTTP/1.1",
+                bus,
+                Some(root),
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let body = r#"{"ok":true}"#;
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+    }
+
 }

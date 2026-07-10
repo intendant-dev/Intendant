@@ -63,7 +63,9 @@ filter = 'test(/^dashboard_control::(api_sessions|api_media)::tests::parity_/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 # The worktrees parity fixtures run the real inventory scan (git
-# subprocess per worktree — the worktree_inventory class above).
+# subprocess per worktree — the worktree_inventory class above); the
+# managed-context parity fixture walks the real ~/.intendant/logs
+# candidate scan (the routes_sessions home-scan class above).
 [[profile.default.overrides]]
-filter = 'test(/^dashboard_control::api_control::tests::parity_worktrees/)'
+filter = 'test(/^dashboard_control::api_control::tests::parity_/)'
 slow-timeout = { period = "60s", terminate-after = 4 }

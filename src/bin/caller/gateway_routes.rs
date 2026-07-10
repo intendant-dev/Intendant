@@ -331,6 +331,18 @@ const fn tunnel_uploadable(name: &'static str) -> TunnelSpec {
     }
 }
 
+/// Upload-frame-only tunnel twin: never dispatched on the request lane,
+/// advertised through the "upload_frames" transport feature rather than
+/// by name (the legacy `upload_only` shape).
+const fn tunnel_upload_only(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: false,
+        upload: true,
+    }
+}
+
 pub(crate) struct Route {
     pub(crate) method: RouteMethod,
     pub(crate) pattern: PathPattern,
@@ -551,7 +563,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionCurrentChanges,
         "List the session's changed files, or the unified diff for one file (subpath)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_changes")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/session/current/history"),
@@ -559,7 +572,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::CurrentHistory,
         "Serialized rollback History for the current session",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_history")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/rollback"),
@@ -567,7 +581,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentRollback,
         "Roll the current session back to a round (optionally reverting files)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_rollback")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),
@@ -575,7 +590,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentRedo,
         "Redo the last rolled-back round",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_redo")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/prune"),
@@ -583,7 +599,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentPrune,
         "Prune rollback state for the current session",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_prune")),
     // POST-shaped read (the body carries output ids; nothing is written).
     // Manage-gated only because the whole current/* family deliberately
     // is (see the sub-router comment below), not because it mutates.
@@ -594,7 +611,10 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentAgentOutput,
         "Fetch the current session's persisted agent output by id (POST-shaped read)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_agent_output")),
+    // The staged-upload POST's datachannel twin arrives only as upload
+    // frames (upload_start/chunk/end), never on the request lane.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/uploads"),
@@ -602,14 +622,44 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Streaming,
         RouteHandlerId::CurrentUploadsPost,
         "Upload a file attachment (raw streamed body; name/destination in query)",
-    ),
+    )
+    .with_tunnel(tunnel_upload_only("api_session_current_upload")),
+    // The uploads GET family: list (exact) and raw-fetch (segments) rows
+    // carved ahead of the Under catch-all so each carries its
+    // datachannel twin; all three share the handler, which routes by
+    // path (the catch-all keeps the handler-owned JSON 404 for unknown
+    // upload subpaths).
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/session/current/uploads"),
+        PeerOperation::SessionManage,
+        BodyPolicy::None,
+        RouteHandlerId::CurrentUploadsGet,
+        "List uploads for the current session",
+    )
+    .with_tunnel(tunnel_method("api_session_current_uploads")),
+    // Capture named `id`: the facade's HTTP adapter lifts template
+    // segments by name and the raw fetch's callers pass `{ id }` (the
+    // tunnel's primary alias) — pinned by the descriptor parity test.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session/current/uploads",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("raw")],
+        ),
+        PeerOperation::SessionManage,
+        BodyPolicy::None,
+        RouteHandlerId::CurrentUploadsGet,
+        "Fetch one upload's raw bytes (inline Content-Disposition)",
+    )
+    .with_tunnel(tunnel_method("api_session_current_upload_raw")),
     op_route(
         RouteMethod::Get,
         PathPattern::Under("/api/session/current/uploads"),
         PeerOperation::SessionManage,
         BodyPolicy::None,
         RouteHandlerId::CurrentUploadsGet,
-        "List uploads, or fetch one (subpath {id}/raw)",
+        "Unknown upload subpaths (handler-owned JSON 404)",
     ),
     op_route(
         RouteMethod::Delete,
@@ -621,7 +671,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::CurrentUploadDelete,
         "Delete one upload (file + sidecar)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_upload_delete")),
     // ── Session deletion. Five accepted wire shapes (native DELETE plus
     //    the WKWebView POST fallback with a literal `delete` suffix); one
     //    handler serves all of them by filtering the `delete` segment.
@@ -846,7 +897,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McAnchors,
         "Managed-context anchor catalog",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_anchors")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/managed-context/records"),
@@ -854,7 +906,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McRecords,
         "Managed-context record index",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_records")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/managed-context/fission"),
@@ -862,7 +915,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McFission,
         "Managed-context fission state",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_fission")),
     // ── Worktrees.
     op_route(
         RouteMethod::Post,
@@ -1679,6 +1733,7 @@ mod tests {
         // Handlers deliberately serving several wire shapes; their rows
         // must be contiguous so the sharing is visible in the table.
         let shared: &[RouteHandlerId] = &[
+            RouteHandlerId::CurrentUploadsGet,
             RouteHandlerId::SessionDelete,
             RouteHandlerId::SessionSubRouter,
             RouteHandlerId::AccessIamGrants,
@@ -1882,6 +1937,24 @@ mod tests {
         let (route, captures) = match_route("DELETE", "/api/session/current/uploads/u1").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentUploadDelete);
         assert_eq!(captures, vec!["u1"]);
+        // The uploads GET family: list on the exact row, raw fetch on the
+        // segments row, anything else on the Under catch-all — all three
+        // share the handler (declared shared group), so the carve is
+        // routing-neutral; it exists to give list and raw their own
+        // datachannel twins.
+        let (route, captures) = match_route("GET", "/api/session/current/uploads").unwrap();
+        assert_eq!(route.pattern, PathPattern::Exact("/api/session/current/uploads"));
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_uploads"));
+        assert!(captures.is_empty());
+        let (route, captures) = match_route("GET", "/api/session/current/uploads/u1/raw").unwrap();
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_upload_raw"));
+        assert_eq!(captures, vec!["u1"]);
+        let (route, _) = match_route("GET", "/api/session/current/uploads/u1/other").unwrap();
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.pattern, PathPattern::Under("/api/session/current/uploads"));
+        assert!(route.tunnel.is_none());
         // Agent-output: current-exact row first, then the by-id row.
         let (route, _) = match_route("POST", "/api/session/current/agent-output").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentAgentOutput);
