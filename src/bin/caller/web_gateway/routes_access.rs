@@ -442,6 +442,9 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "ct_checked_unix_ms": fleet_cert.ct_checked_unix_ms,
         "ct_last_error": fleet_cert.ct_last_error,
     });
+    // Hosted-bundle code-transparency tripwire (hosted_verify.rs): does
+    // the rendezvous serve the dashboard code its public log commits to.
+    let hosted_bundle = crate::hosted_verify::status_snapshot();
     serde_json::json!({
         "schema_version": 1,
         "configured": status.configured,
@@ -462,6 +465,10 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "bootstrap": status.bootstrap,
         "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
         "fleet_cert": fleet_cert_value,
+        "hosted_bundle_state": hosted_bundle.state,
+        "hosted_bundle_checked_unix_ms": hosted_bundle.checked_unix_ms,
+        "hosted_bundle_last_error": hosted_bundle.last_error,
+        "hosted_bundle_mismatches": hosted_bundle.mismatches,
     })
 }
 

@@ -494,6 +494,11 @@ pub fn spawn_web_gateway(
     // SNI resolver and keep it renewed (fleet_cert.rs).
     crate::fleet_cert::refresh_installed_state();
     crate::fleet_cert::spawn_renewal_loop();
+    // Hosted-bundle code transparency: when Connect is enabled,
+    // periodically verify what the rendezvous serves against its public
+    // transparency log (hosted_verify.rs — advisory and fail-open, the
+    // CT tripwire's sibling).
+    crate::hosted_verify::spawn_hosted_bundle_monitor();
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't

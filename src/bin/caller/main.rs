@@ -37,6 +37,7 @@ pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
 mod global_store;
+mod hosted_verify;
 pub(crate) use intendant_core::knowledge;
 mod lineage_ledger;
 mod linux_display_env;
@@ -347,6 +348,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
     println!("    service               Install, remove, inspect, or run the boot service");
@@ -3155,6 +3157,16 @@ async fn main() -> Result<(), CallerError> {
                 std::process::exit(1);
             }
         };
+    }
+
+    // Intercept `intendant hosted-verify` — the out-of-band code-transparency
+    // check against a rendezvous (docs/src/self-hosted-rendezvous.md). Like
+    // `org`, a local path with no project or provider setup: deliberately
+    // runnable from any machine, since page JS can never honestly
+    // self-verify the origin that serves it.
+    if env::args().nth(1).as_deref() == Some("hosted-verify") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(hosted_verify::run_cli(argv).await);
     }
 
     // Intercept `intendant service <action>` — install/remove/inspect the

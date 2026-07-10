@@ -229,7 +229,9 @@ pub(crate) fn log_leaves(store: &Store) -> Vec<[u8; 32]> {
         .collect()
 }
 
-pub(crate) fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::Value {
+/// The signed tree head as a bare object (no `ok` envelope) — nested by
+/// responses that carry an STH alongside other data.
+pub(crate) fn signed_tree_head_fields(state: &AppState, store: &Store) -> serde_json::Value {
     use ring::signature::KeyPair as _;
     let leaves = log_leaves(store);
     let root = b64u(&log_tree_root(&leaves));
@@ -242,13 +244,20 @@ pub(crate) fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::V
         .map(|sig| b64u(sig.as_ref()))
         .unwrap_or_default();
     json!({
-        "ok": true,
         "size": leaves.len(),
         "root": root,
         "unix_ms": unix_ms,
         "signature": signature,
         "public_key": b64u(state.log_key.public_key().as_ref()),
     })
+}
+
+pub(crate) fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::Value {
+    let mut sth = signed_tree_head_fields(state, store);
+    if let Some(map) = sth.as_object_mut() {
+        map.insert("ok".to_string(), json!(true));
+    }
+    sth
 }
 
 pub(crate) async fn log_sth(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
@@ -427,6 +436,273 @@ pub(crate) async fn log_find(
             "kind": entry.kind,
             "unix_ms": entry.unix_ms,
             "leaf_json": entry.leaf_json,
+        }))
+        .into_response(),
+    ))
+}
+
+// ── Code transparency: the served dashboard bundle, committed ──
+//
+// The hosted origin's residual power is serving different bytes than it
+// claims (trust-architecture.md's "it could serve this page with
+// malicious code"). These entries commit what the service SERVES to the
+// same append-only log that commits what it SAYS: at startup the service
+// hashes every static artifact it can serve — the embedded pages exactly
+// as this instance renders them (origin-injected installers included)
+// and every file under the static root — and appends an
+// `artifact_manifest` entry when the manifest changed. Out-of-band
+// monitors (`intendant hosted-verify`, the daemon tripwire in
+// bin/caller/hosted_verify.rs) fetch the live artifacts and compare;
+// page JS can never honestly self-verify, so nothing here is
+// browser-side. Strictly additive: existing clients see one more entry
+// kind in a tree that only ever grows.
+
+pub(crate) const ARTIFACT_MANIFEST_KIND: &str = "artifact_manifest";
+
+/// One served artifact: the URL path a GET fetches it at, and the
+/// lowercase-hex sha256 of the exact bytes served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArtifactRecord {
+    pub path: String,
+    pub sha256: String,
+}
+
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The routes served from compiled-in bytes, rendered exactly as this
+/// instance serves them (the pages and installers are deterministic
+/// functions of the public origin). The `/connect` page matters most:
+/// it carries the passkey and log-verification JS — the code a hosted
+/// betrayal would most want to swap.
+pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> {
+    let origin = config.public_origin.as_str();
+    let mut artifacts = vec![
+        ("/".to_string(), sha256_hex(landing_ui_html(origin).as_bytes())),
+        (
+            "/connect".to_string(),
+            sha256_hex(connect_page_html(origin).as_bytes()),
+        ),
+        (
+            "/access".to_string(),
+            sha256_hex(access_page_html(origin).as_bytes()),
+        ),
+        (
+            "/trust".to_string(),
+            sha256_hex(trust_ui_html(origin).as_bytes()),
+        ),
+        (
+            "/install.sh".to_string(),
+            sha256_hex(install_sh_body(origin).as_bytes()),
+        ),
+        (
+            "/install.ps1".to_string(),
+            sha256_hex(install_ps1_body(origin).as_bytes()),
+        ),
+        ("/logo.svg".to_string(), sha256_hex(LOGO_SVG.as_bytes())),
+        ("/favicon.png".to_string(), sha256_hex(BRAND_ICON_PNG)),
+    ];
+    for (name, bytes) in LANDING_ASSETS {
+        artifacts.push((format!("/assets/landing/{name}"), sha256_hex(bytes)));
+    }
+    artifacts
+        .into_iter()
+        .map(|(path, sha256)| ArtifactRecord { path, sha256 })
+        .collect()
+}
+
+/// Every file under the static root, keyed by the URL path the fallback
+/// serves it at. Skips symlinked directories (no cycles) and non-UTF-8
+/// names (not expressible as a URL path); unreadable files are skipped
+/// with a warning — they would 404 if fetched, too.
+pub(crate) fn static_root_artifacts(static_root: &Path) -> Vec<ArtifactRecord> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<ArtifactRecord>) {
+        if depth > 16 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                walk(root, &path, depth + 1, out);
+                continue;
+            }
+            // Follow file symlinks (serve_file serves them) but never
+            // symlinked directories.
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let mut url_path = String::from("/");
+            let mut expressible = true;
+            for (i, component) in rel.components().enumerate() {
+                let Some(part) = component.as_os_str().to_str() else {
+                    expressible = false;
+                    break;
+                };
+                if i > 0 {
+                    url_path.push('/');
+                }
+                url_path.push_str(part);
+            }
+            if !expressible {
+                continue;
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => out.push(ArtifactRecord {
+                    path: url_path,
+                    sha256: sha256_hex(&bytes),
+                }),
+                Err(error) => {
+                    eprintln!(
+                        "[connect] artifact manifest skipping unreadable {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    let mut artifacts = Vec::new();
+    walk(static_root, static_root, 0, &mut artifacts);
+    artifacts
+}
+
+/// The full served-artifact manifest: static-root files plus the
+/// embedded routes, sorted by path. On a path collision the embedded
+/// artifact wins — routes take precedence over the static fallback
+/// (e.g. `/logo.svg` is served embedded even though `static/logo.svg`
+/// exists).
+pub(crate) fn served_artifact_manifest(config: &ServiceConfig) -> Vec<ArtifactRecord> {
+    let mut by_path: std::collections::BTreeMap<String, String> =
+        static_root_artifacts(&config.static_root)
+            .into_iter()
+            .map(|artifact| (artifact.path, artifact.sha256))
+            .collect();
+    for artifact in embedded_artifacts(config) {
+        by_path.insert(artifact.path, artifact.sha256);
+    }
+    by_path
+        .into_iter()
+        .map(|(path, sha256)| ArtifactRecord { path, sha256 })
+        .collect()
+}
+
+/// Canonical manifest hash: sha256 (lowercase hex) over
+///
+/// ```text
+/// intendant-artifact-manifest-v1\n
+/// {path}\t{sha256}\n      (per artifact, sorted by path, byte order)
+/// ```
+///
+/// Deliberately independent of JSON serialization so external monitors
+/// can recompute it from any faithful copy of the list. REPLICATED in
+/// `bin/caller/hosted_verify.rs` (the two binaries never link each
+/// other); golden tests twin the two implementations.
+pub(crate) fn manifest_hash_hex(artifacts: &[ArtifactRecord]) -> String {
+    let mut canonical = String::from("intendant-artifact-manifest-v1\n");
+    for artifact in artifacts {
+        canonical.push_str(&artifact.path);
+        canonical.push('\t');
+        canonical.push_str(&artifact.sha256);
+        canonical.push('\n');
+    }
+    sha256_hex(canonical.as_bytes())
+}
+
+pub(crate) fn latest_artifact_manifest_hash(store: &Store) -> Option<String> {
+    store
+        .log_entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == ARTIFACT_MANIFEST_KIND)
+        .and_then(|entry| serde_json::from_str::<serde_json::Value>(&entry.leaf_json).ok())
+        .and_then(|leaf| {
+            leaf.get("manifest_hash")
+                .and_then(|hash| hash.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Compute the served-artifact manifest and append an
+/// `artifact_manifest` entry when it differs from the latest logged one.
+/// Returns whether an entry was appended (the caller persists). Called
+/// at startup, inside the same single-threaded window that loads the
+/// store — the log and what the process serves cannot disagree.
+pub(crate) fn record_artifact_manifest(store: &mut Store, config: &ServiceConfig) -> bool {
+    let artifacts = served_artifact_manifest(config);
+    let manifest_hash = manifest_hash_hex(&artifacts);
+    if latest_artifact_manifest_hash(store).as_deref() == Some(manifest_hash.as_str()) {
+        eprintln!(
+            "[connect] artifact manifest unchanged ({} artifacts, {})",
+            artifacts.len(),
+            &manifest_hash[..12.min(manifest_hash.len())],
+        );
+        return false;
+    }
+    eprintln!(
+        "[connect] artifact manifest logged: {} artifacts, {} (bundle {} {})",
+        artifacts.len(),
+        &manifest_hash[..12.min(manifest_hash.len())],
+        env!("CARGO_PKG_VERSION"),
+        env!("INTENDANT_GIT_SHA"),
+    );
+    append_log_entry(
+        store,
+        ARTIFACT_MANIFEST_KIND,
+        json!({
+            "bundle_version": env!("CARGO_PKG_VERSION"),
+            "git_sha": env!("INTENDANT_GIT_SHA"),
+            "manifest_hash": manifest_hash,
+            "artifacts": artifacts,
+        }),
+    );
+    true
+}
+
+/// The current artifact manifest with everything an out-of-band monitor
+/// needs in one response: the exact leaf bytes, its index, an inclusion
+/// proof, and the signed tree head the proof verifies against — all
+/// computed under one store lock so they cohere.
+pub(crate) async fn log_artifact_manifest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
+    let store = state.store.lock().await;
+    let found = store
+        .log_entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.kind == ARTIFACT_MANIFEST_KIND);
+    let Some((index, entry)) = found else {
+        return Ok(orl_cors(
+            Json(json!({ "ok": true, "found": false })).into_response(),
+        ));
+    };
+    let leaves = log_leaves(&store);
+    let proof: Vec<String> = log_inclusion_proof(index, &leaves)
+        .iter()
+        .map(|hash| b64u(hash))
+        .collect();
+    Ok(orl_cors(
+        Json(json!({
+            "ok": true,
+            "found": true,
+            "index": index,
+            "kind": entry.kind,
+            "unix_ms": entry.unix_ms,
+            "leaf_json": entry.leaf_json,
+            "proof": proof,
+            "sth": signed_tree_head_fields(&state, &store),
         }))
         .into_response(),
     ))
@@ -701,6 +977,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn test_config(static_root: &Path) -> ServiceConfig {
+        ServiceConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            public_origin: "https://connect.example.test".to_string(),
+            rp_id: "example.test".to_string(),
+            static_root: static_root.to_path_buf(),
+            data_file: static_root.join("state.json"),
+            daemon_token: None,
+            cookie_secure: true,
+            invite_required: false,
+            open_daemon_registration: false,
+            dns_zone: None,
+            dns_ns_name: None,
+            dns_listen: None,
+        }
+    }
+
+    /// Golden manifest hash — TWINNED byte-for-byte in
+    /// `bin/caller/hosted_verify.rs` (the verifier replicates the
+    /// canonicalization; change both together).
+    #[test]
+    fn manifest_hash_is_canonical_and_pinned() {
+        let artifacts = vec![
+            ArtifactRecord {
+                path: "/app.html".to_string(),
+                sha256: sha256_hex(b"hello"),
+            },
+            ArtifactRecord {
+                path: "/wasm-web/presence_web.js".to_string(),
+                sha256: sha256_hex(b"world"),
+            },
+        ];
+        assert_eq!(
+            artifacts[0].sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(
+            manifest_hash_hex(&artifacts),
+            "d77d51c09215be374511f6763f0c50d6c84726b8ff82d3ac958e1fc5fcf7abf6"
+        );
+        // Order-sensitive by design: the canonical form is the sorted list.
+        let reversed = vec![artifacts[1].clone(), artifacts[0].clone()];
+        assert_ne!(manifest_hash_hex(&reversed), manifest_hash_hex(&artifacts));
+    }
+
+    #[test]
+    fn served_manifest_walks_static_root_and_embeds_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.html"), b"hello").unwrap();
+        std::fs::create_dir_all(dir.path().join("wasm-web")).unwrap();
+        std::fs::write(dir.path().join("wasm-web/presence_web.js"), b"world").unwrap();
+        let config = test_config(dir.path());
+        let manifest = served_artifact_manifest(&config);
+        let paths: Vec<&str> = manifest.iter().map(|a| a.path.as_str()).collect();
+        // Sorted, and the walk found both files at their URL paths.
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "manifest must be path-sorted");
+        for expected in [
+            "/",
+            "/connect",
+            "/access",
+            "/trust",
+            "/install.sh",
+            "/install.ps1",
+            "/logo.svg",
+            "/favicon.png",
+            "/assets/landing/hero.webp",
+            "/app.html",
+            "/wasm-web/presence_web.js",
+        ] {
+            assert!(paths.contains(&expected), "manifest must cover {expected}");
+        }
+        let app = manifest.iter().find(|a| a.path == "/app.html").unwrap();
+        assert_eq!(app.sha256, sha256_hex(b"hello"));
+        // Deterministic: two computations agree (the pages embed only
+        // the origin, never a timestamp or nonce).
+        assert_eq!(
+            manifest_hash_hex(&manifest),
+            manifest_hash_hex(&served_artifact_manifest(&config))
+        );
+        // The embedded route wins a path collision with the static root.
+        std::fs::write(dir.path().join("logo.svg"), b"not the logo").unwrap();
+        let with_collision = served_artifact_manifest(&config);
+        let logo = with_collision.iter().find(|a| a.path == "/logo.svg").unwrap();
+        assert_eq!(logo.sha256, sha256_hex(LOGO_SVG.as_bytes()));
+    }
+
+    #[test]
+    fn artifact_manifest_entries_append_dedupe_and_prove() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.html"), b"bundle-v1").unwrap();
+        let config = test_config(dir.path());
+        let mut store = Store::default();
+        append_log_entry(&mut store, "daemon_claimed", json!({ "daemon_id": "d1" }));
+
+        assert!(record_artifact_manifest(&mut store, &config));
+        assert_eq!(store.log_entries.len(), 2);
+        // Same bytes → deduplicated.
+        assert!(!record_artifact_manifest(&mut store, &config));
+        assert_eq!(store.log_entries.len(), 2);
+        // Changed bytes → a new entry.
+        std::fs::write(dir.path().join("app.html"), b"bundle-v2").unwrap();
+        assert!(record_artifact_manifest(&mut store, &config));
+        assert_eq!(store.log_entries.len(), 3);
+
+        // Round-trip the latest entry: leaf carries the list, the
+        // manifest hash recomputes from it, and the inclusion proof for
+        // the new kind verifies against the tree.
+        let (index, entry) = store
+            .log_entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, e)| e.kind == ARTIFACT_MANIFEST_KIND)
+            .unwrap();
+        let leaf: serde_json::Value = serde_json::from_str(&entry.leaf_json).unwrap();
+        assert_eq!(leaf.get("kind").and_then(|v| v.as_str()), Some(ARTIFACT_MANIFEST_KIND));
+        assert!(leaf.get("unix_ms").and_then(|v| v.as_u64()).is_some());
+        assert_eq!(
+            leaf.get("bundle_version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            leaf.get("git_sha").and_then(|v| v.as_str()),
+            Some(env!("INTENDANT_GIT_SHA"))
+        );
+        let artifacts: Vec<ArtifactRecord> =
+            serde_json::from_value(leaf.get("artifacts").cloned().unwrap()).unwrap();
+        assert_eq!(
+            leaf.get("manifest_hash").and_then(|v| v.as_str()),
+            Some(manifest_hash_hex(&artifacts).as_str()),
+            "manifest_hash must recompute from the carried list"
+        );
+        assert_eq!(
+            artifacts.iter().find(|a| a.path == "/app.html").unwrap().sha256,
+            sha256_hex(b"bundle-v2")
+        );
+
+        let leaves = log_leaves(&store);
+        let proof = log_inclusion_proof(index, &leaves);
+        let root = log_tree_root(&leaves);
+        assert!(log_verify_inclusion(
+            &log_leaf_hash(&entry.leaf_json),
+            index,
+            leaves.len(),
+            &proof,
+            &root,
+        ));
     }
 
     #[test]
