@@ -4016,7 +4016,7 @@ mod tests {
         )
         .unwrap();
 
-        // Anchor-origin keys are anchor-grade: no ceiling.
+        // Keys born on daemon-served origins are uncapped: no ceiling.
         let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
         assert_eq!(
             anchor.authn_origin.as_deref(),
