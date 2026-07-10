@@ -2612,6 +2612,110 @@ mod tests {
         assert_eq!(payload["iam"]["managed_grants"], 1);
     }
 
+    /// FR-3 (design-overhaul QA fleet, Access tab): a manually added
+    /// same-host peer carries the same id as the local daemon — `PeerId`
+    /// is `intendant:<host label>`, so two daemons sharing a hostname
+    /// collide. The dashboard resolves every grant row's target label over
+    /// `targets[]` id-first with FIRST-writer-wins
+    /// (`accessOverviewTargetLabelMap` in static/app/42-usage-terminal.js),
+    /// so the payload contract pinned here is:
+    ///
+    /// 1. the local daemon is present and FIRST in `targets[]`, keeping its
+    ///    label authoritative for the shared id under first-wins;
+    /// 2. the colliding peer row still appears (a real configured peer is
+    ///    never silently dropped), carrying its own label; and
+    /// 3. the current-subject root grant is stamped with the local target
+    ///    id, so it resolves to the local daemon's label.
+    ///
+    /// Before the first-wins fix the peer row overwrote the shared map key
+    /// and every local-daemon grant rendered under the peer's name — the
+    /// audit screenshot showed "Root on qa-peer-b" for a grant on the
+    /// local daemon.
+    #[tokio::test]
+    async fn access_overview_same_host_peer_id_collision_keeps_local_label_authoritative() {
+        use crate::peer::id::{PeerId, PeerKind};
+
+        // Both daemons resolve the same host label, so both cards carry
+        // the same id — the local one via `build_local_agent_card`, the
+        // peer via its fetched card.
+        let shared_id = PeerId::new(PeerKind::Intendant, "qa-host");
+        let host_form_id = shared_id.as_str();
+        let agent_card = serde_json::json!({
+            "id": host_form_id,
+            "label": "This daemon",
+            "capabilities": [],
+        });
+
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        registry
+            .add_peer_with_card(crate::peer::AgentCard {
+                id: shared_id.clone(),
+                label: "qa-peer-b".to_string(),
+                version: "0.0.0".to_string(),
+                git_sha: None,
+                transports: vec![crate::peer::TransportSpec::IntendantWs {
+                    url: "ws://127.0.0.1:9/ws".to_string(),
+                }],
+                capabilities: Vec::new(),
+                auth: crate::peer::AuthRequirements::none(),
+            })
+            .await
+            .expect("register colliding same-host peer");
+
+        let iam_state = crate::access::iam::LoadedIamState {
+            path: std::path::PathBuf::from(crate::access::iam::IAM_STATE_FILE),
+            state: crate::access::iam::LocalIamState::default(),
+            status: crate::access::iam::IamStateStatus::Missing,
+        };
+        let payload = access_overview_response_value_with_identities_and_iam(
+            &agent_card,
+            Some(&registry),
+            &[],
+            &iam_state,
+            None,
+        );
+
+        let targets = payload["targets"].as_array().expect("targets");
+        assert_eq!(targets.len(), 2, "local + colliding peer");
+        assert_eq!(targets[0]["local"], true, "local target must stay first");
+        assert_eq!(targets[0]["id"], host_form_id);
+        assert_eq!(targets[0]["label"], "This daemon");
+        assert_eq!(targets[1]["id"], host_form_id, "collision is representable");
+        assert_eq!(targets[1]["label"], "qa-peer-b");
+
+        let grants = payload["grants"].as_array().expect("grants");
+        let root_grant = grants
+            .iter()
+            .find(|grant| grant["role"] == "root")
+            .expect("current-subject root grant");
+        assert_eq!(root_grant["target_id"], host_form_id);
+
+        // Mirror of the dashboard's target-label resolution
+        // (accessOverviewTargetLabelMap + accessCreateGrantRow): id-first
+        // over id/host_id, first writer wins. Under the payload order
+        // pinned above this resolves the root grant to the local label;
+        // the pre-fix last-writer-wins fill resolved it to "qa-peer-b".
+        let mut labels: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for target in targets {
+            for key in ["id", "host_id"] {
+                if let Some(id) = target[key].as_str().filter(|v| !v.trim().is_empty()) {
+                    labels
+                        .entry(id)
+                        .or_insert_with(|| target["label"].as_str().unwrap_or(id));
+                }
+            }
+        }
+        assert_eq!(
+            labels
+                .get(root_grant["target_id"].as_str().expect("root target id"))
+                .copied(),
+            Some("This daemon"),
+            "local root grant must resolve to the local daemon's label"
+        );
+    }
+
     #[test]
     fn peer_connection_identity_requires_approved_record_for_peer_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
