@@ -778,27 +778,31 @@ pub(crate) async fn api_managed_context_response(
         }
     };
     let home = crate::platform::home_dir();
-    let response = tokio::task::spawn_blocking(move || match kind {
-        "records" => crate::web_gateway::managed_context_records_response_from_home(
-            &request_line,
-            active_log_dir.as_deref(),
-            &home,
-        ),
-        "anchors" => crate::web_gateway::managed_context_anchors_response_from_home(
-            &request_line,
-            active_log_dir.as_deref(),
-            &home,
-        ),
-        "fission" => crate::web_gateway::managed_context_fission_response_from_home(
-            &request_line,
-            active_log_dir.as_deref(),
-            &home,
-        ),
-        _ => crate::web_gateway::managed_context_records_response_from_home(
-            &request_line,
-            active_log_dir.as_deref(),
-            &home,
-        ),
+    // Transitional raw-string render around the (now neutral) builders;
+    // the S4c tunnel commit replaces it with frame_api_response.
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::api_response_to_http_string(match kind {
+            "records" => crate::web_gateway::managed_context_records_response_from_home(
+                &request_line,
+                active_log_dir.as_deref(),
+                &home,
+            ),
+            "anchors" => crate::web_gateway::managed_context_anchors_response_from_home(
+                &request_line,
+                active_log_dir.as_deref(),
+                &home,
+            ),
+            "fission" => crate::web_gateway::managed_context_fission_response_from_home(
+                &request_line,
+                active_log_dir.as_deref(),
+                &home,
+            ),
+            _ => crate::web_gateway::managed_context_records_response_from_home(
+                &request_line,
+                active_log_dir.as_deref(),
+                &home,
+            ),
+        })
     })
     .await;
     let response = match response {

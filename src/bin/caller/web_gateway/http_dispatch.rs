@@ -445,6 +445,8 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     project_root_for_changes,
                     snapshot_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -563,21 +565,55 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::CurrentHistory => {
-                return handle_current_history(stream, file_watcher).await;
+                return handle_current_history(
+                    stream,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentRollback => {
-                return handle_current_rollback(stream, route_body, bus, query_ctx, file_watcher)
-                    .await;
+                return handle_current_rollback(
+                    stream,
+                    route_body,
+                    bus,
+                    query_ctx,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentRedo => {
-                return handle_current_redo(stream, query_ctx, file_watcher).await;
+                return handle_current_redo(
+                    stream,
+                    query_ctx,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentPrune => {
-                return handle_current_prune(stream, file_watcher).await;
+                return handle_current_prune(
+                    stream,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentAgentOutput => {
-                return handle_current_agent_output(stream, route_body, query_ctx, session_log)
-                    .await;
+                return handle_current_agent_output(
+                    stream,
+                    route_body,
+                    query_ctx,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentUploadsPost => {
                 return handle_current_uploads_post(
@@ -589,6 +625,8 @@ pub(crate) async fn serve_http_request(
                     project_root_for_changes,
                     session_log,
                     daemon_session_id,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -598,6 +636,8 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     project_root_for_changes,
                     session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -608,6 +648,8 @@ pub(crate) async fn serve_http_request(
                     bus,
                     project_root_for_changes,
                     session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -635,13 +677,34 @@ pub(crate) async fn serve_http_request(
                     .await;
             }
             RouteHandlerId::McAnchors => {
-                return handle_mc_anchors(stream, request_line, session_log).await;
+                return handle_mc_anchors(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::McRecords => {
-                return handle_mc_records(stream, request_line, session_log).await;
+                return handle_mc_records(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::McFission => {
-                return handle_mc_fission(stream, request_line, session_log).await;
+                return handle_mc_fission(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsStream => {
                 return handle_sessions_stream(stream, request_line).await;
