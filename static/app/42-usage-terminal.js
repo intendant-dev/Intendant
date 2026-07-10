@@ -2519,15 +2519,15 @@ async function accessApplyGrantToTarget(target, payload) {
     if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
     return resp.body;
   }
-  const resp = await fetch(`${target.origin}/api/access/iam/user-client-grants`, {
-    method: 'POST',
-    mode: 'cors',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  // Remote fleet daemon: the explicit remote-http target (transport F4).
+  // Naming the target names the transport — direct cross-origin HTTP to
+  // that daemon's fleet-CORS row, never a tunnel, never a fallback; the
+  // target daemon's own IAM authorizes the write (browser mTLS identity).
+  const resp = await daemonApi.request('api_access_iam_upsert_user_client_grant', payload, {
+    target: { remoteHttp: target.origin },
   });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 function renderAccessUserClientGrantForm() {

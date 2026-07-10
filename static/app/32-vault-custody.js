@@ -2848,7 +2848,7 @@ async function orgRevocationCourier() {
       if (!resp.ok) continue;
       const body = await resp.json().catch(() => ({}));
       if (!body?.orl) continue;
-      const applied = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', body.orl);
+      const applied = await accessOrgCall('api_access_org_orl_apply', body.orl);
       if (applied?.applied?.changed) {
         console.info(`[org] carried @${handle} revocations seq ${applied.applied.seq} to this daemon (${applied.applied.revoked_grants} grants, ${applied.applied.revoked_peer_identities} peer identities revoked)`);
       }
