@@ -141,6 +141,15 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
+- **Tests are hermetic.** A test must never read or mutate machine state
+  outside the repo checkout and its own temp dirs — CI runs on the fleet's
+  real accounts, so a fixture that resolves `dirs::home_dir()` scans a
+  live box (worktree roots, `~/.intendant` session stores) and its outcome
+  and duration become machine state. Functions under test take their roots
+  as parameters (`home: &Path`, store dirs); the transport edge resolves
+  the real environment, tests inject `tempfile` dirs. A nextest lane or
+  widened timeout around an environment-dependent test is a smell, not a
+  fix.
 - **File size budget:** keep a source file under ~3k lines of non-test code
   (4k absolute ceiling; inline `#[cfg(test)]` modules don't count against it;
   the remaining god-files are legacy being carved down, not precedents). When a
