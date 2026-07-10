@@ -2790,6 +2790,32 @@ mod tests {
         assert_eq!(frame["error"], http_body["error"]);
     }
 
+    #[tokio::test]
+    async fn parity_fleet_cert_request_shares_the_no_name_error() {
+        // The S6 ROW-NEW: both lanes run the one neutral fn. The test
+        // process holds no fleet name, so the deterministic error is
+        // the shared shape (explicit addresses keep the fixture off the
+        // NIC-enumeration default; the no-name path never spawns the
+        // ACME flow).
+        let params = || serde_json::json!({ "addresses": ["192.0.2.10"] });
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::fleet_cert_request_api_response(params()),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-fleet-cert".to_string(),
+            crate::web_gateway::fleet_cert_request_api_response(params()),
+            "fleet cert request",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+        assert_eq!(
+            frame["error"],
+            "this daemon has no fleet name — enable Connect against a \
+             rendezvous with fleet DNS and let it register first"
+        );
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 

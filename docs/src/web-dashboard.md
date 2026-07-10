@@ -2059,6 +2059,7 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/access/connect/unclaim` | AccessManage | fleet allowlist | bounded | Release this daemon's claim binding at the rendezvous (daemon-signed) |
 | POST | `/api/access/tier` | AccessManage | fleet allowlist | bounded | Set this daemon's trust tier label (integrated/disposable; null clears) |
 | POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
+| POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
 | any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |

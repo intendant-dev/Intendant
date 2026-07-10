@@ -934,6 +934,11 @@ mod tests {
 
     #[test]
     fn fleet_cors_paths_cover_exactly_the_access_apis() {
+        // is_fleet_cors_access_path derives from the route table (S6):
+        // every FleetAllowlist row's path answers true — a new fleet
+        // row (the fleet-cert ROW-NEW is the first) joins the write-side
+        // origin gate by declaration instead of by remembering to edit
+        // a hand-kept list.
         for path in [
             "/api/access/overview",
             "/api/access/iam/state",
@@ -941,15 +946,23 @@ mod tests {
             "/api/access/enrollment-requests/decide",
             "/api/access/iam/user-client-grants",
             "/api/access/iam/grants/update",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
             "/api/access/connect/status",
             "/api/access/connect/claim-code",
             "/api/access/connect/config",
             "/api/access/connect/unclaim",
+            "/api/access/tier",
+            "/api/access/hosted-ceiling",
+            "/api/access/fleet-cert/request",
         ] {
             assert!(is_fleet_cors_access_path(path), "{path}");
         }
         assert!(!is_fleet_cors_access_path("/api/peers"));
         assert!(!is_fleet_cors_access_path("/config"));
+        // Public and own-origin access rows stay out of the fleet set.
+        assert!(!is_fleet_cors_access_path("/api/access/org-grants"));
+        assert!(!is_fleet_cors_access_path("/api/access/org-grants/issue"));
 
         // The generic helper's wildcard must be REPLACED, never duplicated.
         let with = with_fleet_cors(

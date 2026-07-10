@@ -934,6 +934,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AccessFleetCertRequest => {
+                return handle_fleet_cert_request(
+                    stream,
+                    route_body,
+                    http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AccessOverview => {
                 return handle_access_overview(
                     stream,

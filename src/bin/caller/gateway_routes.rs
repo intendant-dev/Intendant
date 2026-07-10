@@ -267,6 +267,9 @@ pub(crate) enum RouteHandlerId {
     /// tier label and the hosted-control ceiling knob. One handler, two
     /// paths, switched on `req_path`.
     AccessTierSettings,
+    /// Fleet certificate request (async-start; progress rides the
+    /// connect status payload).
+    AccessFleetCertRequest,
     DashboardTargets,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
@@ -1333,6 +1336,15 @@ pub(crate) static ROUTES: &[Route] = &[
         "Set the hosted-control ceiling role for hosted-provenance sessions",
     )
     .with_tunnel(tunnel_method("api_access_set_hosted_ceiling")),
+    fleet_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/access/fleet-cert/request"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::AccessFleetCertRequest,
+        "Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start)",
+    )
+    .with_tunnel(tunnel_method("api_fleet_cert_request")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),

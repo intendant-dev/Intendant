@@ -896,6 +896,77 @@ pub(crate) fn access_org_renew_api_response(
     access_result_api_response(access_org_renew_response_value(cert_dir, params), 400)
 }
 
+/// POST /api/access/fleet-cert/request + the tunnel's
+/// `api_fleet_cert_request` (the S6 ROW-NEW: the tunnel method finally
+/// gets its HTTP twin): publish this daemon's routable addresses under
+/// its fleet name and start the ACME DNS-01 order (fleet_cert.rs).
+/// Async-start semantics preserved — the flow is spawned and progress
+/// rides the connect status payload. Explicit `addresses` in params
+/// override the routable-local-address default.
+pub(crate) fn fleet_cert_request_api_response(params: serde_json::Value) -> ApiResponse {
+    let addresses: Vec<String> = params
+        .get("addresses")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .filter(|list: &Vec<String>| !list.is_empty())
+        .unwrap_or_else(crate::fleet_cert::default_publish_addresses);
+    if crate::fleet_cert::status_snapshot().name.is_none() {
+        return ApiResponse::json_error(
+            400,
+            "this daemon has no fleet name — enable Connect against a \
+             rendezvous with fleet DNS and let it register first",
+        );
+    }
+    let spawned_addresses = addresses.clone();
+    tokio::spawn(async move {
+        if let Err(error) = crate::fleet_cert::request_certificate(spawned_addresses).await {
+            eprintln!("[fleet-cert] request failed: {error}");
+        }
+    });
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "started": true, "addresses": addresses })),
+    )
+}
+
+/// HTTP shim for the fleet-cert request row: manage-belt + empty-body
+/// tolerance (`{}`), matching the access admin family.
+pub(crate) async fn handle_fleet_cert_request(
+    stream: DemuxStream,
+    body_text: String,
+    http_access_context: HttpAccessContext,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
+    }
+    let response = if body_text.trim().is_empty() {
+        fleet_cert_request_api_response(serde_json::json!({}))
+    } else {
+        match parse_access_request_body(&body_text) {
+            Ok(params) => fleet_cert_request_api_response(params),
+            Err(error) => *error,
+        }
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 pub(crate) async fn handle_access_overview(
     stream: DemuxStream,
     cert_dir: std::path::PathBuf,
@@ -4401,6 +4472,92 @@ mod tests {
         assert_eq!(
             golden_access_transcript(&response),
             golden_access_public_json_transcript("400 Bad Request", &expected_body)
+        );
+    }
+
+    // ── S6 golden transcripts: the fleet-cert ROW-NEW ──
+    //
+    // A new HTTP surface (design §2.7 ROW-NEW), so these pins DEFINE the
+    // wire rather than preserve one: the family-standard fleet framing,
+    // the belt-403, and the deterministic no-fleet-name error. Explicit
+    // addresses keep every fixture off the NIC-enumeration default, and
+    // the no-name error path never spawns the ACME flow — the live
+    // order stays smoke-covered.
+
+    #[tokio::test]
+    async fn golden_fleet_cert_request_transcripts() {
+        let cors = access_route_cors(
+            "POST",
+            "/api/access/fleet-cert/request",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+
+        // No fleet name in the process-global status (the test process
+        // never registered against a rendezvous): the deterministic 400
+        // under the fleet tail, both origin shapes.
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let response = collect_access_handler_response(|stream| {
+                handle_fleet_cert_request(
+                    stream,
+                    serde_json::json!({ "addresses": ["192.0.2.10"] }).to_string(),
+                    golden_root_context(),
+                    cors,
+                    origin,
+                )
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript(
+                    "400 Bad Request",
+                    r#"{"error":"this daemon has no fleet name — enable Connect against a rendezvous with fleet DNS and let it register first"}"#,
+                    origin
+                )
+            );
+        }
+
+        // Parse error: the family-standard 400 under the fleet tail.
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_fleet_cert_request(
+                stream,
+                invalid.to_string(),
+                golden_root_context(),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Denied: the belt 403, PLAIN tail (family convention).
+        let denied_dir = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(denied_dir.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_fleet_cert_request(
+                stream,
+                serde_json::json!({ "addresses": ["192.0.2.10"] }).to_string(),
+                context,
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
         );
     }
 }
