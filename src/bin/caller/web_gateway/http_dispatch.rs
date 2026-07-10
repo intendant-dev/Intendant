@@ -972,6 +972,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     request_line,
                     req_method,
+                    cert_dir,
                     bus,
                     project_root,
                     peer_registry,

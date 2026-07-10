@@ -58,6 +58,7 @@ pub(crate) async fn handle_peers_sub_router(
     body_text: String,
     request_line: &str,
     req_method: &str,
+    cert_dir: PathBuf,
     bus: EventBus,
     project_root: Option<PathBuf>,
     peer_registry: Option<crate::peer::PeerRegistry>,
@@ -104,26 +105,27 @@ pub(crate) async fn handle_peers_sub_router(
     let (status, body) = if segments == ["pairing", "invite"] && req_method == "POST" {
         peers_pairing_invite(&body_text)
     } else if segments == ["pairing", "request-access"] && req_method == "POST" {
-        peers_pairing_request_access(&body_text).await
+        peers_pairing_request_access(&cert_dir, &body_text).await
     } else if segments == ["pairing", "request-access", "poll"] && req_method == "POST" {
         peers_pairing_request_access_poll(
             peer_registry.as_ref(),
             project_root.as_deref(),
+            &cert_dir,
             &body_text,
         )
         .await
     } else if segments == ["pairing", "requests"] && req_method == "GET" {
-        peers_pairing_requests_list()
+        peers_pairing_requests_list(&cert_dir)
     } else if segments == ["pairing", "identities"] && req_method == "GET" {
-        peers_pairing_identities_list()
+        peers_pairing_identities_list_from_cert_dir(&cert_dir)
     } else if segments == ["pairing", "identities", "revoke"] && req_method == "POST" {
-        peers_pairing_identity_revoke(&body_text)
+        peers_pairing_identity_revoke_from_cert_dir(&cert_dir, &body_text)
     } else if segments.len() == 4
         && segments[0] == "pairing"
         && segments[1] == "requests"
         && req_method == "POST"
     {
-        peers_pairing_request_decision(segments[2], segments[3], &body_text)
+        peers_pairing_request_decision(&cert_dir, segments[2], segments[3], &body_text)
     } else {
         match peer_registry.as_ref() {
             None => (
@@ -555,7 +557,13 @@ pub(crate) fn peer_access_request_status(request_id: &str) -> (u16, String) {
     }
 }
 
-pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
+/// `cert_dir` arrives from the transport edges (hermeticity convention)
+/// — as on the other pairing leaves below: the HTTP dispatch arm and
+/// the tunnel arms resolve the ambient store; fixtures inject tempdirs.
+pub(crate) async fn peers_pairing_request_access(
+    cert_dir: &Path,
+    body_text: &str,
+) -> (u16, String) {
     let req: PairingAccessRequestStart = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
@@ -571,9 +579,8 @@ pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, Strin
             serde_json::json!({"error": "target_url is required"}).to_string(),
         );
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     match crate::peer::access_request::initiate_access_request(
-        &cert_dir,
+        cert_dir,
         crate::peer::access_request::InitiateAccessRequestOptions {
             target_url: req.target_url,
             requester_label: req.label,
@@ -605,6 +612,7 @@ pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, Strin
 pub(crate) async fn peers_pairing_request_access_poll(
     registry: Option<&crate::peer::PeerRegistry>,
     project_root: Option<&Path>,
+    cert_dir: &Path,
     body_text: &str,
 ) -> (u16, String) {
     let req: PairingAccessRequestPoll = match serde_json::from_str(body_text) {
@@ -622,14 +630,13 @@ pub(crate) async fn peers_pairing_request_access_poll(
             serde_json::json!({"error": "project root not available"}).to_string(),
         );
     };
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
         Ok(project) => project,
         Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
     };
     match crate::peer::access_request::poll_access_request(
         &mut project,
-        &cert_dir,
+        cert_dir,
         req.request_id.trim(),
         req.label.as_deref(),
     )
@@ -706,9 +713,8 @@ pub(crate) async fn peers_pairing_request_access_poll(
     }
 }
 
-pub(crate) fn peers_pairing_requests_list() -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    match crate::peer::access_request::list_requests(&cert_dir) {
+pub(crate) fn peers_pairing_requests_list(cert_dir: &Path) -> (u16, String) {
+    match crate::peer::access_request::list_requests(cert_dir) {
         Ok(requests) => {
             let items: Vec<serde_json::Value> = requests
                 .into_iter()
@@ -724,6 +730,7 @@ pub(crate) fn peers_pairing_requests_list() -> (u16, String) {
 }
 
 pub(crate) fn peers_pairing_request_decision(
+    cert_dir: &Path,
     code_or_id: &str,
     op: &str,
     body_text: &str,
@@ -741,14 +748,13 @@ pub(crate) fn peers_pairing_request_decision(
             }
         }
     };
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     let result = match op {
         "approve" => crate::peer::access_request::approve_request(
-            &cert_dir,
+            cert_dir,
             code_or_id,
             body.profile.as_deref(),
         ),
-        "deny" => crate::peer::access_request::deny_request(&cert_dir, code_or_id),
+        "deny" => crate::peer::access_request::deny_request(cert_dir, code_or_id),
         _ => {
             return (
                 404,
@@ -763,11 +769,6 @@ pub(crate) fn peers_pairing_request_decision(
             serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
         ),
     }
-}
-
-pub(crate) fn peers_pairing_identities_list() -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    peers_pairing_identities_list_from_cert_dir(&cert_dir)
 }
 
 pub(crate) fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String) {
@@ -785,11 +786,6 @@ pub(crate) fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u
             serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
         ),
     }
-}
-
-pub(crate) fn peers_pairing_identity_revoke(body_text: &str) -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    peers_pairing_identity_revoke_from_cert_dir(&cert_dir, body_text)
 }
 
 pub(crate) fn peers_pairing_identity_revoke_from_cert_dir(
@@ -2482,6 +2478,289 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["identities"][0]["status"], "revoked");
         assert!(parsed["identities"][0]["revoked_at_unix"].is_number());
+    }
+
+    // ── S7 golden transcripts: the peers sub-router + coordinator ──
+    //
+    // Byte pins captured BEFORE the family's neutral-core conversion
+    // (design §6 S7, risk R1). The family predates the posture-derived
+    // CORS renderers: both handlers answer under a hand-rolled
+    // wildcard tail — `Cache-Control`, `Access-Control-Allow-Origin: *`,
+    // a per-handler `Access-Control-Allow-Methods` list,
+    // `Access-Control-Allow-Headers: Content-Type`, `Connection: close`
+    // — with the family's own reason ladder (notably `502 Bad Gateway`,
+    // which the relay-failure paths produce; those need a connected
+    // failing peer and stay smoke-covered by the peer validators).
+    // Store-dependent leaves run over injected tempdir cert stores and
+    // a fresh in-memory registry (hermeticity convention) — never the
+    // machine's real peer or cert state.
+
+    async fn collect_peers_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> String
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// The peers sub-router's historical JSON framing, spelled out
+    /// literally.
+    fn golden_peers_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The coordinator's historical framing: same tail, POST-only
+    /// methods list.
+    fn golden_coordinator_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn empty_test_registry() -> crate::peer::PeerRegistry {
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        crate::peer::PeerRegistry::new(log_tx)
+    }
+
+    async fn peers_sub_router_transcript(
+        method: &str,
+        path: &str,
+        body: &str,
+        cert_dir: &Path,
+        registry: Option<crate::peer::PeerRegistry>,
+    ) -> String {
+        let request_line = format!("{method} {path} HTTP/1.1");
+        let cert_dir = cert_dir.to_path_buf();
+        let body = body.to_string();
+        collect_peers_handler_response(move |stream| async move {
+            handle_peers_sub_router(
+                stream,
+                body,
+                &request_line,
+                method,
+                cert_dir,
+                EventBus::new(),
+                None,
+                registry,
+            )
+            .await;
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn golden_peers_sub_router_transcripts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cert_dir = tmp.path();
+
+        // No registry wired in: every non-pairing leaf answers the
+        // deterministic 503.
+        let response = peers_sub_router_transcript("GET", "/api/peers", "", cert_dir, None).await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "503 Service Unavailable",
+                &serde_json::json!({"error": "peer registry not configured"}).to_string(),
+            )
+        );
+
+        // Empty in-memory registry: the list leaf's 200.
+        let response = peers_sub_router_transcript(
+            "GET",
+            "/api/peers",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"peers": []}).to_string())
+        );
+
+        // Unknown per-peer op: the handler-owned JSON 404.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/nope/badop",
+            "{}",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "unknown peer op: badop"}).to_string(),
+            )
+        );
+
+        // Absent peer on a quick control (body decodes first): the
+        // peer_handle_or_404 shape.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/nope/message",
+            &serde_json::json!({"text": "hi"}).to_string(),
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "peer not found: nope"}).to_string(),
+            )
+        );
+
+        // Undeclared method on the registry root: the handler-owned 405.
+        let response = peers_sub_router_transcript(
+            "PUT",
+            "/api/peers",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "405 Method Not Allowed",
+                &serde_json::json!({"error": "method not allowed"}).to_string(),
+            )
+        );
+
+        // Eligible without a capability: the query-string 400 (also
+        // pins the path/query split on the request-line token).
+        let response = peers_sub_router_transcript(
+            "GET",
+            "/api/peers/eligible",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": "at least one ?capability=... is required"})
+                    .to_string(),
+            )
+        );
+
+        // Pairing invite, unparseable body: the decode 400 (answers
+        // before any store or listener state is touched).
+        let invalid = "{not-json";
+        let serde_error = serde_json::from_str::<PairingInviteRequest>(invalid)
+            .err()
+            .expect("invite body must not decode");
+        let response =
+            peers_sub_router_transcript("POST", "/api/peers/pairing/invite", invalid, cert_dir, None)
+                .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                    .to_string(),
+            )
+        );
+
+        // Pairing reads over the injected empty store.
+        let response =
+            peers_sub_router_transcript("GET", "/api/peers/pairing/requests", "", cert_dir, None)
+                .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"requests": []}).to_string())
+        );
+        let response =
+            peers_sub_router_transcript("GET", "/api/peers/pairing/identities", "", cert_dir, None)
+                .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"identities": []}).to_string())
+        );
+
+        // Unknown pairing decision op: the handler's own 404.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/pairing/requests/zzz/badop",
+            "",
+            cert_dir,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "unknown pairing request decision"}).to_string(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_coordinator_route_transcripts() {
+        async fn coordinator_transcript(
+            method: &str,
+            body: &str,
+            registry: Option<crate::peer::PeerRegistry>,
+        ) -> String {
+            let method = method.to_string();
+            let body = body.to_string();
+            collect_peers_handler_response(move |stream| async move {
+                handle_coordinator_route(stream, body, &method, registry).await;
+            })
+            .await
+        }
+
+        // No registry: the deterministic 503.
+        let response = coordinator_transcript("POST", "{}", None).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "503 Service Unavailable",
+                &serde_json::json!({"error": "peer registry not configured"}).to_string(),
+            )
+        );
+
+        // Wrong method with a registry: the handler-owned 405.
+        let response = coordinator_transcript("GET", "", Some(empty_test_registry())).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "405 Method Not Allowed",
+                &serde_json::json!({"error": "method not allowed"}).to_string(),
+            )
+        );
+
+        // Unparseable body: the decode 400.
+        let invalid = "{not-json";
+        let serde_error = serde_json::from_str::<CoordinatorRouteRequest>(invalid)
+            .err()
+            .expect("coordinator body must not decode");
+        let response = coordinator_transcript("POST", invalid, Some(empty_test_registry())).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                    .to_string(),
+            )
+        );
     }
 
     /// Same `session_id` → same `PeerId` on every call. The Offer

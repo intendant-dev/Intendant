@@ -1626,12 +1626,27 @@ pub(crate) async fn api_peer_pairing_join_response(
     http_body_response(id, status, body, "peer pairing join")
 }
 
+// The pairing arms below split transport edge from core (hermeticity
+// convention, the sessions family's `_from_home` shape): the ambient
+// wrapper resolves the daemon's cert store once, the `_from_cert_dir`
+// core is what the parity fixtures drive over injected tempdirs.
+
 pub(crate) async fn api_peer_pairing_request_access_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_request_access(&body_text).await;
+    let (status, body) =
+        crate::web_gateway::peers_pairing_request_access(cert_dir, &body_text).await;
     http_body_response(id, status, body, "peer access request")
 }
 
@@ -1640,10 +1655,22 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_poll_response_from_cert_dir(id, params, runtime, &cert_dir)
+        .await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_poll_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
     let (status, body) = crate::web_gateway::peers_pairing_request_access_poll(
         runtime.peer_registry.as_ref(),
         runtime.project_root.as_deref(),
+        cert_dir,
         &body_text,
     )
     .await;
@@ -1651,13 +1678,30 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
 }
 
 pub(crate) async fn api_peer_pairing_requests_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_requests_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_requests_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_requests_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_requests_list(cert_dir);
     http_body_response(id, status, body, "peer access requests")
 }
 
 pub(crate) async fn api_peer_pairing_request_decision_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_decision_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_decision_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let request_id = string_param(&params, &["request_id", "requestId", "code", "id"]);
@@ -1672,12 +1716,20 @@ pub(crate) async fn api_peer_pairing_request_decision_response(
     };
     let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
     let (status, body) =
-        crate::web_gateway::peers_pairing_request_decision(&request_id, &op, &body_text);
+        crate::web_gateway::peers_pairing_request_decision(cert_dir, &request_id, &op, &body_text);
     http_body_response(id, status, body, "peer access request decision")
 }
 
 pub(crate) async fn api_peer_pairing_identities_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_identities_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identities_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identities_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_identities_list_from_cert_dir(cert_dir);
     http_body_response(id, status, body, "peer identities")
 }
 
@@ -1685,8 +1737,18 @@ pub(crate) async fn api_peer_pairing_identity_revoke_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identity_revoke_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identity_revoke_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_identity_revoke(&body_text);
+    let (status, body) =
+        crate::web_gateway::peers_pairing_identity_revoke_from_cert_dir(cert_dir, &body_text);
     http_body_response(id, status, body, "peer identity revoke")
 }
 
