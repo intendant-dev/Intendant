@@ -1403,8 +1403,8 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_permission_mode: Option<String>,
         /// Optional one-shot Claude Code reasoning-effort level
-        /// (low/medium/high/xhigh/max) for this session. Only applies when
-        /// the resolved agent is Claude Code.
+        /// (low/medium/high/xhigh/max/ultracode) for this session. Only
+        /// applies when the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
         /// Optional one-shot Codex model override for this session (e.g.
