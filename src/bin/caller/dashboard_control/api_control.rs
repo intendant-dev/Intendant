@@ -2697,6 +2697,99 @@ mod tests {
         assert_eq!(frame["result"], http_body);
     }
 
+    // ── S6 tunnel/HTTP parity (third slice): the signed-org doorbell
+    // quartet ──
+    //
+    // Extends the S6 enumeration (#10–#16 apply). The slice-specific
+    // differences, deliberate and pinned:
+    //
+    //  17. Authority is the documented op-override pair (design §2.7):
+    //      the HTTP rows are Public (the signed document/list IS the
+    //      authorization, rate-limited and size-capped), while the
+    //      tunnel methods gate on a bound session's operation —
+    //      AccessInspect for present/orl/renew, PresenceRead for the
+    //      orl-apply courier — declared as `op_override`s on the rows
+    //      and pinned closed by
+    //      `tunnel_op_overrides_are_a_closed_documented_enumeration`.
+    //  18. ORL addressing is transport-owned: HTTP captures the org
+    //      handle from the path, the tunnel reads `params.handle`.
+    //  19. The ORL error is the historical 404 on HTTP; the tunnel
+    //      frame carries the same error string with no status.
+
+    #[tokio::test]
+    async fn parity_org_doorbell_shares_cores_over_an_injected_cert_dir() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+
+        // Present, undecodable document: same core error on both lanes
+        // (the verify successes need real signed documents — smoke-
+        // covered by validate-org-grants).
+        let card = serde_json::json!({});
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_present_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &card,
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-present".to_string(),
+            crate::web_gateway::access_org_present_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &card,
+            ),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // ORL for an unheld org: 404 on HTTP, the same error string as
+        // the tunnel's ok:false frame (differences #18/#19).
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_orl_api_response(tmp.path(), "parity-org"),
+        );
+        assert_eq!(status, 404);
+        let frame = frame_api_ok_error_response(
+            "parity-org-orl".to_string(),
+            crate::web_gateway::access_org_orl_api_response(tmp.path(), "parity-org"),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Apply + renew decode errors: one core wording per leaf.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_orl_apply_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-orl-apply".to_string(),
+            crate::web_gateway::access_org_orl_apply_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+            ),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_renew_api_response(tmp.path(), serde_json::json!({})),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-renew".to_string(),
+            crate::web_gateway::access_org_renew_api_response(tmp.path(), serde_json::json!({})),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 

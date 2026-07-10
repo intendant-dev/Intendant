@@ -763,6 +763,12 @@ pub(crate) fn control_frame_response(
                         "org manage",
                     ))
                 }
+                // The signed-org doorbell twins delegate to the S6
+                // neutral cores under the family's ok/error envelope.
+                // Their route rows are Public — the tunnel methods gate
+                // stricter on purpose (documented op overrides on the
+                // rows): a bound session is required to courier a
+                // document through the tunnel.
                 "api_access_org_present"
                 | "api_access_org_orl"
                 | "api_access_org_orl_apply"
@@ -771,39 +777,29 @@ pub(crate) fn control_frame_response(
                     // Transport edge resolves the ambient cert dir
                     // (hermeticity convention).
                     let cert_dir = crate::access::backend::select_backend().cert_dir();
-                    let result = match method {
-                        "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                    let response = match method {
+                        "api_access_org_orl" => crate::web_gateway::access_org_orl_api_response(
                             &cert_dir,
+                            // Transport-owned addressing: the tunnel
+                            // names the org in params; HTTP by path
+                            // capture.
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
                         "api_access_org_orl_apply" => {
-                            crate::web_gateway::access_org_orl_apply_response_value(
+                            crate::web_gateway::access_org_orl_apply_api_response(
                                 &cert_dir, params,
                             )
                         }
                         "api_access_org_renew" => {
-                            crate::web_gateway::access_org_renew_response_value(&cert_dir, params)
+                            crate::web_gateway::access_org_renew_api_response(&cert_dir, params)
                         }
-                        _ => crate::web_gateway::access_org_present_response_value(
+                        _ => crate::web_gateway::access_org_present_api_response(
                             &cert_dir,
                             params,
                             &runtime.agent_card,
                         ),
                     };
-                    match result {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    Some(frame_api_ok_error_response(id, response, "org doorbell"))
                 }
                 "api_access_iam_upsert_user_client_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
