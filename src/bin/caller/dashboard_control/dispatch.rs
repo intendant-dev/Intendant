@@ -651,23 +651,18 @@ pub(crate) fn control_frame_response(
                 )),
                 "api_access_enrollment_decide" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_enrollment_decide_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_enrollment_decide_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "enrollment decide",
+                    ))
                 }
                 "api_access_connect_status" => Some(frame_api_ok_error_response(
                     id,
@@ -743,40 +738,37 @@ pub(crate) fn control_frame_response(
                         "result": { "started": true, "addresses": addresses },
                     }))
                 }
+                // The seven org-manage twins delegate to the S6 neutral
+                // core (leaf addressed by method name); the signed-org
+                // doorbell quartet below keeps its legacy path until its
+                // own slice ports it.
                 "api_access_org_trust"
                 | "api_access_org_revoke"
                 | "api_access_org_issue"
-                | "api_access_org_present"
                 | "api_access_org_revoke_member"
                 | "api_access_org_issuer_init"
                 | "api_access_org_issuer_delegate"
-                | "api_access_org_issuer_install"
+                | "api_access_org_issuer_install" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    let leaf = crate::web_gateway::OrgManageLeaf::from_control_method(method)
+                        .expect("org-manage arm methods all map to leaves");
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_org_manage_api_response(
+                            &cert_dir, leaf, params,
+                        ),
+                        "org manage",
+                    ))
+                }
+                "api_access_org_present"
                 | "api_access_org_orl"
                 | "api_access_org_orl_apply"
                 | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let result = match method {
-                        "api_access_org_trust" => {
-                            crate::web_gateway::access_org_trust_response_value(params)
-                        }
-                        "api_access_org_revoke" => {
-                            crate::web_gateway::access_org_revoke_response_value(params)
-                        }
-                        "api_access_org_issue" => {
-                            crate::web_gateway::access_org_issue_response_value(params)
-                        }
-                        "api_access_org_revoke_member" => {
-                            crate::web_gateway::access_org_revoke_member_response_value(params)
-                        }
-                        "api_access_org_issuer_init" => {
-                            crate::web_gateway::access_org_issuer_init_response_value(params)
-                        }
-                        "api_access_org_issuer_delegate" => {
-                            crate::web_gateway::access_org_issuer_delegate_response_value(params)
-                        }
-                        "api_access_org_issuer_install" => {
-                            crate::web_gateway::access_org_issuer_install_response_value(params)
-                        }
                         "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
@@ -808,43 +800,33 @@ pub(crate) fn control_frame_response(
                 }
                 "api_access_iam_upsert_user_client_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_iam_upsert_user_client_grant_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "iam grant upsert",
+                    ))
                 }
                 "api_access_iam_update_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_iam_update_grant_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_iam_update_grant_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "iam grant update",
+                    ))
                 }
                 "subscribe_events" => {
                     runtime.events_subscribed = true;
