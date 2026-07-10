@@ -9,37 +9,21 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0B0C10">
 <script>
-  // ui-v2 flag (design-overhaul program): decide before first paint so
-  // neither UI generation flashes. `?ui=v2` / `?ui=v1` overrides and
-  // persists; otherwise localStorage wins. v2 is the DEFAULT since the
-  // P3 flip — `?ui=v1` (or a stored '0') is the soak-period escape
-  // hatch until the v1 chrome is deleted. The class lives on <html> —
-  // all v2 styles are scoped under `html.ui-v2` and inert without it.
+  // The ui-v2 chrome is the only generation (the v1 chrome + its
+  // `?ui=v1` soak-period escape hatch were deleted post-soak). The
+  // `.ui-v2` class stays on <html> as the permanent scoping namespace —
+  // every chrome style is written under `html.ui-v2`, and stripping the
+  // prefix from ~2k selectors would only lower their specificity.
   (function () {
-    var on = true;
+    document.documentElement.classList.add('ui-v2');
+    // Light theme (design-system import): browser-scoped preference,
+    // stamped pre-paint so neither theme flashes.
     try {
-      var q = new URLSearchParams(location.search).get('ui');
-      if (q === 'v2' || q === 'v1') {
-        on = q === 'v2';
-        localStorage.setItem('intendant.ui2', on ? '1' : '0');
-      } else {
-        on = localStorage.getItem('intendant.ui2') !== '0';
+      if (localStorage.getItem('intendant.ui2.theme') === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', '#F5F6FB');
       }
-    } catch (e) { /* storage unavailable: v2 default */ }
-    var meta = document.querySelector('meta[name="theme-color"]');
-    if (on) {
-      document.documentElement.classList.add('ui-v2');
-      // Light theme (design-system import): browser-scoped preference,
-      // stamped pre-paint so neither theme flashes.
-      try {
-        if (localStorage.getItem('intendant.ui2.theme') === 'light') {
-          document.documentElement.setAttribute('data-theme', 'light');
-          if (meta) meta.setAttribute('content', '#F5F6FB');
-        }
-      } catch (e) { /* private mode: dark */ }
-    } else if (meta) {
-      // v1 keeps its Catppuccin crust tab tint during the soak.
-      meta.setAttribute('content', '#11111b');
-    }
+    } catch (e) { /* private mode: dark */ }
   })();
 </script>
