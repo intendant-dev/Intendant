@@ -1048,8 +1048,12 @@ impl CcReader {
             }
             // task_progress duplicates what the child's scoped tool events
             // already show live; task_updated's terminal patch is followed
-            // by the authoritative task_notification.
-            Some("task_progress") | Some("task_updated") => return,
+            // by the authoritative task_notification;
+            // background_tasks_changed (2.1.206) mirrors the background-task
+            // tray, which the per-task signals already cover.
+            Some("task_progress") | Some("task_updated") | Some("background_tasks_changed") => {
+                return
+            }
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -1112,10 +1116,19 @@ impl CcReader {
         }
     }
 
-    /// `system:task_started`: the spawn signal for an async sub-agent.
-    /// Usually the Agent tool_use block already registered the child; this
-    /// event contributes the `task_id` correlation key (and is the
-    /// registration fallback if the tool_use was never seen).
+    /// `system:task_started`: the spawn signal for an async task. Usually
+    /// the Agent tool_use block already registered the child; this event
+    /// contributes the `task_id` correlation key (and is the registration
+    /// fallback if the tool_use was never seen).
+    ///
+    /// Only *sub-agent* tasks may register a child session: since 2.1.206
+    /// the task system also announces background and auto-backgrounded
+    /// Bash commands (`task_type:"local_bash"`), and registering those
+    /// opens one ghost child window per slow command. Agent tasks are
+    /// identified affirmatively — `task_type` naming an agent
+    /// (`local_agent`), or, on CLIs predating `task_type`, a
+    /// `subagent_type`/`prompt` field. An id that is already open as an
+    /// ordinary tool is that command's own tool_use, never a spawn.
     fn handle_task_started(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let tool_use_id = msg
             .get("tool_use_id")
@@ -1125,6 +1138,9 @@ impl CcReader {
         let Some(tool_use_id) = tool_use_id else {
             return;
         };
+        // The correlation key is recorded for every task kind: it only
+        // feeds task_notification's id resolution, and a stray entry for a
+        // Bash task resolves to an id with no registered child (no-op).
         if let Some(task_id) = msg
             .get("task_id")
             .and_then(|v| v.as_str())
@@ -1133,6 +1149,16 @@ impl CcReader {
         {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
+        }
+        let is_agent_task = match msg.get("task_type").and_then(|v| v.as_str()) {
+            Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
+            None => {
+                msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
+                    || msg.get("prompt").and_then(|v| v.as_str()).is_some()
+            }
+        };
+        if !is_agent_task || self.open_tools.contains_key(tool_use_id) {
+            return;
         }
         if !self.task_children.contains_key(tool_use_id) {
             let spawn = CcTaskSpawn {
@@ -3270,6 +3296,64 @@ mod tests {
                     AgentEvent::SubAgentToolCall { status, agents, .. }
                         if status == "failed" && agents[0].status == "errored"
                 )
+        )));
+    }
+
+    #[test]
+    fn bash_task_started_never_opens_a_child() {
+        // 2.1.206 announces background and auto-backgrounded Bash commands
+        // through the same task system (`task_type:"local_bash"`); those
+        // must not materialize ghost child sessions (observed live: one
+        // ghost grid window per slow command).
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","description":"Slow foreground probe loop","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        // (First line also announces NativeSessionId — only the spawn is
+        // forbidden.)
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "bash task spawned: {:?}",
+            out.events
+        );
+        assert!(!reader.task_children.contains_key("toolu_01SLOWBASH00000000"));
+        // Its notification stays silent too (no child to end).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn task_started_for_an_open_tool_never_spawns() {
+        // An id already open as an ordinary tool is that command's own
+        // tool_use — never a spawn, even if the task fields claim agent.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENBASH00000000","name":"Bash","input":{"command":"find . -name '*.rs'","description":"Find all key Rust files by name"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz1","tool_use_id":"toolu_01OPENBASH00000000","description":"Find all key Rust files by name","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "open tool spawned: {:?}", out.events);
+        assert!(!reader.task_children.contains_key("toolu_01OPENBASH00000000"));
+    }
+
+    #[test]
+    fn agent_task_started_registers_without_prior_tool_use() {
+        // The registration fallback (resume replay: task_started seen,
+        // tool_use never observed) still works for real agent tasks.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"a66eab8","tool_use_id":"toolu_01FALLBACKAGENT000","description":"Probe echo child","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Run echo and report.","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, receiver_thread_ids, .. }
+                if status == "inProgress"
+                    && receiver_thread_ids == &vec!["task-FALLBACKAGENT000".to_string()]
         )));
     }
 
