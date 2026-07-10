@@ -113,6 +113,21 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # Fleet build state lives outside the workspace (checkout's
+      # `git clean -ffdx` wipes an in-tree target/ every job) — same
+      # per-listener, toolchain-keyed scheme as windows.yml; later steps
+      # fall back to the workspace target/ when unset (hosted runners).
+      - name: External cargo target dir
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          key=$(rustc -V | tr ' ()' '_')
+          dir="$HOME/.cache/intendant-ci/target/${RUNNER_NAME:-listener}-${key}"
+          mkdir -p "$dir"
+          touch "$dir/.last-used"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "cargo target dir: $dir"
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -166,7 +181,8 @@ jobs:
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
 
-      # Hosted-only: self-hosted runners keep a persistent target/.
+      # Hosted-only: self-hosted runners keep their build state in the
+      # external cargo target dir above.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: runner.environment == 'github-hosted'
         with:
@@ -183,17 +199,17 @@ jobs:
 
       - name: session-vitals smoke
         if: steps.relevance.outputs.relevant != 'false'
-        run: node tests/skills/session-vitals-smoke/driver.cjs "$GITHUB_WORKSPACE/target/debug/intendant"
+        run: node tests/skills/session-vitals-smoke/driver.cjs "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/intendant"
 
       - name: native-goal smoke
         if: steps.relevance.outputs.relevant != 'false'
-        run: node tests/skills/native-goal-smoke/driver.cjs "$GITHUB_WORKSPACE/target/debug/intendant"
+        run: node tests/skills/native-goal-smoke/driver.cjs "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/intendant"
 
       - name: peer-sessions smoke
         if: steps.relevance.outputs.relevant != 'false'
-        env:
-          INTENDANT_BIN: ${{ github.workspace }}/target/debug/intendant
-        run: python3 tests/skills/peer-sessions-smoke/peer-rig.py
+        run: |
+          export INTENDANT_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/intendant"
+          python3 tests/skills/peer-sessions-smoke/peer-rig.py
 
   # Dashboard boot smoke — ADVISORY. On 2026-07-09 a cross-fragment TDZ
   # error killed the whole dashboard SPA silently (every JS fragment is one
@@ -250,6 +266,18 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # Same external per-listener build cache as the smokes job above.
+      - name: External cargo target dir
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          key=$(rustc -V | tr ' ()' '_')
+          dir="$HOME/.cache/intendant-ci/target/${RUNNER_NAME:-listener}-${key}"
+          mkdir -p "$dir"
+          touch "$dir/.last-used"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "cargo target dir: $dir"
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -289,7 +317,8 @@ jobs:
             pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
-      # Hosted-only: self-hosted runners keep a persistent target/.
+      # Hosted-only: self-hosted runners keep their build state in the
+      # external cargo target dir above.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: runner.environment == 'github-hosted'
         with:
@@ -318,7 +347,7 @@ jobs:
           cd "$rig/proj"
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u MODEL_NAME \
             HOME="$rig/home" PROVIDER=mock INTENDANT_MOCK_SCRIPT="$rig/home/mock_script.json" \
-            "$GITHUB_WORKSPACE/target/debug/intendant" --web 0 --bind 127.0.0.1 --no-tls \
+            "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/intendant" --web 0 --bind 127.0.0.1 --no-tls \
             > "$rig/daemon.log" 2>&1 &
           pid=$!
           echo "pid=$pid" >> "$GITHUB_OUTPUT"

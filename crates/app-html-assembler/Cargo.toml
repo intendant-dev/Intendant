@@ -11,7 +11,12 @@ description = "Assembles static/app.html from the ordered fragments in static/ap
 #   - CI runs the binary (`cargo run -p app-html-assembler`) and then
 #     `git diff --exit-code static/app.html` — the regen gate for pushes that
 #     touch only static/ and therefore skip the heavyweight test workflow.
-# std-only on purpose: the CI job must compile in seconds.
+# Dependency-light on purpose: the CI job must compile in seconds. The one
+# non-std dep is `sha2`, computing the vault-kernel hash pin (lib.rs,
+# "vault-kernel hash pin") — never hand-roll crypto to stay std-only.
+
+[dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

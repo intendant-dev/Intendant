@@ -848,6 +848,14 @@ impl CcReader {
             .filter(|s| !s.is_empty())?
             .to_string();
         if !self.task_children.contains_key(&ptid) {
+            // The lazy path exists for resume replays whose Agent tool_use
+            // was never observed. An id currently open as an ordinary tool
+            // is that command's own tool_use, never a spawn scope — route
+            // such envelopes to the main thread instead of materializing a
+            // ghost child (the task_started guard's belt, mirrored here).
+            if self.open_tools.contains_key(&ptid) {
+                return None;
+            }
             let spawn = CcTaskSpawn {
                 description: msg
                     .get("task_description")
@@ -1048,8 +1056,12 @@ impl CcReader {
             }
             // task_progress duplicates what the child's scoped tool events
             // already show live; task_updated's terminal patch is followed
-            // by the authoritative task_notification.
-            Some("task_progress") | Some("task_updated") => return,
+            // by the authoritative task_notification;
+            // background_tasks_changed (2.1.206) mirrors the background-task
+            // tray, which the per-task signals already cover.
+            Some("task_progress") | Some("task_updated") | Some("background_tasks_changed") => {
+                return
+            }
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -1112,10 +1124,19 @@ impl CcReader {
         }
     }
 
-    /// `system:task_started`: the spawn signal for an async sub-agent.
-    /// Usually the Agent tool_use block already registered the child; this
-    /// event contributes the `task_id` correlation key (and is the
-    /// registration fallback if the tool_use was never seen).
+    /// `system:task_started`: the spawn signal for an async task. Usually
+    /// the Agent tool_use block already registered the child; this event
+    /// contributes the `task_id` correlation key (and is the registration
+    /// fallback if the tool_use was never seen).
+    ///
+    /// Only *sub-agent* tasks may register a child session: since 2.1.206
+    /// the task system also announces background and auto-backgrounded
+    /// Bash commands (`task_type:"local_bash"`), and registering those
+    /// opens one ghost child window per slow command. Agent tasks are
+    /// identified affirmatively — `task_type` naming an agent
+    /// (`local_agent`), or, on CLIs predating `task_type`, a
+    /// `subagent_type`/`prompt` field. An id that is already open as an
+    /// ordinary tool is that command's own tool_use, never a spawn.
     fn handle_task_started(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let tool_use_id = msg
             .get("tool_use_id")
@@ -1125,6 +1146,9 @@ impl CcReader {
         let Some(tool_use_id) = tool_use_id else {
             return;
         };
+        // The correlation key is recorded for every task kind: it only
+        // feeds task_notification's id resolution, and a stray entry for a
+        // Bash task resolves to an id with no registered child (no-op).
         if let Some(task_id) = msg
             .get("task_id")
             .and_then(|v| v.as_str())
@@ -1133,6 +1157,23 @@ impl CcReader {
         {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
+        }
+        // `subagent_type` only ever rides agent spawns (live-probed: Bash
+        // payloads carry neither it nor `prompt`), so its presence is
+        // affirmative regardless of task_type — a future CLI renaming the
+        // agent task kind (e.g. "subagent") must not drop registration
+        // while the field still identifies the spawn.
+        let is_agent_task = msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
+            || match msg.get("task_type").and_then(|v| v.as_str()) {
+                Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
+                // Pre-task_type CLIs (< 2.1.206) emitted task_started only
+                // for Agent spawns, and those payloads carried `prompt`
+                // (live-probed) — the affirmative check stays fail-closed
+                // for unknown task kinds.
+                None => msg.get("prompt").and_then(|v| v.as_str()).is_some(),
+            };
+        if !is_agent_task || self.open_tools.contains_key(tool_use_id) {
+            return;
         }
         if !self.task_children.contains_key(tool_use_id) {
             let spawn = CcTaskSpawn {
@@ -1619,6 +1660,16 @@ impl CcReader {
             if was_interrupt {
                 out.log("info", "Claude Code turn interrupted");
             } else {
+                // The budget backstop is cumulative for the process AND its
+                // resumes — without a hint this reads as a mystery failure.
+                let recovery_hint = (subtype == "error_max_budget_usd").then(|| {
+                    "The session hit its --max-budget-usd backstop (spend is \
+                     cumulative across resumes, and forks/side conversations \
+                     inherit the parent session's counted spend); raise \
+                     [agent.claude_code] max_budget_usd (or unset it) and \
+                     restart the session"
+                        .to_string()
+                });
                 out.events.push(AgentEvent::BackendError {
                     message: message
                         .clone()
@@ -1628,7 +1679,7 @@ impl CcReader {
                     details: None,
                     will_retry: false,
                     likely_generation_starvation: false,
-                    recovery_hint: None,
+                    recovery_hint,
                 });
             }
         }
@@ -1856,9 +1907,17 @@ pub struct ClaudeCodeAgent {
     command: String,
     model: Option<String>,
     permission_mode: String,
-    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max);
-    /// `None` omits the flag.
+    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max/
+    /// ultracode); `None` omits the flag.
     effort: Option<String>,
+    /// Hard dollar backstop for `--max-budget-usd`; `None` omits the flag.
+    /// On exceed the CLI fails every further turn with a `result` of
+    /// subtype `error_max_budget_usd` (probed 2.1.206) — cumulative across
+    /// the process, its resumes, AND forks (a forked child inherits the
+    /// parent's counted spend, probed: forking an over-budget parent fails
+    /// immediately). Deliberately still armed on forks — an uncapped
+    /// side/fork child would violate the operator's explicit ceiling.
+    max_budget_usd: Option<f64>,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
     working_dir: Option<PathBuf>,
@@ -1906,6 +1965,7 @@ impl ClaudeCodeAgent {
             model,
             permission_mode,
             effort: crate::project::normalize_claude_effort(effort.as_deref()),
+            max_budget_usd: None,
             allowed_tools,
             web_port,
             working_dir: None,
@@ -1923,6 +1983,24 @@ impl ClaudeCodeAgent {
             shared: Arc::new(CcShared::new(None)),
             control_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Arm the CLI-enforced dollar backstop (`--max-budget-usd`). Kept out
+    /// of `new()` so the many existing constructor sites stay unchanged.
+    /// The value is kept verbatim and validated at `initialize`: a
+    /// non-positive or non-finite cap refuses the spawn instead of silently
+    /// disarming (fail-closed — and the CLI itself crashes on
+    /// `--max-budget-usd 0`, probed 2.1.206).
+    pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
+        self.max_budget_usd = budget;
+        self
+    }
+
+    /// The configured budget when it cannot be passed to the CLI (zero,
+    /// negative, or non-finite). `initialize` refuses to spawn on `Some`.
+    fn invalid_max_budget(&self) -> Option<f64> {
+        self.max_budget_usd
+            .filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
     /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
@@ -2075,7 +2153,7 @@ impl ClaudeCodeAgent {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 CallerError::ExternalAgent(
-                    "permission-mode requires a mode (default, acceptEdits, plan, bypassPermissions)"
+                    "permission-mode requires a mode (default, acceptEdits, plan, auto, dontAsk, bypassPermissions)"
                         .into(),
                 )
             })?;
@@ -2122,6 +2200,13 @@ impl ExternalAgent for ClaudeCodeAgent {
         &mut self,
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+        if let Some(budget) = self.invalid_max_budget() {
+            return Err(CallerError::ExternalAgent(format!(
+                "claude-code max_budget_usd must be a positive dollar amount, got {budget}; \
+                 unset [agent.claude_code] max_budget_usd to run without the backstop \
+                 (the claude CLI itself rejects --max-budget-usd 0)"
+            )));
+        }
         self.working_dir = Some(config.working_dir.clone());
         self.resume_session = config
             .resume_session
@@ -2175,6 +2260,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref effort) = self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+
+        if let Some(budget) = self.max_budget_usd {
+            args.push("--max-budget-usd".into());
+            args.push(budget.to_string());
         }
 
         if !self.allowed_tools.is_empty() {
@@ -2332,10 +2422,11 @@ impl ExternalAgent for ClaudeCodeAgent {
             "permission-mode" | "permission_mode" | "permissions" => {
                 self.set_permission_mode_live(params).await
             }
-            // `fork` never reaches this method: the drain sees
-            // `ForkHandling::RespawnResume` and respawns instead.
+            // `fork` and `side`/`btw` never reach this method: the drain
+            // sees `ForkHandling::RespawnResume` and respawns instead
+            // (side carries the boundary + question as the first prompt).
             other => Err(CallerError::ExternalAgent(format!(
-                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…, model, permission-mode)",
+                "thread action /{} not supported by Claude Code (supported: compact, fork, side, goal…, model, permission-mode)",
                 other
             ))),
         }
@@ -2526,6 +2617,48 @@ mod tests {
         assert_eq!(agent.permission_mode, "auto");
         assert!(agent.allowed_tools.is_empty());
         assert!(agent.web_port.is_none());
+    }
+
+    #[test]
+    fn invalid_max_budget_flags_nonpositive_for_spawn_refusal() {
+        // A bad cap must refuse the spawn (initialize errors on
+        // `invalid_max_budget().is_some()`), never silently disarm: the CLI
+        // crashes on --max-budget-usd 0, and dropping the flag would run the
+        // session uncapped against the operator's explicit ceiling.
+        let base = || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        assert_eq!(base().with_max_budget_usd(Some(2.5)).invalid_max_budget(), None);
+        assert_eq!(base().with_max_budget_usd(None).invalid_max_budget(), None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(0.0)).invalid_max_budget(),
+            Some(0.0)
+        );
+        assert_eq!(
+            base().with_max_budget_usd(Some(-1.0)).invalid_max_budget(),
+            Some(-1.0)
+        );
+        assert!(base()
+            .with_max_budget_usd(Some(f64::NAN))
+            .invalid_max_budget()
+            .is_some_and(f64::is_nan));
+        // The raw value is preserved so the refusal names what was configured.
+        assert_eq!(base().with_max_budget_usd(Some(0.0)).max_budget_usd, Some(0.0));
+    }
+
+    #[test]
+    fn max_budget_error_result_carries_recovery_hint() {
+        // Probed on 2.1.206: exceeding --max-budget-usd fails the turn with
+        // subtype error_max_budget_usd and result null; the process
+        // survives (and keeps failing) — the hint tells the user which
+        // knob to turn.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"num_turns":1,"total_cost_usd":0.0119,"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::BackendError { code: Some(code), recovery_hint: Some(hint), .. }
+                if code == "error_max_budget_usd" && hint.contains("max_budget_usd")
+        )));
     }
 
     #[test]
@@ -2757,9 +2890,19 @@ mod tests {
 
     #[test]
     fn permission_mode_normalization() {
-        // The legacy Intendant default "auto" is not a Claude Code mode;
-        // the CLI coerces it to default, so we don't pass the flag at all.
-        assert_eq!(normalize_permission_mode("auto"), None);
+        // "auto" is a documented CLI mode since 2.1.x (classifier-based
+        // approvals; accepted on 2.1.206) — it passes through. "manual" is
+        // the CLI's alias for default, so like default the flag is omitted.
+        assert_eq!(normalize_permission_mode("auto").as_deref(), Some("auto"));
+        assert_eq!(
+            normalize_permission_mode("dontAsk").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(
+            normalize_permission_mode("dont-ask").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(normalize_permission_mode("manual"), None);
         assert_eq!(normalize_permission_mode("default"), None);
         assert_eq!(normalize_permission_mode(""), None);
         assert_eq!(
@@ -3270,6 +3413,100 @@ mod tests {
                     AgentEvent::SubAgentToolCall { status, agents, .. }
                         if status == "failed" && agents[0].status == "errored"
                 )
+        )));
+    }
+
+    #[test]
+    fn bash_task_started_never_opens_a_child() {
+        // 2.1.206 announces background and auto-backgrounded Bash commands
+        // through the same task system (`task_type:"local_bash"`); those
+        // must not materialize ghost child sessions (observed live: one
+        // ghost grid window per slow command).
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","description":"Slow foreground probe loop","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        // (First line also announces NativeSessionId — only the spawn is
+        // forbidden.)
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "bash task spawned: {:?}",
+            out.events
+        );
+        assert!(!reader.task_children.contains_key("toolu_01SLOWBASH00000000"));
+        // Its notification stays silent too (no child to end).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn subagent_typed_task_started_registers_despite_unknown_task_type() {
+        // subagent_type identifies a spawn even if a future CLI renames the
+        // agent task_type to something outside the *_agent vocabulary.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz9","tool_use_id":"toolu_01RENAMEDAGENT0000","description":"probe","subagent_type":"general-purpose","task_type":"subagent","prompt":"go","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, .. } if status == "inProgress"
+        )));
+    }
+
+    #[test]
+    fn lazy_scope_for_an_open_tool_never_materializes_a_child() {
+        // An envelope parented to an id that is currently open as an
+        // ordinary tool must not ghost a child through the lazy
+        // resume-replay path; it routes to the main thread instead.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENLAZY00000000","name":"Bash","input":{"command":"sleep 5","description":"slow"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"partial output"}]},"parent_tool_use_id":"toolu_01OPENLAZY00000000","session_id":"s1"}"#,
+        );
+        assert!(!reader.task_children.contains_key("toolu_01OPENLAZY00000000"));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "lazy path spawned: {:?}",
+            out.events
+        );
+    }
+
+    #[test]
+    fn task_started_for_an_open_tool_never_spawns() {
+        // An id already open as an ordinary tool is that command's own
+        // tool_use — never a spawn, even if the task fields claim agent.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENBASH00000000","name":"Bash","input":{"command":"find . -name '*.rs'","description":"Find all key Rust files by name"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz1","tool_use_id":"toolu_01OPENBASH00000000","description":"Find all key Rust files by name","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "open tool spawned: {:?}", out.events);
+        assert!(!reader.task_children.contains_key("toolu_01OPENBASH00000000"));
+    }
+
+    #[test]
+    fn agent_task_started_registers_without_prior_tool_use() {
+        // The registration fallback (resume replay: task_started seen,
+        // tool_use never observed) still works for real agent tasks.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"a66eab8","tool_use_id":"toolu_01FALLBACKAGENT000","description":"Probe echo child","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Run echo and report.","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, receiver_thread_ids, .. }
+                if status == "inProgress"
+                    && receiver_thread_ids == &vec!["task-FALLBACKAGENT000".to_string()]
         )));
     }
 

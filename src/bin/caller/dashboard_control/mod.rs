@@ -303,11 +303,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_control_msg", PeerOperation::Message),
     method("api_dashboard_action_msg", PeerOperation::Message),
     method("api_mcp_tool_call", PeerOperation::Message),
-    method("api_settings", PeerOperation::Settings),
-    method("api_settings_save", PeerOperation::Settings),
-    method("api_key_status", PeerOperation::Settings),
-    method("api_api_keys_save", PeerOperation::Settings),
-    method("api_project_root", PeerOperation::Settings),
+    // The settings/keys family (api_settings, api_settings_save,
+    // api_key_status, api_api_keys_save, api_project_root) lives as
+    // tunnel columns on its route rows (S5).
     method("api_voice_session", PeerOperation::RuntimeControl),
     uploadable("api_presence_video_frame", PeerOperation::RuntimeControl),
     uploadable("api_media_annotation_attach", PeerOperation::RuntimeControl),
@@ -3314,11 +3312,11 @@ mod tests {
             ("api_control_msg", Residue, Some(Op::Message)),
             ("api_dashboard_action_msg", Residue, Some(Op::Message)),
             ("api_mcp_tool_call", Residue, Some(Op::Message)),
-            ("api_settings", Residue, Some(Op::Settings)),
-            ("api_settings_save", Residue, Some(Op::Settings)),
-            ("api_key_status", Residue, Some(Op::Settings)),
-            ("api_api_keys_save", Residue, Some(Op::Settings)),
-            ("api_project_root", Residue, Some(Op::Settings)),
+            ("api_settings", Row, Some(Op::Settings)),
+            ("api_settings_save", Row, Some(Op::Settings)),
+            ("api_key_status", Row, Some(Op::Settings)),
+            ("api_api_keys_save", Row, Some(Op::Settings)),
+            ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (
                 "api_presence_video_frame",
@@ -3490,10 +3488,13 @@ mod tests {
             );
         }
 
-        // Coverage pin: exactly the F1 family's twinned methods (fs +
-        // staged uploads). The `api_transfer_*` methods join when their
-        // HTTP rows land (task #6, /api/transfers); adding or dropping an
-        // entry updates this list in the same change, deliberately.
+        // Coverage pin: the F1 family's twinned methods (fs + staged
+        // uploads) plus the F2 sessions-family reads converted so far
+        // (managed-context + worktrees + the session list and its NDJSON
+        // stream). The `api_transfer_*` methods join
+        // when their HTTP rows land (task #6, /api/transfers); adding or
+        // dropping an entry updates this list in the same change,
+        // deliberately.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3506,6 +3507,16 @@ mod tests {
             "api_session_current_upload",
             "api_session_current_upload_raw",
             "api_session_current_upload_delete",
+            "api_sessions",
+            "api_sessions_stream",
+            "api_managed_context_records",
+            "api_managed_context_anchors",
+            "api_managed_context_fission",
+            "api_worktrees",
+            "api_worktrees_inspect",
+            "api_worktrees_scan",
+            "api_worktrees_remove",
+            "api_worktrees_merge",
         ]
         .into_iter()
         .collect();

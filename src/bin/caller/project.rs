@@ -428,18 +428,31 @@ pub struct ClaudeCodeConfig {
     /// Model to use.
     #[serde(default)]
     pub model: Option<String>,
-    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions".
-    /// The legacy value "auto" (never a real Claude Code mode) is accepted
-    /// and treated as "default".
+    /// Permission mode: "default", "acceptEdits", "plan", "auto",
+    /// "dontAsk", or "bypassPermissions" ("manual" is the CLI's alias for
+    /// "default"). "auto" (classifier-based approvals) became a real CLI
+    /// mode in 2.1.x — configs that predate Intendant 2026-07-04 and still
+    /// carry the old shipped default "auto" now get that documented mode
+    /// instead of the historical coercion to "default".
     #[serde(default = "default_claude_code_permission_mode")]
     pub permission_mode: String,
     /// Allowed tools list (empty = all).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     /// Reasoning-effort level passed as `--effort`: "low", "medium",
-    /// "high", "xhigh", or "max". `None` omits the flag (CLI default).
+    /// "high", "xhigh", "max", or "ultracode" (2.1.203+: xhigh with the
+    /// ultracode meta-mode on). `None` omits the flag (CLI default).
     #[serde(default)]
     pub effort: Option<String>,
+    /// Hard per-session dollar backstop passed as `--max-budget-usd`
+    /// (print mode; CLI-enforced, cumulative across the process AND its
+    /// resumes). On exceed the CLI ends every further turn with a
+    /// `result` of subtype `error_max_budget_usd` (probed on 2.1.206),
+    /// surfaced as a backend error with a recovery hint. `None` omits the
+    /// flag. Complements goal budgets: goals measure fresh tokens and
+    /// steer the model; this is the CLI's own hard stop.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 fn default_claude_code_command() -> String {
@@ -451,30 +464,51 @@ fn default_claude_code_permission_mode() -> String {
 }
 
 /// Canonicalize a Claude Code reasoning-effort level. The CLI accepts
-/// low / medium / high / xhigh / max; empty and "default" mean "don't pass
-/// the flag". Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// low / medium / high / xhigh / max / ultracode (2.1.203+); empty and
+/// "default" mean "don't pass the flag". Unknown values pass through
+/// trimmed for forward compatibility with newer CLIs.
 pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     let trimmed = effort.map(str::trim).filter(|s| !s.is_empty())?;
     let lowered = trimmed.to_ascii_lowercase();
     match lowered.as_str() {
         "default" | "inherit" => None,
-        "low" | "medium" | "high" | "xhigh" | "max" => Some(lowered),
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" => Some(lowered),
         _ => Some(trimmed.to_string()),
     }
 }
 
-/// Canonicalize a Claude Code permission mode. The CLI's real modes are
-/// `default`, `acceptEdits`, `plan`, and `bypassPermissions`; the legacy
-/// Intendant default "auto" (never a real mode — the CLI silently coerces
-/// it) maps to `default`. Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// Canonicalize a Claude Code permission mode. The CLI's modes on 2.1.206
+/// are `default` (alias `manual`), `acceptEdits`, `plan`, `auto`
+/// (classifier-based approvals), `dontAsk` (auto-deny anything that would
+/// prompt), and `bypassPermissions` — all probed accepted. `auto` was once
+/// coerced to `default` here (pre-2.1.83 CLIs silently coerced it); now
+/// that it is a documented mode it passes through. Unknown values pass
+/// through trimmed for forward compatibility with newer CLIs.
+/// Canonical Claude Code permission-mode vocabulary — the normalizer's
+/// output set, in display order. The frontend mirrors (the dashboard
+/// selects in `static/app/20-shell.html` and `static/app/21-access-dialogs.html`,
+/// the Station pane mode gate in `static/app/34-station-panes.js`, and the
+/// station-web pill row in `crates/station-web/src/hud/panels.rs`) are
+/// pinned to this list by
+/// `claude_permission_mode_mirrors_carry_the_canonical_vocabulary` — extend
+/// the list and every mirror in the same change.
+pub const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
+
 pub fn normalize_claude_permission_mode(mode: &str) -> String {
     let trimmed = mode.trim();
     match trimmed.to_ascii_lowercase().as_str() {
-        "" | "default" | "auto" => "default".to_string(),
+        "" | "default" | "manual" => "default".to_string(),
         "acceptedits" | "accept-edits" | "accept_edits" => "acceptEdits".to_string(),
         "plan" => "plan".to_string(),
+        "auto" => "auto".to_string(),
+        "dontask" | "dont-ask" | "dont_ask" => "dontAsk".to_string(),
         "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
             "bypassPermissions".to_string()
         }
@@ -490,6 +524,7 @@ impl Default for ClaudeCodeConfig {
             permission_mode: default_claude_code_permission_mode(),
             effort: None,
             allowed_tools: Vec::new(),
+            max_budget_usd: None,
         }
     }
 }
@@ -1345,6 +1380,28 @@ impl Project {
                     config.agent.codex.context_archive
                 );
             }
+            // "auto" changed meaning when Claude Code 2.1.206 made it a real
+            // CLI mode: older Intendant coerced it to "default" (prompt for
+            // everything), so a pre-existing config now silently escalates
+            // to classifier auto-approval without this notice.
+            if config
+                .agent
+                .claude_code
+                .permission_mode
+                .trim()
+                .eq_ignore_ascii_case("auto")
+            {
+                eprintln!(
+                    "[project] intendant.toml [agent.claude_code] permission_mode = \"auto\" now selects the claude CLI's auto-approval mode (2.1.206+); older Intendant treated it as \"default\" (prompt for everything) — set \"default\" explicitly if you want prompting"
+                );
+            }
+            if let Some(budget) = config.agent.claude_code.max_budget_usd {
+                if !(budget.is_finite() && budget > 0.0) {
+                    eprintln!(
+                        "[project] intendant.toml [agent.claude_code] max_budget_usd = {budget} is not a positive dollar amount; Claude Code sessions will refuse to spawn until it is fixed or unset"
+                    );
+                }
+            }
             config
         } else {
             ProjectConfig::default()
@@ -1423,6 +1480,51 @@ mod tests {
         // Whitespace-only entries behave like unset.
         cfg.managed_command = Some("   ".to_string());
         assert_eq!(cfg.effective_command(true), "codex");
+    }
+
+    #[test]
+    fn claude_permission_mode_mirrors_carry_the_canonical_vocabulary() {
+        // The canonical list is the normalizer's own output set…
+        for mode in CLAUDE_PERMISSION_MODES {
+            assert_eq!(
+                normalize_claude_permission_mode(mode),
+                mode,
+                "canonical mode {mode} must survive normalization"
+            );
+        }
+        // …and every static frontend mirror must carry all of it, so a mode
+        // added to the vocabulary without extending a mirror fails here
+        // instead of shipping as silent frontend drift.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+        let shell = read("static/app/20-shell.html");
+        let dialogs = read("static/app/21-access-dialogs.html");
+        let panes = read("static/app/34-station-panes.js");
+        let pills = read("crates/station-web/src/hud/panels.rs");
+        for mode in CLAUDE_PERMISSION_MODES {
+            for (name, hay, needle) in [
+                ("static/app/20-shell.html", &shell, format!("value=\"{mode}\"")),
+                (
+                    "static/app/21-access-dialogs.html",
+                    &dialogs,
+                    format!("value=\"{mode}\""),
+                ),
+                ("static/app/34-station-panes.js", &panes, format!("'{mode}'")),
+                (
+                    "crates/station-web/src/hud/panels.rs",
+                    &pills,
+                    format!("\"{mode}\""),
+                ),
+            ] {
+                assert!(
+                    hay.contains(&needle),
+                    "{name} is missing permission mode {mode} (looked for {needle}); \
+                     extend the mirror alongside CLAUDE_PERMISSION_MODES"
+                );
+            }
+        }
     }
 
     #[test]

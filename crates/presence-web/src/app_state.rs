@@ -1167,7 +1167,11 @@ impl AppState {
                 turn: None,
                 budget_pct: Some(usage.usage_pct),
                 autonomy: None,
-                session_id: None,
+                // Attributed to the selected session: the dashboard's status
+                // gate only lets the focused session drive the header meter,
+                // so an unattributed push would be dropped whenever any
+                // window is focused — exactly when selection happens.
+                session_id: Some(session_id.to_string()),
                 external_agent: None,
             });
         }
