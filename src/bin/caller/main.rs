@@ -24,6 +24,7 @@ mod daemon_log_tee;
 mod dashboard_control;
 mod debug;
 mod diagnostics;
+mod display_requests;
 pub(crate) use intendant_display as display;
 pub(crate) use intendant_core::error;
 mod event;

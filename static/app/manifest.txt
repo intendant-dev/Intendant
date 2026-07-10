@@ -84,5 +84,6 @@ ui2-settings.js
 57-sessions-replay.js
 57-attention-notifications.js
 58-shortcuts-boot.js
+58-display-request.js
 59-module-alive.js
 59-module-close.html

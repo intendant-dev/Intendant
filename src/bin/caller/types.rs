@@ -351,6 +351,35 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// A scoped agent asked to access the user's display
+    /// (`request_user_display`): dashboards raise the dedicated
+    /// display-request popup. Resolution is only ever the owner clicking
+    /// it (`{"action":"resolve_display_request", …}`) — never an approval
+    /// action, never autonomy.
+    DisplayRequestRaised {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        /// "view" | "view_and_control".
+        access: String,
+        /// Short agent-provided justification (display verbatim as text).
+        reason: String,
+        /// Unix ms when the request stops waiting; the popup auto-expires.
+        #[serde(default)]
+        expires_unix_ms: u64,
+    },
+    /// A display request left the pending set: outcome is "approved",
+    /// "denied", "denied_for_session", "timeout", or "cancelled".
+    DisplayRequestResolved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<String>,
+    },
     DisplayCaptureLost {
         display_id: u32,
         reason: String,

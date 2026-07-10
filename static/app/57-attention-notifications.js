@@ -113,14 +113,32 @@ function attentionApplyEvent(d, live) {
     attentionAdd('approval', d.session_id, d.id, live);
   } else if (ev === 'user_question') {
     attentionAdd('question', d.session_id, d.id, live);
+  } else if (ev === 'display_request_raised') {
+    // The user-display doorbell: its ids live in their own registry
+    // (never the approval id space), so the 'display' kind prefix keys
+    // them apart from approvals/questions with the same number.
+    attentionAdd('display', d.session_id, d.id, live);
+  } else if (ev === 'display_request_resolved') {
+    attentionRemove('display', d.session_id, d.id);
+    attentionRepaint();
   } else if (ev === 'approval_resolved') {
     // Approvals and questions share the id space; resolve either.
     attentionRemove('approval', d.session_id, d.id);
     attentionRemove('question', d.session_id, d.id);
     attentionRepaint();
-  } else if (ev === 'task_complete' || ev === 'session_ended' || ev === 'interrupted') {
-    // The blocked loop returned — nothing in that session still waits
-    // (some exit paths skip approval_resolved).
+  } else if (ev === 'task_complete' || ev === 'interrupted') {
+    // The blocked loop returned — approvals/questions in that session no
+    // longer wait (some exit paths skip approval_resolved). A display
+    // request survives: its waiter is the blocked MCP call, not the turn;
+    // it clears via display_request_resolved or session_ended.
+    const sessionKey = attentionSessionKey(d.session_id);
+    for (const [key, item] of [...attentionItems]) {
+      if (attentionSessionKey(item.sessionId) === sessionKey && item.kind !== 'display') {
+        attentionItems.delete(key);
+      }
+    }
+    attentionRepaint();
+  } else if (ev === 'session_ended') {
     attentionClearSession(d.session_id);
     attentionRepaint();
   }
@@ -199,13 +217,17 @@ function attentionQueueNotification(key) {
 function attentionShowNotification(items) {
   const approvals = items.filter((i) => i.kind === 'approval').length;
   const questions = items.filter((i) => i.kind === 'question').length;
+  const displayRequests = items.filter((i) => i.kind === 'display').length;
   let title;
   if (items.length === 1) {
-    title = questions ? 'Intendant: the agent has a question' : 'Intendant: approval needed';
+    title = questions ? 'Intendant: the agent has a question'
+      : displayRequests ? 'Intendant: agent asks to view your screen'
+      : 'Intendant: approval needed';
   } else {
     const parts = [];
     if (approvals) parts.push(`${approvals} approval${approvals > 1 ? 's' : ''}`);
     if (questions) parts.push(`${questions} question${questions > 1 ? 's' : ''}`);
+    if (displayRequests) parts.push(`${displayRequests} display request${displayRequests > 1 ? 's' : ''}`);
     title = `Intendant: ${parts.join(' and ')} waiting`;
   }
   const total = attentionItems.size;

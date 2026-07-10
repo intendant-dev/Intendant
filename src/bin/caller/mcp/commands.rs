@@ -1208,6 +1208,9 @@ pub(crate) async fn handle_control_command_mcp(
             // agent. `Some(false)` = private user view — never touches
             // the autonomy grant.
             let agent_visible = agent_visible.unwrap_or(true);
+            // A manual owner grant supersedes any display-request-rail
+            // arrangement (its timed/this-session auto-revoke disarms).
+            crate::display_requests::registry().note_manual_grant();
             // Filtered lookup on purpose: an active private view reads as
             // absent, so an agent-visible grant falls through to the
             // event and the activation listener upgrades it in place.
@@ -1287,6 +1290,22 @@ pub(crate) async fn handle_control_command_mcp(
                 None,
             );
             Some(RESOURCE_LOGS_URI)
+        }
+        ControlMsg::ResolveDisplayRequest { .. } => {
+            // The control plane is the single resolver (registry take +
+            // grant mint); this surface only acknowledges receipt. The
+            // registry's take-once resolve keeps a second consumer from
+            // ever double-minting.
+            emit_control_result(
+                control_tx,
+                "resolve_display_request",
+                true,
+                "display-request resolution dispatched — outcome arrives as \
+                 display_request_resolved"
+                    .to_string(),
+                None,
+            );
+            None
         }
         ControlMsg::InvokeSkill {
             skill_name,

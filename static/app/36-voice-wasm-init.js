@@ -397,6 +397,17 @@ async function main() {
         handleSessionNoteEvent(d);
         return;
       }
+      if (d.event === 'display_request_raised') {
+        // User-display doorbell: rendered end to end in JS
+        // (58-display-request.js); the attention center already saw it
+        // via attentionObserveServerMessage above.
+        handleDisplayRequestRaised(d);
+        return;
+      }
+      if (d.event === 'display_request_resolved') {
+        handleDisplayRequestResolved(d);
+        return;
+      }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
         handleBrowserWorkspaceMessage(d);
         return;

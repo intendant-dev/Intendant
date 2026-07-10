@@ -297,6 +297,26 @@ pub struct RevokeUserDisplayParams {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestUserDisplayParams {
+    /// Short justification shown to the user in the request popup
+    /// (required; capped at 280 bytes).
+    pub reason: String,
+    /// Access level to request: "view" (the agent can see the display
+    /// stream/frames; no input) or "view_and_control" (the full
+    /// user-display grant: screenshots + input). Default: "view".
+    #[serde(default)]
+    pub access: Option<String>,
+    /// How long to wait for the user's decision, in seconds.
+    /// Default 120, capped at 600. Timing out counts as a decline.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+    /// Session the request is attributed to. Normally injected from the
+    /// session-scoped MCP URL; explicit values win.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SpawnLiveAudioParams {
     /// Unique identifier for this live audio session.

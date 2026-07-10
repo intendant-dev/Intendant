@@ -472,6 +472,39 @@ pub enum AppEvent {
         note: Option<String>,
     },
 
+    /// A scoped agent rang the user-display doorbell
+    /// (`request_user_display`): dashboards raise the dedicated popup.
+    /// Deliberately NOT `ApprovalRequired` — display requests never share
+    /// the approval id space, so `approve`/`approve_all`/autonomy rules
+    /// cannot reach them; the only resolution is
+    /// `ControlMsg::ResolveDisplayRequest` from an owner surface.
+    DisplayRequestRaised {
+        session_id: Option<String>,
+        /// Request id in the display-request registry's own id space.
+        id: u64,
+        /// "view" | "view_and_control" (crate::display_requests vocabulary).
+        access: String,
+        /// Short agent-provided justification shown verbatim to the user.
+        reason: String,
+        /// When the requesting tool call stops waiting (unix ms) — the
+        /// popup auto-expires then.
+        expires_unix_ms: u64,
+    },
+    /// A display request left the pending set: the user decided
+    /// ("approved" / "denied" / "denied_for_session"), the wait window
+    /// elapsed ("timeout"), or the requesting session ended ("cancelled").
+    /// Dashboards drop the popup and the attention chain clears the item.
+    DisplayRequestResolved {
+        session_id: Option<String>,
+        id: u64,
+        outcome: String,
+        /// Granted access level, present on "approved".
+        access: Option<String>,
+        /// Granted duration ("this_session" | "15m" | "until_revoked"),
+        /// present on "approved".
+        duration: Option<String>,
+    },
+
     /// Browser workspace lifecycle/lease update. Browser workspaces are
     /// addressable browser-control surfaces (CDP/Playwright/Agent Browser now,
     /// federated peers later) and are intentionally separate from global
@@ -1626,6 +1659,28 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Resolve a pending user-display request (the doorbell popup's Allow
+    /// / Deny / Deny-for-this-session buttons). Owner-surface intent only:
+    /// classified `PeerOperation::DisplayInput` like `GrantUserDisplay` —
+    /// resolving a request is exactly as powerful as granting directly.
+    /// On approve, the control plane mints the grant through the same
+    /// state flip + events `grant_user_display` performs; deny arms the
+    /// per-session cooldown; deny_session suppresses the session. NEVER
+    /// reachable through the approval registry: `approve`/`approve_all`
+    /// target command approvals and cannot touch display requests.
+    ResolveDisplayRequest {
+        /// The requesting session (the popup echoes it back verbatim).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Display-request registry id from `DisplayRequestRaised`.
+        id: u64,
+        /// "approve" | "deny" | "deny_session".
+        decision: String,
+        /// Grant duration on approve: "this_session" | "15m" |
+        /// "until_revoked" (absent = until_revoked).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<String>,
+    },
     /// Create a virtual (Xvfb) display from a frontend — the keyless path
     /// that gives a claimed headless box a working display without any
     /// agent tool call. The daemon allocates the display number, launches
@@ -2208,6 +2263,32 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 note: note.clone(),
             })
         }
+        AppEvent::DisplayRequestRaised {
+            session_id,
+            id,
+            access,
+            reason,
+            expires_unix_ms,
+        } => Some(OutboundEvent::DisplayRequestRaised {
+            session_id: session_id.clone(),
+            id: *id,
+            access: access.clone(),
+            reason: reason.clone(),
+            expires_unix_ms: *expires_unix_ms,
+        }),
+        AppEvent::DisplayRequestResolved {
+            session_id,
+            id,
+            outcome,
+            access,
+            duration,
+        } => Some(OutboundEvent::DisplayRequestResolved {
+            session_id: session_id.clone(),
+            id: *id,
+            outcome: outcome.clone(),
+            access: access.clone(),
+            duration: duration.clone(),
+        }),
         AppEvent::ContextManagement { turn } => {
             Some(OutboundEvent::ContextManagement { turn: *turn })
         }

@@ -702,6 +702,37 @@ async fn run_display(
                 call_tool(client, config, "revoke_user_display", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "request" | "request-user" | "request_user" | "request_user_display" => {
+            ensure_help(&raw[1..], help_display_request)?;
+            let args = parse_command_args(
+                &raw[1..],
+                &["--reason", "--access", "--wait", "--session"],
+                &[],
+            )?;
+            let reason = args
+                .one("--reason")
+                .or_else(|| args.positional.first().map(String::as_str))
+                .ok_or_else(|| {
+                    "display request requires --reason \"why you need the display\"".to_string()
+                })?;
+            let mut map = Map::new();
+            map.insert("reason".to_string(), Value::String(reason.to_string()));
+            insert_string(&mut map, "access", args.one("--access"));
+            if let Some(wait) = args.one("--wait") {
+                let secs: u64 = wait
+                    .parse()
+                    .map_err(|_| format!("--wait must be a number of seconds, got '{wait}'"))?;
+                map.insert("wait_seconds".to_string(), Value::from(secs));
+            }
+            insert_string(
+                &mut map,
+                "session_id",
+                args.one("--session").or(config.session_id.as_deref()),
+            );
+            let response =
+                call_tool(client, config, "request_user_display", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         other => return Err(format!("unknown display command '{other}'")),
     }
     Ok(())
@@ -2158,8 +2189,22 @@ fn help_display() {
   intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl display grant-user [DISPLAY_ID|--display-id ID]\n\
   intendant ctl display revoke-user [DISPLAY_ID|--display-id ID] [--note TEXT]\n\
+  intendant ctl display request --reason TEXT [--access view|control] [--wait SECS] [--session ID]\n\
   intendant ctl display take DISPLAY_ID\n\
   intendant ctl display release DISPLAY_ID [--note TEXT]"
+    );
+}
+
+fn help_display_request() {
+    println!(
+        "Usage: intendant ctl display request --reason TEXT [--access view|control] [--wait SECS] [--session ID]\n\
+Ask the user for access to their real display (display 0). Raises a dashboard\n\
+popup with your reason and blocks until they decide or --wait seconds pass\n\
+(default 120, max 600). Only the user's click grants it — no autonomy setting\n\
+or approval action can. --access view shares the display stream without\n\
+computer-use input; --access control requests the full user-display grant.\n\
+Prints the structured JSON result (approved/denied/denied_for_session/\n\
+timed_out/cooldown/already_pending/already_granted/unavailable)."
     );
 }
 

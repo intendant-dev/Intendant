@@ -549,6 +549,11 @@ impl AppEventUpcaster {
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
+            // Display requests are an owner-surface doorbell on THIS
+            // daemon's dashboards; the peer rail deliberately does not
+            // carry them (peers resolve nothing here).
+            | AppEvent::DisplayRequestRaised { .. }
+            | AppEvent::DisplayRequestResolved { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
@@ -1879,6 +1884,11 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
+            // A secondary's display-request doorbell rings on its own
+            // dashboards; the peer rail does not mirror it (see the
+            // AppEvent upcaster twin above).
+            | OutboundEvent::DisplayRequestRaised { .. }
+            | OutboundEvent::DisplayRequestResolved { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }

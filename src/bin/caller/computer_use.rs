@@ -1636,8 +1636,10 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 pub(crate) fn user_session_denied_message() -> &'static str {
     "Access to the user's real display (user_session) is an explicit opt-in — \
      the user must grant their display first (dashboard grant, grant_user_display, \
-     or `intendant ctl display grant-user`). Target an agent-owned virtual display \
-     instead, e.g. display_target \":99\"."
+     or `intendant ctl display grant-user`). You can ask for it with \
+     request_user_display (or `intendant ctl display request`), which raises a \
+     dashboard popup the user can approve. Otherwise target an agent-owned \
+     virtual display instead, e.g. display_target \":99\"."
 }
 
 /// session-only backends (Wayland, Windows). A bare "no session" message left

@@ -490,6 +490,10 @@ pub fn spawn_web_gateway(
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.
     crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
+    // An owner surface (dashboards on this gateway) now exists in this
+    // process: display requests may block on the popup instead of failing
+    // closed with the headless no-approver refusal.
+    crate::display_requests::mark_approver_surface_available();
     // Fleet certificates: restore any stored certificate into the live
     // SNI resolver and keep it renewed (fleet_cert.rs).
     crate::fleet_cert::refresh_installed_state();
@@ -1464,6 +1468,29 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_user_display_json.lock() {
                         if let Some(ref ud_json) = *guard {
                             let _ = direct_tx.send(ud_json.clone());
+                        }
+                    }
+
+                    // Re-raise still-pending display requests so a
+                    // late-connecting dashboard (the exact browser the
+                    // attention nudge just summoned) shows the popup.
+                    // Requests are short-lived; expired entries are
+                    // filtered by the snapshot.
+                    for pending in crate::display_requests::registry()
+                        .pending_snapshot(crate::display_requests::now_unix_ms())
+                    {
+                        let line = serde_json::to_string(
+                            &crate::types::OutboundEvent::DisplayRequestRaised {
+                                session_id: Some(pending.session_key.clone())
+                                    .filter(|s| s != "main"),
+                                id: pending.id,
+                                access: pending.access.as_str().to_string(),
+                                reason: pending.reason.clone(),
+                                expires_unix_ms: pending.expires_unix_ms,
+                            },
+                        );
+                        if let Ok(line) = line {
+                            let _ = direct_tx.send(line);
                         }
                     }
 

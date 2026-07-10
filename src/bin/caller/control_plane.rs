@@ -78,11 +78,45 @@ pub fn spawn(
                 Ok(AppEvent::ControlCommand(msg)) => {
                     handle_control_msg(&msg, &state).await;
                 }
+                // Display-request rail hygiene (single-writer side effects):
+                // a session's end cancels its pending doorbell request and
+                // auto-revokes a this-session grant it originated; any
+                // revoke ends the rail's timed/this-session arrangement.
+                Ok(AppEvent::SessionEnded { session_id, .. }) => {
+                    apply_display_request_session_end(&session_id, &state.bus);
+                }
+                Ok(AppEvent::UserDisplayRevoked { .. }) => {
+                    crate::display_requests::registry().note_revoked();
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {} // Other events, lagged -- ignore
             }
         }
     })
+}
+
+/// Session-end hygiene for the display-request rail: notify the waiting
+/// tool + dashboards that a pending request died with its session, and
+/// route a this-session grant's auto-revocation through the EXISTING
+/// revoke path (`ControlMsg::RevokeUserDisplay` back onto the bus — the
+/// same guard clear + `UserDisplayRevoked` event every other revoke takes).
+fn apply_display_request_session_end(session_id: &str, bus: &EventBus) {
+    let actions = crate::display_requests::registry().on_session_ended(session_id);
+    if let Some(id) = actions.cancelled_request_id {
+        bus.send(AppEvent::DisplayRequestResolved {
+            session_id: Some(session_id.to_string()),
+            id,
+            outcome: "cancelled".to_string(),
+            access: None,
+            duration: None,
+        });
+    }
+    if let Some(display_id) = actions.revoke_display_id {
+        bus.send(AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+            display_id: Some(display_id),
+            note: Some("display request grant ended with its session".to_string()),
+        }));
+    }
 }
 
 async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
@@ -669,19 +703,25 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // agent. `Some(false)` is the dashboard's "View this machine"
             // — a private view that must never mint agent authority.
             let agent_visible = agent_visible.unwrap_or(true);
-            if agent_visible {
-                // The autonomy guard is the single holder of the grant;
-                // runtime children observe it via the env derivation at the
-                // spawn boundary (agent_runner). A private view leaves the
-                // guard untouched: viewing your own machine grants the
-                // agent nothing.
-                let mut guard = state.autonomy.write().await;
-                guard.user_display_granted = true;
-            }
-            state.bus.send(AppEvent::UserDisplayGranted {
-                display_id: did,
-                agent_visible,
-            });
+            // A manual owner grant supersedes any request-rail arrangement
+            // (timed / this-session auto-revoke must not fire on it).
+            crate::display_requests::registry().note_manual_grant();
+            apply_user_display_grant(state, did, agent_visible, agent_visible).await;
+        }
+        ControlMsg::ResolveDisplayRequest {
+            session_id,
+            id,
+            decision,
+            duration,
+        } => {
+            resolve_display_request(
+                state,
+                session_id.as_deref(),
+                *id,
+                decision,
+                duration.as_deref().unwrap_or(""),
+            )
+            .await;
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
             let did = display_id.unwrap_or(0);
@@ -699,6 +739,172 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             });
         }
         _ => {} // Other control messages don't update shared state
+    }
+}
+
+/// The single legitimate user-display mint: flip the autonomy guard (when
+/// the grant carries computer-use reach) and announce the activation. The
+/// direct `GrantUserDisplay` arm and the display-request rail's approve
+/// path both come through here — derive, don't mirror.
+///
+/// `grant_cu_reach` is what separates the rail's "view" access from the
+/// full grant: a view shares the display stream with the agent
+/// (`agent_visible: true` activates capture + frames) while the guard —
+/// the `computer_use::execute_actions` chokepoint's single input — stays
+/// untouched, so CU input/screenshots against `user_session` remain denied.
+async fn apply_user_display_grant(
+    state: &ControlPlaneState,
+    display_id: u32,
+    agent_visible: bool,
+    grant_cu_reach: bool,
+) {
+    if grant_cu_reach {
+        // The autonomy guard is the single holder of the grant; runtime
+        // children observe it via the env derivation at the spawn
+        // boundary (agent_runner). A private view leaves the guard
+        // untouched: viewing your own machine grants the agent nothing.
+        let mut guard = state.autonomy.write().await;
+        guard.user_display_granted = true;
+    }
+    state.bus.send(AppEvent::UserDisplayGranted {
+        display_id,
+        agent_visible,
+    });
+}
+
+/// Resolve a pending display request: the owner's popup click arrived as
+/// `ControlMsg::ResolveDisplayRequest`. Approve mints the grant through
+/// [`apply_user_display_grant`] (the same path `GrantUserDisplay` takes)
+/// and arms the duration's auto-revocation; deny/deny_session only update
+/// the registry (cooldown / suppression). Every outcome is announced as
+/// `DisplayRequestResolved` so dashboards drop the popup and the
+/// attention chain clears.
+async fn resolve_display_request(
+    state: &ControlPlaneState,
+    session_id: Option<&str>,
+    id: u64,
+    decision: &str,
+    duration: &str,
+) {
+    use crate::display_requests::{
+        self, DisplayGrantDuration, DisplayRequestDecision, ResolveAction,
+        DISPLAY_REQUEST_TIMED_GRANT_SECS,
+    };
+
+    let Some(decision) = DisplayRequestDecision::parse(decision) else {
+        eprintln!("[control_plane] ignoring resolve_display_request with invalid decision {decision:?} (expected approve/deny/deny_session)");
+        return;
+    };
+    let Some(duration) = DisplayGrantDuration::parse(duration) else {
+        eprintln!("[control_plane] ignoring resolve_display_request with invalid duration {duration:?} (expected this_session/15m/until_revoked)");
+        return;
+    };
+    let session_key = display_requests::session_key(session_id);
+    let registry = display_requests::registry();
+    let action = match registry.resolve(
+        &session_key,
+        id,
+        decision,
+        duration,
+        display_requests::now_unix_ms(),
+    ) {
+        Ok(action) => action,
+        Err(_) => {
+            // Already resolved / timed out / never existed: nothing to
+            // mint, nothing to announce (the earlier resolution already
+            // cleared the popup).
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[display-request] resolution for {session_key}#{id} ignored: not pending"
+                ),
+                level: Some(crate::types::LogLevel::Detail),
+                turn: None,
+            });
+            return;
+        }
+    };
+
+    let event_session_id = session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    match action {
+        ResolveAction::MintGrant {
+            access,
+            duration,
+            grant_token,
+        } => {
+            let grant_cu_reach = access == display_requests::DisplayRequestAccess::ViewAndControl;
+            apply_user_display_grant(state, 0, true, grant_cu_reach).await;
+            // Foreground the freshly shared display in connected
+            // dashboards — the user just granted it; show them what the
+            // agent now sees (the shared-view presentation rail).
+            state.bus.send(AppEvent::SharedView {
+                session_id: event_session_id.clone(),
+                action: "show".to_string(),
+                display_target: Some("user_session".to_string()),
+                display_id: Some(0),
+                reason: None,
+                region: None,
+                note: Some("display request approved".to_string()),
+            });
+            if duration == DisplayGrantDuration::Timed {
+                // Auto-revocation goes through the EXISTING revoke path
+                // (guard clear + UserDisplayRevoked) via the bus; the
+                // compare-and-take on the token means a manual grant or
+                // revoke in the meantime disarms this timer.
+                let bus = state.bus.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        DISPLAY_REQUEST_TIMED_GRANT_SECS,
+                    ))
+                    .await;
+                    if let Some(display_id) =
+                        display_requests::registry().take_grant_if_current(grant_token)
+                    {
+                        bus.send(AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+                            display_id: Some(display_id),
+                            note: Some("15-minute display request grant expired".to_string()),
+                        }));
+                    }
+                });
+            }
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[display-request] approved for {session_key}#{id}: {} ({})",
+                    access.as_str(),
+                    duration.as_str()
+                ),
+                level: Some(crate::types::LogLevel::Info),
+                turn: None,
+            });
+            state.bus.send(AppEvent::DisplayRequestResolved {
+                session_id: event_session_id,
+                id,
+                outcome: "approved".to_string(),
+                access: Some(access.as_str().to_string()),
+                duration: Some(duration.as_str().to_string()),
+            });
+        }
+        ResolveAction::NoGrant => {
+            let outcome = match decision {
+                DisplayRequestDecision::Deny => "denied",
+                DisplayRequestDecision::DenyForSession => "denied_for_session",
+                DisplayRequestDecision::Approve => unreachable!("approve always mints"),
+            };
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!("[display-request] {outcome} for {session_key}#{id}"),
+                level: Some(crate::types::LogLevel::Info),
+                turn: None,
+            });
+            state.bus.send(AppEvent::DisplayRequestResolved {
+                session_id: event_session_id,
+                id,
+                outcome: outcome.to_string(),
+                access: None,
+                duration: None,
+            });
+        }
     }
 }
 

@@ -466,6 +466,18 @@ impl IntendantServer {
                 let params = parse_params::<RevokeUserDisplayParams>(args)?;
                 Ok(text_tool_result(self.revoke_user_display(params).await))
             }
+            "request_user_display" => {
+                // The doorbell: callable by Scoped callers by design — the
+                // tool only asks; the user's dashboard click is what mints
+                // the grant (control plane ResolveDisplayRequest arm).
+                let Parameters(params) = parse_params::<RequestUserDisplayParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(
+                    self.request_user_display_for_session(params, session_id)
+                        .await,
+                ))
+            }
             "show_shared_view" => {
                 let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
                 Ok(text_tool_result(

@@ -117,6 +117,9 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
                     | "grant_user_display"
+                    // The doorbell for the user's own display — exists
+                    // precisely for these scoped supervised callers.
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -139,6 +142,7 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
                     | "grant_user_display"
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -199,7 +203,13 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // session-surface write from the other direction (low-risk session
         // output; deliberately reachable by session-scoped supervised
         // agents, the tool's primary callers).
-        "respond" | "post_session_note" => PeerOperation::Message,
+        //
+        // request_user_display classifies here too: the tool only ASKS the
+        // user (a popup with a reason — the same risk class as messaging
+        // them) and can grant nothing itself. The grant is minted by the
+        // owner's click, whose ControlMsg (`resolve_display_request`) is
+        // classified DisplayInput like grant_user_display.
+        "respond" | "post_session_note" | "request_user_display" => PeerOperation::Message,
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -415,6 +425,14 @@ pub(crate) fn append_manual_http_tool_definitions(
             "revoke_user_display",
             "Revoke access to the user's real display session.",
             RevokeUserDisplayParams
+        ),
+    );
+    push(
+        "request_user_display",
+        manual_http_tool_definition!(
+            "request_user_display",
+            "Ask the user for access to their real display (display 0, user_session). Raises a dedicated dashboard popup with your reason and blocks up to wait_seconds for their click — the user's click is the only thing that can grant it (no autonomy setting or approval action can). access=\"view\" shares the display stream (frames + dashboard visibility) without computer-use input; access=\"view_and_control\" requests the full grant. Returns a structured JSON result: approved (with granted duration), denied, denied_for_session, timed_out, cooldown, already_pending, already_granted, or unavailable.",
+            RequestUserDisplayParams
         ),
     );
     push(
