@@ -524,7 +524,7 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
     }
 
     // Read existing content (may not exist yet).
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let existing = std::fs::read_to_string(env_path).unwrap_or_default();
 
     // Build updated content: replace existing lines, append new ones.
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
@@ -553,7 +553,7 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
 
     let new_content = lines.join("\n") + "\n";
 
-    if let Err(e) = crate::file_watcher::atomic_write(&env_path, new_content.as_bytes()) {
+    if let Err(e) = crate::file_watcher::atomic_write(env_path, new_content.as_bytes()) {
         return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
     }
 
