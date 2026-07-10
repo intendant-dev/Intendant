@@ -67,9 +67,45 @@ pub(crate) fn is_valid_agent_output_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
 }
 
-pub(crate) fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &Path) -> String {
+/// The wildcard-CORS json envelope several session surfaces answer with
+/// (`Cache-Control` + `Access-Control-Allow-Origin: *` + `Connection`
+/// tail — the historical `upload_error_response`/hand-rolled shape).
+pub(crate) fn session_wildcard_json_response(status: u16, body: String) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
+/// `{"error": message}` under the wildcard-CORS tail.
+pub(crate) fn session_wildcard_json_error(status: u16, message: &str) -> ApiResponse {
+    session_wildcard_json_response(status, serde_json::json!({ "error": message }).to_string())
+}
+
+/// Transitional raw-HTTP rendering for the current-session callers that
+/// have not yet converted to [`ApiResponse`] (S4 slices 2–3); byte-
+/// identical to the historical hand-rolled strings (the HTTP adapter's
+/// parity tests pin the framing).
+fn api_response_to_http_string(response: ApiResponse) -> String {
+    String::from_utf8_lossy(&api_response_http_bytes(
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    ))
+    .into_owned()
+}
+
+pub(crate) fn current_agent_output_response_for_ids(
+    ids: Vec<String>,
+    log_dir: &Path,
+) -> ApiResponse {
     if ids.is_empty() {
-        return upload_error_response("400 Bad Request", "missing output ids");
+        return session_wildcard_json_error(400, "missing output ids");
     }
 
     let fallback_logs_dir = Some(crate::platform::intendant_home().join("logs"));
@@ -88,11 +124,7 @@ pub(crate) fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &
         "missing": missing,
     })
     .to_string();
-    HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string()
+    session_wildcard_json_response(200, body)
 }
 
 pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
@@ -115,10 +147,11 @@ pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>,
 }
 
 pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
-    match agent_output_ids_from_json_body(body) {
+    let response = match agent_output_ids_from_json_body(body) {
         Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
-        Err(e) => upload_error_response("400 Bad Request", &e),
-    }
+        Err(e) => session_wildcard_json_error(400, &e),
+    };
+    api_response_to_http_string(response)
 }
 
 pub(crate) fn external_agent_output_response_for_ids(
@@ -126,9 +159,9 @@ pub(crate) fn external_agent_output_response_for_ids(
     source: &str,
     session_id: &str,
     ids: Vec<String>,
-) -> String {
+) -> ApiResponse {
     let Some(entries) = external_session_entries_from_home(home, source, session_id) else {
-        return upload_error_response("404 Not Found", "session not found");
+        return session_wildcard_json_error(404, "session not found");
     };
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut found: HashMap<String, serde_json::Value> = HashMap::new();
@@ -167,12 +200,18 @@ pub(crate) fn external_agent_output_response_for_ids(
         .map(String::as_str)
         .filter(|id| !output_ids.contains(id))
         .collect();
-    json_response_body(
-        serde_json::json!({
-            "outputs": outputs,
-            "missing": missing,
-        })
-        .to_string(),
+    // Historical asymmetry, preserved: the external-source success rides
+    // the canonical json tail (no wildcard CORS header), unlike the
+    // intendant-source success above.
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(
+            serde_json::json!({
+                "outputs": outputs,
+                "missing": missing,
+            })
+            .to_string(),
+        ),
     )
 }
 
@@ -181,25 +220,29 @@ pub(crate) fn session_agent_output_response_for_ids(
     session_id: &str,
     source: &str,
     ids: Vec<String>,
-) -> String {
+) -> ApiResponse {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" {
         let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
-            return upload_error_response("404 Not Found", "session not found");
+            return session_wildcard_json_error(404, "session not found");
         };
         return current_agent_output_response_for_ids(ids, &session_dir);
     }
     external_agent_output_response_for_ids(home, &source, session_id, ids)
 }
 
-pub(crate) fn session_agent_output_post_response(
+/// Transport-neutral core of the by-id agent-output read
+/// (`POST /api/session/{id}/agent-output`, a POST-shaped read; tunnel twin
+/// `api_session_agent_output`): bare-id policy, output-id decode from the
+/// JSON body, then the persisted-chunk fetch.
+pub(crate) fn session_agent_output_api_response(
     body: &str,
     session_id: &str,
     source: &str,
-) -> String {
+) -> ApiResponse {
     let session_id = session_id.trim();
     if !session_lookup_id_is_safe(session_id) {
-        return upload_error_response("400 Bad Request", "invalid session id");
+        return session_wildcard_json_error(400, "invalid session id");
     }
     match agent_output_ids_from_json_body(body) {
         Ok(ids) => session_agent_output_response_for_ids(
@@ -208,8 +251,18 @@ pub(crate) fn session_agent_output_post_response(
             source,
             ids,
         ),
-        Err(e) => upload_error_response("400 Bad Request", &e),
+        Err(e) => session_wildcard_json_error(400, &e),
     }
+}
+
+/// Raw-string bridge for the tunnel twin until it delegates through the
+/// neutral fn (removed with that conversion).
+pub(crate) fn session_agent_output_post_response(
+    body: &str,
+    session_id: &str,
+    source: &str,
+) -> String {
+    api_response_to_http_string(session_agent_output_api_response(body, session_id, source))
 }
 
 /// Build a zip containing the current session's text artifacts for the
@@ -2319,45 +2372,58 @@ pub(crate) async fn handle_current_agent_output(
     finalize_http_stream(&mut stream).await;
 }
 
-pub(crate) async fn handle_sessions_list(mut stream: DemuxStream, request_line: &str) {
-    // Session listing endpoint. CORS `*` so the
-    // multi-host Stats tab can fetch sibling
-    // daemons' session lists to populate its "All
-    // Sessions" and "Disk Usage" cards per host.
+/// Transport-neutral core of `GET /api/sessions` (tunnel twin
+/// `api_sessions`; the hot list path — `PreSerialized` keeps it
+/// allocation-identical, risk R8). Params arrive transport-decoded; the
+/// composition below is the row's semantics: the ids filter wins, then
+/// the limit truncation, then the usage projection. Answers 200 with the
+/// wildcard-CORS tail so the multi-host Stats tab can fetch sibling
+/// daemons' session lists for its "All Sessions" / "Disk Usage" cards.
+pub(crate) fn sessions_list_api_response(
+    ids_filter: Option<Vec<String>>,
+    limit: Option<usize>,
+    usage_view: bool,
+) -> ApiResponse {
+    let body = match ids_filter {
+        Some(ids) => cached_list_sessions_for_ids(&ids),
+        None => match limit {
+            Some(limit) => cached_list_sessions_with_limit(limit),
+            None => cached_list_sessions(),
+        },
+    };
+    let body = limit_session_list_body(&body, limit);
+    let body = if usage_view {
+        session_list_body_usage_view(&body)
+    } else {
+        body
+    };
+    session_wildcard_json_response(200, body)
+}
+
+pub(crate) async fn handle_sessions_list(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
     let ids_filter = session_ids_filter_from_request(request_line);
     let limit = session_list_limit_from_request(request_line);
     let usage_view = session_list_usage_view_from_request(request_line);
-    let body = match tokio::task::spawn_blocking(move || {
-        let body = match ids_filter {
-            Some(ids) => cached_list_sessions_for_ids(&ids),
-            None => match limit {
-                Some(limit) => cached_list_sessions_with_limit(limit),
-                None => cached_list_sessions(),
-            },
-        };
-        let body = limit_session_list_body(&body, limit);
-        if usage_view {
-            session_list_body_usage_view(&body)
-        } else {
-            body
-        }
+    let response = match tokio::task::spawn_blocking(move || {
+        sessions_list_api_response(ids_filter, limit, usage_view)
     })
     .await
     {
-        Ok(body) => body,
-        Err(e) => serde_json::json!({
-            "error": format!("session list task failed: {e}")
-        })
-        .to_string(),
+        Ok(response) => response,
+        Err(e) => session_wildcard_json_response(
+            200,
+            serde_json::json!({
+                "error": format!("session list task failed: {e}")
+            })
+            .to_string(),
+        ),
     };
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_session_delete(mut stream: DemuxStream, request_line: &str) {
@@ -2386,11 +2452,12 @@ pub(crate) async fn handle_session_delete(mut stream: DemuxStream, request_line:
 }
 
 pub(crate) async fn handle_session_agent_output(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let rest = request_line
         .split("/api/session/")
         .nth(1)
@@ -2402,12 +2469,11 @@ pub(crate) async fn handle_session_agent_output(
     let is_agent_output_route = rest_parts.get(1).copied() == Some("agent-output");
     let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
     let response = if is_agent_output_route {
-        session_agent_output_post_response(&body_text, session_id, &source)
+        session_agent_output_api_response(&body_text, session_id, &source)
     } else {
-        upload_error_response("404 Not Found", "unknown session output route")
+        session_wildcard_json_error(404, "unknown session output route")
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_session_sub_router(
@@ -2438,17 +2504,23 @@ pub(crate) async fn handle_session_sub_router(
         let raw_id = rest_parts[0];
         let session_id = raw_id.split('?').next().unwrap_or(raw_id);
         let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
-        let (status, body) = get_session_context_snapshot_from_home(
-            &crate::platform::home_dir(),
-            session_id,
-            &source,
-            request_line,
+        let response = match context_snapshot_selector_parts_from_request(request_line) {
+            Ok((file, request_id, request_index, ts)) => session_context_snapshot_api_response(
+                session_id,
+                &source,
+                file,
+                request_id,
+                request_index,
+                ts,
+            ),
+            Err(error) => ApiResponse::json_error(400, error),
+        };
+        let bytes = api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
         );
-        let response = HttpResponse::with_content(status, "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "close")
-            .into_string();
-        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(&bytes).await;
     } else if rest_parts.len() >= 2 && route_name == "recordings" {
         // Session recording sub-routes: /api/session/{id}/recordings[/...]
         let session_id = rest_parts[0];
@@ -2719,56 +2791,84 @@ pub(crate) async fn handle_session_sub_router(
         let entry_limit = session_detail_entry_limit_from_request(request_line);
         let entry_before = session_detail_before_from_request(request_line);
         let session_id_owned = session_id.to_string();
-        let source_owned = source.clone();
-        let body = if !session_lookup_id_is_safe(session_id) {
-            serde_json::json!({"error": "invalid session id"}).to_string()
-        } else {
-            match tokio::task::spawn_blocking(move || {
-                let home = crate::platform::home_dir();
-                if source_owned == "intendant" {
-                    get_session_detail_from_home_with_page(
-                        &home,
-                        &session_id_owned,
-                        entry_limit,
-                        entry_before,
-                    )
-                } else {
-                    external_session_detail_from_home_with_page(
-                        &home,
-                        &source_owned,
-                        &session_id_owned,
-                        entry_limit,
-                        entry_before,
-                    )
-                    .unwrap_or_else(|| {
-                        serde_json::json!({
-                            "error": "session not found"
-                        })
-                        .to_string()
+        let response = match tokio::task::spawn_blocking(move || {
+            session_detail_api_response(&session_id_owned, &source, entry_limit, entry_before)
+        })
+        .await
+        {
+            Ok(response) => response,
+            // Historical shape: a failed detail task answers 200 with the
+            // error body (the status mapping only knows "not found").
+            Err(e) => ApiResponse::json(
+                200,
+                JsonBody::PreSerialized(
+                    serde_json::json!({
+                        "error": format!("session detail task failed: {e}")
                     })
-                }
-            })
-            .await
-            {
-                Ok(body) => body,
-                Err(e) => serde_json::json!({
-                    "error": format!("session detail task failed: {e}")
-                })
-                .to_string(),
-            }
+                    .to_string(),
+                ),
+            ),
         };
-        let status = if !session_lookup_id_is_safe(session_id) {
-            "400 Bad Request"
-        } else {
-            session_detail_http_status(&body)
-        };
-        let response = HttpResponse::with_content(status, "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "close")
-            .into_string();
-        let _ = stream.write_all(response.as_bytes()).await;
+        let bytes = api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let _ = stream.write_all(&bytes).await;
     }
     finalize_http_stream(&mut stream).await;
+}
+
+/// Transport-neutral core of session detail (`GET /api/session/{id}`,
+/// tunnel twin `api_session_detail`): the bare-id policy check (the raw,
+/// untrimmed id — the HTTP lane's historical strictness; the tunnel
+/// trims before delegating), then the paged replay body with its
+/// historical status mapping (404 only for "session not found").
+pub(crate) fn session_detail_api_response(
+    session_id: &str,
+    source: &str,
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> ApiResponse {
+    if !session_lookup_id_is_safe(session_id) {
+        return ApiResponse::json_error(400, "invalid session id");
+    }
+    let body = session_detail_response_body_with_page(session_id, source, limit, before);
+    let status = if session_detail_http_status(&body) == "404 Not Found" {
+        404
+    } else {
+        200
+    };
+    ApiResponse::json(status, JsonBody::PreSerialized(body))
+}
+
+/// Transport-neutral core of the context-snapshot replay
+/// (`GET /api/session/{id}/context-snapshot`, tunnel twin
+/// `api_session_context_snapshot`): selector parts arrive transport-
+/// decoded (query string vs frame params); the bare-id policy, selector
+/// validation, and log-dir scan are the shared
+/// `session_context_snapshot_response_body` core.
+pub(crate) fn session_context_snapshot_api_response(
+    session_id: &str,
+    source: &str,
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+) -> ApiResponse {
+    let (status_line, body) = session_context_snapshot_response_body(
+        &crate::platform::home_dir(),
+        session_id,
+        source,
+        file,
+        request_id,
+        request_index,
+        ts,
+    );
+    ApiResponse::json(
+        status_line_code(status_line),
+        JsonBody::PreSerialized(body),
+    )
 }
 
 pub(crate) async fn handle_mc_anchors(
@@ -2879,20 +2979,47 @@ pub(crate) async fn handle_sessions_stream(mut stream: DemuxStream, request_line
     finalize_http_stream(&mut stream).await;
 }
 
-pub(crate) async fn handle_sessions_search(mut stream: DemuxStream, request_line: &str) {
+/// Transport-neutral core of `GET /api/sessions/search` (tunnel twin
+/// `api_sessions_search`): one search composition — the single-flight
+/// guard plus the blocking store scan — under the caller's cancellation
+/// token, answered 200 under the wildcard-CORS tail.
+pub(crate) async fn sessions_search_api_response(
+    query: String,
+    source_filter: String,
+    mode: String,
+    project_filter: Vec<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> ApiResponse {
+    let body = sessions_search_response_body_with_cancel(
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        cancel,
+    )
+    .await;
+    session_wildcard_json_response(200, body)
+}
+
+pub(crate) async fn handle_sessions_search(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
     let query = query_param(request_line, "q").unwrap_or_default();
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
     let mode = query_param(request_line, "mode").unwrap_or_default();
     let project_filter = session_project_filter_from_request(request_line);
-    let body = sessions_search_response_body(query, source_filter, mode, project_filter).await;
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = sessions_search_api_response(
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_worktrees_inspect(mut stream: DemuxStream, body_text: String) {
@@ -4631,7 +4758,14 @@ mod tests {
         // touching the session stores — fully deterministic.
         let request_line = "GET /api/sessions?ids= HTTP/1.1";
         let response =
-            collect_session_handler_response(|stream| handle_sessions_list(stream, request_line))
+            collect_session_handler_response(|stream| {
+            handle_sessions_list(
+                stream,
+                request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
                 .await;
         assert_eq!(
             golden_transcript(&response),
@@ -4645,7 +4779,14 @@ mod tests {
         // pins the query-parameter plumbing end to end.
         let request_line = "GET /api/sessions?ids=&limit=3&view=usage HTTP/1.1";
         let response =
-            collect_session_handler_response(|stream| handle_sessions_list(stream, request_line))
+            collect_session_handler_response(|stream| {
+            handle_sessions_list(
+                stream,
+                request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
                 .await;
         assert_eq!(
             golden_transcript(&response),
@@ -4661,7 +4802,14 @@ mod tests {
         // An empty query short-circuits before any store scan.
         let request_line = "GET /api/sessions/search?q= HTTP/1.1";
         let response =
-            collect_session_handler_response(|stream| handle_sessions_search(stream, request_line))
+            collect_session_handler_response(|stream| {
+            handle_sessions_search(
+                stream,
+                request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
                 .await;
         let body = serde_json::json!({
             "query": "",
@@ -4689,7 +4837,14 @@ mod tests {
         assert!(!SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst));
         let request_line = "GET /api/sessions/search?q=anything HTTP/1.1";
         let response =
-            collect_session_handler_response(|stream| handle_sessions_search(stream, request_line))
+            collect_session_handler_response(|stream| {
+            handle_sessions_search(
+                stream,
+                request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
                 .await;
         SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
         let body = serde_json::json!({
@@ -4764,7 +4919,13 @@ mod tests {
     async fn golden_session_agent_output_missing_ids_transcript() {
         let request_line = "POST /api/session/abc123/agent-output HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_agent_output(stream, "{}".to_string(), request_line)
+            handle_session_agent_output(
+                stream,
+                "{}".to_string(),
+                request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -4785,6 +4946,8 @@ mod tests {
                 stream,
                 r#"{"ids":["out-1"]}"#.to_string(),
                 &request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
             )
         })
         .await;
@@ -4811,6 +4974,8 @@ mod tests {
                 stream,
                 r#"{"ids":["go-out-1","go-missing"]}"#.to_string(),
                 &request_line,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
             )
         })
         .await;

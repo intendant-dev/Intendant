@@ -3019,9 +3019,11 @@ mod tests {
             "codex",
             vec!["call_large".to_string()],
         );
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let body = response.split("\r\n\r\n").nth(1).unwrap();
-        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let crate::web_gateway::ApiResponse::Json { status, body, .. } = response else {
+            panic!("agent output must answer on the json lane");
+        };
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body.into_string()).unwrap();
         assert_eq!(json["missing"].as_array().unwrap().len(), 0);
         let stdout = json["outputs"][0]["stdout"].as_str().unwrap();
         assert_eq!(

@@ -736,6 +736,17 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     Ok(full)
 }
 
+/// Numeric code of a status line (`"404 Not Found"` → 404); unparseable
+/// input collapses to 500. Inverse of [`status_reason`] for the (status,
+/// body) helper cores predating [`crate::web_gateway::ApiResponse`].
+pub(crate) fn status_line_code(status_line: &str) -> u16 {
+    status_line
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(500)
+}
+
 pub(crate) fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "200 OK",
