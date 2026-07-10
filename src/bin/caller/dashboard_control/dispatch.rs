@@ -573,11 +573,16 @@ pub(crate) fn control_frame_response(
                 })),
                 "api_access_overview" => {
                     let current_principal = runtime.grant.access_principal();
+                    // The transport edge resolves the ambient cert dir;
+                    // the shared cores are path-parameterized
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
                     Some(serde_json::json!({
                         "t": "response",
                         "id": id,
                         "ok": true,
                         "result": crate::web_gateway::access_overview_response_value_for_principal(
+                            &cert_dir,
                             &runtime.agent_card,
                             runtime.peer_registry.as_ref(),
                             Some(&current_principal),
@@ -588,13 +593,17 @@ pub(crate) fn control_frame_response(
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": crate::web_gateway::access_iam_state_response_value(),
+                    "result": crate::web_gateway::access_iam_state_response_value(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
                 })),
                 "api_access_enrollment_requests" => Some(serde_json::json!({
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": crate::web_gateway::access_enrollment_requests_response_value(),
+                    "result": crate::web_gateway::access_enrollment_requests_response_value(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
                 })),
                 "api_access_enrollment_decide" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
@@ -651,10 +660,15 @@ pub(crate) fn control_frame_response(
                 "api_access_set_tier" | "api_access_set_hosted_ceiling" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let actor = runtime.grant.access_principal();
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
                     let result = if method == "api_access_set_hosted_ceiling" {
-                        crate::web_gateway::access_set_hosted_ceiling_response_value(params, &actor)
+                        crate::web_gateway::access_set_hosted_ceiling_response_value(
+                            &cert_dir, params, &actor,
+                        )
                     } else {
-                        crate::web_gateway::access_set_tier_response_value(params, &actor)
+                        crate::web_gateway::access_set_tier_response_value(&cert_dir, params, &actor)
                     };
                     match result {
                         Ok(result) => Some(serde_json::json!({

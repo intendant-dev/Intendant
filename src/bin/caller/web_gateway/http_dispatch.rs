@@ -857,10 +857,11 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessEnrollmentRequests => {
-                return handle_access_enrollment_requests(stream, fleet_cors_origin).await;
+                return handle_access_enrollment_requests(stream, cert_dir, fleet_cors_origin)
+                    .await;
             }
             RouteHandlerId::AccessIamState => {
-                return handle_access_iam_state(stream, fleet_cors_origin).await;
+                return handle_access_iam_state(stream, cert_dir, fleet_cors_origin).await;
             }
             RouteHandlerId::AccessConnectStatus => {
                 return handle_access_connect_status(stream, fleet_cors_origin).await;
@@ -900,6 +901,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     req_method,
                     req_path,
+                    cert_dir,
                     http_access_context,
                     fleet_cors_origin,
                 )
@@ -908,6 +910,7 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::AccessOverview => {
                 return handle_access_overview(
                     stream,
+                    cert_dir,
                     http_access_context,
                     fleet_cors_origin,
                     peer_registry,
