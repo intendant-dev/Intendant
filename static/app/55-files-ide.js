@@ -1,10 +1,11 @@
 // ── Files tab: editor ──
 //
-// A small IDE over the fs API family. Reads ride GET /api/fs/* (or the
-// api_fs_* tunnel methods), writes ride POST /api/fs/write (or api_fs_write
-// upload frames). Peers are reached over their dashboard-control tunnel and
-// enforce their own IAM profile + filesystem write roots server-side; this
-// UI only decides *where* to send a request, never *whether* it is allowed.
+// A small IDE over the fs API family. Every fs call rides the daemonApi
+// facade (32-daemon-api.js, transport program F1): target '' is this
+// daemon (tunnel first, direct HTTP per the facade's verb-derived fallback
+// policy), a hostId is that peer's dashboard-control tunnel. Peers enforce
+// their own IAM profile + filesystem write roots server-side; this UI only
+// decides *where* to send a request, never *whether* it is allowed.
 // Saves are optimistic-concurrency: every read keeps the content sha256 and
 // every save sends it back as expected_sha256; a 409 opens the
 // reload/overwrite banner instead of clobbering.
@@ -94,80 +95,37 @@ function filesIdeEnsureEditorLib() {
   return filesIdeLibPromise;
 }
 
-// -- transport: one call surface for "this daemon" (HTTP or connect tunnel)
-//    and peers (their dashboard-control tunnel)
+// -- transport: every fs call rides the daemonApi facade (F1). hostId ''
+//    targets this daemon — the facade prefers the dashboard-control tunnel
+//    and applies the verb-derived fallback policy (GET twins may fall back
+//    to HTTP and retry; POST twins never replay after an attempted send).
+//    A non-empty hostId targets that peer's tunnel (peers have no HTTP
+//    lane by design). Availability checks route through
+//    daemonApi.availability; the read-only / reconnect envelopes below
+//    keep the exact strings this UI surfaced before the migration.
 
-function filesIdeNormalizePayload(payload) {
-  const rawStatus = Number(payload?._httpStatus);
-  const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 200;
-  const ok = typeof payload?._httpOk === 'boolean' ? payload._httpOk : status >= 200 && status < 300;
-  let body = payload;
-  if (body && typeof body === 'object' && !Array.isArray(body)) {
-    body = { ...body };
-    delete body._httpStatus;
-    delete body._httpOk;
-  }
-  return { ok, status, body: body || {} };
-}
-
-async function filesIdePeerConnection(hostId) {
-  const conn = await peerDashboardControlConnectionForHost(hostId, { timeoutMs: 30000 });
-  if (!conn) throw new Error('Peer tunnel unavailable');
-  return conn;
-}
-
-async function filesIdeRpc(hostId, method, params, httpFallback) {
-  if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    const payload = await conn.request(method, params);
-    return filesIdeNormalizePayload(payload);
-  }
-  const resp = await dashboardJsonFetch(method, params, httpFallback, method);
-  const body = await resp.json().catch(() => ({}));
-  return { ok: resp.ok, status: resp.status, body: body || {} };
+function filesIdeRpc(hostId, method, params) {
+  return daemonApi.request(method, params, { target: hostId || null });
 }
 
 function filesIdeList(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_list', { path }, () =>
-    authedFetch('/api/fs/list?path=' + encodeURIComponent(path))
-  );
+  return filesIdeRpc(hostId, 'api_fs_list', { path });
 }
 
 function filesIdeStat(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_stat', { path }, () =>
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(path))
-  );
+  return filesIdeRpc(hostId, 'api_fs_stat', { path });
 }
 
 function filesIdeMkdir(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_mkdir', { path }, () =>
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_mkdir', { path });
 }
 
 function filesIdeRename(hostId, from, to) {
-  return filesIdeRpc(hostId, 'api_fs_rename', { from, to }, () =>
-    authedFetch('/api/fs/rename', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to }),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_rename', { from, to });
 }
 
 function filesIdeDeleteRpc(hostId, path, recursive) {
-  const params = recursive ? { path, recursive: true } : { path };
-  return filesIdeRpc(hostId, 'api_fs_delete', params, () =>
-    authedFetch('/api/fs/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_delete', recursive ? { path, recursive: true } : { path });
 }
 
 async function filesIdeSha256Hex(bytes) {
@@ -181,78 +139,52 @@ async function filesIdeSha256Hex(bytes) {
 }
 
 /// Read a whole file: {bytes: Uint8Array, sha256: string}. The sha comes from
-/// the daemon when it offers one (X-Content-Sha256 / result.sha256) so the
-/// conflict baseline matches what the daemon will hash at save time; older
-/// peers without it fall back to a local digest of the same bytes.
+/// the daemon when it offers one (byte-stream result.sha256 / the HTTP
+/// X-Content-Sha256 header — both land in meta.sha256) so the conflict
+/// baseline matches what the daemon will hash at save time; older peers
+/// without it fall back to a local digest of the same bytes.
 async function filesIdeReadFile(hostId, path) {
-  if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    const result = await conn.requestBytes('api_fs_read', { path });
-    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
-    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
-    const sha = typeof result?.sha256 === 'string' && result.sha256
-      ? result.sha256
-      : await filesIdeSha256Hex(bytes);
-    return { bytes, sha256: sha };
+  if (!hostId && dashboardConnectModeEnabled() && !daemonApi.availability('api_fs_read').ok) {
+    throw new Error('File reads are unavailable until this dashboard reconnects');
   }
-  if (dashboardConnectModeEnabled()) {
-    if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
-      throw new Error('File reads are unavailable until this dashboard reconnects');
-    }
-    const result = await dashboardControlTransport.requestBytes('api_fs_read', { path });
-    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
-    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
-    const sha = typeof result?.sha256 === 'string' && result.sha256
-      ? result.sha256
-      : await filesIdeSha256Hex(bytes);
-    return { bytes, sha256: sha };
-  }
-  const resp = await authedFetch('/api/fs/read?path=' + encodeURIComponent(path));
-  if (!resp.ok) {
-    const detail = await resp.json().catch(() => ({}));
-    throw new Error(detail.error || `File read failed (${resp.status})`);
-  }
-  const buffer = await resp.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const sha = resp.headers?.get?.('x-content-sha256') || (await filesIdeSha256Hex(bytes));
-  return { bytes, sha256: sha };
+  const { bytes, meta } = await daemonApi.bytes('api_fs_read', { path }, { target: hostId || null });
+  const sha256 = meta.sha256 || (await filesIdeSha256Hex(bytes));
+  return { bytes, sha256 };
 }
 
-/// Write a whole file. Returns the normalized {ok, status, body} response;
+/// Write a whole file. Returns the facade's {ok, status, body} envelope;
 /// 409 bodies carry {code, current_sha256, ...} for the conflict banner.
+/// api_fs_write is a POST twin, so the facade never replays it over HTTP
+/// after a tunnel attempt that may have reached the daemon.
 async function filesIdeWriteFile(hostId, path, bytes, opts = {}) {
   const params = { path };
   if (opts.expected_sha256) params.expected_sha256 = opts.expected_sha256;
   if (opts.create_new) params.create_new = true;
   if (opts.force) params.force = true;
-  const requestOpts = { signal: opts.signal, timeoutMs: opts.timeoutMs };
   if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    if (conn.lastStatus && conn.lastStatus.api_fs_write_available === false) {
+    // A peer granting read-only file access advertises
+    // api_fs_write_available:false — surface the same friendly envelope
+    // this UI always showed instead of the raw authorizer text.
+    const avail = daemonApi.availability('api_fs_write', hostId);
+    if (!avail.ok && avail.reason === 'denied') {
       return {
         ok: false,
         status: 403,
         body: { error: `${filesIdeHostLabel(hostId)} grants read-only file access to this daemon` },
       };
     }
-    const payload = await conn.uploadBytes('api_fs_write', params, bytes, requestOpts);
-    return filesIdeNormalizePayload(payload);
+  } else if (dashboardConnectModeEnabled() && !daemonApi.availability('api_fs_write').ok) {
+    return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
   }
-  if (dashboardConnectModeEnabled()) {
-    if (!(dashboardTransport?.canUseRpc?.() && dashboardControlTransport?.lastStatus?.api_fs_write_available !== false)) {
-      return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
-    }
-    const payload = await dashboardControlTransport.uploadBytes('api_fs_write', params, bytes, requestOpts);
-    return filesIdeNormalizePayload(payload);
-  }
-  const resp = await authedFetch('/api/fs/write', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...params, content_b64: dashboardControlBytesToBase64(bytes) }),
+  return daemonApi.upload('api_fs_write', params, bytes, {
+    target: hostId || null,
     signal: opts.signal,
+    // Family default when the caller sets no deadline: scale with the
+    // payload like the transfers lane does — the transport's flat
+    // per-method default is sized for small JSON RPCs, not a fs write
+    // that may carry up to UPLOAD_MAX_BYTES.
+    timeoutMs: opts.timeoutMs ?? rangedDownloadTimeoutMs(Number(bytes?.byteLength ?? bytes?.size) || 0),
   });
-  const body = await resp.json().catch(() => ({}));
-  return { ok: resp.ok, status: resp.status, body: body || {} };
 }
 
 // -- tree pane
@@ -1523,10 +1455,8 @@ async function resolveFsPickerListTarget(target) {
   if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
     return { listPath: target, selectedPath: '' };
   }
-  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
-  ), 'api_fs_stat');
-  const status = await resp.json().catch(() => ({}));
+  const resp = await filesIdeStat('', target);
+  const status = resp.body;
   if (!resp.ok) return { listPath: target, selectedPath: '' };
   if (status.exists && status.is_file && status.parent) {
     return { listPath: status.parent, selectedPath: status.path || target };
@@ -1559,10 +1489,8 @@ async function loadFsPicker(path) {
     fsPickerSelectedPath = resolved.selectedPath || '';
     fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
     fsPickerAnchorPath = fsPickerSelectedPath;
-    const resp = await dashboardJsonFetch('api_fs_list', { path: resolved.listPath }, () => (
-      authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath))
-    ), 'api_fs_list');
-    const data = await resp.json().catch(() => ({}));
+    const resp = await filesIdeList('', resolved.listPath);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
     const statusText = fsPickerSelectedPath
@@ -1815,14 +1743,10 @@ async function createPickerDirectory() {
   const path = document.getElementById('fs-picker-path')?.value.trim() || '';
   if (!path) return;
   setFsPickerStatus('', 'Creating directory...');
-  const resp = await dashboardJsonFetch('api_fs_mkdir', { path }, () => (
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    })
-  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // api_fs_mkdir is a POST twin: the facade's no-replay policy covers the
+  // fallbackAfterRpcFailure:false this call used to pass by hand.
+  const resp = await filesIdeMkdir('', path);
+  const data = resp.body;
   if (!resp.ok) {
     setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);
     return;
