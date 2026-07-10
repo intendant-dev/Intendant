@@ -1908,8 +1908,10 @@ function hydrateSessionRelationshipRows(rel) {
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
   const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (`url` survives as the error label).
+  daemonApi.request('api_sessions', { ids: pending })
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
       for (const id of pending) {

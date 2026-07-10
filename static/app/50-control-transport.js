@@ -1664,6 +1664,10 @@ function sessionDetailErrorIsMissing(data) {
   return String(data?.error || '').trim().toLowerCase() === 'session not found';
 }
 
+// daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+// fallback policy. Callers keep the payload-with-error contract this
+// helper always had — errors surface as data.error, never as throws for
+// delivered responses (sessionDetailErrorIsMissing keys off that).
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -1675,31 +1679,17 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
-  return dashboardTransport.rpcOrHttp('api_session_detail', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    if (options.limit !== undefined && options.limit !== null) {
-      query.set('limit', String(options.limit));
-    }
-    if (options.before !== undefined && options.before !== null) {
-      query.set('before', String(options.before));
-    }
-    const fetchOptions = {};
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    return data;
-  }, 'api_session_detail', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_detail', params, {
+    signal: options.signal,
+    cache: options.cache,
+  });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
 async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
@@ -1747,22 +1737,17 @@ async function fetchSessionsSearchPayload(options = {}) {
   const projects = Array.isArray(options.projects)
     ? options.projects.map(value => String(value || '').trim()).filter(Boolean)
     : [];
-  return dashboardTransport.rpcOrHttp('api_sessions_search', {
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy; the descriptor JSON-encodes `projects` on the HTTP
+  // lane exactly as the hand-built fallback did.
+  const resp = await daemonApi.request('api_sessions_search', {
     q: query,
     source,
     mode,
     projects,
-  }, async () => {
-    const params = new URLSearchParams({ q: query, source, mode });
-    if (projects.length > 0) {
-      params.set('projects', JSON.stringify(projects));
-    }
-    const resp = await authedFetch(`/api/sessions/search?${params.toString()}`, {
-      signal: options.signal,
-    });
-    if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
-    return resp.json();
-  }, 'api_sessions_search', { signal: options.signal });
+  }, { signal: options.signal });
+  if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchDashboardSettings() {
@@ -2080,25 +2065,20 @@ async function downloadSessionReportViaDashboardControl(event) {
       if (link) link.textContent = previousText || 'Download session report';
       return result;
     }
-    const useByteStream = dashboardControlTransport?.lastStatus?.byte_streams_available === true;
-    const report = useByteStream
-      ? await dashboardTransport.requestBytes('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 })
-      : await dashboardTransport.request('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 });
-    if (report?.ok === false || report?._httpOk === false) {
-      throw new Error(report.error || `Session report failed (${report._httpStatus || 'error'})`);
-    }
-    const bytes = report?.bytes instanceof Uint8Array
-      ? report.bytes
-      : dashboardControlBase64ToBytes(report?.data_base64 || '');
+    // daemonApi (transport F2): the bytes verb prefers the tunnel
+    // byte-stream lane and still decodes the pre-byte-stream JSON shape
+    // (data_base64 in the result) that old daemons answer with; a failed
+    // lane may replay the GET twin over direct HTTP (never in Connect
+    // mode). The un-intercepted direct case above keeps the native <a>
+    // navigation.
+    const { bytes, meta } = await daemonApi.bytes('api_session_report', {
+      session_id: 'current',
+    }, { timeoutMs: 120000 });
     if (!bytes.length) throw new Error('Session report was empty');
     downloadDashboardBytes(
       bytes,
-      report.filename || 'intendant-session-report.zip',
-      report.content_type || 'application/zip'
+      meta.filename || 'intendant-session-report.zip',
+      meta.contentType || 'application/zip'
     );
   } catch (err) {
     console.warn('[dashboard-control] api_session_report RPC failed', err);

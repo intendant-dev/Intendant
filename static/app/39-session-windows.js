@@ -1929,10 +1929,11 @@ async function hydrateSessionWindowIfEmpty(sessionId) {
   try {
     let record = sessionWindowHydrationRecord(sid);
     if (!record) {
-      const resp = await dashboardJsonFetch('api_sessions', { ids: [sid] }, () => fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' }), 'api_sessions_ids');
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (cache posture preserved).
+      const resp = await daemonApi.request('api_sessions', { ids: [sid] }, { cache: 'no-store' });
       if (resp.ok) {
-        const sessions = await resp.json();
-        cacheSessionWindowMetadata(sessions);
+        cacheSessionWindowMetadata(resp.body);
       }
       record = sessionWindowHydrationRecord(sid);
     }
@@ -1987,16 +1988,11 @@ function refreshSessionWindowMetadata(delay = 0, options = {}) {
     const ids = sessionWindowMetadataRequestIds();
     const url = sessionWindowMetadataUrl();
     const loadMetadata = async () => {
-      if (dashboardTransport?.canUseRpc()) {
-        try {
-          return await dashboardTransport.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
-        } catch (err) {
-          console.warn('[dashboard-control] api_sessions metadata RPC failed, falling back to HTTP', err);
-        }
-      }
-      const r = await authedFetch(url);
-      if (!r.ok) throw new Error(`${url} returned ${r.status}`);
-      return r.json();
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (`url` survives as the error label).
+      const resp = await daemonApi.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
+      if (!resp.ok) throw new Error(`${url} returned ${resp.status}`);
+      return resp.body;
     };
     sessionMetadataRefreshInFlight = loadMetadata()
       .then(sessions => cacheSessionWindowMetadata(sessions))
