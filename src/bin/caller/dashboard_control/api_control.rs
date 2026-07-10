@@ -2330,12 +2330,12 @@ mod tests {
         // list).
         let card = serde_json::json!({});
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::dashboard_targets_api_response(&card, None),
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None),
         );
         assert_eq!(status, 200);
         let frame = frame_api_ok_error_response(
             "parity-targets".to_string(),
-            crate::web_gateway::dashboard_targets_api_response(&card, None),
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None),
             "dashboard targets",
         );
         assert_eq!(frame["ok"], true);

@@ -92,6 +92,12 @@
 .acc-chip.route-webrtc { border-color: color-mix(in srgb, var(--teal) 35%, transparent); color: var(--teal); }
 .acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--overlay0); width: 5px; height: 5px; }
 .acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
+/* Trust tier chips on fleet cards (docs/src/trust-tiers.md): integrated
+   is the warm keep-your-guard-up accent, disposable stays muted. */
+.acc-chip.acc-tier-integrated::before { background: var(--peach); }
+.acc-chip.acc-tier-integrated { border-color: color-mix(in srgb, var(--peach) 35%, transparent); color: var(--peach); }
+.acc-chip.acc-tier-disposable::before { background: var(--overlay1); }
+.acc-chip.acc-tier-disposable { color: var(--subtext0); }
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {

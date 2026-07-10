@@ -618,6 +618,10 @@ pub(crate) fn control_frame_response(
                     crate::web_gateway::dashboard_targets_api_response(
                         &runtime.agent_card,
                         runtime.peer_registry.as_ref(),
+                        crate::web_gateway::local_daemon_tier(
+                            &crate::access::backend::select_backend().cert_dir(),
+                        )
+                        .as_deref(),
                     ),
                     "dashboard targets",
                 )),

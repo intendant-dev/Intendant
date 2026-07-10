@@ -939,12 +939,18 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::DashboardTargets => {
+                // Transport edge resolves the ambient cert dir (hermeticity
+                // convention) — the handler takes the tier as a parameter.
+                let local_tier = crate::web_gateway::local_daemon_tier(
+                    &crate::access::backend::select_backend().cert_dir(),
+                );
                 return handle_dashboard_targets(
                     stream,
                     peer_registry,
                     agent_card_value_for_targets,
                     route.cors,
                     fleet_cors_origin.as_deref(),
+                    local_tier.as_deref(),
                 )
                 .await;
             }

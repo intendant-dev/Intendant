@@ -828,6 +828,11 @@ struct FleetTargetRecord {
     // service stores it blind.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     enc_fields: String,
+    // Owner-set trust tier (docs/src/trust-tiers.md): part of the signed
+    // v4 record payload, relayed verbatim. The service never interprets
+    // it — clients verify it under the record signature.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    tier: String,
     #[serde(default)]
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1154,6 +1159,7 @@ fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
         "browser_tcp_via_url": target.browser_tcp_via_url,
         "connect_signaling_base": target.connect_signaling_base,
         "enc_fields": target.enc_fields,
+        "tier": target.tier,
         "origin": target.origin,
         "connect_daemon_id": target.connect_daemon_id,
         "capabilities": target.capabilities,

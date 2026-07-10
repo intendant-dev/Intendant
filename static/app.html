@@ -981,6 +981,12 @@ html {
 .acc-chip.route-webrtc { border-color: color-mix(in srgb, var(--teal) 35%, transparent); color: var(--teal); }
 .acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--overlay0); width: 5px; height: 5px; }
 .acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
+/* Trust tier chips on fleet cards (docs/src/trust-tiers.md): integrated
+   is the warm keep-your-guard-up accent, disposable stays muted. */
+.acc-chip.acc-tier-integrated::before { background: var(--peach); }
+.acc-chip.acc-tier-integrated { border-color: color-mix(in srgb, var(--peach) 35%, transparent); color: var(--peach); }
+.acc-chip.acc-tier-disposable::before { background: var(--overlay1); }
+.acc-chip.acc-tier-disposable { color: var(--subtext0); }
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {
@@ -25879,11 +25885,15 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   // v3 (encrypted records): the URL fields travel ONLY inside enc_fields,
   // so the signed lines pin them to empty — decrypting into the in-memory
   // record never invalidates the signature.
+  // v4 folds the enc line in unconditionally (may be empty) and appends
+  // the daemon's owner-set trust tier, so a store cannot relabel an
+  // integrated box as disposable without breaking the signature.
   const enc = version >= 3 ? String(record.enc_fields || '') : '';
   const blank = version >= 3 && enc;
   const lines = [
-    version >= 3 ? 'intendant-fleet-record-v3'
-      : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
+    version >= 4 ? 'intendant-fleet-record-v4'
+      : version >= 3 ? 'intendant-fleet-record-v3'
+        : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
     blank ? '' : String(record.url || ''),
@@ -25895,6 +25905,7 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   // device connects through the daemon's own rendezvous, not a default.
   if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
   if (version >= 3) lines.push(enc);
+  if (version >= 4) lines.push(String(record.tier || ''));
   lines.push(String(signedAt));
   return new TextEncoder().encode(lines.join('\n'));
 }
@@ -26011,7 +26022,7 @@ async function accessFleetSignRecord(record) {
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
-      accessFleetRecordPayload(record, signedAt, record.enc_fields ? 3 : 2)
+      accessFleetRecordPayload(record, signedAt, 4)
     );
     return {
       ...record,
@@ -26043,7 +26054,7 @@ async function accessFleetVerifyRecord(record) {
       ['verify']
     );
     let valid = false;
-    for (const version of record.enc_fields ? [3, 2, 1] : [2, 1]) {
+    for (const version of record.enc_fields ? [4, 3, 2, 1] : [4, 2, 1]) {
       valid = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,
@@ -51278,6 +51289,10 @@ function normalizeDashboardAccessTarget(target) {
     effective_role: String(target.effective_role || target.effectiveRole || '').trim(),
     effective_role_label: String(target.effective_role_label || target.effectiveRoleLabel || '').trim(),
     profile: String(target.profile || '').trim(),
+    // Owner-set trust tier, stamped by the daemon into its own targets
+    // payload and carried in the signed v4 fleet record (never on the
+    // public agent card — docs/src/trust-tiers.md § metadata carriers).
+    tier: String(target.tier || '').trim(),
     connected: target.connected !== false,
     capabilities,
   };
@@ -54844,6 +54859,17 @@ function renderAccessFleetStrip() {
     }
     const provenanceChip = accessTargetProvenanceChip(target);
     if (provenanceChip) meta.appendChild(provenanceChip);
+    // Owner-set trust tier from the signed v4 fleet record (or the live
+    // targets payload for the current daemon) — the fleet's zones at a
+    // glance, offline daemons included. Absent = unset: show nothing.
+    const tierMeta = ACCESS_TIER_META[String(target.tier || '').trim()];
+    if (tierMeta) {
+      const tierChip = document.createElement('span');
+      tierChip.className = `acc-chip acc-tier-${String(target.tier).trim()}`;
+      tierChip.textContent = `${tierMeta.glyph} ${tierMeta.label}`;
+      tierChip.title = tierMeta.short;
+      meta.appendChild(tierChip);
+    }
     // The door to the direct path (docs/src/trust-tiers.md): when the
     // record carries the daemon's own URL, offer it — a direct tab talks
     // straight to that daemon (local vault, no Connect service in the
