@@ -271,12 +271,13 @@ async function saveSettings() {
     codex_context_archive: controlCodexConfig.context_archive || 'summary',
   };
   try {
-    const resp = await dashboardTransport.jsonFetch('api_settings_save', payload, () => fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_settings_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — the fallback policy derives
+    // no-replay from the verb, exactly the legacy
+    // fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt
+    // is never replayed over HTTP; with no tunnel the write goes direct).
+    // Sensitive write: the payload shape is unchanged.
+    const resp = await daemonApi.request('api_settings_save', payload);
+    const data = resp.body;
     const status = g('settings-status');
     if (data.ok) {
       status.textContent = 'Saved';
@@ -411,12 +412,13 @@ async function saveApiKeys() {
   }
 
   try {
-    const resp = await dashboardTransport.jsonFetch('api_api_keys_save', { keys }, () => fetch('/api/api-keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keys }),
-    }), 'api_api_keys_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — no-replay after a delivered
+    // tunnel attempt (legacy fallbackAfterRpcFailure:false), direct HTTP
+    // only when no attempt was made. Sensitive write: the { keys } payload
+    // shape is unchanged, and the lane answers 200 with failures in the
+    // body on both transports (data.ok carries the verdict).
+    const resp = await daemonApi.request('api_api_keys_save', { keys });
+    const data = resp.body;
     const status = document.getElementById('settings-keys-status');
     if (data.ok) {
       status.textContent = 'Saved';

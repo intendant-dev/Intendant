@@ -21,10 +21,12 @@
 //     exactly this no-legacy-fallback behavior).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
-// staged uploads) and the F2 sessions-family reads as they migrate; the
-// remaining `rpcOrHttp`/`jsonFetch` call sites move onto these verbs family
-// by family per the design's frontend track. The boot smoke's
-// window.qa.daemonApi() probe asserts the facade evaluates.
+// staged uploads), the F2 sessions-family reads, and the F3 settings/keys
+// family (settings GET/POST, api-keys save, key-status, project-root,
+// external-agents, displays); the remaining `rpcOrHttp`/`jsonFetch` call
+// sites move onto these verbs family by family per the design's frontend
+// track. The boot smoke's window.qa.daemonApi() probe asserts the facade
+// evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -48,9 +50,11 @@
 // the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
-// Coverage: the F1 family (filesystem + staged uploads) and the F2
+// Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots). The
+// its NDJSON stream, search, detail, report, context snapshots), and the
+// F3 settings/keys family (settings GET/POST, api-keys save, key-status,
+// project-root, external-agents, displays). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -94,6 +98,13 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
   api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
   api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
+  api_settings: { verb: 'GET', path: '/api/settings' },
+  api_settings_save: { verb: 'POST', path: '/api/settings' },
+  api_api_keys_save: { verb: 'POST', path: '/api/api-keys' },
+  api_key_status: { verb: 'GET', path: '/api/api-key-status' },
+  api_project_root: { verb: 'GET', path: '/api/project-root' },
+  api_external_agents: { verb: 'GET', path: '/api/external-agents' },
+  api_displays: { verb: 'GET', path: '/api/displays' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────

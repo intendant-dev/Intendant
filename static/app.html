@@ -26099,10 +26099,12 @@ async function accessFleetRefreshProvenance() {
 //     exactly this no-legacy-fallback behavior).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
-// staged uploads) and the F2 sessions-family reads as they migrate; the
-// remaining `rpcOrHttp`/`jsonFetch` call sites move onto these verbs family
-// by family per the design's frontend track. The boot smoke's
-// window.qa.daemonApi() probe asserts the facade evaluates.
+// staged uploads), the F2 sessions-family reads, and the F3 settings/keys
+// family (settings GET/POST, api-keys save, key-status, project-root,
+// external-agents, displays); the remaining `rpcOrHttp`/`jsonFetch` call
+// sites move onto these verbs family by family per the design's frontend
+// track. The boot smoke's window.qa.daemonApi() probe asserts the facade
+// evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -26126,9 +26128,11 @@ async function accessFleetRefreshProvenance() {
 // the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
-// Coverage: the F1 family (filesystem + staged uploads) and the F2
+// Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots). The
+// its NDJSON stream, search, detail, report, context snapshots), and the
+// F3 settings/keys family (settings GET/POST, api-keys save, key-status,
+// project-root, external-agents, displays). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -26172,6 +26176,13 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
   api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
   api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
+  api_settings: { verb: 'GET', path: '/api/settings' },
+  api_settings_save: { verb: 'POST', path: '/api/settings' },
+  api_api_keys_save: { verb: 'POST', path: '/api/api-keys' },
+  api_key_status: { verb: 'GET', path: '/api/api-key-status' },
+  api_project_root: { verb: 'GET', path: '/api/project-root' },
+  api_external_agents: { verb: 'GET', path: '/api/external-agents' },
+  api_displays: { verb: 'GET', path: '/api/displays' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -68732,36 +68743,35 @@ async function fetchSessionsSearchPayload(options = {}) {
   return resp.body;
 }
 
+// The F3 settings/keys-family reads (below): daemonApi — tunnel first,
+// direct HTTP per the GET-twin fallback policy. These tunnel results ride
+// the body-only envelope (no injected status), so `resp.ok` reflects the
+// HTTP lane exactly where the legacy fallbacks threw on !resp.ok, and the
+// historical always-200 error bodies (settings GET's
+// {"error":"No project root"}) still arrive as ok bodies for callers to
+// inspect.
 async function fetchDashboardSettings() {
-  return dashboardTransport.rpcOrHttp('api_settings', {}, async () => {
-    const resp = await fetch('/api/settings');
-    if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
-    return resp.json();
-  }, 'api_settings');
+  const resp = await daemonApi.request('api_settings');
+  if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchApiKeyStatus() {
-  return dashboardTransport.rpcOrHttp('api_key_status', {}, async () => {
-    const resp = await fetch('/api/api-key-status');
-    if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
-    return resp.json();
-  }, 'api_key_status');
+  const resp = await daemonApi.request('api_key_status');
+  if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchExternalAgentAvailability() {
-  return dashboardTransport.rpcOrHttp('api_external_agents', {}, async () => {
-    const resp = await fetch('/api/external-agents');
-    if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
-    return resp.json();
-  }, 'api_external_agents');
+  const resp = await daemonApi.request('api_external_agents');
+  if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchProjectRoot() {
-  return dashboardTransport.rpcOrHttp('api_project_root', {}, async () => {
-    const resp = await fetch('/api/project-root');
-    if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
-    return resp.json();
-  }, 'api_project_root');
+  const resp = await daemonApi.request('api_project_root');
+  if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
+  return resp.body;
 }
 
 function dashboardReportRpcAvailable() {
@@ -69082,12 +69092,13 @@ function normalizeDisplaysPayload(payload) {
 }
 
 async function fetchLocalDisplaysPayload() {
-  return dashboardTransport.rpcOrHttp('api_displays', {}, async () => {
-    const resp = await authedFetch('/api/displays');
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    return data;
-  }, 'api_displays');
+  // daemonApi (transport F3): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (the HTTP error body's message survives as before).
+  const resp = await daemonApi.request('api_displays');
+  if (!resp.ok) {
+    throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
+  }
+  return resp.body;
 }
 
 function dashboardControlBindingPayload(binding) {
@@ -74537,12 +74548,13 @@ async function saveSettings() {
     codex_context_archive: controlCodexConfig.context_archive || 'summary',
   };
   try {
-    const resp = await dashboardTransport.jsonFetch('api_settings_save', payload, () => fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_settings_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — the fallback policy derives
+    // no-replay from the verb, exactly the legacy
+    // fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt
+    // is never replayed over HTTP; with no tunnel the write goes direct).
+    // Sensitive write: the payload shape is unchanged.
+    const resp = await daemonApi.request('api_settings_save', payload);
+    const data = resp.body;
     const status = g('settings-status');
     if (data.ok) {
       status.textContent = 'Saved';
@@ -74677,12 +74689,13 @@ async function saveApiKeys() {
   }
 
   try {
-    const resp = await dashboardTransport.jsonFetch('api_api_keys_save', { keys }, () => fetch('/api/api-keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keys }),
-    }), 'api_api_keys_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — no-replay after a delivered
+    // tunnel attempt (legacy fallbackAfterRpcFailure:false), direct HTTP
+    // only when no attempt was made. Sensitive write: the { keys } payload
+    // shape is unchanged, and the lane answers 200 with failures in the
+    // body on both transports (data.ok carries the verdict).
+    const resp = await daemonApi.request('api_api_keys_save', { keys });
+    const data = resp.body;
     const status = document.getElementById('settings-keys-status');
     if (data.ok) {
       status.textContent = 'Saved';
