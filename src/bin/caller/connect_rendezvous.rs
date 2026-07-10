@@ -2065,7 +2065,7 @@ fn authenticated(config: &ConnectConfig, builder: RequestBuilder) -> RequestBuil
     }
 }
 
-fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
+pub(crate) fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
     let mut url = base_url.clone();
     {
         let mut segments = url
