@@ -306,7 +306,16 @@ pub(crate) fn cached_limited_session_list_cache(
     SESSION_LIST_LIMITED_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) const SESSION_LIST_RESPONSE_STALE_MAX_SECS: u64 = 15 * 60;
+/// Serve-stale-while-revalidate ceiling for the session-list response
+/// caches. Native-session membership changes no longer ride this bound at
+/// all: the bus-driven invalidator (`spawn_session_list_cache_invalidator`
+/// in `startup/wiring.rs`) drops both cache tiers on session lifecycle
+/// events, so this window only limits staleness for changes the bus can't
+/// see — chiefly EXTERNAL backend session dirs (codex / claude) written by
+/// other processes. Three minutes keeps those reasonably fresh; the hard
+/// TTL (`SESSION_LIST_RESPONSE_CACHE_TTL_SECS`) stays at 30s as the storm
+/// shield for the 2026-07-05 relationship-hydration incident.
+pub(crate) const SESSION_LIST_RESPONSE_STALE_MAX_SECS: u64 = 3 * 60;
 
 pub(crate) fn session_list_refresh_inflight() -> &'static Mutex<HashSet<usize>> {
     static INFLIGHT: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
