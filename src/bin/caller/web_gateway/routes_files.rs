@@ -1366,13 +1366,6 @@ pub(crate) fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (S
     }))
 }
 
-pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
-    match mkdir_dashboard_fs_path(raw) {
-        Ok(body) => ("200 OK".to_string(), body.to_string()),
-        Err((status, message)) => (status, serde_json::json!({ "error": message }).to_string()),
-    }
-}
-
 pub(crate) fn system_time_unix_ms(time: std::time::SystemTime) -> Option<u64> {
     time.duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -1627,36 +1620,6 @@ pub(crate) fn apply_dashboard_fs_write(
     )
 }
 
-/// Tunnel-facing wrapper: apply a write whose payload arrived out-of-band
-/// (dashboard-control upload frames) with the request fields as JSON params.
-/// Returns `(http-ish status code, body)` for `http_body_response`.
-pub(crate) fn dashboard_fs_write_response_parts(
-    params: &serde_json::Value,
-    bytes: &[u8],
-) -> (u16, String) {
-    let args = FsWriteArgs {
-        path: params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        expected_sha256: params
-            .get("expected_sha256")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        create_new: params
-            .get("create_new")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        force: params
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-    };
-    let (status_line, body) = apply_dashboard_fs_write(&args, bytes);
-    (status_line_u16(&status_line), body.to_string())
-}
-
 /// Rename/move half of the dashboard editor. Same contract as
 /// [`apply_dashboard_fs_write`]: the caller has already routed **both** paths
 /// through the write-scope gate — this function performs no IAM checks of its
@@ -1882,36 +1845,6 @@ pub(crate) fn apply_dashboard_fs_delete(
     }
 }
 
-/// Tunnel-facing wrapper for [`apply_dashboard_fs_rename`]: request fields
-/// as JSON params, `(http-ish status code, body)` out for
-/// `http_body_response`.
-pub(crate) fn dashboard_fs_rename_response_parts(params: &serde_json::Value) -> (u16, String) {
-    let from = params
-        .get("from")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let to = params
-        .get("to")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let (status_line, body) = apply_dashboard_fs_rename(from, to);
-    (status_line_u16(&status_line), body.to_string())
-}
-
-/// Tunnel-facing wrapper for [`apply_dashboard_fs_delete`].
-pub(crate) fn dashboard_fs_delete_response_parts(params: &serde_json::Value) -> (u16, String) {
-    let path = params
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let recursive = params
-        .get("recursive")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let (status_line, body) = apply_dashboard_fs_delete(path, recursive);
-    (status_line_u16(&status_line), body.to_string())
-}
-
 pub(crate) fn status_line_u16(status_line: &str) -> u16 {
     status_line
         .split_whitespace()
@@ -1943,25 +1876,61 @@ pub(crate) async fn fs_write_api_response(req: FsWriteRequest) -> ApiResponse {
                 create_new: req.create_new,
                 force: req.force,
             };
-            let (status, body) =
-                tokio::task::spawn_blocking(move || apply_dashboard_fs_write(&args, &bytes))
-                    .await
-                    .unwrap_or_else(|e| {
-                        (
-                            "500 Internal Server Error".to_string(),
-                            serde_json::json!({
-                                "error": format!(
-                                    "filesystem write task failed: {e}"
-                                )
-                            }),
-                        )
-                    });
-            ApiResponse::json(
-                status_line_u16(&status),
-                JsonBody::PreSerialized(body.to_string()),
-            )
+            fs_write_bytes_api_response(args, bytes).await
         }
         Err(message) => ApiResponse::json_error(400, message),
+    }
+}
+
+/// Bytes-taking transport-neutral core of the fs write apply leg. The
+/// content-carriage asymmetry is preserved by design (§2.7): HTTP
+/// decodes JSON `content`/`content_b64` into these bytes
+/// ([`fs_write_api_response`] above); the tunnel spools them from
+/// `upload_start/chunk/end` frames. Path authorization is the caller's
+/// lane gate.
+pub(crate) async fn fs_write_bytes_api_response(args: FsWriteArgs, bytes: Vec<u8>) -> ApiResponse {
+    let (status, body) =
+        tokio::task::spawn_blocking(move || apply_dashboard_fs_write(&args, &bytes))
+            .await
+            .unwrap_or_else(|e| {
+                (
+                    "500 Internal Server Error".to_string(),
+                    serde_json::json!({
+                        "error": format!(
+                            "filesystem write task failed: {e}"
+                        )
+                    }),
+                )
+            });
+    ApiResponse::json(
+        status_line_u16(&status),
+        JsonBody::PreSerialized(body.to_string()),
+    )
+}
+
+/// The tunnel's write params→args fold (lifted from the retired
+/// `dashboard_fs_write_response_parts` bridge; HTTP's twin decode is
+/// the serde [`FsWriteRequest`]). Param decode stays transport-owned:
+/// these are the historical lenient reads, verbatim.
+pub(crate) fn fs_write_args_from_params(params: &serde_json::Value) -> FsWriteArgs {
+    FsWriteArgs {
+        path: params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        expected_sha256: params
+            .get("expected_sha256")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        create_new: params
+            .get("create_new")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        force: params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
 

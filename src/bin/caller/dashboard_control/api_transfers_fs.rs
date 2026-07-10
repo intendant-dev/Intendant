@@ -797,49 +797,59 @@ pub(crate) async fn api_fs_mkdir_response(
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    // Transport-owned param decode (HTTP's twin decodes a typed serde
+    // request); the historical string_param read carries over verbatim.
     let path = string_param(&params, &["path"]);
-    let (status_line, body) = crate::web_gateway::dashboard_fs_mkdir_response_body(&path);
-    http_body_response(id, status_line_code(&status_line), body, "filesystem mkdir")
+    frame_api_response(
+        id,
+        crate::web_gateway::fs_mkdir_api_response(&path),
+        "filesystem mkdir",
+    )
 }
 
 pub(crate) async fn api_fs_rename_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::dashboard_fs_rename_response_parts(&params)
-    })
-    .await;
-    match result {
-        Ok((code, body)) => http_body_response(id, code, body, "filesystem rename"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("filesystem rename task failed: {e}"),
-        }),
-    }
+    // Transport-owned param decode: the historical lenient reads,
+    // verbatim (the neutral fn owns the blocking apply leg).
+    let from = params
+        .and_then(|p| p.get("from"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let to = params
+        .and_then(|p| p.get("to"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::fs_rename_api_response(from, to).await,
+        "filesystem rename",
+    )
 }
 
 pub(crate) async fn api_fs_delete_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::dashboard_fs_delete_response_parts(&params)
-    })
-    .await;
-    match result {
-        Ok((code, body)) => http_body_response(id, code, body, "filesystem delete"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("filesystem delete task failed: {e}"),
-        }),
-    }
+    // Transport-owned param decode: the historical lenient reads,
+    // verbatim (the neutral fn owns the blocking apply leg).
+    let path = params
+        .and_then(|p| p.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let recursive = params
+        .and_then(|p| p.get("recursive"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    frame_api_response(
+        id,
+        crate::web_gateway::fs_delete_api_response(path, recursive).await,
+        "filesystem delete",
+    )
 }
 
 /// Terminal leg of an `api_fs_write` upload: the file contents arrived via
@@ -867,16 +877,23 @@ pub(crate) async fn api_fs_write_upload_task_response(
             done: true,
         };
     }
-    let result = tokio::task::spawn_blocking(move || {
-        let bytes = std::fs::read(upload.tmp.path())?;
-        Ok::<_, std::io::Error>(crate::web_gateway::dashboard_fs_write_response_parts(
-            &upload.params,
-            &bytes,
-        ))
+    // Drain the upload spool off the async runtime — the content
+    // carriage is transport-owned (the tunnel's upload lane vs HTTP's
+    // JSON content fields); the apply leg is the shared neutral seam.
+    let read_result = tokio::task::spawn_blocking(move || {
+        std::fs::read(upload.tmp.path()).map(|bytes| (upload.params, bytes))
     })
     .await;
-    let frame = match result {
-        Ok(Ok((code, body))) => http_body_response(id.clone(), code, body, "filesystem write"),
+    let frame = match read_result {
+        Ok(Ok((params, bytes))) => frame_api_response(
+            id.clone(),
+            crate::web_gateway::fs_write_bytes_api_response(
+                crate::web_gateway::fs_write_args_from_params(&params),
+                bytes,
+            )
+            .await,
+            "filesystem write",
+        ),
         Ok(Err(e)) => http_body_response(
             id.clone(),
             500,
@@ -1198,6 +1215,233 @@ mod tests {
         assert_eq!(tunnel_body["error"], http_body["error"]);
         assert_eq!(tunnel_body["ok"], false);
         assert!(http_body.get("ok").is_none());
+    }
+
+    // ── Quartet parity (S2b): mkdir/rename/delete/write ──
+    //
+    // Same discipline as the stat/list/read set above; all four are
+    // JSON-lane, so envelope differences #1 (tunnel result wrapper +
+    // injected status metadata) and #2 (HTTP header decoration) apply
+    // verbatim. The quartet-specific differences, pinned here:
+    //
+    //  8. Write content carriage (design §2.7's preserved asymmetry):
+    //     HTTP carries JSON `content`/`content_b64` (exactly one,
+    //     under the row's body cap) decoded by the serde
+    //     FsWriteRequest; the tunnel spools raw bytes via
+    //     upload_start/chunk/end frames and folds its params
+    //     leniently (fs_write_args_from_params).
+    //  9. Param decode is transport-owned: HTTP's typed serde decode
+    //     rejects missing/mistyped fields as 400 "invalid JSON"
+    //     before the neutral fn runs; the tunnel's historical lenient
+    //     reads (string_param trim/coercion on mkdir; as_str/as_bool
+    //     defaults on rename/delete/write) reach the neutral fn with
+    //     defaults instead.
+    // 10. The formerly tunnel-side spawn-join arms (unreachable in
+    //     practice) now converge on the neutral fns' enveloped 500s;
+    //     only the tunnel's upload-spool read keeps its historical
+    //     bare-frame join arm and tempfile-read 500.
+    //
+    // Mutations are compared under identical pre-state: fixtures
+    // reset the filesystem between the HTTP-render leg and the tunnel
+    // leg, so "same params ⇒ same body" holds exactly (the write
+    // success leg normalizes the time-varying `modified_ms` only).
+
+    #[tokio::test]
+    async fn parity_fs_mkdir_serves_the_same_body_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("made-here");
+        let target_params = serde_json::json!({ "path": target.to_string_lossy() });
+
+        // Create leg (reset between transports).
+        let (status, _headers, body) = http_parts(crate::web_gateway::fs_mkdir_api_response(
+            &target.to_string_lossy(),
+        ));
+        assert_eq!(status, 200);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["created"], true);
+        std::fs::remove_dir(&target).unwrap();
+        let frame = api_fs_mkdir_response("parity-mkdir".to_string(), Some(&target_params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+
+        // Already-exists and relative-path legs are idempotent.
+        for (params, path) in [
+            (
+                serde_json::json!({ "path": dir.path().to_string_lossy() }),
+                dir.path().to_string_lossy().into_owned(),
+            ),
+            (
+                serde_json::json!({ "path": "relative/path" }),
+                "relative/path".to_string(),
+            ),
+        ] {
+            let (status, _headers, body) =
+                http_parts(crate::web_gateway::fs_mkdir_api_response(&path));
+            let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let frame = api_fs_mkdir_response("parity-mkdir".to_string(), Some(&params)).await;
+            assert_eq!(tunnel_result_body(&frame, status), http_body, "{params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_fs_rename_serves_the_same_body_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("from.txt");
+        let dest = dir.path().join("to.txt");
+        let params = serde_json::json!({
+            "from": source.to_string_lossy(),
+            "to": dest.to_string_lossy(),
+        });
+
+        // Success leg (reset between transports).
+        std::fs::write(&source, b"payload").unwrap();
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::fs_rename_api_response(
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["renamed"], true);
+        std::fs::rename(&dest, &source).unwrap();
+        let frame = api_fs_rename_response("parity-rename".to_string(), Some(&params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+        std::fs::rename(&dest, &source).unwrap();
+
+        // Destination-exists 409 (idempotent: state untouched).
+        std::fs::write(&dest, b"occupied").unwrap();
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::fs_rename_api_response(
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+            )
+            .await,
+        );
+        assert_eq!(status, 409);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["code"], "exists");
+        let frame = api_fs_rename_response("parity-rename".to_string(), Some(&params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+
+        // Missing-source 404 (idempotent).
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::fs_rename_api_response(
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+            )
+            .await,
+        );
+        assert_eq!(status, 404);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let frame = api_fs_rename_response("parity-rename".to_string(), Some(&params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_fs_delete_serves_the_same_body_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // File-delete success leg (reset between transports).
+        let file = dir.path().join("victim.txt");
+        std::fs::write(&file, b"bytes").unwrap();
+        let params = serde_json::json!({ "path": file.to_string_lossy() });
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::fs_delete_api_response(
+                file.to_string_lossy().into_owned(),
+                false,
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["deleted"], true);
+        std::fs::write(&file, b"bytes").unwrap();
+        let frame = api_fs_delete_response("parity-delete".to_string(), Some(&params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+
+        // Non-empty directory 409 without recursive (idempotent).
+        let full = dir.path().join("occupied");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("keep.txt"), b"keep").unwrap();
+        let params = serde_json::json!({ "path": full.to_string_lossy() });
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::fs_delete_api_response(
+                full.to_string_lossy().into_owned(),
+                false,
+            )
+            .await,
+        );
+        assert_eq!(status, 409);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["code"], "not_empty");
+        let frame = api_fs_delete_response("parity-delete".to_string(), Some(&params)).await;
+        assert_eq!(tunnel_result_body(&frame, status), http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_fs_write_serves_the_same_body_under_both_carriages() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edited.toml");
+        let content = b"[section]\nkey = \"value\"\n";
+        std::fs::write(&file, content).unwrap();
+
+        // Force-overwrite with the byte-identical payload: pre-state is
+        // identical before each leg; only `modified_ms` varies (pinned
+        // present, then normalized out).
+        let http_request: crate::web_gateway::FsWriteRequest =
+            serde_json::from_value(serde_json::json!({
+                "path": file.to_string_lossy(),
+                "content": String::from_utf8_lossy(content),
+                "force": true,
+            }))
+            .unwrap();
+        let (status, _headers, body) =
+            http_parts(crate::web_gateway::fs_write_api_response(http_request).await);
+        assert_eq!(status, 200);
+        let mut http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tunnel_params = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "force": true,
+        });
+        let response = api_fs_write_upload_task_response(
+            "parity-write".to_string(),
+            test_upload_state("api_fs_write", tunnel_params, content),
+            runtime(),
+        )
+        .await;
+        let mut tunnel_body = tunnel_result_body(&response.frame, status);
+        for body in [&mut http_body, &mut tunnel_body] {
+            let map = body.as_object_mut().expect("write body object");
+            assert!(
+                map.remove("modified_ms").is_some(),
+                "modified_ms present: {map:?}"
+            );
+        }
+        assert_eq!(tunnel_body, http_body);
+
+        // Precondition-required 400 (idempotent, fully deterministic).
+        let http_request: crate::web_gateway::FsWriteRequest =
+            serde_json::from_value(serde_json::json!({
+                "path": file.to_string_lossy(),
+                "content": String::from_utf8_lossy(content),
+            }))
+            .unwrap();
+        let (status, _headers, body) =
+            http_parts(crate::web_gateway::fs_write_api_response(http_request).await);
+        assert_eq!(status, 400);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(http_body["code"], "precondition_required");
+        let tunnel_params = serde_json::json!({ "path": file.to_string_lossy() });
+        let response = api_fs_write_upload_task_response(
+            "parity-write-precondition".to_string(),
+            test_upload_state("api_fs_write", tunnel_params, content),
+            runtime(),
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&response.frame, status), http_body);
     }
 
     #[tokio::test]
