@@ -67,14 +67,12 @@ const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonom
 // the four design sections — and back when the flag is off — so both
 // generations of deep link keep landing somewhere sensible. 'network'
 // stays out of both maps: its Access redirect below handles it.
-const SETTINGS_SUBTAB_TO_V2 = { account: 'providers', agent: 'providers', debug: 'advanced' };
-const SETTINGS_SUBTAB_TO_V1 = { autonomy: 'agent', providers: 'account', presence: 'agent', advanced: 'debug' };
+// Legacy v1-era subtab names in old bookmarks/deep links map onto the
+// sections that absorbed them.
+const SETTINGS_SUBTAB_ALIASES = { account: 'providers', agent: 'providers', debug: 'advanced' };
 function normalizeSettingsSubtab(name) {
   const raw = String(name || '').trim();
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    return SETTINGS_SUBTAB_TO_V2[raw] || raw;
-  }
-  return SETTINGS_SUBTAB_TO_V1[raw] || raw;
+  return SETTINGS_SUBTAB_ALIASES[raw] || raw;
 }
 const ACCESS_SUBTAB_ALIASES = {
   targets: 'daemons',
@@ -2009,11 +2007,8 @@ function switchSettingsSubtab(name) {
 // inline onclick handlers (the unfueled banner's Add-keys button) and the
 // validate-dashboard harness need an explicit global.
 function focusSettingsApiKeys() {
-  // Under ui-v2 the API-keys card lives in the Providers & models
-  // section (same DOM node, re-parented) — route to the canonical
-  // per-generation section so the hash stays truthful.
-  const keysSubtab = (typeof ui2Enabled === 'function' && ui2Enabled()) ? 'providers' : 'account';
-  routeTo('settings', keysSubtab);
+  // The API-keys card lives in the Providers & models section.
+  routeTo('settings', 'providers');
   requestAnimationFrame(() => {
     const heading = document.getElementById('settings-keys-heading');
     const card = heading?.closest('.ui-card') || heading;
@@ -2052,12 +2047,10 @@ function applyInitialSettingsSubtab() {
 function updateSettingsSaveRow() {
   const row = document.querySelector('#tab-settings .settings-save-row');
   if (!row) return;
-  // ui-v2: the batch-saved /api/settings fields live in the Providers &
-  // models and Presence & voice sections; Autonomy is live-apply and
-  // Account & advanced is read-only.
-  const visible = (typeof ui2Enabled === 'function' && ui2Enabled())
-    ? (activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence')
-    : (activeSettingsSubtab === 'agent');
+  // The batch-saved /api/settings fields live in the Providers & models
+  // and Presence & voice sections; Autonomy is live-apply and Account &
+  // advanced is read-only.
+  const visible = activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence';
   row.style.display = visible ? '' : 'none';
 }
 

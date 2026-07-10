@@ -816,6 +816,201 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     child.kill().await.expect("stop the daemon");
 }
 
+/// Worktree sessions, the daemon lane: `CreateSession { worktree: true }`
+/// must branch a fresh worktree off the project's HEAD and run the session
+/// INSIDE it. The scripted loop proves the cwd through the real runtime by
+/// writing a relative-path probe file — it must land in the worktree
+/// checkout, not the base project — and the session's recorded meta pins
+/// the linkage (branch, checkout path, base branch/sha) plus the effective
+/// project root.
+#[tokio::test]
+async fn create_session_with_worktree_runs_inside_the_worktree() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    // The daemon's default project is a real git repo with one commit
+    // (worktree launches branch from HEAD, so an empty repo is an error by
+    // design). intendant.toml doubles as the rooted-daemon marker
+    // spawn_daemon_on_rig would write; committing it keeps the base clean.
+    let project = rig.project.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "e2e@test.com"]);
+    git(&["config", "user.name", "E2E"]);
+    std::fs::write(project.join("intendant.toml"), "").expect("project marker");
+    std::fs::write(project.join("README.md"), "# worktree e2e\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+    let base_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&project)
+            .output()
+            .expect("read base HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // `echo MARKER && echo done > wt_probe.txt` works under both sh and
+    // cmd; the relative redirect target is the cwd proof.
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Writing the cwd probe.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1,
+                                                  "command": "echo WORKTREE_E2E_ROUNDTRIP && echo done > wt_probe.txt" } }] },
+                { "expect_transcript_contains": "WORKTREE_E2E_ROUNDTRIP",
+                  "content": "Probe written.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "worktree session complete" } }] }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, free_loopback_port(), false).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", daemon.port))
+            .await
+            .expect("connect /ws");
+
+    // The very first control message can race daemon startup on a
+    // saturated box (the gateway accepts /ws a beat before the
+    // supervisor's bus subscription), so retry until session_started.
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "write the probe file in the isolated checkout",
+                "direct": true,
+                "worktree": true,
+                "worktree_branch": "wt-e2e",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send worktree create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("isolated checkout"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "worktree create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
+
+    // The worktree exists where the launch contract says (a `.git` file,
+    // not a directory, marks a linked worktree checkout).
+    let worktree_path = project.join(".intendant").join("worktrees").join("wt-e2e");
+    assert!(
+        worktree_path.join(".git").is_file(),
+        "expected a linked worktree checkout at {}",
+        worktree_path.display()
+    );
+
+    // cwd proof: the relative-path probe landed inside the worktree, and
+    // did NOT land in the base project.
+    assert!(
+        worktree_path.join("wt_probe.txt").is_file(),
+        "probe file missing from the worktree — the session did not run inside it; daemon log:\n{}",
+        daemon.log_tail()
+    );
+    assert!(
+        !project.join("wt_probe.txt").exists(),
+        "probe file leaked into the base project — the session ran in the wrong cwd"
+    );
+
+    // Recorded linkage: effective project root is the worktree, and the
+    // worktree meta names the branch and where it branched from.
+    let meta_raw = std::fs::read_to_string(
+        daemon
+            .rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id)
+            .join("session_meta.json"),
+    )
+    .expect("session_meta.json for the worktree session");
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("meta parses");
+    let recorded_root = meta
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .expect("meta records a project root");
+    assert!(
+        std::fs::canonicalize(recorded_root).expect("recorded root exists")
+            == std::fs::canonicalize(&worktree_path).expect("worktree exists"),
+        "meta project_root {recorded_root} is not the worktree {}",
+        worktree_path.display()
+    );
+    let linkage = meta.get("worktree").expect("meta records worktree linkage");
+    assert_eq!(linkage["branch"], "wt-e2e", "{linkage}");
+    assert_eq!(linkage["base_branch"], "main", "{linkage}");
+    assert_eq!(linkage["base_sha"], serde_json::json!(base_head), "{linkage}");
+    assert!(
+        linkage
+            .get("base_root")
+            .and_then(|v| v.as_str())
+            .is_some_and(
+                |root| std::fs::canonicalize(root).ok() == std::fs::canonicalize(&project).ok()
+            ),
+        "{linkage}"
+    );
+
+    // The done signal only fired after the runtime round-trip, and the
+    // base checkout never left its branch.
+    assert!(
+        daemon
+            .rig
+            .session_logs()
+            .contains("worktree session complete"),
+        "session log missing the done signal"
+    );
+    let base_branch_now = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(&project)
+        .output()
+        .expect("read base branch");
+    assert_eq!(
+        String::from_utf8_lossy(&base_branch_now.stdout).trim(),
+        "main",
+        "worktree launch must not move the base checkout"
+    );
+
+    daemon.child.kill().await.expect("stop the daemon");
+}
+
 #[tokio::test]
 async fn mock_provider_without_a_script_fails_closed() {
     let rig = TestRig::new();
@@ -840,6 +1035,136 @@ async fn mock_provider_without_a_script_fails_closed() {
         evidence.contains("INTENDANT_MOCK_SCRIPT"),
         "expected the mock-script configuration error, got:\n{evidence}"
     );
+}
+
+/// `intendant ctl session note` against a live daemon, end to end:
+/// (1) the note broadcasts as an `OutboundEvent::SessionNote` on `/ws`
+/// with the text, source, and attachment *references* (never bytes);
+/// (2) the referenced blob really serves from the upload store's `/raw`
+/// route with the stored MIME and exact bytes; (3) the note persists as a
+/// `session_note` row in the session log — the replay source of truth.
+#[tokio::test]
+async fn ctl_session_note_posts_a_display_only_note_with_image() {
+    const NOTE_TEXT: &str = "E2E_SESSION_NOTE milestone reached";
+    // Not a decodable PNG — the note rail stores and serves bytes verbatim,
+    // so any payload proves the round trip.
+    const IMAGE_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    let image_path = daemon.rig.project.path().join("note-image.png");
+    std::fs::write(&image_path, IMAGE_BYTES).expect("write note image");
+
+    // Subscribe before posting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "session",
+            "note",
+            NOTE_TEXT,
+            "--image",
+            image_path.to_str().expect("utf8 image path"),
+            "--session",
+            "note-e2e-session",
+            "--source",
+            "e2e",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let posted = stdout_json(&output);
+    assert_eq!(posted["status"], "posted", "{posted}");
+    assert_eq!(posted["session_id"], "note-e2e-session", "{posted}");
+    let note_id = posted["note_id"].as_str().expect("note_id").to_string();
+    let attachment_url = posted["attachments"][0]["url"]
+        .as_str()
+        .expect("attachment url")
+        .to_string();
+
+    // (1) The /ws broadcast carries the note as references, not bytes.
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_note")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "session_note never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["note_id"], note_id.as_str(), "{event}");
+    assert_eq!(event["text"], NOTE_TEXT, "{event}");
+    assert_eq!(event["source"], "e2e", "{event}");
+    assert_eq!(event["session_id"], "note-e2e-session", "{event}");
+    assert_eq!(event["attachments"][0]["url"], attachment_url.as_str(), "{event}");
+    assert_eq!(event["attachments"][0]["mime"], "image/png", "{event}");
+    assert!(
+        event["attachments"][0].get("data").is_none(),
+        "attachments must be references, never inline bytes: {event}"
+    );
+
+    // (2) The referenced blob serves with the stored MIME and exact bytes.
+    let response = client
+        .get(format!("http://127.0.0.1:{port}{attachment_url}"))
+        .send()
+        .await
+        .expect("GET note attachment");
+    assert!(
+        response.status().is_success(),
+        "attachment fetch failed: HTTP {}\n{}",
+        response.status(),
+        daemon.log_tail()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = response.bytes().await.expect("attachment bytes");
+    assert_eq!(&bytes[..], IMAGE_BYTES, "blob bytes must round-trip");
+
+    // (3) The note persisted to the session log for replay.
+    poll_until(
+        "the session_note row in the session log",
+        RUN_TIMEOUT,
+        || {
+            let logs = daemon.rig.session_logs();
+            let note_id = note_id.clone();
+            async move {
+                (logs.contains("\"event\":\"session_note\"") && logs.contains(&note_id))
+                    .then_some(())
+            }
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
 }
 
 /// `intendant ctl peer …` against a live federated pair: daemon A federates

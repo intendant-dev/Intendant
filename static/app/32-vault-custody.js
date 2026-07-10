@@ -2460,7 +2460,6 @@ function renderAccessVaultSection() {
    link card is left behind so #access/advanced deep links (unfueled
    empty-state, older bookmarks) still lead somewhere honest. */
 function ui2VaultAdoptSections() {
-  if (typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
   if (DASHBOARD_ACCESS_PAGE_MODE) return;
   const host = document.getElementById('vault-tab-sections');
   const vaultMount = document.getElementById('access-vault-section');

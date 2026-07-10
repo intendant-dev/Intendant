@@ -604,28 +604,17 @@ function initShell() {
   document.getElementById('xterm-css').removeAttribute('disabled');
 
   const start = () => {
-    // ui-v2 re-themes the same instance from design tokens (and turns on
-    // the design's blinking block cursor); v1 keeps Catppuccin Mocha
-    // verbatim. Sizing/fit logic is identical in both generations.
-    const ui2 = typeof ui2Enabled === 'function' && ui2Enabled();
-    const theme = (ui2 && ui2ShellTheme()) || {
-      background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
-      selectionBackground: '#45475a',
-      black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-      blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-      brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-      brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-      brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-    };
-    const ui2Mono = ui2
-      ? getComputedStyle(document.documentElement).getPropertyValue('--mono').trim()
-      : '';
+    // Theme from the design tokens (blinking block cursor per the
+    // design); `|| undefined` keeps xterm's built-in default as the net
+    // if the tokens ever fail to resolve.
+    const theme = ui2ShellTheme() || undefined;
+    const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
     shellTerm = new Terminal({
       theme,
-      fontFamily: ui2Mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+      fontFamily: mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
       fontSize: 13, allowProposedApi: true,
       scrollback: 5000,
-      cursorBlink: ui2,
+      cursorBlink: true,
     });
     shellFitAddon = new FitAddon.FitAddon();
     shellTerm.loadAddon(shellFitAddon);
@@ -654,13 +643,11 @@ function initShell() {
     // Live theme flips: xterm latched the palette resolved above; re-apply
     // from the current tokens whenever data-theme changes (a light terminal
     // otherwise sits inside a dark app, and vice versa).
-    if (ui2) {
-      new MutationObserver(() => {
-        if (!shellTerm || typeof ui2Enabled !== 'function' || !ui2Enabled()) return;
-        const t = ui2ShellTheme();
-        if (t) shellTerm.options.theme = t;
-      }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-    }
+    new MutationObserver(() => {
+      if (!shellTerm) return;
+      const t = ui2ShellTheme();
+      if (t) shellTerm.options.theme = t;
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
     // Forward every byte the user types straight to the PTY. We use
     // `onData` (not `onKey`) so sequences like arrow keys, Ctrl+C, and
@@ -860,13 +847,10 @@ function wireShellKeybar() {
   // rule forces the bar visible on touch devices regardless of this class.
   const toggle = document.getElementById('keybar-toggle');
   if (toggle) {
-    // ui-v2: the Terminal sub-tab strip is hidden (Shell is its only
-    // sub-tab) and the Keys toggle joins the shell toolbar, matching the
-    // design's toolbar placement. The element keeps its id and listeners;
-    // v1 keeps the strip untouched.
-    if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-      document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
-    }
+    // The Terminal sub-tab strip is hidden (Shell is its only sub-tab);
+    // the Keys toggle joins the shell toolbar, matching the design's
+    // toolbar placement. The element keeps its id and listeners.
+    document.querySelector('#tab-terminal .shell-toolbar')?.appendChild(toggle);
     const isCoarse = window.matchMedia('(pointer: coarse)').matches;
     if (isCoarse) {
       toggle.classList.add('active');

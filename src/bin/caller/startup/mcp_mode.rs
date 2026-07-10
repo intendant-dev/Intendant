@@ -140,6 +140,8 @@ pub(crate) async fn run_mcp_mode(
     mcp_app_state.codex_managed_context =
         project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
+    // Matches the project root the gateway above serves uploads from.
+    mcp_app_state.project_root = Some(project.root.clone());
     mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
     mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
     mcp_app_state.session_id = session_log

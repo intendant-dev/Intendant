@@ -78,18 +78,11 @@ const UI2_AUTONOMY_TAGS = {
   Full: 'ungated',
 };
 
+// The v1 chrome and its runtime flag are gone; the ui-v2 chrome is the
+// only generation. Kept as a constant on the QA facade so harness probes
+// written against the flag era keep working.
 function ui2Enabled() {
-  return document.documentElement.classList.contains('ui-v2');
-}
-
-// Persist + reload: the two chromes are alternate DOM, not alternate CSS
-// only, so a live toggle re-boots the app. Callers: the palette/settings
-// escape hatches and the QA harness.
-function ui2SetEnabled(on) {
-  try { localStorage.setItem('intendant.ui2', on ? '1' : '0'); } catch (e) { /* private mode */ }
-  const url = new URL(location.href);
-  url.searchParams.delete('ui');
-  location.replace(url.toString());
+  return true;
 }
 
 // Theme (design-system import): dark is the default; light remaps the
@@ -118,6 +111,6 @@ function ui2Icon(name, size = 18) {
 
 // QA/debug facade (mirrors the window.qa / stationProbe convention).
 window.__ui2 = {
-  enabled: ui2Enabled, setEnabled: ui2SetEnabled, icon: ui2Icon,
+  enabled: ui2Enabled, icon: ui2Icon,
   theme: ui2Theme, setTheme: ui2SetTheme,
 };

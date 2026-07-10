@@ -207,6 +207,14 @@ pub(crate) struct PushSubscribeRequest {
     auth: String,
     #[serde(default)]
     label: String,
+    /// Presence (offline/online) alerts. Default on — the block's original
+    /// purpose.
+    #[serde(default)]
+    notify_presence: Option<bool>,
+    /// Pending agent-request (approval/question) alerts. Default OFF —
+    /// strictly opt-in.
+    #[serde(default)]
+    notify_requests: Option<bool>,
 }
 
 pub(crate) async fn push_subscribe(
@@ -252,7 +260,8 @@ pub(crate) async fn push_subscribe(
             auth,
             label: clean_fleet_text(&body.label, FLEET_LABEL_MAX),
             created_unix_ms: now_unix_ms(),
-            notify_presence: true,
+            notify_presence: body.notify_presence.unwrap_or(true),
+            notify_requests: body.notify_requests.unwrap_or(false),
         });
         audit(
             &mut store,
@@ -293,6 +302,252 @@ pub(crate) async fn push_unsubscribe(
         removed
     };
     Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// The caller's own subscriptions with their alert flags (no keys) — how
+/// the /connect page paints its per-browser toggles.
+pub(crate) async fn push_subscriptions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let subscriptions: Vec<serde_json::Value> = {
+        let store = state.store.lock().await;
+        store
+            .push_subscriptions
+            .iter()
+            .filter(|record| record.user_id == user.id)
+            .map(|record| {
+                json!({
+                    "endpoint": record.endpoint,
+                    "label": record.label,
+                    "created_unix_ms": record.created_unix_ms,
+                    "notify_presence": record.notify_presence,
+                    "notify_requests": record.notify_requests,
+                })
+            })
+            .collect()
+    };
+    Ok(Json(json!({ "ok": true, "subscriptions": subscriptions })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PushPreferencesRequest {
+    endpoint: String,
+    #[serde(default)]
+    notify_presence: Option<bool>,
+    #[serde(default)]
+    notify_requests: Option<bool>,
+}
+
+/// Flip alert flags on an existing subscription without re-subscribing.
+pub(crate) async fn push_preferences(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PushPreferencesRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    let endpoint = body.endpoint.trim();
+    let (notify_presence, notify_requests) = {
+        let mut store = state.store.lock().await;
+        let record = store
+            .push_subscriptions
+            .iter_mut()
+            .find(|record| record.user_id == user.id && record.endpoint == endpoint)
+            .ok_or_else(|| ApiError::not_found("no such subscription on this account"))?;
+        if let Some(value) = body.notify_presence {
+            record.notify_presence = value;
+        }
+        if let Some(value) = body.notify_requests {
+            record.notify_requests = value;
+        }
+        let flags = (record.notify_presence, record.notify_requests);
+        persist_locked(&state, &store)?;
+        flags
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "notify_presence": notify_presence,
+        "notify_requests": notify_requests,
+    })))
+}
+
+/// Mirrors `notify_signing_payload` in the daemon's `connect_rendezvous.rs`
+/// — stable protocol, replicated rather than shared (twin golden test).
+pub(crate) fn notify_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    kind: &str,
+    session_label: &str,
+) -> String {
+    format!(
+        "{NOTIFY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{kind}\n{session_label}\n"
+    )
+}
+
+/// Request kinds a nudge may name. A closed vocabulary — extending it is a
+/// deliberate act on both binaries (planned: display requests, agent
+/// notify), never free text from the wire.
+const NOTIFY_KINDS: &[&str] = &["approval", "question"];
+
+/// Compose the Web Push payload for a pending-request nudge.
+///
+/// PRIVACY (hard rule): the payload names only the request KIND, the
+/// daemon's display label, and the session's display label — NEVER command
+/// text, question text, file paths, or any other work content. The nudge
+/// wire (`DaemonNotifyRequest`) has no field that could carry those, and
+/// this constructor must keep it that way when kinds are added: this
+/// service stays zero-knowledge about work content
+/// (docs/src/self-hosted-rendezvous.md), and owners read the push on lock
+/// screens.
+pub(crate) fn attention_push_payload(
+    kind: &str,
+    daemon_label: &str,
+    session_label: &str,
+    daemon_id: &str,
+) -> serde_json::Value {
+    let (title, body) = match kind {
+        "question" => (
+            format!("{daemon_label}: the agent has a question"),
+            format!("Session \u{201c}{session_label}\u{201d} is waiting for your answer."),
+        ),
+        _ => (
+            format!("{daemon_label}: approval needed"),
+            format!("Session \u{201c}{session_label}\u{201d} is waiting for your approval."),
+        ),
+    };
+    json!({
+        "title": title,
+        "body": body,
+        "url": format!(
+            "/app?connect=1&daemon_id={}",
+            form_urlencoded::byte_serialize(daemon_id.as_bytes()).collect::<String>()
+        ),
+        // One stacked notification per daemon: later nudges replace
+        // earlier ones instead of piling up.
+        "tag": format!("attention-{daemon_id}"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DaemonNotifyRequest {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    issued_at_unix_ms: u64,
+    signature: String,
+    /// One of [`NOTIFY_KINDS`].
+    #[serde(default)]
+    kind: String,
+    /// The session's display label. Content-free by construction on the
+    /// daemon side (id prefix, or the user's explicit rename); sanitized
+    /// and capped here like every other fleet label before display.
+    #[serde(default)]
+    session_label: String,
+}
+
+/// Daemon-signed attention nudge: fan a Web Push out to the owner's
+/// opted-in (`notify_requests`) browsers. Same authentication discipline as
+/// the fleet-DNS publishes: bearer gate, rate limit, freshness window, and
+/// the registered-key signature pin.
+pub(crate) async fn daemon_notify(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonNotifyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let daemon_id = body.daemon_id.trim().to_string();
+    // The daemon-side cooldown paces this to once per session per ten
+    // minutes; the rate limit is the service-side backstop.
+    let daemon = verified_daemon_request(
+        &state,
+        &headers,
+        ("daemon_notify", 12, 600_000),
+        (&body.protocol, NOTIFY_PROTOCOL),
+        &daemon_id,
+        &body.daemon_public_key,
+        body.issued_at_unix_ms,
+    )
+    .await?;
+    if !NOTIFY_KINDS.contains(&body.kind.as_str()) {
+        return Err(ApiError::bad_request("unsupported notify kind"));
+    }
+    if body.session_label.len() > FLEET_LABEL_MAX * 4 {
+        return Err(ApiError::bad_request("session_label is too long"));
+    }
+    // The signature covers the kind and label exactly as sent.
+    let payload = notify_signing_payload(
+        &daemon_id,
+        &daemon.daemon_public_key,
+        body.issued_at_unix_ms,
+        &body.kind,
+        &body.session_label,
+    );
+    if !verify_ed25519_b64u(
+        &daemon.daemon_public_key,
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        return Err(ApiError::bad_request("notify signature invalid"));
+    }
+    let Some(owner) = daemon.owner_user_id else {
+        return Err(ApiError::bad_request("daemon is not claimed"));
+    };
+    let subscriptions: Vec<PushSubscriptionRecord> = {
+        let store = state.store.lock().await;
+        store
+            .push_subscriptions
+            .iter()
+            .filter(|record| record.notify_requests && record.user_id == owner)
+            .cloned()
+            .collect()
+    };
+    let daemon_label = daemon
+        .label
+        .clone()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| daemon.daemon_id.clone());
+    let session_label = clean_fleet_text(&body.session_label, FLEET_LABEL_MAX);
+    let push_payload = attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
+    let mut sent = 0;
+    let mut dead = Vec::new();
+    for subscription in &subscriptions {
+        match send_web_push(
+            &state.push_http,
+            &state.vapid,
+            &state.config.public_origin,
+            subscription,
+            &push_payload,
+        )
+        .await
+        {
+            Ok(true) => sent += 1,
+            Ok(false) => dead.push(subscription.endpoint.clone()),
+            Err(e) => eprintln!("[push] attention nudge failed: {e}"),
+        }
+    }
+    {
+        let mut store = state.store.lock().await;
+        if !dead.is_empty() {
+            store
+                .push_subscriptions
+                .retain(|record| !dead.contains(&record.endpoint));
+        }
+        // Audit names the kind only — the label is for the push, not the
+        // permanent record.
+        audit(
+            &mut store,
+            "daemon_notify",
+            Some(owner),
+            Some(daemon_id.clone()),
+            json!({ "kind": body.kind, "sent": sent }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(
+        json!({ "ok": true, "sent": sent, "pruned": dead.len() }),
+    ))
 }
 
 pub(crate) async fn push_test(
@@ -590,5 +845,94 @@ mod tests {
             keypair.public_key().as_ref(),
             reloaded.public_key().as_ref()
         );
+    }
+
+    /// Twin of the daemon's `claim_and_unclaim_payloads_pin_the_wire_format`
+    /// notify case (`connect_rendezvous.rs`) — the two binaries replicate
+    /// the format rather than share code, so each pins the same golden
+    /// literal.
+    #[test]
+    fn notify_payload_pins_the_wire_format() {
+        assert_eq!(
+            notify_signing_payload(
+                "daemon-1",
+                "PubKey",
+                1_700_000_000_000,
+                "approval",
+                "deploy review"
+            ),
+            "intendant-connect-daemon-notify-v1\ndaemon-1\nPubKey\n1700000000000\napproval\ndeploy review\n"
+        );
+    }
+
+    /// PRIVACY pin: the push payload is exactly {title, body, url, tag},
+    /// composed from the kind + the two display labels — there is no field
+    /// where command text, question text, or paths could ride, and nothing
+    /// beyond the inputs appears in the composed strings.
+    #[test]
+    fn attention_push_payload_carries_no_work_content() {
+        let payload = attention_push_payload("approval", "workshop", "deploy review", "daemon-1");
+        let object = payload.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["body", "tag", "title", "url"]);
+        assert_eq!(payload["title"], "workshop: approval needed");
+        assert_eq!(
+            payload["body"],
+            "Session \u{201c}deploy review\u{201d} is waiting for your approval."
+        );
+        assert_eq!(payload["url"], "/app?connect=1&daemon_id=daemon-1");
+        assert_eq!(payload["tag"], "attention-daemon-1");
+
+        let question = attention_push_payload("question", "workshop", "s-1", "daemon-1");
+        assert_eq!(question["title"], "workshop: the agent has a question");
+        assert_eq!(
+            question["body"],
+            "Session \u{201c}s-1\u{201d} is waiting for your answer."
+        );
+    }
+
+    /// The nudge request wire shape has no content-bearing fields: an old
+    /// or malicious daemon build sending extra fields (command text, ...)
+    /// has them ignored by serde, and the vocabulary check refuses free
+    /// text in `kind`.
+    #[test]
+    fn notify_request_kinds_are_a_closed_vocabulary() {
+        for kind in NOTIFY_KINDS {
+            assert!(matches!(*kind, "approval" | "question"));
+        }
+        let parsed: DaemonNotifyRequest = serde_json::from_value(json!({
+            "protocol": "intendant-connect-daemon-notify-v1",
+            "daemon_id": "daemon-1",
+            "daemon_public_key": "PubKey",
+            "issued_at_unix_ms": 1,
+            "signature": "sig",
+            "kind": "approval",
+            "session_label": "deploy review",
+            // Ignored: the shape has nowhere to put work content.
+            "command": "rm -rf /",
+            "question_text": "which db?"
+        }))
+        .unwrap();
+        assert_eq!(parsed.kind, "approval");
+        assert_eq!(parsed.session_label, "deploy review");
+    }
+
+    /// Pre-existing subscription records (no `notify_requests` on disk)
+    /// deserialize with the flag OFF — the alert stays opt-in across the
+    /// upgrade.
+    #[test]
+    fn notify_requests_defaults_off_for_existing_subscriptions() {
+        let record: PushSubscriptionRecord = serde_json::from_value(json!({
+            "user_id": Uuid::nil(),
+            "endpoint": "https://push.example.net/send/abc",
+            "p256dh": "key",
+            "auth": "auth",
+            "created_unix_ms": 1,
+            "notify_presence": true
+        }))
+        .unwrap();
+        assert!(record.notify_presence);
+        assert!(!record.notify_requests);
     }
 }

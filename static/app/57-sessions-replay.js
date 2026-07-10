@@ -508,9 +508,9 @@ function buildSessionCard(m, derived, ctx) {
   if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
     sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
   }
-  // ui-v2 badge tint is CSS-keyed off the normalized source id (native=iris,
-  // codex=neutral, claude-code=amber); v1 renders no attribute.
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) sourceEl.dataset.src = source;
+  // Badge tint is CSS-keyed off the normalized source id (native=iris,
+  // codex=neutral, claude-code=amber).
+  sourceEl.dataset.src = source;
   top.appendChild(sourceEl);
 
   if (rowIsPartial) {
@@ -2625,7 +2625,15 @@ function buildSessionDetailRows(entries) {
   let lastTurn = null;
   const visibleLevels = sessionDetailVisibleLevels();
 
-  for (const e of entries || []) {
+  for (let e of entries || []) {
+    // Display-only session notes carry their body in `text` and their
+    // image references in `attachments`; normalize them into the generic
+    // record shape (content + attachment_previews) the renderer expects.
+    if (e && e.event === 'session_note') {
+      const note = sessionNoteLogCommand(e);
+      if (!note) continue;
+      e = { ...e, ...note };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -2840,6 +2848,7 @@ function materializeSessionDetailRow(view, row, index) {
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + e.level;
   entry.dataset.detailRowIndex = String(index);
+  if (e.kind) entry.dataset.kind = e.kind;
   const sourceClass = String(e.source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   if (sourceClass) entry.classList.add('source-' + sourceClass);
   if (e.session_id) entry.dataset.sessionId = e.session_id;
@@ -2905,6 +2914,7 @@ function materializeSessionDetailRow(view, row, index) {
     content: e.content
   });
   appendLogStateBadges(cnt, e);
+  appendLogAttachmentStrip(cnt, e);
   if (sessionDetailLevelColors[e.level]) cnt.style.color = sessionDetailLevelColors[e.level];
 
   entry.appendChild(ts);

@@ -61,6 +61,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "approval" | "approvals" => run_approval(&client, &config, &command[1..]).await?,
         "input" => run_input(&client, &config, &command[1..]).await?,
         "settings" | "set" => run_settings(&client, &config, &command[1..]).await?,
+        "session" | "sessions" => run_session(&client, &config, &command[1..]).await?,
         "task" => run_task(&client, &config, &command[1..]).await?,
         "controller" => run_controller(&client, &config, &command[1..]).await?,
         "context" => run_context(&client, &config, &command[1..]).await?,
@@ -1101,6 +1102,132 @@ async fn run_settings(
     Ok(())
 }
 
+async fn run_session(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_session();
+        return Ok(());
+    }
+    match raw[0].as_str() {
+        "note" => {
+            if is_help(&raw[1..]) {
+                help_session_note();
+                return Ok(());
+            }
+            let response = call_tool(
+                client,
+                config,
+                "post_session_note",
+                session_note_args(&raw[1..])?,
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        other => return Err(format!("unknown session command '{other}'")),
+    }
+    Ok(())
+}
+
+/// Build `post_session_note` arguments from `session note` flags. Reads
+/// each `--image` file locally (so the caller's own sandbox governs what
+/// is readable) and base64-encodes it into the tool arguments; the daemon
+/// deliberately accepts no file paths from MCP callers.
+fn session_note_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--image", "--source", "--session"], &[])?;
+    let text = if args.positional.is_empty() {
+        return Err("session note requires note text".to_string());
+    } else {
+        args.positional.join(" ")
+    };
+    if text.len() > crate::mcp::SESSION_NOTE_MAX_TEXT_BYTES {
+        return Err(format!(
+            "note text is {} bytes; max {} KB",
+            text.len(),
+            crate::mcp::SESSION_NOTE_MAX_TEXT_BYTES / 1024
+        ));
+    }
+    let mut map = Map::new();
+    map.insert("text".to_string(), Value::String(text));
+    insert_string(&mut map, "source", args.one("--source"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    let image_paths: Vec<&str> = args.all("--image").collect();
+    if image_paths.len() > crate::mcp::SESSION_NOTE_MAX_IMAGES {
+        return Err(format!(
+            "too many images: {} (max {} per note)",
+            image_paths.len(),
+            crate::mcp::SESSION_NOTE_MAX_IMAGES
+        ));
+    }
+    let mut images = Vec::new();
+    let mut total_bytes = 0usize;
+    for path in image_paths {
+        let (media_type, name, data, size) = read_session_note_image(Path::new(path))?;
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > crate::mcp::SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES {
+            return Err(format!(
+                "total image size exceeds the {} MB per-note cap",
+                crate::mcp::SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+        images.push(json_object([
+            ("media_type", Value::String(media_type.to_string())),
+            ("data", Value::String(data)),
+            ("name", Value::String(name)),
+        ]));
+    }
+    if !images.is_empty() {
+        map.insert("images".to_string(), Value::Array(images));
+    }
+    Ok(Value::Object(map))
+}
+
+/// Read one `--image` file: infer the MIME type from the extension,
+/// enforce the per-image cap, and return (mime, basename, base64, size).
+fn read_session_note_image(path: &Path) -> Result<(&'static str, String, String, usize), String> {
+    let media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        other => {
+            return Err(format!(
+                "unsupported image extension {:?} for {}; supported: png, jpg, jpeg, gif, webp, bmp",
+                other.unwrap_or(""),
+                path.display()
+            ));
+        }
+    };
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    if bytes.len() > crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES {
+        return Err(format!(
+            "{} is {} bytes; max {} MB per image",
+            path.display(),
+            bytes.len(),
+            crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image".to_string());
+    let size = bytes.len();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok((media_type, name, data, size))
+}
+
 async fn run_task(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
     if raw.is_empty() || is_help(raw) {
         help_task();
@@ -1976,6 +2103,7 @@ Commands:\n\
   approval                  Pending approvals and approval responses\n\
   input                     Pending human question and response\n\
   settings                  Autonomy and verbosity\n\
+  session                   Session transcript notes (display-only, optional images)\n\
   task                      Start tasks\n\
   controller                Controller loop and restart controls\n\
   context                   Managed-context rewind/backout controls\n\
@@ -2154,6 +2282,34 @@ fn help_settings() {
     );
 }
 
+fn help_session() {
+    println!(
+        "Usage:\n\
+  intendant ctl session note TEXT [--image PATH ...] [--source LABEL] [--session ID]\n\
+\n\
+Run `intendant ctl session note --help` for details."
+    );
+}
+
+fn help_session_note() {
+    println!(
+        "Usage: intendant ctl session note TEXT [--image PATH ...] [--source LABEL] [--session ID]\n\
+\n\
+Post a display-only note into the session transcript. The note shows up\n\
+live in the dashboard and persists for replay; it never enters any model's\n\
+context. Each --image file (png, jpg, jpeg, gif, webp, bmp) is read locally,\n\
+stored in the session upload store, and rendered as a clickable thumbnail.\n\
+Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total.\n\
+\n\
+--session defaults to the calling session (INTENDANT_SESSION_ID or the\n\
+session bound into your injected MCP URL).\n\
+\n\
+Examples:\n\
+  intendant ctl session note \"Milestone: encoder pool rewired\"\n\
+  intendant ctl session note \"Before/after comparison\" --image before.png --image after.png"
+    );
+}
+
 fn help_task() {
     println!(
         "Usage: intendant ctl task start [--task TEXT] [--session ID] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
@@ -2230,6 +2386,58 @@ mod tests {
         let parsed = parse_command_args(&args(&["-vyeJaE3hyqm4"]), &[], &[])
             .expect("single-dash token is a positional, not a flag");
         assert_eq!(parsed.positional, vec!["-vyeJaE3hyqm4".to_string()]);
+    }
+
+    #[test]
+    fn session_note_args_builds_tool_arguments_with_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("shot.png");
+        std::fs::write(&image_path, [0x89u8, b'P', b'N', b'G']).unwrap();
+
+        let value = session_note_args(&args(&[
+            "Milestone",
+            "reached",
+            "--image",
+            image_path.to_str().unwrap(),
+            "--source",
+            "codex",
+            "--session",
+            "sess-1",
+        ]))
+        .unwrap();
+        assert_eq!(value["text"], "Milestone reached");
+        assert_eq!(value["source"], "codex");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["images"][0]["media_type"], "image/png");
+        assert_eq!(value["images"][0]["name"], "shot.png");
+        use base64::Engine as _;
+        assert_eq!(
+            value["images"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G'])
+        );
+
+        // Text-only notes omit the images key entirely.
+        let value = session_note_args(&args(&["just", "text"])).unwrap();
+        assert_eq!(value["text"], "just text");
+        assert!(value.get("images").is_none());
+    }
+
+    #[test]
+    fn session_note_args_rejects_missing_text_bad_extension_and_missing_file() {
+        let err = session_note_args(&args(&[])).unwrap_err();
+        assert!(err.contains("requires note text"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let svg = dir.path().join("vector.svg");
+        std::fs::write(&svg, b"<svg/>").unwrap();
+        let err =
+            session_note_args(&args(&["text", "--image", svg.to_str().unwrap()])).unwrap_err();
+        assert!(err.contains("unsupported image extension"), "{err}");
+
+        let missing = dir.path().join("nope.png");
+        let err =
+            session_note_args(&args(&["text", "--image", missing.to_str().unwrap()])).unwrap_err();
+        assert!(err.contains("failed to read"), "{err}");
     }
 
     #[test]

@@ -599,6 +599,43 @@ pub fn session_log_entry_to_app_event(
                 .map(String::from);
             Some(AppEvent::SessionStarted { session_id, task })
         }
+        "session_note" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let note_id = data
+                .and_then(|d| d.get("note_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = data
+                .and_then(|d| d.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message.strip_prefix("Note: ").unwrap_or(message))
+                .to_string();
+            let attachments = data
+                .and_then(|d| d.get("attachments"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let ts = data
+                .and_then(|d| d.get("ts_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(AppEvent::SessionNote {
+                session_id,
+                note_id,
+                text,
+                attachments,
+                source,
+                ts,
+            })
+        }
         "session_identity" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -1200,6 +1237,64 @@ mod tests {
             }
             other => panic!("expected SteerRequested, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn rt_session_note_preserves_text_and_attachment_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let attachments = vec![crate::types::SessionNoteAttachment {
+            upload_id: "u-1".to_string(),
+            name: "diagram.png".to_string(),
+            mime: "image/png".to_string(),
+            url: "/api/session/current/uploads/u-1/raw".to_string(),
+        }];
+        let text = "Milestone reached.\nSee the attached diagram for the new topology.";
+        log.session_note(
+            Some("thread-9"),
+            "note-1",
+            text,
+            &attachments,
+            Some("codex"),
+            1_752_000_000_123,
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "session_note");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SessionNote {
+                session_id,
+                note_id,
+                text: replayed,
+                attachments: replayed_attachments,
+                source,
+                ts,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-9"));
+                assert_eq!(note_id, "note-1");
+                assert_eq!(replayed, text);
+                assert_eq!(replayed_attachments, attachments);
+                assert_eq!(source.as_deref(), Some("codex"));
+                assert_eq!(ts, 1_752_000_000_123);
+            }
+            other => panic!("expected SessionNote, got {:?}", other),
+        }
+
+        // The replay entry must survive the full browser-entry pipeline
+        // (AppEvent -> OutboundEvent -> tagged JSON) with the wire shape
+        // the dashboard consumes.
+        let app_event = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        let outbound = crate::event::app_event_to_outbound(&app_event).unwrap();
+        let value = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(value["event"], "session_note");
+        assert_eq!(value["note_id"], "note-1");
+        assert_eq!(value["text"], text);
+        assert_eq!(value["attachments"][0]["upload_id"], "u-1");
+        assert_eq!(
+            value["attachments"][0]["url"],
+            "/api/session/current/uploads/u-1/raw"
+        );
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub struct McpAppState {
     pub should_quit: bool,
     /// Session log directory for askHuman files.
     pub log_dir: std::path::PathBuf,
+    /// The daemon's project root, when it serves one. Must match the web
+    /// gateway's `project_root_for_changes` so upload-store writes made by
+    /// MCP tools (`post_session_note` image commits) resolve to the same
+    /// [`crate::global_store::StoreScope`] the gateway's
+    /// `/api/session/current/uploads/<id>/raw` route reads from.
+    pub project_root: Option<std::path::PathBuf>,
     pub(crate) controller_loop_dir_override: Option<std::path::PathBuf>,
     pub(crate) controller_loop_status_override: Option<serde_json::Value>,
     /// Test override for the home that anchors persisted-session lookup
@@ -187,6 +193,7 @@ impl McpAppState {
             human_question: None,
             should_quit: false,
             log_dir,
+            project_root: None,
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
             session_logs_home_override: None,

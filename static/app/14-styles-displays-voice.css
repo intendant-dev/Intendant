@@ -847,6 +847,29 @@ body.display-fullscreen-open {
   color: var(--subtext1);
   font-size: 11px;
 }
+.log-attachment-link {
+  display: inline-flex;
+  line-height: 0;
+  border-radius: 4px;
+}
+.log-attachment-link:hover .log-attachment-thumb {
+  border-color: var(--blue);
+}
+.log-attachment-missing {
+  border-style: dashed;
+  color: var(--overlay0);
+  font-style: italic;
+}
+/* Display-only session notes (post_session_note / ctl session note):
+   subtle accent so agent annotations read apart from run output. */
+.log-entry[data-kind="session_note"] {
+  border-left: 2px solid var(--mauve);
+  background: color-mix(in srgb, var(--mauve) 6%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.log-entry[data-kind="session_note"] > .log-level {
+  color: var(--mauve);
+}
 .pending-attachment-chip .chip-remove {
   width: 14px;
   height: 14px;

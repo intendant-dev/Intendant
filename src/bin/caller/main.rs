@@ -3,6 +3,7 @@ mod agent_runner;
 mod app_state_pricing;
 mod approval;
 mod atspi_read;
+mod attention_nudge;
 mod audio_routing;
 pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]

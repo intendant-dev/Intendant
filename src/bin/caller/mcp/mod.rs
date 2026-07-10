@@ -53,9 +53,16 @@ pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
 // tools_managed / tools_display / tools_peer contribute impl-block
-// methods only — nothing importable, so no re-export.
+// methods only — nothing importable, so no re-export. tools_notes also
+// exports the session-note caps, which `intendant ctl session note`
+// enforces client-side (derive, don't mirror).
 mod tools_display;
 mod tools_managed;
+mod tools_notes;
+pub(crate) use tools_notes::{
+    SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES, SESSION_NOTE_MAX_TEXT_BYTES,
+    SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES,
+};
 mod tools_peer;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
@@ -308,6 +315,17 @@ impl IntendantServer {
             "respond" => {
                 let params = parse_params::<RespondParams>(args)?;
                 Ok(text_tool_result(self.respond(params).await))
+            }
+            "post_session_note" => {
+                let Parameters(params) = parse_params::<PostSessionNoteParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(match self.post_session_note_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => {
+                        text_tool_error(format!("post_session_note failed: {message}"))
+                    }
+                })
             }
             "set_autonomy" => {
                 let params = parse_params::<SetAutonomyParams>(args)?;

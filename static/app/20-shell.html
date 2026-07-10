@@ -1364,6 +1364,17 @@
                   </div>
                   <div id="new-session-project-status" class="sessions-project-status"></div>
                   <datalist id="new-session-project-options"></datalist>
+                  <div class="sessions-worktree-row">
+                    <label class="sessions-toggle sessions-worktree-toggle" id="new-session-worktree-wrap"
+                           title="Create a fresh git worktree branched off the project's HEAD and run the session inside it. Needs a git repository with at least one commit.">
+                      <input id="new-session-worktree" type="checkbox" onchange="onNewSessionWorktreeToggle()">
+                      Run in a git worktree
+                    </label>
+                    <label class="sessions-new-session-field sessions-worktree-branch hidden" for="new-session-worktree-branch" id="new-session-worktree-branch-row">
+                      Branch name
+                      <input id="new-session-worktree-branch" class="sessions-project-input" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Optional — derived from the session name">
+                    </label>
+                  </div>
                 </div>
                 <div class="sessions-new-agent-row sessions-new-agent-picker">
                   <label class="sessions-new-session-field" for="new-session-agent">

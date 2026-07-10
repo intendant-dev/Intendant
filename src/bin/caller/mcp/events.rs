@@ -150,6 +150,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
+                    | AppEvent::SessionNote { .. }
                     | AppEvent::UserMessageRewind { .. }
                     | AppEvent::UserMessageEditStatus { .. }
                     | AppEvent::UserMessageLog { .. }
