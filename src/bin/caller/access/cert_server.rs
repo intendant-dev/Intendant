@@ -24,7 +24,6 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-use crate::access::pinning::{format_fingerprint, parse_fingerprint};
 use crate::web_tls::{build_acceptor, TlsCertSource};
 
 use super::{certs::CertState, AccessError, AccessResult};
@@ -110,12 +109,19 @@ pub async fn serve(
         .map_err(|e| AccessError(format!("bind {bind_addr}: {e}")))?;
 
     let gate = Arc::new(EnrollmentGate::default());
+    // Fleet front door: when this daemon holds a live fleet certificate
+    // (fleet_cert.rs), serve it for its SNI name on this port too — the
+    // enrollment page then loads warning-free under the fleet name and
+    // the fingerprint transcription is unnecessary (the classic ceremony
+    // stays available for the trustless path).
+    let fleet_name = install_fleet_enrollment_certificate();
     warn_if_access_host_missing_from_cert(&cert_path, access_host);
-    print_client_setup_banner(access_host, port, https_port);
+    print_client_setup_banner(access_host, port, https_port, fleet_name.as_deref());
 
     let prompt_gate = Arc::clone(&gate);
+    let prompt_fleet = fleet_name.clone();
     tokio::spawn(async move {
-        prompt_for_pairing(expected_fingerprint, prompt_gate).await;
+        prompt_for_pairing(expected_fingerprint, prompt_fleet, prompt_gate).await;
     });
 
     let cert_dir = state.cert_dir.clone();
@@ -141,12 +147,42 @@ pub async fn serve(
     Ok(())
 }
 
-async fn prompt_for_pairing(expected_fingerprint: String, gate: Arc<EnrollmentGate>) {
+/// Why the trustless leg is fingerprint transcription and not something
+/// "smarter": until the device trusts the daemon's certificate, the only
+/// phone-side UI an attacker cannot draw is the browser's own certificate
+/// viewer. Any scheme where the user types a short pairing code into the
+/// PAGE — PAKE included — hands the code to whoever served the page;
+/// under an active MITM that is the attacker, who then completes the
+/// exchange with the real daemon and walks away with the credentials.
+/// SAS-style "compare two short codes" fails the same way: the attacker
+/// endpoint knows the daemon-side transcript, so it can display the
+/// matching code. So the trustless path keeps reading from browser
+/// chrome into the trusted terminal — shortened to an 80-bit prefix
+/// (`MIN_FINGERPRINT_PREFIX_HEX`) — and the CONVENIENT path removes the
+/// transcription entirely by authenticating the page with the daemon's
+/// real fleet certificate instead (first-contact rung two,
+/// docs/src/trust-tiers.md: betrayal is active-only, CT-logged, and
+/// watched by this daemon's CT tripwire).
+async fn prompt_for_pairing(
+    expected_fingerprint: String,
+    fleet_name: Option<String>,
+    gate: Arc<EnrollmentGate>,
+) {
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
     loop {
-        print!("  Browser-observed server cert SHA-256 fingerprint: ");
+        if fleet_name.is_some() {
+            print!(
+                "  Press Enter once the page is open (or paste a certificate fingerprint \
+                 to run the classic ceremony instead): "
+            );
+        } else {
+            print!(
+                "  Browser-observed server cert SHA-256 fingerprint (first \
+                 {MIN_FINGERPRINT_PREFIX_HEX}+ chars are enough): "
+            );
+        }
         let _ = std::io::stdout().flush();
         line.clear();
         match reader.read_line(&mut line).await {
@@ -163,7 +199,17 @@ async fn prompt_for_pairing(expected_fingerprint: String, gate: Arc<EnrollmentGa
             }
         }
 
-        let observed = match normalize_fingerprint_input(&line) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if fleet_name.is_some() {
+                // Fleet mode: the page is WebPKI-authenticated, so the
+                // operator's confirmation is presence, not transcription.
+                break;
+            }
+            continue;
+        }
+
+        let observed = match normalize_fingerprint_input(trimmed) {
             Ok(fp) => fp,
             Err(e) => {
                 println!("!! invalid fingerprint: {e}");
@@ -171,26 +217,36 @@ async fn prompt_for_pairing(expected_fingerprint: String, gate: Arc<EnrollmentGa
             }
         };
 
-        if observed != expected_fingerprint {
+        if !fingerprint_input_matches(&observed, &expected_fingerprint) {
             println!("!! fingerprint did not match this Intendant server; no secret revealed");
             continue;
         }
+        break;
+    }
 
-        let secret = random_secret();
-        gate.arm_secret(secret.clone());
-        println!();
-        println!("============================================================");
-        println!("  Browser pairing verified");
-        println!("============================================================");
-        println!();
-        println!("  Enrollment secret:");
-        println!("    {secret}");
-        println!();
-        println!("  Enter that secret on the HTTPS enrollment page.");
-        println!("  It can be redeemed once. Keep this server running until");
-        println!("  the browser has downloaded ca.crt and client.p12.");
-        println!();
-        return;
+    let secret = random_secret();
+    gate.arm_secret(secret.clone());
+    println!();
+    println!("============================================================");
+    println!("  Browser pairing verified");
+    println!("============================================================");
+    println!();
+    println!("  Enrollment secret:");
+    println!("    {secret}");
+    println!();
+    println!("  Enter that secret on the HTTPS enrollment page.");
+    println!("  It can be redeemed once. Keep this server running until");
+    println!("  the browser has downloaded ca.crt and client.p12.");
+    println!();
+}
+
+/// A pasted fingerprint (or prefix) against the expected one. Full
+/// 64-char input must match exactly; a prefix must be a prefix.
+fn fingerprint_input_matches(observed: &str, expected: &str) -> bool {
+    if observed.len() == 64 {
+        observed == expected
+    } else {
+        expected.starts_with(observed)
     }
 }
 
@@ -755,14 +811,41 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// A SHA-256 fingerprint prefix must carry at least this many hex chars
+/// (80 bits). Truncated comparison is sound because the attacker's move
+/// is pre-grinding a certificate whose fingerprint shares the typed
+/// prefix — ~2^80 hashes for 20 chars, out of reach — while cutting the
+/// transcription to a third of the full 64.
+const MIN_FINGERPRINT_PREFIX_HEX: usize = 20;
+
+/// Pairing input as browsers display fingerprints: colon groups,
+/// uppercase, arbitrary whitespace/line wraps. Accepts the full 64 hex
+/// chars or a prefix of at least [`MIN_FINGERPRINT_PREFIX_HEX`].
 fn normalize_fingerprint_input(input: &str) -> Result<String, String> {
     let compact = input
         .trim()
         .chars()
-        .filter(|c| !c.is_ascii_whitespace())
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':')
         .collect::<String>();
-    let parsed = parse_fingerprint(&compact)?;
-    Ok(format_fingerprint(&parsed))
+    if !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected hex chars (with optional colons); got {:?}",
+            input.trim()
+        ));
+    }
+    if compact.len() < MIN_FINGERPRINT_PREFIX_HEX {
+        return Err(format!(
+            "need at least the first {MIN_FINGERPRINT_PREFIX_HEX} hex chars of the fingerprint (got {})",
+            compact.len()
+        ));
+    }
+    if compact.len() > 64 {
+        return Err(format!(
+            "SHA-256 fingerprints are 64 hex chars (got {})",
+            compact.len()
+        ));
+    }
+    Ok(compact.to_ascii_lowercase())
 }
 
 fn random_secret() -> String {
@@ -1477,33 +1560,144 @@ fn warn_if_access_host_missing_from_cert(cert_path: &Path, access_host: &str) {
     }
 }
 
-fn print_client_setup_banner(access_host: &str, cert_port: u16, https_port: u16) {
+fn print_client_setup_banner(
+    access_host: &str,
+    cert_port: u16,
+    https_port: u16,
+    fleet_name: Option<&str>,
+) {
     println!();
     println!("============================================================");
     println!("  Strict client enrollment");
     println!("============================================================");
     println!();
-    println!("  Open this URL on the client browser/device:");
-    println!("    https://{access_host}:{cert_port}/");
-    println!();
-    println!("  The browser may warn because the Intendant CA is not installed yet.");
-    println!("  Stop at that warning page. Do not continue to page content, enter");
-    println!("  secrets, click downloads, or install anything until this terminal");
-    println!("  accepts the browser-observed server certificate fingerprint.");
-    println!();
-    println!("  Inspect the server certificate from the browser warning/details UI,");
-    println!("  then paste its SHA-256 fingerprint into this terminal. If the browser");
-    println!("  cannot show the certificate before loading the page, use a client-side");
-    println!("  certificate inspection tool first.");
-    println!();
-    println!("  This terminal intentionally does not print the expected fingerprint.");
-    println!("  It will reveal a one-time enrollment secret only after the pasted");
-    println!("  fingerprint matches the local Intendant server certificate.");
+    match fleet_name {
+        Some(name) => {
+            println!("  Open this URL on the client device (or scan the QR code):");
+            println!("    https://{name}:{cert_port}/");
+            println!();
+            print_qr_code(&format!("https://{name}:{cert_port}/"));
+            println!();
+            println!("  The page carries this daemon's real fleet certificate, so NO");
+            println!("  certificate warning should appear. If one does, STOP — a warning");
+            println!("  on the fleet name is exactly the attack this ceremony exists to");
+            println!("  catch (the name is monitored in Certificate Transparency).");
+            println!();
+            println!("  Once the page is open, press Enter in this terminal to reveal the");
+            println!("  one-time enrollment secret, then enter it on the page.");
+            println!();
+            println!("  Trustless alternative (no DNS or CA in the loop): open");
+            println!("    https://{access_host}:{cert_port}/");
+            println!("  stop at the certificate warning, and paste the browser-observed");
+            println!("  SHA-256 fingerprint here — the first {MIN_FINGERPRINT_PREFIX_HEX} characters are enough.");
+        }
+        None => {
+            println!("  Open this URL on the client browser/device (or scan the QR code):");
+            println!("    https://{access_host}:{cert_port}/");
+            println!();
+            print_qr_code(&format!("https://{access_host}:{cert_port}/"));
+            println!();
+            println!("  The browser may warn because the Intendant CA is not installed yet.");
+            println!("  Stop at that warning page. Do not continue to page content, enter");
+            println!("  secrets, click downloads, or install anything until this terminal");
+            println!("  accepts the browser-observed server certificate fingerprint.");
+            println!();
+            println!("  Inspect the server certificate from the browser warning/details UI,");
+            println!("  then paste its SHA-256 fingerprint into this terminal — the first");
+            println!("  {MIN_FINGERPRINT_PREFIX_HEX} characters are enough (an attacker cannot pre-grind a");
+            println!("  certificate sharing an 80-bit prefix). If the browser cannot show");
+            println!("  the certificate before loading the page, use a client-side");
+            println!("  certificate inspection tool first.");
+            println!();
+            println!("  This terminal intentionally does not print the expected fingerprint.");
+            println!("  It will reveal a one-time enrollment secret only after the pasted");
+            println!("  fingerprint matches the local Intendant server certificate.");
+            println!();
+            println!("  Tip: a fleet certificate makes this warning-free — the dashboard's");
+            println!("  Connect card ('Get a real certificate') mints one, and this banner");
+            println!("  will then lead with the fleet URL.");
+        }
+    }
     println!();
     println!("  After pairing, follow the browser page's device-specific install steps.");
     println!("  Dashboard URL after enrollment:");
-    println!("    https://{access_host}:{https_port}");
+    match fleet_name {
+        Some(name) => println!("    https://{name}:{https_port}"),
+        None => println!("    https://{access_host}:{https_port}"),
+    }
     println!();
+}
+
+/// Terminal QR of the enrollment URL, so phones scan instead of typing.
+/// Dark terminals are the norm, so modules render inverted (bright
+/// modules on the dark background — phone scanners read inverted codes),
+/// with the quiet zone included.
+fn print_qr_code(url: &str) {
+    match qr_code_lines(url) {
+        Some(lines) => {
+            for line in lines {
+                println!("    {line}");
+            }
+        }
+        None => println!("    (QR unavailable — use the URL above)"),
+    }
+}
+
+fn qr_code_lines(url: &str) -> Option<Vec<String>> {
+    use qrcode::render::unicode;
+    let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
+    let rendered = code
+        .render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build();
+    Some(rendered.lines().map(str::to_string).collect())
+}
+
+/// The daemon's live fleet certificate (fleet_cert.rs), if one is on
+/// disk and unexpired: install it into the process TLS resolver — the
+/// enrollment acceptor consults the same resolver, so requests naming
+/// the fleet name get the real certificate while everything else keeps
+/// the self-signed access cert — and return the fleet name. The name
+/// comes from the certificate's own SAN: the cert is the authority on
+/// what it covers, and this CLI process has no Connect client to learn
+/// the name any other way.
+fn install_fleet_enrollment_certificate() -> Option<String> {
+    let cert_path = crate::fleet_cert::cert_path();
+    let name = live_fleet_cert_dns_name(&cert_path)?;
+    let cert_pem = std::fs::read_to_string(&cert_path).ok()?;
+    let key_pem = std::fs::read_to_string(crate::fleet_cert::key_path()).ok()?;
+    match crate::web_tls::install_fleet_certificate(&name, &cert_pem, &key_pem) {
+        Ok(()) => Some(name),
+        Err(err) => {
+            eprintln!("[access/cert-server] fleet certificate present but unusable: {err}");
+            None
+        }
+    }
+}
+
+/// First SAN DNS name of the leaf at `cert_path`, provided the leaf is
+/// valid for at least another 30 minutes (a cert about to lapse would
+/// start warning mid-ceremony).
+fn live_fleet_cert_dns_name(cert_path: &Path) -> Option<String> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::*;
+
+    let der = super::certs::read_cert_der(cert_path).ok()?;
+    let (_, cert) = X509Certificate::from_der(&der).ok()?;
+    let now_ms = super::client_key::now_unix_ms().max(0);
+    let not_after_ms = cert.validity().not_after.timestamp().checked_mul(1000)?;
+    if not_after_ms < now_ms + 30 * 60 * 1000 {
+        return None;
+    }
+    let san = cert.subject_alternative_name().ok().flatten()?;
+    san.value.general_names.iter().find_map(|name| match name {
+        GeneralName::DNSName(dns) => {
+            Some(dns.trim().trim_end_matches('.').to_ascii_lowercase())
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -1518,6 +1712,76 @@ mod tests {
         assert_eq!(host_without_port("[fd7a::1]:8443"), "[fd7a::1]");
         assert_eq!(host_without_port("daemon.local"), "daemon.local");
         assert_eq!(host_without_port("[fd7a::1]"), "[fd7a::1]");
+    }
+
+    #[test]
+    fn fingerprint_prefix_input_is_accepted_at_80_bits_and_matched_as_prefix() {
+        let expected = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+        // 20 hex chars (colon-grouped, uppercase) normalize and match.
+        let prefix = normalize_fingerprint_input("AA:BB:CC:DD:EE:FF:00:11:22:33").unwrap();
+        assert_eq!(prefix, "aabbccddeeff00112233");
+        assert!(fingerprint_input_matches(&prefix, expected));
+
+        // A wrong prefix does not.
+        let wrong = normalize_fingerprint_input("AA:BB:CC:DD:EE:FF:00:11:22:34").unwrap();
+        assert!(!fingerprint_input_matches(&wrong, expected));
+
+        // Below the 80-bit floor is refused outright.
+        let err = normalize_fingerprint_input("AA:BB:CC:DD:EE:FF:00:11:22").unwrap_err();
+        assert!(err.contains("at least"), "{err}");
+
+        // Full-length input still requires an exact match.
+        assert!(fingerprint_input_matches(expected, expected));
+        let mut flipped = expected.to_string();
+        flipped.replace_range(63..64, "8");
+        assert!(!fingerprint_input_matches(&flipped, expected));
+    }
+
+    #[test]
+    fn qr_code_lines_renders_a_scannable_block() {
+        let lines = qr_code_lines("https://d-0123456789abcdef0123.fleet.example:8443/").unwrap();
+        assert!(lines.len() > 10, "QR should span multiple terminal rows");
+        let text = lines.join("\n");
+        assert!(
+            text.contains('█') || text.contains('▀') || text.contains('▄'),
+            "unicode QR must use block glyphs: {text}"
+        );
+    }
+
+    #[test]
+    fn live_fleet_cert_dns_name_reads_the_san_and_gates_on_expiry() {
+        let tmp = TempDir::new().unwrap();
+
+        // A currently-valid cert: name comes from its SAN, lowercased.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![
+            "D-0123456789abcdef0123.Fleet.Example.Test".to_string(),
+        ])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+        let live = tmp.path().join("fleet-cert.pem");
+        std::fs::write(&live, cert.pem()).unwrap();
+        assert_eq!(
+            live_fleet_cert_dns_name(&live).as_deref(),
+            Some("d-0123456789abcdef0123.fleet.example.test")
+        );
+
+        // An expired cert is not a front door.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["d-stale.fleet.example.test".to_string()])
+                .unwrap();
+        params.not_before = rcgen::date_time_ymd(2001, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2002, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let stale_cert = params.self_signed(&key).unwrap();
+        let stale = tmp.path().join("stale-cert.pem");
+        std::fs::write(&stale, stale_cert.pem()).unwrap();
+        assert_eq!(live_fleet_cert_dns_name(&stale), None);
+
+        // Absent file: no front door, no panic.
+        assert_eq!(live_fleet_cert_dns_name(&tmp.path().join("missing.pem")), None);
     }
 
     #[test]
