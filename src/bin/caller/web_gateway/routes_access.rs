@@ -437,6 +437,10 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "not_after_unix_ms": fleet_cert.not_after_unix_ms,
         "last_error": fleet_cert.last_error,
         "addresses": fleet_cert.addresses,
+        "ct_state": fleet_cert.ct_state,
+        "ct_unknown": fleet_cert.ct_unknown,
+        "ct_checked_unix_ms": fleet_cert.ct_checked_unix_ms,
+        "ct_last_error": fleet_cert.ct_last_error,
     });
     serde_json::json!({
         "schema_version": 1,
@@ -1882,11 +1886,37 @@ pub(crate) fn access_org_renew_response_value(
 }
 
 pub(crate) fn access_enrollment_requests_response_value() -> serde_json::Value {
+    // Route provenance is classified daemon-side (derive, don't mirror):
+    // the browser gets a ready `origin_class` per request instead of
+    // re-deriving hosted/fleet membership from its own copies.
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let hosted_origins = crate::access::iam::load_state(&cert_dir)
+        .map(|state| state.hosted_origins)
+        .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let requests: Vec<serde_json::Value> = crate::access::enrollment::pending_enrollments(
+        crate::access::client_key::now_unix_ms(),
+    )
+    .into_iter()
+    .map(|pending| {
+        let origin_class = crate::access::iam::origin_route_class(
+            &pending.origin,
+            &hosted_origins,
+            fleet_zone.as_deref(),
+        );
+        let mut value = serde_json::to_value(&pending).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "origin_class".to_string(),
+                serde_json::Value::String(origin_class.to_string()),
+            );
+        }
+        value
+    })
+    .collect();
     serde_json::json!({
         "schema_version": 1,
-        "requests": crate::access::enrollment::pending_enrollments(
-            crate::access::client_key::now_unix_ms(),
-        ),
+        "requests": requests,
     })
 }
 

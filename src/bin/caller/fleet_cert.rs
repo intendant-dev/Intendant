@@ -56,6 +56,19 @@ pub struct FleetCertStatus {
     pub last_error: Option<String>,
     /// Addresses last published for the name (what the A/AAAA records say).
     pub addresses: Vec<String>,
+    /// Certificate Transparency tripwire (docs/src/trust-tiers.md, first
+    /// contact rung two): `unchecked` | `ok` | `alert`. An `alert` means
+    /// the public CT logs hold a certificate for this daemon's name that
+    /// this daemon never requested — the fleet-zone operator (or a CA)
+    /// minted one, which is exactly the betrayal the rung's security
+    /// argument says must leave evidence. Reflects the last successful
+    /// check; fetch failures land in `ct_last_error` instead.
+    pub ct_state: String,
+    /// The foreign certificates behind an `alert`: "serial · issuer ·
+    /// not_before" summaries.
+    pub ct_unknown: Vec<String>,
+    pub ct_checked_unix_ms: Option<u64>,
+    pub ct_last_error: Option<String>,
 }
 
 fn registry() -> &'static Mutex<FleetCertStatus> {
@@ -63,6 +76,7 @@ fn registry() -> &'static Mutex<FleetCertStatus> {
     STATUS.get_or_init(|| {
         Mutex::new(FleetCertStatus {
             state: "none".to_string(),
+            ct_state: "unchecked".to_string(),
             ..Default::default()
         })
     })
@@ -313,6 +327,9 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         .poll_certificate(&instant_acme::RetryPolicy::default())
         .await
         .map_err(|e| format!("acme certificate: {e}"))?;
+    // The CT tripwire's own-serial ledger — recorded before install so a
+    // crash here can't make this certificate look foreign later.
+    record_own_certificate(&cert_chain_pem, &name, &acme_directory());
     // Best-effort challenge cleanup; the TXT self-expires regardless.
     let _ = crate::connect_rendezvous::dns_acme_clear().await;
 
@@ -328,12 +345,213 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     Ok(())
 }
 
-/// Renewal loop: daily check, renew inside the last 30 days of validity
-/// (Let's Encrypt certificates run 90). Spawned once at gateway startup.
+/* ── Certificate Transparency tripwire ──
+The fleet rung's security argument is "the zone operator can only betray
+loudly": a hijack needs a mis-issued certificate, and browsers only
+accept CT-logged certificates. This monitor turns that in-principle
+evidence into an actual alarm — the daemon records the serials of every
+certificate IT obtained and periodically asks the public CT indexes
+whether its name carries any it didn't. Advisory by nature (crt.sh is a
+best-effort public service); failures are reported, never alarmed. */
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OwnCertRecord {
+    serial_hex: String,
+    name: String,
+    directory: String,
+    issued_unix_ms: u64,
+}
+
+fn serials_path() -> PathBuf {
+    cert_dir().join("fleet-cert-serials.json")
+}
+
+/// Lowercase hex with leading zeros trimmed — both our parsed serials
+/// and crt.sh's strings normalize to this before comparison.
+fn normalize_serial_hex(serial: &str) -> String {
+    let lower = serial.trim().to_ascii_lowercase();
+    let trimmed = lower.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The leaf certificate's serial from a PEM chain.
+fn cert_serial_hex(cert_pem: &str) -> Option<String> {
+    let leaf = pem_certificates(cert_pem).into_iter().next()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&leaf).ok()?;
+    let hex: String = parsed
+        .raw_serial()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(normalize_serial_hex(&hex))
+}
+
+fn own_serial_records() -> Vec<OwnCertRecord> {
+    std::fs::read_to_string(serials_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Record a certificate this daemon obtained — BEFORE install, so a
+/// crash between issuance and install can't leave an own-cert looking
+/// foreign at the next check.
+fn record_own_certificate(cert_pem: &str, name: &str, directory: &str) {
+    let Some(serial) = cert_serial_hex(cert_pem) else {
+        return;
+    };
+    let mut records = own_serial_records();
+    if records.iter().any(|record| record.serial_hex == serial) {
+        return;
+    }
+    records.push(OwnCertRecord {
+        serial_hex: serial,
+        name: name.to_string(),
+        directory: directory.to_string(),
+        issued_unix_ms: now_unix_ms(),
+    });
+    if let Ok(serialized) = serde_json::to_string_pretty(&records) {
+        let _ = write_private(&serials_path(), serialized.as_bytes());
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct CtEntry {
+    serial_hex: String,
+    issuer: String,
+    not_before: String,
+}
+
+/// Parse a crt.sh `output=json` response, deduplicating the
+/// precertificate/leaf pairs that share a serial.
+fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(json_text).map_err(|e| format!("crt.sh response: {e}"))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for row in rows {
+        let serial = row
+            .get("serial_number")
+            .and_then(|v| v.as_str())
+            .map(normalize_serial_hex)
+            .unwrap_or_default();
+        if serial.is_empty() || !seen.insert(serial.clone()) {
+            continue;
+        }
+        entries.push(CtEntry {
+            serial_hex: serial,
+            issuer: row
+                .get("issuer_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown issuer")
+                .to_string(),
+            not_before: row
+                .get("not_before")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// The foreign entries: publicly logged certificates for our name whose
+/// serials this daemon never recorded.
+fn foreign_entries(logged: Vec<CtEntry>, own_serials: &[String]) -> Vec<CtEntry> {
+    logged
+        .into_iter()
+        .filter(|entry| !own_serials.iter().any(|own| *own == entry.serial_hex))
+        .collect()
+}
+
+/// One CT check against the public index. Advisory: fetch/parse failures
+/// set `ct_last_error` and leave the last successful verdict standing.
+pub async fn ct_check_once() {
+    let Some(name) = status_snapshot().name else {
+        return;
+    };
+    let own: Vec<String> = own_serial_records()
+        .into_iter()
+        .map(|record| record.serial_hex)
+        .collect();
+    let result = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("intendant-fleet-cert-monitor")
+            .build()
+            .map_err(|e| e.to_string())?;
+        let response = client
+            .get(format!("https://crt.sh/?q={name}&output=json"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("crt.sh HTTP {}", response.status()));
+        }
+        let text = response.text().await.map_err(|e| e.to_string())?;
+        parse_crt_sh_entries(&text)
+    }
+    .await;
+    let now = now_unix_ms();
+    match result {
+        Ok(logged) => {
+            let foreign = foreign_entries(logged, &own);
+            with_status(|status| {
+                status.ct_checked_unix_ms = Some(now);
+                status.ct_last_error = None;
+                if foreign.is_empty() {
+                    status.ct_state = "ok".to_string();
+                    status.ct_unknown = Vec::new();
+                } else {
+                    status.ct_state = "alert".to_string();
+                    status.ct_unknown = foreign
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{} · {} · {}",
+                                entry.serial_hex, entry.issuer, entry.not_before
+                            )
+                        })
+                        .collect();
+                }
+            });
+            let status = status_snapshot();
+            if status.ct_state == "alert" {
+                eprintln!(
+                    "[fleet-cert] CT ALERT: {} certificate(s) for {name} in the public CT logs \
+                     that this daemon never requested: {:?} — if you did not mint these through \
+                     another channel, treat the fleet route as compromised and reach this \
+                     daemon directly",
+                    status.ct_unknown.len(),
+                    status.ct_unknown,
+                );
+            }
+        }
+        Err(error) => {
+            with_status(|status| {
+                status.ct_last_error = Some(error);
+            });
+        }
+    }
+}
+
+/// Renewal + CT loop: first tick shortly after startup (registration
+/// needs a moment to learn the fleet name), then twice daily. Renewal
+/// fires inside the last 30 days of validity (Let's Encrypt certificates
+/// run 90); the CT tripwire runs every tick. Spawned once at gateway
+/// startup.
 pub fn spawn_renewal_loop() {
     tokio::spawn(async move {
+        let mut first = true;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(12 * 60 * 60)).await;
+            let delay = if first { 10 * 60 } else { 12 * 60 * 60 };
+            first = false;
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            ct_check_once().await;
             let status = status_snapshot();
             let Some(not_after) = status.not_after_unix_ms else {
                 continue;
@@ -429,5 +647,41 @@ mod tests {
             .unwrap();
         let not_after = cert_not_after_unix_ms(&cert.pem()).unwrap();
         assert!(not_after > now_unix_ms());
+    }
+
+    #[test]
+    fn serial_extraction_and_normalization_agree_with_crt_sh_format() {
+        // A fixed serial with a leading zero byte (DER's positive-sign
+        // padding) must normalize to what crt.sh prints for it.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["d-test.fleet.example.test".to_string()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(vec![0x00, 0x8a, 0xbc, 0x01]));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        assert_eq!(cert_serial_hex(&cert.pem()).as_deref(), Some("8abc01"));
+
+        assert_eq!(normalize_serial_hex("038ABc"), "38abc");
+        assert_eq!(normalize_serial_hex("0000"), "0");
+        assert_eq!(normalize_serial_hex(" 03f2 "), "3f2");
+    }
+
+    #[test]
+    fn crt_sh_parsing_dedupes_precert_pairs_and_flags_foreign_serials() {
+        let fixture = r#"[
+            {"issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03AB01","not_before":"2026-07-09T00:00:00"},
+            {"issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03ab01","not_before":"2026-07-09T00:00:00"},
+            {"issuer_name":"C=US, O=Evil CA","serial_number":"04ff02","not_before":"2026-07-10T00:00:00"}
+        ]"#;
+        let entries = parse_crt_sh_entries(fixture).unwrap();
+        assert_eq!(entries.len(), 2, "precert/leaf pair must dedupe");
+
+        let own = vec!["3ab01".to_string()];
+        let foreign = foreign_entries(entries, &own);
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].serial_hex, "4ff02");
+        assert!(foreign[0].issuer.contains("Evil CA"));
+
+        assert!(parse_crt_sh_entries("<html>rate limited</html>").is_err());
+        assert_eq!(parse_crt_sh_entries("[]").unwrap().len(), 0);
     }
 }

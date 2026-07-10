@@ -801,12 +801,16 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
 /* ── Browser client identity key ──
    The durable identity of this browser *on this origin*: a WebCrypto P-256
    keypair whose non-extractable private key lives in IndexedDB. Because
-   browser storage is origin-scoped, a key created under an anchor daemon's
-   origin can never be wielded by code served from any other origin — that
-   property is what lets daemons treat key-bound sessions as anchor-grade
-   (see docs/src/trust-architecture.md). Offers carry the public key plus a
-   signature over (daemon id, client nonce, sdp digest, timestamp); daemons
-   resolve the key fingerprint against their local IAM. */
+   browser storage is origin-scoped, a key created under one origin can
+   never be wielded by code served from any OTHER origin — which is what
+   lets daemons weight key-bound sessions by their enrollment origin's
+   provenance (see docs/src/trust-architecture.md). Honest limit: origin
+   scoping is only as strong as the origin's own naming — whoever can
+   present a valid certificate for the origin's name IS the origin to this
+   browser (the first-contact rungs in docs/src/trust-tiers.md). Offers
+   carry the public key plus a signature over (daemon id, client nonce,
+   sdp digest, timestamp); daemons resolve the key fingerprint against
+   their local IAM. */
 
 const CLIENT_IDENTITY_DB = 'intendant-client-identity';
 const CLIENT_IDENTITY_STORE = 'keys';

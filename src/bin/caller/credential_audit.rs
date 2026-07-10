@@ -42,8 +42,8 @@ pub struct CustodyEvent {
     pub actor: String,
     /// Origin class of the session that performed the ceremony —
     /// `hosted` (Connect account / hosted-origin browser key), `direct`
-    /// (anchor-grade key or mTLS cert), `local` (the owner's own
-    /// dashboard), or `peer`. Empty for events with no session behind
+    /// (a key or mTLS cert born on a daemon-served origin), `local` (the
+    /// owner's own dashboard), or `peer`. Empty for events with no session behind
     /// them (expiry sweeps, restart resets) and for records written
     /// before the field existed. See docs/src/trust-tiers.md.
     #[serde(default, skip_serializing_if = "String::is_empty")]

@@ -2118,8 +2118,11 @@ pub fn evaluate_principal_operation_with_state(
 /// The ceiling role applying to this session, if any. `connect_account`
 /// bindings are always subject to their configured ceiling; `client_key`
 /// bindings only when the key's recorded enrollment origin is one of the
-/// configured hosted origins (keys born on daemon-served origins are
-/// anchor-grade and uncapped).
+/// configured hosted origins. Keys born on daemon-served origins are
+/// uncapped — including fleet-name origins, whose code is daemon-served
+/// but whose ROUTE the rendezvous names (first-contact rung two,
+/// docs/src/trust-tiers.md); owners who want fleet-name sessions capped
+/// add the fleet zone's origins to `hosted_origins`.
 pub fn role_ceiling_for_session(
     state: &LocalIamState,
     principal: &AccessPrincipal,
@@ -2142,9 +2145,11 @@ pub fn role_ceiling_for_session(
 
 /// Origin class of a session for the custody trail
 /// (docs/src/trust-tiers.md): `hosted` (Connect account or a browser key
-/// enrolled from one of `hosted_origins`), `direct` (anchor-grade key,
-/// mTLS certificate, or any other explicit binding), `local` (the
-/// owner's own dashboard / loopback), or `peer` (a federated daemon).
+/// enrolled from one of `hosted_origins`), `direct` (a key or mTLS
+/// certificate on a daemon-served origin — fleet-name origins included:
+/// daemon-served for code, rendezvous-named for routing; the finer
+/// routing distinction is [`origin_route_class`]), `local` (the owner's
+/// own dashboard / loopback), or `peer` (a federated daemon).
 /// Classification mirrors [`role_ceiling_for_session`]'s hosted test.
 pub fn session_origin_class(hosted_origins: &[String], principal: &AccessPrincipal) -> &'static str {
     if principal.kind == "peer_daemon" {
@@ -2173,6 +2178,49 @@ pub fn session_origin_class(hosted_origins: &[String], principal: &AccessPrincip
             }
         }
     }
+}
+
+/// Routing provenance of an enrollment origin — the first-contact rung it
+/// arrived on (docs/src/trust-tiers.md, "First contact"):
+///
+/// - `hosted`: one of `hosted_origins` — the rendezvous serves the code.
+/// - `fleet`: a name under the rendezvous's delegated fleet zone — the
+///   daemon serves the code, but the rendezvous names the route (it could
+///   hijack DNS and mint a certificate; active-only, CT-logged).
+/// - `direct`: any other explicit origin (typed IP, mDNS, own domain).
+/// - `unknown`: no origin recorded (pre-origin enrollments).
+///
+/// Distinct from [`session_origin_class`]: that classifies for custody
+/// (code provenance), this classifies for approval decisions (route
+/// provenance). A fleet origin is `direct`-grade there and `fleet` here.
+pub fn origin_route_class(
+    origin: &str,
+    hosted_origins: &[String],
+    fleet_zone: Option<&str>,
+) -> &'static str {
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return "unknown";
+    }
+    if hosted_origins
+        .iter()
+        .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'))
+    {
+        return "hosted";
+    }
+    if let Some(zone) = fleet_zone.map(str::trim).filter(|zone| !zone.is_empty()) {
+        let zone = zone.trim_end_matches('.').to_ascii_lowercase();
+        let host = url::Url::parse(origin)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        if let Some(host) = host {
+            let host = host.trim_end_matches('.');
+            if host == zone || host.ends_with(&format!(".{zone}")) {
+                return "fleet";
+            }
+        }
+    }
+    "direct"
 }
 
 /// True when a permission list grants `permission`. The legacy aggregate id
@@ -3968,7 +4016,7 @@ mod tests {
         )
         .unwrap();
 
-        // Anchor-origin keys are anchor-grade: no ceiling.
+        // Keys born on daemon-served origins are uncapped: no ceiling.
         let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
         assert_eq!(
             anchor.authn_origin.as_deref(),
@@ -4001,6 +4049,44 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn origin_route_class_distinguishes_the_first_contact_rungs() {
+        let hosted = default_hosted_origins();
+        let zone = Some("fleet.intendant.dev");
+        assert_eq!(
+            origin_route_class("https://connect.intendant.dev", &hosted, zone),
+            "hosted"
+        );
+        assert_eq!(
+            origin_route_class("https://connect.intendant.dev/", &hosted, zone),
+            "hosted"
+        );
+        assert_eq!(
+            origin_route_class("https://d-30a08371a38c1b.fleet.intendant.dev:8765", &hosted, zone),
+            "fleet"
+        );
+        // The zone apex itself is fleet-classed; a lookalike suffix is not.
+        assert_eq!(
+            origin_route_class("https://fleet.intendant.dev", &hosted, zone),
+            "fleet"
+        );
+        assert_eq!(
+            origin_route_class("https://evil-fleet.intendant.dev", &hosted, zone),
+            "direct"
+        );
+        assert_eq!(
+            origin_route_class("https://192.168.1.50:8765", &hosted, zone),
+            "direct"
+        );
+        // No fleet zone configured: fleet-looking names are just direct.
+        assert_eq!(
+            origin_route_class("https://d-x.fleet.intendant.dev", &hosted, None),
+            "direct"
+        );
+        assert_eq!(origin_route_class("", &hosted, zone), "unknown");
+        assert_eq!(origin_route_class("   ", &hosted, zone), "unknown");
     }
 
     #[test]

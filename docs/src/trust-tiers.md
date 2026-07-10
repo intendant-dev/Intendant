@@ -5,7 +5,7 @@
 > chapter is the operating model an owner applies across a fleet whose
 > machines carry different stakes. Almost nothing here is new mechanism — it
 > composes ceilings, grants, custody, and client choice that already exist.
-> The three product hooks at the end are the tracked exceptions.
+> The product hooks at the end are the tracked exceptions.
 
 ## Two axes, not one
 
@@ -53,6 +53,11 @@ sensitive thing that ever touches it**, not by the label its owner had in
 mind. Pasting a production credential into a session on a disposable box
 silently promotes the box. Tier discipline is as much about what you feed a
 daemon as about how you reach it.
+
+There is a third axis, easy to conflate with client provenance and
+untangled [below](#first-contact-three-rungs): **first contact** — who
+named the route you followed to reach a daemon at all, and what evidence
+their betrayal would leave.
 
 ## One fleet, zones — not two networks
 
@@ -143,10 +148,94 @@ The owner claims all three into one account, sees them in one dashboard,
 and the tier boundary is carried entirely by ceilings, grant direction, and
 which client they open for which box.
 
+## First contact: three rungs
+
+The two axes above describe steady state: a client you already hold,
+driving a daemon you already reach. A third question is orthogonal to both
+and only looks answered until you ask it precisely: **who did you have to
+trust to reach the daemon at all — and what evidence would their betrayal
+leave?** Client provenance says who serves the code that runs; first
+contact says who *named the route* you followed to it. The answers can
+differ for the same URL, and conflating them is how "it's daemon-served"
+quietly overstates a link's safety.
+
+Three rungs, ordered by what betrayal costs the attacker:
+
+1. **Trustless — nothing between you and the box.** A typed direct address
+   plus the enrollment ceremony (the fingerprint verified out of band pins
+   the daemon's certificate), preinstalled mTLS material, or a client you
+   built or installed yourself. No third party participates in naming or
+   serving, so there is nothing whose betrayal you would need evidence of.
+   This is the only rung that deserves the word *anchor*, and it is bought
+   with the one deliberately inconvenient ceremony.
+2. **Trust with mandatory evidence — the fleet name.**
+   `https://d-<hash>.fleet.intendant.dev:8765` is daemon-served code on a
+   rendezvous-named route: the zone operator — or anything else that can
+   answer DNS for the name and convince a CA — could point your daemon's
+   name at a box of its choosing. What this rung guarantees is not that
+   the swap cannot happen but that it **cannot happen quietly**: serving
+   code at the `https` origin requires a certificate for the name, the
+   attack must be live at the moment you connect (nothing is exposed
+   passively or retroactively), and every issued certificate lands in
+   public Certificate Transparency logs — where the daemon's own CT
+   tripwire watches for serials it never requested and raises **CT
+   ALERT** on the Connect card. Betrayal is possible, targeted, and loud.
+3. **Trusted but bounded — the hosted tab.** The rendezvous origin serves
+   the code itself, so betrayal is a silently different bundle to one
+   visitor, once, with no artifact anywhere. No evidence machinery can
+   apply; what bounds the damage is authority, not detection — role
+   ceilings cap hosted-provenance sessions, trusted-only vault entries
+   refuse hosted unseal, and custody keeps durable secrets off the tier
+   that would leak them.
+
+The product states the rung wherever an owner makes a trust decision:
+device-enrollment approvals carry a daemon-computed route chip (*via
+direct origin* / *via fleet name* / *via hosted route*), and owners who
+want rung-two sessions capped like rung-three ones add the daemon's fleet
+origin to `hosted_origins` (the ceiling test matches exact origins, so it
+is the daemon's own fleet URL that goes in the list, not the bare zone).
+
+One consequence is easy to miss: for any *browser* client, first contact
+re-asks itself on every page load — the tab re-fetches its code each
+visit, so a rung's guarantee is only as durable as its serving origin.
+Enrolled identity keys do not change this: browser storage is
+origin-scoped, so a key enrolled at a fleet name is wieldable by whatever
+code that name serves. Rungs one and two therefore fully converge only
+when the client stops being re-served — the signed native app and code
+transparency over serving origins (both tracked) are the ladder's missing
+top, not polish.
+
+### Still blurry, on purpose
+
+Named honestly rather than smoothed over — each is either tracked or a
+stated non-goal:
+
+- **The time axis (TOFU).** Everything above grades *first* contact;
+  later visits inherit pinned material (enrolled keys, remembered
+  certificates) but re-inherit the code channel every load. The signed
+  app collapses code trust to install-and-update moments; until it
+  ships, rung two re-runs per visit.
+- **The update channel.** A signed app trusts its updater. Code
+  transparency — served-artifact hashes in a public log, monitors,
+  verifiers — is the evidence leg for that too. (Tracked.)
+- **Lookalike names.** `d-<hash>` labels are deliberately opaque, which
+  also means humans cannot eyeball them; a phished lookalike with its own
+  valid certificate raises no CT alarm on *your* name, because it is not
+  your name. The mitigation is navigational: reach fleet names from the
+  fleet strip, bookmarks, or the app — never by retyping.
+- **The browser itself.** Every rung assumes the browser and OS are
+  honest; an extension with page access reads all tiers alike. Outside
+  Intendant's reach — stated so the ladder is not mistaken for covering
+  it.
+- **Hosted-passkey coupling.** Unsealing the vault with a passkey inside
+  a hosted tab is rung-three code wielding rung-one credentials. The
+  write-only CLI vault lane and the pinned crypto kernel (both tracked)
+  are the untangle.
+
 ## Product hooks
 
-Three pieces of mechanism let the product carry this doctrine instead of
-the owner's memory. All three are **shipped**:
+Four pieces of mechanism let the product carry this doctrine instead of
+the owner's memory. All four are **shipped**:
 
 1. **Tier labels + upward-grant guard.** Each daemon carries its tier in
    local IAM (`tier` in `iam.json`; `POST /api/access/tier`,
@@ -181,3 +270,16 @@ the owner's memory. All three are **shipped**:
    [Credential Custody](./credential-custody.md#the-vault)), trusted-only
    entries do real work: sealed against hosted tabs, fully usable from a
    direct dashboard backed by the daemon's own store.
+4. **First-contact route, surfaced and watched.** Enrollment approvals
+   carry a route chip computed daemon-side (`iam::origin_route_class`:
+   hosted / fleet / direct / unknown — route provenance for approval
+   decisions, distinct from `session_origin_class`, the custody-trail
+   code-provenance class), with honest per-rung copy and an
+   integrated-tier warning on any network route. The **CT tripwire**
+   backs rung two's evidence claim: `fleet_cert` records the serial of
+   every certificate it obtains (before install, so a crash cannot make
+   an own certificate look foreign), polls crt.sh for the daemon's fleet
+   name on each renewal tick, and flips the Connect card to **CT ALERT**
+   on any serial the daemon never requested. Advisory and fail-open by
+   design: a crt.sh outage stamps `ct_last_error` rather than blocking
+   renewal.
