@@ -360,8 +360,12 @@ triggers keep paths filters — push runs are check-only warm passes, not gates
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
 **self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
-`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
-incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+`intendant-macos`, `samsung-win` = `intendant-windows`) with build state
+in **external per-listener cargo target caches** (`CARGO_TARGET_DIR`
+under the runner account's `~/.cache/intendant-ci/`, keyed by `rustc -V`
+— checkout's `git clean -ffdx` wipes an in-workspace `target/` every
+job, so warmth can only live outside it) — warm gate runs are minutes,
+not half-hours.
 **Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
 `matrix.os` doubles as the hosted label): external code never executes on
 our hardware, yet its required checks really run. Fork-PR workflows also
