@@ -55,7 +55,14 @@ pub(crate) use tool_params::*;
 // tools_managed / tools_display / tools_peer contribute impl-block
 // methods only — nothing importable, so no re-export. tools_notes also
 // exports the session-note caps, which `intendant ctl session note`
-// enforces client-side (derive, don't mirror).
+// enforces client-side (derive, don't mirror); tools_ask likewise exports
+// its caps for `intendant ctl ask` / `ctl notify`, plus the pending-ask
+// probe the session supervisor's approval routing consults.
+mod tools_ask;
+pub(crate) use tools_ask::{
+    ask_user_question_pending, ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_OPTIONS,
+    ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
+};
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
@@ -325,6 +332,23 @@ impl IntendantServer {
                     Err(message) => {
                         text_tool_error(format!("post_session_note failed: {message}"))
                     }
+                })
+            }
+            "ask_user" => {
+                let Parameters(params) =
+                    parse_params::<AskUserParams>(with_default_mcp_session_id(args, session_id))?;
+                Ok(match self.ask_user_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("ask_user failed: {message}")),
+                })
+            }
+            "notify_user" => {
+                let Parameters(params) = parse_params::<NotifyUserParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(match self.notify_user_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("notify_user failed: {message}")),
                 })
             }
             "set_autonomy" => {

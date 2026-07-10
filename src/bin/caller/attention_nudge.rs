@@ -87,8 +87,8 @@ fn last_dashboard_seen() -> Option<u64> {
 
 /// The kind of agent→user request pending. This is the whole vocabulary the
 /// nudge wire carries about the request — deliberately a category, not a
-/// payload. New attention kinds (agent notify) extend this enum + the
-/// service-side whitelist (`NOTIFY_KINDS` in src/bin/connect/push.rs).
+/// payload. New attention kinds extend this enum + the service-side
+/// whitelist (`NOTIFY_KINDS` in `src/bin/connect/push.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionKind {
     Approval,
@@ -96,6 +96,11 @@ pub(crate) enum AttentionKind {
     /// A scoped agent asked to access the user's display
     /// (`request_user_display`); the popup waits for the owner's click.
     DisplayRequest,
+    /// An urgent `notify_user` notification — an explicit agent escalation,
+    /// not a pending request: it skips the grace period (nothing to
+    /// "answer quickly"), fires at most once, and still respects the
+    /// per-session cooldown.
+    Notify,
 }
 
 impl AttentionKind {
@@ -104,6 +109,7 @@ impl AttentionKind {
             AttentionKind::Approval => "approval",
             AttentionKind::Question => "question",
             AttentionKind::DisplayRequest => "display_request",
+            AttentionKind::Notify => "notify",
         }
     }
 }
@@ -144,8 +150,22 @@ pub(crate) struct NudgeInput {
 /// the grace period with no dashboard connected at any point since it
 /// appeared, and the session's cooldown has elapsed.
 pub(crate) fn should_nudge(input: NudgeInput) -> bool {
+    should_nudge_with_grace(input, NUDGE_GRACE_MS)
+}
+
+/// The urgent-escalation rule (`notify_user` with `urgency: urgent`): the
+/// agent explicitly asked to reach the owner, so there is no grace period —
+/// but the dashboard suppressions and the per-session cooldown still hold.
+/// The attention chain stays layered: an open tab renders the toast, a
+/// hidden tab raises the browser notification, and only the nobody-watching
+/// case leaves the machine.
+pub(crate) fn should_nudge_escalation(input: NudgeInput) -> bool {
+    should_nudge_with_grace(input, 0)
+}
+
+fn should_nudge_with_grace(input: NudgeInput, grace_ms: u64) -> bool {
     let age = input.now_unix_ms.saturating_sub(input.pending_since_unix_ms);
-    if age < NUDGE_GRACE_MS {
+    if age < grace_ms {
         return false;
     }
     if input.dashboards_connected {
@@ -192,6 +212,10 @@ fn fallback_label(key: &str) -> String {
 struct MonitorState {
     /// (session key, id space, request id) → pending request.
     pending: HashMap<(String, IdSpace, u64), PendingRequest>,
+    /// session key → oldest undelivered urgent-notification escalation
+    /// (unix-ms it appeared). One slot per session: an urgent burst
+    /// collapses into one nudge like every other burst.
+    escalations: HashMap<String, u64>,
     /// session key → last nudge unix-ms.
     last_nudge: HashMap<String, u64>,
     /// session key → user-set display name (explicit renames only).
@@ -202,6 +226,7 @@ impl MonitorState {
     fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            escalations: HashMap::new(),
             last_nudge: HashMap::new(),
             names: HashMap::new(),
         }
@@ -240,6 +265,17 @@ impl MonitorState {
                 self.pending
                     .remove(&(session_key(session_id), IdSpace::DisplayRequest, *id));
             }
+            // Only urgent notifications escalate off the machine; info and
+            // attention stay browser-side by design.
+            AppEvent::UserNotification {
+                session_id,
+                urgency: crate::types::NotificationUrgency::Urgent,
+                ..
+            } => {
+                self.escalations
+                    .entry(session_key(session_id))
+                    .or_insert_with(now_unix_ms);
+            }
             AppEvent::ApprovalResolved { session_id, id, .. } => {
                 self.pending
                     .remove(&(session_key(session_id), IdSpace::Approval, *id));
@@ -249,15 +285,18 @@ impl MonitorState {
             // headless deny) skip ApprovalResolved, so clear by session.
             // Display requests deliberately survive TaskComplete/Interrupted
             // — their waiter is the blocked MCP call, not the agent loop's
-            // turn — and clear on SessionEnded like everything else.
+            // turn — and clear on SessionEnded like everything else. A dead
+            // session's undelivered escalation dies with it too.
             AppEvent::TaskComplete { session_id, .. }
             | AppEvent::Interrupted { session_id, .. } => {
                 let key = session_key(session_id);
                 self.pending
                     .retain(|(k, space, _), _| *k != key || *space == IdSpace::DisplayRequest);
+                self.escalations.remove(&key);
             }
             AppEvent::SessionEnded { session_id, .. } => {
                 self.pending.retain(|(k, _, _), _| k != session_id);
+                self.escalations.remove(session_id);
                 self.names.remove(session_id);
                 self.last_nudge.remove(session_id);
             }
@@ -271,6 +310,51 @@ impl MonitorState {
             }
             _ => {}
         }
+    }
+
+    fn label(&self, key: &str) -> String {
+        self.names
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| fallback_label(key))
+    }
+
+    /// Advance the one-shot escalations: returns the sessions to nudge NOW
+    /// (kind `notify`, no grace) and drops every escalation whose owner is
+    /// already informed — a dashboard connected now, or one seen since the
+    /// notification appeared (the toast/transcript row rendered there).
+    /// Escalations blocked only by the cooldown stay queued for a later
+    /// tick: the owner is genuinely away and the escalation must still
+    /// reach them once the pacing allows.
+    fn take_due_escalations(
+        &mut self,
+        now: u64,
+        connected: bool,
+        last_seen: Option<u64>,
+    ) -> Vec<(String, String)> {
+        let mut due: Vec<(String, String)> = Vec::new();
+        let mut drop_keys: Vec<String> = Vec::new();
+        for (key, since) in &self.escalations {
+            let input = NudgeInput {
+                now_unix_ms: now,
+                pending_since_unix_ms: *since,
+                dashboards_connected: connected,
+                last_dashboard_seen_unix_ms: last_seen,
+                last_nudge_unix_ms: self.last_nudge.get(key).copied(),
+            };
+            if should_nudge_escalation(input) {
+                due.push((key.clone(), self.label(key)));
+            } else if connected || last_seen.is_some_and(|seen| seen >= *since) {
+                // Seen on a dashboard: the escalation delivered browser-side.
+                drop_keys.push(key.clone());
+            }
+            // Else: only the cooldown holds it — keep for a later tick.
+        }
+        for key in due.iter().map(|(key, _)| key).chain(drop_keys.iter()) {
+            self.escalations.remove(key);
+        }
+        due.sort_by(|a, b| a.0.cmp(&b.0));
+        due
     }
 
     /// Sessions due a nudge now: `(session key, kind, display label)` for
@@ -294,14 +378,7 @@ impl MonitorState {
                     last_nudge_unix_ms: self.last_nudge.get(*key).copied(),
                 })
             })
-            .map(|(key, request)| {
-                let label = self
-                    .names
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| fallback_label(key));
-                (key.to_string(), request.kind, label)
-            })
+            .map(|(key, request)| (key.to_string(), request.kind, self.label(key)))
             .collect();
         due.sort_by(|a, b| a.0.cmp(&b.0));
         due
@@ -335,14 +412,26 @@ pub(crate) fn spawn_attention_nudge_monitor(bus: EventBus) {
                     if connected {
                         LAST_DASHBOARD_SEEN_UNIX_MS.store(now, Ordering::SeqCst);
                     }
-                    if state.pending.is_empty() {
+                    if state.pending.is_empty() && state.escalations.is_empty() {
                         continue;
                     }
-                    for (key, kind, label) in state.due(now, connected, last_dashboard_seen()) {
+                    // Escalations first: marking last_nudge here also
+                    // cooldown-suppresses a same-tick pending nudge for the
+                    // session, so one push carries the attention.
+                    let mut nudges: Vec<(String, AttentionKind, String)> = state
+                        .take_due_escalations(now, connected, last_dashboard_seen())
+                        .into_iter()
+                        .map(|(key, label)| (key, AttentionKind::Notify, label))
+                        .collect();
+                    for (key, _, _) in &nudges {
+                        state.last_nudge.insert(key.clone(), now);
+                    }
+                    nudges.extend(state.due(now, connected, last_dashboard_seen()));
+                    for (key, kind, label) in nudges {
                         // Mark before sending: a failing rendezvous must not
                         // turn into a hammer loop — the cooldown paces retries.
                         state.last_nudge.insert(key.clone(), now);
-                        // Cooldown-paced, so neither arm can chat more than
+                        // Cooldown-paced, so no arm can chat more than
                         // once per session per NUDGE_SESSION_COOLDOWN_MS.
                         match crate::connect_rendezvous::notify_attention(kind.as_str(), &label).await {
                             Ok(()) => eprintln!(
@@ -582,6 +671,126 @@ mod tests {
         let due = state.due(now, false, None);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].2, "deploy review");
+    }
+
+    #[test]
+    fn escalations_skip_grace_but_respect_cooldown_and_dashboards() {
+        // The urgent rule is the pending rule minus the grace period.
+        let mut input = base_input();
+        input.pending_since_unix_ms = input.now_unix_ms; // brand new
+        assert!(!should_nudge(input));
+        assert!(should_nudge_escalation(input));
+        // A connected dashboard still suppresses (the toast delivered).
+        input.dashboards_connected = true;
+        assert!(!should_nudge_escalation(input));
+        input.dashboards_connected = false;
+        // The per-session cooldown still paces explicit escalations.
+        input.last_nudge_unix_ms = Some(input.now_unix_ms - NUDGE_SESSION_COOLDOWN_MS + 1);
+        assert!(!should_nudge_escalation(input));
+    }
+
+    fn urgent_notification(session_id: &str) -> AppEvent {
+        AppEvent::UserNotification {
+            session_id: Some(session_id.to_string()),
+            id: "notif-1".to_string(),
+            title: None,
+            text: "the deploy is blocked on credentials".to_string(),
+            urgency: crate::types::NotificationUrgency::Urgent,
+            ts: 1,
+        }
+    }
+
+    #[test]
+    fn urgent_notifications_escalate_once_with_a_content_free_label() {
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc12345-XYZ"));
+        // Only urgent escalates: info/attention stay browser-side.
+        state.observe(&AppEvent::UserNotification {
+            session_id: Some("other-session".to_string()),
+            id: "notif-2".to_string(),
+            title: None,
+            text: "fyi".to_string(),
+            urgency: crate::types::NotificationUrgency::Attention,
+            ts: 1,
+        });
+        assert_eq!(state.escalations.len(), 1);
+
+        // Immediately due — no grace — and the label is the content-free
+        // id-prefix fallback, never the notification text.
+        let now = now_unix_ms() + 1;
+        let due = state.take_due_escalations(now, false, None);
+        assert_eq!(due, vec![("abc12345-XYZ".to_string(), "session abc12345".to_string())]);
+        // One-shot: dispatched escalations leave the queue.
+        assert!(state.escalations.is_empty());
+        assert!(state.take_due_escalations(now, false, None).is_empty());
+    }
+
+    #[test]
+    fn escalations_seen_on_a_dashboard_drop_without_pushing() {
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc"));
+        let now = now_unix_ms() + 1;
+        // Connected right now: the toast rendered — drop, no push.
+        assert!(state.take_due_escalations(now, true, Some(now)).is_empty());
+        assert!(state.escalations.is_empty());
+
+        // Seen since (connected after the notification, since disconnected):
+        // the transcript row replayed — drop, no push.
+        state.observe(&urgent_notification("abc"));
+        let since = state.escalations["abc"];
+        assert!(state.take_due_escalations(now, false, Some(since + 1)).is_empty());
+        assert!(state.escalations.is_empty());
+    }
+
+    #[test]
+    fn cooldown_blocked_escalations_stay_queued_for_a_later_tick() {
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc"));
+        let now = now_unix_ms() + 1;
+        state.last_nudge.insert("abc".to_string(), now - 1);
+        // Cooldown holds it — but the owner is genuinely away, so it must
+        // not be dropped: it fires once the cooldown elapses.
+        assert!(state.take_due_escalations(now, false, None).is_empty());
+        assert_eq!(state.escalations.len(), 1);
+        let later = now + NUDGE_SESSION_COOLDOWN_MS;
+        assert_eq!(state.take_due_escalations(later, false, None).len(), 1);
+        assert!(state.escalations.is_empty());
+    }
+
+    #[test]
+    fn session_teardown_clears_escalations() {
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc"));
+        state.observe(&AppEvent::SessionEnded {
+            session_id: "abc".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(state.escalations.is_empty());
+
+        state.observe(&urgent_notification("def"));
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("def".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert!(state.escalations.is_empty());
+    }
+
+    /// The daemon-side kind vocabulary is CLOSED and must match the
+    /// service-side whitelist (`NOTIFY_KINDS` in `src/bin/connect/push.rs`)
+    /// value for value — a kind added on one side only either never
+    /// delivers or gets rejected as free text.
+    #[test]
+    fn attention_kind_vocabulary_is_pinned() {
+        for kind in [
+            AttentionKind::Approval,
+            AttentionKind::Question,
+            AttentionKind::Notify,
+        ] {
+            assert!(matches!(kind.as_str(), "approval" | "question" | "notify"));
+        }
+        assert_eq!(AttentionKind::Notify.as_str(), "notify");
     }
 
     #[test]

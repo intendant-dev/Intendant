@@ -126,10 +126,17 @@ pub(crate) fn context_snapshot_file_selector_is_safe(file: &str) -> bool {
             .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
-pub(crate) fn context_snapshot_selector_from_request(
+/// Query-string decode of the snapshot selector parts — the HTTP lane's
+/// transport-owned decode (the tunnel decodes the same parts from frame
+/// params). Selector validation lives with the shared
+/// [`session_context_snapshot_response_body`] core; only the u64 parse
+/// can fail here, keeping its historical wording.
+pub(crate) type ContextSnapshotSelectorParts =
+    (Option<String>, Option<String>, Option<u64>, Option<String>);
+
+pub(crate) fn context_snapshot_selector_parts_from_request(
     request_line: &str,
-) -> Result<ContextSnapshotSelector, String> {
-    let file = query_param(request_line, "file").filter(|value| !value.trim().is_empty());
+) -> Result<ContextSnapshotSelectorParts, String> {
     let request_index =
         match query_param(request_line, "request_index").filter(|value| !value.trim().is_empty()) {
             Some(value) => Some(
@@ -139,12 +146,12 @@ pub(crate) fn context_snapshot_selector_from_request(
             ),
             None => None,
         };
-    context_snapshot_selector_from_parts(
-        file,
+    Ok((
+        query_param(request_line, "file").filter(|value| !value.trim().is_empty()),
         query_param(request_line, "request_id").filter(|value| !value.trim().is_empty()),
         request_index,
         query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
-    )
+    ))
 }
 
 pub(crate) fn context_snapshot_selector_from_parts(
@@ -326,30 +333,6 @@ pub(crate) fn session_context_snapshot_response_body(
     session_context_snapshot_response_for_selector(home, session_id, source, selector)
 }
 
-pub(crate) fn get_session_context_snapshot_from_home(
-    home: &Path,
-    session_id: &str,
-    source: &str,
-    request_line: &str,
-) -> (&'static str, String) {
-    if !session_lookup_id_is_safe(session_id) {
-        return (
-            "400 Bad Request",
-            serde_json::json!({"error": "invalid session id"}).to_string(),
-        );
-    }
-    let selector = match context_snapshot_selector_from_request(request_line) {
-        Ok(selector) => selector,
-        Err(error) => {
-            return (
-                "400 Bad Request",
-                serde_json::json!({"error": error}).to_string(),
-            );
-        }
-    };
-    session_context_snapshot_response_for_selector(home, session_id, source, selector)
-}
-
 pub(crate) fn session_context_snapshot_response_for_selector(
     home: &Path,
     session_id: &str,
@@ -387,22 +370,6 @@ pub(crate) fn session_context_snapshot_response_for_selector(
         "404 Not Found",
         serde_json::json!({"error": "context snapshot not found"}).to_string(),
     )
-}
-
-pub(crate) async fn sessions_search_response_body(
-    query: String,
-    source_filter: String,
-    mode: String,
-    project_filter: Vec<String>,
-) -> String {
-    sessions_search_response_body_with_cancel(
-        query,
-        source_filter,
-        mode,
-        project_filter,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
 }
 
 pub(crate) async fn sessions_search_response_body_with_cancel(
@@ -1803,11 +1770,19 @@ mod tests {
         let request = format!(
             "GET /api/session/lazy-session/context-snapshot?source=intendant&file={encoded_file} HTTP/1.1"
         );
-        let (status, body) = get_session_context_snapshot_from_home(
+        // The HTTP lane's decode (url-decoding the file selector) feeding
+        // the shared (status, body) core, over this test's own home.
+        let (file, request_id, request_index, ts) =
+            context_snapshot_selector_parts_from_request(&request).unwrap();
+        assert_eq!(file.as_deref(), Some(snapshot_file));
+        let (status, body) = session_context_snapshot_response_body(
             dir.path(),
             "lazy-session",
             "intendant",
-            &request,
+            file,
+            request_id,
+            request_index,
+            ts,
         );
         assert_eq!(status, "200 OK");
         let loaded: serde_json::Value = serde_json::from_str(&body).unwrap();

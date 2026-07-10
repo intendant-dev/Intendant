@@ -2126,11 +2126,15 @@ function handleSessionNoteEvent(d) {
 // QA readback (window.qa convention): the dashboard validator exercises
 // the note rail's module-scoped pieces directly — the attachment strip
 // (including its deleted-blob chip degradation) and the wire-event
-// normalizer. Side-effect-free beyond the DOM node the caller passes in.
+// normalizers. Side-effect-free beyond the DOM node the caller passes in.
 window.qa = Object.assign(window.qa || {}, {
   sessionNotes: {
     renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
     logCommand: (d) => sessionNoteLogCommand(d),
+  },
+  userNotifications: {
+    logCommand: (d) => userNotificationLogCommand(d),
+    toastText: (d) => userNotificationToastText(d),
   },
 });
 
@@ -2150,6 +2154,79 @@ function sessionNoteReplayEntryToLogEntry(entry) {
     source: String(entry.source || '').trim() || 'note',
     kind: 'session_note',
     content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
+// ── Agent→user notifications (notify_user) ──
+// Wire shape: { event: 'user_notification', session_id, id, title?, text,
+// urgency: 'info'|'attention'|'urgent', ts }. Display-only like session
+// notes: a transcript row (kind 'user_notification') plus a toast; the
+// attention center (fragment 57) separately badges the escalated
+// urgencies, and the daemon's attention monitor owns the urgent push.
+
+function userNotificationToastText(d) {
+  const title = String(d?.title || '').trim();
+  const text = String(d?.text || '').trim();
+  return title ? `${title}: ${text}` : text;
+}
+
+// Normalize a user_notification wire event (live WS or a raw
+// replay/session-detail entry) into the log-command shape renderLogEntry
+// consumes.
+function userNotificationLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const urgency = String(d?.urgency || 'info');
+  const title = String(d?.title || '').trim();
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  const id = d?.id || d?.notification_id || d?.notificationId || '';
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: urgency === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
+    event_id: d?.event_id || d?.eventId || (id ? `user-notification:${id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+  };
+}
+
+// Live-path handler for the user_notification WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleUserNotificationEvent(d) {
+  const c = userNotificationLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+  // Toast for at-a-glance visibility; urgent renders in the alarm style.
+  const urgency = String(d?.urgency || 'info');
+  if (typeof showControlToast === 'function') {
+    showControlToast(urgency === 'urgent' ? 'error' : 'info', userNotificationToastText(d));
+  }
+}
+
+// Bootstrap-replay adapter (same contract as
+// sessionNoteReplayEntryToLogEntry): notifications replay as plain
+// notify-styled text rows; no toast for history.
+function userNotificationReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'user_notification') return entry;
+  const title = String(entry.title || '').trim();
+  const text = String(entry.text || '').trim();
+  return {
+    event: 'log_entry',
+    level: String(entry.urgency || '') === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
     session_id: entry.session_id || '',
     ts: entry.ts,
     event_id: entry.event_id || '',

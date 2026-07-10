@@ -636,6 +636,43 @@ pub fn session_log_entry_to_app_event(
                 ts,
             })
         }
+        "user_notification" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("notification_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let title = data
+                .and_then(|d| d.get("title"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let text = data
+                .and_then(|d| d.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message.strip_prefix("Notification: ").unwrap_or(message))
+                .to_string();
+            let urgency = data
+                .and_then(|d| d.get("urgency"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| crate::types::NotificationUrgency::parse(Some(v)).ok())
+                .unwrap_or_default();
+            let ts = data
+                .and_then(|d| d.get("ts_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(AppEvent::UserNotification {
+                session_id,
+                id,
+                title,
+                text,
+                urgency,
+                ts,
+            })
+        }
         "session_identity" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -1295,6 +1332,56 @@ mod tests {
             value["attachments"][0]["url"],
             "/api/session/current/uploads/u-1/raw"
         );
+    }
+
+    #[test]
+    fn rt_user_notification_preserves_fields_and_wire_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let text = "Deploy blocked on expired credentials.";
+        log.user_notification(
+            Some("thread-3"),
+            "notif-1",
+            Some("Deploy"),
+            text,
+            crate::types::NotificationUrgency::Urgent,
+            1_752_000_000_456,
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "user_notification");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::UserNotification {
+                session_id,
+                id,
+                title,
+                text: replayed,
+                urgency,
+                ts,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-3"));
+                assert_eq!(id, "notif-1");
+                assert_eq!(title.as_deref(), Some("Deploy"));
+                assert_eq!(replayed, text);
+                assert_eq!(urgency, crate::types::NotificationUrgency::Urgent);
+                assert_eq!(ts, 1_752_000_000_456);
+            }
+            other => panic!("expected UserNotification, got {:?}", other),
+        }
+
+        // The replay entry must survive the full browser-entry pipeline
+        // (AppEvent -> OutboundEvent -> tagged JSON) with the wire shape
+        // the dashboard consumes.
+        let app_event = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        let outbound = crate::event::app_event_to_outbound(&app_event).unwrap();
+        let value = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(value["event"], "user_notification");
+        assert_eq!(value["id"], "notif-1");
+        assert_eq!(value["title"], "Deploy");
+        assert_eq!(value["text"], text);
+        assert_eq!(value["urgency"], "urgent");
+        assert_eq!(value["ts"], 1_752_000_000_456u64);
     }
 
     #[test]

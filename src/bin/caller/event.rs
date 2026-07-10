@@ -389,6 +389,19 @@ pub enum AppEvent {
         id: u64,
         action: String,
     },
+    /// Fire-and-forget agent→user notification (`notify_user`). Display
+    /// only: rendered by dashboards (toast + transcript row), persisted to
+    /// the session log for replay, never injected into any model context,
+    /// and never blocking. `urgency` escalates delivery (attention center,
+    /// Connect nudge) — see [`crate::types::NotificationUrgency`].
+    UserNotification {
+        session_id: Option<String>,
+        id: String,
+        title: Option<String>,
+        text: String,
+        urgency: crate::types::NotificationUrgency,
+        ts: u64,
+    },
 
     // Vision display ready
     DisplayReady {
@@ -2197,6 +2210,21 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id: *id,
             questions: questions.clone(),
         }),
+        AppEvent::UserNotification {
+            session_id,
+            id,
+            title,
+            text,
+            urgency,
+            ts,
+        } => Some(OutboundEvent::UserNotification {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            title: title.clone(),
+            text: text.clone(),
+            urgency: *urgency,
+            ts: *ts,
+        }),
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
         }),
@@ -2815,6 +2843,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::HumanQuestionDetected { .. }
             | AppEvent::HumanResponseSent
             | AppEvent::SessionNote { .. }
+            | AppEvent::UserNotification { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::DisplayResize { .. }
             | AppEvent::DisplayTaken { .. }
@@ -2990,6 +3019,23 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 text,
                 attachments,
                 source.as_deref(),
+                *ts,
+            );
+        }
+        AppEvent::UserNotification {
+            session_id,
+            id,
+            title,
+            text,
+            urgency,
+            ts,
+        } => {
+            log.user_notification(
+                session_id.as_deref(),
+                id,
+                title.as_deref(),
+                text,
+                *urgency,
                 *ts,
             );
         }

@@ -388,9 +388,12 @@ pub(crate) fn notify_signing_payload(
 }
 
 /// Request kinds a nudge may name. A closed vocabulary — extending it is a
-/// deliberate act on both binaries (planned: agent notify), never free
-/// text from the wire.
-const NOTIFY_KINDS: &[&str] = &["approval", "question", "display_request"];
+/// deliberate act on both binaries, never free text from the wire.
+/// `notify` is an urgent `notify_user` agent notification escalated by the
+/// daemon's attention monitor (`src/bin/caller/attention_nudge.rs`);
+/// `display_request` is the user-display doorbell
+/// (`request_user_display`) waiting on the owner's click.
+const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify", "display_request"];
 
 /// Compose the Web Push payload for a pending-request nudge.
 ///
@@ -412,6 +415,12 @@ pub(crate) fn attention_push_payload(
         "question" => (
             format!("{daemon_label}: the agent has a question"),
             format!("Session \u{201c}{session_label}\u{201d} is waiting for your answer."),
+        ),
+        // Deliberately content-free: the notification text itself never
+        // leaves the daemon — only the fact that an urgent one exists.
+        "notify" => (
+            format!("{daemon_label}: urgent agent notification"),
+            format!("Session \u{201c}{session_label}\u{201d} needs your attention."),
         ),
         "display_request" => (
             format!("{daemon_label}: agent asks to view your screen"),
@@ -897,6 +906,16 @@ mod tests {
             "Session \u{201c}s-1\u{201d} is waiting for your answer."
         );
 
+        // The urgent-notification kind stays content-free too: the
+        // notification's own text/title never ride the push — only the
+        // fact that an urgent one exists in a labeled session.
+        let notify = attention_push_payload("notify", "workshop", "s-1", "daemon-1");
+        assert_eq!(notify["title"], "workshop: urgent agent notification");
+        assert_eq!(
+            notify["body"],
+            "Session \u{201c}s-1\u{201d} needs your attention."
+        );
+
         // Display requests keep the same discipline: kind + labels only —
         // the agent's reason text never rides the push.
         let display = attention_push_payload("display_request", "workshop", "s-1", "daemon-1");
@@ -920,7 +939,10 @@ mod tests {
     #[test]
     fn notify_request_kinds_are_a_closed_vocabulary() {
         for kind in NOTIFY_KINDS {
-            assert!(matches!(*kind, "approval" | "question" | "display_request"));
+            assert!(matches!(
+                *kind,
+                "approval" | "question" | "notify" | "display_request"
+            ));
         }
         let parsed: DaemonNotifyRequest = serde_json::from_value(json!({
             "protocol": "intendant-connect-daemon-notify-v1",

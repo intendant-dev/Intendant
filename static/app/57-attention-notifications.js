@@ -121,6 +121,16 @@ function attentionApplyEvent(d, live) {
   } else if (ev === 'display_request_resolved') {
     attentionRemove('display', d.session_id, d.id);
     attentionRepaint();
+  } else if (ev === 'user_notification') {
+    // Fire-and-forget notifications register only for the escalated
+    // urgencies, only live (history never badges), and only while the tab
+    // is hidden — a visible tab already rendered the toast. Unlike pending
+    // requests nothing "resolves" them: they self-clear when the tab next
+    // becomes visible (see the visibilitychange hook below).
+    const urgency = d.urgency || 'info';
+    if ((urgency === 'attention' || urgency === 'urgent') && live && document.hidden) {
+      attentionAdd('notify', d.session_id, d.id, live);
+    }
   } else if (ev === 'approval_resolved') {
     // Approvals and questions share the id space; resolve either.
     attentionRemove('approval', d.session_id, d.id);
@@ -142,6 +152,16 @@ function attentionApplyEvent(d, live) {
     attentionClearSession(d.session_id);
     attentionRepaint();
   }
+}
+
+// Notifications deliver by being seen: when the tab becomes visible the
+// toast/transcript row is on screen, so their attention items retire.
+function attentionClearNotifyKind() {
+  let changed = false;
+  for (const [key, item] of [...attentionItems]) {
+    if (item.kind === 'notify') { attentionItems.delete(key); changed = true; }
+  }
+  if (changed) attentionRepaint();
 }
 
 // Event-stream connection state (fragment 36's set_on_server_state): a
@@ -218,22 +238,27 @@ function attentionShowNotification(items) {
   const approvals = items.filter((i) => i.kind === 'approval').length;
   const questions = items.filter((i) => i.kind === 'question').length;
   const displayRequests = items.filter((i) => i.kind === 'display').length;
+  const notifies = items.filter((i) => i.kind === 'notify').length;
   let title;
   if (items.length === 1) {
     title = questions ? 'Intendant: the agent has a question'
       : displayRequests ? 'Intendant: agent asks to view your screen'
+      : notifies ? 'Intendant: the agent sent a notification'
       : 'Intendant: approval needed';
   } else {
     const parts = [];
     if (approvals) parts.push(`${approvals} approval${approvals > 1 ? 's' : ''}`);
     if (questions) parts.push(`${questions} question${questions > 1 ? 's' : ''}`);
     if (displayRequests) parts.push(`${displayRequests} display request${displayRequests > 1 ? 's' : ''}`);
+    if (notifies) parts.push(`${notifies} notification${notifies > 1 ? 's' : ''}`);
     title = `Intendant: ${parts.join(' and ')} waiting`;
   }
   const total = attentionItems.size;
   const body = total > items.length
     ? `${total} requests are waiting for you.`
-    : 'The agent is waiting for you.';
+    : notifies === items.length
+      ? 'The agent wants your attention.'
+      : 'The agent is waiting for you.';
   const focusSessionId = items[0].sessionId || '';
   try {
     const notification = new Notification(title, {
@@ -261,6 +286,7 @@ document.addEventListener('visibilitychange', () => {
     for (const notification of attentionOpenNotifications.splice(0)) {
       try { notification.close(); } catch (_) {}
     }
+    attentionClearNotifyKind();
   }
 });
 
@@ -299,7 +325,7 @@ function attentionBuildSettingsCard() {
   h3.textContent = 'Notifications';
   const sub = document.createElement('div');
   sub.className = 'ui-section-sub';
-  sub.textContent = 'When the agent waits on you — approvals and questions. These apply to this browser only.';
+  sub.textContent = 'When the agent needs you — approvals, questions, and agent notifications. These apply to this browser only.';
   head.append(h3, sub);
   card.appendChild(head);
 

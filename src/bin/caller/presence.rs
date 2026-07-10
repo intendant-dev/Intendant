@@ -1052,6 +1052,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::StatusUpdate { .. }
         | AppEvent::LogEntry { .. }
         | AppEvent::SessionNote { .. }
+        | AppEvent::UserNotification { .. }
         | AppEvent::UserMessageRewind { .. }
         | AppEvent::UserMessageEditStatus { .. }
         | AppEvent::UserMessageLog { .. }

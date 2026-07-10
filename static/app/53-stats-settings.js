@@ -665,8 +665,7 @@ function renderStatsSessionSections(sessions) {
   }
   setStatsSessionLoading(currentStatsHostKey(), false);
   renderStatsKpiRow(sessions);
-  // ui-v2 only: per-model cost cards (the section exists only under the flag).
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) renderUi2UsageByModel(sessions);
+  renderUi2UsageByModel(sessions);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDailyUsage(sessions);
@@ -1983,7 +1982,7 @@ function renderUi2UsageByModel(sessions) {
 // tables, disk usage, and display transport). Nodes are MOVED with
 // appendChild — ids, renderer contracts, and delegated listeners are
 // untouched — and none of this runs under v1.
-if (typeof ui2Enabled === 'function' && ui2Enabled()) {
+{
   const usageContainer = document.getElementById('usage-container');
   if (usageContainer) {
     const head = document.createElement('div');

@@ -1342,6 +1342,11 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
       attachment_previews: sessionNoteAttachmentPreviews(entry),
     };
   }
+  if (event === 'user_notification') {
+    const command = userNotificationLogCommand(entry);
+    if (!command) return null;
+    return { ...base, ...command };
+  }
   if (event === 'model_response') {
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
@@ -2107,7 +2112,7 @@ function shouldDetachConcurrentLogStream() {
   // grid is CSS-hidden without touching its .hidden class) — never park
   // the stream in the detached fragment there, or Focus shows nothing.
   const root = document.documentElement;
-  if (root.classList.contains('ui-v2') && root.dataset.ui2Layout !== 'grid') return false;
+  if (root.dataset.ui2Layout !== 'grid') return false;
   const grid = document.getElementById('session-window-grid');
   return !!grid
     && !grid.classList.contains('hidden')

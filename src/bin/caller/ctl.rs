@@ -60,6 +60,8 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "shared" | "shared-view" => run_shared(&client, &config, &command[1..]).await?,
         "approval" | "approvals" => run_approval(&client, &config, &command[1..]).await?,
         "input" => run_input(&client, &config, &command[1..]).await?,
+        "ask" => run_ask(&client, &config, &command[1..]).await?,
+        "notify" => run_notify(&client, &config, &command[1..]).await?,
         "settings" | "set" => run_settings(&client, &config, &command[1..]).await?,
         "session" | "sessions" => run_session(&client, &config, &command[1..]).await?,
         "task" => run_task(&client, &config, &command[1..]).await?,
@@ -1259,6 +1261,161 @@ fn read_session_note_image(path: &Path) -> Result<(&'static str, String, String,
     Ok((media_type, name, data, size))
 }
 
+/// `intendant ctl ask` — raise a structured question on the dashboard
+/// question rail and block until the user answers (or the wait expires).
+/// Prints the answer to stdout; exits nonzero on timeout so scripts can
+/// branch on "nobody answered".
+async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_ask();
+        return Ok(());
+    }
+    let arguments = ask_args(raw)?;
+    let response = call_tool(client, config, "ask_user", arguments).await?;
+    if config.raw {
+        return print_json(&response);
+    }
+    if let Some(error) = response.get("error") {
+        print_json(error)?;
+        return Err("MCP tool call failed".to_string());
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = single_text_content(result)
+        .ok_or_else(|| format!("unexpected ask_user result shape: {result}"))?;
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("{text}");
+        return Err("tool returned isError=true".to_string());
+    }
+    let outcome: Value = serde_json::from_str(text)
+        .map_err(|e| format!("unexpected ask_user result payload: {e}: {text}"))?;
+    if config.json {
+        print_json(&outcome)?;
+    } else {
+        // `answer` carries the user's choice(s) when answered, and the
+        // best-judgment guidance on pass/dismissed/auto_answered.
+        let answer = outcome
+            .get("answer")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        println!("{answer}");
+    }
+    match outcome.get("status").and_then(Value::as_str) {
+        Some("timeout") => Err("timed out waiting for an answer".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Build `ask_user` arguments from `ask` flags. Options arrive as
+/// repeatable `--option "Label"` / `--option "Label:what it means"`.
+fn ask_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(
+        raw,
+        &["--option", "--header", "--wait", "--session"],
+        &["--multi", "--free-text"],
+    )?;
+    if args.positional.is_empty() {
+        return Err("ask requires question text".to_string());
+    }
+    let question = args.positional.join(" ");
+    let options: Vec<&str> = args.all("--option").collect();
+    if options.len() > crate::mcp::ASK_USER_MAX_OPTIONS {
+        return Err(format!(
+            "too many options: {} (max {}; omit --option for free-text only)",
+            options.len(),
+            crate::mcp::ASK_USER_MAX_OPTIONS
+        ));
+    }
+    // `--free-text` documents intent; typed answers are always accepted by
+    // the rail, options or not.
+    let _ = args.has("--free-text");
+    let mut map = Map::new();
+    map.insert("question".to_string(), Value::String(question));
+    insert_string(&mut map, "header", args.one("--header"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    if args.has("--multi") {
+        map.insert("multi_select".to_string(), Value::Bool(true));
+    }
+    if let Some(wait) = args.one("--wait") {
+        let seconds: u64 = wait
+            .parse()
+            .map_err(|_| format!("--wait requires a number of seconds, got '{wait}'"))?;
+        if seconds == 0 || seconds > crate::mcp::ASK_USER_MAX_WAIT_SECS {
+            return Err(format!(
+                "--wait must be 1..={} seconds (default {})",
+                crate::mcp::ASK_USER_MAX_WAIT_SECS,
+                crate::mcp::ASK_USER_DEFAULT_WAIT_SECS
+            ));
+        }
+        map.insert("wait_seconds".to_string(), Value::from(seconds));
+    }
+    if !options.is_empty() {
+        let options: Vec<Value> = options
+            .iter()
+            .map(|option| {
+                let (label, description) = match option.split_once(':') {
+                    Some((label, description)) => (label.trim(), Some(description.trim())),
+                    None => (option.trim(), None),
+                };
+                let mut entry = Map::new();
+                entry.insert("label".to_string(), Value::String(label.to_string()));
+                if let Some(description) = description.filter(|d| !d.is_empty()) {
+                    entry.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        map.insert("options".to_string(), Value::Array(options));
+    }
+    Ok(Value::Object(map))
+}
+
+/// `intendant ctl notify` — fire-and-forget notification to the user.
+async fn run_notify(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_notify();
+        return Ok(());
+    }
+    let response = call_tool(client, config, "notify_user", notify_args(raw)?).await?;
+    print_tool_response(response, config, None)
+}
+
+/// Build `notify_user` arguments from `notify` flags.
+fn notify_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--title", "--urgency", "--session"], &[])?;
+    if args.positional.is_empty() {
+        return Err("notify requires notification text".to_string());
+    }
+    let text = args.positional.join(" ");
+    if text.len() > crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES {
+        return Err(format!(
+            "notification text is {} bytes; max {} KB",
+            text.len(),
+            crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES / 1024
+        ));
+    }
+    // Same closed vocabulary the daemon enforces — fail fast client-side.
+    crate::types::NotificationUrgency::parse(args.one("--urgency"))?;
+    let mut map = Map::new();
+    map.insert("text".to_string(), Value::String(text));
+    insert_string(&mut map, "title", args.one("--title"));
+    insert_string(&mut map, "urgency", args.one("--urgency"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    Ok(Value::Object(map))
+}
+
 async fn run_task(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
     if raw.is_empty() || is_help(raw) {
         help_task();
@@ -2133,6 +2290,8 @@ Commands:\n\
   shared                    Shared display collaboration\n\
   approval                  Pending approvals and approval responses\n\
   input                     Pending human question and response\n\
+  ask                       Ask the user a structured question; BLOCKS for the answer\n\
+  notify                    Fire-and-forget user notification (info/attention/urgent)\n\
   settings                  Autonomy and verbosity\n\
   session                   Session transcript notes (display-only, optional images)\n\
   task                      Start tasks\n\
@@ -2355,6 +2514,42 @@ Examples:\n\
     );
 }
 
+fn help_ask() {
+    println!(
+        "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi] \\\n\
+\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json]\n\
+\n\
+Raises the question on the dashboard question rail and BLOCKS until the user\n\
+answers, then prints the answer to stdout. A question requests input, never\n\
+permission — it is never auto-approved. Up to 4 options; with none (or with\n\
+--free-text) the user types an answer — free text is always accepted on top\n\
+of options. --multi allows selecting several options (joined with \", \").\n\
+Default --wait 300 seconds, max 900; on timeout prints best-judgment guidance\n\
+and exits nonzero. --json prints {{status, answer, answers}} instead.\n\
+\n\
+Examples:\n\
+  intendant ctl ask \"Which database?\" --option \"postgres:Existing infra\" --option sqlite\n\
+  intendant ctl ask \"Name the release branch\" --free-text --wait 600"
+    );
+}
+
+fn help_notify() {
+    println!(
+        "Usage: intendant ctl notify \"TEXT\" [--title TEXT] [--urgency info|attention|urgent]\n\
+\n\
+Fire-and-forget notification to the user; returns immediately. It renders as\n\
+a dashboard toast plus a transcript row. Urgency escalates delivery:\n\
+  info       (default) dashboard only\n\
+  attention  + tab badge and a browser notification when the tab is hidden\n\
+  urgent     + immediate push nudge to the owner's opted-in browsers\n\
+             (content-free; reserve for being blocked)\n\
+\n\
+Examples:\n\
+  intendant ctl notify \"Test suite green, opening the PR\" --title \"CI\"\n\
+  intendant ctl notify \"Deploy blocked on expired credentials\" --urgency urgent"
+    );
+}
+
 fn help_task() {
     println!(
         "Usage: intendant ctl task start [--task TEXT] [--session ID] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
@@ -2431,6 +2626,99 @@ mod tests {
         let parsed = parse_command_args(&args(&["-vyeJaE3hyqm4"]), &[], &[])
             .expect("single-dash token is a positional, not a flag");
         assert_eq!(parsed.positional, vec!["-vyeJaE3hyqm4".to_string()]);
+    }
+
+    #[test]
+    fn ask_args_builds_tool_arguments() {
+        let value = ask_args(&args(&[
+            "Which",
+            "database?",
+            "--option",
+            "postgres:Existing infra",
+            "--option",
+            "sqlite",
+            "--multi",
+            "--header",
+            "Storage",
+            "--wait",
+            "120",
+            "--session",
+            "sess-1",
+        ]))
+        .expect("ask args");
+        assert_eq!(value["question"], "Which database?");
+        assert_eq!(value["header"], "Storage");
+        assert_eq!(value["multi_select"], true);
+        assert_eq!(value["wait_seconds"], 120);
+        assert_eq!(value["session_id"], "sess-1");
+        let options = value["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["label"], "postgres");
+        assert_eq!(options[0]["description"], "Existing infra");
+        assert_eq!(options[1]["label"], "sqlite");
+        assert!(options[1].get("description").is_none());
+    }
+
+    #[test]
+    fn ask_args_free_text_defaults_and_validation() {
+        // --free-text / no options → no options array, no multi_select.
+        let value = ask_args(&args(&["Name the branch", "--free-text"])).expect("ask args");
+        assert_eq!(value["question"], "Name the branch");
+        assert!(value.get("options").is_none());
+        assert!(value.get("multi_select").is_none());
+        assert!(value.get("wait_seconds").is_none());
+
+        let err = ask_args(&args(&["--multi"])).unwrap_err();
+        assert!(err.contains("requires question text"), "{err}");
+
+        let err = ask_args(&args(&["Q", "--wait", "soon"])).unwrap_err();
+        assert!(err.contains("--wait requires a number"), "{err}");
+        let err = ask_args(&args(&["Q", "--wait", "0"])).unwrap_err();
+        assert!(err.contains("--wait must be"), "{err}");
+        let err = ask_args(&args(&["Q", "--wait", "100000"])).unwrap_err();
+        assert!(err.contains("--wait must be"), "{err}");
+
+        // Client-side option cap derives from the tool's own constant.
+        let mut over = vec!["Q".to_string()];
+        for i in 0..crate::mcp::ASK_USER_MAX_OPTIONS + 1 {
+            over.push("--option".to_string());
+            over.push(format!("o{i}"));
+        }
+        let err = ask_args(&over).unwrap_err();
+        assert!(err.contains("too many options"), "{err}");
+    }
+
+    #[test]
+    fn notify_args_builds_tool_arguments_and_validates_urgency() {
+        let value = notify_args(&args(&[
+            "Deploy",
+            "finished",
+            "--title",
+            "CI",
+            "--urgency",
+            "attention",
+            "--session",
+            "sess-2",
+        ]))
+        .expect("notify args");
+        assert_eq!(value["text"], "Deploy finished");
+        assert_eq!(value["title"], "CI");
+        assert_eq!(value["urgency"], "attention");
+        assert_eq!(value["session_id"], "sess-2");
+
+        // Omitted urgency stays omitted (the daemon defaults to info).
+        let value = notify_args(&args(&["hello"])).expect("notify args");
+        assert!(value.get("urgency").is_none());
+
+        let err = notify_args(&args(&["hello", "--urgency", "loud"])).unwrap_err();
+        assert!(err.contains("unknown urgency"), "{err}");
+        let err = notify_args(&args(&["--title", "x"])).unwrap_err();
+        assert!(err.contains("requires notification text"), "{err}");
+        let err = notify_args(&args(&[&"x".repeat(
+            crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES + 1,
+        )]))
+        .unwrap_err();
+        assert!(err.contains("max"), "{err}");
     }
 
     #[test]

@@ -711,6 +711,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'shared_view',
   // Unique note_id per note makes the JSON.stringify dedupe key exact.
   'session_note',
+  // Same shape: unique notification id per event.
+  'user_notification',
   'recording_started',
   'recording_stopped',
   'recording_deleted',

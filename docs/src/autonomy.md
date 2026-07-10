@@ -50,6 +50,34 @@ command or question itself (`attention_nudge.rs`;
 [Hosted rendezvous](./self-hosted-rendezvous.md)). Headless daemons with no
 frontend at all still auto-deny as before.
 
+## Questions and notifications are not permissions
+
+Two agent→user primitives share the approval *plumbing* (id space, rail,
+attention chain) without being approvals:
+
+- **Questions** (`ask_user`, the native loop's askHuman, supervised Claude
+  Code's AskUserQuestion) request *input*. Autonomy policy never
+  auto-resolves one — no level, per-category rule, or session-wide
+  approve-all grant answers a question — and answering (or approving one
+  through a verbs-only surface) never widens command autonomy. The asking
+  agent blocks until an answer, a dismissal, or its wait expires; the
+  timeout and the no-frontend shapes both hand the agent explicit
+  best-judgment guidance instead of a fabricated choice.
+- **Notifications** (`notify_user`) request *nothing*: fire-and-forget,
+  display-only, never blocking. `urgency` picks the delivery escalation —
+  `info` renders a dashboard toast plus a transcript row; `attention` also
+  registers in the attention center (tab badge, hidden-tab browser
+  notification); `urgent` also sends an immediate Connect nudge — an
+  explicit escalation, so it skips the pending-request grace period while
+  keeping the per-session cooldown and the content-free payload (kind +
+  labels only). Pending `ask_user` questions ride the ordinary
+  pending-request nudge above; they need no separate kind.
+
+`urgency: urgent` is also the designed attach point for audible/voice
+escalation ("ring the owner"): the `UserNotification` event carries the
+urgency on the bus, so a future voice leg (see [Presence](./presence.md))
+can subscribe to it without a new wire shape. No such leg exists yet.
+
 ## How `needs_approval` actually resolves
 
 The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:

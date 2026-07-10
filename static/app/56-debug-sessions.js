@@ -3,10 +3,10 @@ let debugScreenActive = false;
 let debugRecording = false;
 const browserWorkspaces = new Map();
 
-// ui-v2 re-skin (design overhaul): the reference Debug page carries a page
-// header the v1 DOM never had. Inject it under the flag only — v1 markup
-// stays untouched; the cards, ids, and handlers below are shared by both.
-if (ui2Enabled()) {
+// Design-overhaul re-skin: the reference Debug page carries a page header
+// the original DOM never had — injected here; the cards, ids, and handlers
+// below predate it.
+{
   const debugPane = document.querySelector('#tab-debug .debug-pane');
   if (debugPane) {
     const head = document.createElement('header');
@@ -143,8 +143,8 @@ function renderBrowserWorkspaces() {
   for (const w of rows) {
     const card = document.createElement('div');
     card.className = 'debug-workspace-row';
-    // ui-v2 status dot is CSS-keyed off this attribute; v1 renders none.
-    if (ui2Enabled()) card.dataset.status = String(w.status || '');
+    // The status dot is CSS-keyed off this attribute.
+    card.dataset.status = String(w.status || '');
     const meta = document.createElement('div');
     meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? `leased by ${w.lease.holder_id || 'unknown'}` : 'unleased';
@@ -2017,45 +2017,35 @@ function renderSessionsAggregate(sessions, el) {
   const outputTile = { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading };
   const diskTile = { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading };
 
-  let cards;
-  if (typeof ui2Enabled === 'function' && ui2Enabled()) {
-    // ui-v2 (design overhaul): the reference KPI set — Sessions · Tokens ·
-    // Cost · Active days — leads, with the v1 breakdown tiles kept as a
-    // second row (re-homed, not deleted). All values are real: cost sums
-    // per-row estimates; active days counts distinct calendar days that
-    // saw session activity (created or last changed — the honest
-    // client-side read; no per-day server metric exists).
-    const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
-    const activeDayKeys = new Set();
-    for (const s of sessions) {
-      for (const value of [s.created_at, s.updated_at || s.changed_at]) {
-        if (!value) continue;
-        const t = Date.parse(value);
-        if (Number.isNaN(t)) continue;
-        const d = new Date(t);
-        activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
-      }
+  // The reference KPI set — Sessions · Tokens · Cost · Active days —
+  // leads, with the breakdown tiles as a second row. All values are
+  // real: cost sums per-row estimates; active days counts distinct
+  // calendar days that saw session activity (created or last changed —
+  // the honest client-side read; no per-day server metric exists).
+  const totalCost = sessions.reduce((sum, s) => sum + (s.estimated_cost || 0), 0);
+  const activeDayKeys = new Set();
+  for (const s of sessions) {
+    for (const value of [s.created_at, s.updated_at || s.changed_at]) {
+      if (!value) continue;
+      const t = Date.parse(value);
+      if (Number.isNaN(t)) continue;
+      const d = new Date(t);
+      activeDayKeys.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
     }
-    cards = [
-      sessionsTile,
-      { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-      {
-        label: 'Cost',
-        value: detailsLoading
-          ? loadingValue
-          : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        loading: detailsLoading,
-      },
-      { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
-      inputTile, cachedTile, outputTile, diskTile,
-    ];
-  } else {
-    cards = [
-      sessionsTile,
-      { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-      inputTile, cachedTile, outputTile, diskTile,
-    ];
   }
+  const cards = [
+    sessionsTile,
+    { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+    {
+      label: 'Cost',
+      value: detailsLoading
+        ? loadingValue
+        : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      loading: detailsLoading,
+    },
+    { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
+    inputTile, cachedTile, outputTile, diskTile,
+  ];
 
   renderAggregateStatTiles(el, cards);
 }

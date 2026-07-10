@@ -477,7 +477,7 @@ function ui2WirePalette() {
 }
 
 ui2BuildNav();
-if (ui2Enabled()) {
+{
   // Single-boot: a module script executes at readyState 'interactive', so
   // the old immediate call + DOMContentLoaded listener both fired and wired
   // everything twice — the doubled capture-phase keydown made one ⌘K

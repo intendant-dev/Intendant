@@ -255,26 +255,14 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         PeerOperation::PeerManage,
     ),
     method("api_coordinator_route", PeerOperation::PeerManage),
-    method("api_sessions", PeerOperation::SessionInspect),
+    // The sessions read-core methods (api_sessions, api_sessions_search,
+    // api_session_detail, api_session_agent_output,
+    // api_session_context_snapshot) live as tunnel columns on their
+    // route rows — their IAM operations derive from the rows (S4a; the
+    // formerly divergent agent-output/context-snapshot twins are now
+    // derivation-equal by construction).
     method("api_sessions_stream", PeerOperation::SessionInspect),
-    method("api_session_detail", PeerOperation::SessionInspect),
     method("api_session_report", PeerOperation::SessionInspect),
-    // Fetches persisted stdout/stderr chunks by output id — a pure
-    // session-log read, inspect-grade like the neighboring by-id reads.
-    // Keep equal to the HTTP twin row (POST /api/session/{id}/agent-output;
-    // POST-shaped only because the ids ride the body) until transport
-    // unification derives tunnel ops from the route rows — pinned by
-    // `formerly_divergent_twins_gate_identically_on_both_lanes`.
-    method("api_session_agent_output", PeerOperation::SessionInspect),
-    // Replays one archived context snapshot out of the session log — a
-    // pure read; inspect-grade to match the HTTP twin (the GET
-    // /api/session sub-router row serving {id}/context-snapshot). It was
-    // originally mis-grouped with the manage-gated mutations below. Keep
-    // equal to the route row until transport unification derives tunnel
-    // ops from the rows — pinned by
-    // `formerly_divergent_twins_gate_identically_on_both_lanes`.
-    method("api_session_context_snapshot", PeerOperation::SessionInspect),
-    method("api_sessions_search", PeerOperation::SessionInspect),
     method("api_session_recordings", PeerOperation::SessionInspect),
     method("api_session_recording_asset", PeerOperation::SessionInspect),
     method("api_session_frame_asset", PeerOperation::SessionInspect),
@@ -1792,13 +1780,9 @@ fn split_http_response(response: &str) -> (u16, &str) {
     (status, body)
 }
 
-fn status_line_code(status_line: &str) -> u16 {
-    status_line
-        .split_whitespace()
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(500)
-}
+// One status-line parser across both lanes (the api core's (status,
+// body) helper vocabulary).
+pub(crate) use crate::web_gateway::status_line_code;
 
 fn params_body_text(params: Option<&serde_json::Value>) -> String {
     serde_json::to_string(&params.cloned().unwrap_or_else(|| serde_json::json!({})))
@@ -1831,17 +1815,21 @@ async fn api_sessions_response(
     let limit = control_session_limit(&params);
     let ids = control_session_ids(&params);
     let usage_view = params.get("view").and_then(|v| v.as_str()) == Some("usage");
-    let body = tokio::task::spawn_blocking(move || {
-        let body = crate::web_gateway::sessions_list_response_body(limit, &ids);
-        if usage_view {
-            crate::web_gateway::session_list_body_usage_view(&body)
-        } else {
-            body
-        }
+    // Transport-owned param mapping onto the neutral core: the tunnel's
+    // ids path historically never applied the limit truncation (and its
+    // ids vocabulary cannot express HTTP's present-but-empty filter), so
+    // an ids request passes no limit.
+    let (ids_filter, limit) = if ids.is_empty() {
+        (None, limit)
+    } else {
+        (Some(ids), None)
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::sessions_list_api_response(ids_filter, limit, usage_view)
     })
     .await;
-    let body = match body {
-        Ok(body) => body,
+    let response = match result {
+        Ok(response) => response,
         Err(e) => {
             return serde_json::json!({
                 "t": "response",
@@ -1851,7 +1839,16 @@ async fn api_sessions_response(
             });
         }
     };
-    match serde_json::from_str::<serde_json::Value>(&body) {
+    let crate::web_gateway::ApiResponse::Json { body, .. } = response else {
+        return serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": "session list returned an unexpected byte response",
+        });
+    };
+    // Historical result-shape guard: the list must be a JSON array.
+    match serde_json::from_str::<serde_json::Value>(&body.into_string()) {
         Ok(result) if result.is_array() => serde_json::json!({
             "t": "response",
             "id": id,
@@ -3205,21 +3202,17 @@ mod tests {
                 Some(Op::PeerManage),
             ),
             ("api_coordinator_route", Residue, Some(Op::PeerManage)),
-            ("api_sessions", Residue, Some(Op::SessionInspect)),
+            ("api_sessions", Row, Some(Op::SessionInspect)),
             ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
-            ("api_session_detail", Residue, Some(Op::SessionInspect)),
+            ("api_session_detail", Row, Some(Op::SessionInspect)),
             ("api_session_report", Residue, Some(Op::SessionInspect)),
-            (
-                "api_session_agent_output",
-                Residue,
-                Some(Op::SessionInspect),
-            ),
+            ("api_session_agent_output", Row, Some(Op::SessionInspect)),
             (
                 "api_session_context_snapshot",
-                Residue,
+                Row,
                 Some(Op::SessionInspect),
             ),
-            ("api_sessions_search", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_search", Row, Some(Op::SessionInspect)),
             ("api_session_recordings", Residue, Some(Op::SessionInspect)),
             (
                 "api_session_recording_asset",
@@ -3669,13 +3662,13 @@ mod tests {
 
     /// The two methods whose tunnel rows historically diverged from their
     /// HTTP route rows are pinned equal across BOTH lanes. Their handlers
-    /// are pure session-log reads (`session_agent_output_post_response`
+    /// are pure session-log reads (`session_agent_output_api_response`
     /// fetches persisted output chunks by id;
-    /// `session_context_snapshot_response_body` replays one archived
-    /// snapshot), so both lanes gate them inspect-grade. Transport
-    /// unification will derive the tunnel op from the route row and make
-    /// this drift class unrepresentable; until then this test is the pin
-    /// — if either declaration moves, move its twin in the same commit.
+    /// `session_context_snapshot_api_response` replays one archived
+    /// snapshot), so both lanes gate them inspect-grade. Since S4a their
+    /// tunnel ops DERIVE from the route rows (`tunnel:` columns), making
+    /// the drift class unrepresentable — this test stays as the
+    /// end-to-end assertion that classification and method table agree.
     #[test]
     fn formerly_divergent_twins_gate_identically_on_both_lanes() {
         use crate::gateway_routes::{classify, TableClassification};
