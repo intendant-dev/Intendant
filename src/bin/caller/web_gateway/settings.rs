@@ -564,12 +564,6 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
     serde_json::json!({"ok": true}).to_string()
 }
 
-/// Ambient-path twin of [`set_api_keys_result`] for the unconverted
-/// tunnel caller; the S5 tunnel commit retires it.
-pub(crate) fn handle_set_api_keys(body: &str) -> String {
-    set_api_keys_result(api_keys_env_path().as_deref(), body)
-}
-
 // ── Transport-neutral cores (transport-unification design §2.1, S5):
 //    the settings/keys family. Each fn is the single response builder
 //    both lanes render — the HTTP shims below hand them to
@@ -1206,6 +1200,31 @@ mod tests {
         assert_eq!(
             golden_settings_transcript(&response),
             golden_settings_bare_wildcard_json_transcript("200 OK", &expected_body)
+        );
+    }
+
+    /// The persist core writes the injected env path — the hermetic
+    /// success pin (an empty keys map exercises the full write path
+    /// without touching process env; the transport edges resolve the
+    /// real path via api_keys_env_path).
+    #[test]
+    fn set_api_keys_persists_to_injected_env_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("intendant").join(".env");
+        let body = serde_json::json!({"keys": {}}).to_string();
+        let result = set_api_keys_result(Some(&env_path), &body);
+        assert_eq!(result, r#"{"ok":true}"#);
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "\n");
+    }
+
+    /// No config directory: the persist core reports the historical
+    /// error body (still a 200 lane).
+    #[test]
+    fn set_api_keys_without_config_dir_reports_error_body() {
+        let body = serde_json::json!({"keys": {}}).to_string();
+        assert_eq!(
+            set_api_keys_result(None, &body),
+            r#"{"error":"Cannot determine config directory"}"#
         );
     }
 

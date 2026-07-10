@@ -11,9 +11,9 @@ pub(crate) async fn api_settings_response(id: String, runtime: &ControlRuntime) 
         let session = runtime.shared_session.read().await;
         session.runtime_settings.clone()
     };
-    json_body_response(
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::settings_get_response_body(
+        crate::web_gateway::settings_get_api_response(
             runtime.project_root.as_deref(),
             &runtime_settings,
         )
@@ -960,12 +960,15 @@ pub(crate) async fn api_settings_save_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::settings_post_result(
-        &body_text,
-        runtime.project_root.as_deref(),
-        &runtime.bus,
-    );
-    http_body_response(id, status, body, "settings save")
+    frame_api_response(
+        id,
+        crate::web_gateway::settings_post_api_response(
+            &body_text,
+            runtime.project_root.as_deref(),
+            &runtime.bus,
+        ),
+        "settings save",
+    )
 }
 
 pub(crate) async fn api_control_msg_response(
@@ -1403,10 +1406,14 @@ pub(crate) async fn api_api_keys_save_response(
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    http_body_response(
+    // The transport edge resolves the ambient env path; the persist
+    // core below it is path-parameterized (hermeticity convention).
+    frame_api_response(
         id,
-        200,
-        crate::web_gateway::handle_set_api_keys(&body_text),
+        crate::web_gateway::api_keys_save_api_response(
+            crate::web_gateway::api_keys_env_path().as_deref(),
+            &body_text,
+        ),
         "api keys save",
     )
 }
@@ -1716,7 +1723,7 @@ mod tests {
     //  5. Task-failure shapes stay per-lane (scan answers 200 with an
     //     error body on HTTP, an ok:false frame on the tunnel).
 
-    fn parity_worktrees_http_body(
+    fn parity_http_status_and_body(
         response: crate::web_gateway::ApiResponse,
     ) -> (u16, serde_json::Value) {
         let bytes = crate::web_gateway::api_response_http_bytes(
@@ -1746,7 +1753,7 @@ mod tests {
             let mut guard = rt.worktree_inventory_cache.lock().unwrap();
             *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
         }
-        let (status, http_body) = parity_worktrees_http_body(
+        let (status, http_body) = parity_http_status_and_body(
             crate::web_gateway::worktrees_list_api_response(&rt.worktree_inventory_cache),
         );
         assert_eq!(status, 200);
@@ -1766,7 +1773,7 @@ mod tests {
         // The injected temp home is never reached on this path, but the
         // fixture still must not hand the core a real home dir.
         let tmp_home = tempfile::tempdir().expect("temp home");
-        let (status, http_body) = parity_worktrees_http_body(
+        let (status, http_body) = parity_http_status_and_body(
             crate::web_gateway::worktrees_inspect_api_response(tmp_home.path(), "not json"),
         );
         assert_eq!(status, 400);
@@ -1815,7 +1822,7 @@ mod tests {
         };
 
         let http_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let (status, http_body) = parity_worktrees_http_body(
+        let (status, http_body) = parity_http_status_and_body(
             crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &http_cache),
         );
         assert_eq!(status, 200);
@@ -1893,7 +1900,7 @@ mod tests {
                     &home,
                 ),
             };
-            let (status, http_body) = parity_worktrees_http_body(response);
+            let (status, http_body) = parity_http_status_and_body(response);
             assert_eq!(status, 200, "{kind}");
             assert_eq!(http_body[empty_key], serde_json::json!([]), "{kind}");
 
@@ -1927,6 +1934,208 @@ mod tests {
                 .await;
         assert_eq!(frame["ok"], false);
         assert_eq!(frame["error"], "missing query", "{frame}");
+    }
+
+    // ── S5 tunnel/HTTP parity: settings/keys family (design §8) ──
+    //
+    // Extends the S4a (api_sessions.rs), S4b (above), and S4c
+    // enumerations. The S5-specific envelope differences, deliberate
+    // and pinned across this set:
+    //
+    //  1. Envelope split: api_settings, api_key_status, and
+    //     api_project_root ride the body-only envelope
+    //     (frame_api_json_body_response — no injected status), so the
+    //     settings GET's historical always-200 error body
+    //     ({"error":"No project root"}) arrives under ok:true with no
+    //     status metadata; api_settings_save and api_api_keys_save
+    //     ride the injected-status envelope (frame_api_response).
+    //  2. Transport-owned request carriage: HTTP hands the raw request
+    //     body to the shared cores; the tunnel serializes its params
+    //     object (params_body_text) — the same JSON object fed to both
+    //     lanes reaches the one parse as the same bytes, but absent
+    //     tunnel params arrive as "{}", never as an empty body.
+    //  3. api_api_keys_save answers 200 on both lanes with failures in
+    //     the body (historical always-200 lane) — tunnel failure
+    //     bodies therefore still carry _httpStatus 200/_httpOk true.
+    //  4. Header tails are HTTP-lane decoration only: settings
+    //     GET/POST, key-status, and project-root the canonical tail;
+    //     api-keys the bare wildcard tail (no Cache-Control).
+    //  5. The api-keys env path resolves at each transport edge
+    //     (api_keys_env_path); the persist core is path-parameterized.
+    //     These fixtures drive only its pre-persist rejection paths —
+    //     the hermetic success pin (tempdir env path, empty keys map)
+    //     lives with the core's unit tests in web_gateway/settings.rs.
+
+    /// The minimal valid settings payload (exactly the fields without
+    /// a serde default), as the Settings tab has always POSTed it.
+    fn parity_settings_payload() -> serde_json::Value {
+        serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": null
+        })
+    }
+
+    #[tokio::test]
+    async fn parity_settings_get_serves_the_same_body_on_both_transports() {
+        // Rootless: the historical always-200 error body, identical
+        // across lanes, body-only envelope on the tunnel.
+        let rt = runtime();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_get_api_response(
+                None,
+                &crate::web_gateway::RuntimeSettingsState::default(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"error": "No project root"}));
+        let frame = api_settings_response("parity-settings-get".to_string(), &rt).await;
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_none_or(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+
+        // Tempdir root: both lanes serve the same default-config payload.
+        let dir = tempfile::tempdir().expect("temp project root");
+        let mut rt = runtime();
+        rt.project_root = Some(dir.path().to_path_buf());
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_get_api_response(
+                Some(dir.path()),
+                &crate::web_gateway::RuntimeSettingsState::default(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert!(http_body.get("cu_backend").is_some(), "{http_body}");
+        let frame = api_settings_response("parity-settings-get-root".to_string(), &rt).await;
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_settings_save_shares_bodies_with_status_metadata() {
+        // No project root: 400 body from the one core; the tunnel adds
+        // the injected-status metadata.
+        let rt = runtime();
+        let payload = parity_settings_payload();
+        let body_text = params_body_text(Some(&payload));
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus),
+        );
+        assert_eq!(status, 400);
+        let frame =
+            api_settings_save_response("parity-settings-save".to_string(), Some(&payload), &rt)
+                .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Tempdir roots: the success body rides both lanes and each
+        // lane's save lands in its own injected root.
+        let http_dir = tempfile::tempdir().expect("temp http root");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_post_api_response(
+                &body_text,
+                Some(http_dir.path()),
+                &rt.bus,
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"ok": true}));
+        assert!(http_dir.path().join("intendant.toml").exists());
+
+        let tunnel_dir = tempfile::tempdir().expect("temp tunnel root");
+        let mut rt = runtime();
+        rt.project_root = Some(tunnel_dir.path().to_path_buf());
+        let frame = api_settings_save_response(
+            "parity-settings-save-root".to_string(),
+            Some(&payload),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["result"]["ok"], true, "{frame}");
+        assert_eq!(frame["result"]["_httpStatus"], 200);
+        assert!(tunnel_dir.path().join("intendant.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn parity_api_keys_save_rejections_share_bodies_always_200() {
+        // Unknown key: rejected before any env-path use on both lanes —
+        // and still 200 (difference #3), so the tunnel's failure body
+        // carries _httpOk true.
+        let payload = serde_json::json!({"keys": {"NOT_A_KNOWN_KEY": "x"}});
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::api_keys_save_api_response(
+                None,
+                &params_body_text(Some(&payload)),
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "Unknown key: NOT_A_KNOWN_KEY"})
+        );
+        let frame =
+            api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_key_status_and_project_root_ride_the_plain_envelope() {
+        // Key status: both lanes render the ONE neutral fn; the tunnel
+        // frames it body-only.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::api_key_status_api_response());
+        assert_eq!(status, 200);
+        let frame = frame_api_json_body_response(
+            "parity-key-status".to_string(),
+            crate::web_gateway::api_key_status_api_response(),
+            "api key status",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+
+        // Project root: Some and None bodies, identical across lanes.
+        let dir = tempfile::tempdir().expect("temp project root");
+        for root in [None, Some(dir.path())] {
+            let (status, http_body) =
+                parity_http_status_and_body(crate::web_gateway::project_root_api_response(root));
+            assert_eq!(status, 200);
+            let frame = frame_api_json_body_response(
+                "parity-project-root".to_string(),
+                crate::web_gateway::project_root_api_response(root),
+                "project root",
+            );
+            assert_eq!(frame["result"], http_body);
+            assert_eq!(frame["result"]["project_root"].is_null(), root.is_none());
+        }
     }
 
     use crate::*;
