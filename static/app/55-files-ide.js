@@ -64,6 +64,7 @@ function filesIdeTreeState(hostId) {
       creating: null, // {kind: 'file'|'folder', dir}
       renaming: null, // {path, dir, name, isDir}
       deleteArming: null, // {path, recursive, timer}
+      focusedPath: '', // roving-tabindex row (WAI-ARIA tree keyboard pattern)
     };
     filesIdeTreeStates.set(key, state);
   }
@@ -381,12 +382,22 @@ function renderFilesIdeTree() {
   if (rootInput && document.activeElement !== rootInput) rootInput.value = state.root;
   const upBtn = document.getElementById('files-ide-up-btn');
   if (upBtn) upBtn.disabled = !state.rootParent;
+  // Rebuilding innerHTML destroys the focused row; remember whether focus
+  // was inside the tree so it can be restored onto the roving row after.
+  const hadFocus = container.contains(document.activeElement);
   if (!state.root) {
     container.innerHTML = '<div class="files-ide-tree-notice">Loading…</div>';
     return;
   }
   const rows = [];
   filesIdeTreeRows(state, state.root, 0, rows);
+  // Roving tabindex (WAI-ARIA tree): exactly one row sits in the page tab
+  // order; arrow keys move between rows (filesIdeTreeKeydown). Fall back
+  // to the first row when the remembered path is no longer rendered.
+  const entryPaths = rows
+    .filter(row => row.entry && !(state.renaming && state.renaming.path === row.entry.path))
+    .map(row => row.entry.path);
+  state.focusedPath = entryPaths.includes(state.focusedPath) ? state.focusedPath : (entryPaths[0] || '');
   const html = [];
   for (const row of rows) {
     const pad = 8 + row.depth * 14;
@@ -435,13 +446,18 @@ function renderFilesIdeTree() {
     const deleteTitle = arming
       ? (arming.recursive ? 'Folder is not empty — click again to delete everything inside' : 'Click again to delete')
       : `Delete ${escapeHtml(entry.name || '')}`;
+    // The row-action buttons are tabindex="-1" hover/pointer affordances:
+    // the tree is one tab stop (roving row), and the keyboard paths to the
+    // same actions are F2 (rename) and Delete on the focused row.
     html.push(
-      `<div class="${classes.join(' ')}" role="button" tabindex="0" data-path="${pathAttr}" data-dir="${isDir ? '1' : '0'}" style="padding-left:${pad}px" title="${pathAttr}">` +
+      `<div class="${classes.join(' ')}" role="treeitem" tabindex="${entry.path === state.focusedPath ? '0' : '-1'}"` +
+      ` aria-level="${row.depth + 1}"${isDir ? ` aria-expanded="${expanded ? 'true' : 'false'}"` : ''}` +
+      ` data-path="${pathAttr}" data-dir="${isDir ? '1' : '0'}" style="padding-left:${pad}px" title="${pathAttr}">` +
       `<span class="files-ide-tree-caret">${caret}</span>` +
       `<span class="files-ide-tree-name">${name}${suffix}</span>` +
       `<span class="files-ide-row-acts">` +
-      `<button type="button" class="files-ide-row-act" data-act="rename" title="Rename ${name}" aria-label="Rename ${name}">✎</button>` +
-      `<button type="button" class="${deleteClass}" data-act="delete" title="${deleteTitle}" aria-label="Delete ${name}">${deleteLabel}</button>` +
+      `<button type="button" class="files-ide-row-act" data-act="rename" tabindex="-1" title="Rename ${name} (F2)" aria-label="Rename ${name}">✎</button>` +
+      `<button type="button" class="${deleteClass}" data-act="delete" tabindex="-1" title="${deleteTitle}" aria-label="Delete ${name}">${deleteLabel}</button>` +
       `</span>` +
       `</div>`
     );
@@ -453,17 +469,18 @@ function renderFilesIdeTree() {
     const open = () => (isDir ? filesIdeToggleDir(path) : filesIdeOpenFile(filesIdeSelectedHostId(), path));
     rowEl.addEventListener('click', ev => {
       if (ev.target.closest('.files-ide-row-act')) return;
+      state.focusedPath = path; // keep the roving tab stop on the clicked row
       open();
     });
-    rowEl.addEventListener('keydown', ev => {
-      if ((ev.key === 'Enter' || ev.key === ' ') && !ev.target.closest('.files-ide-row-act')) {
-        ev.preventDefault();
-        open();
-      }
-    });
+    // Keyboard activation (Enter/Space) rides the delegated container
+    // listener (filesIdeTreeKeydown), not a per-row handler.
     rowEl.querySelector('[data-act="rename"]')?.addEventListener('click', () => filesIdeBeginRename(path, isDir));
     rowEl.querySelector('[data-act="delete"]')?.addEventListener('click', () => filesIdeDeleteRequested(path, isDir));
   });
+  // Re-renders triggered from the keyboard (expand/collapse/arming) must
+  // not dump focus onto <body>: put it back on the roving row. The create
+  // and rename inputs are focused below and win when present.
+  if (hadFocus) container.querySelector('.files-ide-tree-row[tabindex="0"]')?.focus();
   const createInput = document.getElementById('files-ide-create-input');
   if (createInput) {
     createInput.focus();
@@ -497,6 +514,93 @@ function renderFilesIdeTree() {
     });
   }
 }
+
+// Tree keyboard support (WAI-ARIA tree pattern, pragmatic subset), as ONE
+// delegated listener on the container: rows are re-rendered wholesale via
+// innerHTML, so per-row key listeners would cost a listener per row and a
+// re-attach per render. Arrows move focus / expand / collapse, Enter and
+// Space activate, Home/End jump, F2 renames and Delete deletes (the
+// pointer-only row buttons are tabindex="-1"; these are their keyboard
+// equivalents — Delete keeps the same two-press arming as the button).
+function filesIdeTreeKeydown(ev) {
+  if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
+  if (ev.target.closest('input, textarea')) return; // create/rename fields own their keys
+  // A mouse-focused row-action button keeps its native Enter/Space
+  // activation — don't preventDefault it into a row open.
+  if (ev.target.closest('.files-ide-row-act')) return;
+  const row = ev.target.closest('.files-ide-tree-row');
+  if (!row) return;
+  const rows = Array.from(document.querySelectorAll('#files-ide-tree .files-ide-tree-row'));
+  const idx = rows.indexOf(row);
+  if (idx < 0) return;
+  const path = row.dataset.path || '';
+  const isDir = row.dataset.dir === '1';
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  const level = el => Number(el.getAttribute('aria-level')) || 1;
+  const focusRow = target => {
+    if (!target) return;
+    state.focusedPath = target.dataset.path || '';
+    row.setAttribute('tabindex', '-1');
+    target.setAttribute('tabindex', '0');
+    target.focus();
+  };
+  state.focusedPath = path;
+  switch (ev.key) {
+    case 'ArrowDown':
+      focusRow(rows[idx + 1]);
+      break;
+    case 'ArrowUp':
+      focusRow(rows[idx - 1]);
+      break;
+    case 'ArrowRight':
+      // Collapsed dir expands (focus stays); expanded dir steps into its
+      // first child; files ignore the key.
+      if (!isDir) break;
+      if (!state.expanded.has(path)) filesIdeToggleDir(path);
+      else if (rows[idx + 1] && level(rows[idx + 1]) === level(row) + 1) focusRow(rows[idx + 1]);
+      break;
+    case 'ArrowLeft': {
+      // Expanded dir collapses; otherwise climb to the parent row.
+      if (isDir && state.expanded.has(path)) {
+        filesIdeToggleDir(path);
+        break;
+      }
+      let parent = null;
+      for (let i = idx - 1; i >= 0 && !parent; i--) {
+        if (level(rows[i]) < level(row)) parent = rows[i];
+      }
+      focusRow(parent);
+      break;
+    }
+    case 'Home':
+      focusRow(rows[0]);
+      break;
+    case 'End':
+      focusRow(rows[rows.length - 1]);
+      break;
+    case 'Enter':
+    case ' ':
+      if (isDir) filesIdeToggleDir(path);
+      else filesIdeOpenFile(filesIdeSelectedHostId(), path);
+      break;
+    case 'F2':
+      filesIdeBeginRename(path, isDir);
+      break;
+    case 'Delete':
+      filesIdeDeleteRequested(path, isDir);
+      break;
+    default:
+      return; // unhandled — leave the event alone
+  }
+  ev.preventDefault();
+}
+
+// The container survives renders (only its innerHTML is rebuilt), so this
+// attaches exactly once. DOMContentLoaded per the shared-module-script
+// convention for wiring.
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('files-ide-tree')?.addEventListener('keydown', filesIdeTreeKeydown);
+});
 
 function filesIdeBeginCreate(kind) {
   const hostId = filesIdeSelectedHostId();

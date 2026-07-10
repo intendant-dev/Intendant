@@ -925,6 +925,10 @@
             <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
           </div>
           <div class="terminal-container" id="shell-container"></div>
+          <!-- Visually hidden (see ui2-terminal-files.css); referenced by
+               aria-describedby on xterm's input textarea. Documents the
+               keyboard escape out of the Tab-swallowing terminal. -->
+          <span id="shell-escape-hint">Tab types into the terminal. Press Control+Shift+Tab to move keyboard focus out to the key bar.</span>
           <div class="shell-keybar" id="shell-keybar">
             <button class="shell-key" data-key="esc">Esc</button>
             <button class="shell-key" data-key="tab">Tab</button>

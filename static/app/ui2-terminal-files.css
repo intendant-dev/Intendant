@@ -16,9 +16,26 @@
 
 /* v1 guards: elements that exist only for the v2 design (the ^C/^D/⏎ key
    chips and the Ln/Col statusbar span) stay invisible — and layout-inert —
-   under the v1 UI. These are deliberately the only unscoped rules here. */
+   under the v1 UI. Together with the a11y hint below, these are
+   deliberately the only unscoped rules here. */
 .shell-key.ui2-key { display: none; }
 .files-ide-status-lncol { display: none; }
+
+/* Terminal keyboard-escape hint (both generations): visually hidden but
+   exposed to assistive tech — xterm's input textarea points at it with
+   aria-describedby (44-shell-frames.js). Documents Ctrl+Shift+Tab, the
+   focus escape out of the Tab-swallowing terminal. */
+#shell-escape-hint {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  border: 0;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 
 /* ═══ TERMINAL ═══════════════════════════════════════════════════════ */
 
