@@ -828,11 +828,11 @@ pub(crate) async fn serve_http_request(
                 return handle_access_iam_grants(
                     stream,
                     route_body,
-                    req_method,
                     req_path,
                     cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -840,11 +840,11 @@ pub(crate) async fn serve_http_request(
                 return handle_access_org_manage(
                     stream,
                     route_body,
-                    req_method,
                     req_path,
                     cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -852,10 +852,10 @@ pub(crate) async fn serve_http_request(
                 return handle_access_enrollment_decide(
                     stream,
                     route_body,
-                    req_method,
                     cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }

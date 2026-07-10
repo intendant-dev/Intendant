@@ -250,172 +250,115 @@ pub(crate) async fn handle_access_org_apply_renew(
 }
 
 pub(crate) async fn handle_access_iam_grants(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     req_path: &str,
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let (status, body) = if req_path == "/api/access/iam/grants/update" {
-                access_iam_update_grant_response_body(
+    // Belt-and-suspenders manage re-check (see the claim-code shim):
+    // historical PLAIN 403, own-origin render.
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
+    }
+    let response = match parse_access_request_body(&body_text) {
+        Ok(params) => {
+            if req_path == "/api/access/iam/grants/update" {
+                access_iam_update_grant_api_response(
                     &cert_dir,
-                    &body_text,
+                    params,
                     &http_access_context.principal,
                 )
             } else {
-                access_iam_upsert_user_client_grant_response_body(
+                access_iam_upsert_user_client_grant_api_response(
                     &cert_dir,
-                    &body_text,
+                    params,
                     &http_access_context.principal,
                 )
-            };
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+            }
         }
-    }
-    finalize_http_stream(&mut stream).await;
+        Err(error) => *error,
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_org_manage(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     req_path: &str,
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let handler = match req_path {
-                "/api/access/orgs/trust" => {
-                    access_org_trust_response_value
-                        as fn(
-                            &std::path::Path,
-                            serde_json::Value,
-                        ) -> Result<serde_json::Value, String>
-                }
-                "/api/access/orgs/revoke" => access_org_revoke_response_value,
-                "/api/access/org-grants/revoke-member" => access_org_revoke_member_response_value,
-                "/api/access/org-grants/issuers/init" => access_org_issuer_init_response_value,
-                "/api/access/org-grants/issuers/delegate" => {
-                    access_org_issuer_delegate_response_value
-                }
-                "/api/access/org-grants/issuers/install" => {
-                    access_org_issuer_install_response_value
-                }
-                _ => access_org_issue_response_value,
-            };
-            let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-                .map_err(|e| format!("invalid request body: {e}"))
-                .and_then(|params| handler(&cert_dir, params))
-            {
-                Ok(value) => (200, value.to_string()),
-                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-            };
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    let response = match parse_access_request_body(&body_text) {
+        Ok(params) => access_org_manage_api_response(
+            &cert_dir,
+            OrgManageLeaf::from_req_path(req_path),
+            params,
+        ),
+        Err(error) => *error,
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_enrollment_decide(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let (status, body) = access_enrollment_decide_response_body(
-                &cert_dir,
-                &body_text,
-                &http_access_context.principal,
-            );
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    let response = match parse_access_request_body(&body_text) {
+        Ok(params) => access_enrollment_decide_api_response(
+            &cert_dir,
+            params,
+            &http_access_context.principal,
+        ),
+        Err(error) => *error,
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_enrollment_requests(
@@ -801,6 +744,119 @@ pub(crate) fn access_tier_settings_api_response(
         access_set_hosted_ceiling_response_value(cert_dir, params, actor)
     } else {
         access_set_tier_response_value(cert_dir, params, actor)
+    };
+    access_result_api_response(result, 400)
+}
+
+/// Transport-owned body decode for the manage POST shims: the
+/// historical "invalid request body" 400 (rendered under the row's own
+/// posture, matching this family's fleet-decorated value errors).
+fn parse_access_request_body(body_text: &str) -> Result<serde_json::Value, Box<ApiResponse>> {
+    serde_json::from_str(body_text).map_err(|e| {
+        Box::new(ApiResponse::json_error(
+            400,
+            format!("invalid request body: {e}"),
+        ))
+    })
+}
+
+/// POST /api/access/iam/user-client-grants + the tunnel's
+/// `api_access_iam_upsert_user_client_grant`.
+pub(crate) fn access_iam_upsert_user_client_grant_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> ApiResponse {
+    access_result_api_response(
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(cert_dir, params, actor),
+        400,
+    )
+}
+
+/// POST /api/access/iam/grants/update + the tunnel's
+/// `api_access_iam_update_grant`.
+pub(crate) fn access_iam_update_grant_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> ApiResponse {
+    access_result_api_response(
+        access_iam_update_grant_response_value_with_cert_dir(cert_dir, params, actor),
+        400,
+    )
+}
+
+/// POST /api/access/enrollment-requests/decide + the tunnel's
+/// `api_access_enrollment_decide`.
+pub(crate) fn access_enrollment_decide_api_response(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> ApiResponse {
+    access_result_api_response(
+        access_enrollment_decide_response_value(cert_dir, params, actor),
+        400,
+    )
+}
+
+/// The seven org administration leaves, addressed by request path on
+/// HTTP (the historical match, issue as the default arm) and by method
+/// name on the tunnel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrgManageLeaf {
+    Trust,
+    Revoke,
+    Issue,
+    RevokeMember,
+    IssuerInit,
+    IssuerDelegate,
+    IssuerInstall,
+}
+
+impl OrgManageLeaf {
+    pub(crate) fn from_req_path(req_path: &str) -> Self {
+        match req_path {
+            "/api/access/orgs/trust" => OrgManageLeaf::Trust,
+            "/api/access/orgs/revoke" => OrgManageLeaf::Revoke,
+            "/api/access/org-grants/revoke-member" => OrgManageLeaf::RevokeMember,
+            "/api/access/org-grants/issuers/init" => OrgManageLeaf::IssuerInit,
+            "/api/access/org-grants/issuers/delegate" => OrgManageLeaf::IssuerDelegate,
+            "/api/access/org-grants/issuers/install" => OrgManageLeaf::IssuerInstall,
+            _ => OrgManageLeaf::Issue,
+        }
+    }
+
+    pub(crate) fn from_control_method(method: &str) -> Option<Self> {
+        Some(match method {
+            "api_access_org_trust" => OrgManageLeaf::Trust,
+            "api_access_org_revoke" => OrgManageLeaf::Revoke,
+            "api_access_org_issue" => OrgManageLeaf::Issue,
+            "api_access_org_revoke_member" => OrgManageLeaf::RevokeMember,
+            "api_access_org_issuer_init" => OrgManageLeaf::IssuerInit,
+            "api_access_org_issuer_delegate" => OrgManageLeaf::IssuerDelegate,
+            "api_access_org_issuer_install" => OrgManageLeaf::IssuerInstall,
+            _ => return None,
+        })
+    }
+}
+
+/// The seven org-manage rows + their tunnel twins: one leaf fan-out
+/// over the shared cores, one `Result` framing.
+pub(crate) fn access_org_manage_api_response(
+    cert_dir: &std::path::Path,
+    leaf: OrgManageLeaf,
+    params: serde_json::Value,
+) -> ApiResponse {
+    let result = match leaf {
+        OrgManageLeaf::Trust => access_org_trust_response_value(cert_dir, params),
+        OrgManageLeaf::Revoke => access_org_revoke_response_value(cert_dir, params),
+        OrgManageLeaf::Issue => access_org_issue_response_value(cert_dir, params),
+        OrgManageLeaf::RevokeMember => access_org_revoke_member_response_value(cert_dir, params),
+        OrgManageLeaf::IssuerInit => access_org_issuer_init_response_value(cert_dir, params),
+        OrgManageLeaf::IssuerDelegate => {
+            access_org_issuer_delegate_response_value(cert_dir, params)
+        }
+        OrgManageLeaf::IssuerInstall => access_org_issuer_install_response_value(cert_dir, params),
     };
     access_result_api_response(result, 400)
 }
@@ -2110,47 +2166,6 @@ pub(crate) fn access_enrollment_decide_response_value(
     Ok(value)
 }
 
-pub(crate) fn access_enrollment_decide_response_body(
-    cert_dir: &std::path::Path,
-    body_text: &str,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> (u16, String) {
-    let params = match serde_json::from_str::<serde_json::Value>(body_text) {
-        Ok(params) => params,
-        Err(e) => {
-            return (
-                400,
-                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
-            );
-        }
-    };
-    match access_enrollment_decide_response_value(cert_dir, params, actor) {
-        Ok(value) => (200, value.to_string()),
-        Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-    }
-}
-
-pub(crate) fn access_iam_upsert_user_client_grant_response_body(
-    cert_dir: &std::path::Path,
-    body_text: &str,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> (u16, String) {
-    let params = match serde_json::from_str::<serde_json::Value>(body_text) {
-        Ok(params) => params,
-        Err(e) => {
-            return (
-                400,
-                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
-            );
-        }
-    };
-    match access_iam_upsert_user_client_grant_response_value_with_cert_dir(cert_dir, params, actor)
-    {
-        Ok(value) => (200, value.to_string()),
-        Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-    }
-}
-
 pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
@@ -2172,26 +2187,6 @@ pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
         "iam": crate::access::iam::overview_metadata(&loaded),
         "state": loaded.state
     }))
-}
-
-pub(crate) fn access_iam_update_grant_response_body(
-    cert_dir: &std::path::Path,
-    body_text: &str,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> (u16, String) {
-    let params = match serde_json::from_str::<serde_json::Value>(body_text) {
-        Ok(params) => params,
-        Err(e) => {
-            return (
-                400,
-                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
-            );
-        }
-    };
-    match access_iam_update_grant_response_value_with_cert_dir(cert_dir, params, actor) {
-        Ok(value) => (200, value.to_string()),
-        Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-    }
 }
 
 /// The HTTP lane's name for the unified [`RequestAuthority`]
@@ -3882,7 +3877,7 @@ mod tests {
 
     #[tokio::test]
     async fn golden_access_iam_grants_transcripts() {
-        access_route_cors(
+        let cors = access_route_cors(
             "POST",
             "/api/access/iam/user-client-grants",
             crate::gateway_routes::CorsPosture::FleetAllowlist,
@@ -3902,11 +3897,11 @@ mod tests {
             handle_access_iam_grants(
                 stream,
                 "{}".to_string(),
-                "POST",
                 "/api/access/iam/user-client-grants",
                 denied_dir.path().to_path_buf(),
                 context,
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -3927,11 +3922,11 @@ mod tests {
             handle_access_iam_grants(
                 stream,
                 invalid.to_string(),
-                "POST",
                 "/api/access/iam/user-client-grants",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -3956,11 +3951,11 @@ mod tests {
                     "role_id": "role:observer"
                 })
                 .to_string(),
-                "POST",
                 "/api/access/iam/user-client-grants",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -3987,10 +3982,10 @@ mod tests {
             handle_access_iam_grants(
                 stream,
                 "{}".to_string(),
-                "POST",
                 "/api/access/iam/grants/update",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
+                cors,
                 None,
             )
         })
@@ -4003,7 +3998,7 @@ mod tests {
 
     #[tokio::test]
     async fn golden_access_enrollment_decide_transcripts() {
-        access_route_cors(
+        let cors = access_route_cors(
             "POST",
             "/api/access/enrollment-requests/decide",
             crate::gateway_routes::CorsPosture::FleetAllowlist,
@@ -4020,10 +4015,10 @@ mod tests {
                     "approve": true
                 })
                 .to_string(),
-                "POST",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -4041,9 +4036,9 @@ mod tests {
             handle_access_enrollment_decide(
                 stream,
                 serde_json::json!({ "fingerprint": "60:1D:EN" }).to_string(),
-                "POST",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
+                cors,
                 None,
             )
         })
@@ -4065,10 +4060,10 @@ mod tests {
             handle_access_enrollment_decide(
                 stream,
                 "{}".to_string(),
-                "POST",
                 denied_dir.path().to_path_buf(),
                 context,
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -4080,6 +4075,15 @@ mod tests {
 
     #[tokio::test]
     async fn golden_access_org_manage_transcripts() {
+        let org_cors = |path: &str| {
+            let expected =
+                if matches!(path, "/api/access/orgs/trust" | "/api/access/orgs/revoke") {
+                    crate::gateway_routes::CorsPosture::FleetAllowlist
+                } else {
+                    crate::gateway_routes::CorsPosture::OwnOrigin
+                };
+            access_route_cors("POST", path, expected)
+        };
         for path in [
             "/api/access/orgs/trust",
             "/api/access/orgs/revoke",
@@ -4089,13 +4093,7 @@ mod tests {
             "/api/access/org-grants/issuers/delegate",
             "/api/access/org-grants/issuers/install",
         ] {
-            let expected =
-                if matches!(path, "/api/access/orgs/trust" | "/api/access/orgs/revoke") {
-                    crate::gateway_routes::CorsPosture::FleetAllowlist
-                } else {
-                    crate::gateway_routes::CorsPosture::OwnOrigin
-                };
-            access_route_cors("POST", path, expected);
+            org_cors(path);
         }
         let tmp = tempfile::TempDir::new().unwrap();
 
@@ -4105,11 +4103,11 @@ mod tests {
             handle_access_org_manage(
                 stream,
                 serde_json::json!({ "handle": "golden-org" }).to_string(),
-                "POST",
                 "/api/access/org-grants/issue",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                org_cors("/api/access/org-grants/issue"),
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -4133,10 +4131,10 @@ mod tests {
             handle_access_org_manage(
                 stream,
                 serde_json::json!({ "handle": "golden-org" }).to_string(),
-                "POST",
                 "/api/access/org-grants/issuers/delegate",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
+                org_cors("/api/access/org-grants/issuers/delegate"),
                 None,
             )
         })
@@ -4157,10 +4155,10 @@ mod tests {
             handle_access_org_manage(
                 stream,
                 serde_json::json!({ "handle": "golden-org" }).to_string(),
-                "POST",
                 "/api/access/org-grants/issuers/init",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
+                org_cors("/api/access/org-grants/issuers/init"),
                 None,
             )
         })
@@ -4190,11 +4188,11 @@ mod tests {
             handle_access_org_manage(
                 stream,
                 invalid.to_string(),
-                "POST",
                 "/api/access/orgs/trust",
                 tmp.path().to_path_buf(),
                 golden_root_context(),
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                org_cors("/api/access/orgs/trust"),
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
@@ -4215,11 +4213,11 @@ mod tests {
             handle_access_org_manage(
                 stream,
                 "{}".to_string(),
-                "POST",
                 "/api/access/orgs/trust",
                 denied_dir.path().to_path_buf(),
                 context,
-                Some(GOLDEN_FLEET_ORIGIN.to_string()),
+                org_cors("/api/access/orgs/trust"),
+                Some(GOLDEN_FLEET_ORIGIN),
             )
         })
         .await;
