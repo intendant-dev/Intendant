@@ -27418,6 +27418,7 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
       });
   }
   renderAccessVaultSection();
+  vaultDepositLaneSync().catch(() => {});
   return true;
 }
 
@@ -27734,6 +27735,140 @@ function vaultRemoveEntry(id) {
   vaultRevealedEntries.delete(id);
   vaultSyncVoiceMirror();
   return vaultQueuePersist();
+}
+
+/* ── Write-only deposits (the CLI lane) ──
+   `intendant vault deposit <label>` seals a secret to the vault's deposit
+   public key and queues it on the DAEMON (vault_deposits.rs) — the daemon
+   holds ciphertext only, and the plaintext never rides a web UI. After
+   every unlock we (1) ensure the deposit keypair exists inside the sealed
+   body's settings and publish its public half to this daemon, then
+   (2) fold queued deposits into the vault as ordinary entries, consuming
+   them only AFTER the re-wrapped blob has published. The crypto mirrors
+   vault_deposits.rs (v1) exactly: P-256 ECDH → HKDF-SHA256 (empty salt,
+   info = "intendant-vault-deposit-v1" || eph_pub || recipient_pub ||
+   label) → AES-256-GCM with AAD "intendant-vault-deposit-v1:" + label.
+   ring concatenates its HKDF info parts, so `info` here is the same
+   byte string. Cross-implementation parity harness:
+   scripts/vault-deposit-parity.cjs. */
+const VAULT_DEPOSIT_INFO = 'intendant-vault-deposit-v1';
+
+function vaultDepositConcatBytes(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+async function vaultDepositLaneSync() {
+  if (vaultState.status !== 'unlocked' || !vaultState.kBytes) return;
+  try {
+    // 1. Keypair lives inside the sealed body (extractable so it rides
+    //    the blob to every unlocking device; it exists only as ciphertext
+    //    at rest).
+    let lane = vaultState.settings.deposit_lane;
+    if (!lane || !lane.priv_jwk || !lane.pub_raw_b64u) {
+      const pair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+      const privJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+      const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+      lane = {
+        alg: 'ECDH-P256',
+        priv_jwk: privJwk,
+        pub_raw_b64u: dashboardBytesToBase64Url(pubRaw),
+        created_unix_ms: Date.now(),
+      };
+      vaultState.settings.deposit_lane = lane;
+      await vaultQueuePersist();
+    }
+
+    // 2. Publish the public half to this daemon (idempotent; a daemon can
+    //    hold at most one deposit key — last unlocked vault wins, and the
+    //    mismatch check keeps this a no-op in the steady state).
+    const current = await vaultLeaseRpc('api_daemon_vault_deposit_key_fetch').catch(() => null);
+    if (!current?.present || current.pub_raw_b64u !== lane.pub_raw_b64u) {
+      await vaultLeaseRpc('api_daemon_vault_deposit_key_publish', {
+        alg: 'ECDH-P256',
+        pub_raw_b64u: lane.pub_raw_b64u,
+      });
+    }
+
+    // 3. Fold queued deposits, then consume. Consume strictly after the
+    //    folded blob PUBLISHED — a failed publish leaves them queued.
+    const fetched = await vaultLeaseRpc('api_daemon_vault_deposits_fetch').catch(() => null);
+    const deposits = Array.isArray(fetched?.deposits) ? fetched.deposits : [];
+    if (!deposits.length) return;
+    const privKey = await crypto.subtle.importKey(
+      'jwk', lane.priv_jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    const consumed = [];
+    for (const dep of deposits) {
+      try {
+        const secret = await vaultOpenDeposit(privKey, lane.pub_raw_b64u, dep);
+        vaultState.entries.push({
+          id: vaultRandomId('cred'),
+          kind: 'api_key',
+          provider: '',
+          label: String(dep.label || 'CLI deposit'),
+          secret,
+          origin: 'cli-deposit',
+          created_unix_ms: Number(dep.created_unix_ms) || Date.now(),
+          updated_unix_ms: Date.now(),
+        });
+        consumed.push(String(dep.id));
+      } catch (err) {
+        // Sealed to a superseded deposit key, or corrupt: leave it queued
+        // (visible via `intendant vault status`); never consume blind.
+        console.warn('[vault] deposit', dep?.id, 'did not open — leaving it queued:', err?.message || err);
+      }
+    }
+    if (!consumed.length) return;
+    await vaultQueuePersist();
+    await vaultLeaseRpc('api_daemon_vault_deposits_consume', { ids: consumed });
+    vaultSyncVoiceMirror();
+    renderAccessVaultSection();
+    console.info(`[vault] folded ${consumed.length} CLI deposit(s) into the vault`);
+  } catch (err) {
+    // Advisory lane: never let it break an unlock.
+    console.warn('[vault] deposit-lane sync failed:', err?.message || err);
+  }
+}
+
+async function vaultOpenDeposit(privKey, recipientPubB64u, dep) {
+  if (dep?.alg !== 'ECIES-P256-HKDF-SHA256-A256GCM') {
+    throw new Error(`unknown deposit alg ${dep?.alg}`);
+  }
+  const encoder = new TextEncoder();
+  const ephRaw = dashboardBase64UrlToBytes(String(dep.eph_pub_raw_b64u || ''));
+  const ephKey = await crypto.subtle.importKey(
+    'raw', ephRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: 'ECDH', public: ephKey }, privKey, 256));
+  const label = String(dep.label || '');
+  const info = vaultDepositConcatBytes(
+    encoder.encode(VAULT_DEPOSIT_INFO),
+    ephRaw,
+    dashboardBase64UrlToBytes(recipientPubB64u),
+    encoder.encode(label));
+  const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
+    hkdfKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']);
+  const plain = await crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: dashboardBase64UrlToBytes(String(dep.nonce_b64u || '')),
+      additionalData: encoder.encode(VAULT_DEPOSIT_INFO + ':' + label),
+    },
+    aesKey,
+    dashboardBase64UrlToBytes(String(dep.ct_b64u || '')));
+  return new TextDecoder().decode(plain);
 }
 
 async function vaultEnrollThisPasskey() {

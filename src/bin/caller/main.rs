@@ -76,6 +76,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
+mod vault_deposits;
 mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
@@ -3169,6 +3170,10 @@ async fn main() -> Result<(), CallerError> {
     // Intercept `intendant access <action>` before the main runtime setup.
     // This is a local certificate/enrollment path with no project, no .env,
     // and no provider selection.
+    if env::args().nth(1).as_deref() == Some("vault") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(vault_deposits::run_vault_cli(argv).await);
+    }
     if env::args().nth(1).as_deref() == Some("access") {
         #[cfg(not(target_os = "windows"))]
         {

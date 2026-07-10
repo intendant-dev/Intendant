@@ -148,10 +148,33 @@ credential lease is already scoped, time-boxed, and revocable (below).
 Users who refuse hosted-origin unsealing browse from an anchor origin —
 both escape hatches stay first-class.
 
-**Reserved, not v1:** an asymmetric sealing half (X25519 keypair derived
-from the same PRF secret, public key published) that would let *daemons*
-seal secrets into the vault one-way — the org-root-key-backup tenant.
-The format reserves an `envelopes[].kind = "sealed"` variant for it.
+**The write-only deposit lane** (`intendant vault deposit <label>`) is
+the asymmetric sealing half, shipped: a P-256 deposit keypair lives
+*inside* the sealed body (`settings.deposit_lane`, so it reaches every
+unlocking device but exists only as ciphertext at rest), and an unlocked
+dashboard publishes its public half to the daemon
+(`~/.intendant/vault-deposit-key.pub.json`). The CLI reads a secret from
+**stdin** — piped, so the plaintext never rides a web UI, a terminal
+echo, or this daemon's disk — seals it ECIES-style to that public key
+(ephemeral P-256 → HKDF-SHA256 → AES-256-GCM, the label bound into both
+the KDF info and the AEAD AAD), and queues one ciphertext record per
+deposit under `~/.intendant/vault-deposits.d/`. The next unlocked
+dashboard on this daemon folds queued deposits into the vault as
+ordinary entries and deletes them **only after** the re-wrapped blob has
+published; a deposit sealed to a superseded key stays queued and visible
+(`intendant vault status`) rather than being consumed blind. Honest
+limits: the depositing CLI trusts the machine it runs on — a malicious
+daemon could swap the deposit key and capture *future* deposits (it
+still can never read the vault), and deposits are write-only by
+construction: nothing on the CLI side can read an entry back out. The
+implementation pair is `vault_deposits.rs` (seal) and
+`32-vault-custody.js` (open); `scripts/vault-deposit-parity.cjs`
+cross-checks the two against real WebCrypto.
+
+**Still reserved, not v1:** deriving the deposit keypair from the PRF
+secret itself (today it is generated randomly and rides the blob), and
+the org-root-key-backup tenant with its `envelopes[].kind = "sealed"`
+variant.
 
 ## Authority transport: credential leases
 
