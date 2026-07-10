@@ -45,13 +45,18 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # Run a command as the CI account with its own HOME and a deterministic
 # PATH (the account has no login shell profile to lean on).
 ci_run() {
+    # --chdir equivalent via sh -c: the invoker's cwd is typically inside
+    # the operator's 700 home, where the CI account cannot even getcwd —
+    # rustup and cargo abort on that. Run everything from the CI home.
     sudo -u "$CI_ACCOUNT" -H env HOME="$CI_HOME" \
         PATH="$CI_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-        "$@"
+        sh -c 'cd "$HOME" && exec "$@"' ci-run "$@"
 }
 
 echo "== account"
-if dscl . -read "/Users/$CI_ACCOUNT" UniqueID >/dev/null 2>&1; then
+if dscl . -read "/Users/$CI_ACCOUNT" UniqueID 2>/dev/null | grep -qE 'UniqueID: [0-9]+'; then
+    # Attribute-level check: a partially-created record (a failed prior
+    # run) satisfies a bare `dscl -read` while `id` still fails.
     echo "account $CI_ACCOUNT already exists — leaving it as is"
 else
     # Free UID in Apple's role-account range: sysadminctl -roleAccount
@@ -92,6 +97,12 @@ else
     # account gets no password material, so password login is impossible.
     sysadminctl -addUser "$CI_ACCOUNT" -roleAccount -UID "$uid" -GID "$gid" \
         -fullName "Intendant CI" -home "$CI_HOME" -shell /bin/bash
+    # sysadminctl IGNORES -home and -shell for role accounts (prints
+    # "Home argument is ignored… /var/empty", live on Darwin 25.4). The
+    # LaunchDaemon injects HOME anyway, but the directory-services record
+    # must agree with it for getpwuid-based resolution: set both directly.
+    dscl . -create "/Users/$CI_ACCOUNT" NFSHomeDirectory "$CI_HOME"
+    dscl . -create "/Users/$CI_ACCOUNT" UserShell /bin/bash
     # Belt and braces (role accounts are already hidden by UID range):
     dscl . -create "/Users/$CI_ACCOUNT" IsHidden 1
 fi
