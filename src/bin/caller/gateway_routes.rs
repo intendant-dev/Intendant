@@ -625,6 +625,8 @@ pub(crate) static ROUTES: &[Route] = &[
     // ── Session deletion. Five accepted wire shapes (native DELETE plus
     //    the WKWebView POST fallback with a literal `delete` suffix); one
     //    handler serves all of them by filtering the `delete` segment.
+    //    The datachannel twin rides the canonical shape below (one tunnel
+    //    name per row; all five rows share the operation and handler).
     op_route(
         RouteMethod::Delete,
         PathPattern::Segments("/api/session", &[SegmentSpec::Capture("id")]),
@@ -632,7 +634,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionDelete,
         "Delete a session's data",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_delete")),
     op_route(
         RouteMethod::Delete,
         PathPattern::Segments(
@@ -752,6 +755,66 @@ pub(crate) static ROUTES: &[Route] = &[
     .with_tunnel(tunnel_method("api_session_context_snapshot")),
     op_route(
         RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("report")],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session report zip (text artifacts; id=current targets the live session)",
+    )
+    .with_tunnel(tunnel_method("api_session_report")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("recordings"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "List a session's recording streams",
+    )
+    .with_tunnel(tunnel_method("api_session_recordings")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("recordings"),
+                SegmentSpec::Capture("stream"),
+                SegmentSpec::Capture("asset"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Recording assets: segments listing, playlist.m3u8, or a segment file",
+    )
+    .with_tunnel(tunnel_method("api_session_recording_asset")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("frames"),
+                SegmentSpec::Capture("filename"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session frame image asset",
+    )
+    .with_tunnel(tunnel_method("api_session_frame_asset")),
+    op_route(
+        RouteMethod::Get,
         PathPattern::Segments("/api/session", &[SegmentSpec::Capture("id")]),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
@@ -808,7 +871,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::WorktreesInspect,
         "Inspect one worktree (branch, ahead/behind, dirty state)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_inspect")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/remove"),
@@ -816,7 +880,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::WorktreesRemove,
         "Remove a worktree from the inventory",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_remove")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/merge"),
@@ -833,7 +898,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::WorktreesScan,
         "Rescan the worktree inventory (refreshes the cache)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_scan")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/worktrees"),
@@ -841,7 +907,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::WorktreesList,
         "Cached worktree inventory",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees")),
     // ── Session listing. The stream/search rows close a historical gap:
     //    dispatch served them but the hand classifier never gated them
     //    for browser principals (peers were already SessionInspect-gated

@@ -261,14 +261,11 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // route rows — their IAM operations derive from the rows (S4a; the
     // formerly divergent agent-output/context-snapshot twins are now
     // derivation-equal by construction).
+    // The session artifact reads (api_session_report,
+    // api_session_recordings, api_session_recording_asset,
+    // api_session_frame_asset), api_session_delete, and the worktrees
+    // quartet live as tunnel columns on their route rows (S4b).
     method("api_sessions_stream", PeerOperation::SessionInspect),
-    method("api_session_report", PeerOperation::SessionInspect),
-    method("api_session_recordings", PeerOperation::SessionInspect),
-    method("api_session_recording_asset", PeerOperation::SessionInspect),
-    method("api_session_frame_asset", PeerOperation::SessionInspect),
-    method("api_worktrees", PeerOperation::SessionInspect),
-    method("api_worktrees_inspect", PeerOperation::SessionInspect),
-    method("api_session_delete", PeerOperation::SessionManage),
     method("api_session_current_history", PeerOperation::SessionManage),
     method("api_session_current_rollback", PeerOperation::SessionManage),
     method("api_session_current_redo", PeerOperation::SessionManage),
@@ -285,8 +282,6 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         PeerOperation::SessionManage,
     ),
     method("api_session_control_msg", PeerOperation::SessionManage),
-    method("api_worktrees_scan", PeerOperation::SessionManage),
-    method("api_worktrees_remove", PeerOperation::SessionManage),
     upload_only("api_session_current_upload", PeerOperation::SessionManage),
     method("api_transfer_jobs", PeerOperation::FilesystemRead),
     method("api_transfer_download_read", PeerOperation::FilesystemRead),
@@ -3205,7 +3200,7 @@ mod tests {
             ("api_sessions", Row, Some(Op::SessionInspect)),
             ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
-            ("api_session_report", Residue, Some(Op::SessionInspect)),
+            ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
             (
                 "api_session_context_snapshot",
@@ -3213,16 +3208,16 @@ mod tests {
                 Some(Op::SessionInspect),
             ),
             ("api_sessions_search", Row, Some(Op::SessionInspect)),
-            ("api_session_recordings", Residue, Some(Op::SessionInspect)),
+            ("api_session_recordings", Row, Some(Op::SessionInspect)),
             (
                 "api_session_recording_asset",
-                Residue,
+                Row,
                 Some(Op::SessionInspect),
             ),
-            ("api_session_frame_asset", Residue, Some(Op::SessionInspect)),
-            ("api_worktrees", Residue, Some(Op::SessionInspect)),
-            ("api_worktrees_inspect", Residue, Some(Op::SessionInspect)),
-            ("api_session_delete", Residue, Some(Op::SessionManage)),
+            ("api_session_frame_asset", Row, Some(Op::SessionInspect)),
+            ("api_worktrees", Row, Some(Op::SessionInspect)),
+            ("api_worktrees_inspect", Row, Some(Op::SessionInspect)),
+            ("api_session_delete", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_history",
                 Residue,
@@ -3265,8 +3260,8 @@ mod tests {
                 Some(Op::SessionManage),
             ),
             ("api_session_control_msg", Residue, Some(Op::SessionManage)),
-            ("api_worktrees_scan", Residue, Some(Op::SessionManage)),
-            ("api_worktrees_remove", Residue, Some(Op::SessionManage)),
+            ("api_worktrees_scan", Row, Some(Op::SessionManage)),
+            ("api_worktrees_remove", Row, Some(Op::SessionManage)),
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload",
