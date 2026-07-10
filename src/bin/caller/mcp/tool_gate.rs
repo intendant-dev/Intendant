@@ -628,6 +628,57 @@ mod tests {
     }
 
     #[test]
+    fn manual_http_request_user_display_description_matches_tool_attribute() {
+        // Same drift guard as the rewind/peer/session-note tools:
+        // request_user_display lives in a non-router impl block, so the
+        // HTTP transport serves the manual definition while the #[tool]
+        // attribute documents the method; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "request_user_display")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for request_user_display");
+        let attr = IntendantServer::request_user_display_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "request_user_display manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn request_user_display_is_advertised_to_supervised_profiles() {
+        // The doorbell exists FOR scoped supervised callers: it must be
+        // listed in the small core profile, the display profile, and the
+        // permissive default/full lists.
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+            Some("screen"),
+            Some("display"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("request_user_display", false, profile),
+                "request_user_display must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual
+                .iter()
+                .any(|tool| tool["name"] == "request_user_display"),
+            "core-profile manual definitions must include request_user_display"
+        );
+    }
+
+    #[test]
     fn fission_tool_profile_gating_matrix() {
         for name in [
             "fission_spawn",
@@ -687,6 +738,15 @@ mod tests {
         // session-scoped supervised agents (the primary callers) pass.
         assert_eq!(
             mcp_tool_operation("post_session_note"),
+            PeerOperation::Message
+        );
+        // The display-request doorbell classifies as Message too: it only
+        // ASKS the user (popup + reason) and can grant nothing — scoped
+        // supervised agents, its primary callers, must be able to ring it.
+        // The grant itself is minted by the owner's resolve_display_request
+        // control message, which classifies DisplayInput.
+        assert_eq!(
+            mcp_tool_operation("request_user_display"),
             PeerOperation::Message
         );
         assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);

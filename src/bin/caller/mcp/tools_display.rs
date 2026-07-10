@@ -1594,6 +1594,273 @@ mod tests {
         });
     }
 
+    /// Extract the tool's structured JSON result from a CallToolResult.
+    fn tool_result_json(result: &CallToolResult) -> serde_json::Value {
+        let rendered = serde_json::to_value(result).expect("serializable tool result");
+        let text = rendered["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected text content, got {rendered}"));
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("expected JSON result ({e}): {text}"))
+    }
+
+    #[tokio::test]
+    async fn request_user_display_validates_reason_and_access() {
+        crate::display_requests::mark_approver_surface_available();
+        let bus = EventBus::new();
+        let server = IntendantServer::new(test_state(), bus);
+
+        let result = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "   " }),
+                Some("tool-validate"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        assert_eq!(tool_result_json(&result)["status"], "invalid");
+
+        let result = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "why", "access": "root" }),
+                Some("tool-validate"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        let json = tool_result_json(&result);
+        assert_eq!(json["status"], "invalid");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains("access"),
+            "unknown access is named: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_user_display_short_circuits_when_already_granted() {
+        crate::display_requests::mark_approver_surface_available();
+        let bus = EventBus::new();
+        let state = test_state();
+        let server = IntendantServer::new(state.clone(), bus);
+        let autonomy = { state.read().await.autonomy.clone() };
+        autonomy.write().await.user_display_granted = true;
+
+        let result = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "why", "access": "view_and_control" }),
+                Some("tool-already-granted"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        assert_eq!(tool_result_json(&result)["status"], "already_granted");
+    }
+
+    /// The scoped-caller round trip: the tool (dispatched Scoped, the
+    /// fail-closed default) raises the doorbell event and blocks; the
+    /// registry resolution (what the control plane performs on the user's
+    /// click) unblocks it with the structured approved result. The tool
+    /// itself never touches the autonomy guard.
+    #[tokio::test]
+    async fn request_user_display_scoped_round_trip_approval() {
+        crate::display_requests::mark_approver_surface_available();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let state = test_state();
+        let server = IntendantServer::new(state.clone(), bus.clone());
+
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .call_tool_by_name_for_session(
+                        "request_user_display",
+                        serde_json::json!({
+                            "reason": "verify the deploy output on your screen",
+                            "access": "view_and_control",
+                            "wait_seconds": 30,
+                        }),
+                        Some("tool-round-trip"),
+                        None,
+                    )
+                    .await
+                    .expect("tool should dispatch")
+            })
+        };
+
+        // The doorbell rings: the dedicated event (NOT ApprovalRequired).
+        let raised_id = loop {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayRequestRaised {
+                    session_id,
+                    id,
+                    access,
+                    reason,
+                    expires_unix_ms,
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("tool-round-trip"));
+                    assert_eq!(access, "view_and_control");
+                    assert_eq!(reason, "verify the deploy output on your screen");
+                    assert!(expires_unix_ms > 0);
+                    break id;
+                }
+                Ok(Ok(AppEvent::ApprovalRequired { .. })) => {
+                    panic!("a display request must never ride the approval rail")
+                }
+                Ok(Ok(_)) => continue,
+                other => panic!("expected DisplayRequestRaised, got {other:?}"),
+            }
+        };
+
+        // The user's click (the control plane's registry take) resolves it.
+        let action = crate::display_requests::registry()
+            .resolve(
+                "tool-round-trip",
+                raised_id,
+                crate::display_requests::DisplayRequestDecision::Approve,
+                crate::display_requests::DisplayGrantDuration::Timed,
+                crate::display_requests::now_unix_ms(),
+            )
+            .expect("pending request resolves");
+        assert!(matches!(
+            action,
+            crate::display_requests::ResolveAction::MintGrant { .. }
+        ));
+
+        let result = timeout(Duration::from_secs(5), call)
+            .await
+            .expect("tool returns after resolution")
+            .expect("tool task");
+        let json = tool_result_json(&result);
+        assert_eq!(json["status"], "approved");
+        assert_eq!(json["access"], "view_and_control");
+        assert_eq!(json["duration"], "15m");
+        // The tool only ASKED: minting is the control plane's job, so the
+        // guard is untouched by the tool path itself.
+        let autonomy = { state.read().await.autonomy.clone() };
+        assert!(!autonomy.read().await.user_display_granted);
+    }
+
+    #[tokio::test]
+    async fn request_user_display_second_call_reports_the_pending_request() {
+        crate::display_requests::mark_approver_surface_available();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let server = IntendantServer::new(test_state(), bus.clone());
+
+        let first = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .call_tool_by_name_for_session(
+                        "request_user_display",
+                        serde_json::json!({ "reason": "first ask", "wait_seconds": 30 }),
+                        Some("tool-dedupe"),
+                        None,
+                    )
+                    .await
+                    .expect("tool should dispatch")
+            })
+        };
+        // Wait until the first request is registered (its event fires).
+        let raised_id = loop {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayRequestRaised { id, .. })) => break id,
+                Ok(Ok(_)) => continue,
+                other => panic!("expected DisplayRequestRaised, got {other:?}"),
+            }
+        };
+
+        let second = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "second ask", "wait_seconds": 30 }),
+                Some("tool-dedupe"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        let json = tool_result_json(&second);
+        assert_eq!(json["status"], "already_pending", "{json}");
+        assert_eq!(json["request_id"], raised_id);
+
+        // Unblock the first call (deny) and confirm its structured result.
+        crate::display_requests::registry()
+            .resolve(
+                "tool-dedupe",
+                raised_id,
+                crate::display_requests::DisplayRequestDecision::Deny,
+                crate::display_requests::DisplayGrantDuration::UntilRevoked,
+                crate::display_requests::now_unix_ms(),
+            )
+            .expect("resolves");
+        let result = timeout(Duration::from_secs(5), first)
+            .await
+            .expect("first call returns")
+            .expect("tool task");
+        let json = tool_result_json(&result);
+        assert_eq!(json["status"], "denied");
+        assert!(json["retry_after_secs"].as_u64().unwrap_or(0) > 0);
+
+        // The deny cooldown now refuses new asks without a popup.
+        let third = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "third ask" }),
+                Some("tool-dedupe"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        assert_eq!(tool_result_json(&third)["status"], "cooldown");
+    }
+
+    #[tokio::test]
+    async fn request_user_display_times_out_as_declined_by_absence() {
+        crate::display_requests::mark_approver_surface_available();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let server = IntendantServer::new(test_state(), bus.clone());
+
+        let result = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "nobody home", "wait_seconds": 1 }),
+                Some("tool-timeout"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        let json = tool_result_json(&result);
+        assert_eq!(json["status"], "timed_out", "{json}");
+        assert!(json["retry_after_secs"].as_u64().unwrap_or(0) > 0);
+
+        // The timeout resolution is announced so popups + badges clear.
+        let mut saw_timeout_resolution = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::DisplayRequestResolved { outcome, .. } = event {
+                if outcome == "timeout" {
+                    saw_timeout_resolution = true;
+                }
+            }
+        }
+        assert!(saw_timeout_resolution, "timeout emits DisplayRequestResolved");
+
+        // Declined by absence: the cooldown applies like an explicit deny.
+        let again = server
+            .call_tool_by_name_for_session(
+                "request_user_display",
+                serde_json::json!({ "reason": "asking again" }),
+                Some("tool-timeout"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        assert_eq!(tool_result_json(&again)["status"], "cooldown");
+    }
+
     #[test]
     fn resolve_display_target_never_yields_a_virtual_user_display() {
         use crate::computer_use::DisplayTarget;

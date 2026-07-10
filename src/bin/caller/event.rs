@@ -4621,6 +4621,90 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_resolve_display_request_deserialize() {
+        // The popup's wire shape: approve with a duration.
+        let json = r#"{"action":"resolve_display_request","session_id":"sess-1","id":7,"decision":"approve","duration":"15m"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 7);
+                assert_eq!(decision, "approve");
+                assert_eq!(duration.as_deref(), Some("15m"));
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // Deny needs no duration; session_id may be absent ("main").
+        let json = r#"{"action":"resolve_display_request","id":3,"decision":"deny"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(id, 3);
+                assert_eq!(decision, "deny");
+                assert_eq!(duration, None);
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // `id` and `decision` are required: a resolution cannot default
+        // its target or its verdict.
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","decision":"approve"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","id":3}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn display_request_events_map_to_outbound_wire_shapes() {
+        let raised = app_event_to_outbound(&AppEvent::DisplayRequestRaised {
+            session_id: Some("sess-1".to_string()),
+            id: 7,
+            access: "view".to_string(),
+            reason: "watch the migration".to_string(),
+            expires_unix_ms: 123_456,
+        })
+        .expect("raised maps to an outbound event");
+        let wire = serde_json::to_value(&raised).unwrap();
+        assert_eq!(wire["event"], "display_request_raised");
+        assert_eq!(wire["session_id"], "sess-1");
+        assert_eq!(wire["id"], 7);
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["reason"], "watch the migration");
+        assert_eq!(wire["expires_unix_ms"], 123_456);
+
+        let resolved = app_event_to_outbound(&AppEvent::DisplayRequestResolved {
+            session_id: None,
+            id: 7,
+            outcome: "approved".to_string(),
+            access: Some("view".to_string()),
+            duration: Some("this_session".to_string()),
+        })
+        .expect("resolved maps to an outbound event");
+        let wire = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(wire["event"], "display_request_resolved");
+        assert_eq!(wire["outcome"], "approved");
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["duration"], "this_session");
+        assert!(wire.get("session_id").is_none());
+    }
+
+    #[test]
     fn control_msg_set_diagnostics_visual_marker_default_display() {
         let json = r#"{"action":"set_diagnostics_visual_marker","enabled":true}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
