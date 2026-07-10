@@ -93,6 +93,16 @@ impl TestRig {
             // grant. Pin the virtual-display convention instead — nothing
             // here opens an X connection, and display ids > 0 need no grant.
             .env("DISPLAY", ":99")
+            // The macOS/Windows half of the same contract: display
+            // enumeration and capture serve a deterministic 1280×720
+            // synthetic source instead of touching ScreenCaptureKit or
+            // GDI/DXGI. Without this, a Windows daemon's startup
+            // auto-activation BitBlts the runner's real desktop (or spins
+            // in an Access-denied retry storm when the runner's screen is
+            // locked), and a macOS grant starts a real SCK stream of the
+            // runner account's screen. Honored only alongside
+            // PROVIDER=mock — fail closed, like the provider itself.
+            .env("INTENDANT_MOCK_DISPLAY", "synthetic")
             .env("PROVIDER", "mock");
         cmd
     }
@@ -1194,6 +1204,16 @@ async fn display_request_rail_round_trips_over_ws() {
 
     const REASON: &str = "E2E_DISPLAY_REQUEST verify the deploy output";
 
+    // Displayless contract: with the suite-wide synthetic display backend
+    // (`INTENDANT_MOCK_DISPLAY=synthetic`), the whole rail round-trip is
+    // fast on every platform. A platform capture stack sneaking back in
+    // shows up here as seconds-to-minutes (Windows GDI Access-denied retry
+    // storms on a locked runner, SCK/TCC stalls) — so pin the wall clock.
+    // Generous versus the single-digit-second measured times to stay
+    // robust on loaded CI runners.
+    let wall_clock = std::time::Instant::now();
+    const RAIL_WALL_CLOCK_BOUND: Duration = Duration::from_secs(30);
+
     let idle_script = serde_json::json!({
         "profiles": [{
             "steps": [
@@ -1323,6 +1343,29 @@ async fn display_request_rail_round_trips_over_ws() {
         assert_eq!(resolved["id"], id, "{resolved}");
         assert_eq!(resolved["outcome"], "approved", "{resolved}");
         assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
+
+        // The grant the approval minted also activated a capture session,
+        // and under the suite-wide synthetic display mode that session is
+        // the deterministic synthetic source on every platform: 1280×720,
+        // no ScreenCaptureKit / GDI / X11 involved. Its `display_ready`
+        // geometry is the end-to-end proof — a platform backend would
+        // report the host's real resolution (or never come up at all on a
+        // headless runner). Any leg-0 display events were consumed by the
+        // raised-matcher above, so the next display_ready is this leg's.
+        let ready = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_ready")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_ready never broadcast after the approved grant:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(ready["display_id"], 0, "{ready}");
+        assert_eq!(ready["width"], 1280, "{ready}");
+        assert_eq!(ready["height"], 720, "{ready}");
+        assert_eq!(ready["agent_visible"], true, "{ready}");
     };
     let (output, ()) = tokio::join!(request, resolver);
     assert!(output.status.success(), "{}", text_of(&output));
@@ -1419,6 +1462,14 @@ async fn display_request_rail_round_trips_over_ws() {
     assert!(
         result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
         "{result}"
+    );
+
+    let elapsed = wall_clock.elapsed();
+    assert!(
+        elapsed < RAIL_WALL_CLOCK_BOUND,
+        "display-request rail e2e took {elapsed:?} (bound {RAIL_WALL_CLOCK_BOUND:?}) — \
+         is a real capture backend in play?\n{}",
+        daemon.log_tail()
     );
 }
 

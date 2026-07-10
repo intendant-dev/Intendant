@@ -473,6 +473,51 @@ pub(crate) fn report_user_display_capture_unavailable(
     bus.send(AppEvent::DisplayCaptureLost { display_id, reason });
 }
 
+/// Arm the synthetic display backend when — and only when — the headless
+/// test rig asked for it AND the scripted mock provider is the explicitly
+/// selected provider.
+///
+/// `INTENDANT_MOCK_DISPLAY=synthetic` mirrors the mock provider's own
+/// gating (`PROVIDER=mock` is never auto-selected — see
+/// `provider::select_provider`): it is a test-rig knob, so it fails closed.
+/// A stray or planted env var on a real-provider daemon must never be able
+/// to swap real capture for a fake source, and an unrecognized value must
+/// never half-arm anything — both cases log and change nothing. Called once
+/// from the startup prologue, after `.env` loading and the `--provider`
+/// flag override, before any display machinery exists (the Windows
+/// user-display auto-activation at daemon startup included).
+///
+/// While armed, `display::enumerate_displays` serves the synthetic list and
+/// [`activate_user_display`] constructs [`display::synthetic::SyntheticBackend`]
+/// sessions — no native capture API (ScreenCaptureKit, GDI/DXGI, Media
+/// Foundation, X11, Wayland/PipeWire) is touched anywhere in the process.
+pub(crate) fn arm_synthetic_display_if_requested() {
+    let Ok(value) = std::env::var("INTENDANT_MOCK_DISPLAY") else {
+        return;
+    };
+    if !value.eq_ignore_ascii_case("synthetic") {
+        eprintln!(
+            "[display] INTENDANT_MOCK_DISPLAY={value:?} is not a recognized mode \
+             (expected \"synthetic\"); ignoring"
+        );
+        return;
+    }
+    if std::env::var("PROVIDER").as_deref() != Ok("mock") {
+        eprintln!(
+            "[display] INTENDANT_MOCK_DISPLAY=synthetic ignored: PROVIDER=mock is not \
+             active (the synthetic display backend is a mock-provider test rig and \
+             fails closed without it)"
+        );
+        return;
+    }
+    eprintln!(
+        "[display] synthetic display backend armed (PROVIDER=mock + \
+         INTENDANT_MOCK_DISPLAY=synthetic): display enumeration and capture are \
+         synthetic; no OS capture API will be touched"
+    );
+    display::synthetic::arm();
+}
+
 /// Handle user display grant: create a `DisplaySession` and emit
 /// `DisplayReady` for the selected user display.
 ///
@@ -521,6 +566,42 @@ pub(crate) async fn activate_user_display(
             width,
             height,
             agent_visible: session.agent_visible(),
+        });
+        return;
+    }
+
+    // Synthetic display mode (headless test rigs): serve every activation —
+    // any display id, every platform — from the deterministic synthetic
+    // backend and never reach a platform arm below. Armed only by
+    // [`arm_synthetic_display_if_requested`]'s fail-closed gate.
+    if display::synthetic::armed() {
+        let backend = display::synthetic::SyntheticBackend::new();
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
+        if let Err(e) = session
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
+            report_user_display_capture_unavailable(
+                bus,
+                display_id,
+                format!("synthetic display session failed: {e}"),
+            );
+            return;
+        }
+        let (width, height) = session.resolution();
+        let session = Arc::new(session);
+        session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
+        session_registry.write().await.insert(display_id, session);
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+            agent_visible,
         });
         return;
     }
