@@ -124,6 +124,8 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 similar = "2"
 sha2 = "0.10"
 ring = "0.17"
+# Terminal QR for the enrollment URL (unicode render only — no image/svg).
+qrcode = { version = "0.14", default-features = false }
 # `intendant lan` mTLS certificate generation — pure-Rust, replacing the
 # former OpenSSL dependency. `rsa` generates RSA-2048 keys; `rcgen` builds
 # the CA + server (SAN=IP, ≤825d) + client certs on the `ring` backend using

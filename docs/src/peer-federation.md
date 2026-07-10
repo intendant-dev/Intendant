@@ -597,14 +597,33 @@ Windows daemon can still use native HTTPS/mTLS and
 [Windows Support](./windows-support.md).
 
 Enrollment is not a plain unauthenticated download. The temporary
-`serve-certs` endpoint runs HTTPS with the access server certificate. The CLI does
-not print the expected server fingerprint or the enrollment secret at startup;
-the operator first copies the SHA-256 fingerprint observed in the browser's
-certificate UI into the CLI. Only a match reveals a one-time secret, and only a
-browser that redeems that secret can download the CA, client certificate, or
-Apple configuration profile. The page detects the browser only to put the most
+`serve-certs` endpoint runs HTTPS with the access server certificate, prints
+the enrollment URL as a terminal QR code (scan instead of typing), and
+answers accidental plain-`http://` dials with a redirect to the https URL.
+The CLI does not print the expected server fingerprint or the enrollment
+secret at startup; the operator first copies the SHA-256 fingerprint observed
+in the browser's certificate UI into the CLI — the first 20 hex characters
+are enough (an attacker cannot pre-grind a certificate sharing an 80-bit
+prefix). Only a match reveals a one-time secret, and only a browser that
+redeems that secret can download the CA, client certificate, or Apple
+configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
+
+When the daemon holds a live **fleet certificate**
+([Self-Hosted Rendezvous → Fleet DNS](./self-hosted-rendezvous.md#fleet-dns-real-certificates-for-daemons)),
+`serve-certs` also serves it for the fleet name on the enrollment port and
+leads with that URL instead: the page then loads warning-free under WebPKI,
+and the fingerprint transcription is skipped — the operator just presses
+Enter to reveal the secret once the page is open. That path bootstraps
+device trust through [first-contact rung two](./trust-tiers.md#first-contact-three-rungs)
+(active-only betrayal, CT-logged, tripwire-watched) rather than rung one;
+the classic fingerprint ceremony against the IP URL remains available from
+the same prompt for trustless assurance. There is deliberately no
+short-code/PAKE variant: until the device trusts the daemon's certificate,
+a code typed into the *page* goes to whoever served the page — under an
+active MITM, the attacker — so the trustless leg keeps reading from browser
+chrome into the trusted terminal.
 
 Native access TLS also solves browser secure-context requirements for access clients
 once the CA/client identity are installed. That matters for Station's WebGPU

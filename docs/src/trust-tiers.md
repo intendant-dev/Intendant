@@ -194,6 +194,12 @@ direct origin* / *via fleet name* / *via hosted route*), and owners who
 want rung-two sessions capped like rung-three ones add the daemon's fleet
 origin to `hosted_origins` (the ceiling test matches exact origins, so it
 is the daemon's own fleet URL that goes in the list, not the bare zone).
+Device enrollment (`intendant access serve-certs`) rides the same ladder:
+with a live fleet certificate it leads with the warning-free fleet URL and
+skips the fingerprint transcription (a rung-two bootstrap), while the
+fingerprint ceremony against a direct address remains the rung-one path —
+shortened to an 80-bit prefix, since pre-grinding a certificate that
+shares 20 hex characters is out of reach.
 
 One consequence is easy to miss: for any *browser* client, first contact
 re-asks itself on every page load — the tab re-fetches its code each
