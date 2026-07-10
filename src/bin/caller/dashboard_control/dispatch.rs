@@ -5,6 +5,76 @@
 
 use super::*;
 
+/// Tunnel adapter for the transport-neutral api core (transport-
+/// unification design §2.1): render a JSON [`crate::web_gateway::ApiResponse`]
+/// into the tunnel's historical envelope — `http_body_response`, which
+/// wraps the body as `{t:"response", id, ok:true, result:<body>}` and
+/// injects `_httpStatus`/`_httpOk` into the result object. A byte
+/// response on a JSON-only method is a wiring bug and fails closed.
+pub(crate) fn frame_api_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { status, body, .. } => {
+            http_body_response(id, status, body.into_string(), label)
+        }
+        crate::web_gateway::ApiResponse::Bytes { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected byte response"),
+        }),
+    }
+}
+
+/// Tunnel adapter for byte-capable methods: `Bytes` becomes a
+/// `byte_stream_start/chunk/end` sequence — chunking, credits, and
+/// backpressure stay wire.rs-owned — with the neutral fn's `meta`
+/// object emitted verbatim as `byte_stream_end.result` (and the
+/// stream's filename lifted from it); JSON responses (the error
+/// shapes) ride the plain response envelope.
+pub(crate) fn frame_api_task_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    stream_suffix: &str,
+    label: &str,
+) -> ControlTaskResponse {
+    match response {
+        crate::web_gateway::ApiResponse::Bytes {
+            content_type,
+            bytes: crate::web_gateway::BytesPayload::InMemory(bytes),
+            meta,
+            ..
+        } => {
+            let filename = meta
+                .get("filename")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::Value::Null,
+                byte_stream: Some(ControlByteStream {
+                    id: id.clone(),
+                    stream_id: format!("{id}:{stream_suffix}"),
+                    content_type,
+                    filename,
+                    bytes,
+                    result: meta,
+                }),
+                done: true,
+            }
+        }
+        json @ crate::web_gateway::ApiResponse::Json { .. } => ControlTaskResponse {
+            id: id.clone(),
+            frame: frame_api_response(id, json, label),
+            byte_stream: None,
+            done: true,
+        },
+    }
+}
+
 pub(crate) fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,
@@ -2205,6 +2275,24 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::{runtime, scoped_user_client_grant};
+
+    #[test]
+    fn frame_api_response_fails_closed_on_byte_payloads() {
+        let response = crate::web_gateway::ApiResponse::Bytes {
+            status: 200,
+            content_type: "application/octet-stream".to_string(),
+            headers: Vec::new(),
+            bytes: crate::web_gateway::BytesPayload::InMemory(b"x".to_vec()),
+            meta: serde_json::Value::Null,
+        };
+        let frame = frame_api_response("bad-lane".to_string(), response, "unit probe");
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], false);
+        assert!(frame["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unexpected byte response"));
+    }
 
     #[test]
     fn dashboard_preview_text_truncates_on_char_boundary() {

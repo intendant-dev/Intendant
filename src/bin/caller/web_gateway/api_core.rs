@@ -36,12 +36,17 @@ impl ApiRequest {
 
 /// A byte-range request as it arrived on its transport. Satisfiability
 /// (and the exact 416 wording) is resolved against the target's size
-/// inside the handler, exactly where today's code resolves it; the
-/// tunnel's offset/length form joins as a second variant when the fs
-/// family's tunnel lane delegates (S2).
+/// inside the handler, exactly where today's code resolves it. The two
+/// forms keep their historical semantics: the HTTP header is
+/// end-inclusive; the tunnel's offset/length form is start+count with
+/// an end-exclusive `range_end` in the response meta.
 pub(crate) enum ByteRange {
     /// Verbatim HTTP `Range` header value (e.g. `bytes=100-199`).
     HttpHeader(String),
+    /// The datachannel tunnel's resumable form (`offset`/`length`
+    /// params, pre-normalized by the tunnel adapter). `length: None`
+    /// reads to end of file.
+    OffsetLength { offset: u64, length: Option<u64> },
 }
 
 /// JSON response body in whichever form the handler already has (risk
@@ -89,6 +94,14 @@ pub(crate) enum ApiResponse {
         /// Same contract as `Json::headers`.
         headers: Vec<(&'static str, String)>,
         bytes: BytesPayload,
+        /// Sidecar result for the byte lane: the tunnel adapter emits it
+        /// verbatim as `byte_stream_end.result` (the historical
+        /// `{ok, path, filename, …, range_start, range_end, resumable,
+        /// sha256}` object). The HTTP adapter ignores it today — the
+        /// header-form responses already carry their meta as headers;
+        /// the transfer rows (S9) define meta's HTTP rendering. `Null`
+        /// when the response has no sidecar.
+        meta: serde_json::Value,
     },
 }
 

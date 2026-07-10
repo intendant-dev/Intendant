@@ -747,21 +747,26 @@ pub(crate) fn transfer_download_error_task_response(
     }
 }
 
+/// Build the neutral [`crate::web_gateway::ApiRequest`] for a tunnel
+/// method: the frame's `params` object rides verbatim (transport-
+/// unification design §2.1 — the tunnel's shape is the canonical one).
+fn control_api_request(
+    params: Option<&serde_json::Value>,
+    range: Option<crate::web_gateway::ByteRange>,
+) -> crate::web_gateway::ApiRequest {
+    crate::web_gateway::ApiRequest {
+        params: params.cloned().unwrap_or_else(|| serde_json::json!({})),
+        range,
+    }
+}
+
 pub(crate) async fn api_fs_stat_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
-    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let path = string_param(&params, &["path"]);
-    let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::dashboard_fs_stat_response_body(&path)
-    })
-    .await;
+    let request = control_api_request(params, None);
+    let result =
+        tokio::task::spawn_blocking(move || crate::web_gateway::fs_stat_api_response(&request))
+            .await;
     match result {
-        Ok(Ok(body)) => http_body_response(id, 200, body, "filesystem stat"),
-        Ok(Err(error)) => http_body_response(
-            id,
-            400,
-            serde_json::json!({ "error": error }).to_string(),
-            "filesystem stat",
-        ),
+        Ok(response) => frame_api_response(id, response, "filesystem stat"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -772,20 +777,12 @@ pub(crate) async fn api_fs_stat_response(id: String, params: Option<&serde_json:
 }
 
 pub(crate) async fn api_fs_list_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
-    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let path = string_param(&params, &["path"]);
-    let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::dashboard_fs_list_response_body(&path)
-    })
-    .await;
+    let request = control_api_request(params, None);
+    let result =
+        tokio::task::spawn_blocking(move || crate::web_gateway::fs_list_api_response(&request))
+            .await;
     match result {
-        Ok(Ok(body)) => http_body_response(id, 200, body, "filesystem list"),
-        Ok(Err(error)) => http_body_response(
-            id,
-            400,
-            serde_json::json!({ "error": error }).to_string(),
-            "filesystem list",
-        ),
+        Ok(response) => frame_api_response(id, response, "filesystem list"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -908,9 +905,14 @@ pub(crate) async fn api_fs_read_task_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> ControlTaskResponse {
-    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let path_param = string_param(&params, &["path"]);
-    let offset = match optional_u64_param(&params, &["offset", "start"]) {
+    // Transport-owned range normalization: the tunnel's offset/length
+    // param aliases become the neutral request's ByteRange, exactly as
+    // the HTTP shim lifts its `Range` header (design §2.1 — ranges
+    // arrive pre-normalized, per transport).
+    let offset = match params
+        .map(|p| optional_u64_param(p, &["offset", "start"]))
+        .unwrap_or(Ok(None))
+    {
         Ok(value) => value.unwrap_or(0),
         Err(error) => {
             return filesystem_read_error_task_response(
@@ -920,7 +922,10 @@ pub(crate) async fn api_fs_read_task_response(
             );
         }
     };
-    let length = match optional_u64_param(&params, &["length", "limit"]) {
+    let length = match params
+        .map(|p| optional_u64_param(p, &["length", "limit"]))
+        .unwrap_or(Ok(None))
+    {
         Ok(value) => value,
         Err(error) => {
             return filesystem_read_error_task_response(
@@ -930,183 +935,27 @@ pub(crate) async fn api_fs_read_task_response(
             );
         }
     };
-    let path = match crate::web_gateway::expand_dashboard_fs_path(&path_param) {
-        Ok(path) => path,
-        Err(error) => {
-            return filesystem_read_error_task_response(
-                id,
-                400,
-                serde_json::json!({ "ok": false, "error": error }),
-            );
-        }
-    };
-    let filename = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.is_empty());
-    let content_type = dashboard_fs_content_type(&path);
-    let read_result = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || read_dashboard_fs_file_range(&path, offset, length)
-    })
-    .await;
-    let (bytes, total_size, end, display_path) = match read_result {
-        Ok(Ok(value)) => value,
-        Ok(Err((status, body))) => return filesystem_read_error_task_response(id, status, body),
-        Err(e) => {
-            return ControlTaskResponse {
-                id: id.clone(),
-                frame: serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": format!("filesystem read task failed: {e}"),
-                }),
-                byte_stream: None,
-                done: true,
-            };
-        }
-    };
-    let size = bytes.len();
-    // Full reads carry the content hash so the editor has a conflict
-    // baseline for its later write-back (mirrors the HTTP route's
-    // X-Content-Sha256 header).
-    let sha256 = (offset == 0 && bytes.len() as u64 == total_size)
-        .then(|| crate::web_gateway::fs_sha256_hex(&bytes));
-    let stream_name = display_path.to_string_lossy().to_string();
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: serde_json::Value::Null,
-        byte_stream: Some(ControlByteStream {
+    let request = control_api_request(
+        params,
+        Some(crate::web_gateway::ByteRange::OffsetLength { offset, length }),
+    );
+    let result =
+        tokio::task::spawn_blocking(move || crate::web_gateway::fs_read_api_response(&request))
+            .await;
+    match result {
+        Ok(response) => frame_api_task_response(id, response, "fs-read", "filesystem read"),
+        Err(e) => ControlTaskResponse {
             id: id.clone(),
-            stream_id: format!("{id}:fs-read"),
-            content_type: content_type.clone(),
-            filename: filename.clone(),
-            bytes,
-            result: serde_json::json!({
-                "ok": true,
-                "path": stream_name,
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-                "total_size": total_size,
-                "offset": offset,
-                "range_start": offset,
-                "range_end": end,
-                "resumable": true,
-                "sha256": sha256,
-            }),
-        }),
-        done: true,
-    }
-}
-
-pub(crate) fn dashboard_fs_content_type(path: &std::path::Path) -> String {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("css") => "text/css; charset=utf-8",
-        Some("csv") => "text/csv; charset=utf-8",
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("json") => "application/json",
-        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
-        Some("md") | Some("markdown") | Some("txt") | Some("toml") | Some("yaml") | Some("yml") => {
-            "text/plain; charset=utf-8"
-        }
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("webp") => "image/webp",
-        Some("wasm") => "application/wasm",
-        Some("zip") => "application/zip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-pub(crate) fn read_dashboard_fs_file_range(
-    path: &std::path::Path,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64, PathBuf), (u16, serde_json::Value)> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        (
-            404,
-            serde_json::json!({ "ok": false, "error": format!("file not accessible: {e}") }),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err((
-            400,
-            serde_json::json!({ "ok": false, "error": "path is not a regular file" }),
-        ));
-    }
-    let total_size = metadata.len();
-    let (start, transfer_len, end) = filesystem_read_range(total_size, offset, length)?;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("open file: {e}") }),
-        )
-    })?;
-    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("seek file: {e}") }),
-        )
-    })?;
-    let mut bytes = vec![0u8; transfer_len];
-    file.read_exact(&mut bytes).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("read file: {e}") }),
-        )
-    })?;
-    let display = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    Ok((bytes, total_size, end, display))
-}
-
-pub(crate) fn filesystem_read_range(
-    total_size: u64,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
-    if offset > total_size {
-        return Err((
-            416,
-            serde_json::json!({
+            frame: serde_json::json!({
+                "t": "response",
+                "id": id,
                 "ok": false,
-                "error": "range start beyond file size",
-                "total_size": total_size,
+                "error": format!("filesystem read task failed: {e}"),
             }),
-        ));
+            byte_stream: None,
+            done: true,
+        },
     }
-    let available = total_size.saturating_sub(offset);
-    let requested = length.unwrap_or(available).min(available);
-    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
-        return Err((
-            413,
-            serde_json::json!({
-                "ok": false,
-                "error": format!(
-                    "range too large: {} bytes (cap is {})",
-                    requested,
-                    crate::web_gateway::UPLOAD_MAX_BYTES
-                ),
-            }),
-        ));
-    }
-    let transfer_len = usize::try_from(requested).map_err(|_| {
-        (
-            413,
-            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-        )
-    })?;
-    Ok((offset, transfer_len, offset.saturating_add(requested)))
 }
 
 pub(crate) fn filesystem_read_error_task_response(
@@ -1126,6 +975,230 @@ pub(crate) fn filesystem_read_error_task_response(
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::{runtime, test_upload_state};
+
+    // ── Tunnel/HTTP parity fixtures (transport-unification design §8) ──
+    //
+    // The S2 convergence claim: the same params through the ONE neutral
+    // fn (`crate::web_gateway::fs_{stat,list,read}_api_response`),
+    // rendered by the HTTP adapter (`api_response_http_bytes`) and by
+    // the tunnel framer (`api_fs_*_response` → `frame_api_*response`),
+    // yield IDENTICAL JSON result bodies. The envelope differences —
+    // deliberate, historical, and pinned by these fixtures — are:
+    //
+    //  1. Frame envelope: the tunnel wraps the body as `{t:"response",
+    //     id, ok:true, result:<body>}` and injects `_httpStatus` /
+    //     `_httpOk` into the result object (`http_body_response`);
+    //     HTTP sends the raw body with the status on the status line.
+    //  2. Headers: HTTP decorates with `Content-Type`/`Content-Length`,
+    //     the `Cache-Control`/`Connection` tail, and CORS per the
+    //     route's posture; the tunnel has no header lane.
+    //  3. fs_read success: both lanes carry the same payload bytes.
+    //     HTTP renders the meta as headers (`X-Content-Sha256` on full
+    //     reads, `Content-Range` + 206 on partials,
+    //     `Content-Disposition`); the tunnel emits
+    //     `byte_stream_start/chunk/end` with the meta object emitted
+    //     verbatim as `byte_stream_end.result`.
+    //  4. Range addressing: HTTP `Range: bytes=a-b` is end-inclusive;
+    //     the tunnel's offset/length form reports an end-EXCLUSIVE
+    //     `range_end` (`bytes=7-16` ≙ offset=7,length=10 → 17).
+    //  5. fs_read errors: the header form answers `{"error": …}`; the
+    //     offset/length form keeps its historical `{"ok":false,
+    //     "error": …}` body (`total_size` inline on 416 instead of a
+    //     `Content-Range: bytes */N` header), and each form keeps its
+    //     historical wordings (e.g. "<path> is not a file" vs "path is
+    //     not a regular file").
+    //  6. fs_read filename: HTTP sanitizes the canonicalized name
+    //     (fallback "download.bin"); the offset/length form reports
+    //     the expanded path's file name verbatim (nullable).
+    //  7. fs_read sha256: HTTP hashes form-full reads (no `Range`
+    //     header sent); the offset/length form hashes extent-full
+    //     reads (offset 0 covering the whole file).
+
+    /// Render a neutral response through the HTTP adapter and split it
+    /// into (status, headers, body).
+    fn http_parts(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let body = bytes[split + 4..].to_vec();
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        let headers = lines
+            .map(|line| {
+                let (name, value) = line.split_once(": ").expect("header line");
+                (name.to_string(), value.to_string())
+            })
+            .collect();
+        (status, headers, body)
+    }
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Strip the tunnel envelope (difference #1): assert the
+    /// `http_body_response` shape, check the injected status metadata
+    /// against the HTTP adapter's status, and return the result object
+    /// minus the injected keys.
+    fn tunnel_result_body(frame: &serde_json::Value, expect_status: u16) -> serde_json::Value {
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true, "{frame}");
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(
+            map.remove("_httpStatus"),
+            Some(serde_json::json!(expect_status)),
+            "{frame}"
+        );
+        assert_eq!(
+            map.remove("_httpOk"),
+            Some(serde_json::json!((200..300).contains(&expect_status)))
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn parity_fs_stat_serves_the_same_body_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        for params in [
+            serde_json::json!({ "path": dir.path().to_string_lossy() }),
+            serde_json::json!({ "path": "relative/path" }),
+        ] {
+            let request = crate::web_gateway::ApiRequest {
+                params: params.clone(),
+                range: None,
+            };
+            let (status, _headers, body) =
+                http_parts(crate::web_gateway::fs_stat_api_response(&request));
+            let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            let frame = api_fs_stat_response("parity-stat".to_string(), Some(&params)).await;
+            assert_eq!(tunnel_result_body(&frame, status), http_body, "{params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_fs_list_serves_the_same_body_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("beta")).unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+        let not_a_dir = dir.path().join("alpha.txt");
+        for params in [
+            serde_json::json!({ "path": dir.path().to_string_lossy() }),
+            serde_json::json!({ "path": not_a_dir.to_string_lossy() }),
+        ] {
+            let request = crate::web_gateway::ApiRequest {
+                params: params.clone(),
+                range: None,
+            };
+            let (status, _headers, body) =
+                http_parts(crate::web_gateway::fs_list_api_response(&request));
+            let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            let frame = api_fs_list_response("parity-list".to_string(), Some(&params)).await;
+            assert_eq!(tunnel_result_body(&frame, status), http_body, "{params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_fs_read_serves_the_same_bytes_and_meta_on_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parity.txt");
+        std::fs::write(&file, b"parity read fixture payload").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        // Full read: no range on either transport — same bytes, and the
+        // tunnel meta matches the HTTP headers (differences #3/#7).
+        let request = crate::web_gateway::ApiRequest {
+            params: serde_json::json!({ "path": path }),
+            range: None,
+        };
+        let (status, headers, body) =
+            http_parts(crate::web_gateway::fs_read_api_response(&request));
+        assert_eq!(status, 200);
+        let full = api_fs_read_task_response(
+            "parity-read".to_string(),
+            Some(&serde_json::json!({ "path": path })),
+        )
+        .await;
+        let stream = full.byte_stream.expect("tunnel byte stream");
+        assert_eq!(stream.bytes, body);
+        assert_eq!(
+            stream.result["sha256"].as_str(),
+            header_value(&headers, "X-Content-Sha256")
+        );
+        assert_eq!(
+            Some(stream.content_type.as_str()),
+            header_value(&headers, "Content-Type")
+        );
+        assert_eq!(stream.result["total_size"].as_u64(), Some(body.len() as u64));
+
+        // Ranged read: offset=7,length=10 ≙ `Range: bytes=7-16` — same
+        // bytes; inclusive header vs exclusive range_end (difference #4).
+        let request = crate::web_gateway::ApiRequest {
+            params: serde_json::json!({ "path": path }),
+            range: Some(crate::web_gateway::ByteRange::HttpHeader(
+                "bytes=7-16".to_string(),
+            )),
+        };
+        let (status, headers, body) =
+            http_parts(crate::web_gateway::fs_read_api_response(&request));
+        assert_eq!(status, 206);
+        assert_eq!(
+            header_value(&headers, "Content-Range"),
+            Some("bytes 7-16/27")
+        );
+        let ranged = api_fs_read_task_response(
+            "parity-read-range".to_string(),
+            Some(&serde_json::json!({ "path": path, "offset": 7, "length": 10 })),
+        )
+        .await;
+        let stream = ranged.byte_stream.expect("tunnel byte stream");
+        assert_eq!(stream.bytes, body);
+        assert_eq!(stream.result["range_start"].as_u64(), Some(7));
+        assert_eq!(stream.result["range_end"].as_u64(), Some(17));
+        assert!(stream.result["sha256"].is_null());
+    }
+
+    #[tokio::test]
+    async fn parity_fs_read_errors_share_messages_under_their_own_envelopes() {
+        // Difference #5 pinned from both sides: the same expand failure
+        // surfaces the same message under each form's historical body.
+        let params = serde_json::json!({ "path": "relative/path" });
+        let request = crate::web_gateway::ApiRequest {
+            params: params.clone(),
+            range: None,
+        };
+        let (status, _headers, body) =
+            http_parts(crate::web_gateway::fs_read_api_response(&request));
+        assert_eq!(status, 400);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let response =
+            api_fs_read_task_response("parity-read-error".to_string(), Some(&params)).await;
+        assert!(response.byte_stream.is_none());
+        let tunnel_body = tunnel_result_body(&response.frame, 400);
+        assert_eq!(tunnel_body["error"], http_body["error"]);
+        assert_eq!(tunnel_body["ok"], false);
+        assert!(http_body.get("ok").is_none());
+    }
 
     #[tokio::test]
     async fn fs_read_returns_bounded_byte_stream() {

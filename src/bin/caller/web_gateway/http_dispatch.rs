@@ -1322,6 +1322,10 @@ pub(crate) fn api_response_http_bytes(
             content_type,
             headers,
             bytes,
+            // The byte lane's sidecar is a tunnel-frame concern; on HTTP
+            // the header tail already carries the response's meta (the
+            // S9 transfer rows define an HTTP rendering for it).
+            meta: _,
         } => {
             let BytesPayload::InMemory(payload) = bytes;
             let mut http =

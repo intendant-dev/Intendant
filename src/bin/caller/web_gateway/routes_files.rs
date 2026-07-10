@@ -1067,11 +1067,6 @@ pub(crate) fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, Strin
     })
 }
 
-pub(crate) fn dashboard_fs_stat_response_body(raw: &str) -> Result<String, String> {
-    inspect_dashboard_fs_path(raw)
-        .and_then(|status| serde_json::to_string(&status).map_err(|e| e.to_string()))
-}
-
 pub(crate) fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
     let path = expand_dashboard_fs_path(raw)?;
     let canonical = std::fs::canonicalize(&path)
@@ -1112,10 +1107,6 @@ pub(crate) fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, Stri
         "entries": entries,
         "truncated": truncated,
     }))
-}
-
-pub(crate) fn dashboard_fs_list_response_body(raw: &str) -> Result<String, String> {
-    list_dashboard_fs_dir(raw).map(|body| body.to_string())
 }
 
 #[derive(Debug)]
@@ -2061,11 +2052,16 @@ pub(crate) async fn handle_fs_list(
 /// Transport-neutral core of `GET /api/fs/read` (tunnel twin
 /// `api_fs_read`): bytes lane on success (200 full / 206 partial), JSON
 /// error shapes otherwise (the 416 keeps its range-probing header tail).
+/// Each [`ByteRange`] form keeps its transport's historical semantics —
+/// the divergences are enumerated on the tunnel-side parity fixtures.
 pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
-    let range_header = request.range.as_ref().map(|range| {
-        let ByteRange::HttpHeader(value) = range;
-        value.as_str()
-    });
+    let range_header = match &request.range {
+        Some(ByteRange::OffsetLength { offset, length }) => {
+            return fs_read_offset_length_api_response(request.str_param("path"), *offset, *length);
+        }
+        Some(ByteRange::HttpHeader(value)) => Some(value.as_str()),
+        None => None,
+    };
     match dashboard_fs_read_file(request.str_param("path"), range_header) {
         Ok(file) => {
             let mut headers: Vec<(&'static str, String)> =
@@ -2105,6 +2101,7 @@ pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
                 content_type: file.content_type,
                 headers,
                 bytes: BytesPayload::InMemory(file.bytes),
+                meta: serde_json::Value::Null,
             }
         }
         Err(error) => {
@@ -2126,6 +2123,153 @@ pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
             }
         }
     }
+}
+
+/// The offset/length read form — the datachannel tunnel's historical
+/// `api_fs_read` semantics, preserved byte-for-byte through the S2
+/// delegation: errors keep their `{"ok": false, …}` bodies and their
+/// wordings; success carries the payload plus the tunnel's result
+/// object as [`ApiResponse::Bytes`] `meta` (filename and content type
+/// derive from the expanded — not canonicalized — path, exactly as
+/// before). Status and headers on the success arm are HTTP-lane
+/// decoration only until the transfer rows (S9) define this form's
+/// HTTP rendering; the tunnel framer consumes `content_type`, `bytes`,
+/// and `meta`.
+fn fs_read_offset_length_api_response(
+    raw_path: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> ApiResponse {
+    let path = match expand_dashboard_fs_path(raw_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ApiResponse::json(
+                400,
+                JsonBody::Value(serde_json::json!({ "ok": false, "error": error })),
+            );
+        }
+    };
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty());
+    let content_type = dashboard_fs_content_type(&path);
+    let (bytes, total_size, end, display_path) =
+        match read_dashboard_fs_file_range(&path, offset, length) {
+            Ok(value) => value,
+            Err((status, body)) => return ApiResponse::json(status, JsonBody::Value(body)),
+        };
+    // Full-extent reads carry the content hash so the editor has a
+    // conflict baseline for its later write-back (mirrors the HTTP
+    // route's X-Content-Sha256 header; this form is extent-based where
+    // the header form keys off the request shape).
+    let full = offset == 0 && bytes.len() as u64 == total_size;
+    let sha256 = full.then(|| fs_sha256_hex(&bytes));
+    let meta = serde_json::json!({
+        "ok": true,
+        "path": display_path.to_string_lossy().to_string(),
+        "filename": filename,
+        "content_type": content_type.clone(),
+        "size": bytes.len(),
+        "total_size": total_size,
+        "offset": offset,
+        "range_start": offset,
+        "range_end": end,
+        "resumable": true,
+        "sha256": sha256,
+    });
+    ApiResponse::Bytes {
+        status: if full { 200 } else { 206 },
+        content_type,
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        bytes: BytesPayload::InMemory(bytes),
+        meta,
+    }
+}
+
+pub(crate) fn read_dashboard_fs_file_range(
+    path: &Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64, PathBuf), (u16, serde_json::Value)> {
+    use std::io::{Read as _, Seek as _};
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            404,
+            serde_json::json!({ "ok": false, "error": format!("file not accessible: {e}") }),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err((
+            400,
+            serde_json::json!({ "ok": false, "error": "path is not a regular file" }),
+        ));
+    }
+    let total_size = metadata.len();
+    let (start, transfer_len, end) = filesystem_read_range(total_size, offset, length)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("open file: {e}") }),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("seek file: {e}") }),
+        )
+    })?;
+    let mut bytes = vec![0u8; transfer_len];
+    file.read_exact(&mut bytes).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("read file: {e}") }),
+        )
+    })?;
+    let display = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok((bytes, total_size, end, display))
+}
+
+pub(crate) fn filesystem_read_range(
+    total_size: u64,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
+    if offset > total_size {
+        return Err((
+            416,
+            serde_json::json!({
+                "ok": false,
+                "error": "range start beyond file size",
+                "total_size": total_size,
+            }),
+        ));
+    }
+    let available = total_size.saturating_sub(offset);
+    let requested = length.unwrap_or(available).min(available);
+    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
+        return Err((
+            413,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "range too large: {} bytes (cap is {})",
+                    requested,
+                    crate::web_gateway::UPLOAD_MAX_BYTES
+                ),
+            }),
+        ));
+    }
+    let transfer_len = usize::try_from(requested).map_err(|_| {
+        (
+            413,
+            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
+        )
+    })?;
+    Ok((offset, transfer_len, offset.saturating_add(requested)))
 }
 
 pub(crate) async fn handle_fs_read(
