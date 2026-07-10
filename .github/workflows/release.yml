@@ -63,6 +63,9 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          # The default persisted token grants every later step push access;
+          # nothing in these jobs pushes.
+          persist-credentials: false
           # Full history so dev builds (workflow_dispatch off a branch) can
           # stamp a `git describe --tags` version.
           fetch-depth: 0

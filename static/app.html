@@ -21708,11 +21708,13 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                     <option value="default" selected>default</option>
                     <option value="acceptEdits">acceptEdits</option>
                     <option value="plan">plan</option>
+                    <option value="auto">auto</option>
+                    <option value="dontAsk">dontAsk</option>
                     <option value="bypassPermissions">bypassPermissions</option>
                   </select>
                 </div>
                 <div class="control-hint">
-                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
+                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>auto</strong>: a classifier auto-approves safe calls, the rest still ask. <strong>dontAsk</strong>: anything that would ask is denied instead. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -22367,6 +22369,8 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                           <option value="default">default</option>
                           <option value="acceptEdits">acceptEdits</option>
                           <option value="plan">plan</option>
+                          <option value="auto">auto</option>
+                          <option value="dontAsk">dontAsk</option>
                           <option value="bypassPermissions">bypassPermissions</option>
                         </select>
                       </label>
@@ -22379,6 +22383,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                           <option value="high">high</option>
                           <option value="xhigh">xhigh</option>
                           <option value="max">max</option>
+                          <option value="ultracode">ultracode</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
@@ -23377,6 +23382,8 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
         <option value="default">default</option>
         <option value="acceptEdits">acceptEdits</option>
         <option value="plan">plan</option>
+        <option value="auto">auto</option>
+        <option value="dontAsk">dontAsk</option>
         <option value="bypassPermissions">bypassPermissions</option>
       </select>
     </div>
@@ -23393,6 +23400,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
         <option value="high">high</option>
         <option value="xhigh">xhigh</option>
         <option value="max">max</option>
+        <option value="ultracode">ultracode</option>
       </select>
     </div>
     <div class="session-config-status" id="session-config-status"></div>
@@ -26090,11 +26098,11 @@ async function accessFleetRefreshProvenance() {
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
 //     exactly this no-legacy-fallback behavior).
 //
-// STATUS (F0): wired to NOTHING. No existing call site consumes this yet —
-// the F1+ family migrations (transfers/fs first, per the design's frontend
-// track) move `rpcOrHttp`/`jsonFetch`/`filesIdeRpc`/pump call sites onto
-// these verbs family by family; the boot smoke's window.qa.daemonApi()
-// probe is the only reader today.
+// STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
+// staged uploads) and the F2 sessions-family reads as they migrate; the
+// remaining `rpcOrHttp`/`jsonFetch` call sites move onto these verbs family
+// by family per the design's frontend track. The boot smoke's
+// window.qa.daemonApi() probe asserts the facade evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -26118,15 +26126,25 @@ async function accessFleetRefreshProvenance() {
 // the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
-// Coverage (F0): the F1 family's twinned methods only — filesystem and
-// staged uploads. The `api_transfer_*` methods are deliberately absent:
-// they have no HTTP rows until the server-track stage that adds
-// /api/transfers (task #6); F1 adds their entries when those rows land.
+// Coverage: the F1 family (filesystem + staged uploads) and the F2
+// sessions-family reads (managed-context, worktrees, the session list and
+// its NDJSON stream, search, detail, report, context snapshots). The
+// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
+// until the server-track stage that adds /api/transfers (task #6); F1 adds
+// their entries when those rows land.
 // Entry shape: verb + path template (`{name}` segments are lifted from
-// params), `query` = param keys lifted into the query string, `lane` =
-// non-JSON response/request lane ('bytes' | 'upload'), `encode` = upload
+// params), `alias` = capture-name -> param-key lift map (the session rows
+// capture `id` while the tunnel's canonical param is `session_id` — the
+// handlers accept both, so the wire never changes), `query` = param keys
+// lifted into the query string (arrays comma-join; empty arrays stay
+// absent), `queryJson` = query keys whose array value JSON-encodes instead
+// (the search `projects` filter, which the HTTP handler serde-parses),
+// `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
+// `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
-// content_b64). `mutation` is DERIVED from the verb (POST/DELETE), never
+// content_b64), `rawQuery` = the named param is a pre-encoded query STRING
+// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_stat: { verb: 'GET', path: '/api/fs/stat', query: ['path'] },
@@ -26140,6 +26158,20 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
   api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
+  api_sessions: { verb: 'GET', path: '/api/sessions', query: ['ids', 'limit', 'view'] },
+  api_sessions_stream: { verb: 'GET', path: '/api/sessions/stream', query: ['limit'], lane: 'stream' },
+  api_sessions_search: { verb: 'GET', path: '/api/sessions/search', query: ['q', 'source', 'mode', 'projects'], queryJson: ['projects'] },
+  api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
+  api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
+  api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
+  api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
+  api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
+  api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
+  api_worktrees: { verb: 'GET', path: '/api/worktrees' },
+  api_worktrees_inspect: { verb: 'POST', path: '/api/worktrees/inspect' },
+  api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
+  api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
+  api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -26319,17 +26351,19 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
 
 // ── HTTP adapter ──────────────────────────────────────────────────────────
 // Builds verb/path/query/body from the descriptor. `{name}` path segments
-// lift (and consume) params[name]; `query` keys lift into the query
+// lift (and consume) params[name] — or params[alias[name]] when the entry
+// declares a capture alias; `query` keys lift into the query
 // string; for JSON POSTs the remaining params become the body verbatim.
 function daemonApiHttpTarget(spec, method, params) {
   const source = params && typeof params === 'object' ? params : {};
   const used = new Set();
   const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
-    const value = source[key];
+    const paramKey = (spec.alias && spec.alias[key]) || key;
+    const value = source[paramKey];
     if (value === undefined || value === null || String(value) === '') {
-      throw new TypeError(`daemonApi: ${method} requires params.${key} for ${spec.path}`);
+      throw new TypeError(`daemonApi: ${method} requires params.${paramKey} for ${spec.path}`);
     }
-    used.add(key);
+    used.add(paramKey);
     return encodeURIComponent(String(value));
   });
   const query = [];
@@ -26337,7 +26371,31 @@ function daemonApiHttpTarget(spec, method, params) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     used.add(key);
+    if (Array.isArray(value)) {
+      // Empty lists stay absent on every array key — the tunnel
+      // vocabulary cannot express HTTP's present-but-empty filter, and no
+      // legacy call site sent one.
+      if (!value.length) continue;
+      // queryJson keys JSON-encode (the search `projects` filter, which
+      // the HTTP handler serde-parses); other arrays comma-join
+      // (api_sessions ids).
+      const encoded = (spec.queryJson || []).includes(key)
+        ? JSON.stringify(value)
+        : value.join(',');
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(encoded)}`);
+      continue;
+    }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  // rawQuery twins: the tunnel method takes one pre-encoded query-string
+  // param (the managed-context handlers rebuild a request line from it);
+  // the HTTP twin takes that same string as the URL query verbatim.
+  if (spec.rawQuery) {
+    const raw = source[spec.rawQuery];
+    used.add(spec.rawQuery);
+    if (raw !== undefined && raw !== null && String(raw) !== '') {
+      query.push(String(raw));
+    }
   }
   const rest = {};
   for (const [key, value] of Object.entries(source)) {
@@ -26350,7 +26408,13 @@ async function daemonApiHttpRequest(method, params, opts) {
   const spec = DAEMON_API_HTTP_MAP[method];
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
-  if (spec.verb === 'POST') {
+  // Caller cache posture passes through (session detail/metadata reads
+  // send 'no-store', exactly as their pre-facade fetches did).
+  if (opts && opts.cache) init.cache = opts.cache;
+  // Body-less POST twins stay body-less (api_worktrees_scan rides a
+  // BodyPolicy::None row, and every legacy empty-payload POST call site
+  // sent no body/Content-Type either).
+  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -26442,6 +26506,68 @@ async function daemonApiHttpUpload(method, params, source, opts) {
   }
   const body = await resp.json().catch(() => ({}));
   return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
+// Read a newline-delimited JSON body, invoking onLine per non-empty line.
+// Shared with call sites that keep an explicit remote NDJSON lane (the
+// cross-origin peer session stream) so the reader exists exactly once.
+async function daemonApiReadNdjsonBody(response, onLine) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const handleLine = line => {
+    const trimmed = line.trim();
+    if (trimmed) onLine(trimmed);
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) handleLine(line);
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) handleLine(buffer);
+}
+
+// Stream-lane twins over direct HTTP: the daemon's NDJSON endpoints emit
+// the same event objects the tunnel's stream_event frames carry (the
+// sessions stream predates the tunnel lane), so the adapter reads lines
+// and feeds the same callbacks. There is no stream_end result on HTTP —
+// resolve with null, exactly what consumers that track state from events
+// expect. `end` fires like the tunnel's; `start` has no HTTP equivalent
+// frame and is never synthesized.
+async function daemonApiHttpStream(method, params, opts, onEvent) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url } = daemonApiHttpTarget(spec, method, params);
+  let resp;
+  try {
+    resp = await authedFetch(url, { method: spec.verb, signal: daemonApiHttpSignal(method, opts) });
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (!resp.ok || !resp.body) {
+    throw new DaemonApiError('http', method, null, `${method} returned HTTP ${resp.status}`, resp.status);
+  }
+  const emit = event => {
+    // Same callback-shape tolerance as the tunnel's callStreamCallback.
+    try {
+      if (typeof onEvent === 'function') onEvent(event);
+      else if (onEvent && typeof onEvent.event === 'function') onEvent.event(event);
+    } catch (err) {
+      console.warn('[daemon-api] stream callback failed', err);
+    }
+  };
+  try {
+    await daemonApiReadNdjsonBody(resp, line => emit(JSON.parse(line)));
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (onEvent && typeof onEvent.end === 'function') {
+    try { onEvent.end(null); } catch (err) { console.warn('[daemon-api] stream end callback failed', err); }
+  }
+  return null;
 }
 
 // ── Tunnel adapters ───────────────────────────────────────────────────────
@@ -26576,20 +26702,21 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
     }
   }
   const transport = dashboardControlTransport;
-  if (!transport || !transport.canUseRpc()) {
-    // No stream twin exists in the F0 descriptor family; the NDJSON HTTP
-    // lane arrives with the sessions family (F2) once the server stream
-    // stage lands. Until then streams are tunnel-only.
-    throw new DaemonApiError(
-      'unavailable', method, null,
-      `dashboard tunnel is not connected for ${method} (streams have no HTTP lane yet)`
-    );
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
+    } catch (err) {
+      tunnelError = daemonApiTunnelError(err, method, null);
+      if (tunnelError.kind === 'abort') throw tunnelError;
+    }
   }
-  try {
-    return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
-  } catch (err) {
-    throw daemonApiTunnelError(err, method, null);
-  }
+  // Streams are GET twins: a failed tunnel stream may replay over the
+  // NDJSON HTTP lane (consumers merge idempotent event objects; a
+  // mid-stream restart re-delivers rows, exactly like the legacy
+  // per-call-site fallbacks did). Connect mode never uses HTTP.
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpStream(method, params, opts, onEvent);
 }
 
 // ── Availability (§3.4): one function, derived ────────────────────────────
@@ -26606,9 +26733,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
   const status = transport.lastStatus || null;
   const features = Array.isArray(transport.controlFeatures) ? transport.controlFeatures : [];
   const lane = (spec && spec.lane) || 'json';
-  const laneFeature = lane === 'bytes' ? 'byte_streams' : (lane === 'upload' ? 'upload_frames' : '');
+  const laneFeature = lane === 'bytes' ? 'byte_streams'
+    : (lane === 'upload' ? 'upload_frames'
+      : (lane === 'stream' ? 'stream_frames' : ''));
   if (laneFeature) {
-    const laneOk = status ? status[`${laneFeature}_available`] === true : features.includes(laneFeature);
+    // Not every lane feature has a status boolean (stream_frames is
+    // wire-level only), and pre-status daemons carry none — fall back to
+    // the hello features list rather than reading absence as denial.
+    const laneFlag = status ? status[`${laneFeature}_available`] : undefined;
+    const laneOk = typeof laneFlag === 'boolean' ? laneFlag : features.includes(laneFeature);
     if (!laneOk) return { ok: false, reason: 'unsupported' };
   }
   const flag = status ? status[`${method}_available`] : undefined;
@@ -26709,6 +26842,8 @@ window.qa = Object.assign(window.qa || {}, {
         api_fs_stat: daemonApiAvailability('api_fs_stat'),
         api_fs_write: daemonApiAvailability('api_fs_write'),
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
+        api_sessions: daemonApiAvailability('api_sessions'),
+        api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,
@@ -26732,7 +26867,11 @@ window.qa = Object.assign(window.qa || {}, {
    blob authentication" below), so the store cannot tamper, splice, or
    relabel. What remains to the store: withholding, or serving a stale
    revision — detectable via the local high-water mark. Unsealing happens
-   only here, in memory, behind a passkey gesture or the phrase. */
+   only client-side, in memory, behind a passkey gesture or the phrase —
+   and the key-touching crypto itself runs inside the pinned crypto
+   kernel (static/vault-kernel.js, a hash-verified dedicated Worker; see
+   "Vault crypto: the pinned kernel" below), so the master key never
+   exists in this page's memory. */
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
@@ -26760,7 +26899,8 @@ const vaultState = {
   blob: null,          // the full encrypted vault blob
   entries: [],         // decrypted entries while unlocked
   settings: {},        // decrypted vault-wide settings while unlocked
-  kBytes: null,        // raw master key while unlocked (zeroed on lock)
+  // The master key itself lives in the crypto kernel worker while
+  // unlocked; the page holds only vaultKernelToken (below).
   matchedEnvelopeId: null, // which prf envelope this session's passkey opened
   macSeen: false,      // downgrade ratchet: an authenticated blob has been seen
   rollbackWarning: '',
@@ -26806,78 +26946,159 @@ function vaultAvailable() {
   return Boolean(crypto?.subtle) && vaultBackendKind() !== null;
 }
 
-/* ── Vault crypto ── */
+/* ── Vault crypto: the pinned kernel ──
+   All key-touching crypto lives in static/vault-kernel.js — a small,
+   separately served, dedicated Worker that holds the master key, every
+   KEK, and the MAC key for its lifetime (the kernel's header carries the
+   full design and its honest limits). The page refuses to run vault
+   crypto through unverified code: it fetches /vault-kernel.js, hashes
+   the bytes, and compares against VAULT_KERNEL_SHA256 — the sha256 the
+   app.html assembler computed from the kernel file at build time. On a
+   mismatch the vault fails closed with a loud error; there is
+   deliberately no inline-crypto fallback. What remains in this fragment
+   is policy and state: which envelope to try, when to trust a MAC, what
+   to render, storage and sync. */
 
-async function vaultHkdfAesKey(secretBytes, info) {
-  const hkdf = await crypto.subtle.importKey('raw', secretBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode(info),
-    },
-    hkdf,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
+/* Substituted by crates/app-html-assembler at assembly time (the
+   fragment source carries the placeholder; the assembled app.html
+   carries the real lowercase-hex sha256 of static/vault-kernel.js). */
+const VAULT_KERNEL_SHA256 = 'e140c644b7c583f7ba1b66270ff11820d5ed2955b75c4f00e2f1090831219879';
+
+let vaultKernel = null;        // { worker, pending, seq } once verified + running
+let vaultKernelPromise = null; // in-flight spawn: concurrent callers share one fetch
+let vaultKernelToken = '';     // the kernel's unlock token (page-held session nonce)
+
+async function vaultKernelSpawn() {
+  const resp = await fetch('/vault-kernel.js', { cache: 'no-cache' });
+  if (!resp.ok) throw new Error(`vault kernel fetch failed: HTTP ${resp.status}`);
+  const bytes = await resp.arrayBuffer();
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const hex = Array.from(digest, b => b.toString(16).padStart(2, '0')).join('');
+  if (hex !== VAULT_KERNEL_SHA256) {
+    // Fail closed and loudly: a mismatch means the served kernel is not
+    // the one this bundle was built against — tampering, or a skewed
+    // deploy (e.g. an edited kernel without `cargo run -p
+    // app-html-assembler`).
+    const err = new Error(
+      `VAULT KERNEL INTEGRITY FAILURE: /vault-kernel.js hashes to ${hex} but this dashboard pins ${VAULT_KERNEL_SHA256}. Refusing to unseal the vault through unverified code.`
+    );
+    err.vaultKernelIntegrity = true;
+    throw err;
+  }
+  // Instantiate from the VERIFIED bytes (a blob: URL), never from the
+  // network path — re-fetching could race a swap after verification.
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }));
+  let worker;
+  try {
+    worker = new Worker(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  const kernel = { worker, pending: new Map(), seq: 0 };
+  const fail = message => {
+    for (const request of kernel.pending.values()) request.reject(new Error(message));
+    kernel.pending.clear();
+    if (vaultKernel === kernel) {
+      vaultKernel = null;
+      vaultKernelPromise = null;
+    }
+    try { worker.terminate(); } catch (_) {}
+  };
+  worker.onmessage = event => {
+    const msg = event.data || {};
+    const request = kernel.pending.get(msg.id);
+    if (!request) return;
+    kernel.pending.delete(msg.id);
+    if (msg.ok) request.resolve(msg.result || {});
+    else request.reject(new Error(msg.error || 'vault kernel error'));
+  };
+  worker.onerror = event => fail(`vault kernel crashed: ${event?.message || 'worker error'}`);
+  worker.onmessageerror = () => fail('vault kernel message deserialization failed');
+  return kernel;
 }
 
-/* KEK from the dedicated vault PRF domain — what new envelopes use. */
-async function vaultPrfKekDedicated() {
+function vaultKernelEnsure() {
+  if (vaultKernel) return Promise.resolve(vaultKernel);
+  if (!vaultKernelPromise) {
+    vaultKernelPromise = vaultKernelSpawn().then(
+      kernel => {
+        vaultKernel = kernel;
+        return kernel;
+      },
+      err => {
+        vaultKernelPromise = null;
+        if (err?.vaultKernelIntegrity) {
+          // Tamper evidence must surface even on silent auto-unlock paths.
+          console.error('[vault]', err.message);
+          vaultState.lastError = err.message;
+          renderAccessVaultSection();
+        }
+        throw err;
+      }
+    );
+  }
+  return vaultKernelPromise;
+}
+
+/* One kernel RPC. `transfer` optionally moves ArrayBuffers into the
+   worker, detaching the page-side copy. */
+async function vaultKernelCall(op, params = {}, transfer = []) {
+  const kernel = await vaultKernelEnsure();
+  return new Promise((resolve, reject) => {
+    const id = ++kernel.seq;
+    kernel.pending.set(id, { resolve, reject });
+    try {
+      kernel.worker.postMessage({ id, op, params }, transfer);
+    } catch (err) {
+      kernel.pending.delete(id);
+      reject(err);
+    }
+  });
+}
+
+/* Drop the kernel's master key; best-effort and non-blocking so lock
+   paths stay synchronous. Clears the page-held token either way, and
+   never spawns a kernel just to lock it. */
+function vaultKernelLock() {
+  if (vaultKernel) vaultKernelCall('lock').catch(() => {});
+  vaultKernelToken = '';
+}
+
+/* The dedicated vault PRF secret for this session, as bytes (null when
+   the login gesture did not evaluate the second salt). sessionStorage
+   keeps the base64url copy so a reload can re-unlock without a fresh
+   gesture — a pre-kernel design the kernel does not change; what the
+   kernel removes from the page is every key DERIVED from it. */
+function vaultPrfSecretDedicated() {
   const prfB64u = sessionStorage.getItem(VAULT_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] vault-PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK from the fleet PRF secret — legacy: pre-two-salt envelopes were
-   wrapped under this. Kept for unlocking them (and as the wrap fallback
-   for authenticators that only evaluate one PRF salt). */
-async function vaultPrfKekLegacy() {
+/* The fleet PRF secret — legacy: pre-two-salt envelopes were wrapped
+   under a KEK derived from it. Kept for unlocking them (and as the wrap
+   fallback for authenticators that only evaluate one PRF salt). */
+function vaultPrfSecretLegacy() {
   const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK for wrapping a NEW envelope: [kek, marker]. Dedicated domain when
-   the authenticator evaluated both salts, legacy (markerless) otherwise. */
-async function vaultPrfKekForWrap() {
-  const dedicated = await vaultPrfKekDedicated();
+/* The PRF secret + envelope marker for wrapping a NEW envelope:
+   dedicated domain when the authenticator evaluated both salts, legacy
+   (markerless) otherwise. */
+function vaultPrfWrapSource() {
+  const dedicated = vaultPrfSecretDedicated();
   if (dedicated) return [dedicated, VAULT_PRF_ENVELOPE_MARK];
-  return [await vaultPrfKekLegacy(), null];
-}
-
-/* KEK for OPENING an existing envelope, chosen by its marker. */
-async function vaultPrfKekForEnvelope(envelope) {
-  return envelope?.prf === VAULT_PRF_ENVELOPE_MARK
-    ? vaultPrfKekDedicated()
-    : vaultPrfKekLegacy();
-}
-
-/* Standard BIP39 seed stretch (PBKDF2-HMAC-SHA512, salt 'mnemonic',
-   2048 iterations — the 128-bit entropy does the security work), then
-   our own HKDF domain down to an AES-GCM key. */
-async function vaultPhraseKek(phrase) {
-  const password = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(phrase.normalize('NFKD')), 'PBKDF2', false, ['deriveBits']
-  );
-  const seed = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-512', salt: new TextEncoder().encode('mnemonic'), iterations: 2048 },
-    password,
-    512
-  );
-  return vaultHkdfAesKey(new Uint8Array(seed), 'vault-kek-phrase');
+  return [vaultPrfSecretLegacy(), null];
 }
 
 async function vaultGeneratePhrase() {
@@ -26911,79 +27132,6 @@ async function vaultNormalizePhrase(input) {
   return words.join(' ');
 }
 
-function vaultEnvelopeAad() {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|kek`);
-}
-
-/* The body AAD binds the revision into the ciphertext, so the store
-   cannot re-label an old body with a new revision number; replaying a
-   complete old blob (rollback) remains and is what highWater detects. */
-function vaultBodyAad(revision) {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|body|rev:${revision}`);
-}
-
-async function vaultWrapMasterKey(kek, kBytes) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const wrapped = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultEnvelopeAad() },
-    kek,
-    kBytes
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    wrapped: dashboardBytesToBase64Url(new Uint8Array(wrapped)),
-  };
-}
-
-async function vaultUnwrapMasterKey(kek, envelope) {
-  try {
-    const kBytes = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(String(envelope.iv || '')), additionalData: vaultEnvelopeAad() },
-      kek,
-      dashboardBase64UrlToBytes(String(envelope.wrapped || ''))
-    );
-    return new Uint8Array(kBytes);
-  } catch {
-    return null;
-  }
-}
-
-async function vaultMasterAesKey(kBytes) {
-  return crypto.subtle.importKey('raw', kBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-
-async function vaultEncryptBody(kBytes, bodyObj, revision) {
-  const key = await vaultMasterAesKey(kBytes);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultBodyAad(revision) },
-    key,
-    new TextEncoder().encode(JSON.stringify(bodyObj))
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    ct: dashboardBytesToBase64Url(new Uint8Array(ct)),
-  };
-}
-
-async function vaultDecryptBody(kBytes, blob) {
-  try {
-    const key = await vaultMasterAesKey(kBytes);
-    const plaintext = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: dashboardBase64UrlToBytes(String(blob?.body?.iv || '')),
-        additionalData: vaultBodyAad(Number(blob?.revision) || 0),
-      },
-      key,
-      dashboardBase64UrlToBytes(String(blob?.body?.ct || ''))
-    );
-    return JSON.parse(new TextDecoder().decode(plaintext));
-  } catch {
-    return null;
-  }
-}
-
 function vaultRandomId(prefix) {
   return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
 }
@@ -26995,60 +27143,9 @@ function vaultRandomId(prefix) {
    closes that: HMAC-SHA-256 under a key derived from the vault master
    key over the whole blob. The store never holds the master key, so it
    can neither mint nor relabel a MAC'd blob; every unlocker can verify.
-   Canonical JSON (sorted keys) because the store's serializer is free to
-   reorder object keys in transit. */
-
-function vaultCanonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(vaultCanonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map(k => `${JSON.stringify(k)}:${vaultCanonicalJson(value[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
-async function vaultMacKey(kBytes) {
-  const hkdf = await crypto.subtle.importKey('raw', kBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode('vault-mac-v1'),
-    },
-    hkdf,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign', 'verify']
-  );
-}
-
-function vaultMacPayload(blob) {
-  return new TextEncoder().encode(
-    `intendant-vault-mac-v1\n${Number(blob.v) || 0}\n${String(blob.kind || '')}\n` +
-    `${Number(blob.revision) || 0}\n${vaultCanonicalJson(blob.envelopes || [])}\n` +
-    `${vaultCanonicalJson(blob.body || {})}`
-  );
-}
-
-async function vaultComputeMac(kBytes, blob) {
-  const key = await vaultMacKey(kBytes);
-  const mac = await crypto.subtle.sign('HMAC', key, vaultMacPayload(blob));
-  return dashboardBytesToBase64Url(new Uint8Array(mac));
-}
-
-async function vaultVerifyMac(kBytes, blob) {
-  const mac = String(blob?.mac || '');
-  if (!mac) return false;
-  try {
-    const key = await vaultMacKey(kBytes);
-    return await crypto.subtle.verify(
-      'HMAC', key, dashboardBase64UrlToBytes(mac), vaultMacPayload(blob)
-    );
-  } catch {
-    return false;
-  }
-}
+   The kernel computes and verifies MACs (compute-mac / verify-mac); this
+   page decides the POLICY — when a missing MAC is legacy-acceptable and
+   when it is a downgrade attack (the macSeen ratchet below). */
 
 /* Once this device has seen an authenticated blob, an unauthenticated one
    is a downgrade attack, not a legacy vault. Ratchet state rides in
@@ -27149,8 +27246,9 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   // Locked with a MAC: adopt provisionally — unlock verifies before any
   // use. Either way the downgrade ratchet refuses an unauthenticated
   // blob once this device has seen an authenticated one.
-  if (blob.mac && vaultState.kBytes) {
-    if (!(await vaultVerifyMac(vaultState.kBytes, blob))) {
+  if (blob.mac && vaultKernelToken) {
+    const { valid } = await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob });
+    if (!valid) {
       vaultState.lastError = 'The store returned a vault blob that failed its integrity check — ignoring it.';
       renderAccessVaultSection();
       return;
@@ -27164,8 +27262,8 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
-  if (vaultState.kBytes) {
-    const body = await vaultDecryptBody(vaultState.kBytes, blob);
+  if (vaultKernelToken) {
+    const { body } = await vaultKernelCall('decrypt-body', { token: vaultKernelToken, blob });
     if (body) {
       vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
       vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
@@ -27221,8 +27319,7 @@ async function vaultInitInner() {
 /* ── Lock / unlock / create / enroll ── */
 
 function vaultLock(notice) {
-  if (vaultState.kBytes) vaultState.kBytes.fill(0);
-  vaultState.kBytes = null;
+  vaultKernelLock();
   vaultState.entries = [];
   vaultState.settings = {};
   vaultState.matchedEnvelopeId = null;
@@ -27239,29 +27336,44 @@ function vaultLock(notice) {
   renderAccessVaultSection();
 }
 
-async function vaultFinishUnlock(kBytes, envelopeId) {
-  // Every unlock funnels through here: authenticate the whole blob before
-  // trusting any of it. A blob without a MAC is legacy — allowed only
-  // until this device has seen an authenticated one, and upgraded in
-  // place right after unlock.
-  if (vaultState.blob?.mac) {
-    if (!(await vaultVerifyMac(kBytes, vaultState.blob))) {
-      vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+async function vaultFinishUnlock(token, envelopeId) {
+  // Every unlock funnels through here: the kernel already holds the
+  // master key behind `token`; authenticate the whole blob before
+  // trusting any of it (and re-lock the kernel on every refusal so the
+  // worker never outlives the page's decision). A blob without a MAC is
+  // legacy — allowed only until this device has seen an authenticated
+  // one, and upgraded in place right after unlock.
+  vaultKernelToken = token;
+  let body;
+  try {
+    if (vaultState.blob?.mac) {
+      const { valid } = await vaultKernelCall('verify-mac', { token, blob: vaultState.blob });
+      if (!valid) {
+        vaultKernelLock();
+        vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+        renderAccessVaultSection();
+        return false;
+      }
+      vaultMarkMacSeen();
+    } else if (vaultState.macSeen) {
+      vaultKernelLock();
+      vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
       renderAccessVaultSection();
       return false;
     }
-    vaultMarkMacSeen();
-  } else if (vaultState.macSeen) {
-    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    body = (await vaultKernelCall('decrypt-body', { token, blob: vaultState.blob })).body;
+  } catch (err) {
+    // Kernel died mid-unlock: keep the historical never-throws contract.
+    vaultKernelLock();
+    vaultState.lastError = `Vault unlock failed: ${err?.message || err}`;
     renderAccessVaultSection();
     return false;
   }
-  const body = await vaultDecryptBody(kBytes, vaultState.blob);
   if (!body) {
+    vaultKernelLock();
     vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
     return false;
   }
-  vaultState.kBytes = kBytes;
   vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
   vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
   vaultState.matchedEnvelopeId = envelopeId || null;
@@ -27291,25 +27403,44 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
 
 async function vaultTryPrfUnlock({ silent = false } = {}) {
   if (!vaultState.blob) return false;
-  let sawKek = false;
-  for (const envelope of vaultState.blob.envelopes || []) {
-    if (envelope.kind !== 'prf') continue;
-    // Each envelope names its PRF domain: marked = dedicated vault salt,
-    // markerless = legacy fleet-secret derivation.
-    const kek = await vaultPrfKekForEnvelope(envelope);
-    if (!kek) continue;
-    sawKek = true;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    if (kBytes) {
-      const unlocked = await vaultFinishUnlock(kBytes, envelope.id);
-      if (unlocked && envelope.prf !== VAULT_PRF_ENVELOPE_MARK) {
-        vaultMigratePrfEnvelope(envelope.id);
-      }
-      return unlocked;
+  // Each envelope names its PRF domain: marked = dedicated vault salt,
+  // markerless = legacy fleet-secret derivation. The kernel picks the
+  // matching secret per envelope; this page only decides which secrets
+  // exist this session. No secret at all skips the kernel entirely.
+  const secretDedicated = vaultPrfSecretDedicated();
+  const secretLegacy = vaultPrfSecretLegacy();
+  if (!secretDedicated && !secretLegacy) {
+    if (!silent) {
+      vaultState.lastError = 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
     }
+    return false;
+  }
+  let result;
+  try {
+    // Transfer the secret buffers into the worker (detaches the page-side
+    // copies; the sessionStorage strings remain for reload-unlock).
+    const transfer = [secretDedicated?.buffer, secretLegacy?.buffer].filter(Boolean);
+    result = await vaultKernelCall('unlock-prf', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: secretDedicated,
+      secret_legacy: secretLegacy,
+    }, transfer);
+  } catch (err) {
+    console.warn('[vault] kernel unlock-prf failed:', err?.message || err);
+    if (!silent && !err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Passkey unlock failed: ${err?.message || err}`;
+    }
+    return false;
+  }
+  if (result.unlocked) {
+    const unlocked = await vaultFinishUnlock(result.token, result.envelope_id);
+    if (unlocked && result.envelope_prf !== VAULT_PRF_ENVELOPE_MARK) {
+      vaultMigratePrfEnvelope(result.envelope_id);
+    }
+    return unlocked;
   }
   if (!silent) {
-    vaultState.lastError = sawKek
+    vaultState.lastError = result.saw_kek
       ? 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.'
       : 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
   }
@@ -27323,9 +27454,9 @@ async function vaultTryPrfUnlock({ silent = false } = {}) {
 function vaultMigratePrfEnvelope(envelopeId) {
   vaultPublishChain = vaultPublishChain
     .then(async () => {
-      if (!vaultState.kBytes || !vaultState.blob) return false;
-      const [kek, mark] = await vaultPrfKekForWrap();
-      if (!kek || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
+      if (!vaultKernelToken || !vaultState.blob) return false;
+      const [secret, mark] = vaultPrfWrapSource();
+      if (!secret || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
       const envelopes = [];
       let migrated = false;
       for (const envelope of vaultState.blob.envelopes || []) {
@@ -27333,7 +27464,10 @@ function vaultMigratePrfEnvelope(envelopeId) {
           envelopes.push({
             ...envelope,
             prf: VAULT_PRF_ENVELOPE_MARK,
-            ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+            ...(await vaultKernelCall('wrap-new-envelope', {
+              token: vaultKernelToken,
+              prf_secret: secret,
+            })),
           });
           migrated = true;
         } else {
@@ -27410,15 +27544,23 @@ async function vaultUnlockWithPhrase(input) {
     renderAccessVaultSection();
     return false;
   }
-  const kek = await vaultPhraseKek(phrase);
-  for (const envelope of vaultState.blob?.envelopes || []) {
-    if (envelope.kind !== 'phrase') continue;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    // matchedEnvelopeId means "the prf envelope this session's passkey
-    // opened" — a phrase unlock matches none, which is exactly what
-    // makes the enroll-this-passkey offer appear.
-    if (kBytes) return vaultFinishUnlock(kBytes, null);
+  let result;
+  try {
+    result = await vaultKernelCall('unlock-phrase', {
+      phrase,
+      envelopes: vaultState.blob?.envelopes || [],
+    });
+  } catch (err) {
+    if (!err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Phrase unlock failed: ${err?.message || err}`;
+    }
+    renderAccessVaultSection();
+    return false;
   }
+  // matchedEnvelopeId means "the prf envelope this session's passkey
+  // opened" — a phrase unlock matches none, which is exactly what
+  // makes the enroll-this-passkey offer appear.
+  if (result.unlocked) return vaultFinishUnlock(result.token, null);
   vaultState.lastError = 'The phrase is well-formed but does not open this vault.';
   renderAccessVaultSection();
   return false;
@@ -27426,48 +27568,45 @@ async function vaultUnlockWithPhrase(input) {
 
 async function vaultCreate(phrase) {
   if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
-  const kBytes = crypto.getRandomValues(new Uint8Array(32));
   const now = Date.now();
-  const envelopes = [];
-  envelopes.push({
-    kind: 'phrase',
-    id: vaultRandomId('env'),
-    label: 'Recovery phrase',
-    created_unix_ms: now,
-    ...(await vaultWrapMasterKey(await vaultPhraseKek(phrase), kBytes)),
-  });
-  let matched = null;
-  const [prfKek, prfMark] = await vaultPrfKekForWrap();
-  if (prfKek) {
-    const envelope = {
-      kind: 'prf',
+  // The page owns the metadata (ids, labels, timestamps); the kernel
+  // generates the master key, wraps the envelopes, encrypts the empty
+  // body, and MACs the assembled blob — the key never exists here.
+  const [prfSecret, prfMark] = vaultPrfWrapSource();
+  const { token, blob, matched_envelope_id: matched } = await vaultKernelCall('create', {
+    phrase,
+    phrase_envelope: {
+      kind: 'phrase',
       id: vaultRandomId('env'),
-      label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+      label: 'Recovery phrase',
       created_unix_ms: now,
-      ...(prfMark ? { prf: prfMark } : {}),
-      ...(await vaultWrapMasterKey(prfKek, kBytes)),
-    };
-    envelopes.push(envelope);
-    matched = envelope.id;
+    },
+    prf_secret: prfSecret,
+    prf_mark: prfMark,
+    prf_envelope: prfSecret
+      ? {
+          kind: 'prf',
+          id: vaultRandomId('env'),
+          label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+          created_unix_ms: now,
+        }
+      : null,
+    revision: Math.max(1, vaultState.highWater + 1),
+    now,
+  });
+  try {
+    await vaultServerPublish(blob);
+  } catch (err) {
+    // Nothing was committed: drop the kernel's key with the ceremony.
+    vaultKernelLock();
+    throw err;
   }
-  const revision = Math.max(1, vaultState.highWater + 1);
-  const blob = {
-    v: 1,
-    kind: 'intendant-vault',
-    revision,
-    created_unix_ms: now,
-    updated_unix_ms: now,
-    envelopes,
-    body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
-  };
-  blob.mac = await vaultComputeMac(kBytes, blob);
-  await vaultServerPublish(blob);
   vaultState.blob = blob;
-  vaultState.revision = revision;
-  vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultState.revision = blob.revision;
+  vaultState.highWater = Math.max(vaultState.highWater, blob.revision);
   vaultState.macSeen = true;
   vaultWriteLocal();
-  await vaultFinishUnlock(kBytes, matched);
+  await vaultFinishUnlock(token, matched);
 }
 
 /* Re-encrypt and publish the unlocked state as the next revision. On a
@@ -27475,21 +27614,21 @@ async function vaultCreate(phrase) {
    a concurrent update wins over a concurrent delete, never silently
    dropping a credential — and retry once. */
 async function vaultPersist() {
-  if (!vaultState.kBytes || !vaultState.blob) throw new Error('vault is locked');
+  if (!vaultKernelToken || !vaultState.blob) throw new Error('vault is locked');
   const attempt = async () => {
     const revision = Math.max(vaultState.revision, vaultState.highWater) + 1;
     const blob = {
       ...vaultState.blob,
       revision,
       updated_unix_ms: Date.now(),
-      body: await vaultEncryptBody(
-        vaultState.kBytes,
-        { entries: vaultState.entries, settings: vaultState.settings },
-        revision
-      ),
+      body: await vaultKernelCall('encrypt-body', {
+        token: vaultKernelToken,
+        body: { entries: vaultState.entries, settings: vaultState.settings },
+        revision,
+      }),
     };
     // Recompute — the spread carries the previous revision's MAC.
-    blob.mac = await vaultComputeMac(vaultState.kBytes, blob);
+    blob.mac = (await vaultKernelCall('compute-mac', { token: vaultKernelToken, blob })).mac;
     await vaultServerPublish(blob);
     vaultState.blob = blob;
     vaultState.revision = revision;
@@ -27507,7 +27646,7 @@ async function vaultPersist() {
       // envelope set here and re-signing it in the retry would launder the
       // splice into a valid MAC.
       const remoteAuthentic = server.vault.mac
-        ? await vaultVerifyMac(vaultState.kBytes, server.vault)
+        ? (await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob: server.vault })).valid
         : !vaultState.macSeen;
       if (!remoteAuthentic) {
         vaultState.lastError = 'The conflict refetch returned a vault blob that failed its integrity check — keeping local state.';
@@ -27515,7 +27654,10 @@ async function vaultPersist() {
         throw err;
       }
       if (server.vault.mac) vaultMarkMacSeen();
-      const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
+      const { body: remoteBody } = await vaultKernelCall('decrypt-body', {
+        token: vaultKernelToken,
+        blob: server.vault,
+      });
       if (!remoteBody) {
         vaultLock('The vault was re-keyed on another device — unlock it again.');
         throw err;
@@ -27611,42 +27753,26 @@ function vaultRemoveEntry(id) {
    every unlock we (1) ensure the deposit keypair exists inside the sealed
    body's settings and publish its public half to this daemon, then
    (2) fold queued deposits into the vault as ordinary entries, consuming
-   them only AFTER the re-wrapped blob has published. The crypto mirrors
-   vault_deposits.rs (v1) exactly: P-256 ECDH → HKDF-SHA256 (empty salt,
-   info = "intendant-vault-deposit-v1" || eph_pub || recipient_pub ||
-   label) → AES-256-GCM with AAD "intendant-vault-deposit-v1:" + label.
-   ring concatenates its HKDF info parts, so `info` here is the same
-   byte string. Cross-implementation parity harness:
+   them only AFTER the re-wrapped blob has published. The crypto (P-256
+   ECDH → HKDF-SHA256 → AES-256-GCM, label-bound) lives in the kernel
+   (open-deposit / generate-deposit-keypair) and mirrors vault_deposits.rs
+   (v1) exactly. Cross-implementation parity harness:
    scripts/vault-deposit-parity.cjs. */
-const VAULT_DEPOSIT_INFO = 'intendant-vault-deposit-v1';
-
-function vaultDepositConcatBytes(...parts) {
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
 
 async function vaultDepositLaneSync() {
-  if (vaultState.status !== 'unlocked' || !vaultState.kBytes) return;
+  if (vaultState.status !== 'unlocked' || !vaultKernelToken) return;
   try {
     // 1. Keypair lives inside the sealed body (extractable so it rides
     //    the blob to every unlocking device; it exists only as ciphertext
-    //    at rest).
+    //    at rest). The kernel generates it; the private JWK is body
+    //    material by design — it must reach every unlocking device.
     let lane = vaultState.settings.deposit_lane;
     if (!lane || !lane.priv_jwk || !lane.pub_raw_b64u) {
-      const pair = await crypto.subtle.generateKey(
-        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-      const privJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-      const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+      const pair = await vaultKernelCall('generate-deposit-keypair', { token: vaultKernelToken });
       lane = {
         alg: 'ECDH-P256',
-        priv_jwk: privJwk,
-        pub_raw_b64u: dashboardBytesToBase64Url(pubRaw),
+        priv_jwk: pair.priv_jwk,
+        pub_raw_b64u: pair.pub_raw_b64u,
         created_unix_ms: Date.now(),
       };
       vaultState.settings.deposit_lane = lane;
@@ -27669,12 +27795,15 @@ async function vaultDepositLaneSync() {
     const fetched = await vaultLeaseRpc('api_daemon_vault_deposits_fetch').catch(() => null);
     const deposits = Array.isArray(fetched?.deposits) ? fetched.deposits : [];
     if (!deposits.length) return;
-    const privKey = await crypto.subtle.importKey(
-      'jwk', lane.priv_jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
     const consumed = [];
     for (const dep of deposits) {
       try {
-        const secret = await vaultOpenDeposit(privKey, lane.pub_raw_b64u, dep);
+        const { secret } = await vaultKernelCall('open-deposit', {
+          token: vaultKernelToken,
+          deposit: dep,
+          lane_priv_jwk: lane.priv_jwk,
+          lane_pub_raw_b64u: lane.pub_raw_b64u,
+        });
         vaultState.entries.push({
           id: vaultRandomId('cred'),
           kind: 'api_key',
@@ -27704,58 +27833,27 @@ async function vaultDepositLaneSync() {
   }
 }
 
-async function vaultOpenDeposit(privKey, recipientPubB64u, dep) {
-  if (dep?.alg !== 'ECIES-P256-HKDF-SHA256-A256GCM') {
-    throw new Error(`unknown deposit alg ${dep?.alg}`);
-  }
-  const encoder = new TextEncoder();
-  const ephRaw = dashboardBase64UrlToBytes(String(dep.eph_pub_raw_b64u || ''));
-  const ephKey = await crypto.subtle.importKey(
-    'raw', ephRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
-  const shared = new Uint8Array(
-    await crypto.subtle.deriveBits({ name: 'ECDH', public: ephKey }, privKey, 256));
-  const label = String(dep.label || '');
-  const info = vaultDepositConcatBytes(
-    encoder.encode(VAULT_DEPOSIT_INFO),
-    ephRaw,
-    dashboardBase64UrlToBytes(recipientPubB64u),
-    encoder.encode(label));
-  const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
-    hkdfKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['decrypt']);
-  const plain = await crypto.subtle.decrypt(
-    {
-      name: 'AES-GCM',
-      iv: dashboardBase64UrlToBytes(String(dep.nonce_b64u || '')),
-      additionalData: encoder.encode(VAULT_DEPOSIT_INFO + ':' + label),
-    },
-    aesKey,
-    dashboardBase64UrlToBytes(String(dep.ct_b64u || '')));
-  return new TextDecoder().decode(plain);
-}
-
 async function vaultEnrollThisPasskey() {
-  if (!vaultState.kBytes) return;
+  if (!vaultKernelToken) return;
   vaultState.lastError = '';
   try {
-    let [kek, mark] = await vaultPrfKekForWrap();
-    if (!kek) {
+    let [secret, mark] = vaultPrfWrapSource();
+    if (!secret) {
       if (!(await vaultRequestPrfSecret())) throw new Error('this authenticator did not return a PRF secret');
-      [kek, mark] = await vaultPrfKekForWrap();
+      [secret, mark] = vaultPrfWrapSource();
     }
-    if (!kek) throw new Error('no PRF secret available');
-    for (const envelope of vaultState.blob.envelopes || []) {
-      if (envelope.kind !== 'prf') continue;
-      const envelopeKek = await vaultPrfKekForEnvelope(envelope);
-      if (envelopeKek && (await vaultUnwrapMasterKey(envelopeKek, envelope))) {
-        vaultState.matchedEnvelopeId = envelope.id;
-        renderAccessVaultSection();
-        return;
-      }
+    if (!secret) throw new Error('no PRF secret available');
+    // Already enrolled? The kernel probes which envelope (if any) this
+    // session's secrets open, without touching the held key.
+    const { envelope_id: matched } = await vaultKernelCall('match-prf-envelope', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: vaultPrfSecretDedicated(),
+      secret_legacy: vaultPrfSecretLegacy(),
+    });
+    if (matched) {
+      vaultState.matchedEnvelopeId = matched;
+      renderAccessVaultSection();
+      return;
     }
     const now = Date.now();
     const envelope = {
@@ -27764,7 +27862,10 @@ async function vaultEnrollThisPasskey() {
       label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
       created_unix_ms: now,
       ...(mark ? { prf: mark } : {}),
-      ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+      ...(await vaultKernelCall('wrap-new-envelope', {
+        token: vaultKernelToken,
+        prf_secret: secret,
+      })),
     };
     vaultState.blob = { ...vaultState.blob, envelopes: [...(vaultState.blob.envelopes || []), envelope] };
     vaultState.matchedEnvelopeId = envelope.id;
@@ -27784,7 +27885,7 @@ let vaultVoiceMirror = {};
    synchronous voice paths keep working without an unlock await. */
 function vaultSyncVoiceMirror() {
   const mirror = {};
-  if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+  if (vaultState.status === 'unlocked' || vaultKernelToken) {
     const usable = vaultState.entries.filter(vaultEntryUsableHere);
     for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
       const entry =
@@ -34108,7 +34209,7 @@ function stationHandleControlsAction(action) {
   }
   if (op.startsWith('claude-permission:')) {
     const mode = op.slice('claude-permission:'.length).trim();
-    if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(mode)) return;
+    if (!['default', 'acceptEdits', 'plan', 'auto', 'dontAsk', 'bypassPermissions'].includes(mode)) return;
     dispatchControlMsg({ action: 'set_claude_permission_mode', mode });
     showControlToast?.('success', `Claude permissions: ${mode}`);
     return;
@@ -40948,13 +41049,14 @@ async function fetchManagedContextFission() {
 }
 
 async function fetchManagedContextHistoryJson(kind, query) {
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy. The tunnel contract is one pre-encoded query string
+  // (`{ query }`); the descriptor's rawQuery column turns it back into the
+  // HTTP twin's URL query.
   const method = `api_managed_context_${kind}`;
-  const resp = await dashboardTransport.jsonFetch(method, { query }, () => (
-    authedFetch(`/api/managed-context/${kind}?${query}`)
-  ), method);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `${kind} HTTP ${resp.status}`);
-  return payload;
+  const resp = await daemonApi.request(method, { query });
+  if (!resp.ok) throw new Error(resp.body?.error || `${kind} HTTP ${resp.status}`);
+  return resp.body;
 }
 
 function settleManagedContextPromise(promise) {
@@ -42950,6 +43052,14 @@ function discardPromptTargetReference(sessionId) {
   if (currentSessionFullId === sid) currentSessionFullId = '';
 }
 
+// Explicit focus only — none of resolvePromptTargetSessionId's routing
+// fallbacks: the status-bar gate must never let a "best guess" session
+// drive the header chips while the user is looking at a different window.
+// Empty when no session window is explicitly focused.
+function explicitForegroundSessionId() {
+  return String(foregroundSessionFullId || currentSessionFullId || '').trim();
+}
+
 function resolvePromptTargetSessionId() {
   for (const sid of [foregroundSessionFullId, currentSessionFullId]) {
     if (!sid) continue;
@@ -44687,10 +44797,11 @@ async function hydrateSessionWindowIfEmpty(sessionId) {
   try {
     let record = sessionWindowHydrationRecord(sid);
     if (!record) {
-      const resp = await dashboardJsonFetch('api_sessions', { ids: [sid] }, () => fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' }), 'api_sessions_ids');
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (cache posture preserved).
+      const resp = await daemonApi.request('api_sessions', { ids: [sid] }, { cache: 'no-store' });
       if (resp.ok) {
-        const sessions = await resp.json();
-        cacheSessionWindowMetadata(sessions);
+        cacheSessionWindowMetadata(resp.body);
       }
       record = sessionWindowHydrationRecord(sid);
     }
@@ -44745,16 +44856,11 @@ function refreshSessionWindowMetadata(delay = 0, options = {}) {
     const ids = sessionWindowMetadataRequestIds();
     const url = sessionWindowMetadataUrl();
     const loadMetadata = async () => {
-      if (dashboardTransport?.canUseRpc()) {
-        try {
-          return await dashboardTransport.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
-        } catch (err) {
-          console.warn('[dashboard-control] api_sessions metadata RPC failed, falling back to HTTP', err);
-        }
-      }
-      const r = await authedFetch(url);
-      if (!r.ok) throw new Error(`${url} returned ${r.status}`);
-      return r.json();
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (`url` survives as the error label).
+      const resp = await daemonApi.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
+      if (!resp.ok) throw new Error(`${url} returned ${resp.status}`);
+      return resp.body;
     };
     sessionMetadataRefreshInFlight = loadMetadata()
       .then(sessions => cacheSessionWindowMetadata(sessions))
@@ -46184,7 +46290,7 @@ function codexThreadActionSpec(op) {
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
-  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
+  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral context fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
     label: 'Configure goal...',
@@ -47445,8 +47551,10 @@ function hydrateSessionRelationshipRows(rel) {
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
   const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (`url` survives as the error label).
+  daemonApi.request('api_sessions', { ids: pending })
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
       for (const id of pending) {
@@ -47712,12 +47820,23 @@ function sideCloseParamsForSession(sessionId) {
   };
 }
 
+// Capability-driven: only a parent that advertises `side-close` can end the
+// side in-process (Codex). A respawned side (Claude Code /btw) is its own
+// live backend — no advertised op, so Stop session applies to it instead.
+function sideCloseSupportedForSession(sessionId) {
+  const close = sideCloseParamsForSession(sessionId);
+  if (!close) return false;
+  const parentMeta = sessionMetadataById.get(close.parentSessionId) || {};
+  const ops = (parentMeta.capabilities || {}).codexThreadActions;
+  return Array.isArray(ops) && ops.includes('side-close');
+}
+
 function maybeDispatchSideClose(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!sid || win?.ended) return false;
+  if (!sideCloseSupportedForSession(sid)) return false;
   const close = sideCloseParamsForSession(sid);
-  if (!close) return false;
   return dispatchCodexThreadAction('side-close', close.params, close.parentSessionId, {
     internalSideClose: true,
   });
@@ -47915,11 +48034,22 @@ function sessionWindowExternalActionContext(sessionId) {
 function sessionWindowExternalActionAvailability(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return { ok: false, reason: 'No session selected.', toast: '' };
-  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
+  if (sessionWindowIsSubagent(sid)) {
     return {
       ok: false,
       reason: 'This is a related session. Stop the parent session instead.',
       toast: 'Stop the parent session instead',
+    };
+  }
+  // A side window is close-only when its parent can actually end it
+  // in-process; a respawned side (Claude Code /btw) is its own live
+  // backend and falls through to the normal Stop path — the old
+  // unconditional side gate left those children unstoppable.
+  if (sessionWindowIsSide(sid) && sideCloseSupportedForSession(sid)) {
+    return {
+      ok: false,
+      reason: 'This side conversation lives inside its parent thread. Use Close side instead.',
+      toast: 'Use Close side for this side conversation',
     };
   }
   const source = externalSourceForSessionWindow(sid);
@@ -47996,7 +48126,7 @@ async function chooseSessionWindowCloseAction(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const stopAvailability = sessionWindowStopAvailability(sid);
-  const canCloseSide = !stopAvailability.ok && !!sideCloseParamsForSession(sid);
+  const canCloseSide = !stopAvailability.ok && sideCloseSupportedForSession(sid);
   const alternateLabel = stopAvailability.ok
     ? 'Stop session'
     : canCloseSide
@@ -50403,7 +50533,12 @@ function cacheSessionUsage(c) {
 }
 
 function usageForForegroundSession() {
-  const sid = resolvePromptTargetSessionId();
+  // Explicit focus, not the prompt-target resolver: its "best usable
+  // window" fallbacks would render some other session's usage while the
+  // user looks at an unfocused/ended window (global usage is the honest
+  // answer when nothing is focused).
+  const sid = typeof explicitForegroundSessionId === 'function'
+    ? explicitForegroundSessionId() : '';
   if (sid) {
     if (sessionUsageById.has(sid)) return sessionUsageById.get(sid);
     // External sessions re-key the foreground to the backend-native id
@@ -50453,11 +50588,29 @@ function applyMainBackendStatus() {
 }
 
 function updateStatusBar(d) {
-  if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
-  if (d.model) document.getElementById('sb-model').textContent = d.model;
-  if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
-  if (d.budget_pct !== undefined && d.budget_pct !== null) {
-    setContextUsagePct(d.budget_pct);
+  // Status events are session-scoped: only the explicitly focused session
+  // may drive the session-scoped header chips (provider, model, turn,
+  // context meter). Unscoped ticks (daemon primary) apply only while no
+  // session window is focused — a busy background session used to stomp
+  // the chips on every status tick, freezing them across grid-window
+  // switches. Explicit focus, not the prompt-target resolver: its
+  // "best usable window" fallbacks would hand the header to a session the
+  // user is not looking at.
+  const statusSid = String(d.session_id || '').trim();
+  const foreground = typeof explicitForegroundSessionId === 'function'
+    ? explicitForegroundSessionId() : '';
+  const drivesForeground = !foreground
+    ? true
+    : (statusSid
+        ? (statusSid === foreground
+           || (typeof relatedSessionIdsForSession === 'function'
+               && relatedSessionIdsForSession(statusSid).has(foreground)))
+        : false);
+  if (drivesForeground) {
+    if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
+    if (d.model) document.getElementById('sb-model').textContent = d.model;
+    if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
+    if (d.budget_pct !== undefined && d.budget_pct !== null) setContextUsagePct(d.budget_pct);
   }
   if (d.autonomy) {
     const el = document.getElementById('sb-autonomy');
@@ -63187,30 +63340,26 @@ function ensureExactContextSnapshot(snapshot) {
   const sessionId = contextSnapshotLazySessionId(snapshot);
   const file = contextSnapshotFile(snapshot);
   if (!sessionId) return null;
-  const params = new URLSearchParams();
   const source = contextSnapshotLazySource(snapshot);
   const rpcParams = { session_id: sessionId, source };
   if (file) {
-    params.set('file', file);
     rpcParams.file = file;
   }
-  params.set('source', source);
   if (snapshot.request_id) {
-    params.set('request_id', snapshot.request_id);
     rpcParams.request_id = snapshot.request_id;
   }
   if (snapshot.request_index !== undefined && snapshot.request_index !== null) {
-    params.set('request_index', String(snapshot.request_index));
     rpcParams.request_index = snapshot.request_index;
   }
   if (snapshot.ts) {
-    params.set('ts', snapshot.ts);
     rpcParams.ts = snapshot.ts;
   }
-  const url = `/api/session/${encodeURIComponent(sessionId)}/context-snapshot?${params.toString()}`;
-  const promise = dashboardJsonFetch('api_session_context_snapshot', rpcParams, () => authedFetch(url), 'api_session_context_snapshot')
-    .then(async resp => {
-      const data = await resp.json().catch(() => ({}));
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy; the descriptor lifts the selector params into the
+  // /api/session/{id}/context-snapshot query the legacy URL carried.
+  const promise = daemonApi.request('api_session_context_snapshot', rpcParams)
+    .then(resp => {
+      const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
       if (!resp.ok || data?.error) {
         throw new Error(data?.error || `context snapshot fetch returned ${resp.status}`);
       }
@@ -68497,6 +68646,10 @@ function sessionDetailErrorIsMissing(data) {
   return String(data?.error || '').trim().toLowerCase() === 'session not found';
 }
 
+// daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+// fallback policy. Callers keep the payload-with-error contract this
+// helper always had — errors surface as data.error, never as throws for
+// delivered responses (sessionDetailErrorIsMissing keys off that).
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -68508,31 +68661,17 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
-  return dashboardTransport.rpcOrHttp('api_session_detail', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    if (options.limit !== undefined && options.limit !== null) {
-      query.set('limit', String(options.limit));
-    }
-    if (options.before !== undefined && options.before !== null) {
-      query.set('before', String(options.before));
-    }
-    const fetchOptions = {};
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    return data;
-  }, 'api_session_detail', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_detail', params, {
+    signal: options.signal,
+    cache: options.cache,
+  });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
 async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
@@ -68580,22 +68719,17 @@ async function fetchSessionsSearchPayload(options = {}) {
   const projects = Array.isArray(options.projects)
     ? options.projects.map(value => String(value || '').trim()).filter(Boolean)
     : [];
-  return dashboardTransport.rpcOrHttp('api_sessions_search', {
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy; the descriptor JSON-encodes `projects` on the HTTP
+  // lane exactly as the hand-built fallback did.
+  const resp = await daemonApi.request('api_sessions_search', {
     q: query,
     source,
     mode,
     projects,
-  }, async () => {
-    const params = new URLSearchParams({ q: query, source, mode });
-    if (projects.length > 0) {
-      params.set('projects', JSON.stringify(projects));
-    }
-    const resp = await authedFetch(`/api/sessions/search?${params.toString()}`, {
-      signal: options.signal,
-    });
-    if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
-    return resp.json();
-  }, 'api_sessions_search', { signal: options.signal });
+  }, { signal: options.signal });
+  if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchDashboardSettings() {
@@ -68913,25 +69047,20 @@ async function downloadSessionReportViaDashboardControl(event) {
       if (link) link.textContent = previousText || 'Download session report';
       return result;
     }
-    const useByteStream = dashboardControlTransport?.lastStatus?.byte_streams_available === true;
-    const report = useByteStream
-      ? await dashboardTransport.requestBytes('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 })
-      : await dashboardTransport.request('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 });
-    if (report?.ok === false || report?._httpOk === false) {
-      throw new Error(report.error || `Session report failed (${report._httpStatus || 'error'})`);
-    }
-    const bytes = report?.bytes instanceof Uint8Array
-      ? report.bytes
-      : dashboardControlBase64ToBytes(report?.data_base64 || '');
+    // daemonApi (transport F2): the bytes verb prefers the tunnel
+    // byte-stream lane and still decodes the pre-byte-stream JSON shape
+    // (data_base64 in the result) that old daemons answer with; a failed
+    // lane may replay the GET twin over direct HTTP (never in Connect
+    // mode). The un-intercepted direct case above keeps the native <a>
+    // navigation.
+    const { bytes, meta } = await daemonApi.bytes('api_session_report', {
+      session_id: 'current',
+    }, { timeoutMs: 120000 });
     if (!bytes.length) throw new Error('Session report was empty');
     downloadDashboardBytes(
       bytes,
-      report.filename || 'intendant-session-report.zip',
-      report.content_type || 'application/zip'
+      meta.filename || 'intendant-session-report.zip',
+      meta.contentType || 'application/zip'
     );
   } catch (err) {
     console.warn('[dashboard-control] api_session_report RPC failed', err);
@@ -74616,37 +74745,41 @@ function fetchSessionsForHost(hostId, options = {}) {
       if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
       return r.json();
     }
-    if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-      try {
-        return await dashboardTransport.request('api_sessions', rpcParams);
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_sessions RPC failed, falling back to HTTP', err);
+    if (hostId === selfPeerId) {
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy; Connect mode never falls back. The
+      // availability pre-check keeps the exact reconnect copy this pane
+      // always showed for the tunnel-down Connect case.
+      if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions').ok) {
+        throw new Error('Session list is unavailable until dashboard access reconnects');
       }
+      const resp = await daemonApi.request('api_sessions', rpcParams, { signal: options.signal });
+      if (!resp.ok) throw new Error(resp.body?.error || `/api/sessions returned ${resp.status}`);
+      return resp.body;
     }
-    if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-      throw new Error('Session list is unavailable until dashboard access reconnects');
-    }
-    if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
+    if (peerDashboardControlSignalAvailable(hostId)) {
       try {
-        const conn = await peerDashboardControlConnectionForHost(hostId, {
-          signal: options.signal,
-          timeoutMs: 30000,
-        });
-        return await conn.request('api_sessions', rpcParams, {
+        const resp = await daemonApi.request('api_sessions', rpcParams, {
+          target: hostId,
           signal: options.signal,
           timeoutMs: 60000,
         });
+        return resp.body;
       } catch (err) {
-        if (err?.name === 'AbortError') throw err;
+        // Facade aborts are DaemonApiError kind:'abort' (name differs
+        // from the DOM AbortError the old path threw).
+        if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
         if (dashboardConnectModeEnabled()) throw err;
         console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
       }
     }
-    if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+    if (dashboardConnectModeEnabled()) {
       throw new Error('Peer sessions are unavailable for this target');
     }
-    const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
+    // Cross-origin peer HTTP is an explicit remote lane (the fleet Stats
+    // CORS design), never a facade fallback — the browser holds no
+    // authenticated HTTP lane to a peer.
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
     return r.json();
   };
@@ -74714,80 +74847,58 @@ async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
     baseUrl = d.url.replace(/\/$/, '');
   }
   const limit = sessionListRequestLimit(options);
-  if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-    const state = { finalSessions: null };
-    try {
-      await dashboardTransport.stream('api_sessions_stream', { limit }, {
-        signal: options.signal,
-        timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
-      return state.finalSessions;
-    } catch (err) {
-      if (err?.name === 'AbortError') throw err;
-      if (dashboardConnectModeEnabled()) throw err;
-      console.warn('[dashboard-control] api_sessions_stream RPC failed, falling back to HTTP stream', err);
+  const state = { finalSessions: null };
+  const streamCallbacks = {
+    event(event) {
+      handleSessionStreamEvent(event, onEvent, state);
+    },
+  };
+  if (hostId === selfPeerId) {
+    // daemonApi (transport F2): tunnel stream first; on a failed lane the
+    // facade replays the GET twin as a chunked NDJSON read — the HTTP
+    // endpoint emits the same event objects, and consumers merge rows
+    // idempotently (exactly what the hand-rolled fallback here did).
+    // Connect mode never uses HTTP; keep the exact reconnect copy for the
+    // tunnel-down Connect case.
+    if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions_stream').ok) {
+      throw new Error('Session stream is unavailable until dashboard access reconnects');
     }
+    await daemonApi.stream('api_sessions_stream', { limit }, {
+      signal: options.signal,
+      timeoutMs: 120000,
+    }, streamCallbacks);
+    return state.finalSessions;
   }
-  if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-    throw new Error('Session stream is unavailable until dashboard access reconnects');
-  }
-  if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
-    const state = { finalSessions: null };
+  if (peerDashboardControlSignalAvailable(hostId)) {
     try {
-      const conn = await peerDashboardControlConnectionForHost(hostId, {
-        signal: options.signal,
-        timeoutMs: 30000,
-      });
-      await conn.stream('api_sessions_stream', { limit }, {
+      await daemonApi.stream('api_sessions_stream', { limit }, {
+        target: hostId,
         signal: options.signal,
         timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
+      }, streamCallbacks);
       return state.finalSessions;
     } catch (err) {
-      if (err?.name === 'AbortError') throw err;
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the old path threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
       if (dashboardConnectModeEnabled()) throw err;
       console.warn('[peer-dashboard-control] api_sessions_stream RPC failed, falling back to direct peer HTTP stream', err);
     }
   }
-  if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+  if (dashboardConnectModeEnabled()) {
     throw new Error('Peer session updates are unavailable for this target');
   }
+  // Cross-origin peer HTTP stream: an explicit remote lane, never a facade
+  // fallback (the browser holds no authenticated HTTP lane to a peer). The
+  // NDJSON reader is the facade's — declared once.
   const url = sessionListStreamUrl(baseUrl, limit);
-  const request = hostId === selfPeerId
-    ? authedFetch(url, { signal: options.signal })
-    : fetch(url, { signal: options.signal });
-  const response = await request;
+  const response = await fetch(url, { signal: options.signal });
   if (!response.ok || !response.body) {
     throw new Error(`/api/sessions/stream returned ${response.status}`);
   }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const state = { finalSessions: null };
-  const handleLine = line => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    const event = JSON.parse(trimmed);
-    handleSessionStreamEvent(event, onEvent, state);
-  };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) handleLine(line);
-  }
-  buffer += decoder.decode();
-  if (buffer.trim()) handleLine(buffer);
+  await daemonApiReadNdjsonBody(response, line => {
+    handleSessionStreamEvent(JSON.parse(line), onEvent, state);
+  });
   return state.finalSessions;
 }
 
@@ -77235,19 +77346,14 @@ async function hydrateSessionWorktreeFinishInfo(sid) {
   const existing = sessionWorktreeFinishInfo(sid);
   if (existing) return existing;
   let sessions = null;
-  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
-    try {
-      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
-    } catch (_) {}
-  }
-  if (!sessions) {
-    try {
-      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
-      if (!r.ok) return null;
-      sessions = await r.json();
-    } catch (_) {
-      return null;
-    }
+  try {
+    // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+    // fallback policy — this helper always tolerated a missing list.
+    const resp = await daemonApi.request('api_sessions', { ids: [sid] });
+    if (!resp.ok) return null;
+    sessions = resp.body;
+  } catch (_) {
+    return null;
   }
   if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
   return sessionWorktreeFinishInfo(sid);
@@ -77345,17 +77451,12 @@ function renderWorktreeFinishCard(win, sid, info, options = {}) {
     dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
     actions.appendChild(dismissBtn);
   };
+  // daemonApi (transport F2): POST twins — the facade's no-replay policy
+  // covers the fallbackAfterRpcFailure:false these calls passed by hand.
+  // `url` survives only as the error label the card always showed.
   const callWorktreeAction = async (method, url, payload) => {
-    const r = await dashboardTransport.jsonFetch(method, payload, () => (
-      authedFetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), method, { fallbackAfterRpcFailure: false });
-    const textBody = await r.text();
-    let result = {};
-    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    const r = await daemonApi.request(method, payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
     if (!r.ok || result.ok === false) {
       throw new Error(result.error || `${url} returned ${r.status}`);
     }
@@ -84027,7 +84128,9 @@ function loadSessions(options = {}) {
     })
     .catch(err => {
       if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
-      if (err?.name === 'AbortError') {
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the pre-facade stream threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') {
         if (token === _sessionsLoadToken) {
           setSessionsHydrationState({ active: false, done: false, error: '', phase: 'idle' });
         }
@@ -86357,10 +86460,11 @@ function loadWorktrees(options = {}) {
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
   const rpcMethod = forceScan ? 'api_worktrees_scan' : 'api_worktrees';
-  const promise = dashboardJsonFetch(rpcMethod, {}, () => (
-    authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
-  ), rpcMethod)
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): the cached read is a GET twin (tunnel first,
+  // HTTP fallback allowed); the forced scan is a POST twin, so the facade
+  // never replays it over HTTP after an attempted tunnel send.
+  const promise = daemonApi.request(rpcMethod, {})
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(scan => {
       if (requestSerial !== worktreesRequestSerial) return;
       worktreesLoaded = true;
@@ -86527,16 +86631,11 @@ async function openWorktreeInspect(wt) {
   renderWorktreeInspectLoading(wt);
   try {
     const payload = worktreeInspectPayload(wt);
-    const resp = await dashboardTransport.jsonFetch('api_worktrees_inspect', payload, () => (
-      authedFetch('/api/worktrees/inspect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), 'api_worktrees_inspect', { fallbackAfterRpcFailure: false });
-    const text = await resp.text();
-    let inspect = {};
-    try { inspect = text ? JSON.parse(text) : {}; } catch (_) {}
+    // daemonApi (transport F2): a POST twin — the facade's no-replay
+    // policy covers the fallbackAfterRpcFailure:false this call passed by
+    // hand.
+    const resp = await daemonApi.request('api_worktrees_inspect', payload);
+    const inspect = (resp.body && typeof resp.body === 'object') ? resp.body : {};
     if (!resp.ok || inspect.ok === false) {
       throw new Error(inspect.error || `worktree inspect returned ${resp.status}`);
     }
@@ -86880,16 +86979,11 @@ async function drainWorktreeRemovalQueue() {
         path: wt.path,
         expected_head: wt.head || null,
       };
-      const r = await dashboardTransport.jsonFetch('api_worktrees_remove', payload, () => (
-        authedFetch('/api/worktrees/remove', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
-      ), 'api_worktrees_remove', { fallbackAfterRpcFailure: false });
-      const text = await r.text();
-      let result = {};
-      try { result = text ? JSON.parse(text) : {}; } catch (_) {}
+      // daemonApi (transport F2): a POST twin — the facade's no-replay
+      // policy covers the fallbackAfterRpcFailure:false this call passed
+      // by hand.
+      const r = await daemonApi.request('api_worktrees_remove', payload);
+      const result = (r.body && typeof r.body === 'object') ? r.body : {};
       if (!r.ok || result.ok === false) {
         throw new Error(result.error || `worktree removal returned ${r.status}`);
       }

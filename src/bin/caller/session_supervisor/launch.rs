@@ -6,6 +6,15 @@
 use super::*;
 
 impl SessionSupervisor {
+    /// Register a launched session's effective project root as its
+    /// git-vitals probe target (worktree sessions pass their checkout).
+    /// No-op when the daemon runs without the vitals producer.
+    fn register_git_vitals(&self, session_id: &str, root: &std::path::Path) {
+        if let Some(targets) = self.config.git_vitals_targets.as_ref() {
+            targets.register(session_id, root.to_path_buf());
+        }
+    }
+
     pub(crate) async fn start_new_session(
         &self,
         task: String,
@@ -130,6 +139,7 @@ impl SessionSupervisor {
             task_meta,
             session_name.as_deref(),
         );
+        self.register_git_vitals(&session_id, &project.root);
         if let Some(ref meta) = worktree_meta {
             // Persist the linkage after the meta file exists; it survives
             // later meta rewrites (see SessionLog::write_meta_worktree).
@@ -414,6 +424,7 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         fork: bool,
+        relationship_kind: Option<String>,
         overrides: LaunchOverrides,
         force_new: bool,
     ) {
@@ -477,9 +488,20 @@ impl SessionSupervisor {
             // Record what this session forks from. While the child's own
             // native id is unknown, spawners treat `resume == forked_from`
             // as "add the backend's fork flag"; afterwards it documents
-            // lineage and drives the `fork` relationship emit.
+            // lineage and drives the relationship emit (`fork`, or the
+            // requested kind — `side` for /btw conversations).
             if let Some(config) = session_agent_config.as_mut() {
                 config.forked_from = Some(resume_token.clone());
+                // Only vetted lineage kinds may ride the wire into persisted
+                // lineage: the kind drives frontend gating (side-window
+                // affordances), so an arbitrary string from any ResumeSession
+                // sender must not masquerade as e.g. "subagent". Unknown
+                // kinds degrade to the plain "fork" emit (None).
+                config.fork_relationship = relationship_kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|kind| *kind == "side")
+                    .map(str::to_string);
             }
         }
         let project_root = if external_backend.is_some() {
@@ -595,6 +617,7 @@ impl SessionSupervisor {
                 });
 
                 write_session_meta(&session_log, &project.root, None, None);
+                self.register_git_vitals(&session_id, &project.root);
                 if let Some(config) = effective_session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
@@ -711,7 +734,23 @@ impl SessionSupervisor {
             )
         });
 
-        write_session_meta(&session_log, &project.root, Some(&resume_task), None);
+        // A respawned side child's task is the contract prologue + question;
+        // display surfaces (session meta, SessionStarted) get the bare
+        // question while the agent still receives the full blob.
+        let display_task = crate::thread_actions::side_respawn_display_task(&resume_task)
+            .unwrap_or_else(|| resume_task.clone());
+        write_session_meta(&session_log, &project.root, Some(&display_task), None);
+        // Forks announce under the child wrapper id (see SessionStarted
+        // below); key the git probe the same way so the row lands on the
+        // child window, not the parent's.
+        self.register_git_vitals(
+            if fork {
+                &intendant_session_id
+            } else {
+                &live_session_id
+            },
+            &project.root,
+        );
         if let Some(config) = effective_session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
@@ -723,8 +762,17 @@ impl SessionSupervisor {
             .and_then(|config| config.codex_home.clone());
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
-            session_id: live_session_id.clone(),
-            task: Some(resume_task.clone()),
+            // A fork materializes a NEW wrapper session: announce it under
+            // the child's own id — the resume token is the PARENT's native
+            // id, and stamping the parent's window with the fork's task
+            // mislabels it. (Non-fork resumes keep addressing the resumed
+            // session itself.)
+            session_id: if fork {
+                intendant_session_id.clone()
+            } else {
+                live_session_id.clone()
+            },
+            task: Some(display_task.clone()),
         });
 
         let session_dir = session_log
@@ -1967,6 +2015,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -2020,6 +2069,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -2208,6 +2258,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             ),
@@ -2300,6 +2351,7 @@ mod tests {
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )

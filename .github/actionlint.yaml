@@ -1,0 +1,8 @@
+self-hosted-runner:
+  # The fleet's custom runner labels (see CLAUDE.md "CI/CD"): without
+  # this list actionlint rejects every `runs-on: [self-hosted, ...]`
+  # placement as an unknown label.
+  labels:
+    - intendant-linux
+    - intendant-macos
+    - intendant-windows

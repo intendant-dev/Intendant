@@ -283,7 +283,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
-    method("api_displays", PeerOperation::DisplayView),
+    // api_displays and api_diagnostics_visual_freshness live as tunnel
+    // columns on their route rows (S5); the signaling/authority methods
+    // below stay residue (their HTTP-era twin is /ws, not a route).
     method(
         "api_display_input_authority_snapshot",
         PeerOperation::DisplayInput,
@@ -296,18 +298,12 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_display_input_authority_release",
         PeerOperation::DisplayInput,
     ),
-    method(
-        "api_diagnostics_visual_freshness",
-        PeerOperation::DisplayInput,
-    ),
     method("api_control_msg", PeerOperation::Message),
     method("api_dashboard_action_msg", PeerOperation::Message),
     method("api_mcp_tool_call", PeerOperation::Message),
-    method("api_settings", PeerOperation::Settings),
-    method("api_settings_save", PeerOperation::Settings),
-    method("api_key_status", PeerOperation::Settings),
-    method("api_api_keys_save", PeerOperation::Settings),
-    method("api_project_root", PeerOperation::Settings),
+    // The settings/keys family (api_settings, api_settings_save,
+    // api_key_status, api_api_keys_save, api_project_root) lives as
+    // tunnel columns on its route rows (S5).
     method("api_voice_session", PeerOperation::RuntimeControl),
     uploadable("api_presence_video_frame", PeerOperation::RuntimeControl),
     uploadable("api_media_annotation_attach", PeerOperation::RuntimeControl),
@@ -327,8 +323,8 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     ),
     method("api_dashboard_bootstrap", PeerOperation::SessionInspect),
     // The api_managed_context_* trio lives as tunnel columns on the
-    // /api/managed-context/* route rows (S4c).
-    method("api_external_agents", PeerOperation::SessionInspect),
+    // /api/managed-context/* route rows (S4c); api_external_agents on
+    // its row (S5).
 ];
 
 /// The effective method table: route-row tunnel specs first (in ROUTES
@@ -3319,7 +3315,7 @@ mod tests {
             ("api_fs_delete", Row, Some(Op::FilesystemWrite)),
             ("api_display_bootstrap", Residue, Some(Op::DisplayView)),
             ("api_display_webrtc_signal", Residue, Some(Op::DisplayView)),
-            ("api_displays", Residue, Some(Op::DisplayView)),
+            ("api_displays", Row, Some(Op::DisplayView)),
             (
                 "api_display_input_authority_snapshot",
                 Residue,
@@ -3337,17 +3333,17 @@ mod tests {
             ),
             (
                 "api_diagnostics_visual_freshness",
-                Residue,
+                Row,
                 Some(Op::DisplayInput),
             ),
             ("api_control_msg", Residue, Some(Op::Message)),
             ("api_dashboard_action_msg", Residue, Some(Op::Message)),
             ("api_mcp_tool_call", Residue, Some(Op::Message)),
-            ("api_settings", Residue, Some(Op::Settings)),
-            ("api_settings_save", Residue, Some(Op::Settings)),
-            ("api_key_status", Residue, Some(Op::Settings)),
-            ("api_api_keys_save", Residue, Some(Op::Settings)),
-            ("api_project_root", Residue, Some(Op::Settings)),
+            ("api_settings", Row, Some(Op::Settings)),
+            ("api_settings_save", Row, Some(Op::Settings)),
+            ("api_key_status", Row, Some(Op::Settings)),
+            ("api_api_keys_save", Row, Some(Op::Settings)),
+            ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (
                 "api_presence_video_frame",
@@ -3398,7 +3394,7 @@ mod tests {
                 Row,
                 Some(Op::SessionInspect),
             ),
-            ("api_external_agents", Residue, Some(Op::SessionInspect)),
+            ("api_external_agents", Row, Some(Op::SessionInspect)),
         ];
 
         // Live partition: rows first (the resolution order), then the
@@ -3519,10 +3515,13 @@ mod tests {
             );
         }
 
-        // Coverage pin: exactly the F1 family's twinned methods (fs +
-        // staged uploads). The `api_transfer_*` methods join when their
-        // HTTP rows land (task #6, /api/transfers); adding or dropping an
-        // entry updates this list in the same change, deliberately.
+        // Coverage pin: the F1 family's twinned methods (fs + staged
+        // uploads) plus the F2 sessions-family reads (managed-context,
+        // worktrees, the session list and its NDJSON stream, search,
+        // detail, report, context snapshots). The `api_transfer_*` methods
+        // join when their HTTP rows land (task #6, /api/transfers); adding
+        // or dropping an entry updates this list in the same change,
+        // deliberately.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3535,6 +3534,20 @@ mod tests {
             "api_session_current_upload",
             "api_session_current_upload_raw",
             "api_session_current_upload_delete",
+            "api_sessions",
+            "api_sessions_stream",
+            "api_sessions_search",
+            "api_session_detail",
+            "api_session_report",
+            "api_session_context_snapshot",
+            "api_managed_context_records",
+            "api_managed_context_anchors",
+            "api_managed_context_fission",
+            "api_worktrees",
+            "api_worktrees_inspect",
+            "api_worktrees_scan",
+            "api_worktrees_remove",
+            "api_worktrees_merge",
         ]
         .into_iter()
         .collect();

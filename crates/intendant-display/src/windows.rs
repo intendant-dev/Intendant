@@ -1832,22 +1832,43 @@ fn run_gdi_capture(
     };
 
     let mut capture = match GdiCapture::new(rect_x, rect_y, init_w, init_h) {
-        Ok(c) => {
-            // Publish the resolved capture rect (origin + size) so input
-            // injection maps normalized coordinates into this monitor's slice
-            // of the virtual desktop rather than the whole desktop.
-            shared_width.store(init_w, Ordering::SeqCst);
-            shared_height.store(init_h, Ordering::SeqCst);
-            shared_left.store(rect_x, Ordering::SeqCst);
-            shared_top.store(rect_y, Ordering::SeqCst);
-            let _ = init_tx.send(Ok((init_w, init_h)));
-            c
-        }
+        Ok(c) => c,
         Err(e) => {
             let _ = init_tx.send(Err(e));
             return;
         }
     };
+
+    // Probe one BitBlt before declaring the capture live. Creating the DCs
+    // succeeds even on a session with no capturable desktop (a locked
+    // workstation's secure desktop, a headless service session) — there the
+    // failure only shows up at `BitBlt` time, as `Access is denied` on
+    // EVERY iteration. Without this probe such an activation "succeeds",
+    // registers a session that never produces a frame, and the loop below
+    // grinds through MAX_CONSECUTIVE_ERRORS × 100 ms of retry noise before
+    // giving up (observed as a 60-line error storm per spawned daemon on a
+    // locked CI runner). Failing init instead surfaces one clear error
+    // immediately: `start_capture` returns `Err` and the caller reports
+    // capture unavailable. A desktop that locks AFTER capture is live still
+    // rides the in-loop retry/heartbeat path, which absorbs transient
+    // secure-desktop transitions. The probe frame is discarded so the
+    // success path's frame accounting (`frame #1` diagnostics) is unchanged.
+    if let Err(e) = capture.grab() {
+        let _ = init_tx.send(Err(format!(
+            "{e} — no capturable desktop in this session \
+             (locked workstation or non-interactive service session?)"
+        )));
+        return;
+    }
+
+    // Publish the resolved capture rect (origin + size) so input
+    // injection maps normalized coordinates into this monitor's slice
+    // of the virtual desktop rather than the whole desktop.
+    shared_width.store(init_w, Ordering::SeqCst);
+    shared_height.store(init_h, Ordering::SeqCst);
+    shared_left.store(rect_x, Ordering::SeqCst);
+    shared_top.store(rect_y, Ordering::SeqCst);
+    let _ = init_tx.send(Ok((init_w, init_h)));
 
     let mut last_frame: Option<Frame> = None;
     let mut frame_count: u64 = 0;

@@ -647,7 +647,7 @@ function codexThreadActionSpec(op) {
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
-  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
+  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral context fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
     label: 'Configure goal...',
@@ -1908,8 +1908,10 @@ function hydrateSessionRelationshipRows(rel) {
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
   const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (`url` survives as the error label).
+  daemonApi.request('api_sessions', { ids: pending })
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
       for (const id of pending) {
@@ -2175,12 +2177,23 @@ function sideCloseParamsForSession(sessionId) {
   };
 }
 
+// Capability-driven: only a parent that advertises `side-close` can end the
+// side in-process (Codex). A respawned side (Claude Code /btw) is its own
+// live backend — no advertised op, so Stop session applies to it instead.
+function sideCloseSupportedForSession(sessionId) {
+  const close = sideCloseParamsForSession(sessionId);
+  if (!close) return false;
+  const parentMeta = sessionMetadataById.get(close.parentSessionId) || {};
+  const ops = (parentMeta.capabilities || {}).codexThreadActions;
+  return Array.isArray(ops) && ops.includes('side-close');
+}
+
 function maybeDispatchSideClose(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!sid || win?.ended) return false;
+  if (!sideCloseSupportedForSession(sid)) return false;
   const close = sideCloseParamsForSession(sid);
-  if (!close) return false;
   return dispatchCodexThreadAction('side-close', close.params, close.parentSessionId, {
     internalSideClose: true,
   });
@@ -2378,11 +2391,22 @@ function sessionWindowExternalActionContext(sessionId) {
 function sessionWindowExternalActionAvailability(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return { ok: false, reason: 'No session selected.', toast: '' };
-  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
+  if (sessionWindowIsSubagent(sid)) {
     return {
       ok: false,
       reason: 'This is a related session. Stop the parent session instead.',
       toast: 'Stop the parent session instead',
+    };
+  }
+  // A side window is close-only when its parent can actually end it
+  // in-process; a respawned side (Claude Code /btw) is its own live
+  // backend and falls through to the normal Stop path — the old
+  // unconditional side gate left those children unstoppable.
+  if (sessionWindowIsSide(sid) && sideCloseSupportedForSession(sid)) {
+    return {
+      ok: false,
+      reason: 'This side conversation lives inside its parent thread. Use Close side instead.',
+      toast: 'Use Close side for this side conversation',
     };
   }
   const source = externalSourceForSessionWindow(sid);
@@ -2459,7 +2483,7 @@ async function chooseSessionWindowCloseAction(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const stopAvailability = sessionWindowStopAvailability(sid);
-  const canCloseSide = !stopAvailability.ok && !!sideCloseParamsForSession(sid);
+  const canCloseSide = !stopAvailability.ok && sideCloseSupportedForSession(sid);
   const alternateLabel = stopAvailability.ok
     ? 'Stop session'
     : canCloseSide

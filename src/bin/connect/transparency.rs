@@ -1030,10 +1030,15 @@ mod tests {
         std::fs::write(dir.path().join("app.html"), b"hello").unwrap();
         std::fs::create_dir_all(dir.path().join("wasm-web")).unwrap();
         std::fs::write(dir.path().join("wasm-web/presence_web.js"), b"world").unwrap();
+        // The vault crypto kernel deploys into the static root like every
+        // other static artifact; the walk MUST cover it — the pinned-kernel
+        // design (32-vault-custody.js + static/vault-kernel.js) leans on
+        // this manifest for its out-of-band verification story.
+        std::fs::write(dir.path().join("vault-kernel.js"), b"kernel").unwrap();
         let config = test_config(dir.path());
         let manifest = served_artifact_manifest(&config);
         let paths: Vec<&str> = manifest.iter().map(|a| a.path.as_str()).collect();
-        // Sorted, and the walk found both files at their URL paths.
+        // Sorted, and the walk found the files at their URL paths.
         let mut sorted = paths.clone();
         sorted.sort_unstable();
         assert_eq!(paths, sorted, "manifest must be path-sorted");
@@ -1049,11 +1054,14 @@ mod tests {
             "/assets/landing/hero.webp",
             "/app.html",
             "/wasm-web/presence_web.js",
+            "/vault-kernel.js",
         ] {
             assert!(paths.contains(&expected), "manifest must cover {expected}");
         }
         let app = manifest.iter().find(|a| a.path == "/app.html").unwrap();
         assert_eq!(app.sha256, sha256_hex(b"hello"));
+        let kernel = manifest.iter().find(|a| a.path == "/vault-kernel.js").unwrap();
+        assert_eq!(kernel.sha256, sha256_hex(b"kernel"));
         // Deterministic: two computations agree (the pages embed only
         // the origin, never a timestamp or nonce).
         assert_eq!(

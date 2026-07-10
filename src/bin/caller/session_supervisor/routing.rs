@@ -300,6 +300,7 @@ impl SessionSupervisor {
                     Some(attach.direct.unwrap_or(true)),
                     Vec::new(),
                     false,
+                    None,
                     LaunchOverrides::default(),
                     false,
                 )
@@ -810,6 +811,7 @@ impl SessionSupervisor {
             direct,
             attachments,
             false,
+            None,
             overrides,
             true,
         )

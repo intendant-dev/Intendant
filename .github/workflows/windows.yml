@@ -75,13 +75,10 @@ jobs:
     env:
       # CI needs pass/fail and panic messages, not debugger-grade binaries.
       # Debug info is the dominant compile+link cost across these large
-      # test binaries, so the Windows AND Linux legs build without it
-      # (Linux joined 2026-07-07: its 12.5-minute leg measured ~95%
-      # compile+link vs ~12s of test execution, and it runs the full suite
-      # on the most triggers — the biggest single lever on the dell
-      # bottleneck). macOS keeps the default: it only builds the full
-      # suite in the merge group, and rich backtraces stay useful when a
-      # failure does need reading in place. Repro locally with default
+      # test binaries, so every leg builds without it (Linux measured ~95%
+      # compile+link vs ~12s of test execution when it joined 2026-07-07;
+      # macOS joined 2026-07-10 — its merge-group full suite was the last
+      # debuginfo=2 build in the gate). Repro locally with default
       # debuginfo when a CI backtrace is too thin.
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug }}
     # Full test builds are much heavier than the old `cargo check`; a cold
@@ -96,8 +93,10 @@ jobs:
         # required context in the main ruleset — renaming it means a
         # coordinated ruleset edit) AND the hosted-runner label fork PRs
         # route to; `runner` is the self-hosted fleet placement for trusted
-        # refs (dell-206, macbook-vm, samsung-win — persistent target/ dirs
-        # make warm runs minutes instead of half-hours). Provisioning steps
+        # refs (dell-206, macbook-vm, samsung-win — build state persists in
+        # the external per-listener target cache set up below; the
+        # in-workspace target/ is wiped by checkout's `git clean -ffdx`
+        # every job, so warmth never lives there). Provisioning steps
         # (dep installs, cache actions) gate on `runner.environment ==
         # 'github-hosted'`: the fleet boxes are pre-provisioned and keep
         # their build state.
@@ -109,7 +108,7 @@ jobs:
           - os: macos-latest
             runner: [self-hosted, intendant-macos]
             target: aarch64-apple-darwin
-            cargo_debug: "2"
+            cargo_debug: "0"
           - os: ubuntu-latest
             runner: [self-hosted, intendant-linux]
             target: x86_64-unknown-linux-gnu
@@ -152,6 +151,43 @@ jobs:
           }
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # The default persisted token grants every later step push access;
+        # nothing in these jobs pushes.
+        with:
+          persist-credentials: false
+
+      # Fleet build state lives OUTSIDE the workspace: checkout
+      # (clean: true) runs `git clean -ffdx` at the start of every job, so
+      # an in-tree target/ restarts cold each run — the "persistent
+      # target/" this file used to describe never actually survived a
+      # checkout. The external cache is per-listener (concurrent listeners
+      # on one host must not share — same-name artifacts clobber each
+      # other) and keyed by `rustc -V` (a toolchain bump starts a fresh
+      # key instead of thrashing the old one). `.last-used` is the recency
+      # marker the fleet watchdog prunes stale keys by (scripts/ci).
+      # Hosted runners skip this and keep the rust-cache action below.
+      - name: External cargo target dir (unix)
+        if: runner.environment != 'github-hosted' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          key=$(rustc -V | tr ' ()' '_')
+          dir="$HOME/.cache/intendant-ci/target/${RUNNER_NAME:-listener}-${key}"
+          mkdir -p "$dir"
+          touch "$dir/.last-used"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "cargo target dir: $dir"
+
+      - name: External cargo target dir (windows)
+        if: runner.environment != 'github-hosted' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $key = (rustc -V) -replace '[ ()]', '_'
+          $name = if ($env:RUNNER_NAME) { $env:RUNNER_NAME } else { 'listener' }
+          $dir = Join-Path $env:LOCALAPPDATA "intendant-ci\target\$name-$key"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $dir '.last-used') | Out-Null
+          "CARGO_TARGET_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "cargo target dir: $dir"
 
       # rustup ships preinstalled on the GitHub-hosted runners; just pin the
       # target this job type-checks against.
@@ -259,9 +295,9 @@ jobs:
       # saving them buys nothing — and the Windows tar/zstd save step is flaky
       # enough to fail an otherwise-green job. `save-if` keeps the speed-up on
       # restore while removing the unreliable post-run save from PR checks.
-      # Hosted-only: the self-hosted runners keep a persistent target/ between
-      # runs — that persistence IS the cache, and shipping it to GitHub's
-      # cache store would only add minutes.
+      # Hosted-only: the self-hosted runners keep their build state in the
+      # external per-listener cargo target dir set up above — shipping it
+      # to GitHub's cache store would only add minutes.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: runner.environment == 'github-hosted'
         with:

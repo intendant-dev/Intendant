@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /* Cross-implementation parity check for the write-only vault deposit lane:
    the Rust CLI seals (src/bin/caller/vault_deposits.rs), real WebCrypto
-   opens (the same calls 32-vault-custody.js makes). Run it locally after
-   touching either side — it is deliberately not in CI (needs a built
-   binary):
+   opens (the same calls the vault crypto kernel's open-deposit op makes —
+   static/vault-kernel.js, exercised by scripts/vault-kernel-exercise.cjs).
+   Run it locally after touching either side — it is deliberately not in CI
+   (needs a built binary):
 
      cargo build --bin intendant
      node scripts/vault-deposit-parity.cjs ./target/debug/intendant
@@ -70,7 +71,7 @@ async function main() {
     }
     if (record.label !== label) throw new Error(`label mismatch: ${record.label}`);
 
-    // Open with the dashboard's exact algorithm (vaultOpenDeposit).
+    // Open with the dashboard's exact algorithm (the kernel's open-deposit).
     const encoder = new TextEncoder();
     const ephRaw = fromB64u(record.eph_pub_raw_b64u);
     const ephKey = await subtle.importKey('raw', ephRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);

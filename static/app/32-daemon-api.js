@@ -20,11 +20,11 @@
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
 //     exactly this no-legacy-fallback behavior).
 //
-// STATUS (F0): wired to NOTHING. No existing call site consumes this yet —
-// the F1+ family migrations (transfers/fs first, per the design's frontend
-// track) move `rpcOrHttp`/`jsonFetch`/`filesIdeRpc`/pump call sites onto
-// these verbs family by family; the boot smoke's window.qa.daemonApi()
-// probe is the only reader today.
+// STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
+// staged uploads) and the F2 sessions-family reads as they migrate; the
+// remaining `rpcOrHttp`/`jsonFetch` call sites move onto these verbs family
+// by family per the design's frontend track. The boot smoke's
+// window.qa.daemonApi() probe asserts the facade evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -48,15 +48,25 @@
 // the sanctioned mirror-with-parity-test pattern (CLAUDE.md "Derive, don't
 // mirror"). KEEP ONE ENTRY PER LINE: the test parses this literal.
 //
-// Coverage (F0): the F1 family's twinned methods only — filesystem and
-// staged uploads. The `api_transfer_*` methods are deliberately absent:
-// they have no HTTP rows until the server-track stage that adds
-// /api/transfers (task #6); F1 adds their entries when those rows land.
+// Coverage: the F1 family (filesystem + staged uploads) and the F2
+// sessions-family reads (managed-context, worktrees, the session list and
+// its NDJSON stream, search, detail, report, context snapshots). The
+// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
+// until the server-track stage that adds /api/transfers (task #6); F1 adds
+// their entries when those rows land.
 // Entry shape: verb + path template (`{name}` segments are lifted from
-// params), `query` = param keys lifted into the query string, `lane` =
-// non-JSON response/request lane ('bytes' | 'upload'), `encode` = upload
+// params), `alias` = capture-name -> param-key lift map (the session rows
+// capture `id` while the tunnel's canonical param is `session_id` — the
+// handlers accept both, so the wire never changes), `query` = param keys
+// lifted into the query string (arrays comma-join; empty arrays stay
+// absent), `queryJson` = query keys whose array value JSON-encodes instead
+// (the search `projects` filter, which the HTTP handler serde-parses),
+// `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
+// `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
-// content_b64). `mutation` is DERIVED from the verb (POST/DELETE), never
+// content_b64), `rawQuery` = the named param is a pre-encoded query STRING
+// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_stat: { verb: 'GET', path: '/api/fs/stat', query: ['path'] },
@@ -70,6 +80,20 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
   api_session_current_upload_delete: { verb: 'DELETE', path: '/api/session/current/uploads/{upload_id}' },
+  api_sessions: { verb: 'GET', path: '/api/sessions', query: ['ids', 'limit', 'view'] },
+  api_sessions_stream: { verb: 'GET', path: '/api/sessions/stream', query: ['limit'], lane: 'stream' },
+  api_sessions_search: { verb: 'GET', path: '/api/sessions/search', query: ['q', 'source', 'mode', 'projects'], queryJson: ['projects'] },
+  api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
+  api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
+  api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
+  api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
+  api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
+  api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
+  api_worktrees: { verb: 'GET', path: '/api/worktrees' },
+  api_worktrees_inspect: { verb: 'POST', path: '/api/worktrees/inspect' },
+  api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
+  api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
+  api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -249,17 +273,19 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
 
 // ── HTTP adapter ──────────────────────────────────────────────────────────
 // Builds verb/path/query/body from the descriptor. `{name}` path segments
-// lift (and consume) params[name]; `query` keys lift into the query
+// lift (and consume) params[name] — or params[alias[name]] when the entry
+// declares a capture alias; `query` keys lift into the query
 // string; for JSON POSTs the remaining params become the body verbatim.
 function daemonApiHttpTarget(spec, method, params) {
   const source = params && typeof params === 'object' ? params : {};
   const used = new Set();
   const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
-    const value = source[key];
+    const paramKey = (spec.alias && spec.alias[key]) || key;
+    const value = source[paramKey];
     if (value === undefined || value === null || String(value) === '') {
-      throw new TypeError(`daemonApi: ${method} requires params.${key} for ${spec.path}`);
+      throw new TypeError(`daemonApi: ${method} requires params.${paramKey} for ${spec.path}`);
     }
-    used.add(key);
+    used.add(paramKey);
     return encodeURIComponent(String(value));
   });
   const query = [];
@@ -267,7 +293,31 @@ function daemonApiHttpTarget(spec, method, params) {
     const value = source[key];
     if (value === undefined || value === null) continue;
     used.add(key);
+    if (Array.isArray(value)) {
+      // Empty lists stay absent on every array key — the tunnel
+      // vocabulary cannot express HTTP's present-but-empty filter, and no
+      // legacy call site sent one.
+      if (!value.length) continue;
+      // queryJson keys JSON-encode (the search `projects` filter, which
+      // the HTTP handler serde-parses); other arrays comma-join
+      // (api_sessions ids).
+      const encoded = (spec.queryJson || []).includes(key)
+        ? JSON.stringify(value)
+        : value.join(',');
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(encoded)}`);
+      continue;
+    }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  // rawQuery twins: the tunnel method takes one pre-encoded query-string
+  // param (the managed-context handlers rebuild a request line from it);
+  // the HTTP twin takes that same string as the URL query verbatim.
+  if (spec.rawQuery) {
+    const raw = source[spec.rawQuery];
+    used.add(spec.rawQuery);
+    if (raw !== undefined && raw !== null && String(raw) !== '') {
+      query.push(String(raw));
+    }
   }
   const rest = {};
   for (const [key, value] of Object.entries(source)) {
@@ -280,7 +330,13 @@ async function daemonApiHttpRequest(method, params, opts) {
   const spec = DAEMON_API_HTTP_MAP[method];
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, signal: daemonApiHttpSignal(method, opts) };
-  if (spec.verb === 'POST') {
+  // Caller cache posture passes through (session detail/metadata reads
+  // send 'no-store', exactly as their pre-facade fetches did).
+  if (opts && opts.cache) init.cache = opts.cache;
+  // Body-less POST twins stay body-less (api_worktrees_scan rides a
+  // BodyPolicy::None row, and every legacy empty-payload POST call site
+  // sent no body/Content-Type either).
+  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -372,6 +428,68 @@ async function daemonApiHttpUpload(method, params, source, opts) {
   }
   const body = await resp.json().catch(() => ({}));
   return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
+// Read a newline-delimited JSON body, invoking onLine per non-empty line.
+// Shared with call sites that keep an explicit remote NDJSON lane (the
+// cross-origin peer session stream) so the reader exists exactly once.
+async function daemonApiReadNdjsonBody(response, onLine) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const handleLine = line => {
+    const trimmed = line.trim();
+    if (trimmed) onLine(trimmed);
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) handleLine(line);
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) handleLine(buffer);
+}
+
+// Stream-lane twins over direct HTTP: the daemon's NDJSON endpoints emit
+// the same event objects the tunnel's stream_event frames carry (the
+// sessions stream predates the tunnel lane), so the adapter reads lines
+// and feeds the same callbacks. There is no stream_end result on HTTP —
+// resolve with null, exactly what consumers that track state from events
+// expect. `end` fires like the tunnel's; `start` has no HTTP equivalent
+// frame and is never synthesized.
+async function daemonApiHttpStream(method, params, opts, onEvent) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  const { url } = daemonApiHttpTarget(spec, method, params);
+  let resp;
+  try {
+    resp = await authedFetch(url, { method: spec.verb, signal: daemonApiHttpSignal(method, opts) });
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (!resp.ok || !resp.body) {
+    throw new DaemonApiError('http', method, null, `${method} returned HTTP ${resp.status}`, resp.status);
+  }
+  const emit = event => {
+    // Same callback-shape tolerance as the tunnel's callStreamCallback.
+    try {
+      if (typeof onEvent === 'function') onEvent(event);
+      else if (onEvent && typeof onEvent.event === 'function') onEvent.event(event);
+    } catch (err) {
+      console.warn('[daemon-api] stream callback failed', err);
+    }
+  };
+  try {
+    await daemonApiReadNdjsonBody(resp, line => emit(JSON.parse(line)));
+  } catch (err) {
+    throw daemonApiHttpError(err, method);
+  }
+  if (onEvent && typeof onEvent.end === 'function') {
+    try { onEvent.end(null); } catch (err) { console.warn('[daemon-api] stream end callback failed', err); }
+  }
+  return null;
 }
 
 // ── Tunnel adapters ───────────────────────────────────────────────────────
@@ -506,20 +624,21 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
     }
   }
   const transport = dashboardControlTransport;
-  if (!transport || !transport.canUseRpc()) {
-    // No stream twin exists in the F0 descriptor family; the NDJSON HTTP
-    // lane arrives with the sessions family (F2) once the server stream
-    // stage lands. Until then streams are tunnel-only.
-    throw new DaemonApiError(
-      'unavailable', method, null,
-      `dashboard tunnel is not connected for ${method} (streams have no HTTP lane yet)`
-    );
+  let tunnelError = null;
+  if (transport && transport.canUseRpc()) {
+    try {
+      return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
+    } catch (err) {
+      tunnelError = daemonApiTunnelError(err, method, null);
+      if (tunnelError.kind === 'abort') throw tunnelError;
+    }
   }
-  try {
-    return await transport.stream(method, params, daemonApiTunnelOptions(method, opts), onEvent);
-  } catch (err) {
-    throw daemonApiTunnelError(err, method, null);
-  }
+  // Streams are GET twins: a failed tunnel stream may replay over the
+  // NDJSON HTTP lane (consumers merge idempotent event objects; a
+  // mid-stream restart re-delivers rows, exactly like the legacy
+  // per-call-site fallbacks did). Connect mode never uses HTTP.
+  daemonApiEnsureHttpFallback(method, opts, tunnelError);
+  return daemonApiHttpStream(method, params, opts, onEvent);
 }
 
 // ── Availability (§3.4): one function, derived ────────────────────────────
@@ -536,9 +655,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
   const status = transport.lastStatus || null;
   const features = Array.isArray(transport.controlFeatures) ? transport.controlFeatures : [];
   const lane = (spec && spec.lane) || 'json';
-  const laneFeature = lane === 'bytes' ? 'byte_streams' : (lane === 'upload' ? 'upload_frames' : '');
+  const laneFeature = lane === 'bytes' ? 'byte_streams'
+    : (lane === 'upload' ? 'upload_frames'
+      : (lane === 'stream' ? 'stream_frames' : ''));
   if (laneFeature) {
-    const laneOk = status ? status[`${laneFeature}_available`] === true : features.includes(laneFeature);
+    // Not every lane feature has a status boolean (stream_frames is
+    // wire-level only), and pre-status daemons carry none — fall back to
+    // the hello features list rather than reading absence as denial.
+    const laneFlag = status ? status[`${laneFeature}_available`] : undefined;
+    const laneOk = typeof laneFlag === 'boolean' ? laneFlag : features.includes(laneFeature);
     if (!laneOk) return { ok: false, reason: 'unsupported' };
   }
   const flag = status ? status[`${method}_available`] : undefined;
@@ -639,6 +764,8 @@ window.qa = Object.assign(window.qa || {}, {
         api_fs_stat: daemonApiAvailability('api_fs_stat'),
         api_fs_write: daemonApiAvailability('api_fs_write'),
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
+        api_sessions: daemonApiAvailability('api_sessions'),
+        api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,

@@ -348,23 +348,54 @@ pub(crate) async fn displays_response_body(
     .unwrap_or_else(|_| "{\"displays\":[]}".to_string())
 }
 
+/// POST /api/diagnostics/visual-freshness + the tunnel's
+/// `api_diagnostics_visual_freshness` (transport-unification design
+/// §2.1, S5): the **Phase 0 visual-freshness transcript sink**
+/// (task #83). `body` is browser-emitted NDJSON (one JSON record per
+/// `\n`-terminated line), appended verbatim to
+/// `<state_dir>/diagnostics/visual-freshness/<session>.ndjson` —
+/// `state_dir` arrives from each transport edge (dispatch and the
+/// tunnel arm resolve `platform::intendant_home()`), so tests inject a
+/// tempdir instead of writing the live store. No parsing or schema
+/// validation here — that's browser-side or post-hoc analysis on the
+/// transcript. The session id is sanitized aggressively (alnum + `-` +
+/// `_` only) and anything that collapses empty is rejected (400), so a
+/// missing id can't accidentally produce a bare-`.ndjson` write. Each
+/// transport keeps its own param decode: HTTP reads `?session_id=` +
+/// the raw body; the tunnel reads session_id/body params with its
+/// stricter missing-param rejections.
+pub(crate) fn diagnostics_visual_freshness_api_response(
+    state_dir: &Path,
+    session_id_raw: &str,
+    body: &[u8],
+) -> ApiResponse {
+    let (status, body) = match crate::diagnostics::append_visual_freshness_record_in(
+        state_dir,
+        session_id_raw,
+        body,
+    ) {
+        Ok(written) => (
+            200,
+            serde_json::json!({"ok": true, "written": written}).to_string(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            (400, serde_json::json!({"error": e.to_string()}).to_string())
+        }
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    };
+    bare_wildcard_json_response(status, body)
+}
+
 async fn handle_diagnostics_visual_freshness(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     request_line: &str,
+    state_dir: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    // **Phase 0 visual-freshness transcript sink** (task #83).
-    // Body is browser-emitted NDJSON (one JSON record per
-    // `\n`-terminated line); server appends verbatim to
-    // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
-    // No parsing or schema validation here — that's
-    // browser-side or post-hoc analysis on the
-    // transcript. Session id arrives via `?session_id=…`
-    // query param; we sanitize aggressively (alnum + `-`
-    // + `_` only) and reject anything that collapses
-    // empty so a missing param can't accidentally
-    // produce a bare-`.ndjson` write.
-    use tokio::io::AsyncWriteExt;
+    // Transport-owned param decode: the session id rides the query
+    // string on the HTTP lane.
     let session_id_raw: String = request_line
         .split('?')
         .nth(1)
@@ -382,30 +413,12 @@ async fn handle_diagnostics_visual_freshness(
                 .unwrap_or_default()
         })
         .unwrap_or_default();
-    let (status, body) =
-        match crate::diagnostics::append_visual_freshness_record(
-            &session_id_raw,
-            body_text.as_bytes(),
-        ) {
-            Ok(written) => (
-                "200 OK",
-                serde_json::json!({"ok": true, "written": written}).to_string(),
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
-                "400 Bad Request",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            ),
-            Err(e) => (
-                "500 Internal Server Error",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            ),
-        };
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = diagnostics_visual_freshness_api_response(
+        &state_dir,
+        &session_id_raw,
+        body_text.as_bytes(),
+    );
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 
@@ -464,6 +477,117 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    // ── S5 golden transcripts: the diagnostics visual-freshness sink ──
+    // Second S5 slice, same discipline as the settings/keys set:
+    // byte-exact pins captured before the transport-neutral conversion.
+    // The state dir is injected (the dispatch arm resolves the real one
+    // in production), so the fixtures never touch the live store.
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_gateway_handler_response<Fut>(
+        run: impl FnOnce(DemuxStream) -> Fut,
+    ) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The sink's bare wildcard-CORS JSON framing (`Access-Control-
+    /// Allow-Origin: *` + `Connection` tail, NO `Cache-Control`),
+    /// spelled out literally.
+    fn golden_diagnostics_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn golden_diagnostics_visual_freshness_transcripts() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cors = crate::gateway_routes::match_route("POST", "/api/diagnostics/visual-freshness")
+            .expect("diagnostics route declared")
+            .0
+            .cors;
+
+        // Success: the NDJSON batch appends verbatim under the injected
+        // state dir and reports the written byte count.
+        let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                ndjson.to_string(),
+                "POST /api/diagnostics/visual-freshness?session_id=vf-golden HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript(
+                "200 OK",
+                &format!(r#"{{"ok":true,"written":{}}}"#, ndjson.len())
+            )
+        );
+        let path = crate::diagnostics::visual_freshness_path_in(state_dir.path(), "vf-golden")
+            .expect("diagnostics path");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ndjson);
+
+        // Missing/empty session id: rejected by the sanitizer before
+        // any disk touch — the sink's 400 shape.
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                ndjson.to_string(),
+                "POST /api/diagnostics/visual-freshness HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript(
+                "400 Bad Request",
+                r#"{"error":"session_id sanitizes to empty"}"#
+            )
+        );
+
+        // Empty body with a valid session id: the historical HTTP lane
+        // accepts it as a zero-byte append (the tunnel twin instead
+        // pre-rejects a missing body — a pinned per-lane difference).
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                String::new(),
+                "POST /api/diagnostics/visual-freshness?session_id=vf-golden-empty HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript("200 OK", r#"{"ok":true,"written":0}"#)
+        );
     }
 
 

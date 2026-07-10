@@ -1941,6 +1941,7 @@ family (sub-routes elided where the family is uniform):
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
 | `GET /wasm-web/*`, `GET /wasm-station/*` | Compiled WASM + JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for mic capture |
+| `GET /vault-kernel.js` | The vault crypto kernel worker; the SPA hash-verifies it against its assembled-in pin before instantiating (see [credential custody](./credential-custody.md#the-crypto-kernel)) |
 | `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
 | `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling |

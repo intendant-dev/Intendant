@@ -479,37 +479,41 @@ function fetchSessionsForHost(hostId, options = {}) {
       if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
       return r.json();
     }
-    if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-      try {
-        return await dashboardTransport.request('api_sessions', rpcParams);
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_sessions RPC failed, falling back to HTTP', err);
+    if (hostId === selfPeerId) {
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy; Connect mode never falls back. The
+      // availability pre-check keeps the exact reconnect copy this pane
+      // always showed for the tunnel-down Connect case.
+      if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions').ok) {
+        throw new Error('Session list is unavailable until dashboard access reconnects');
       }
+      const resp = await daemonApi.request('api_sessions', rpcParams, { signal: options.signal });
+      if (!resp.ok) throw new Error(resp.body?.error || `/api/sessions returned ${resp.status}`);
+      return resp.body;
     }
-    if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-      throw new Error('Session list is unavailable until dashboard access reconnects');
-    }
-    if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
+    if (peerDashboardControlSignalAvailable(hostId)) {
       try {
-        const conn = await peerDashboardControlConnectionForHost(hostId, {
-          signal: options.signal,
-          timeoutMs: 30000,
-        });
-        return await conn.request('api_sessions', rpcParams, {
+        const resp = await daemonApi.request('api_sessions', rpcParams, {
+          target: hostId,
           signal: options.signal,
           timeoutMs: 60000,
         });
+        return resp.body;
       } catch (err) {
-        if (err?.name === 'AbortError') throw err;
+        // Facade aborts are DaemonApiError kind:'abort' (name differs
+        // from the DOM AbortError the old path threw).
+        if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
         if (dashboardConnectModeEnabled()) throw err;
         console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
       }
     }
-    if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+    if (dashboardConnectModeEnabled()) {
       throw new Error('Peer sessions are unavailable for this target');
     }
-    const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
+    // Cross-origin peer HTTP is an explicit remote lane (the fleet Stats
+    // CORS design), never a facade fallback — the browser holds no
+    // authenticated HTTP lane to a peer.
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
     return r.json();
   };
@@ -577,80 +581,58 @@ async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
     baseUrl = d.url.replace(/\/$/, '');
   }
   const limit = sessionListRequestLimit(options);
-  if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-    const state = { finalSessions: null };
-    try {
-      await dashboardTransport.stream('api_sessions_stream', { limit }, {
-        signal: options.signal,
-        timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
-      return state.finalSessions;
-    } catch (err) {
-      if (err?.name === 'AbortError') throw err;
-      if (dashboardConnectModeEnabled()) throw err;
-      console.warn('[dashboard-control] api_sessions_stream RPC failed, falling back to HTTP stream', err);
+  const state = { finalSessions: null };
+  const streamCallbacks = {
+    event(event) {
+      handleSessionStreamEvent(event, onEvent, state);
+    },
+  };
+  if (hostId === selfPeerId) {
+    // daemonApi (transport F2): tunnel stream first; on a failed lane the
+    // facade replays the GET twin as a chunked NDJSON read — the HTTP
+    // endpoint emits the same event objects, and consumers merge rows
+    // idempotently (exactly what the hand-rolled fallback here did).
+    // Connect mode never uses HTTP; keep the exact reconnect copy for the
+    // tunnel-down Connect case.
+    if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions_stream').ok) {
+      throw new Error('Session stream is unavailable until dashboard access reconnects');
     }
+    await daemonApi.stream('api_sessions_stream', { limit }, {
+      signal: options.signal,
+      timeoutMs: 120000,
+    }, streamCallbacks);
+    return state.finalSessions;
   }
-  if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-    throw new Error('Session stream is unavailable until dashboard access reconnects');
-  }
-  if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
-    const state = { finalSessions: null };
+  if (peerDashboardControlSignalAvailable(hostId)) {
     try {
-      const conn = await peerDashboardControlConnectionForHost(hostId, {
-        signal: options.signal,
-        timeoutMs: 30000,
-      });
-      await conn.stream('api_sessions_stream', { limit }, {
+      await daemonApi.stream('api_sessions_stream', { limit }, {
+        target: hostId,
         signal: options.signal,
         timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
+      }, streamCallbacks);
       return state.finalSessions;
     } catch (err) {
-      if (err?.name === 'AbortError') throw err;
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the old path threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
       if (dashboardConnectModeEnabled()) throw err;
       console.warn('[peer-dashboard-control] api_sessions_stream RPC failed, falling back to direct peer HTTP stream', err);
     }
   }
-  if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+  if (dashboardConnectModeEnabled()) {
     throw new Error('Peer session updates are unavailable for this target');
   }
+  // Cross-origin peer HTTP stream: an explicit remote lane, never a facade
+  // fallback (the browser holds no authenticated HTTP lane to a peer). The
+  // NDJSON reader is the facade's — declared once.
   const url = sessionListStreamUrl(baseUrl, limit);
-  const request = hostId === selfPeerId
-    ? authedFetch(url, { signal: options.signal })
-    : fetch(url, { signal: options.signal });
-  const response = await request;
+  const response = await fetch(url, { signal: options.signal });
   if (!response.ok || !response.body) {
     throw new Error(`/api/sessions/stream returned ${response.status}`);
   }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const state = { finalSessions: null };
-  const handleLine = line => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    const event = JSON.parse(trimmed);
-    handleSessionStreamEvent(event, onEvent, state);
-  };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) handleLine(line);
-  }
-  buffer += decoder.decode();
-  if (buffer.trim()) handleLine(buffer);
+  await daemonApiReadNdjsonBody(response, line => {
+    handleSessionStreamEvent(JSON.parse(line), onEvent, state);
+  });
   return state.finalSessions;
 }
 

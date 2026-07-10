@@ -63,6 +63,13 @@ pub struct SessionSupervisorConfig {
     /// otherwise resolve against a real session log and flip the flow
     /// from follow-up routing to a fresh resume dispatch.
     pub logs_home_override: Option<PathBuf>,
+    /// Git-vitals target registry: the supervisor registers each managed
+    /// session's effective project root (the worktree checkout for
+    /// worktree sessions) at launch, which is what puts the dirty /
+    /// merge-parity / unpushed rows on dashboard-spawned sessions.
+    /// `SessionEnded` prunes on the producer side. None when the daemon
+    /// runs without the vitals producer (no web frontends).
+    pub git_vitals_targets: Option<crate::session_vitals::GitVitalsTargets>,
 }
 
 #[derive(Clone)]
@@ -675,6 +682,7 @@ mod tests {
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             ))),
+            git_vitals_targets: None,
         })
     }
 

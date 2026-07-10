@@ -185,19 +185,14 @@ async function hydrateSessionWorktreeFinishInfo(sid) {
   const existing = sessionWorktreeFinishInfo(sid);
   if (existing) return existing;
   let sessions = null;
-  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
-    try {
-      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
-    } catch (_) {}
-  }
-  if (!sessions) {
-    try {
-      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
-      if (!r.ok) return null;
-      sessions = await r.json();
-    } catch (_) {
-      return null;
-    }
+  try {
+    // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+    // fallback policy — this helper always tolerated a missing list.
+    const resp = await daemonApi.request('api_sessions', { ids: [sid] });
+    if (!resp.ok) return null;
+    sessions = resp.body;
+  } catch (_) {
+    return null;
   }
   if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
   return sessionWorktreeFinishInfo(sid);
@@ -295,17 +290,12 @@ function renderWorktreeFinishCard(win, sid, info, options = {}) {
     dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
     actions.appendChild(dismissBtn);
   };
+  // daemonApi (transport F2): POST twins — the facade's no-replay policy
+  // covers the fallbackAfterRpcFailure:false these calls passed by hand.
+  // `url` survives only as the error label the card always showed.
   const callWorktreeAction = async (method, url, payload) => {
-    const r = await dashboardTransport.jsonFetch(method, payload, () => (
-      authedFetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), method, { fallbackAfterRpcFailure: false });
-    const textBody = await r.text();
-    let result = {};
-    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    const r = await daemonApi.request(method, payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
     if (!r.ok || result.ok === false) {
       throw new Error(result.error || `${url} returned ${r.status}`);
     }

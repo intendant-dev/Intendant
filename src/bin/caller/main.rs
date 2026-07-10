@@ -3284,6 +3284,12 @@ async fn main() -> Result<(), CallerError> {
     if let Some(ref m) = flags.model {
         env::set_var("MODEL_NAME", m);
     }
+    // Synthetic display for headless test rigs (INTENDANT_MOCK_DISPLAY=
+    // synthetic; fail-closed: honored only under PROVIDER=mock). Evaluated
+    // here — after the .env load and the --provider override settle the
+    // provider, and before any display machinery exists (the Windows
+    // user-display auto-activation at daemon startup included).
+    display_glue::arm_synthetic_display_if_requested();
     // Apply project model config when CLI/env did not override.
     if env::var("MODEL_CONTEXT_WINDOW").is_err() {
         if let Some(ctx) = project.config.model.context_window {

@@ -322,25 +322,101 @@ fn spawn_cache_vitals_listener(
     })
 }
 
+/// Live registry of (session id → working dir) git-probe targets. The
+/// daemon seeds the primary session at startup; the session supervisor
+/// registers every managed session at launch — which is what puts the
+/// dirty-count / merge-parity / unpushed rows on dashboard-spawned
+/// sessions and on projectless daemons (whose primary has no repo).
+/// `SessionEnded` prunes entries, so a handle owner only has to register.
+#[derive(Clone, Default)]
+pub(crate) struct GitVitalsTargets {
+    targets: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl GitVitalsTargets {
+    /// Register (or retarget) a session's git probe root. No-ops on empty
+    /// ids so callers can pass through unresolved values unchecked.
+    pub(crate) fn register(&self, session_id: &str, cwd: PathBuf) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .insert(session_id.to_string(), cwd);
+    }
+
+    pub(crate) fn remove(&self, session_id: &str) {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .remove(session_id.trim());
+    }
+
+    fn snapshot(&self) -> Vec<(String, PathBuf)> {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .iter()
+            .map(|(id, cwd)| (id.clone(), cwd.clone()))
+            .collect()
+    }
+}
+
 /// Vitals producer: spawns the cache listener and runs the periodic git
-/// prober for a fixed set of (session id, working dir) targets — today the
-/// primary session. All emission flows through the change-detecting hub;
-/// the session log persists each emission so reconnecting frontends replay
-/// the latest.
+/// prober over the live target registry (seeded with the primary session,
+/// fed by the session supervisor as sessions launch). All emission flows
+/// through the change-detecting hub; the session log persists each
+/// emission so reconnecting frontends replay the latest.
+///
+/// The seed may be empty: the cache/limits sections are usage-driven and
+/// backend-agnostic, so the listener runs wherever a bus exists — a
+/// projectless daemon still reports cache and rate-limit vitals for every
+/// session; only the git segment needs a repo target.
 pub(crate) fn spawn_session_vitals_producer(
     bus: EventBus,
-    targets: Vec<(String, PathBuf)>,
-) -> tokio::task::JoinHandle<()> {
+    seed_targets: Vec<(String, PathBuf)>,
+) -> (GitVitalsTargets, tokio::task::JoinHandle<()>) {
+    let registry = GitVitalsTargets::default();
+    for (session_id, cwd) in seed_targets {
+        registry.register(&session_id, cwd);
+    }
     let hub = SessionVitalsHub::new(bus.clone());
-    let _cache_listener = spawn_cache_vitals_listener(bus, hub.clone());
-    tokio::spawn(async move {
-        let mut prober = GitVitalsProber::default();
-        loop {
-            for (session_id, cwd) in &targets {
-                let probed = prober.probe(cwd).await;
-                hub.apply(session_id, |vitals| vitals.git = probed);
+    let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+    let _target_pruner = spawn_git_target_pruner(bus, registry.clone());
+    let handle = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            let mut prober = GitVitalsProber::default();
+            loop {
+                for (session_id, cwd) in registry.snapshot() {
+                    let probed = prober.probe(&cwd).await;
+                    hub.apply(&session_id, |vitals| vitals.git = probed);
+                }
+                tokio::time::sleep(PROBE_INTERVAL).await;
             }
-            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+    });
+    (registry, handle)
+}
+
+/// Prune git targets when their session ends — mirrors the cache
+/// listener's `SessionEnded` hygiene so registered sessions never leak
+/// probe work past their lifetime.
+fn spawn_git_target_pruner(
+    bus: EventBus,
+    registry: GitVitalsTargets,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(AppEvent::SessionEnded { session_id, .. }) => registry.remove(&session_id),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     })
 }
@@ -503,6 +579,84 @@ mod tests {
             emissions[2].1.cache.is_none(),
             "removed session re-registers from scratch"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_target_probes_and_session_end_prunes() {
+        // Supervisor-registered sessions get git rows without a restart;
+        // SessionEnded prunes the target (registry drops the entry).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("b.txt"), "dirty\n").unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        targets.register("supervised-1", root.to_path_buf());
+
+        let deadline = std::time::Duration::from_secs(20);
+        loop {
+            let event = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("git vitals emission before timeout")
+                .expect("bus open");
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "supervised-1");
+                let git = vitals.git.expect("git section probed");
+                assert_eq!(git.branch, "main");
+                assert_eq!(git.dirty_files, 1);
+                break;
+            }
+        }
+
+        bus.send(AppEvent::SessionEnded {
+            session_id: "supervised-1".into(),
+            reason: "done".into(),
+            error_kind: None,
+        });
+        // The pruner runs on the bus; poll until the entry is gone.
+        let start = std::time::Instant::now();
+        while !targets.snapshot().is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "SessionEnded did not prune the git target"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn producer_with_no_git_targets_still_serves_cache_vitals() {
+        // A projectless daemon has no git target, but cache/limits vitals
+        // are usage-driven and must keep flowing for every session
+        // (regression: the listener used to die with the git gating,
+        // blanking the dashboard's Prompt cache row daemon-wide).
+        let bus = EventBus::new();
+        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let mut rx = bus.subscribe();
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("cc-session".into()),
+            main: usage_with_sample("anthropic", 80, 10, 10, Some(3600)),
+            presence: None,
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("vitals emission before timeout")
+                .expect("bus open");
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "cc-session");
+                assert_eq!(vitals.cache.as_ref().unwrap().hit_pct, Some(80));
+                assert_eq!(vitals.cache.as_ref().unwrap().ttl_seconds, Some(3600));
+                assert!(vitals.git.is_none(), "no git target, no git section");
+                break;
+            }
+        }
     }
 
     #[tokio::test]

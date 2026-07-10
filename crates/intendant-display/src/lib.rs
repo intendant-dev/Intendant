@@ -47,6 +47,7 @@ pub mod keymap;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_keymap;
+pub mod synthetic;
 pub mod tile;
 pub mod twcc_tap;
 pub mod visual_marker;
@@ -117,6 +118,13 @@ pub enum DisplayInfoKind {
 /// [`enumerate_displays_with_sessions`], which patches each entry with the
 /// session's actual stream resolution.
 pub async fn enumerate_displays() -> Vec<DisplayInfo> {
+    // Synthetic display mode (headless test rigs): serve the deterministic
+    // synthetic list and never touch a platform enumerator (macOS SCK's
+    // SCShareableContent is itself a TCC-gated capture-API call). Inert
+    // unless the embedder's fail-closed gate armed it — see the module docs.
+    if synthetic::armed() {
+        return synthetic::enumerate_displays();
+    }
     let displays = enumerate_displays_platform().await;
     if displays.is_empty() {
         // macOS ScreenCaptureKit may not be ready on first call (TCC prompt,
@@ -1319,12 +1327,21 @@ impl DisplaySession {
         // gated off — see `encode::pool::BASELINE_CODEC`), so the guard checks
         // that the single full-resolution layer clears MIN_LAYER_DIM rather
         // than the VP8 simulcast set.
+        //
+        // Synthetic sessions (headless test rigs — `synthetic::KIND`) run
+        // with an EMPTY always-on bank instead: spinning encoders for a test
+        // card would touch real codec stacks (Media Foundation H.264 on
+        // Windows) and burn CPU in every spawned test daemon for a stream
+        // nobody watches. An empty pool is explicitly supported (on-demand
+        // flows), so the empty-baseline guard below — which protects real
+        // displays from the silent-black-screen class — does not apply.
+        let synthetic_source = self.backend.kind() == synthetic::KIND;
         #[cfg(not(target_os = "windows"))]
         let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
         #[cfg(target_os = "windows")]
         let baseline_empty =
             width < encode::pool::MIN_LAYER_DIM || height < encode::pool::MIN_LAYER_DIM;
-        if baseline_empty {
+        if baseline_empty && !synthetic_source {
             self.backend.stop_capture().await;
             return Err(CallerError::Display(format!(
                 "source too small for the always-on encoder baseline: \
@@ -1423,10 +1440,20 @@ impl DisplaySession {
         // simulcast in this pool — matching the existing `LayerSpec::single`
         // rationale — so the always-on bank is one layer the Media
         // Foundation encoder serves.
+        // (Synthetic sessions return an empty always-on set — see the
+        // `synthetic_source` rationale above the empty-baseline guard.)
         #[cfg(not(target_os = "windows"))]
-        let layer_factory = move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
+        let layer_factory = move |w: u32, h: u32| {
+            if synthetic_source {
+                return Vec::new();
+            }
+            encode::pool::LayerSpec::vp8_simulcast(w, h, fps)
+        };
         #[cfg(target_os = "windows")]
         let layer_factory = move |w: u32, h: u32| {
+            if synthetic_source {
+                return Vec::new();
+            }
             vec![encode::pool::LayerSpec::single(
                 encode::pool::CodecKind::H264,
                 w,

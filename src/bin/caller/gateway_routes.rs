@@ -1005,7 +1005,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::ProjectRoot,
         "Project root path this daemon serves",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_project_root")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/settings"),
@@ -1013,7 +1014,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::SettingsPost,
         "Update runtime settings",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_settings_save")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/settings"),
@@ -1021,7 +1023,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SettingsGet,
         "Current runtime settings",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_settings")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/api-keys"),
@@ -1029,7 +1032,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::ApiKeysPost,
         "Store provider API keys in the project .env",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_api_keys_save")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/api-key-status"),
@@ -1037,7 +1041,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::ApiKeyStatus,
         "Which provider keys are configured (presence only)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_key_status")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
@@ -1045,7 +1050,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::ExternalAgents,
         "Detected external coding agents (codex, claude)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_external_agents")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/diagnostics/visual-freshness"),
@@ -1053,7 +1059,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES),
         RouteHandlerId::DiagnosticsVisualFreshness,
         "Visual-freshness diagnostics transcript sink (NDJSON body)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_diagnostics_visual_freshness")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/displays"),
@@ -1061,7 +1068,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::Displays,
         "Enumerate active displays",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_displays")),
     // ── Public doorbell + signed org endpoints. The payload's own
     //    signature/shape is the authority; RouteAuthz::Public makes the
     //    no-IAM-gate decision explicit (these paths are also exempted by
