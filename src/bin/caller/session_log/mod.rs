@@ -439,6 +439,21 @@ impl SessionLog {
             .join(&session_id)
     }
 
+    /// [`SessionLog::resolve_path`] against an explicit home: mints the
+    /// fresh UUID dir under `<home>/.intendant/logs`. The supervisor mints
+    /// through its `logs_home()` so tests' spawned sessions land in the
+    /// injected scratch home instead of the machine's real store; the
+    /// ambient variant stays the CLI/startup edge.
+    pub fn resolve_path_in_home(home: &Path, override_path: Option<&str>) -> PathBuf {
+        if let Some(path) = override_path {
+            return PathBuf::from(path);
+        }
+        let session_id = Uuid::new_v4().to_string();
+        crate::platform::intendant_home_in(home)
+            .join("logs")
+            .join(&session_id)
+    }
+
     /// Find the most recent session for a given project root.
     /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
     /// and returns the most recently created session.
@@ -1480,7 +1495,10 @@ mod tests {
 
     #[test]
     fn find_session_by_id_nonexistent() {
-        let result = SessionLog::find_session_by_id("nonexistent-uuid-12345");
+        // An injected empty home: the lookup must miss without scanning
+        // the machine's real logs store.
+        let home = tempfile::tempdir().unwrap();
+        let result = SessionLog::find_session_by_id_in_home(home.path(), "nonexistent-uuid-12345");
         assert!(result.is_none());
     }
 

@@ -1332,6 +1332,7 @@ pub(crate) fn session_log_dir_matches_requested_session(log_dir: &std::path::Pat
 }
 
 pub(crate) fn requested_session_log_dirs(
+    home: &std::path::Path,
     current_log_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
@@ -1341,7 +1342,7 @@ pub(crate) fn requested_session_log_dirs(
     {
         dirs.push(current_log_dir.to_path_buf());
     }
-    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id(session_id) {
+    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
         if !dirs.iter().any(|existing| existing == &dir) {
             dirs.push(dir);
         }
@@ -1355,13 +1356,14 @@ pub(crate) fn requested_session_log_dirs(
 /// session — supervised parents log under `~/.intendant/logs/<id>/`, which is
 /// not necessarily the MCP server's own log dir.
 pub(crate) fn status_ledger_candidate_dirs(
+    home: &std::path::Path,
     primary_log_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let mut dirs = vec![primary_log_dir.to_path_buf()];
     let session_id = session_id.trim();
     if !session_id.is_empty() {
-        for dir in requested_session_log_dirs(primary_log_dir, session_id) {
+        for dir in requested_session_log_dirs(home, primary_log_dir, session_id) {
             if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -1444,12 +1446,16 @@ pub(crate) fn merged_fission_ledger_document_for_session(
     merged
 }
 
-pub(crate) fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, session_id: &str) -> bool {
+pub(crate) fn hydrate_requested_session_status_from_logs(
+    home: &std::path::Path,
+    s: &mut McpAppState,
+    session_id: &str,
+) -> bool {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return false;
     }
-    let dirs = requested_session_log_dirs(&s.log_dir, session_id);
+    let dirs = requested_session_log_dirs(home, &s.log_dir, session_id);
     if dirs.is_empty() {
         return false;
     }

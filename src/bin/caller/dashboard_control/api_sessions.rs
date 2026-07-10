@@ -535,6 +535,16 @@ pub(crate) async fn api_session_detail_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_detail_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_detail_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if session_id.is_empty() {
@@ -556,8 +566,9 @@ pub(crate) async fn api_session_detail_response(
     let session_id = session_id.trim().to_string();
     let limit = control_session_detail_limit(&params);
     let before = control_session_detail_before(&params);
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_detail_api_response(&session_id, &source, limit, before)
+        crate::web_gateway::session_detail_api_response(&home, &session_id, &source, limit, before)
     })
     .await;
     match result {
@@ -576,6 +587,18 @@ pub(crate) async fn api_session_report_task_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_report_task_response_from_home(id, params, runtime, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_session_report_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    home: &std::path::Path,
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = optional_string_param(&params, &["session_id", "sessionId", "id"])
         .unwrap_or_else(|| "current".to_string());
@@ -583,8 +606,10 @@ pub(crate) async fn api_session_report_task_response(
         let session = runtime.shared_session.read().await;
         (session.session_log.clone(), session.query_ctx.clone())
     };
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::session_report_zip_for_request(
+            &home,
             &session_id,
             session_log.as_ref(),
             query_ctx.as_ref(),
@@ -695,7 +720,10 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             };
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(runtime.project_root.as_deref());
+    let scope = crate::global_store::StoreScope::resolve_in(
+        runtime.project_root.as_deref(),
+        &runtime.state_root,
+    );
     let session_log = {
         let session = runtime.shared_session.read().await;
         session.session_log.clone()
@@ -800,7 +828,10 @@ pub(crate) async fn api_session_current_uploads_response(
             );
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+    let scope = crate::global_store::StoreScope::resolve_in(
+        project_root.as_deref(),
+        &runtime.state_root,
+    );
     let session_dir =
         session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&scope));
     let result = tokio::task::spawn_blocking(move || {
@@ -843,9 +874,11 @@ pub(crate) async fn api_session_current_upload_task_response(
         )
     };
     let project_root = runtime.project_root.clone();
+    let state_root = runtime.state_root.clone();
     let bus = runtime.bus.clone();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::current_upload_commit_api_response(
+            &state_root,
             project_root.as_deref(),
             session_log.as_ref(),
             daemon_session_id.as_deref(),
@@ -879,12 +912,23 @@ pub(crate) async fn api_session_delete_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_delete_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_delete_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     let target =
         optional_string_param(&params, &["target"]).unwrap_or_else(|| "session".to_string());
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_delete_api_response(&session_id, &target)
+        crate::web_gateway::session_delete_api_response(&home, &session_id, &target)
     })
     .await;
     match result {
@@ -907,7 +951,11 @@ pub(crate) async fn api_session_current_agent_output_response(
     match active_session_log_dir(runtime).await {
         Ok(Some(log_dir)) => frame_api_response(
             id,
-            crate::web_gateway::current_agent_output_api_response(&body_text, &log_dir),
+            crate::web_gateway::current_agent_output_api_response(
+                &crate::platform::home_dir(),
+                &body_text,
+                &log_dir,
+            ),
             "agent output",
         ),
         Ok(None) => http_body_response(
@@ -929,6 +977,16 @@ pub(crate) async fn api_session_agent_output_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_agent_output_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_agent_output_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if session_id.is_empty() {
@@ -946,8 +1004,9 @@ pub(crate) async fn api_session_agent_output_response(
         source
     };
     let body_text = params_body_text(Some(&params));
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_agent_output_api_response(&body_text, &session_id, &source)
+        crate::web_gateway::session_agent_output_api_response(&home, &body_text, &session_id, &source)
     })
     .await;
     match result {
@@ -1070,8 +1129,10 @@ pub(crate) async fn api_session_context_snapshot_response(
         }
     };
     let ts = optional_string_param(&params, &["ts"]);
+    let home = crate::platform::home_dir();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::session_context_snapshot_api_response(
+            &home,
             &session_id,
             &source,
             file,
@@ -1322,6 +1383,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
@@ -1356,6 +1418,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
@@ -1427,22 +1490,15 @@ mod tests {
     /// Route-level proof for projectless daemons (task "Wave 1F"): with no
     /// project root anywhere, a staged upload POST commits into the
     /// daemon-global store and the raw read streams the same bytes back.
-    /// Fixture writes go through the process state root (the live
-    /// `~/.intendant` in bin unit tests — same convention as the
-    /// session-frame transfer test), so the session id is unique per run
-    /// and the store dir is removed afterwards.
+    /// Both legs resolve the store under the test runtime's scratch
+    /// state root, so the fixture never touches the machine's real
+    /// `~/.intendant/global-store` and needs no unique ids or cleanup.
     #[tokio::test]
     async fn projectless_staged_upload_posts_and_reads_raw_from_global_store() {
         let mut rt = runtime();
         assert!(rt.project_root.is_none());
-        rt.session_id = format!(
-            "projectless-upload-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let session_store_dir = crate::global_store::global_store_root()
+        rt.session_id = "projectless-upload-test".to_string();
+        let session_store_dir = crate::global_store::global_store_root_in(&rt.state_root)
             .join("uploads")
             .join(&rt.session_id);
 
@@ -1452,6 +1508,7 @@ mod tests {
 
         // POST: commit with no project root resolves the global store.
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             None,
             None,
             Some(rt.session_id.as_str()),
@@ -1478,13 +1535,11 @@ mod tests {
             &rt,
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&session_store_dir);
         assert!(response.done);
         let stream = response.byte_stream.expect("raw read must stream bytes");
         assert_eq!(stream.bytes, bytes);
         assert_eq!(stream.result["ok"], true);
         assert_eq!(stream.result["id"], descriptor.id);
-        cleanup.expect("global-store session dir cleanup");
     }
 
     #[tokio::test]
@@ -1711,84 +1766,81 @@ mod tests {
         frame["result"].clone()
     }
 
-    /// Unique-per-run fixture session in the live logs store (the
-    /// bin-test convention; removed by the caller).
-    fn parity_session_fixture(prefix: &str) -> (String, std::path::PathBuf) {
-        let session_id = format!(
-            "{prefix}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let log_dir = crate::platform::intendant_home()
+    /// Fixture session under an injected tempdir home's
+    /// `.intendant/logs` store. Both parity lanes take the same temp home
+    /// (`_from_home` adapters / home-threaded neutral fns), so no fixture
+    /// ever reads or writes the machine's real `~/.intendant` — and the
+    /// isolated store makes exact row-set assertions possible. The id can
+    /// be fixed: each test owns its whole store.
+    fn parity_session_fixture(prefix: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let home = tempfile::tempdir().expect("temp home");
+        let session_id = prefix.to_string();
+        let log_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
             .join(&session_id);
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.agent_output_with_id("parity stdout", "", Some("Codex"), Some("parity-out-1"));
         drop(log);
-        (session_id, log_dir)
+        (home, session_id, log_dir)
     }
 
     #[tokio::test]
     async fn parity_sessions_list_serves_the_same_rows_on_both_transports() {
-        let (session_id, log_dir) = parity_session_fixture("parity-list");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-list");
 
         // ids filter, plain view.
         let (status, http_body) = http_status_and_body(
             crate::web_gateway::sessions_list_api_response(
+                home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 false,
             ),
         );
         assert_eq!(status, 200);
-        let frame = api_sessions_response(
+        let frame = api_sessions_response_from_home(
             "parity-list".to_string(),
             Some(&serde_json::json!({ "ids": [session_id] })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         let tunnel_body = tunnel_plain_body(&frame);
         assert!(tunnel_body.is_array(), "{frame}");
         assert_eq!(tunnel_body, http_body);
-        assert!(
-            tunnel_body
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["session_id"] == session_id),
-            "fixture session must be listed: {tunnel_body}"
-        );
-        cleanup.expect("parity list fixture cleanup");
+        // The injected store holds exactly the fixture session — assert
+        // the whole row set, not mere membership.
+        let rows = tunnel_body.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "temp store must list only the fixture: {tunnel_body}");
+        assert_eq!(rows[0]["session_id"], session_id);
     }
 
     #[tokio::test]
     async fn parity_sessions_list_usage_view_serves_the_same_projection() {
-        let (session_id, log_dir) = parity_session_fixture("parity-usage");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-usage");
         let (status, http_body) = http_status_and_body(
             crate::web_gateway::sessions_list_api_response(
+                home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 true,
             ),
         );
-        let frame = api_sessions_response(
+        let frame = api_sessions_response_from_home(
             "parity-usage".to_string(),
             Some(&serde_json::json!({ "ids": [session_id], "view": "usage" })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         let tunnel_body = tunnel_plain_body(&frame);
         assert_eq!(tunnel_body, http_body);
+        assert_eq!(tunnel_body.as_array().unwrap().len(), 1);
         let row = &tunnel_body.as_array().unwrap()[0];
         assert!(row.get("session_id").is_some());
         assert!(
             row.get("entries").is_none() && row.get("goal").is_none(),
             "usage view must project rows down: {row}"
         );
-        cleanup.expect("parity usage fixture cleanup");
     }
 
     #[tokio::test]
@@ -1819,27 +1871,42 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_detail_serves_the_same_body_on_both_transports() {
-        let (session_id, log_dir) = parity_session_fixture("parity-detail");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-detail");
         let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response(&session_id, "intendant", Some(5), None),
+            crate::web_gateway::session_detail_api_response(
+                home.path(),
+                &session_id,
+                "intendant",
+                Some(5),
+                None,
+            ),
         );
-        let frame = api_session_detail_response(
+        let frame = api_session_detail_response_from_home(
             "parity-detail".to_string(),
             Some(&serde_json::json!({ "session_id": session_id, "limit": 5 })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         assert_eq!(tunnel_plain_body(&frame), http_body);
-        cleanup.expect("parity detail fixture cleanup");
     }
 
     #[tokio::test]
     async fn parity_session_detail_errors_share_bodies_under_the_plain_envelope() {
         // Difference #1 pinned from both sides: the HTTP 400 does not
         // surface on the tunnel — only the identical error body does.
+        // (The bare-id check answers before any store access, so the
+        // tunnel lane exercises the full public adapter here; the temp
+        // home on the HTTP lane is never read.)
+        let home = tempfile::tempdir().unwrap();
         let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response("..", "intendant", None, None),
+            crate::web_gateway::session_detail_api_response(
+                home.path(),
+                "..",
+                "intendant",
+                None,
+                None,
+            ),
         );
         assert_eq!(status, 400);
         let frame = api_session_detail_response(
@@ -1852,10 +1919,11 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_agent_output_serves_the_same_body_with_status_metadata() {
-        let (session_id, log_dir) = parity_session_fixture("parity-output");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-output");
         let ids_body = r#"{"ids":["parity-out-1","parity-missing"]}"#;
         let (status, http_body) = http_status_and_body(
             crate::web_gateway::session_agent_output_api_response(
+                home.path(),
                 ids_body,
                 &session_id,
                 "intendant",
@@ -1863,22 +1931,27 @@ mod tests {
         );
         // The tunnel serializes its whole params object as the body; the
         // chunk fetch only reads `ids`.
-        let frame = api_session_agent_output_response(
+        let frame = api_session_agent_output_response_from_home(
             "parity-output".to_string(),
             Some(&serde_json::json!({
                 "session_id": session_id,
                 "ids": ["parity-out-1", "parity-missing"],
             })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         assert_eq!(tunnel_result_body(&frame, 200), http_body);
-        cleanup.expect("parity output fixture cleanup");
 
-        // Missing-ids: same 400 body under each envelope.
+        // Missing-ids: same 400 body under each envelope (decode error
+        // before any store access — the public adapter stays under test).
         let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_agent_output_api_response("{}", "abc123", "intendant"),
+            crate::web_gateway::session_agent_output_api_response(
+                home.path(),
+                "{}",
+                "abc123",
+                "intendant",
+            ),
         );
         assert_eq!(status, 400);
         let frame = api_session_agent_output_response(
@@ -1896,9 +1969,12 @@ mod tests {
     #[tokio::test]
     async fn parity_session_delete_serves_the_same_body_on_both_transports() {
         // Invalid id: deterministic, store-free; the delete trio rides the
-        // pre-_httpStatus envelope (difference #1).
+        // pre-_httpStatus envelope (difference #1). The bare-id check
+        // answers before any store access, so the tunnel lane exercises
+        // the full public adapter.
+        let home = tempfile::tempdir().unwrap();
         let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_delete_api_response("..", "session"),
+            crate::web_gateway::session_delete_api_response(home.path(), "..", "session"),
         );
         assert_eq!(status, 200);
         let frame = api_session_delete_response(
@@ -1909,19 +1985,20 @@ mod tests {
         assert_eq!(tunnel_plain_body(&frame), http_body);
 
         // A real deletion under identical pre-state on each lane.
-        let (session_id, log_dir) = parity_session_fixture("parity-delete-http");
+        let (home, session_id, log_dir) = parity_session_fixture("parity-delete-http");
         let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_delete_api_response(&session_id, "session"),
+            crate::web_gateway::session_delete_api_response(home.path(), &session_id, "session"),
         );
         assert_eq!(status, 200);
         assert!(!log_dir.exists(), "http-lane delete must remove the dir");
         assert_eq!(http_body["ok"], true);
         assert_eq!(http_body["deleted"], "session");
 
-        let (session_id, log_dir) = parity_session_fixture("parity-delete-rpc");
-        let frame = api_session_delete_response(
+        let (home, session_id, log_dir) = parity_session_fixture("parity-delete-rpc");
+        let frame = api_session_delete_response_from_home(
             "parity-delete-2".to_string(),
             Some(&serde_json::json!({ "session_id": session_id })),
+            home.path(),
         )
         .await;
         assert!(!log_dir.exists(), "tunnel delete must remove the dir");
@@ -1938,11 +2015,12 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_report_serves_the_same_zip_and_meta_on_both_transports() {
-        let (session_id, log_dir) = parity_session_fixture("parity-report");
+        let (home, session_id, log_dir) = parity_session_fixture("parity-report");
         std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
 
-        let report = crate::web_gateway::session_report_zip_for_request(&session_id, None, None)
-            .unwrap_or_else(|_| panic!("fixture report must build"));
+        let report =
+            crate::web_gateway::session_report_zip_for_request(home.path(), &session_id, None, None)
+                .unwrap_or_else(|_| panic!("fixture report must build"));
         let response = crate::web_gateway::session_report_api_response(report);
         let (http_bytes, http_meta) = match &response {
             crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
@@ -1952,13 +2030,13 @@ mod tests {
             _ => panic!("report must ride the bytes lane"),
         };
 
-        let task = api_session_report_task_response(
+        let task = api_session_report_task_response_from_home(
             "parity-report".to_string(),
             Some(&serde_json::json!({ "session_id": session_id })),
             &runtime(),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         let stream = task.byte_stream.expect("tunnel byte stream");
         assert_eq!(stream.stream_id, "parity-report:session-report");
         assert_eq!(stream.content_type, "application/zip");
@@ -1972,7 +2050,8 @@ mod tests {
 
         // Invalid id: per-lane error framing — the tunnel answers the
         // injected-status envelope; HTTP answers wildcard json (pinned by
-        // the goldens).
+        // the goldens). The id-policy check answers before any store
+        // access, so the public adapter stays under test.
         let invalid = api_session_report_task_response(
             "parity-report-invalid".to_string(),
             Some(&serde_json::json!({ "session_id": ".." })),
@@ -1981,15 +2060,22 @@ mod tests {
         .await;
         assert!(invalid.byte_stream.is_none());
         assert_eq!(invalid.frame["result"]["_httpStatus"], 400);
-        cleanup.expect("parity report fixture cleanup");
     }
 
     #[tokio::test]
     async fn parity_session_context_snapshot_shares_bodies_with_status_metadata() {
-        // Missing selector: 400 on both lanes.
+        // Missing selector: 400 on both lanes (before any store access,
+        // so the tunnel lane exercises the full public adapter).
+        let home = tempfile::tempdir().unwrap();
         let (status, http_body) = http_status_and_body(
             crate::web_gateway::session_context_snapshot_api_response(
-                "abc123", "intendant", None, None, None, None,
+                home.path(),
+                "abc123",
+                "intendant",
+                None,
+                None,
+                None,
+                None,
             ),
         );
         assert_eq!(status, 400);
@@ -2108,49 +2194,48 @@ mod tests {
 
     #[tokio::test]
     async fn parity_current_agent_output_shares_bodies_with_status_metadata() {
-        let (session_id, log_dir) = parity_session_fixture("parity-current-output");
+        let (home, _session_id, log_dir) = parity_session_fixture("parity-current-output");
+        let rt = runtime();
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         {
-            let rt = runtime();
-            let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
-            {
-                let mut session = rt.shared_session.write().await;
-                session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
-            }
-
-            // Success: one persisted id — found in the primary dir, so
-            // neither lane runs the fallback sweep.
-            let (status, http_body) = http_status_and_body(
-                crate::web_gateway::current_agent_output_api_response(
-                    r#"{"ids":["parity-out-1"]}"#,
-                    &log_dir,
-                ),
-            );
-            assert_eq!(status, 200);
-            assert_eq!(http_body["outputs"][0]["output_id"], "parity-out-1");
-            let frame = api_session_current_agent_output_response(
-                "parity-current-output".to_string(),
-                Some(&serde_json::json!({ "ids": ["parity-out-1"] })),
-                &rt,
-            )
-            .await;
-            assert_eq!(tunnel_result_body(&frame, 200), http_body);
-
-            // Decode error: 400 missing-ids on both lanes.
-            let (status, http_body) = http_status_and_body(
-                crate::web_gateway::current_agent_output_api_response("{}", &log_dir),
-            );
-            assert_eq!(status, 400);
-            let frame = api_session_current_agent_output_response(
-                "parity-current-output-400".to_string(),
-                Some(&serde_json::json!({})),
-                &rt,
-            )
-            .await;
-            assert_eq!(tunnel_result_body(&frame, 400), http_body);
-            assert_eq!(http_body["error"], "missing output ids");
+            let mut session = rt.shared_session.write().await;
+            session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
         }
-        std::fs::remove_dir_all(&log_dir)
-            .unwrap_or_else(|e| panic!("cleanup {session_id}: {e}"));
+
+        // Success: one persisted id — found in the primary dir, so
+        // neither lane runs the fallback sweep (the tunnel adapter's
+        // edge-resolved home is never read; the HTTP lane's temp home
+        // pins the same).
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::current_agent_output_api_response(
+                home.path(),
+                r#"{"ids":["parity-out-1"]}"#,
+                &log_dir,
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body["outputs"][0]["output_id"], "parity-out-1");
+        let frame = api_session_current_agent_output_response(
+            "parity-current-output".to_string(),
+            Some(&serde_json::json!({ "ids": ["parity-out-1"] })),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 200), http_body);
+
+        // Decode error: 400 missing-ids on both lanes.
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::current_agent_output_api_response(home.path(), "{}", &log_dir),
+        );
+        assert_eq!(status, 400);
+        let frame = api_session_current_agent_output_response(
+            "parity-current-output-400".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 400), http_body);
+        assert_eq!(http_body["error"], "missing output ids");
     }
 
     #[tokio::test]
@@ -2239,6 +2324,7 @@ mod tests {
         tmp.write_all(&payload).unwrap();
         let (status, http_descriptor) = http_status_and_body(
             crate::web_gateway::current_upload_commit_api_response(
+                &rt.state_root,
                 Some(project.path()),
                 None,
                 Some("parity-session"),

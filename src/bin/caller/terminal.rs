@@ -531,6 +531,19 @@ impl PtySession {
                 }
                 // Seed TERM so xterm.js gets colors and cursor sequences.
                 cmd.env("TERM", "xterm-256color");
+                // Unit-test builds point the spawned shell's HOME at a
+                // per-process scratch: interactive shells write history
+                // (~/.zsh_history, ~/.bash_history) on exit, and terminal
+                // tests must never mutate the account's real home
+                // (tests-are-hermetic; the listener.rs cfg-gate shape).
+                // Production spawns keep the user's real HOME — terminal
+                // tabs are the user's own shells, history included.
+                if cfg!(test) {
+                    let scratch = std::env::temp_dir()
+                        .join(format!("intendant-test-shell-home-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&scratch);
+                    cmd.env("HOME", &scratch);
+                }
                 cmd
             };
             match pair.slave.spawn_command(build_cmd(&shell, &shell_args)) {

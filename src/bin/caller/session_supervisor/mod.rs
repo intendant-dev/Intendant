@@ -670,10 +670,18 @@ mod tests {
             // a box with live session history (a dev box, the peer-testing
             // Dell) can otherwise match a test's hardcoded wrapper id. The
             // dir is never created unless a test writes through it.
-            logs_home_override: Some(
-                std::env::temp_dir()
-                    .join(format!("intendant-test-logs-home-{}", std::process::id())),
-            ),
+            // PID alone is not unique across runs (recycled PIDs inherit a
+            // previous run's scratch — the state_paths precedent); a nanos
+            // component makes the scratch per process INSTANCE. Sub-agent
+            // and rename flows now WRITE through this home, not just read.
+            logs_home_override: Some(std::env::temp_dir().join(format!(
+                "intendant-test-logs-home-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))),
             git_vitals_targets: None,
         })
     }

@@ -650,11 +650,21 @@ pub(crate) async fn api_session_recordings_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_recordings_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_recordings_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     frame_api_response(
         id,
-        crate::web_gateway::session_recordings_api_response(&session_id),
+        crate::web_gateway::session_recordings_api_response(home, &session_id),
         "session recordings",
     )
 }
@@ -686,6 +696,21 @@ pub(crate) async fn api_session_recording_asset_task_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the parity fixture
+    // drives the `_from_home` variant with an injected temp home.
+    api_session_recording_asset_task_response_from_home(
+        id,
+        params,
+        &crate::platform::home_dir(),
+    )
+    .await
+}
+
+pub(crate) async fn api_session_recording_asset_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if !crate::web_gateway::session_lookup_id_is_safe(&session_id) {
@@ -701,7 +726,7 @@ pub(crate) async fn api_session_recording_asset_task_response(
             return recording_asset_error_task_response(id, status, error);
         }
     };
-    let session_dir = crate::web_gateway::resolve_session_dir(&session_id);
+    let session_dir = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id);
     let resolved = resolve_session_recording_asset(session_dir, &stream_name, &asset);
     recording_asset_task_response(id, stream_name, asset, offset, length, resolved).await
 }
@@ -864,6 +889,16 @@ pub(crate) async fn api_session_frame_asset_task_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the RPC fixture drives
+    // the `_from_home` variant with an injected temp home.
+    api_session_frame_asset_task_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_frame_asset_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if !crate::web_gateway::session_lookup_id_is_safe(&session_id) {
@@ -909,7 +944,8 @@ pub(crate) async fn api_session_frame_asset_task_response(
         }
     };
 
-    let Some(session_dir) = crate::web_gateway::resolve_session_dir(&session_id) else {
+    let Some(session_dir) = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id)
+    else {
         return session_frame_asset_error_task_response(
             id,
             404,
@@ -995,23 +1031,21 @@ pub(crate) fn session_frame_asset_error_task_response(
 mod tests {
     use super::*;
 
-    /// Live-store recordings fixture (unique id; caller removes).
-    fn parity_recordings_fixture(prefix: &str) -> (String, std::path::PathBuf) {
-        let session_id = format!(
-            "{prefix}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let log_dir = crate::platform::intendant_home()
+    /// Recordings fixture under an injected tempdir home's
+    /// `.intendant/logs` store (both parity lanes take the same temp
+    /// home, so the fixture never touches the machine's real
+    /// `~/.intendant`; a fixed id is fine — each test owns its store).
+    fn parity_recordings_fixture(prefix: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let home = tempfile::tempdir().expect("temp home");
+        let session_id = prefix.to_string();
+        let log_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
             .join(&session_id);
         let stream_dir = log_dir.join("recordings").join("screen");
         std::fs::create_dir_all(&stream_dir).unwrap();
         std::fs::write(stream_dir.join("seg_00001.mp4"), b"parity segment bytes").unwrap();
         std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
-        (session_id, log_dir)
+        (home, session_id, log_dir)
     }
 
     fn parity_http_json_body(
@@ -1041,29 +1075,29 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_recordings_list_shares_bodies_with_status_metadata() {
-        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-list");
+        let (home, session_id, _log_dir) = parity_recordings_fixture("parity-rec-list");
         let (status, http_body) = parity_http_json_body(
-            crate::web_gateway::session_recordings_api_response(&session_id),
+            crate::web_gateway::session_recordings_api_response(home.path(), &session_id),
         );
         assert_eq!(status, 200);
-        let frame = api_session_recordings_response(
+        let frame = api_session_recordings_response_from_home(
             "parity-rec-list".to_string(),
             Some(&serde_json::json!({ "session_id": session_id })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(frame["t"], "response");
         assert_eq!(frame["ok"], true);
         // The list body is a json ARRAY: the injected-status envelope
         // only decorates objects, so the array passes through untouched.
         assert!(frame["result"].is_array(), "{frame}");
         assert_eq!(frame["result"], http_body);
-        cleanup.expect("parity recordings fixture cleanup");
 
         // Invalid id: an object body — the injection appears and matches
-        // the HTTP status.
+        // the HTTP status. (Bare-id check before any store access; the
+        // tunnel lane exercises the full public adapter.)
         let (status, http_body) = parity_http_json_body(
-            crate::web_gateway::session_recordings_api_response(".."),
+            crate::web_gateway::session_recordings_api_response(home.path(), ".."),
         );
         assert_eq!(status, 400);
         let frame = api_session_recordings_response(
@@ -1080,10 +1114,11 @@ mod tests {
 
     #[tokio::test]
     async fn parity_recording_listing_assets_share_bytes_on_both_transports() {
-        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-assets");
+        let (home, session_id, _log_dir) = parity_recordings_fixture("parity-rec-assets");
         for asset in ["segments", "playlist.m3u8"] {
             // HTTP: the shared resolver under the canonical tail.
             let response = crate::web_gateway::session_recording_listing_asset_api_response(
+                home.path(),
                 &session_id,
                 "screen",
                 asset,
@@ -1098,13 +1133,14 @@ mod tests {
             };
             // Tunnel: the same asset vocabulary through the ranged
             // byte-stream carriage (offset 0, unbounded).
-            let task = api_session_recording_asset_task_response(
+            let task = api_session_recording_asset_task_response_from_home(
                 format!("parity-asset-{asset}"),
                 Some(&serde_json::json!({
                     "session_id": session_id,
                     "stream_name": "screen",
                     "asset": asset,
                 })),
+                home.path(),
             )
             .await;
             let stream = task.byte_stream.expect("tunnel byte stream");
@@ -1113,7 +1149,6 @@ mod tests {
             assert_eq!(stream.result["ok"], true);
             assert_eq!(stream.result["total_size"], http_bytes.len());
         }
-        std::fs::remove_dir_all(&log_dir).expect("parity assets fixture cleanup");
     }
 
     use crate::dashboard_control::tests::{runtime, test_upload_state};
@@ -1384,35 +1419,30 @@ mod tests {
 
     #[tokio::test]
     async fn session_frame_asset_rpc_streams_validated_frame_ranges() {
-        let session_id = format!(
-            "dashboard-frame-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        // The RPC resolves sessions from the process state root
-        // (`platform::intendant_home()` — a per-process scratch in
-        // unit-test builds, so this never touches the live ~/.intendant).
-        let session_dir = crate::platform::intendant_home()
+        // The RPC resolves sessions from an injected temp home's
+        // `.intendant/logs` store (the `_from_home` variant; the public
+        // adapter resolves the real home at the transport edge).
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "dashboard-frame-test";
+        let session_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
-            .join(&session_id);
+            .join(session_id);
         let frames_dir = session_dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let frame_bytes = b"dashboard frame bytes";
         std::fs::write(frames_dir.join("ann-test.png"), frame_bytes).unwrap();
 
-        let response = api_session_frame_asset_task_response(
+        let response = api_session_frame_asset_task_response_from_home(
             "frame-asset1".to_string(),
             Some(&serde_json::json!({
-                "session_id": &session_id,
+                "session_id": session_id,
                 "filename": "ann-test.png",
                 "offset": 10,
                 "length": 5,
             })),
+            home.path(),
         )
         .await;
-        let _ = std::fs::remove_dir_all(&session_dir);
 
         assert!(response.done);
         assert!(response.byte_stream.is_some());

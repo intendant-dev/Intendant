@@ -10,7 +10,10 @@ use super::*;
 /// (see `global_store.rs`). Infallible — projectless daemons are served,
 /// not refused.
 pub(crate) fn transfer_store_scope(runtime: &ControlRuntime) -> crate::global_store::StoreScope {
-    crate::global_store::StoreScope::resolve(runtime.project_root.as_deref())
+    crate::global_store::StoreScope::resolve_in(
+        runtime.project_root.as_deref(),
+        &runtime.state_root,
+    )
 }
 
 pub(crate) fn transfer_http_error_response(
@@ -72,6 +75,7 @@ pub(crate) fn transfer_artifact_type(artifact: &serde_json::Value) -> String {
 }
 
 pub(crate) async fn transfer_create_download_job_from_params(
+    home: &std::path::Path,
     scope: crate::global_store::StoreScope,
     params: serde_json::Value,
     runtime: &ControlRuntime,
@@ -81,7 +85,7 @@ pub(crate) async fn transfer_create_download_job_from_params(
         .filter(|value| value.is_object())
         .cloned()
     {
-        return transfer_create_artifact_download_job(scope, artifact, runtime).await;
+        return transfer_create_artifact_download_job(home, scope, artifact, runtime).await;
     }
     let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
     if path.is_empty() {
@@ -168,25 +172,28 @@ pub(crate) async fn transfer_create_upload_job_from_params(
 }
 
 pub(crate) async fn transfer_create_artifact_download_job(
+    home: &std::path::Path,
     scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
     match transfer_artifact_type(&artifact).as_str() {
         "session_report" | "session-report" => {
-            transfer_create_session_report_download_job(scope, artifact, runtime).await
+            transfer_create_session_report_download_job(home, scope, artifact, runtime).await
         }
         "staged_upload" | "staged-upload" | "upload" => {
             transfer_create_staged_upload_download_job(scope, artifact, runtime).await
         }
         "recording_asset" | "recording-asset" => {
-            transfer_create_recording_asset_download_job(scope, artifact, runtime, false).await
+            transfer_create_recording_asset_download_job(home, scope, artifact, runtime, false)
+                .await
         }
         "session_recording_asset" | "session-recording-asset" => {
-            transfer_create_recording_asset_download_job(scope, artifact, runtime, true).await
+            transfer_create_recording_asset_download_job(home, scope, artifact, runtime, true)
+                .await
         }
         "session_frame_asset" | "session-frame-asset" | "frame_asset" | "frame-asset" => {
-            transfer_create_session_frame_download_job(scope, artifact).await
+            transfer_create_session_frame_download_job(home, scope, artifact).await
         }
         "" => Err(crate::transfer_store::TransferStoreError::new(
             400,
@@ -200,6 +207,7 @@ pub(crate) async fn transfer_create_artifact_download_job(
 }
 
 pub(crate) async fn transfer_create_session_report_download_job(
+    home: &std::path::Path,
     scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
@@ -212,8 +220,10 @@ pub(crate) async fn transfer_create_session_report_download_job(
     };
     let report = tokio::task::spawn_blocking({
         let session_id = session_id.clone();
+        let home = home.to_path_buf();
         move || {
             crate::web_gateway::session_report_zip_for_request(
+                &home,
                 &session_id,
                 session_log.as_ref(),
                 query_ctx.as_ref(),
@@ -295,6 +305,7 @@ pub(crate) async fn transfer_create_staged_upload_download_job(
 }
 
 pub(crate) async fn transfer_create_recording_asset_download_job(
+    home: &std::path::Path,
     scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
     runtime: &ControlRuntime,
@@ -328,7 +339,7 @@ pub(crate) async fn transfer_create_recording_asset_download_job(
                 "invalid session id",
             ));
         }
-        let session_dir = crate::web_gateway::resolve_session_dir(&session_id);
+        let session_dir = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id);
         resolve_session_recording_asset(session_dir, &stream_name, &asset)
     } else {
         let Some(registry) = active_recording_registry(runtime).await else {
@@ -391,6 +402,7 @@ pub(crate) async fn transfer_create_recording_asset_job(
 }
 
 pub(crate) async fn transfer_create_session_frame_download_job(
+    home: &std::path::Path,
     scope: crate::global_store::StoreScope,
     artifact: serde_json::Value,
 ) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
@@ -411,7 +423,7 @@ pub(crate) async fn transfer_create_session_frame_download_job(
             "invalid frame filename",
         ));
     }
-    let session_dir = crate::web_gateway::resolve_session_dir(&session_id)
+    let session_dir = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id)
         .ok_or_else(|| crate::transfer_store::TransferStoreError::new(404, "session not found"))?;
     let path = session_dir.join("frames").join(&filename);
     if !path.exists() {
@@ -475,6 +487,18 @@ pub(crate) async fn api_transfer_job_create_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the artifact fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_transfer_job_create_response_from_home(id, params, runtime, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_transfer_job_create_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let kind = string_param(&params, &["kind", "type"]);
@@ -491,7 +515,7 @@ pub(crate) async fn api_transfer_job_create_response(
     };
     let result = match kind {
         crate::transfer_store::TransferKind::Download => {
-            transfer_create_download_job_from_params(scope, params, runtime).await
+            transfer_create_download_job_from_params(home, scope, params, runtime).await
         }
         crate::transfer_store::TransferKind::Upload => {
             transfer_create_upload_job_from_params(scope, params).await
@@ -1761,6 +1785,7 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
@@ -1885,18 +1910,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let session_id = format!(
-            "dashboard-frame-transfer-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        // Fixture under the process state root, matching what the transfer
-        // path resolves (per-process scratch in unit-test builds).
-        let session_dir = crate::platform::intendant_home()
+        // Fixture under an injected temp home's `.intendant/logs` store —
+        // the `_from_home` create variant resolves sessions from the same
+        // home (the public adapter resolves the real home at the edge).
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "dashboard-frame-transfer-test";
+        let session_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
-            .join(&session_id);
+            .join(session_id);
         let frames_dir = session_dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let frame_bytes = b"dashboard frame bytes";
@@ -1905,17 +1926,18 @@ mod tests {
         let mut rt = runtime();
         rt.project_root = Some(project);
 
-        let create = api_transfer_job_create_response(
+        let create = api_transfer_job_create_response_from_home(
             "frame-transfer-create".to_string(),
             Some(&serde_json::json!({
                 "kind": "download",
                 "artifact": {
                     "type": "session_frame_asset",
-                    "session_id": &session_id,
+                    "session_id": session_id,
                     "filename": "ann-test.png",
                 },
             })),
             &rt,
+            home.path(),
         )
         .await;
         assert_eq!(create["result"]["ok"], true);
@@ -1937,7 +1959,6 @@ mod tests {
             &rt,
         )
         .await;
-        let _ = std::fs::remove_dir_all(&session_dir);
         assert!(read.done);
         let stream = read.byte_stream.unwrap();
         assert_eq!(stream.content_type, "image/png");

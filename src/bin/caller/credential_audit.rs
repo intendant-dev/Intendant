@@ -185,10 +185,22 @@ fn restrict_file(path: &Path) {
 }
 
 fn trail_path() -> PathBuf {
-    // `platform::intendant_home()` already resolves to a per-process
-    // scratch root in unit-test builds, so side-effect events from other
-    // modules' tests never land in the developer's real trail file (the
-    // seam subsumed this module's older `cfg!(test)` temp-file redirect).
+    // Unit-test builds redirect the trail to a per-process-instance
+    // scratch file: `intendant_home()`'s cfg(test) scratch default does
+    // NOT cross crates (state_paths.rs documents the limit — in this
+    // bin's test binary it is the LIVE ~/.intendant), so without this
+    // redirect side-effect events from other modules' tests (credential
+    // egress fixtures) append into the developer's real trail file.
+    if cfg!(test) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return std::env::temp_dir().join(format!(
+            "intendant-test-custody-audit-{}-{nanos}.jsonl",
+            std::process::id()
+        ));
+    }
     crate::platform::intendant_home().join("custody-audit.jsonl")
 }
 

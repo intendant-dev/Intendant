@@ -443,7 +443,7 @@ impl IntendantServer {
         };
         push(primary.clone(), &mut candidates);
         if let Some(session_id) = session_id {
-            for dir in requested_session_log_dirs(&primary, &session_id) {
+            for dir in requested_session_log_dirs(&self.home, &primary, &session_id) {
                 push(dir, &mut candidates);
             }
         }
