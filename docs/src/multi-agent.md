@@ -206,6 +206,50 @@ implementation-2 ─► branch subagent-e5f6a7b8 ─┼─► parent merges each
 > import / canonical claim) rather than an orchestrator merge. See
 > [External-Agent Orchestration](./external-agent-orchestration.md).
 
+### Top-Level Worktree Sessions
+
+Worktree isolation is also available to **top-level sessions**, not just
+sub-agents: `CreateSession { worktree: true, worktree_branch? }` (the New
+Session pane's "Run in a git worktree" toggle) branches a fresh worktree off
+the resolved project root's `HEAD` and makes the checkout the session's
+effective project root. The project root must be a git repository with at
+least one commit — anything else fails the launch with an actionable error
+instead of a half-created session.
+
+The branch name is either user-supplied (validated against a conservative,
+path-safe subset of git ref syntax — traversal shapes, `@{`, `.lock`
+segments, leading `-`/`.` are all rejected) or derived: a slug of the
+session name, else `session-<short-id>`, with a numeric suffix on collision.
+The linkage — branch, checkout path, base root, base branch, base commit —
+is recorded in the session's `session_meta.json` (`SessionMeta.worktree`),
+survives meta rewrites (resume, rename), and is served on session-catalog
+rows; the dashboard renders it as a branch badge in the session window
+header, and the Worktrees tab links sessions to checkouts by cwd exactly as
+it does for sub-agent worktrees.
+
+The worktree persists after the session ends — same doctrine as above; the
+branch is the work product and nothing is removed automatically. When a
+worktree-backed session ends, its window shows a dismissible **finish card**
+with the three explicit outcomes:
+
+- **Merge into `<base branch>` & remove worktree** — `POST
+  /api/worktrees/merge` (dashboard-control twin `api_worktrees_merge`) takes
+  only a session id and resolves everything else from the recorded linkage,
+  so it can only ever merge a session-linked worktree branch. It runs
+  `git merge <branch> --no-edit` in the base checkout — refusing fail-closed
+  if the checkout is no longer registered, the branch was renamed, or the
+  base checkout has moved to a different branch or a detached HEAD — aborts
+  cleanly on conflict, then removes the checkout through the same
+  safety-checked path as `/api/worktrees/remove`. A refused removal (say the
+  checkout picked up new dirt) is reported in the response, not fatal: the
+  merge already landed, and the branch ref is always kept.
+- **Remove worktree** — the inventory-safe removal; refuses dirty or
+  unmerged checkouts and surfaces the safety reason.
+- **Keep** — dismiss; the checkout stays available in the Worktrees tab.
+
+An explicitly stopped worktree session keeps its dashboard window until the
+card is dismissed — the merge/remove/keep decision outlives the stop.
+
 ## Knowledge Routing Between Agents
 
 Agents share findings through the **knowledge store** — a tagged,

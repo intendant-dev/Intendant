@@ -1182,7 +1182,7 @@ fn default_branch_for_repo(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn git_repo_root(path: &Path) -> Option<PathBuf> {
+pub(crate) fn git_repo_root(path: &Path) -> Option<PathBuf> {
     git_string(path, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(|s| PathBuf::from(s.trim()))

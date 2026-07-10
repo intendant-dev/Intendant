@@ -183,6 +183,24 @@ fn default_true() -> bool {
     true
 }
 
+/// One image attached to a display-only session note. A *reference* to a
+/// blob committed into the session's upload store — never inline bytes:
+/// the WebSocket broadcast and the session log both stay small, and the
+/// browser fetches the pixels lazily from `url` (the upload store's
+/// existing `/raw` route, which serves the stored MIME inline).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNoteAttachment {
+    /// Upload-store descriptor id the blob was committed under.
+    pub upload_id: String,
+    /// Display filename (sanitized).
+    pub name: String,
+    /// Image MIME type (`image/png`, ...).
+    pub mime: String,
+    /// Same-origin URL that serves the blob
+    /// (`/api/session/current/uploads/<id>/raw`).
+    pub url: String,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -663,6 +681,27 @@ pub enum OutboundEvent {
         user_turn_revision: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         replacement_for_user_turn_index: Option<u32>,
+    },
+    /// Display-only note an agent posted into its session transcript
+    /// (`post_session_note` MCP tool / `intendant ctl session note`).
+    /// Never enters any model's context — this is a presentation rail:
+    /// the dashboard renders it as a distinct transcript entry and the
+    /// session log persists it for replay. Attachments are references
+    /// to session upload-store blobs, never inline bytes.
+    SessionNote {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        note_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<SessionNoteAttachment>,
+        /// Short label shown on the entry (e.g. "codex"); defaults to
+        /// "note" in the dashboard when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Unix epoch milliseconds when the note was posted.
+        #[serde(default)]
+        ts: u64,
     },
     /// Live user-message edit rewound an active external-agent session.
     UserMessageRewind {

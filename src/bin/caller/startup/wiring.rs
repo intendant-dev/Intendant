@@ -291,6 +291,9 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.codex_managed_context =
         project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
+    // Same value as ActiveSessionState.project_root_for_changes above, so
+    // MCP upload-store writes resolve to the scope the gateway serves.
+    mcp_http_state.project_root = project_root.clone();
     mcp_http_state.frame_registry = Some(frame_registry.clone());
     mcp_http_state.session_registry = Some(session_registry.clone());
     mcp_http_state.peer_registry = Some(peer_registry.clone());

@@ -200,6 +200,20 @@ Five subtabs:
   the old approve-all — it lifts every gate, and is labeled for what it is.
   Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
   input sends a message after a round completes.
+
+  Pending requests also escalate beyond the open tab (the **attention
+  center**, `static/app/57-attention-notifications.js`): every pending
+  approval/question across sessions counts into a `(N)` document-title
+  prefix and favicon badge (on by default; toggle under Settings →
+  Appearance → Notifications), and — strictly opt-in from the same
+  card, which is the only place notification permission is ever
+  requested — a browser Notification fires when a request arrives while
+  the tab is hidden; clicking it focuses the tab and the owning session.
+  The badge clears as requests resolve and drops on stream disconnect
+  (the reconnect bootstrap rebuilds what still stands). For closed tabs
+  entirely, the daemon nudges the Connect rendezvous and opted-in
+  browsers get a Web Push (see `self-hosted-rendezvous.md` —
+  Notifications; payloads never carry work content).
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
@@ -1707,9 +1721,10 @@ include `offset`/`length`; the response carries `range_start`, `range_end`,
 tab uses repeated ranged reads to download staged uploads back to the browser.
 This is a bounded current-session attachment primitive, not yet a general
 daemon-filesystem upload/download adapter.
-Worktree cached inventory reads, explicit scans, and guarded removals use
-`api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
-the same no-replay fallback rule as other writes.
+Worktree cached inventory reads, explicit scans, guarded removals, and the
+session finish card's merge use `api_worktrees`, `api_worktrees_scan`,
+`api_worktrees_remove`, and `api_worktrees_merge`; the writes use the same
+no-replay fallback rule as other writes.
 The filesystem picker's path checks, directory listings, and mkdir operation use
 `api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
 fallback rule as other writes.
@@ -1946,7 +1961,7 @@ family (sub-routes elided where the family is uniform):
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
-| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
+| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,merge}` | Agent worktree inventory and lifecycle (merge = session-linked worktree finish card) |
 | `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
 
 ### Declared API routes
@@ -1997,6 +2012,7 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/managed-context/fission` | SessionInspect | own origin | none | Managed-context fission state |
 | POST | `/api/worktrees/inspect` | SessionInspect | own origin | bounded | Inspect one worktree (branch, ahead/behind, dirty state) |
 | POST | `/api/worktrees/remove` | SessionManage | own origin | bounded | Remove a worktree from the inventory |
+| POST | `/api/worktrees/merge` | SessionManage | own origin | bounded | Merge a session's linked worktree branch into its base checkout, then remove the checkout |
 | POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
 | GET | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |

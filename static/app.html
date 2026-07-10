@@ -4896,6 +4896,82 @@ body.context-focus-active {
 .session-window-task::before { content: "msg"; }
 .session-window-project::before { content: "proj"; }
 .session-window-cwd::before { content: "cwd"; }
+.session-window-worktree {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 220px;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--mauve) 30%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mauve) 10%, transparent);
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-worktree-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 8px 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--mauve) 35%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+  font-size: 12px;
+}
+.session-worktree-card.busy {
+  opacity: 0.75;
+}
+.session-worktree-card-text {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.session-worktree-card-title {
+  font-weight: 700;
+}
+.session-worktree-card-detail {
+  color: var(--overlay1);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-worktree-card-status {
+  flex: 1 1 100%;
+  font-size: 11px;
+}
+.session-worktree-card-status.hidden {
+  display: none;
+}
+.session-worktree-card-status.pending {
+  color: var(--yellow);
+}
+.session-worktree-card-status.ok {
+  color: var(--green);
+}
+.session-worktree-card-status.error {
+  color: var(--red);
+}
+.session-worktree-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.session-worktree-card-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+.session-worktree-card-btn.primary {
+  border-color: color-mix(in srgb, var(--mauve) 45%, transparent);
+  background: color-mix(in srgb, var(--mauve) 18%, transparent);
+  color: var(--text);
+}
 .session-window-status {
   flex-shrink: 0;
   padding: 1px 6px;
@@ -7224,6 +7300,22 @@ body.context-focus-active {
 .sessions-project-status.ok { color: var(--green); }
 .sessions-project-status.warn { color: var(--yellow); }
 .sessions-project-status.error { color: var(--red); }
+.sessions-worktree-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.sessions-worktree-toggle {
+  flex-shrink: 0;
+  text-transform: none;
+}
+.sessions-worktree-branch {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.sessions-worktree-branch.hidden { display: none; }
 .sessions-start-btn {
   align-self: flex-start;
   padding: 4px 12px;
@@ -10676,6 +10768,29 @@ body.display-fullscreen-open {
   background: var(--surface0);
   color: var(--subtext1);
   font-size: 11px;
+}
+.log-attachment-link {
+  display: inline-flex;
+  line-height: 0;
+  border-radius: 4px;
+}
+.log-attachment-link:hover .log-attachment-thumb {
+  border-color: var(--blue);
+}
+.log-attachment-missing {
+  border-style: dashed;
+  color: var(--overlay0);
+  font-style: italic;
+}
+/* Display-only session notes (post_session_note / ctl session note):
+   subtle accent so agent annotations read apart from run output. */
+.log-entry[data-kind="session_note"] {
+  border-left: 2px solid var(--mauve);
+  background: color-mix(in srgb, var(--mauve) 6%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.log-entry[data-kind="session_note"] > .log-level {
+  color: var(--mauve);
 }
 .pending-attachment-chip .chip-remove {
   width: 14px;
@@ -22128,6 +22243,17 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                   </div>
                   <div id="new-session-project-status" class="sessions-project-status"></div>
                   <datalist id="new-session-project-options"></datalist>
+                  <div class="sessions-worktree-row">
+                    <label class="sessions-toggle sessions-worktree-toggle" id="new-session-worktree-wrap"
+                           title="Create a fresh git worktree branched off the project's HEAD and run the session inside it. Needs a git repository with at least one commit.">
+                      <input id="new-session-worktree" type="checkbox" onchange="onNewSessionWorktreeToggle()">
+                      Run in a git worktree
+                    </label>
+                    <label class="sessions-new-session-field sessions-worktree-branch hidden" for="new-session-worktree-branch" id="new-session-worktree-branch-row">
+                      Branch name
+                      <input id="new-session-worktree-branch" class="sessions-project-input" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Optional — derived from the session name">
+                    </label>
+                  </div>
                 </div>
                 <div class="sessions-new-agent-row sessions-new-agent-picker">
                   <label class="sessions-new-session-field" for="new-session-agent">
@@ -25467,6 +25593,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'user_display_granted',
   'user_display_revoked',
   'shared_view',
+  // Unique note_id per note makes the JSON.stringify dedupe key exact.
+  'session_note',
   'recording_started',
   'recording_stopped',
   'recording_deleted',
@@ -36968,6 +37096,9 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
+      // Attention center (57-attention-notifications.js): tab badge +
+      // hidden-tab notifications for pending approvals/questions.
+      try { attentionObserveServerMessage(d); } catch (_) {}
       if (d.t === 'ws_denied') {
         const frame = String(d.frame || '');
         if (!wsDeniedToastShown.has(frame)) {
@@ -36985,6 +37116,12 @@ async function main() {
       }
       if (d.event === 'shared_view') {
         handleSharedViewEvent(d);
+        return;
+      }
+      if (d.event === 'session_note') {
+        // Display-only transcript note: rendered end to end in JS (the
+        // WASM presence layer does not know this event).
+        handleSessionNoteEvent(d);
         return;
       }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
@@ -37008,7 +37145,13 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          const cmds = app.handle_server_message(filtered);
+          // session_note entries ride the WASM pipeline as note-styled
+          // log_entry rows (see sessionNoteReplayEntryToLogEntry) so the
+          // replayed transcript keeps chronological order.
+          const cmds = app.handle_server_message({
+            ...filtered,
+            entries: filtered.entries.map(sessionNoteReplayEntryToLogEntry),
+          });
           if (cmds) processCommands(cmds);
         } finally {
           processingLogReplay = wasProcessingLogReplay;
@@ -37311,6 +37454,9 @@ async function main() {
   app.set_on_server_state((connected) => {
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
+    // A dead event stream can't retract pending-request items — drop the
+    // attention badge; the reconnect bootstrap rebuilds what still stands.
+    try { attentionOnServerState(connected); } catch (_) {}
   });
 
   // ── Voice Callbacks ──
@@ -42842,7 +42988,13 @@ function normalizeSessionWindowMeta(meta = {}) {
     out.projectRoot = project;
     out.projectLabel = compactPathLabel(project, true);
   }
-  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || project);
+  // Worktree linkage (an OBJECT — branch/path/base) is distinct from the
+  // legacy string `worktree` cwd alias some callers pass; only the string
+  // form may feed the cwd fallback below.
+  const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
+  if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
+  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
     out.cwd = cwd;
     out.cwdLabel = compactPathLabel(cwd, true);
@@ -42893,6 +43045,24 @@ function normalizeSessionWindowMeta(meta = {}) {
   return out;
 }
 
+// Session worktree linkage from the catalog row / session_meta.json —
+// `{branch, path, base_root, base_branch?, base_sha?}` — normalized to a
+// compact object, or null when absent/malformed.
+function normalizeSessionWorktreeInfo(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const branch = compactSessionText(raw.branch);
+  const path = compactSessionText(raw.path);
+  if (!branch || !path) return null;
+  const info = { branch, path };
+  const baseRoot = compactSessionText(raw.base_root || raw.baseRoot);
+  if (baseRoot) info.baseRoot = baseRoot;
+  const baseBranch = compactSessionText(raw.base_branch || raw.baseBranch);
+  if (baseBranch) info.baseBranch = baseBranch;
+  const baseSha = compactSessionText(raw.base_sha || raw.baseSha);
+  if (baseSha) info.baseSha = baseSha;
+  return info;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -42901,6 +43071,7 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.projectLabel || '',
     meta.cwd || '',
     meta.cwdLabel || '',
+    meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -43309,6 +43480,7 @@ function sessionWindowMetaFromSession(session) {
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
+    worktree: session.worktree,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,
@@ -43582,6 +43754,7 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.codexContextArchive) record.codex_context_archive = meta.codexContextArchive;
   if (meta.projectRoot) record.project_root = meta.projectRoot;
   if (meta.cwd) record.cwd = meta.cwd;
+  if (meta.worktree) record.worktree = meta.worktree;
   if (meta.parentId && meta.relationshipKind) {
     record.parent_session_id = meta.parentId;
     record.relationship = meta.relationshipKind;
@@ -43706,6 +43879,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'log_entry' || !event) {
     if (!content) return null;
     return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
+  }
+  if (event === 'session_note') {
+    const noteText = String(entry.text || content || '').trim();
+    if (!noteText) return null;
+    return {
+      ...base,
+      level: 'info',
+      source: source || 'note',
+      content: noteText,
+      kind: 'session_note',
+      attachment_previews: sessionNoteAttachmentPreviews(entry),
+    };
   }
   if (event === 'model_response') {
     if (!content) {
@@ -46164,6 +46349,7 @@ function buildSessionWindowLogEntry(c) {
   cnt.className = 'log-content';
   renderLogContentElement(cnt, c);
   appendLogStateBadges(cnt, c);
+  appendLogAttachmentStrip(cnt, c);
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
@@ -47818,11 +48004,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
     'unknown',
     'Working directory not known yet'
   );
+  const worktreeBadge = document.createElement('span');
+  worktreeBadge.className = 'session-window-worktree hidden';
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
   metaRow.appendChild(relationStrip);
   metaRow.appendChild(project);
+  metaRow.appendChild(worktreeBadge);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
@@ -47991,6 +48180,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     relationStrip,
     project,
     cwd,
+    worktreeBadge,
     task,
     status,
     goal,
@@ -48075,6 +48265,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
+  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -48110,6 +48301,27 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
+}
+
+// Worktree badge next to the project path: branch name up front, the full
+// linkage (checkout path, base branch/commit) in the tooltip.
+function renderSessionWindowWorktreeBadge(win, worktree) {
+  if (!win?.worktreeBadge) return;
+  if (!worktree?.branch) {
+    win.worktreeBadge.className = 'session-window-worktree hidden';
+    win.worktreeBadge.textContent = '';
+    win.worktreeBadge.title = '';
+    return;
+  }
+  win.worktreeBadge.className = 'session-window-worktree';
+  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
+  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
+  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
+  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
+  if (worktree.baseBranch) {
+    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
+  }
+  win.worktreeBadge.title = lines.join('\n');
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
@@ -48378,6 +48590,7 @@ function sessionWindowRecordFromLogCommand(c) {
     superseded: !!c?.superseded,
     superseded_reason: c?.superseded_reason || c?.supersededReason || '',
     collapsible: !!c?.collapsible,
+    attachment_previews: Array.isArray(c?.attachment_previews) ? c.attachment_previews : [],
   };
 }
 
@@ -49663,6 +49876,141 @@ function appendEditUserMessageButton(entry, c) {
   entry.appendChild(btn);
 }
 
+// Render a log entry's attachment previews as a thumbnail strip.
+// Each preview is { dataUrl?, url?, name?, note?, frameId?, mime? }:
+// `dataUrl` (a data: URL or a same-origin /raw URL) renders as an <img>;
+// `url` additionally wraps the thumb in a click-through link that opens
+// the blob in a new tab. A preview without pixels — or one whose blob was
+// deleted from the upload store (the <img> error path) — degrades to a
+// named chip instead of a broken image.
+function appendLogAttachmentStrip(cnt, c) {
+  const attachmentPreviews = Array.isArray(c?.attachment_previews) ? c.attachment_previews : [];
+  if (attachmentPreviews.length === 0) return;
+  const strip = document.createElement('div');
+  strip.className = 'log-attachment-strip';
+  const missingChip = (att) => {
+    const chip = document.createElement('span');
+    chip.className = 'log-attachment-file';
+    chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
+    return chip;
+  };
+  for (const att of attachmentPreviews) {
+    if (att && att.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'log-attachment-thumb';
+      img.loading = 'lazy';
+      img.src = att.dataUrl;
+      img.alt = '';
+      img.title = att.note || att.name || att.frameId || 'attachment';
+      let holder = img;
+      if (att.url) {
+        const link = document.createElement('a');
+        link.className = 'log-attachment-link';
+        link.href = att.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.title = img.title;
+        link.appendChild(img);
+        holder = link;
+      }
+      img.addEventListener('error', () => {
+        const chip = missingChip(att);
+        chip.classList.add('log-attachment-missing');
+        chip.title = 'attachment unavailable (blob deleted from the upload store)';
+        holder.replaceWith(chip);
+      }, { once: true });
+      strip.appendChild(holder);
+    } else {
+      strip.appendChild(missingChip(att));
+    }
+  }
+  cnt.appendChild(strip);
+}
+
+// ── Session notes (display-only transcript notes) ──
+// Wire shape: { event: 'session_note', session_id, note_id, text,
+// attachments: [{upload_id, name, mime, url}], source?, ts }.
+// Rendered as an ordinary log entry with kind 'session_note' (distinct
+// styling via .log-entry[data-kind=session_note]) and the attachment
+// strip fed by the upload-store /raw URLs.
+
+function sessionNoteAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => ({
+    dataUrl: att?.url || '',
+    url: att?.url || '',
+    name: att?.name || 'image',
+    mime: att?.mime || '',
+  }));
+}
+
+// Normalize a session_note wire event (live WS or a raw replay/session-
+// detail entry) into the log-command shape renderLogEntry consumes.
+function sessionNoteLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: 'info',
+    source: String(d?.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: text,
+    note_id: d?.note_id || d?.noteId || '',
+    event_id: d?.event_id || d?.eventId || (d?.note_id ? `session-note:${d.note_id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+    attachment_previews: sessionNoteAttachmentPreviews(d),
+  };
+}
+
+// Live-path handler for the session_note WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleSessionNoteEvent(d) {
+  const c = sessionNoteLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+}
+
+// QA readback (window.qa convention): the dashboard validator exercises
+// the note rail's module-scoped pieces directly — the attachment strip
+// (including its deleted-blob chip degradation) and the wire-event
+// normalizer. Side-effect-free beyond the DOM node the caller passes in.
+window.qa = Object.assign(window.qa || {}, {
+  sessionNotes: {
+    renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
+    logCommand: (d) => sessionNoteLogCommand(d),
+  },
+});
+
+// Bootstrap-replay adapter: the WASM activity-feed pipeline only carries
+// log_entry-shaped replay rows (AddLogEntry has no attachment fields), so
+// session_note entries replay as note-styled text entries; the session
+// windows and the Sessions detail view re-attach the thumbnails from the
+// raw entries. The content deliberately stays byte-identical to the raw
+// note text so the transcript-signature dedupe collapses this row with
+// the attachment-bearing record the external window sync later inserts.
+// Everything else passes through untouched.
+function sessionNoteReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'session_note') return entry;
+  return {
+    event: 'log_entry',
+    level: 'info',
+    source: String(entry.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
@@ -49686,34 +50034,13 @@ function renderLogEntry(c) {
   appendLogStateBadges(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
-  const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];
   if (hasImages) {
     const badge = document.createElement('span');
     badge.className = 'log-image-badge';
     badge.textContent = c.images.length === 1 ? '[screenshot]' : '[' + c.images.length + ' screenshots]';
     cnt.appendChild(badge);
   }
-  if (attachmentPreviews.length > 0) {
-    const strip = document.createElement('div');
-    strip.className = 'log-attachment-strip';
-    for (const att of attachmentPreviews) {
-      if (att && att.dataUrl) {
-        const img = document.createElement('img');
-        img.className = 'log-attachment-thumb';
-        img.loading = 'lazy';
-        img.src = att.dataUrl;
-        img.alt = '';
-        img.title = att.note || att.name || att.frameId || 'attachment';
-        strip.appendChild(img);
-      } else {
-        const chip = document.createElement('span');
-        chip.className = 'log-attachment-file';
-        chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
-        strip.appendChild(chip);
-      }
-    }
-    cnt.appendChild(strip);
-  }
+  appendLogAttachmentStrip(cnt, c);
 
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
@@ -49973,16 +50300,19 @@ function setPhase(phase) {
   stationScheduleUpdate();
 }
 
-// Cross-tab pending-approval indicator: badge the favicon + prefix the page
-// title so a pending approval is visible even when this tab is in the
-// background. Browsers (esp. Chrome) ignore an in-place href change on the
-// existing <link rel=icon>, so we remove it and append a fresh <link> each
-// time. The badged icon is composited on a canvas (app icon + attention dot),
-// with a solid-tile fallback if the base icon can't load; the title change
-// signals it regardless of canvas support.
-const _origDocTitle = document.title;
-let _approvalIndicatorOn = false;
+// Cross-tab pending-request indicator: SUPERSEDED by the attention center
+// (57-attention-notifications.js), which tracks the full pending set
+// (approvals + questions, across sessions, from the event stream) and owns
+// the title prefix + favicon count badge. The panel show/clear paths still
+// call this hook; it just nudges the center to repaint so panel-driven
+// transitions repaint promptly.
+function setApprovalIndicator(_pending) {
+  try { attentionRepaint(); } catch (_) {}
+}
 
+// Browsers (esp. Chrome) ignore an in-place href change on the existing
+// <link rel=icon>, so replace the element wholesale. Used by the attention
+// center's favicon badge.
 function _swapFavicon(href) {
   document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
   const link = document.createElement('link');
@@ -49991,42 +50321,6 @@ function _swapFavicon(href) {
   link.type = 'image/png';
   link.href = href;
   document.head.appendChild(link);
-}
-
-function _drawApprovalBadge(ctx, size) {
-  // bottom-right attention dot with a dark ring so it reads on any icon
-  const r = size * 0.30, cx = size - r - 1, cy = size - r - 1;
-  ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, 2 * Math.PI);
-  ctx.fillStyle = '#1e1e2e'; ctx.fill();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-  ctx.fillStyle = '#f38ba0'; ctx.fill();
-}
-
-function setApprovalIndicator(pending) {
-  if (pending === _approvalIndicatorOn) return;
-  _approvalIndicatorOn = pending;
-  document.title = pending ? '● Approval needed — ' + _origDocTitle : _origDocTitle;
-  if (!pending) { _swapFavicon('/icon-128.png'); return; }
-  const size = 64;
-  const c = document.createElement('canvas');
-  c.width = size; c.height = size;
-  const ctx = c.getContext('2d');
-  const finish = function() {
-    try { if (_approvalIndicatorOn) _swapFavicon(c.toDataURL('image/png')); } catch (_) {}
-  };
-  const img = new Image();
-  img.onload = function() {
-    try { ctx.drawImage(img, 0, 0, size, size); } catch (_) {}
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.onerror = function() {
-    ctx.fillStyle = '#313244';
-    ctx.fillRect(0, 0, size, size);
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.src = '/icon-128.png';
 }
 
 function clearPendingApproval() {
@@ -52288,9 +52582,16 @@ function accessModelLabel(value, fallback = '') {
 
 function accessOverviewTargetLabelMap(overview) {
   const map = new Map();
+  // First writer wins on BOTH keys. The daemon emits the local target as
+  // the first targets[] row, and a manually added same-host peer can carry
+  // the very same id/host_id (PeerId is `intendant:<host label>`, and host
+  // labels collide when two daemons share a hostname). Letting a later peer
+  // row overwrite the key relabelled every local-daemon grant with the
+  // peer's name — "Root on qa-peer-b" for a grant on this daemon
+  // (design-overhaul QA fleet, access finding FR-3).
   for (const target of Array.isArray(overview.targets) ? overview.targets : []) {
     const id = accessModelLabel(target.id || target.host_id);
-    if (id) map.set(id, accessModelLabel(target.label, id));
+    if (id && !map.has(id)) map.set(id, accessModelLabel(target.label, id));
     const hostId = accessModelLabel(target.host_id);
     if (hostId && !map.has(hostId)) map.set(hostId, accessModelLabel(target.label, hostId));
   }
@@ -76547,7 +76848,15 @@ function onSessionEnded(sessionId, reason, errorKind) {
   } else if (explicitStop) {
     clearPendingFollowUpsForSession(sid, reason || 'session stopped');
     removeSessionRelationshipsForSession(sid);
-    removeSessionWindow(sid);
+    // A worktree-backed session leaves a decision behind (merge / remove /
+    // keep the worktree), so its window survives an explicit stop to host
+    // the finish card; dismissing the card completes the removal.
+    if (sessionWorktreeFinishInfo(sid)) {
+      updateSessionWindow(sid, { phase: 'done', ended: true });
+      maybeShowWorktreeFinishCard(sid, { removeWindowOnDismiss: true });
+    } else {
+      removeSessionWindow(sid);
+    }
   } else if (restarting) {
     clearPendingFollowUpsForSession(sid, reason || 'restarting session');
     updateSessionWindow(sid, { phase: 'idle', ended: false });
@@ -76557,6 +76866,7 @@ function onSessionEnded(sessionId, reason, errorKind) {
     setSessionWindowDetached(sid, true, reason || 'session ended');
   } else if (sid) {
     updateSessionWindow(sid, { phase: 'done', ended: true });
+    maybeShowWorktreeFinishCard(sid);
   }
   if (!keepExternalDetached && (!sessionId || sessionId === currentSessionFullId)) {
     currentSessionFullId = '';
@@ -76584,6 +76894,197 @@ function onSessionEnded(sessionId, reason, errorKind) {
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
+}
+
+// ── Worktree finish card ───────────────────────────────────────────────────
+// When a session that ran in a git worktree ends, its window offers the
+// three explicit outcomes for the branch it leaves behind: merge it back
+// into the base checkout (and remove the checkout), remove the checkout
+// via the same safety-checked path as the Worktrees tab, or keep it.
+// Nothing is ever automatic — the worktree persists until a click.
+
+const worktreeFinishCardDismissed = new Set();
+
+function sessionWorktreeFinishInfo(sid) {
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return meta.worktree && meta.worktree.branch && meta.worktree.path ? meta.worktree : null;
+}
+
+// The linkage rides the session catalog row (from session_meta.json); it is
+// normally hydrated well before the session ends, but fetch once on demand
+// for windows that never saw a metadata refresh.
+async function hydrateSessionWorktreeFinishInfo(sid) {
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) return existing;
+  let sessions = null;
+  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
+    try {
+      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
+    } catch (_) {}
+  }
+  if (!sessions) {
+    try {
+      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
+      if (!r.ok) return null;
+      sessions = await r.json();
+    } catch (_) {
+      return null;
+    }
+  }
+  if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
+  return sessionWorktreeFinishInfo(sid);
+}
+
+function maybeShowWorktreeFinishCard(sid, options = {}) {
+  if (!sid || worktreeFinishCardDismissed.has(sid)) return;
+  const attach = info => {
+    if (!info || worktreeFinishCardDismissed.has(sid)) return;
+    const win = sessionWindows.get(sid);
+    if (!win || win.worktreeCard) return;
+    renderWorktreeFinishCard(win, sid, info, options);
+  };
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) {
+    attach(existing);
+    return;
+  }
+  hydrateSessionWorktreeFinishInfo(sid).then(attach).catch(() => {});
+}
+
+function dismissWorktreeFinishCard(sid, options = {}) {
+  worktreeFinishCardDismissed.add(sid);
+  const win = sessionWindows.get(sid);
+  if (win?.worktreeCard) {
+    win.worktreeCard.remove();
+    win.worktreeCard = null;
+  }
+  // An explicitly stopped session only kept its window to host this card;
+  // finishing the decision completes the original removal.
+  if (options.removeWindowOnDismiss) removeSessionWindow(sid);
+}
+
+function renderWorktreeFinishCard(win, sid, info, options = {}) {
+  const card = document.createElement('div');
+  card.className = 'session-worktree-card';
+  card.setAttribute('role', 'status');
+
+  const text = document.createElement('div');
+  text.className = 'session-worktree-card-text';
+  const title = document.createElement('div');
+  title.className = 'session-worktree-card-title';
+  title.textContent = `Session ended — worktree branch ${info.branch} is still checked out.`;
+  const detail = document.createElement('div');
+  detail.className = 'session-worktree-card-detail';
+  detail.textContent = info.path;
+  detail.title = info.path;
+  text.appendChild(title);
+  text.appendChild(detail);
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'session-worktree-card-status hidden';
+
+  const actions = document.createElement('div');
+  actions.className = 'session-worktree-card-actions';
+  const mergeBtn = document.createElement('button');
+  mergeBtn.type = 'button';
+  mergeBtn.className = 'ui-btn session-worktree-card-btn primary';
+  mergeBtn.textContent = info.baseBranch
+    ? `Merge into ${info.baseBranch} & remove worktree`
+    : 'Merge & remove worktree';
+  mergeBtn.title = info.baseBranch
+    ? `git merge ${info.branch} in ${info.baseRoot || 'the base checkout'} (on ${info.baseBranch}), then remove the worktree checkout. Aborts cleanly on conflict.`
+    : 'Merge the worktree branch into the base checkout, then remove the checkout.';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'ui-btn session-worktree-card-btn';
+  removeBtn.textContent = 'Remove worktree';
+  removeBtn.title = 'Remove the checkout without merging (refused if it has uncommitted or unmerged work). The branch ref is kept.';
+  const keepBtn = document.createElement('button');
+  keepBtn.type = 'button';
+  keepBtn.className = 'ui-btn session-worktree-card-btn';
+  keepBtn.textContent = 'Keep';
+  keepBtn.title = 'Keep the worktree and dismiss. It stays available in Sessions -> Worktrees.';
+  actions.appendChild(mergeBtn);
+  actions.appendChild(removeBtn);
+  actions.appendChild(keepBtn);
+
+  const setBusy = busy => {
+    for (const btn of [mergeBtn, removeBtn, keepBtn]) btn.disabled = busy;
+    card.classList.toggle('busy', busy);
+  };
+  const showStatus = (kind, message) => {
+    statusLine.className = `session-worktree-card-status ${kind}`;
+    statusLine.textContent = message;
+  };
+  const finishResolved = message => {
+    card.classList.remove('busy');
+    showStatus('ok', message);
+    actions.replaceChildren();
+    const dismissBtn = document.createElement('button');
+    dismissBtn.type = 'button';
+    dismissBtn.className = 'ui-btn session-worktree-card-btn';
+    dismissBtn.textContent = 'Dismiss';
+    dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+    actions.appendChild(dismissBtn);
+  };
+  const callWorktreeAction = async (method, url, payload) => {
+    const r = await dashboardTransport.jsonFetch(method, payload, () => (
+      authedFetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    ), method, { fallbackAfterRpcFailure: false });
+    const textBody = await r.text();
+    let result = {};
+    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `${url} returned ${r.status}`);
+    }
+    return result;
+  };
+
+  mergeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', `Merging ${info.branch}...`);
+    try {
+      const result = await callWorktreeAction(
+        'api_worktrees_merge',
+        '/api/worktrees/merge',
+        { session_id: sid },
+      );
+      showControlToast('success', `Merged ${info.branch} into ${result.merged_into || info.baseBranch || 'the base branch'}.`);
+      finishResolved(result.removed
+        ? `Merged into ${result.merged_into || 'the base branch'} and removed the worktree.`
+        : `Merged into ${result.merged_into || 'the base branch'}. Worktree kept: ${result.removal_error || 'removal was refused'}.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree merge failed.');
+    }
+  });
+  removeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', 'Removing the worktree...');
+    try {
+      await callWorktreeAction(
+        'api_worktrees_remove',
+        '/api/worktrees/remove',
+        { repo_root: info.baseRoot || '', path: info.path },
+      );
+      showControlToast('success', 'Worktree removed.');
+      finishResolved(`Removed the worktree. Branch ${info.branch} is kept.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree removal was refused.');
+    }
+  });
+  keepBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+
+  card.appendChild(text);
+  card.appendChild(statusLine);
+  card.appendChild(actions);
+  win.el.insertBefore(card, win.log);
+  win.worktreeCard = card;
 }
 
 const TASK_TEXTAREA_MIN_HEIGHT_PX = 28;
@@ -79374,11 +79875,12 @@ function fsPathLooksAbsolute(path) {
 /* ── static/app/55-files-ide.js ── */
 // ── Files tab: editor ──
 //
-// A small IDE over the fs API family. Reads ride GET /api/fs/* (or the
-// api_fs_* tunnel methods), writes ride POST /api/fs/write (or api_fs_write
-// upload frames). Peers are reached over their dashboard-control tunnel and
-// enforce their own IAM profile + filesystem write roots server-side; this
-// UI only decides *where* to send a request, never *whether* it is allowed.
+// A small IDE over the fs API family. Every fs call rides the daemonApi
+// facade (32-daemon-api.js, transport program F1): target '' is this
+// daemon (tunnel first, direct HTTP per the facade's verb-derived fallback
+// policy), a hostId is that peer's dashboard-control tunnel. Peers enforce
+// their own IAM profile + filesystem write roots server-side; this UI only
+// decides *where* to send a request, never *whether* it is allowed.
 // Saves are optimistic-concurrency: every read keeps the content sha256 and
 // every save sends it back as expected_sha256; a 409 opens the
 // reload/overwrite banner instead of clobbering.
@@ -79465,80 +79967,37 @@ function filesIdeEnsureEditorLib() {
   return filesIdeLibPromise;
 }
 
-// -- transport: one call surface for "this daemon" (HTTP or connect tunnel)
-//    and peers (their dashboard-control tunnel)
+// -- transport: every fs call rides the daemonApi facade (F1). hostId ''
+//    targets this daemon — the facade prefers the dashboard-control tunnel
+//    and applies the verb-derived fallback policy (GET twins may fall back
+//    to HTTP and retry; POST twins never replay after an attempted send).
+//    A non-empty hostId targets that peer's tunnel (peers have no HTTP
+//    lane by design). Availability checks route through
+//    daemonApi.availability; the read-only / reconnect envelopes below
+//    keep the exact strings this UI surfaced before the migration.
 
-function filesIdeNormalizePayload(payload) {
-  const rawStatus = Number(payload?._httpStatus);
-  const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 200;
-  const ok = typeof payload?._httpOk === 'boolean' ? payload._httpOk : status >= 200 && status < 300;
-  let body = payload;
-  if (body && typeof body === 'object' && !Array.isArray(body)) {
-    body = { ...body };
-    delete body._httpStatus;
-    delete body._httpOk;
-  }
-  return { ok, status, body: body || {} };
-}
-
-async function filesIdePeerConnection(hostId) {
-  const conn = await peerDashboardControlConnectionForHost(hostId, { timeoutMs: 30000 });
-  if (!conn) throw new Error('Peer tunnel unavailable');
-  return conn;
-}
-
-async function filesIdeRpc(hostId, method, params, httpFallback) {
-  if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    const payload = await conn.request(method, params);
-    return filesIdeNormalizePayload(payload);
-  }
-  const resp = await dashboardJsonFetch(method, params, httpFallback, method);
-  const body = await resp.json().catch(() => ({}));
-  return { ok: resp.ok, status: resp.status, body: body || {} };
+function filesIdeRpc(hostId, method, params) {
+  return daemonApi.request(method, params, { target: hostId || null });
 }
 
 function filesIdeList(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_list', { path }, () =>
-    authedFetch('/api/fs/list?path=' + encodeURIComponent(path))
-  );
+  return filesIdeRpc(hostId, 'api_fs_list', { path });
 }
 
 function filesIdeStat(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_stat', { path }, () =>
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(path))
-  );
+  return filesIdeRpc(hostId, 'api_fs_stat', { path });
 }
 
 function filesIdeMkdir(hostId, path) {
-  return filesIdeRpc(hostId, 'api_fs_mkdir', { path }, () =>
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_mkdir', { path });
 }
 
 function filesIdeRename(hostId, from, to) {
-  return filesIdeRpc(hostId, 'api_fs_rename', { from, to }, () =>
-    authedFetch('/api/fs/rename', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to }),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_rename', { from, to });
 }
 
 function filesIdeDeleteRpc(hostId, path, recursive) {
-  const params = recursive ? { path, recursive: true } : { path };
-  return filesIdeRpc(hostId, 'api_fs_delete', params, () =>
-    authedFetch('/api/fs/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    })
-  );
+  return filesIdeRpc(hostId, 'api_fs_delete', recursive ? { path, recursive: true } : { path });
 }
 
 async function filesIdeSha256Hex(bytes) {
@@ -79552,78 +80011,52 @@ async function filesIdeSha256Hex(bytes) {
 }
 
 /// Read a whole file: {bytes: Uint8Array, sha256: string}. The sha comes from
-/// the daemon when it offers one (X-Content-Sha256 / result.sha256) so the
-/// conflict baseline matches what the daemon will hash at save time; older
-/// peers without it fall back to a local digest of the same bytes.
+/// the daemon when it offers one (byte-stream result.sha256 / the HTTP
+/// X-Content-Sha256 header — both land in meta.sha256) so the conflict
+/// baseline matches what the daemon will hash at save time; older peers
+/// without it fall back to a local digest of the same bytes.
 async function filesIdeReadFile(hostId, path) {
-  if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    const result = await conn.requestBytes('api_fs_read', { path });
-    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
-    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
-    const sha = typeof result?.sha256 === 'string' && result.sha256
-      ? result.sha256
-      : await filesIdeSha256Hex(bytes);
-    return { bytes, sha256: sha };
+  if (!hostId && dashboardConnectModeEnabled() && !daemonApi.availability('api_fs_read').ok) {
+    throw new Error('File reads are unavailable until this dashboard reconnects');
   }
-  if (dashboardConnectModeEnabled()) {
-    if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
-      throw new Error('File reads are unavailable until this dashboard reconnects');
-    }
-    const result = await dashboardControlTransport.requestBytes('api_fs_read', { path });
-    if (result?.ok === false) throw new Error(result?.error || 'File read failed');
-    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(0);
-    const sha = typeof result?.sha256 === 'string' && result.sha256
-      ? result.sha256
-      : await filesIdeSha256Hex(bytes);
-    return { bytes, sha256: sha };
-  }
-  const resp = await authedFetch('/api/fs/read?path=' + encodeURIComponent(path));
-  if (!resp.ok) {
-    const detail = await resp.json().catch(() => ({}));
-    throw new Error(detail.error || `File read failed (${resp.status})`);
-  }
-  const buffer = await resp.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const sha = resp.headers?.get?.('x-content-sha256') || (await filesIdeSha256Hex(bytes));
-  return { bytes, sha256: sha };
+  const { bytes, meta } = await daemonApi.bytes('api_fs_read', { path }, { target: hostId || null });
+  const sha256 = meta.sha256 || (await filesIdeSha256Hex(bytes));
+  return { bytes, sha256 };
 }
 
-/// Write a whole file. Returns the normalized {ok, status, body} response;
+/// Write a whole file. Returns the facade's {ok, status, body} envelope;
 /// 409 bodies carry {code, current_sha256, ...} for the conflict banner.
+/// api_fs_write is a POST twin, so the facade never replays it over HTTP
+/// after a tunnel attempt that may have reached the daemon.
 async function filesIdeWriteFile(hostId, path, bytes, opts = {}) {
   const params = { path };
   if (opts.expected_sha256) params.expected_sha256 = opts.expected_sha256;
   if (opts.create_new) params.create_new = true;
   if (opts.force) params.force = true;
-  const requestOpts = { signal: opts.signal, timeoutMs: opts.timeoutMs };
   if (hostId) {
-    const conn = await filesIdePeerConnection(hostId);
-    if (conn.lastStatus && conn.lastStatus.api_fs_write_available === false) {
+    // A peer granting read-only file access advertises
+    // api_fs_write_available:false — surface the same friendly envelope
+    // this UI always showed instead of the raw authorizer text.
+    const avail = daemonApi.availability('api_fs_write', hostId);
+    if (!avail.ok && avail.reason === 'denied') {
       return {
         ok: false,
         status: 403,
         body: { error: `${filesIdeHostLabel(hostId)} grants read-only file access to this daemon` },
       };
     }
-    const payload = await conn.uploadBytes('api_fs_write', params, bytes, requestOpts);
-    return filesIdeNormalizePayload(payload);
+  } else if (dashboardConnectModeEnabled() && !daemonApi.availability('api_fs_write').ok) {
+    return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
   }
-  if (dashboardConnectModeEnabled()) {
-    if (!(dashboardTransport?.canUseRpc?.() && dashboardControlTransport?.lastStatus?.api_fs_write_available !== false)) {
-      return { ok: false, status: 503, body: { error: 'File writes are unavailable until this dashboard reconnects' } };
-    }
-    const payload = await dashboardControlTransport.uploadBytes('api_fs_write', params, bytes, requestOpts);
-    return filesIdeNormalizePayload(payload);
-  }
-  const resp = await authedFetch('/api/fs/write', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...params, content_b64: dashboardControlBytesToBase64(bytes) }),
+  return daemonApi.upload('api_fs_write', params, bytes, {
+    target: hostId || null,
     signal: opts.signal,
+    // Family default when the caller sets no deadline: scale with the
+    // payload like the transfers lane does — the transport's flat
+    // per-method default is sized for small JSON RPCs, not a fs write
+    // that may carry up to UPLOAD_MAX_BYTES.
+    timeoutMs: opts.timeoutMs ?? rangedDownloadTimeoutMs(Number(bytes?.byteLength ?? bytes?.size) || 0),
   });
-  const body = await resp.json().catch(() => ({}));
-  return { ok: resp.ok, status: resp.status, body: body || {} };
 }
 
 // -- tree pane
@@ -80893,10 +81326,8 @@ async function resolveFsPickerListTarget(target) {
   if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
     return { listPath: target, selectedPath: '' };
   }
-  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
-  ), 'api_fs_stat');
-  const status = await resp.json().catch(() => ({}));
+  const resp = await filesIdeStat('', target);
+  const status = resp.body;
   if (!resp.ok) return { listPath: target, selectedPath: '' };
   if (status.exists && status.is_file && status.parent) {
     return { listPath: status.parent, selectedPath: status.path || target };
@@ -80929,10 +81360,8 @@ async function loadFsPicker(path) {
     fsPickerSelectedPath = resolved.selectedPath || '';
     fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
     fsPickerAnchorPath = fsPickerSelectedPath;
-    const resp = await dashboardJsonFetch('api_fs_list', { path: resolved.listPath }, () => (
-      authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath))
-    ), 'api_fs_list');
-    const data = await resp.json().catch(() => ({}));
+    const resp = await filesIdeList('', resolved.listPath);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
     const statusText = fsPickerSelectedPath
@@ -81185,14 +81614,10 @@ async function createPickerDirectory() {
   const path = document.getElementById('fs-picker-path')?.value.trim() || '';
   if (!path) return;
   setFsPickerStatus('', 'Creating directory...');
-  const resp = await dashboardJsonFetch('api_fs_mkdir', { path }, () => (
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    })
-  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // api_fs_mkdir is a POST twin: the facade's no-replay policy covers the
+  // fallbackAfterRpcFailure:false this call used to pass by hand.
+  const resp = await filesIdeMkdir('', path);
+  const data = resp.body;
   if (!resp.ok) {
     setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);
     return;
@@ -82438,6 +82863,13 @@ async function startNewSession() {
   } else if (execution === 'direct' || direct) {
     msg.direct = true;
   }
+  // Worktree launch: the daemon validates/derives the branch, creates the
+  // worktree off the project's HEAD, and roots the session inside it.
+  if (document.getElementById('new-session-worktree')?.checked) {
+    msg.worktree = true;
+    const worktreeBranch = document.getElementById('new-session-worktree-branch')?.value.trim() || '';
+    if (worktreeBranch) msg.worktree_branch = worktreeBranch;
+  }
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {
@@ -82460,6 +82892,14 @@ async function startNewSession() {
   }
 }
 window.startNewSession = startNewSession;
+
+// Reveal the optional branch-name input only while the worktree launch is
+// requested; an untouched form stays exactly as before.
+function onNewSessionWorktreeToggle() {
+  const checked = !!document.getElementById('new-session-worktree')?.checked;
+  document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
+}
+window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
 
 /* ── static/app/56-debug-sessions.js ── */
 // ── Debug Screen ──
@@ -87166,7 +87606,15 @@ function buildSessionDetailRows(entries) {
   let lastTurn = null;
   const visibleLevels = sessionDetailVisibleLevels();
 
-  for (const e of entries || []) {
+  for (let e of entries || []) {
+    // Display-only session notes carry their body in `text` and their
+    // image references in `attachments`; normalize them into the generic
+    // record shape (content + attachment_previews) the renderer expects.
+    if (e && e.event === 'session_note') {
+      const note = sessionNoteLogCommand(e);
+      if (!note) continue;
+      e = { ...e, ...note };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -87381,6 +87829,7 @@ function materializeSessionDetailRow(view, row, index) {
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + e.level;
   entry.dataset.detailRowIndex = String(index);
+  if (e.kind) entry.dataset.kind = e.kind;
   const sourceClass = String(e.source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   if (sourceClass) entry.classList.add('source-' + sourceClass);
   if (e.session_id) entry.dataset.sessionId = e.session_id;
@@ -87446,6 +87895,7 @@ function materializeSessionDetailRow(view, row, index) {
     content: e.content
   });
   appendLogStateBadges(cnt, e);
+  appendLogAttachmentStrip(cnt, e);
   if (sessionDetailLevelColors[e.level]) cnt.style.color = sessionDetailLevelColors[e.level];
 
   entry.appendChild(ts);
@@ -87629,6 +88079,350 @@ function loadNewerSessionDetailRows(view) {
   return true;
 }
 
+/* ── static/app/57-attention-notifications.js ── */
+// ── Attention center: pending agent→user requests ──────────────────────
+//
+// A generic set of "attention items" — requests from the agent that block
+// on the human — fed from the same server events the panels render
+// (approval_required / user_question / approval_resolved, plus session
+// terminations), keyed by (kind, session, id) so future kinds (display
+// requests, agent notify) drop in cheaply.
+//
+// Surfaces, in escalation order:
+//   1. document-title prefix `(N)` + favicon count badge — default ON
+//      (harmless), toggleable. Supersedes fragment 41's single-approval
+//      indicator (`setApprovalIndicator` now delegates here): this set
+//      counts every pending request across sessions instead of tracking
+//      one panel.
+//   2. a browser Notification when an item arrives while the tab is
+//      hidden — default OFF; permission is requested only from the
+//      explicit settings toggle, never on load. Click focuses the tab and
+//      the owning session. Bursts debounce into one notification.
+//   3. (not this file) closed tabs entirely: the daemon nudges the Connect
+//      rendezvous and opted-in browsers get a Web Push
+//      (src/bin/caller/attention_nudge.rs, src/bin/connect/push.rs).
+//
+// Wire-in points (fragment 36): the server-message dispatcher calls
+// attentionObserveServerMessage(d) after its dedupe check, and the WASM
+// server-state callback calls attentionOnServerState(connected).
+
+const ATTENTION_BADGE_KEY = 'intendant.attention.badge'; // 'off' disables; default on
+const ATTENTION_NOTIFY_KEY = 'intendant.attention.notify'; // 'on' enables; default off
+const ATTENTION_NOTIFY_DEBOUNCE_MS = 1500;
+
+// key "kind:sessionKey:id" -> { kind, sessionId, id }
+const attentionItems = new Map();
+// Keys already announced via Notification in this page's lifetime — a WS
+// flap (clear + bootstrap re-send of still-pending asks) must not
+// re-notify about the same request.
+const attentionNotifiedKeys = new Set();
+let attentionTitleBase = null;
+let attentionTitleComposed = null;
+let attentionNotifyTimer = null;
+let attentionNotifyPending = [];
+let attentionOpenNotifications = [];
+
+function attentionBadgeEnabled() {
+  try { return localStorage.getItem(ATTENTION_BADGE_KEY) !== 'off'; } catch (_) { return true; }
+}
+
+function attentionNotifySupported() {
+  return typeof Notification !== 'undefined';
+}
+
+function attentionNotifyEnabled() {
+  if (!attentionNotifySupported()) return false;
+  try {
+    return localStorage.getItem(ATTENTION_NOTIFY_KEY) === 'on'
+      && Notification.permission === 'granted';
+  } catch (_) { return false; }
+}
+
+function attentionSessionKey(sessionId) {
+  return (sessionId && String(sessionId)) || 'main';
+}
+
+function attentionKey(kind, sessionId, id) {
+  return `${kind}:${attentionSessionKey(sessionId)}:${String(id)}`;
+}
+
+function attentionAdd(kind, sessionId, id, live) {
+  if (id === undefined || id === null) return;
+  const key = attentionKey(kind, sessionId, id);
+  const isNew = !attentionItems.has(key);
+  attentionItems.set(key, { kind, sessionId: sessionId || '', id });
+  if (isNew && live && document.hidden && !attentionNotifiedKeys.has(key)) {
+    attentionNotifiedKeys.add(key);
+    attentionQueueNotification(key);
+  }
+  attentionRepaint();
+}
+
+function attentionRemove(kind, sessionId, id) {
+  attentionItems.delete(attentionKey(kind, sessionId, id));
+}
+
+function attentionClearSession(sessionId) {
+  const sessionKey = attentionSessionKey(sessionId);
+  for (const [key, item] of [...attentionItems]) {
+    if (attentionSessionKey(item.sessionId) === sessionKey) attentionItems.delete(key);
+  }
+}
+
+function attentionClearAll() {
+  attentionItems.clear();
+  attentionRepaint();
+}
+
+// One observer for every server event, live or replayed. Replay
+// (log_replay bootstrap) rebuilds the set silently — no notifications for
+// history; the daemon's still-pending re-sends arrive as ordinary live
+// events and take the normal path.
+function attentionObserveServerMessage(d) {
+  if (!d || typeof d !== 'object') return;
+  if (d.t === 'log_replay' && Array.isArray(d.entries)) {
+    for (const entry of d.entries) attentionApplyEvent(entry, false);
+    attentionRepaint();
+    return;
+  }
+  attentionApplyEvent(d, true);
+}
+
+function attentionApplyEvent(d, live) {
+  const ev = d && d.event;
+  if (!ev) return;
+  if (ev === 'approval_required') {
+    attentionAdd('approval', d.session_id, d.id, live);
+  } else if (ev === 'user_question') {
+    attentionAdd('question', d.session_id, d.id, live);
+  } else if (ev === 'approval_resolved') {
+    // Approvals and questions share the id space; resolve either.
+    attentionRemove('approval', d.session_id, d.id);
+    attentionRemove('question', d.session_id, d.id);
+    attentionRepaint();
+  } else if (ev === 'task_complete' || ev === 'session_ended' || ev === 'interrupted') {
+    // The blocked loop returned — nothing in that session still waits
+    // (some exit paths skip approval_resolved).
+    attentionClearSession(d.session_id);
+    attentionRepaint();
+  }
+}
+
+// Event-stream connection state (fragment 36's set_on_server_state): a
+// dead stream can't retract items, so a stale badge would lie — clear and
+// let the reconnect bootstrap rebuild what is still pending.
+function attentionOnServerState(connected) {
+  if (!connected) attentionClearAll();
+}
+
+// ── Title + favicon badge ──
+
+function attentionRepaint() {
+  const count = attentionBadgeEnabled() ? attentionItems.size : 0;
+  // Re-capture the base whenever someone else last wrote the title.
+  if (attentionTitleBase === null || document.title !== attentionTitleComposed) {
+    attentionTitleBase = document.title.replace(/^\(\d+\+?\)\s+/, '');
+  }
+  const composed = count > 0 ? `(${count > 99 ? '99+' : count}) ${attentionTitleBase}` : attentionTitleBase;
+  if (document.title !== composed) document.title = composed;
+  attentionTitleComposed = composed;
+  attentionPaintFavicon(count);
+}
+
+let attentionFaviconLastCount = 0;
+function attentionPaintFavicon(count) {
+  if (count === attentionFaviconLastCount) return;
+  attentionFaviconLastCount = count;
+  if (typeof _swapFavicon !== 'function') return;
+  if (count === 0) { _swapFavicon('/icon-128.png'); return; }
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const drawBadge = () => {
+    const label = count > 9 ? '9+' : String(count);
+    const r = size * 0.30, cx = size - r - 1, cy = size - r - 1;
+    ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, 2 * Math.PI);
+    ctx.fillStyle = '#1e1e2e'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+    ctx.fillStyle = '#f38ba0'; ctx.fill();
+    ctx.fillStyle = '#11111b';
+    ctx.font = `bold ${label.length > 1 ? 22 : 27}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, cx, cy + 1);
+    // Only install if a request is still pending by the time the base
+    // image resolved.
+    try { if (attentionFaviconLastCount > 0) _swapFavicon(canvas.toDataURL('image/png')); } catch (_) {}
+  };
+  const img = new Image();
+  img.onload = () => { try { ctx.drawImage(img, 0, 0, size, size); } catch (_) {} drawBadge(); };
+  img.onerror = () => { ctx.fillStyle = '#313244'; ctx.fillRect(0, 0, size, size); drawBadge(); };
+  img.src = '/icon-128.png';
+}
+
+// ── Hidden-tab Notifications ──
+
+function attentionQueueNotification(key) {
+  if (!attentionNotifyEnabled()) return;
+  attentionNotifyPending.push(key);
+  if (attentionNotifyTimer) return;
+  attentionNotifyTimer = setTimeout(() => {
+    attentionNotifyTimer = null;
+    const keys = attentionNotifyPending.splice(0);
+    // Only announce what is still pending after the debounce window.
+    const items = keys.map((k) => attentionItems.get(k)).filter(Boolean);
+    if (!items.length || !document.hidden || !attentionNotifyEnabled()) return;
+    attentionShowNotification(items);
+  }, ATTENTION_NOTIFY_DEBOUNCE_MS);
+}
+
+function attentionShowNotification(items) {
+  const approvals = items.filter((i) => i.kind === 'approval').length;
+  const questions = items.filter((i) => i.kind === 'question').length;
+  let title;
+  if (items.length === 1) {
+    title = questions ? 'Intendant: the agent has a question' : 'Intendant: approval needed';
+  } else {
+    const parts = [];
+    if (approvals) parts.push(`${approvals} approval${approvals > 1 ? 's' : ''}`);
+    if (questions) parts.push(`${questions} question${questions > 1 ? 's' : ''}`);
+    title = `Intendant: ${parts.join(' and ')} waiting`;
+  }
+  const total = attentionItems.size;
+  const body = total > items.length
+    ? `${total} requests are waiting for you.`
+    : 'The agent is waiting for you.';
+  const focusSessionId = items[0].sessionId || '';
+  try {
+    const notification = new Notification(title, {
+      body,
+      // One stacked notification per dashboard: later bursts replace it.
+      tag: 'intendant-attention',
+      icon: '/icon-128.png',
+    });
+    notification.onclick = () => {
+      try { window.focus(); } catch (_) {}
+      if (focusSessionId && typeof focusSessionWindow === 'function') {
+        try { focusSessionWindow(focusSessionId); } catch (_) {}
+      }
+      notification.close();
+    };
+    attentionOpenNotifications.push(notification);
+  } catch (_) {
+    // Constructor can throw on some platforms (e.g. Android Chrome
+    // requires ServiceWorker notifications) — the badge still stands.
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    for (const notification of attentionOpenNotifications.splice(0)) {
+      try { notification.close(); } catch (_) {}
+    }
+  }
+});
+
+// ── Settings card (badge + notification toggles; browser-local) ──
+
+function attentionToggleRow(labelText, subText, checkbox) {
+  const row = document.createElement('div');
+  row.className = 'settings-row attention-toggle-row';
+  const label = document.createElement('label');
+  label.style.display = 'flex';
+  label.style.alignItems = 'center';
+  label.style.gap = '8px';
+  label.style.cursor = 'pointer';
+  checkbox.type = 'checkbox';
+  label.appendChild(checkbox);
+  const meta = document.createElement('span');
+  const title = document.createElement('span');
+  title.textContent = labelText;
+  const sub = document.createElement('small');
+  sub.textContent = subText;
+  sub.style.display = 'block';
+  sub.style.opacity = '0.7';
+  meta.append(title, sub);
+  label.appendChild(meta);
+  row.appendChild(label);
+  return row;
+}
+
+function attentionBuildSettingsCard() {
+  const card = document.createElement('section');
+  card.className = 'ui-card attention-settings-card';
+  const head = document.createElement('div');
+  head.className = 'ui-section-head';
+  const h3 = document.createElement('h3');
+  h3.className = 'ui-section-title';
+  h3.textContent = 'Notifications';
+  const sub = document.createElement('div');
+  sub.className = 'ui-section-sub';
+  sub.textContent = 'When the agent waits on you — approvals and questions. These apply to this browser only.';
+  head.append(h3, sub);
+  card.appendChild(head);
+
+  const badgeBox = document.createElement('input');
+  badgeBox.id = 'attention-badge-toggle';
+  badgeBox.checked = attentionBadgeEnabled();
+  badgeBox.addEventListener('change', () => {
+    try { localStorage.setItem(ATTENTION_BADGE_KEY, badgeBox.checked ? 'on' : 'off'); } catch (_) {}
+    attentionRepaint();
+  });
+  card.appendChild(attentionToggleRow(
+    'Tab alert badge',
+    'Prefix the tab title and favicon with the number of pending requests.',
+    badgeBox,
+  ));
+
+  const notifyBox = document.createElement('input');
+  notifyBox.id = 'attention-notify-toggle';
+  const hint = document.createElement('p');
+  hint.className = 'settings-note';
+  if (!attentionNotifySupported()) {
+    notifyBox.disabled = true;
+    hint.textContent = 'Browser notifications are unavailable in this context (they need a secure origin such as https or localhost).';
+  } else {
+    notifyBox.checked = attentionNotifyEnabled();
+    hint.textContent = 'Shown when a request arrives while this tab is hidden; click one to jump to the session. For alerts when no tab is open at all, enable request push on your Connect account page (intendant.dev → Notifications).';
+  }
+  notifyBox.addEventListener('change', async () => {
+    if (!notifyBox.checked) {
+      try { localStorage.setItem(ATTENTION_NOTIFY_KEY, 'off'); } catch (_) {}
+      return;
+    }
+    // Permission is requested HERE and only here — an explicit user act.
+    let permission = Notification.permission;
+    if (permission === 'default') {
+      try { permission = await Notification.requestPermission(); } catch (_) { permission = 'denied'; }
+    }
+    if (permission === 'granted') {
+      try { localStorage.setItem(ATTENTION_NOTIFY_KEY, 'on'); } catch (_) {}
+    } else {
+      notifyBox.checked = false;
+      hint.textContent = 'Notification permission was not granted. Allow notifications for this site in your browser, then try again.';
+    }
+  });
+  card.appendChild(attentionToggleRow(
+    'Desktop notifications',
+    'Notify when a request arrives while this tab is hidden.',
+    notifyBox,
+  ));
+  card.appendChild(hint);
+  return card;
+}
+
+// Mount: the v2 Appearance pane holds browser-local preferences (built by
+// ui2-settings.js, which evaluates before this fragment); v1 falls back to
+// the Account pane body.
+(function attentionMountSettingsCard() {
+  try {
+    const host = document.getElementById('settings-pane-appearance')
+      || document.querySelector('#settings-pane-account .settings-pane-body');
+    if (host) host.appendChild(attentionBuildSettingsCard());
+  } catch (_) {}
+})();
 /* ── static/app/58-shortcuts-boot.js ── */
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {

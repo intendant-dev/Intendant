@@ -707,6 +707,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'user_display_granted',
   'user_display_revoked',
   'shared_view',
+  // Unique note_id per note makes the JSON.stringify dedupe key exact.
+  'session_note',
   'recording_started',
   'recording_stopped',
   'recording_deleted',

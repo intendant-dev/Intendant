@@ -72,6 +72,32 @@ pub struct StartTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionNoteImageParams {
+    /// Image MIME type: image/png, image/jpeg, image/gif, image/webp, or image/bmp.
+    pub media_type: String,
+    /// Base64-encoded image bytes (standard alphabet; an optional data-URL prefix is tolerated).
+    pub data: String,
+    /// Optional display filename for the attachment.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PostSessionNoteParams {
+    /// Note text shown in the session transcript. Plain text (rendered escaped).
+    pub text: String,
+    /// Optional target session id. Omit to post into the calling session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Optional short source label shown on the entry (e.g. "codex"). Defaults to "note".
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Optional images to attach. Each is committed to the session upload store and rendered as a clickable thumbnail.
+    #[serde(default)]
+    pub images: Vec<SessionNoteImageParams>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RewindContextAnchorParams {
     /// Exact Codex thread item/tool-call id to roll back to. Once a rewind is needed, use list_rewind_anchors first when the id is not already known.
     pub item_id: String,

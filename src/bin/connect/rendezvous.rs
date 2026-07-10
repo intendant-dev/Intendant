@@ -1407,31 +1407,30 @@ pub(crate) struct DnsAcmeChallengeRequest {
     clear: bool,
 }
 
-/// The shared front half of both DNS endpoints: bearer gate, rate
-/// limit, protocol + freshness checks, and the registered-key pin.
-/// Returns the daemon record the signature must verify against.
-async fn dns_request_daemon(
+/// The shared front half of daemon-signed endpoints (fleet DNS publishes,
+/// attention nudges): bearer gate, rate limit, protocol + freshness checks,
+/// and the registered-key pin. Returns the daemon record the signature must
+/// verify against.
+pub(crate) async fn verified_daemon_request(
     state: &Arc<AppState>,
     headers: &HeaderMap,
-    rate_key: &str,
-    protocol: &str,
-    expected_protocol: &str,
+    rate: (&str, u32, u64),
+    protocol: (&str, &str),
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
 ) -> ApiResult<DaemonRecord> {
-    if state.dns_zone.is_none() {
-        return Err(ApiError::not_found("fleet dns is not enabled on this rendezvous"));
-    }
     require_daemon_auth(state, headers)?;
-    check_rate_limit(state, headers, rate_key, 30, 60_000).await?;
-    if protocol != expected_protocol {
-        return Err(ApiError::bad_request("unsupported dns publish protocol"));
+    let (rate_key, rate_limit, rate_window_ms) = rate;
+    check_rate_limit(state, headers, rate_key, rate_limit, rate_window_ms).await?;
+    let (got_protocol, expected_protocol) = protocol;
+    if got_protocol != expected_protocol {
+        return Err(ApiError::bad_request("unsupported protocol"));
     }
     let now = now_unix_ms();
     if now.abs_diff(issued_at_unix_ms) > UNCLAIM_MAX_SKEW_MS {
         return Err(ApiError::bad_request(
-            "dns publish payload is stale — check the daemon clock and retry",
+            "signed payload is stale — check the daemon clock and retry",
         ));
     }
     let daemon = {
@@ -1449,6 +1448,33 @@ async fn dns_request_daemon(
         ));
     }
     Ok(daemon)
+}
+
+/// The DNS wrapper over [`verified_daemon_request`]: additionally requires
+/// the fleet zone to be enabled.
+async fn dns_request_daemon(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    rate_key: &str,
+    protocol: &str,
+    expected_protocol: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+) -> ApiResult<DaemonRecord> {
+    if state.dns_zone.is_none() {
+        return Err(ApiError::not_found("fleet dns is not enabled on this rendezvous"));
+    }
+    verified_daemon_request(
+        state,
+        headers,
+        (rate_key, 30, 60_000),
+        (protocol, expected_protocol),
+        daemon_id,
+        daemon_public_key,
+        issued_at_unix_ms,
+    )
+    .await
 }
 
 /// A publishable address: routable unicast only. Loopback, unspecified,

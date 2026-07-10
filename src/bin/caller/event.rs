@@ -773,6 +773,21 @@ pub enum AppEvent {
         content: String,
         turn: Option<usize>,
     },
+    /// Display-only session note posted by an agent (`post_session_note`
+    /// MCP tool / `intendant ctl session note`). Presentation rail only:
+    /// broadcast to frontends and persisted to the session log, never
+    /// injected into any model conversation (that path is
+    /// [`ContextInjection`]). Attachments reference blobs already
+    /// committed to the session upload store.
+    SessionNote {
+        session_id: Option<String>,
+        note_id: String,
+        text: String,
+        attachments: Vec<crate::types::SessionNoteAttachment>,
+        source: Option<String>,
+        /// Unix epoch milliseconds when the note was posted.
+        ts: u64,
+    },
     /// Active user-message edit rewound already-rendered session context.
     UserMessageRewind {
         session_id: Option<String>,
@@ -1389,6 +1404,17 @@ pub enum ControlMsg {
         /// Frame/upload IDs attached via the dashboard.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// Launch the session in a fresh git worktree branched off the
+        /// resolved project root's HEAD; the worktree checkout becomes the
+        /// session's effective project root. Requires the project root to
+        /// be a git repository with at least one commit.
+        #[serde(default)]
+        worktree: Option<bool>,
+        /// Branch name for the worktree (validated against a conservative
+        /// git-ref subset). Omitted: derived from the session name, else
+        /// `session-<short-id>`; collisions get a numeric suffix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_branch: Option<String>,
     },
     /// Delegate a task to a new supervised sub-agent under an existing
     /// internal session (the dashboard "delegate" action). The child is
@@ -2440,6 +2466,21 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_revision: None,
             replacement_for_user_turn_index: None,
         }),
+        AppEvent::SessionNote {
+            session_id,
+            note_id,
+            text,
+            attachments,
+            source,
+            ts,
+        } => Some(OutboundEvent::SessionNote {
+            session_id: session_id.clone(),
+            note_id: note_id.clone(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+            source: source.clone(),
+            ts: *ts,
+        }),
         AppEvent::UserMessageRewind {
             session_id,
             user_turn_index,
@@ -2692,6 +2733,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::ApprovalResolved { .. }
             | AppEvent::HumanQuestionDetected { .. }
             | AppEvent::HumanResponseSent
+            | AppEvent::SessionNote { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::DisplayResize { .. }
             | AppEvent::DisplayTaken { .. }
@@ -2852,6 +2894,23 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SubAgentResult { formatted } => {
             log.sub_agent_result(formatted);
+        }
+        AppEvent::SessionNote {
+            session_id,
+            note_id,
+            text,
+            attachments,
+            source,
+            ts,
+        } => {
+            log.session_note(
+                session_id.as_deref(),
+                note_id,
+                text,
+                attachments,
+                source.as_deref(),
+                *ts,
+            );
         }
         AppEvent::RoundComplete {
             round,
@@ -3593,6 +3652,8 @@ mod tests {
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
                 display_target: Some("user_session".to_string()),
                 attachments: vec!["upload:u1".to_string()],
+                worktree: Some(true),
+                worktree_branch: Some("feature-branch".to_string()),
             },
             ControlMsg::StartTask {
                 session_id: None,
@@ -3866,6 +3927,8 @@ mod tests {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                worktree,
+                worktree_branch,
             } => {
                 assert_eq!(task, "fix bug");
                 assert!(claude_model.is_none());
@@ -3886,6 +3949,26 @@ mod tests {
                 assert!(reference_frame_ids.is_empty());
                 assert!(display_target.is_none());
                 assert_eq!(attachments, vec!["upload:u1"]);
+                // Legacy payloads without the worktree fields parse as "off".
+                assert!(worktree.is_none());
+                assert!(worktree_branch.is_none());
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_create_session_worktree_deserialize() {
+        let json = r#"{"action":"create_session","task":"fix bug","worktree":true,"worktree_branch":"fix/login"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::CreateSession {
+                worktree,
+                worktree_branch,
+                ..
+            } => {
+                assert_eq!(worktree, Some(true));
+                assert_eq!(worktree_branch.as_deref(), Some("fix/login"));
             }
             _ => panic!("expected CreateSession"),
         }

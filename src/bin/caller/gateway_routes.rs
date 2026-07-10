@@ -228,6 +228,7 @@ pub(crate) enum RouteHandlerId {
     McFission,
     WorktreesInspect,
     WorktreesRemove,
+    WorktreesMerge,
     WorktreesScan,
     WorktreesList,
     SessionsStream,
@@ -786,6 +787,15 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::WorktreesRemove,
         "Remove a worktree from the inventory",
     ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/worktrees/merge"),
+        PeerOperation::SessionManage,
+        BodyPolicy::Default,
+        RouteHandlerId::WorktreesMerge,
+        "Merge a session's linked worktree branch into its base checkout, then remove the checkout",
+    )
+    .with_tunnel(tunnel_method("api_worktrees_merge")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/scan"),

@@ -184,6 +184,7 @@ Full MCP tool groups:
 | `skip`          | Skip, continue with the next command. | `id` |
 | `approve_all`   | Approve and set autonomy to Full. | `id` |
 | `respond`       | Answer an `askHuman` question. | `text` |
+| `post_session_note` | Post a **display-only note** into the session transcript — rendered live in the dashboard and persisted for replay, never added to any model's context. Optional base64 images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total; raster types only (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`). Session-scoped callers post into their own session by default. | `text`, `images?` (`[{media_type, data, name?}]`), `session_id?`, `source?` |
 | `set_autonomy`  | Set autonomy. | `level`: `low`/`medium`/`high`/`full` |
 | `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
 | `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |

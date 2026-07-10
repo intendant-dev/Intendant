@@ -741,6 +741,41 @@ pub(crate) async fn api_worktrees_remove_response(
     }
 }
 
+pub(crate) async fn api_worktrees_merge_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let cache = runtime.worktree_inventory_cache.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = crate::web_gateway::merge_session_worktree_response(&home, &body_text);
+        if result.0 == "200 OK" {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = None;
+            }
+        }
+        result
+    })
+    .await;
+    match result {
+        Ok((status_line, body)) => {
+            http_body_response(id, status_line_code(status_line), body, "worktree merge")
+        }
+        Err(e) => http_body_response(
+            id,
+            500,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("worktree merge task failed: {e}")
+            })
+            .to_string(),
+            "worktree merge",
+        ),
+    }
+}
+
 pub(crate) async fn api_managed_context_response(
     id: String,
     kind: &'static str,

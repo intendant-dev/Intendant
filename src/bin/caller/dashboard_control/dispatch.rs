@@ -799,6 +799,7 @@ pub(crate) fn control_frame_response(
                 | "api_worktrees_inspect"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
+                | "api_worktrees_merge"
                 | "api_managed_context_records"
                 | "api_managed_context_anchors"
                 | "api_managed_context_fission"
