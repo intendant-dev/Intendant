@@ -6,6 +6,13 @@
 
 use super::*;
 
+/// Serializes tests that drive the session search's single-flight guard
+/// (`SESSION_SEARCH_IN_FLIGHT` is process-global): the golden transcripts
+/// here and the tunnel/HTTP parity fixtures in `dashboard_control` lock it
+/// so a concurrent test never observes a spurious busy response.
+#[cfg(test)]
+pub(crate) static SESSIONS_SEARCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn agent_output_chunks_with_fallback(
     primary_log_dir: &Path,
     ids: &[String],
@@ -4551,5 +4558,342 @@ mod tests {
         assert_eq!(parsed.len(), 700);
         assert_eq!(parsed[0], "ao-19e4f985a17-0");
         assert_eq!(parsed[699], "ao-19e4f985a17-2bb");
+    }
+
+    // ── Golden HTTP transcripts: the sessions read-core wire contract ──
+    //
+    // Byte-exact pins of the session list / search / detail /
+    // agent-output / context-snapshot HTTP responses, captured before the
+    // transport-neutral conversion (transport-unification design §6 S4,
+    // risk R1) and kept as the conversion's proof. The expected framing
+    // is hand-written below — never built through the response helpers
+    // under conversion. Store-dependent bodies (detail success,
+    // agent-output success) come from the store-layer fns the conversion
+    // does not touch, over fixtures written into the live `~/.intendant`
+    // logs store (the bin-test convention — unique id per run, dir
+    // removed afterwards).
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_session_handler_response<Fut>(
+        run: impl FnOnce(DemuxStream) -> Fut,
+    ) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The canonical JSON framing (`Cache-Control` + `Connection` tail):
+    /// detail and context-snapshot responses, spelled out literally.
+    fn golden_session_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The wildcard-CORS JSON framing (`Cache-Control` +
+    /// `Access-Control-Allow-Origin: *` + `Connection` tail): the session
+    /// list, search, and agent-output shapes, spelled out literally.
+    fn golden_session_wildcard_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn golden_transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Unique-per-run id for fixtures written into the live logs store.
+    fn golden_unique_session_id(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[tokio::test]
+    async fn golden_sessions_list_empty_ids_filter_transcript() {
+        // A present-but-empty ids filter answers the empty list without
+        // touching the session stores — fully deterministic.
+        let request_line = "GET /api/sessions?ids= HTTP/1.1";
+        let response =
+            collect_session_handler_response(|stream| handle_sessions_list(stream, request_line))
+                .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", "[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_sessions_list_usage_view_and_limit_transcript() {
+        // The limit and view=usage knobs ride the same empty-filter body:
+        // pins the query-parameter plumbing end to end.
+        let request_line = "GET /api/sessions?ids=&limit=3&view=usage HTTP/1.1";
+        let response =
+            collect_session_handler_response(|stream| handle_sessions_list(stream, request_line))
+                .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", "[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_sessions_search_no_input_transcript() {
+        let _guard = SESSIONS_SEARCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // An empty query short-circuits before any store scan.
+        let request_line = "GET /api/sessions/search?q= HTTP/1.1";
+        let response =
+            collect_session_handler_response(|stream| handle_sessions_search(stream, request_line))
+                .await;
+        let body = serde_json::json!({
+            "query": "",
+            "mode": "all_keywords",
+            "source_filter": "all",
+            "searched": 0,
+            "truncated": false,
+            "exhaustive": true,
+            "truncated_files": 0,
+            "results": [],
+        })
+        .to_string();
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_sessions_search_busy_transcript() {
+        let _guard = SESSIONS_SEARCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The single-flight guard answers 200 with the busy body.
+        assert!(!SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst));
+        let request_line = "GET /api/sessions/search?q=anything HTTP/1.1";
+        let response =
+            collect_session_handler_response(|stream| handle_sessions_search(stream, request_line))
+                .await;
+        SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        let body = serde_json::json!({
+            "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
+            "busy": true,
+        })
+        .to_string();
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_detail_invalid_id_transcript() {
+        // `..` fails the bare-id policy (session_lookup_id_is_safe).
+        let request_line = "GET /api/session/.. HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"invalid session id"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_detail_missing_transcript() {
+        let session_id = golden_unique_session_id("golden-detail-missing");
+        let request_line = format!("GET /api/session/{session_id} HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("404 Not Found", r#"{"error":"session not found"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_detail_success_transcript() {
+        let session_id = golden_unique_session_id("golden-detail");
+        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("golden detail stdout", "", Some("Codex"), Some("gd-out-1"));
+        drop(log);
+
+        let request_line = format!("GET /api/session/{session_id}?limit=5 HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        // Body from the store layer (untouched by the conversion); the
+        // framing around it is the golden contract.
+        let body = get_session_detail_from_home_with_page(
+            &crate::platform::home_dir(),
+            &session_id,
+            Some(5),
+            None,
+        );
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("200 OK", &body)
+        );
+        cleanup.expect("golden detail fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_session_agent_output_missing_ids_transcript() {
+        let request_line = "POST /api/session/abc123/agent-output HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_agent_output(stream, "{}".to_string(), request_line)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"missing output ids"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_agent_output_missing_session_transcript() {
+        let session_id = golden_unique_session_id("golden-output-missing");
+        let request_line = format!("POST /api/session/{session_id}/agent-output HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_agent_output(
+                stream,
+                r#"{"ids":["out-1"]}"#.to_string(),
+                &request_line,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "404 Not Found",
+                r#"{"error":"session not found"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_agent_output_success_transcript() {
+        let session_id = golden_unique_session_id("golden-output");
+        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("golden stdout", "", Some("Codex"), Some("go-out-1"));
+        drop(log);
+
+        let request_line = format!("POST /api/session/{session_id}/agent-output HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_agent_output(
+                stream,
+                r#"{"ids":["go-out-1","go-missing"]}"#.to_string(),
+                &request_line,
+            )
+        })
+        .await;
+        // Body from the chunk store layer (untouched by the conversion).
+        let chunks = agent_output_chunks_with_fallback(
+            &log_dir,
+            &["go-out-1".to_string(), "go-missing".to_string()],
+            None,
+        );
+        let body = serde_json::json!({
+            "outputs": chunks,
+            "missing": ["go-missing"],
+        })
+        .to_string();
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript("200 OK", &body)
+        );
+        cleanup.expect("golden agent-output fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn golden_session_context_snapshot_missing_selector_transcript() {
+        let request_line = "GET /api/session/abc123/context-snapshot HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"missing snapshot selector"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_context_snapshot_invalid_index_transcript() {
+        let request_line = "GET /api/session/abc123/context-snapshot?request_index=abc HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"invalid request_index"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_context_snapshot_invalid_id_transcript() {
+        // `..` fails the bare-id policy (session_lookup_id_is_safe).
+        let request_line = "GET /api/session/../context-snapshot?file=snapshot.json HTTP/1.1";
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"invalid session id"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_session_context_snapshot_not_found_transcript() {
+        let session_id = golden_unique_session_id("golden-snapshot-missing");
+        let request_line =
+            format!("GET /api/session/{session_id}/context-snapshot?file=snapshot.json HTTP/1.1");
+        let response = collect_session_handler_response(|stream| {
+            handle_session_sub_router(stream, &request_line, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_json_transcript(
+                "404 Not Found",
+                r#"{"error":"context snapshot not found"}"#
+            )
+        );
     }
 }
