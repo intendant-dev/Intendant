@@ -750,14 +750,17 @@ pub(crate) async fn create_external_agent(
         }
         AgentBackend::ClaudeCode => {
             let cfg = &project.config.agent.claude_code;
-            let agent = Box::new(external_agent::claude_code::ClaudeCodeAgent::new(
-                cfg.command.clone(),
-                cfg.model.clone(),
-                cfg.permission_mode.clone(),
-                cfg.effort.clone(),
-                cfg.allowed_tools.clone(),
-                web_port,
-            ));
+            let agent = Box::new(
+                external_agent::claude_code::ClaudeCodeAgent::new(
+                    cfg.command.clone(),
+                    cfg.model.clone(),
+                    cfg.permission_mode.clone(),
+                    cfg.effort.clone(),
+                    cfg.allowed_tools.clone(),
+                    web_port,
+                )
+                .with_max_budget_usd(cfg.max_budget_usd),
+            );
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),

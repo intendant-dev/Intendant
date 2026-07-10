@@ -56,6 +56,12 @@ pub struct SessionAgentConfig {
     /// documents lineage and drives the `fork` relationship emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Relationship kind the `forked_from` edge carries when the child
+    /// announces its native id: `None` = plain `fork`; `side` = an
+    /// ephemeral side conversation (`/btw`) materialized as a respawned
+    /// fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_relationship: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -75,6 +81,7 @@ impl SessionAgentConfig {
             && self.claude_allowed_tools.is_none()
             && self.claude_effort.is_none()
             && self.forked_from.is_none()
+            && self.fork_relationship.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -122,6 +129,9 @@ impl SessionAgentConfig {
         }
         if self.forked_from.is_none() {
             self.forked_from = fallback.forked_from;
+        }
+        if self.fork_relationship.is_none() {
+            self.fork_relationship = fallback.fork_relationship;
         }
     }
 }
@@ -343,6 +353,7 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
             .then(|| normalize_claude_effort(fields.claude_effort))
             .flatten(),
         forked_from: None,
+        fork_relationship: None,
     }
 }
 
@@ -374,6 +385,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             claude_allowed_tools: None,
             claude_effort: None,
             forked_from: None,
+            fork_relationship: None,
         },
         AgentBackend::ClaudeCode => {
             let claude = &project.config.agent.claude_code;
@@ -398,6 +410,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 claude_allowed_tools: Some(claude.allowed_tools.clone()),
                 claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
                 forked_from: None,
+                fork_relationship: None,
             }
         }
     }

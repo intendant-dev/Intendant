@@ -974,56 +974,27 @@ pub(crate) async fn run_with_presence(
                 } else if let Some(ref mut agent) = persistent_agent {
                     // Backends without an in-process fork (Claude Code) fork
                     // by respawning — mirror the drain-level
-                    // `ForkHandling::RespawnResume` branch. (This inline
-                    // presence dispatcher duplicates the drain's action
-                    // handling; keep the two in sync.)
-                    if op == "fork" {
+                    // `ForkHandling::RespawnResume` branch through the shared
+                    // helper (fork bare; side/btw with the boundary prompt).
+                    if respawn_resume_thread_action_op(&op) {
                         if let external_agent::ForkHandling::RespawnResume { thread_id } =
                             agent.fork_handling()
                         {
-                            let (success, message) = match thread_id {
-                                Some(parent_thread_id) => {
-                                    bus.send(AppEvent::ControlCommand(
-                                        event::ControlMsg::ResumeSession {
-                                            source: agent.name().to_string(),
-                                            session_id: parent_thread_id.clone(),
-                                            resume_id: Some(parent_thread_id.clone()),
-                                            project_root: Some(
-                                                project.root.to_string_lossy().to_string(),
-                                            ),
-                                            task: None,
-                                            direct: Some(true),
-                                            attachments: Vec::new(),
-                                            fork: true,
-                                            agent_command:
-                                                crate::session_config::read_log_dir_config(
-                                                    &log_dir,
-                                                )
-                                                .and_then(|cfg| cfg.agent_command),
-                                            codex_sandbox: None,
-                                            codex_approval_policy: None,
-                                            codex_managed_context: None,
-                                            codex_context_archive: None,
-                                        },
-                                    ));
-                                    (
-                                        true,
-                                        format!(
-                                            "forking thread {} — the fork announces its own session id on its first turn",
-                                            short_external_session_id(&parent_thread_id)
-                                        ),
-                                    )
-                                }
-                                None => (
-                                    false,
-                                    "fork needs a native session id — run a turn in this session first"
-                                        .to_string(),
-                                ),
-                            };
+                            let (success, message) = respawn_resume_thread_action(
+                                &bus,
+                                agent.name(),
+                                thread_id,
+                                &op,
+                                &action_params,
+                                &project.root,
+                                crate::session_config::read_log_dir_config(&log_dir)
+                                    .and_then(|cfg| cfg.agent_command),
+                            );
                             slog(&session_log, |l| {
                                 l.info(&format!(
-                                    "{} thread action /fork: {} — {}",
+                                    "{} thread action /{}: {} — {}",
                                     agent.name(),
+                                    op,
                                     if success { "ok" } else { "FAILED" },
                                     message
                                 ))
@@ -1130,6 +1101,7 @@ pub(crate) async fn run_with_presence(
                             task: None,
                             direct: Some(true),
                             fork: false,
+                            relationship_kind: None,
                             attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
                             codex_sandbox: Some(crate::project::normalize_sandbox_mode(

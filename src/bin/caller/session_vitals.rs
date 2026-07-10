@@ -327,6 +327,11 @@ fn spawn_cache_vitals_listener(
 /// primary session. All emission flows through the change-detecting hub;
 /// the session log persists each emission so reconnecting frontends replay
 /// the latest.
+///
+/// `targets` may be empty: the cache/limits sections are usage-driven and
+/// backend-agnostic, so the listener runs wherever a bus exists — a
+/// projectless daemon still reports cache and rate-limit vitals for every
+/// session; only the git segment needs a repo target.
 pub(crate) fn spawn_session_vitals_producer(
     bus: EventBus,
     targets: Vec<(String, PathBuf)>,
@@ -334,6 +339,11 @@ pub(crate) fn spawn_session_vitals_producer(
     let hub = SessionVitalsHub::new(bus.clone());
     let _cache_listener = spawn_cache_vitals_listener(bus, hub.clone());
     tokio::spawn(async move {
+        if targets.is_empty() {
+            // Nothing to probe — the cache/limits listener above is
+            // detached and outlives this task.
+            return;
+        }
         let mut prober = GitVitalsProber::default();
         loop {
             for (session_id, cwd) in &targets {
@@ -503,6 +513,36 @@ mod tests {
             emissions[2].1.cache.is_none(),
             "removed session re-registers from scratch"
         );
+    }
+
+    #[tokio::test]
+    async fn producer_with_no_git_targets_still_serves_cache_vitals() {
+        // A projectless daemon has no git target, but cache/limits vitals
+        // are usage-driven and must keep flowing for every session
+        // (regression: the listener used to die with the git gating,
+        // blanking the dashboard's Prompt cache row daemon-wide).
+        let bus = EventBus::new();
+        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let mut rx = bus.subscribe();
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("cc-session".into()),
+            main: usage_with_sample("anthropic", 80, 10, 10, Some(3600)),
+            presence: None,
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("vitals emission before timeout")
+                .expect("bus open");
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "cc-session");
+                assert_eq!(vitals.cache.as_ref().unwrap().hit_pct, Some(80));
+                assert_eq!(vitals.cache.as_ref().unwrap().ttl_seconds, Some(3600));
+                assert!(vitals.git.is_none(), "no git target, no git section");
+                break;
+            }
+        }
     }
 
     #[tokio::test]

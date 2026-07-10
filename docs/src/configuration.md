@@ -286,9 +286,10 @@ preserve Codex's normal user configuration inheritance.
 |-----|------|---------|-------------|
 | `command` | string | `claude` | Path or command name |
 | `model` | string | unset | Model override — an alias (`fable`, `opus`, `sonnet`, `haiku`; the CLI resolves it to the latest model) or a full model id |
-| `permission_mode` | string | `default` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (legacy `auto` = `default`) |
-| `effort` | string | unset | Reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max` (unset omits the flag) |
+| `permission_mode` | string | `default` | `default` (alias `manual`), `acceptEdits`, `plan`, `auto` (classifier-based approvals), `dontAsk` (auto-deny anything that would prompt), `bypassPermissions`. **Semantics change:** before Claude Code 2.1.206 Intendant coerced `auto` to `default`; it now selects the CLI's real auto-approval mode, and the config load warns when it finds `auto` so an old config doesn't escalate silently |
+| `effort` | string | unset | Reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max`, `ultracode` (unset omits the flag) |
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
+| `max_budget_usd` | float | unset | CLI-enforced dollar backstop passed as `--max-budget-usd`; cumulative for the session, its resumes, AND its forks — a forked or `/btw` side child inherits the parent's counted spend (probed 2.1.206), so children of an exhausted parent fail immediately with the same hint. On exceed every further turn fails with `error_max_budget_usd` (surfaced as a backend error with a recovery hint). Must be positive: a zero/negative/non-finite value refuses the spawn instead of silently disarming (the CLI itself rejects `--max-budget-usd 0`) |
 
 Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
 are normalized to the safe default so a config typo cannot silently escalate
