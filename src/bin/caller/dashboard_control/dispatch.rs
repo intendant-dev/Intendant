@@ -29,6 +29,31 @@ pub(crate) fn frame_api_response(
     }
 }
 
+/// Tunnel adapter for the pre-`_httpStatus` methods (the sessions
+/// list/detail/search trio predates the injected-status envelope):
+/// render only the neutral response's JSON body through the historical
+/// `json_body_response` wrapper — `{t:"response", id, ok:true,
+/// result:<body>}` with NO status metadata injected — so the wire stays
+/// byte-identical through the delegation. A byte response on these
+/// methods is a wiring bug and fails closed.
+pub(crate) fn frame_api_json_body_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { body, .. } => {
+            json_body_response(id, body.into_string(), label)
+        }
+        crate::web_gateway::ApiResponse::Bytes { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected byte response"),
+        }),
+    }
+}
+
 /// Tunnel adapter for byte-capable methods: `Bytes` becomes a
 /// `byte_stream_start/chunk/end` sequence — chunking, credits, and
 /// backpressure stay wire.rs-owned — with the neutral fn's `meta`

@@ -683,16 +683,6 @@ pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
 }
 
-pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) -> String {
-    if !ids.is_empty() {
-        cached_list_sessions_for_ids(ids)
-    } else if let Some(limit) = limit {
-        cached_list_sessions_with_limit(limit)
-    } else {
-        cached_list_sessions()
-    }
-}
-
 /// Strip session rows down to what the Stats tab folds: usage, costs,
 /// per-day buckets, disk sizes, and the model name (the ui-v2 Usage
 /// screen aggregates cost by model client-side). Full rows carry tasks,
@@ -3029,9 +3019,11 @@ mod tests {
             "codex",
             vec!["call_large".to_string()],
         );
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let body = response.split("\r\n\r\n").nth(1).unwrap();
-        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let crate::web_gateway::ApiResponse::Json { status, body, .. } = response else {
+            panic!("agent output must answer on the json lane");
+        };
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body.into_string()).unwrap();
         assert_eq!(json["missing"].as_array().unwrap().len(), 0);
         let stdout = json["outputs"][0]["stdout"].as_str().unwrap();
         assert_eq!(
