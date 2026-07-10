@@ -5,7 +5,7 @@
 > chapter is the operating model an owner applies across a fleet whose
 > machines carry different stakes. Almost nothing here is new mechanism — it
 > composes ceilings, grants, custody, and client choice that already exist.
-> The product hooks at the end are the tracked exceptions.
+> The product hooks at the end are the shipped exceptions.
 
 ## Two axes, not one
 
@@ -207,9 +207,15 @@ visit, so a rung's guarantee is only as durable as its serving origin.
 Enrolled identity keys do not change this: browser storage is
 origin-scoped, so a key enrolled at a fleet name is wieldable by whatever
 code that name serves. Rungs one and two therefore fully converge only
-when the client stops being re-served — the signed native app and code
-transparency over serving origins (both tracked) are the ladder's missing
-top, not polish.
+when the client stops being re-served. That top of the ladder is now
+built: the native app ships through a signing/notarization release
+pipeline (dormant until the operator's signing credentials are
+provisioned — tags build clearly-labeled unsigned dev artifacts until
+then), and every serving origin is answerable to **code transparency** —
+the artifacts an origin serves are committed to the rendezvous's public
+append-only log, and `intendant hosted-verify` re-downloads them exactly
+as a browser would and checks them against the log from a machine the
+origin does not control.
 
 ### Still blurry, on purpose
 
@@ -218,12 +224,19 @@ stated non-goal:
 
 - **The time axis (TOFU).** Everything above grades *first* contact;
   later visits inherit pinned material (enrolled keys, remembered
-  certificates) but re-inherit the code channel every load. The signed
-  app collapses code trust to install-and-update moments; until it
-  ships, rung two re-runs per visit.
-- **The update channel.** A signed app trusts its updater. Code
-  transparency — served-artifact hashes in a public log, monitors,
-  verifiers — is the evidence leg for that too. (Tracked.)
+  certificates) but re-inherit the code channel every load. The app
+  collapses code trust to install-and-update moments; every browser
+  client still re-runs its rung per visit — that is the browser's
+  condition, not a defect the ladder can fix.
+- **The update channel.** A signed app trusts its updater. For the
+  *serving* channel the evidence leg is shipped: served-artifact
+  manifests live in the rendezvous's public transparency log, verified
+  out of band by `hosted-verify` and advisorily by every daemon's
+  bundle tripwire. The *release* channel is thinner: app builds ship as
+  GitHub releases (public source, public workflow runs, and — once
+  signing is provisioned — Developer ID + notarization), but release
+  artifacts are not yet committed to the same transparency log. That
+  tie is the remaining open thread here.
 - **Lookalike names.** `d-<hash>` labels are deliberately opaque, which
   also means humans cannot eyeball them; a phished lookalike with its own
   valid certificate raises no CT alarm on *your* name, because it is not
@@ -234,9 +247,17 @@ stated non-goal:
   Intendant's reach — stated so the ladder is not mistaken for covering
   it.
 - **Hosted-passkey coupling.** Unsealing the vault with a passkey inside
-  a hosted tab is rung-three code wielding rung-one credentials. The
-  write-only CLI vault lane and the pinned crypto kernel (both tracked)
-  are the untangle.
+  a hosted tab is rung-three code wielding rung-one credentials. Two
+  shipped mechanisms narrow it: the write-only CLI deposit lane moves
+  secret *entry* off the web UI entirely, and the pinned crypto kernel
+  confines the master key, KEKs, and MAC key to one small hash-pinned
+  worker — page code can no longer exfiltrate key material or decrypt
+  future blobs offline. What remains, stated plainly: while a vault is
+  unlocked, the page necessarily sees entry plaintext to render it, so a
+  malicious hosted bundle can still read what it shows you — bounded by
+  the unseal policy (trusted-only entries refuse hosted tabs), the
+  ceilings, and the transparency log's after-the-fact evidence, not by
+  the kernel.
 
 ## Product hooks
 
