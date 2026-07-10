@@ -1175,9 +1175,19 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
 /// (`user_display_granted` broadcast) and the blocked ctl call returns the
 /// structured approved result. The daemon runs at `--autonomy full`, which
 /// proves the rail's core invariant live: even full autonomy never
-/// auto-approves a display request — it waits for the click. The second
-/// leg exercises deny + the per-session cooldown (the third ask is refused
+/// auto-approves a display request — it waits for the click. The deny leg
+/// exercises deny + the per-session cooldown (the following ask is refused
 /// without raising anything).
+///
+/// Leg 0 pins the held-grant short-circuit, which is also what makes the
+/// test platform-uniform: a Windows daemon auto-registers the user desktop
+/// and holds the grant from startup
+/// (`display_glue::auto_activate_windows_user_display` — capture consent
+/// is implicit there by design), so a request on a fresh Windows daemon
+/// correctly answers `already_granted` without ringing. Granting
+/// explicitly first makes every platform take that same path, and the
+/// revoke that follows gives the popup legs one clean, grantless starting
+/// state everywhere.
 #[tokio::test]
 async fn display_request_rail_round_trips_over_ws() {
     use futures_util::SinkExt;
@@ -1204,6 +1214,31 @@ async fn display_request_rail_round_trips_over_ws() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
         .expect("connect /ws");
+
+    // ── Leg 0: a held grant short-circuits without ringing ──
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "is the door already open?",
+            "--session",
+            "display-e2e-pregrant",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "already_granted", "{result}");
+
+    // Clean slate for the popup legs (this also revokes the Windows
+    // startup auto-grant like any other grant).
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
 
     // ── Leg 1: request(view_and_control) → user approves ──
     let request = ctl(
