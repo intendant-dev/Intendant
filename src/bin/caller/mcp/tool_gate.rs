@@ -100,6 +100,11 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
             matches!(
                 name,
                 "get_status"
+                    // Display-only transcript notes are a collaboration
+                    // primitive for supervised backends (the note's images
+                    // travel as base64 tool arguments), so they ride in
+                    // the small profile next to the shared-view set.
+                    | "post_session_note"
                     | "show_shared_view"
                     | "focus_shared_view"
                     | "request_shared_view_input"
@@ -189,8 +194,12 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "inspect_rewind_anchor" => PeerOperation::SessionInspect,
         // Resolving supervised approvals.
         "approve" | "deny" | "skip" | "approve_all" => PeerOperation::Approval,
-        // Injecting user-style messages into the session.
-        "respond" => PeerOperation::Message,
+        // Injecting user-style messages into the session — and the agent's
+        // own display-only transcript notes, which are the same
+        // session-surface write from the other direction (low-risk session
+        // output; deliberately reachable by session-scoped supervised
+        // agents, the tool's primary callers).
+        "respond" | "post_session_note" => PeerOperation::Message,
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -334,6 +343,14 @@ pub(crate) fn append_manual_http_tool_definitions(
             "claim_fission_canonical",
             "Claim a fission group's canonical branch. Omit expected_canonical_session_id for first-writer-wins; provide it to deliberately compare-and-swap from the current canonical branch.",
             ClaimFissionCanonicalParams
+        ),
+    );
+    push(
+        "post_session_note",
+        manual_http_tool_definition!(
+            "post_session_note",
+            "Post a display-only note into the session transcript, with optional base64 images. The note renders live in the dashboard transcript and persists for replay; it never enters any model's context. Images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total.",
+            PostSessionNoteParams
         ),
     );
     push(
@@ -553,6 +570,46 @@ mod tests {
     }
 
     #[test]
+    fn manual_http_session_note_description_matches_tool_attribute() {
+        // Same drift guard as the rewind/peer tools: post_session_note
+        // lives in a non-router impl block, so the HTTP transport serves
+        // the manual definition while the #[tool] attribute documents the
+        // method; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "post_session_note")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for post_session_note");
+        let attr = IntendantServer::post_session_note_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "post_session_note manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn session_note_tool_is_advertised_to_supervised_profiles() {
+        // The tool exists to be called by supervised session-scoped
+        // agents: it must be advertised in the small `core` profile and
+        // in the permissive default/full lists.
+        for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+            assert!(
+                tool_allowed_for_profile("post_session_note", false, profile),
+                "post_session_note must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual.iter().any(|tool| tool["name"] == "post_session_note"),
+            "core-profile manual definitions must include post_session_note"
+        );
+    }
+
+    #[test]
     fn fission_tool_profile_gating_matrix() {
         for name in [
             "fission_spawn",
@@ -607,6 +664,13 @@ mod tests {
         );
         assert_eq!(mcp_tool_operation("approve"), PeerOperation::Approval);
         assert_eq!(mcp_tool_operation("respond"), PeerOperation::Message);
+        // Display-only transcript notes classify with `respond`: a session
+        // message-surface write, deliberately below RuntimeControl so
+        // session-scoped supervised agents (the primary callers) pass.
+        assert_eq!(
+            mcp_tool_operation("post_session_note"),
+            PeerOperation::Message
+        );
         assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);
         assert_eq!(
             mcp_tool_operation("rewind_context"),

@@ -206,6 +206,66 @@ impl SessionLog {
         );
     }
 
+    /// Persist a display-only session note (`AppEvent::SessionNote`).
+    ///
+    /// The full note text and the attachment *references* live in `data`;
+    /// `message` carries a short preview for plain-log readers. Replay
+    /// reconstructs the event via `session_log_entry_to_app_event` so a
+    /// rehydrated session renders the note exactly like the live path.
+    /// Attachment blobs themselves persist in the session upload store.
+    pub fn session_note(
+        &mut self,
+        session_id: Option<&str>,
+        note_id: &str,
+        text: &str,
+        attachments: &[crate::types::SessionNoteAttachment],
+        source: Option<&str>,
+        ts_ms: u64,
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        data.insert(
+            "note_id".to_string(),
+            serde_json::Value::String(note_id.to_string()),
+        );
+        data.insert(
+            "text".to_string(),
+            serde_json::Value::String(text.to_string()),
+        );
+        if let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "source".to_string(),
+                serde_json::Value::String(source.to_string()),
+            );
+        }
+        data.insert("ts_ms".to_string(), serde_json::Value::from(ts_ms));
+        if !attachments.is_empty() {
+            data.insert(
+                "attachments".to_string(),
+                serde_json::to_value(attachments).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "session_note".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Note: {}", log_preview(text, 160))),
+            data: Some(serde_json::Value::Object(data)),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a new session starting (MCP multi-task).
     pub fn session_started(&mut self, session_id: &str, task: Option<&str>) {
         self.emit(LogEvent {

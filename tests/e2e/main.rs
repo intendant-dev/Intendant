@@ -1037,6 +1037,136 @@ async fn mock_provider_without_a_script_fails_closed() {
     );
 }
 
+/// `intendant ctl session note` against a live daemon, end to end:
+/// (1) the note broadcasts as an `OutboundEvent::SessionNote` on `/ws`
+/// with the text, source, and attachment *references* (never bytes);
+/// (2) the referenced blob really serves from the upload store's `/raw`
+/// route with the stored MIME and exact bytes; (3) the note persists as a
+/// `session_note` row in the session log — the replay source of truth.
+#[tokio::test]
+async fn ctl_session_note_posts_a_display_only_note_with_image() {
+    const NOTE_TEXT: &str = "E2E_SESSION_NOTE milestone reached";
+    // Not a decodable PNG — the note rail stores and serves bytes verbatim,
+    // so any payload proves the round trip.
+    const IMAGE_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    let image_path = daemon.rig.project.path().join("note-image.png");
+    std::fs::write(&image_path, IMAGE_BYTES).expect("write note image");
+
+    // Subscribe before posting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "session",
+            "note",
+            NOTE_TEXT,
+            "--image",
+            image_path.to_str().expect("utf8 image path"),
+            "--session",
+            "note-e2e-session",
+            "--source",
+            "e2e",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let posted = stdout_json(&output);
+    assert_eq!(posted["status"], "posted", "{posted}");
+    assert_eq!(posted["session_id"], "note-e2e-session", "{posted}");
+    let note_id = posted["note_id"].as_str().expect("note_id").to_string();
+    let attachment_url = posted["attachments"][0]["url"]
+        .as_str()
+        .expect("attachment url")
+        .to_string();
+
+    // (1) The /ws broadcast carries the note as references, not bytes.
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_note")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "session_note never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["note_id"], note_id.as_str(), "{event}");
+    assert_eq!(event["text"], NOTE_TEXT, "{event}");
+    assert_eq!(event["source"], "e2e", "{event}");
+    assert_eq!(event["session_id"], "note-e2e-session", "{event}");
+    assert_eq!(event["attachments"][0]["url"], attachment_url.as_str(), "{event}");
+    assert_eq!(event["attachments"][0]["mime"], "image/png", "{event}");
+    assert!(
+        event["attachments"][0].get("data").is_none(),
+        "attachments must be references, never inline bytes: {event}"
+    );
+
+    // (2) The referenced blob serves with the stored MIME and exact bytes.
+    let response = client
+        .get(format!("http://127.0.0.1:{port}{attachment_url}"))
+        .send()
+        .await
+        .expect("GET note attachment");
+    assert!(
+        response.status().is_success(),
+        "attachment fetch failed: HTTP {}\n{}",
+        response.status(),
+        daemon.log_tail()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = response.bytes().await.expect("attachment bytes");
+    assert_eq!(&bytes[..], IMAGE_BYTES, "blob bytes must round-trip");
+
+    // (3) The note persisted to the session log for replay.
+    poll_until(
+        "the session_note row in the session log",
+        RUN_TIMEOUT,
+        || {
+            let logs = daemon.rig.session_logs();
+            let note_id = note_id.clone();
+            async move {
+                (logs.contains("\"event\":\"session_note\"") && logs.contains(&note_id))
+                    .then_some(())
+            }
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+}
+
 /// `intendant ctl peer …` against a live federated pair: daemon A federates
 /// to daemon B over `POST /api/peers` (the peer-sessions smoke's pattern),
 /// then the ctl surface — which reaches A's `/mcp` over tokenless loopback —

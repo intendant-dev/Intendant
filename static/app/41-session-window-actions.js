@@ -736,6 +736,7 @@ function sessionWindowRecordFromLogCommand(c) {
     superseded: !!c?.superseded,
     superseded_reason: c?.superseded_reason || c?.supersededReason || '',
     collapsible: !!c?.collapsible,
+    attachment_previews: Array.isArray(c?.attachment_previews) ? c.attachment_previews : [],
   };
 }
 
@@ -2021,6 +2022,141 @@ function appendEditUserMessageButton(entry, c) {
   entry.appendChild(btn);
 }
 
+// Render a log entry's attachment previews as a thumbnail strip.
+// Each preview is { dataUrl?, url?, name?, note?, frameId?, mime? }:
+// `dataUrl` (a data: URL or a same-origin /raw URL) renders as an <img>;
+// `url` additionally wraps the thumb in a click-through link that opens
+// the blob in a new tab. A preview without pixels — or one whose blob was
+// deleted from the upload store (the <img> error path) — degrades to a
+// named chip instead of a broken image.
+function appendLogAttachmentStrip(cnt, c) {
+  const attachmentPreviews = Array.isArray(c?.attachment_previews) ? c.attachment_previews : [];
+  if (attachmentPreviews.length === 0) return;
+  const strip = document.createElement('div');
+  strip.className = 'log-attachment-strip';
+  const missingChip = (att) => {
+    const chip = document.createElement('span');
+    chip.className = 'log-attachment-file';
+    chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
+    return chip;
+  };
+  for (const att of attachmentPreviews) {
+    if (att && att.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'log-attachment-thumb';
+      img.loading = 'lazy';
+      img.src = att.dataUrl;
+      img.alt = '';
+      img.title = att.note || att.name || att.frameId || 'attachment';
+      let holder = img;
+      if (att.url) {
+        const link = document.createElement('a');
+        link.className = 'log-attachment-link';
+        link.href = att.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.title = img.title;
+        link.appendChild(img);
+        holder = link;
+      }
+      img.addEventListener('error', () => {
+        const chip = missingChip(att);
+        chip.classList.add('log-attachment-missing');
+        chip.title = 'attachment unavailable (blob deleted from the upload store)';
+        holder.replaceWith(chip);
+      }, { once: true });
+      strip.appendChild(holder);
+    } else {
+      strip.appendChild(missingChip(att));
+    }
+  }
+  cnt.appendChild(strip);
+}
+
+// ── Session notes (display-only transcript notes) ──
+// Wire shape: { event: 'session_note', session_id, note_id, text,
+// attachments: [{upload_id, name, mime, url}], source?, ts }.
+// Rendered as an ordinary log entry with kind 'session_note' (distinct
+// styling via .log-entry[data-kind=session_note]) and the attachment
+// strip fed by the upload-store /raw URLs.
+
+function sessionNoteAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => ({
+    dataUrl: att?.url || '',
+    url: att?.url || '',
+    name: att?.name || 'image',
+    mime: att?.mime || '',
+  }));
+}
+
+// Normalize a session_note wire event (live WS or a raw replay/session-
+// detail entry) into the log-command shape renderLogEntry consumes.
+function sessionNoteLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: 'info',
+    source: String(d?.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: text,
+    note_id: d?.note_id || d?.noteId || '',
+    event_id: d?.event_id || d?.eventId || (d?.note_id ? `session-note:${d.note_id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+    attachment_previews: sessionNoteAttachmentPreviews(d),
+  };
+}
+
+// Live-path handler for the session_note WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleSessionNoteEvent(d) {
+  const c = sessionNoteLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+}
+
+// QA readback (window.qa convention): the dashboard validator exercises
+// the note rail's module-scoped pieces directly — the attachment strip
+// (including its deleted-blob chip degradation) and the wire-event
+// normalizer. Side-effect-free beyond the DOM node the caller passes in.
+window.qa = Object.assign(window.qa || {}, {
+  sessionNotes: {
+    renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
+    logCommand: (d) => sessionNoteLogCommand(d),
+  },
+});
+
+// Bootstrap-replay adapter: the WASM activity-feed pipeline only carries
+// log_entry-shaped replay rows (AddLogEntry has no attachment fields), so
+// session_note entries replay as note-styled text entries; the session
+// windows and the Sessions detail view re-attach the thumbnails from the
+// raw entries. The content deliberately stays byte-identical to the raw
+// note text so the transcript-signature dedupe collapses this row with
+// the attachment-bearing record the external window sync later inserts.
+// Everything else passes through untouched.
+function sessionNoteReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'session_note') return entry;
+  return {
+    event: 'log_entry',
+    level: 'info',
+    source: String(entry.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
@@ -2044,34 +2180,13 @@ function renderLogEntry(c) {
   appendLogStateBadges(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
-  const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];
   if (hasImages) {
     const badge = document.createElement('span');
     badge.className = 'log-image-badge';
     badge.textContent = c.images.length === 1 ? '[screenshot]' : '[' + c.images.length + ' screenshots]';
     cnt.appendChild(badge);
   }
-  if (attachmentPreviews.length > 0) {
-    const strip = document.createElement('div');
-    strip.className = 'log-attachment-strip';
-    for (const att of attachmentPreviews) {
-      if (att && att.dataUrl) {
-        const img = document.createElement('img');
-        img.className = 'log-attachment-thumb';
-        img.loading = 'lazy';
-        img.src = att.dataUrl;
-        img.alt = '';
-        img.title = att.note || att.name || att.frameId || 'attachment';
-        strip.appendChild(img);
-      } else {
-        const chip = document.createElement('span');
-        chip.className = 'log-attachment-file';
-        chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
-        strip.appendChild(chip);
-      }
-    }
-    cnt.appendChild(strip);
-  }
+  appendLogAttachmentStrip(cnt, c);
 
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');

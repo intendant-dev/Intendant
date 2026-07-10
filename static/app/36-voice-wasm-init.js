@@ -391,6 +391,12 @@ async function main() {
         handleSharedViewEvent(d);
         return;
       }
+      if (d.event === 'session_note') {
+        // Display-only transcript note: rendered end to end in JS (the
+        // WASM presence layer does not know this event).
+        handleSessionNoteEvent(d);
+        return;
+      }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
         handleBrowserWorkspaceMessage(d);
         return;
@@ -412,7 +418,13 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          const cmds = app.handle_server_message(filtered);
+          // session_note entries ride the WASM pipeline as note-styled
+          // log_entry rows (see sessionNoteReplayEntryToLogEntry) so the
+          // replayed transcript keeps chronological order.
+          const cmds = app.handle_server_message({
+            ...filtered,
+            entries: filtered.entries.map(sessionNoteReplayEntryToLogEntry),
+          });
           if (cmds) processCommands(cmds);
         } finally {
           processingLogReplay = wasProcessingLogReplay;
