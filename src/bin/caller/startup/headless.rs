@@ -466,6 +466,22 @@ pub(crate) async fn run_headless_mode(
         },
     );
 
+    // Session vitals: cache/limits are usage-driven and always produced;
+    // the git segment probes the live target registry (primary session
+    // seed + supervisor-registered sessions).
+    let vitals = if use_web {
+        let seed = session_log_id(&session_log)
+            .map(|session_id| vec![(session_id, project.root.clone())])
+            .unwrap_or_default();
+        Some(session_vitals::spawn_session_vitals_producer(
+            bus.clone(),
+            seed,
+        ))
+    } else {
+        None
+    };
+    let vitals_git_targets = vitals.as_ref().map(|(targets, _)| targets.clone());
+
     // Dashboard-driven CreateSession / ResumeSession while the foreground
     // session runs: parallel sessions are owned by the session supervisor
     // (the dispatcher deliberately ignores them).
@@ -487,6 +503,7 @@ pub(crate) async fn run_headless_mode(
                     shared_session: headless_shared_session.clone(),
                     provider_factory: None,
                     logs_home_override: None,
+                    git_vitals_targets: vitals_git_targets.clone(),
                 },
             )
             .spawn_resume_listener(),
@@ -495,19 +512,6 @@ pub(crate) async fn run_headless_mode(
         None
     };
 
-    // Session vitals: cache/limits are usage-driven and always produced;
-    // the git segment probes the project root for the primary session.
-    let _vitals_producer = if use_web {
-        let targets = session_log_id(&session_log)
-            .map(|session_id| vec![(session_id, project.root.clone())])
-            .unwrap_or_default();
-        Some(session_vitals::spawn_session_vitals_producer(
-            bus.clone(),
-            targets,
-        ))
-    } else {
-        None
-    };
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     let _usage_rail = if use_web {
@@ -706,6 +710,7 @@ pub(crate) async fn run_headless_mode(
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: headless_shared_session.clone(),
+            git_vitals_targets: vitals_git_targets.clone(),
         })
         .await;
     } else {
