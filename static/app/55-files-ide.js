@@ -3070,6 +3070,13 @@ async function startNewSession() {
   } else if (execution === 'direct' || direct) {
     msg.direct = true;
   }
+  // Worktree launch: the daemon validates/derives the branch, creates the
+  // worktree off the project's HEAD, and roots the session inside it.
+  if (document.getElementById('new-session-worktree')?.checked) {
+    msg.worktree = true;
+    const worktreeBranch = document.getElementById('new-session-worktree-branch')?.value.trim() || '';
+    if (worktreeBranch) msg.worktree_branch = worktreeBranch;
+  }
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {
@@ -3092,4 +3099,12 @@ async function startNewSession() {
   }
 }
 window.startNewSession = startNewSession;
+
+// Reveal the optional branch-name input only while the worktree launch is
+// requested; an untouched form stays exactly as before.
+function onNewSessionWorktreeToggle() {
+  const checked = !!document.getElementById('new-session-worktree')?.checked;
+  document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
+}
+window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
 

@@ -1563,6 +1563,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut external_source: Option<String> = None;
     let mut canonical_session_id: Option<String> = None;
     let mut capabilities: Option<serde_json::Value> = None;
+    let mut worktree = serde_json::Value::Null;
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = session_activity_mtime_secs(dir);
 
@@ -1598,6 +1599,9 @@ pub(crate) fn intendant_session_list_row_from_dir(
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if let Some(value) = meta.get("worktree").filter(|v| v.is_object()) {
+                worktree = value.clone();
+            }
         }
     }
 
@@ -1956,6 +1960,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
         "total_bytes": total_bytes,
         "cwd": cwd.clone().or_else(|| project_root.clone()),
         "project_root": project_root.clone(),
+        "worktree": worktree,
         "path": dir.to_string_lossy().to_string(),
         "can_delete": true,
         "can_resume": true,
@@ -2067,6 +2072,7 @@ pub(crate) fn intendant_session_skeleton_from_dir(
     let mut project_root: Option<String> = None;
     let mut status = "in_progress".to_string();
     let mut role: Option<String> = None;
+    let mut worktree = serde_json::Value::Null;
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
             task = value_str(&meta, "task");
@@ -2077,6 +2083,9 @@ pub(crate) fn intendant_session_skeleton_from_dir(
                 status = value;
             }
             role = value_str(&meta, "role");
+            if let Some(value) = meta.get("worktree").filter(|v| v.is_object()) {
+                worktree = value.clone();
+            }
         }
     }
     if status != "completed" {
@@ -2121,6 +2130,7 @@ pub(crate) fn intendant_session_skeleton_from_dir(
         "total_bytes": 0,
         "cwd": project_root.clone(),
         "project_root": project_root,
+        "worktree": worktree,
         "path": dir.to_string_lossy().to_string(),
         "can_delete": true,
         "can_resume": true,

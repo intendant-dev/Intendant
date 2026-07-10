@@ -394,6 +394,172 @@ pub(crate) fn remove_worktree_inventory_response(
     }
 }
 
+/// Session-end finish-card action: merge a session's linked worktree
+/// branch into its base checkout, then remove the checkout via the same
+/// safety-checked path `/api/worktrees/remove` uses.
+///
+/// The request carries only a session id; the branch, checkout path, and
+/// base root all come from the session's own recorded linkage in
+/// `session_meta.json` — so the endpoint can only ever merge a
+/// session-linked worktree branch, never an arbitrary ref.
+pub(crate) fn merge_session_worktree_response(
+    home: &Path,
+    body_text: &str,
+) -> (&'static str, String) {
+    let session_id = serde_json::from_str::<serde_json::Value>(body_text)
+        .ok()
+        .and_then(|body| {
+            body.get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let Some(session_id) = session_id.filter(|id| session_lookup_id_is_safe(id)) else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({
+                "ok": false,
+                "error": "worktree merge request needs a session_id"
+            })
+            .to_string(),
+        );
+    };
+    let Some(session_dir) = resolve_bare_session_dir_from_home(home, &session_id) else {
+        return (
+            "404 Not Found",
+            serde_json::json!({
+                "ok": false,
+                "error": format!("session '{session_id}' was not found")
+            })
+            .to_string(),
+        );
+    };
+    let hints = worktree_session_hints_from_home(home);
+    match merge_linked_session_worktree(&session_dir, &hints) {
+        Ok(body) => ("200 OK", body.to_string()),
+        Err(message) => (
+            "409 Conflict",
+            serde_json::json!({
+                "ok": false,
+                "error": message
+            })
+            .to_string(),
+        ),
+    }
+}
+
+/// The merge itself, keyed entirely off the session's recorded linkage.
+/// Fails closed on every drifted precondition (unregistered checkout,
+/// renamed branch, base checkout moved to another branch or detached);
+/// a conflicted merge is aborted by `worktree::merge` and reported. A
+/// post-merge removal refusal is reported in the response, not an error —
+/// the merge itself already landed.
+pub(crate) fn merge_linked_session_worktree(
+    session_dir: &Path,
+    hints: &[crate::worktree_inventory::WorktreeSessionHint],
+) -> Result<serde_json::Value, String> {
+    let meta = std::fs::read_to_string(session_dir.join("session_meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<crate::session_log::SessionMeta>(&raw).ok())
+        .ok_or_else(|| "session metadata was not readable".to_string())?;
+    let linkage = meta
+        .worktree
+        .ok_or_else(|| "this session has no linked git worktree".to_string())?;
+    let base_root = PathBuf::from(&linkage.base_root);
+    if !base_root.is_dir() {
+        return Err(format!(
+            "base checkout {} no longer exists",
+            base_root.display()
+        ));
+    }
+    let worktree_path = PathBuf::from(&linkage.path);
+    // The linked checkout must still be a registered worktree of the base
+    // repo, still on the branch the session recorded.
+    let registered = crate::worktree::list(&base_root)
+        .map_err(|e| format!("could not list worktrees: {e}"))?
+        .into_iter()
+        .find(|wt| worktree_merge_paths_match(&wt.path, &worktree_path));
+    let Some(registered) = registered else {
+        return Err(format!(
+            "{} is no longer a registered worktree of {}",
+            worktree_path.display(),
+            base_root.display()
+        ));
+    };
+    if registered.branch_name != linkage.branch {
+        return Err(format!(
+            "worktree {} is now on branch {:?}, not the session's recorded {:?} — merge manually",
+            worktree_path.display(),
+            registered.branch_name,
+            linkage.branch
+        ));
+    }
+    // Merge into the branch the base checkout is on — and require it to
+    // still be the branch the worktree branched from, so "Merge into
+    // <base>" can never silently land on a different branch.
+    let current = crate::worktree::current_branch(&base_root);
+    let merge_target = match (&linkage.base_branch, current) {
+        (Some(recorded), Some(current)) if *recorded == current => current,
+        (Some(recorded), Some(current)) => {
+            return Err(format!(
+                "base checkout is now on {current:?} (it was on {recorded:?} when the \
+                 worktree was created) — check out {recorded:?} first or merge manually"
+            ));
+        }
+        (Some(recorded), None) => {
+            return Err(format!(
+                "base checkout is on a detached HEAD — check out {recorded:?} first"
+            ));
+        }
+        (None, _) => {
+            return Err(
+                "the worktree was created from a detached HEAD; merge manually".to_string(),
+            );
+        }
+    };
+    let wt = crate::worktree::Worktree {
+        branch_name: linkage.branch.clone(),
+        path: worktree_path.clone(),
+        base_branch: merge_target.clone(),
+    };
+    match crate::worktree::merge(&base_root, &wt, &merge_target).map_err(|e| e.to_string())? {
+        crate::worktree::MergeResult::Conflict(message) => Err(message),
+        crate::worktree::MergeResult::Clean => {
+            let repo_root = crate::worktree_inventory::git_repo_root(&base_root)
+                .unwrap_or_else(|| base_root.clone());
+            let removal = crate::worktree_inventory::remove_worktree_if_safe(
+                crate::worktree_inventory::WorktreeRemoveRequest {
+                    repo_root,
+                    path: worktree_path.clone(),
+                    expected_head: None,
+                },
+                hints,
+            );
+            let (removed, removal_error) = match removal {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e)),
+            };
+            Ok(serde_json::json!({
+                "ok": true,
+                "merged": true,
+                "branch": linkage.branch,
+                "merged_into": merge_target,
+                "base_root": linkage.base_root,
+                "worktree_path": linkage.path,
+                "removed": removed,
+                "removal_error": removal_error,
+            }))
+        }
+    }
+}
+
+/// Compare a `git worktree list` path against the session's recorded
+/// checkout path, tolerating symlinked tempdirs (macOS `/tmp` vs
+/// `/private/tmp`) by canonicalizing when possible.
+fn worktree_merge_paths_match(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    a == b || canon(a) == canon(b)
+}
+
 /// Handle `/api/session/current/changes[/{path}]` requests.
 ///
 /// - No path suffix: list all changed files (baseline vs current).
@@ -2945,6 +3111,42 @@ pub(crate) async fn handle_worktrees_remove(
     finalize_http_stream(&mut stream).await;
 }
 
+pub(crate) async fn handle_worktrees_merge(
+    mut stream: DemuxStream,
+    body_text: String,
+    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+) {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let cache = worktree_inventory_cache.clone();
+    let (status, body) = match tokio::task::spawn_blocking(move || {
+        let result = merge_session_worktree_response(&home, &body_text);
+        if result.0 == "200 OK" {
+            // The merge (and usually the removal) changed the inventory;
+            // drop the cached scan like the remove handler does.
+            if let Ok(mut guard) = cache.lock() {
+                *guard = None;
+            }
+        }
+        result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({
+                "ok": false,
+                "error": format!("worktree merge task failed: {e}")
+            })
+            .to_string(),
+        ),
+    };
+    let response = json_response(status, body);
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.write_all(response.as_bytes()).await;
+    finalize_http_stream(&mut stream).await;
+}
+
 pub(crate) async fn handle_worktrees_scan(
     mut stream: DemuxStream,
     project_root: Option<PathBuf>,
@@ -3438,6 +3640,164 @@ mod tests {
             .map(|(_, body)| body)
             .expect("response body");
         serde_json::from_str(body).expect("json response")
+    }
+
+    mod worktree_merge {
+        use super::*;
+        use std::process::Command;
+
+        fn git(repo: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn init_repo(dir: &Path) {
+            git(dir, &["init", "-b", "main"]);
+            git(dir, &["config", "user.email", "test@test.com"]);
+            git(dir, &["config", "user.name", "Test"]);
+            std::fs::write(dir.join("README.md"), "# base\n").unwrap();
+            git(dir, &["add", "README.md"]);
+            git(dir, &["commit", "-m", "initial"]);
+        }
+
+        /// A repo + linked worktree with one committed change, and the
+        /// session dir whose meta records the linkage — the state a
+        /// worktree session leaves behind when it ends.
+        fn linked_session(
+            repo: &Path,
+            session_dir: &Path,
+            branch: &str,
+        ) -> crate::session_log::SessionWorktreeMeta {
+            init_repo(repo);
+            let wt = crate::worktree::create(repo, branch, "HEAD").unwrap();
+            std::fs::write(wt.path.join("feature.txt"), "from the worktree\n").unwrap();
+            git(&wt.path, &["add", "feature.txt"]);
+            git(&wt.path, &["commit", "-m", "worktree change"]);
+
+            let linkage = crate::session_log::SessionWorktreeMeta {
+                branch: branch.to_string(),
+                path: wt.path.to_string_lossy().to_string(),
+                base_root: repo.to_string_lossy().to_string(),
+                base_branch: Some("main".to_string()),
+                base_sha: crate::worktree::head_commit(repo).ok(),
+            };
+            std::fs::create_dir_all(session_dir).unwrap();
+            let meta = serde_json::json!({
+                "session_id": "wt-session",
+                "created_at": "2026-07-09T00:00:00",
+                "project_root": linkage.path,
+                "worktree": linkage,
+            });
+            std::fs::write(
+                session_dir.join("session_meta.json"),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            linkage
+        }
+
+        #[test]
+        fn clean_merge_lands_and_removes_the_worktree() {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            let linkage = linked_session(repo_dir.path(), session_dir.path(), "wt-clean");
+
+            let body = merge_linked_session_worktree(session_dir.path(), &[]).unwrap();
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["merged"], true);
+            assert_eq!(body["merged_into"], "main");
+            assert_eq!(body["branch"], "wt-clean");
+            assert_eq!(body["removed"], true, "{body}");
+            // The change landed in the base checkout; the checkout is gone
+            // but the branch ref survives (the work product).
+            assert!(repo_dir.path().join("feature.txt").exists());
+            assert!(!PathBuf::from(&linkage.path).exists());
+            assert!(crate::worktree::branch_exists(repo_dir.path(), "wt-clean"));
+        }
+
+        #[test]
+        fn conflicted_merge_aborts_and_keeps_everything() {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            let linkage = linked_session(repo_dir.path(), session_dir.path(), "wt-conflict");
+            // Divergent edit to the same file in the base checkout.
+            std::fs::write(repo_dir.path().join("feature.txt"), "from main\n").unwrap();
+            git(repo_dir.path(), &["add", "feature.txt"]);
+            git(repo_dir.path(), &["commit", "-m", "conflicting main change"]);
+
+            let err = merge_linked_session_worktree(session_dir.path(), &[]).unwrap_err();
+            assert!(err.contains("wt-conflict"), "{err}");
+            // The merge was aborted: no merge in progress, worktree intact.
+            assert!(!repo_dir.path().join(".git").join("MERGE_HEAD").exists());
+            assert!(PathBuf::from(&linkage.path).exists());
+        }
+
+        #[test]
+        fn merge_refuses_when_base_checkout_moved_branches() {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            linked_session(repo_dir.path(), session_dir.path(), "wt-moved");
+            git(repo_dir.path(), &["checkout", "-b", "elsewhere"]);
+
+            let err = merge_linked_session_worktree(session_dir.path(), &[]).unwrap_err();
+            assert!(err.contains("elsewhere"), "{err}");
+            assert!(err.contains("main"), "{err}");
+        }
+
+        #[test]
+        fn merge_requires_a_recorded_linkage() {
+            let session_dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                session_dir.path().join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": "plain",
+                    "created_at": "2026-07-09T00:00:00",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let err = merge_linked_session_worktree(session_dir.path(), &[]).unwrap_err();
+            assert!(err.contains("no linked git worktree"), "{err}");
+        }
+
+        #[test]
+        fn merge_response_rejects_bad_and_unknown_session_ids() {
+            let home = tempfile::tempdir().unwrap();
+            let (status, body) = merge_session_worktree_response(home.path(), "{}");
+            assert_eq!(status, "400 Bad Request", "{body}");
+            let (status, body) = merge_session_worktree_response(
+                home.path(),
+                &serde_json::json!({"session_id": "../escape"}).to_string(),
+            );
+            assert_eq!(status, "400 Bad Request", "{body}");
+            let (status, body) = merge_session_worktree_response(
+                home.path(),
+                &serde_json::json!({"session_id": "does-not-exist"}).to_string(),
+            );
+            assert_eq!(status, "404 Not Found", "{body}");
+        }
+
+        #[test]
+        fn merge_refuses_a_session_linked_to_a_missing_worktree() {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            let linkage = linked_session(repo_dir.path(), session_dir.path(), "wt-gone");
+            // Simulate the checkout being removed out from under the card.
+            git(
+                repo_dir.path(),
+                &["worktree", "remove", "--force", &linkage.path],
+            );
+            let err = merge_linked_session_worktree(session_dir.path(), &[]).unwrap_err();
+            assert!(err.contains("no longer a registered worktree"), "{err}");
+        }
     }
 
     fn managed_context_test_record(

@@ -12,11 +12,191 @@ pub struct Worktree {
     pub base_branch: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergeResult {
     Clean,
     Conflict(String),
+}
+
+/// Ceiling for user-supplied worktree branch names. Git itself allows far
+/// longer refs, but the branch doubles as the worktree directory name under
+/// `.intendant/worktrees/`, so keep it filesystem-friendly.
+const MAX_BRANCH_NAME_LEN: usize = 120;
+
+/// Validate a user-supplied branch name for a session worktree.
+///
+/// A deliberately conservative subset of `git check-ref-format` that is
+/// also path-safe: the branch becomes a directory under
+/// `.intendant/worktrees/`, so `..`, absolute separators, and other
+/// traversal shapes are rejected outright rather than left for git to
+/// maybe-accept.
+pub fn validate_branch_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("branch name is empty".to_string());
+    }
+    if name.len() > MAX_BRANCH_NAME_LEN {
+        return Err(format!(
+            "branch name is longer than {MAX_BRANCH_NAME_LEN} characters"
+        ));
+    }
+    if name.starts_with('-') {
+        return Err("branch name must not start with '-'".to_string());
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return Err("branch name must not start or end with '/'".to_string());
+    }
+    if name.ends_with('.') {
+        return Err("branch name must not end with '.'".to_string());
+    }
+    if name.contains("@{") {
+        return Err("branch name must not contain '@{'".to_string());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+    {
+        return Err(format!(
+            "branch name may only contain letters, digits, '.', '_', '-' and '/' (got {bad:?})"
+        ));
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Err("branch name must not contain empty path segments ('//')".to_string());
+        }
+        if component.starts_with('.') {
+            return Err(format!(
+                "branch name segment {component:?} must not start with '.'"
+            ));
+        }
+        if component.ends_with(".lock") {
+            return Err("branch name segments must not end with '.lock'".to_string());
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// Derive a worktree branch name when the user did not supply one: a slug
+/// of the session name when present, otherwise `session-<short-id>`.
+pub fn derive_branch_name(session_name: Option<&str>, session_id: &str) -> String {
+    if let Some(name) = session_name.map(str::trim).filter(|name| !name.is_empty()) {
+        let mut slug = String::new();
+        let mut last_dash = true; // suppress a leading dash
+        for c in name.chars() {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() {
+                slug.push(c);
+                last_dash = false;
+            } else if !last_dash {
+                slug.push('-');
+                last_dash = true;
+            }
+            if slug.len() >= 40 {
+                break;
+            }
+        }
+        let slug = slug.trim_matches('-').to_string();
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+    let short_id: String = session_id.chars().take(8).collect();
+    format!("session-{short_id}")
+}
+
+/// First branch name in `base`, `base-2`, `base-3`, … that neither exists
+/// as a local branch nor collides with an existing worktree directory.
+/// After a bounded scan it falls back to a nanos suffix so the launch can
+/// never loop forever on a pathological repo.
+pub fn unique_branch_name(project_root: &Path, base: &str) -> String {
+    let taken = |candidate: &str| {
+        branch_exists(project_root, candidate)
+            || project_root
+                .join(".intendant")
+                .join("worktrees")
+                .join(candidate)
+                .exists()
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for n in 2..=50 {
+        let candidate = format!("{base}-{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{base}-{nanos}")
+}
+
+pub fn branch_exists(project_root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(project_root)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The commit `HEAD` resolves to in `project_root`.
+///
+/// Doubles as the "can this directory host a session worktree?" preflight:
+/// a non-repo directory and a repo with no commits both fail here with an
+/// actionable message, before `git worktree add` gets a chance to emit a
+/// more cryptic one.
+pub fn head_commit(project_root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let inside_repo = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(project_root)
+            .output()
+            .map(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+            })
+            .unwrap_or(false);
+        if !inside_repo {
+            return Err(format!(
+                "{} is not a git repository — worktree sessions need a git project \
+                 (run `git init` there or launch without the worktree option)",
+                project_root.display()
+            ));
+        }
+        return Err(format!(
+            "{} has no commits yet — a worktree branches from HEAD, so make an \
+             initial commit first",
+            project_root.display()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The branch currently checked out at `path`, `None` when detached (or
+/// not a repo).
+pub fn current_branch(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
 }
 
 pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree, CallerError> {
@@ -107,7 +287,6 @@ pub fn remove_worktree_and_branch(project_root: &Path, wt: &Worktree) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Merge the worktree branch into the current checkout at `project_root`.
 ///
 /// `current_checkout_label` is used only for diagnostics; this helper does
@@ -146,7 +325,6 @@ pub fn merge(
     }
 }
 
-#[allow(dead_code)]
 pub fn list(project_root: &Path) -> Result<Vec<Worktree>, CallerError> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -364,6 +542,115 @@ mod tests {
             }
             MergeResult::Clean => panic!("Expected conflict"),
         }
+    }
+
+    #[test]
+    fn validate_branch_name_accepts_sane_names() {
+        for name in [
+            "feature-1",
+            "feat/worktree-sessions",
+            "user.branch_2",
+            "  padded  ",
+        ] {
+            let validated = validate_branch_name(name).unwrap();
+            assert_eq!(validated, name.trim());
+        }
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_traversal_and_weird_refs() {
+        for bad in [
+            "",
+            "   ",
+            "../escape",
+            "a/../b",
+            "a/..",
+            "..",
+            ".hidden",
+            "a/.hidden",
+            "-flag",
+            "/rooted",
+            "trailing/",
+            "double//slash",
+            "dot.",
+            "ref@{1}",
+            "has space",
+            "semi;colon",
+            "back\\slash",
+            "tilde~1",
+            "caret^2",
+            "colon:ref",
+            "quest?ion",
+            "star*",
+            "brack[et",
+            "locky.lock",
+            "deep/locky.lock",
+        ] {
+            assert!(
+                validate_branch_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        let too_long = "a".repeat(200);
+        assert!(validate_branch_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn derive_branch_name_slugs_session_name_or_falls_back_to_id() {
+        assert_eq!(
+            derive_branch_name(Some("Fix the Login Bug!"), "abcd1234-rest"),
+            "fix-the-login-bug"
+        );
+        assert_eq!(
+            derive_branch_name(Some("  --- "), "abcd1234-rest"),
+            "session-abcd1234"
+        );
+        assert_eq!(derive_branch_name(None, "abcd1234-rest"), "session-abcd1234");
+        // Long names are capped and never end on a dash.
+        let long = derive_branch_name(Some(&"word ".repeat(30)), "abcd1234");
+        assert!(long.len() <= 40, "{long}");
+        assert!(!long.ends_with('-'), "{long}");
+    }
+
+    #[test]
+    fn unique_branch_name_suffixes_on_collision() {
+        let dir = init_test_repo();
+        let repo = dir.path();
+        assert_eq!(unique_branch_name(repo, "fresh"), "fresh");
+
+        create(repo, "taken", "HEAD").unwrap();
+        assert_eq!(unique_branch_name(repo, "taken"), "taken-2");
+        create(repo, "taken-2", "HEAD").unwrap();
+        assert_eq!(unique_branch_name(repo, "taken"), "taken-3");
+    }
+
+    #[test]
+    fn head_commit_reports_non_repo_and_empty_repo_clearly() {
+        let plain = tempfile::tempdir().unwrap();
+        let err = head_commit(plain.path()).unwrap_err();
+        assert!(err.contains("not a git repository"), "{err}");
+
+        let empty = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(empty.path())
+            .output()
+            .unwrap();
+        let err = head_commit(empty.path()).unwrap_err();
+        assert!(err.contains("no commits yet"), "{err}");
+
+        let dir = init_test_repo();
+        let sha = head_commit(dir.path()).unwrap();
+        assert_eq!(sha.len(), 40, "{sha}");
+    }
+
+    #[test]
+    fn current_branch_reads_checkout_branch() {
+        let dir = init_test_repo();
+        let branch = current_branch(dir.path()).expect("fresh repo is on a branch");
+        assert!(!branch.is_empty());
+        let wt = create(dir.path(), "branch-probe", "HEAD").unwrap();
+        assert_eq!(current_branch(&wt.path).as_deref(), Some("branch-probe"));
     }
 
     #[test]

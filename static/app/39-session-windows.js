@@ -438,7 +438,13 @@ function normalizeSessionWindowMeta(meta = {}) {
     out.projectRoot = project;
     out.projectLabel = compactPathLabel(project, true);
   }
-  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || project);
+  // Worktree linkage (an OBJECT — branch/path/base) is distinct from the
+  // legacy string `worktree` cwd alias some callers pass; only the string
+  // form may feed the cwd fallback below.
+  const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
+  if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
+  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
     out.cwd = cwd;
     out.cwdLabel = compactPathLabel(cwd, true);
@@ -489,6 +495,24 @@ function normalizeSessionWindowMeta(meta = {}) {
   return out;
 }
 
+// Session worktree linkage from the catalog row / session_meta.json —
+// `{branch, path, base_root, base_branch?, base_sha?}` — normalized to a
+// compact object, or null when absent/malformed.
+function normalizeSessionWorktreeInfo(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const branch = compactSessionText(raw.branch);
+  const path = compactSessionText(raw.path);
+  if (!branch || !path) return null;
+  const info = { branch, path };
+  const baseRoot = compactSessionText(raw.base_root || raw.baseRoot);
+  if (baseRoot) info.baseRoot = baseRoot;
+  const baseBranch = compactSessionText(raw.base_branch || raw.baseBranch);
+  if (baseBranch) info.baseBranch = baseBranch;
+  const baseSha = compactSessionText(raw.base_sha || raw.baseSha);
+  if (baseSha) info.baseSha = baseSha;
+  return info;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -497,6 +521,7 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.projectLabel || '',
     meta.cwd || '',
     meta.cwdLabel || '',
+    meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -905,6 +930,7 @@ function sessionWindowMetaFromSession(session) {
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
+    worktree: session.worktree,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,
@@ -1178,6 +1204,7 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.codexContextArchive) record.codex_context_archive = meta.codexContextArchive;
   if (meta.projectRoot) record.project_root = meta.projectRoot;
   if (meta.cwd) record.cwd = meta.cwd;
+  if (meta.worktree) record.worktree = meta.worktree;
   if (meta.parentId && meta.relationshipKind) {
     record.parent_session_id = meta.parentId;
     record.relationship = meta.relationshipKind;

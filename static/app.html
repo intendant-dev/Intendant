@@ -5198,6 +5198,82 @@ body.context-focus-active {
 .session-window-task::before { content: "msg"; }
 .session-window-project::before { content: "proj"; }
 .session-window-cwd::before { content: "cwd"; }
+.session-window-worktree {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 220px;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--mauve) 30%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mauve) 10%, transparent);
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-worktree-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 8px 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--mauve) 35%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+  font-size: 12px;
+}
+.session-worktree-card.busy {
+  opacity: 0.75;
+}
+.session-worktree-card-text {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.session-worktree-card-title {
+  font-weight: 700;
+}
+.session-worktree-card-detail {
+  color: var(--overlay1);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-worktree-card-status {
+  flex: 1 1 100%;
+  font-size: 11px;
+}
+.session-worktree-card-status.hidden {
+  display: none;
+}
+.session-worktree-card-status.pending {
+  color: var(--yellow);
+}
+.session-worktree-card-status.ok {
+  color: var(--green);
+}
+.session-worktree-card-status.error {
+  color: var(--red);
+}
+.session-worktree-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.session-worktree-card-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+.session-worktree-card-btn.primary {
+  border-color: color-mix(in srgb, var(--mauve) 45%, transparent);
+  background: color-mix(in srgb, var(--mauve) 18%, transparent);
+  color: var(--text);
+}
 .session-window-status {
   flex-shrink: 0;
   padding: 1px 6px;
@@ -7526,6 +7602,22 @@ body.context-focus-active {
 .sessions-project-status.ok { color: var(--green); }
 .sessions-project-status.warn { color: var(--yellow); }
 .sessions-project-status.error { color: var(--red); }
+.sessions-worktree-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.sessions-worktree-toggle {
+  flex-shrink: 0;
+  text-transform: none;
+}
+.sessions-worktree-branch {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.sessions-worktree-branch.hidden { display: none; }
 .sessions-start-btn {
   align-self: flex-start;
   padding: 4px 12px;
@@ -22432,6 +22524,17 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                   </div>
                   <div id="new-session-project-status" class="sessions-project-status"></div>
                   <datalist id="new-session-project-options"></datalist>
+                  <div class="sessions-worktree-row">
+                    <label class="sessions-toggle sessions-worktree-toggle" id="new-session-worktree-wrap"
+                           title="Create a fresh git worktree branched off the project's HEAD and run the session inside it. Needs a git repository with at least one commit.">
+                      <input id="new-session-worktree" type="checkbox" onchange="onNewSessionWorktreeToggle()">
+                      Run in a git worktree
+                    </label>
+                    <label class="sessions-new-session-field sessions-worktree-branch hidden" for="new-session-worktree-branch" id="new-session-worktree-branch-row">
+                      Branch name
+                      <input id="new-session-worktree-branch" class="sessions-project-input" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Optional — derived from the session name">
+                    </label>
+                  </div>
                 </div>
                 <div class="sessions-new-agent-row sessions-new-agent-picker">
                   <label class="sessions-new-session-field" for="new-session-agent">
@@ -43156,7 +43259,13 @@ function normalizeSessionWindowMeta(meta = {}) {
     out.projectRoot = project;
     out.projectLabel = compactPathLabel(project, true);
   }
-  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || meta.worktree || project);
+  // Worktree linkage (an OBJECT — branch/path/base) is distinct from the
+  // legacy string `worktree` cwd alias some callers pass; only the string
+  // form may feed the cwd fallback below.
+  const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
+  if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
+  const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
     out.cwd = cwd;
     out.cwdLabel = compactPathLabel(cwd, true);
@@ -43207,6 +43316,24 @@ function normalizeSessionWindowMeta(meta = {}) {
   return out;
 }
 
+// Session worktree linkage from the catalog row / session_meta.json —
+// `{branch, path, base_root, base_branch?, base_sha?}` — normalized to a
+// compact object, or null when absent/malformed.
+function normalizeSessionWorktreeInfo(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const branch = compactSessionText(raw.branch);
+  const path = compactSessionText(raw.path);
+  if (!branch || !path) return null;
+  const info = { branch, path };
+  const baseRoot = compactSessionText(raw.base_root || raw.baseRoot);
+  if (baseRoot) info.baseRoot = baseRoot;
+  const baseBranch = compactSessionText(raw.base_branch || raw.baseBranch);
+  if (baseBranch) info.baseBranch = baseBranch;
+  const baseSha = compactSessionText(raw.base_sha || raw.baseSha);
+  if (baseSha) info.baseSha = baseSha;
+  return info;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -43215,6 +43342,7 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.projectLabel || '',
     meta.cwd || '',
     meta.cwdLabel || '',
+    meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -43623,6 +43751,7 @@ function sessionWindowMetaFromSession(session) {
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
+    worktree: session.worktree,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,
@@ -43896,6 +44025,7 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.codexContextArchive) record.codex_context_archive = meta.codexContextArchive;
   if (meta.projectRoot) record.project_root = meta.projectRoot;
   if (meta.cwd) record.cwd = meta.cwd;
+  if (meta.worktree) record.worktree = meta.worktree;
   if (meta.parentId && meta.relationshipKind) {
     record.parent_session_id = meta.parentId;
     record.relationship = meta.relationshipKind;
@@ -48132,11 +48262,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
     'unknown',
     'Working directory not known yet'
   );
+  const worktreeBadge = document.createElement('span');
+  worktreeBadge.className = 'session-window-worktree hidden';
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
   metaRow.appendChild(relationStrip);
   metaRow.appendChild(project);
+  metaRow.appendChild(worktreeBadge);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
@@ -48305,6 +48438,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     relationStrip,
     project,
     cwd,
+    worktreeBadge,
     task,
     status,
     goal,
@@ -48389,6 +48523,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
+  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -48424,6 +48559,27 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
+}
+
+// Worktree badge next to the project path: branch name up front, the full
+// linkage (checkout path, base branch/commit) in the tooltip.
+function renderSessionWindowWorktreeBadge(win, worktree) {
+  if (!win?.worktreeBadge) return;
+  if (!worktree?.branch) {
+    win.worktreeBadge.className = 'session-window-worktree hidden';
+    win.worktreeBadge.textContent = '';
+    win.worktreeBadge.title = '';
+    return;
+  }
+  win.worktreeBadge.className = 'session-window-worktree';
+  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
+  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
+  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
+  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
+  if (worktree.baseBranch) {
+    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
+  }
+  win.worktreeBadge.title = lines.join('\n');
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
@@ -76894,7 +77050,15 @@ function onSessionEnded(sessionId, reason, errorKind) {
   } else if (explicitStop) {
     clearPendingFollowUpsForSession(sid, reason || 'session stopped');
     removeSessionRelationshipsForSession(sid);
-    removeSessionWindow(sid);
+    // A worktree-backed session leaves a decision behind (merge / remove /
+    // keep the worktree), so its window survives an explicit stop to host
+    // the finish card; dismissing the card completes the removal.
+    if (sessionWorktreeFinishInfo(sid)) {
+      updateSessionWindow(sid, { phase: 'done', ended: true });
+      maybeShowWorktreeFinishCard(sid, { removeWindowOnDismiss: true });
+    } else {
+      removeSessionWindow(sid);
+    }
   } else if (restarting) {
     clearPendingFollowUpsForSession(sid, reason || 'restarting session');
     updateSessionWindow(sid, { phase: 'idle', ended: false });
@@ -76904,6 +77068,7 @@ function onSessionEnded(sessionId, reason, errorKind) {
     setSessionWindowDetached(sid, true, reason || 'session ended');
   } else if (sid) {
     updateSessionWindow(sid, { phase: 'done', ended: true });
+    maybeShowWorktreeFinishCard(sid);
   }
   if (!keepExternalDetached && (!sessionId || sessionId === currentSessionFullId)) {
     currentSessionFullId = '';
@@ -76931,6 +77096,197 @@ function onSessionEnded(sessionId, reason, errorKind) {
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
+}
+
+// ── Worktree finish card ───────────────────────────────────────────────────
+// When a session that ran in a git worktree ends, its window offers the
+// three explicit outcomes for the branch it leaves behind: merge it back
+// into the base checkout (and remove the checkout), remove the checkout
+// via the same safety-checked path as the Worktrees tab, or keep it.
+// Nothing is ever automatic — the worktree persists until a click.
+
+const worktreeFinishCardDismissed = new Set();
+
+function sessionWorktreeFinishInfo(sid) {
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return meta.worktree && meta.worktree.branch && meta.worktree.path ? meta.worktree : null;
+}
+
+// The linkage rides the session catalog row (from session_meta.json); it is
+// normally hydrated well before the session ends, but fetch once on demand
+// for windows that never saw a metadata refresh.
+async function hydrateSessionWorktreeFinishInfo(sid) {
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) return existing;
+  let sessions = null;
+  if (typeof dashboardTransport !== 'undefined' && dashboardTransport?.canUseRpc()) {
+    try {
+      sessions = await dashboardTransport.request('api_sessions', { ids: [sid] });
+    } catch (_) {}
+  }
+  if (!sessions) {
+    try {
+      const r = await authedFetch(`/api/sessions?ids=${encodeURIComponent(sid)}`);
+      if (!r.ok) return null;
+      sessions = await r.json();
+    } catch (_) {
+      return null;
+    }
+  }
+  if (Array.isArray(sessions)) cacheSessionWindowMetadata(sessions);
+  return sessionWorktreeFinishInfo(sid);
+}
+
+function maybeShowWorktreeFinishCard(sid, options = {}) {
+  if (!sid || worktreeFinishCardDismissed.has(sid)) return;
+  const attach = info => {
+    if (!info || worktreeFinishCardDismissed.has(sid)) return;
+    const win = sessionWindows.get(sid);
+    if (!win || win.worktreeCard) return;
+    renderWorktreeFinishCard(win, sid, info, options);
+  };
+  const existing = sessionWorktreeFinishInfo(sid);
+  if (existing) {
+    attach(existing);
+    return;
+  }
+  hydrateSessionWorktreeFinishInfo(sid).then(attach).catch(() => {});
+}
+
+function dismissWorktreeFinishCard(sid, options = {}) {
+  worktreeFinishCardDismissed.add(sid);
+  const win = sessionWindows.get(sid);
+  if (win?.worktreeCard) {
+    win.worktreeCard.remove();
+    win.worktreeCard = null;
+  }
+  // An explicitly stopped session only kept its window to host this card;
+  // finishing the decision completes the original removal.
+  if (options.removeWindowOnDismiss) removeSessionWindow(sid);
+}
+
+function renderWorktreeFinishCard(win, sid, info, options = {}) {
+  const card = document.createElement('div');
+  card.className = 'session-worktree-card';
+  card.setAttribute('role', 'status');
+
+  const text = document.createElement('div');
+  text.className = 'session-worktree-card-text';
+  const title = document.createElement('div');
+  title.className = 'session-worktree-card-title';
+  title.textContent = `Session ended — worktree branch ${info.branch} is still checked out.`;
+  const detail = document.createElement('div');
+  detail.className = 'session-worktree-card-detail';
+  detail.textContent = info.path;
+  detail.title = info.path;
+  text.appendChild(title);
+  text.appendChild(detail);
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'session-worktree-card-status hidden';
+
+  const actions = document.createElement('div');
+  actions.className = 'session-worktree-card-actions';
+  const mergeBtn = document.createElement('button');
+  mergeBtn.type = 'button';
+  mergeBtn.className = 'ui-btn session-worktree-card-btn primary';
+  mergeBtn.textContent = info.baseBranch
+    ? `Merge into ${info.baseBranch} & remove worktree`
+    : 'Merge & remove worktree';
+  mergeBtn.title = info.baseBranch
+    ? `git merge ${info.branch} in ${info.baseRoot || 'the base checkout'} (on ${info.baseBranch}), then remove the worktree checkout. Aborts cleanly on conflict.`
+    : 'Merge the worktree branch into the base checkout, then remove the checkout.';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'ui-btn session-worktree-card-btn';
+  removeBtn.textContent = 'Remove worktree';
+  removeBtn.title = 'Remove the checkout without merging (refused if it has uncommitted or unmerged work). The branch ref is kept.';
+  const keepBtn = document.createElement('button');
+  keepBtn.type = 'button';
+  keepBtn.className = 'ui-btn session-worktree-card-btn';
+  keepBtn.textContent = 'Keep';
+  keepBtn.title = 'Keep the worktree and dismiss. It stays available in Sessions -> Worktrees.';
+  actions.appendChild(mergeBtn);
+  actions.appendChild(removeBtn);
+  actions.appendChild(keepBtn);
+
+  const setBusy = busy => {
+    for (const btn of [mergeBtn, removeBtn, keepBtn]) btn.disabled = busy;
+    card.classList.toggle('busy', busy);
+  };
+  const showStatus = (kind, message) => {
+    statusLine.className = `session-worktree-card-status ${kind}`;
+    statusLine.textContent = message;
+  };
+  const finishResolved = message => {
+    card.classList.remove('busy');
+    showStatus('ok', message);
+    actions.replaceChildren();
+    const dismissBtn = document.createElement('button');
+    dismissBtn.type = 'button';
+    dismissBtn.className = 'ui-btn session-worktree-card-btn';
+    dismissBtn.textContent = 'Dismiss';
+    dismissBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+    actions.appendChild(dismissBtn);
+  };
+  const callWorktreeAction = async (method, url, payload) => {
+    const r = await dashboardTransport.jsonFetch(method, payload, () => (
+      authedFetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    ), method, { fallbackAfterRpcFailure: false });
+    const textBody = await r.text();
+    let result = {};
+    try { result = textBody ? JSON.parse(textBody) : {}; } catch (_) {}
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `${url} returned ${r.status}`);
+    }
+    return result;
+  };
+
+  mergeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', `Merging ${info.branch}...`);
+    try {
+      const result = await callWorktreeAction(
+        'api_worktrees_merge',
+        '/api/worktrees/merge',
+        { session_id: sid },
+      );
+      showControlToast('success', `Merged ${info.branch} into ${result.merged_into || info.baseBranch || 'the base branch'}.`);
+      finishResolved(result.removed
+        ? `Merged into ${result.merged_into || 'the base branch'} and removed the worktree.`
+        : `Merged into ${result.merged_into || 'the base branch'}. Worktree kept: ${result.removal_error || 'removal was refused'}.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree merge failed.');
+    }
+  });
+  removeBtn.addEventListener('click', async () => {
+    setBusy(true);
+    showStatus('pending', 'Removing the worktree...');
+    try {
+      await callWorktreeAction(
+        'api_worktrees_remove',
+        '/api/worktrees/remove',
+        { repo_root: info.baseRoot || '', path: info.path },
+      );
+      showControlToast('success', 'Worktree removed.');
+      finishResolved(`Removed the worktree. Branch ${info.branch} is kept.`);
+    } catch (err) {
+      setBusy(false);
+      showStatus('error', err?.message || 'Worktree removal was refused.');
+    }
+  });
+  keepBtn.addEventListener('click', () => dismissWorktreeFinishCard(sid, options));
+
+  card.appendChild(text);
+  card.appendChild(statusLine);
+  card.appendChild(actions);
+  win.el.insertBefore(card, win.log);
+  win.worktreeCard = card;
 }
 
 const TASK_TEXTAREA_MIN_HEIGHT_PX = 28;
@@ -82791,6 +83147,13 @@ async function startNewSession() {
   } else if (execution === 'direct' || direct) {
     msg.direct = true;
   }
+  // Worktree launch: the daemon validates/derives the branch, creates the
+  // worktree off the project's HEAD, and roots the session inside it.
+  if (document.getElementById('new-session-worktree')?.checked) {
+    msg.worktree = true;
+    const worktreeBranch = document.getElementById('new-session-worktree-branch')?.value.trim() || '';
+    if (worktreeBranch) msg.worktree_branch = worktreeBranch;
+  }
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {
@@ -82813,6 +83176,14 @@ async function startNewSession() {
   }
 }
 window.startNewSession = startNewSession;
+
+// Reveal the optional branch-name input only while the worktree launch is
+// requested; an untouched form stays exactly as before.
+function onNewSessionWorktreeToggle() {
+  const checked = !!document.getElementById('new-session-worktree')?.checked;
+  document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
+}
+window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
 
 /* ── static/app/56-debug-sessions.js ── */
 // ── Debug Screen ──
