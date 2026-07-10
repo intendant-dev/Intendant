@@ -6,6 +6,15 @@
 use super::*;
 
 impl SessionSupervisor {
+    /// Register a launched session's effective project root as its
+    /// git-vitals probe target (worktree sessions pass their checkout).
+    /// No-op when the daemon runs without the vitals producer.
+    fn register_git_vitals(&self, session_id: &str, root: &std::path::Path) {
+        if let Some(targets) = self.config.git_vitals_targets.as_ref() {
+            targets.register(session_id, root.to_path_buf());
+        }
+    }
+
     pub(crate) async fn start_new_session(
         &self,
         task: String,
@@ -130,6 +139,7 @@ impl SessionSupervisor {
             task_meta,
             session_name.as_deref(),
         );
+        self.register_git_vitals(&session_id, &project.root);
         if let Some(ref meta) = worktree_meta {
             // Persist the linkage after the meta file exists; it survives
             // later meta rewrites (see SessionLog::write_meta_worktree).
@@ -607,6 +617,7 @@ impl SessionSupervisor {
                 });
 
                 write_session_meta(&session_log, &project.root, None, None);
+                self.register_git_vitals(&session_id, &project.root);
                 if let Some(config) = effective_session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
@@ -729,6 +740,17 @@ impl SessionSupervisor {
         let display_task = crate::thread_actions::side_respawn_display_task(&resume_task)
             .unwrap_or_else(|| resume_task.clone());
         write_session_meta(&session_log, &project.root, Some(&display_task), None);
+        // Forks announce under the child wrapper id (see SessionStarted
+        // below); key the git probe the same way so the row lands on the
+        // child window, not the parent's.
+        self.register_git_vitals(
+            if fork {
+                &intendant_session_id
+            } else {
+                &live_session_id
+            },
+            &project.root,
+        );
         if let Some(config) = effective_session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
