@@ -788,11 +788,12 @@ pub struct GetLogsParams {
 }
 
 pub(crate) fn read_persisted_log_entries_for_session(
+    home: &std::path::Path,
     session_id: Option<&str>,
     params: &GetLogsParams,
 ) -> Option<Vec<LogEntrySnapshot>> {
     let session_id = session_id.map(str::trim).filter(|id| !id.is_empty())?;
-    let log_dir = persisted_log_dir_for_session(session_id)?;
+    let log_dir = persisted_log_dir_for_session_in_home(home, session_id)?;
     read_persisted_log_entries_from_dir(&log_dir, params)
 }
 
@@ -837,11 +838,6 @@ pub(crate) fn read_persisted_log_entries_from_dir(
     }
 
     Some(entries)
-}
-
-pub(crate) fn persisted_log_dir_for_session(session_id: &str) -> Option<std::path::PathBuf> {
-    let home = crate::platform::home_dir();
-    persisted_log_dir_for_session_in_home(&home, session_id)
 }
 
 pub(crate) fn persisted_log_dir_for_session_in_home(

@@ -20,6 +20,7 @@ pub(crate) fn get_session_detail_from_home(home: &Path, session_id: &str) -> Str
 }
 
 pub(crate) fn session_detail_response_body_with_page(
+    home: &Path,
     session_id: &str,
     source: &str,
     limit: Option<usize>,
@@ -35,11 +36,10 @@ pub(crate) fn session_detail_response_body_with_page(
     } else {
         source
     };
-    let home = crate::platform::home_dir();
     if source == "intendant" {
-        get_session_detail_from_home_with_page(&home, session_id, limit, before)
+        get_session_detail_from_home_with_page(home, session_id, limit, before)
     } else {
-        external_session_detail_from_home_with_page(&home, source, session_id, limit, before)
+        external_session_detail_from_home_with_page(home, source, session_id, limit, before)
             .unwrap_or_else(|| serde_json::json!({"error": "session not found"}).to_string())
     }
 }

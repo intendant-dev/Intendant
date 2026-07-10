@@ -102,14 +102,24 @@ fn format_agent_output_with_stderr(stdout: &str, stderr: &str) -> String {
 pub struct IntendantServer {
     state: SharedMcpState,
     bus: EventBus,
+    /// The home dir persisted-session lookups resolve against. Resolved
+    /// once at construction (the MCP transport edge); tests inject a temp
+    /// home via [`IntendantServer::new_with_home`] so fixtures never read
+    /// or write the machine's real `~/.intendant` store.
+    home: std::path::PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
 impl IntendantServer {
     pub fn new(state: SharedMcpState, bus: EventBus) -> Self {
+        Self::new_with_home(state, bus, crate::platform::home_dir())
+    }
+
+    pub fn new_with_home(state: SharedMcpState, bus: EventBus, home: std::path::PathBuf) -> Self {
         Self {
             state,
             bus,
+            home,
             tool_router: Self::tool_router(),
         }
     }
@@ -971,7 +981,7 @@ impl IntendantServer {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
             {
-                hydrate_requested_session_status_from_logs(&mut s, requested_session_id);
+                hydrate_requested_session_status_from_logs(&self.home, &mut s, requested_session_id);
             }
             let target_session_id = session_id_override
                 .map(str::trim)
@@ -1066,7 +1076,7 @@ impl IntendantServer {
         // Supervised parents log under `~/.intendant/logs/<id>/`, which is not
         // necessarily this server's primary log dir, so merge the ledger reads
         // across every candidate dir the requested session is known by.
-        let ledger_dirs = status_ledger_candidate_dirs(&log_dir, &session_id);
+        let ledger_dirs = status_ledger_candidate_dirs(&self.home, &log_dir, &session_id);
         if let Some(ledger) = merged_lineage_ledger_for_session(&ledger_dirs, &session_id) {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
@@ -1105,7 +1115,9 @@ impl IntendantServer {
         session_id: Option<&str>,
     ) -> String {
         let target_session_id = params.session_id.as_deref().or(session_id);
-        if let Some(entries) = read_persisted_log_entries_for_session(target_session_id, &params) {
+        if let Some(entries) =
+            read_persisted_log_entries_for_session(&self.home, target_session_id, &params)
+        {
             return serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
         }
 
@@ -2215,6 +2227,20 @@ pub(crate) mod tests {
         )))
     }
 
+    /// Test server over an injected temp home. Session-id-driven paths
+    /// (status hydration, persisted get_logs) scan `<home>/.intendant/logs`,
+    /// so a server built on the real home would read the machine's live
+    /// store — machine-dependent duration and a prefix-collision flake
+    /// risk. Keep the TempDir guard alive for the server's lifetime.
+    pub(crate) fn test_server(
+        state: SharedMcpState,
+        bus: EventBus,
+    ) -> (tempfile::TempDir, IntendantServer) {
+        let home = tempdir().expect("temp home");
+        let server = IntendantServer::new_with_home(state, bus, home.path().to_path_buf());
+        (home, server)
+    }
+
     pub(crate) struct TestDisplayBackend {
         pub(crate) width: u32,
         pub(crate) height: u32,
@@ -2578,12 +2604,13 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // Persisted-session resolution defaults to the process state
-            // root (`platform::intendant_home()`, a per-process scratch in
-            // unit-test builds) — drop the fixture there instead of racing
-            // the parallel runner over the process HOME.
+            // Persisted-session resolution reads the home the server
+            // resolves at construction — inject a temp home and drop the
+            // fixture in its `.intendant/logs`, so the test never touches
+            // the machine's real store and never mutates the process HOME.
+            let home = tempfile::tempdir().unwrap();
             let wrapper_session_id = "6eee2a11-51f2-453b-b993-b47744f34792";
-            let wrapper_dir = crate::platform::intendant_home()
+            let wrapper_dir = crate::platform::intendant_home_in(home.path())
                 .join("logs")
                 .join(wrapper_session_id);
             std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -2610,7 +2637,11 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            let server = IntendantServer::new(test_state(), EventBus::new());
+            let server = IntendantServer::new_with_home(
+                test_state(),
+                EventBus::new(),
+                home.path().to_path_buf(),
+            );
             let result = server
                 .call_tool_by_name_for_session(
                     "get_logs",
@@ -2668,7 +2699,7 @@ pub(crate) mod tests {
             let state = test_state();
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus.clone());
+            let (_home, server) = test_server(state, bus.clone());
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -2755,7 +2786,7 @@ pub(crate) mod tests {
             state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let result = server
                 .call_tool_by_name_for_session(
                     "start_task",
@@ -2861,7 +2892,7 @@ pub(crate) mod tests {
             }
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -2969,7 +3000,7 @@ pub(crate) mod tests {
                     }
                 }));
             }
-            let server = IntendantServer::new(state.clone(), EventBus::new());
+            let (_home, server) = test_server(state.clone(), EventBus::new());
 
             let status: serde_json::Value = serde_json::from_str(
                 &server
@@ -3043,7 +3074,7 @@ pub(crate) mod tests {
             let mut rx = bus.subscribe();
             let state = test_state();
             state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let result = server
                 .call_tool_by_name_for_session(
                     "start_task",
@@ -3079,7 +3110,7 @@ pub(crate) mod tests {
             .unwrap();
         rt.block_on(async {
             let state = test_state();
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -3121,7 +3152,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&125.into()));
@@ -3171,7 +3202,7 @@ pub(crate) mod tests {
                 s.session_codex_managed_context
                     .insert("managed-session".to_string(), true);
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("managed-session"), None)
                 .await;
@@ -3221,7 +3252,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("active-managed-session"), Some(true))
                 .await;
@@ -3287,7 +3318,7 @@ pub(crate) mod tests {
                 s.provider_name = "none".to_string();
                 s.model_name = "none".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("wrapper-session"), Some(true))
                 .await;
@@ -3331,7 +3362,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("new-session-without-usage"), Some(true))
                 .await;
@@ -3373,7 +3404,7 @@ pub(crate) mod tests {
                 let mut s = state.write().await;
                 s.session_id = "parent".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(
@@ -3414,7 +3445,7 @@ pub(crate) mod tests {
                 let mut s = state.write().await;
                 s.session_id = "child".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(
@@ -3435,12 +3466,14 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // A supervised parent logs under `<state root>/logs/<id>/`, which
-            // is NOT the MCP server's primary log dir. Resolution defaults to
-            // `platform::intendant_home()` (a per-process scratch in unit-test
-            // builds), so the fixture goes there — no HOME mutation.
+            // A supervised parent logs under `<home>/.intendant/logs/<id>/`,
+            // which is NOT the MCP server's primary log dir. Resolution
+            // reads the home the server resolves at construction — inject
+            // a temp home and drop the fixture in its store (no HOME
+            // mutation, no real-store access).
+            let home = tempfile::tempdir().unwrap();
             let parent_session_id = "0f5b3a52-9f51-4ad8-8a96-fsbstatus001";
-            let parent_dir = crate::platform::intendant_home()
+            let parent_dir = crate::platform::intendant_home_in(home.path())
                 .join("logs")
                 .join(parent_session_id);
             std::fs::create_dir_all(&parent_dir).unwrap();
@@ -3483,7 +3516,8 @@ pub(crate) mod tests {
 
             let primary = tempdir().unwrap();
             let state = test_state_with_log_dir(primary.path().to_path_buf());
-            let server = IntendantServer::new(state, EventBus::new());
+            let server =
+                IntendantServer::new_with_home(state, EventBus::new(), home.path().to_path_buf());
             let status = server
                 .get_status_for_session(Some(parent_session_id), None)
                 .await;
@@ -3634,7 +3668,7 @@ pub(crate) mod tests {
             .unwrap();
         rt.block_on(async {
             let bus = EventBus::new();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let info = server.get_info();
             assert_eq!(info.server_info.name, "intendant");
             assert!(info.instructions.is_some());

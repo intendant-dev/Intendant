@@ -765,6 +765,19 @@ pub(crate) async fn api_managed_context_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixture
+    // drives the `_from_home` variant with an injected temp home.
+    api_managed_context_response_from_home(id, kind, params, runtime, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_managed_context_response_from_home(
+    id: String,
+    kind: &'static str,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let Some(request_line) = managed_context_request_line(kind, &params) else {
         return missing_param_response(id, "query");
@@ -780,7 +793,7 @@ pub(crate) async fn api_managed_context_response(
             );
         }
     };
-    let home = crate::platform::home_dir();
+    let home = home.to_path_buf();
     let response = tokio::task::spawn_blocking(move || match kind {
         "records" => crate::web_gateway::managed_context_records_response_from_home(
             &request_line,
@@ -1857,18 +1870,14 @@ mod tests {
 
     #[tokio::test]
     async fn parity_managed_context_shares_bodies_with_status_metadata() {
-        // A unique session id keeps the home-scoped candidate scan empty
-        // and deterministic on a live box; both lanes then serve the
+        // An injected temp home keeps the home-scoped candidate scan
+        // empty and deterministic — a fixture must never walk the
+        // machine's real ~/.intendant/logs; both lanes then serve the
         // scoped empty bodies from the ONE neutral fn per kind.
         let rt = runtime();
-        let session_id = format!(
-            "parity-mc-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let home = crate::platform::home_dir();
+        let session_id = "parity-mc-session";
+        let tmp_home = tempfile::tempdir().expect("temp home");
+        let home = tmp_home.path().to_path_buf();
         for (kind, empty_key) in [
             ("anchors", "anchors"),
             ("records", "records"),
@@ -1897,11 +1906,12 @@ mod tests {
             assert_eq!(status, 200, "{kind}");
             assert_eq!(http_body[empty_key], serde_json::json!([]), "{kind}");
 
-            let frame = api_managed_context_response(
+            let frame = api_managed_context_response_from_home(
                 format!("parity-mc-{kind}"),
                 kind,
                 Some(&serde_json::json!({ "session_id": session_id })),
                 &rt,
+                &home,
             )
             .await;
             let mut result = frame["result"].clone();

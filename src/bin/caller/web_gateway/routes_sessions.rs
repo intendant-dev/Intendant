@@ -88,6 +88,7 @@ pub(crate) fn session_wildcard_json_error(status: u16, message: &str) -> ApiResp
 }
 
 pub(crate) fn current_agent_output_response_for_ids(
+    home: &Path,
     ids: Vec<String>,
     log_dir: &Path,
 ) -> ApiResponse {
@@ -95,7 +96,7 @@ pub(crate) fn current_agent_output_response_for_ids(
         return session_wildcard_json_error(400, "missing output ids");
     }
 
-    let fallback_logs_dir = Some(crate::platform::intendant_home().join("logs"));
+    let fallback_logs_dir = Some(crate::platform::intendant_home_in(home).join("logs"));
     let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
     let found: HashSet<&str> = chunks
         .iter()
@@ -137,10 +138,15 @@ pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>,
 /// (tunnel twin `api_session_current_agent_output`): output-id decode
 /// from the JSON body, then the persisted-chunk fetch against the active
 /// session log dir. The no-active-log 404 stays with each lane's log
-/// resolution step.
-pub(crate) fn current_agent_output_api_response(body: &str, log_dir: &Path) -> ApiResponse {
+/// resolution step; `home` scopes the cross-session fallback sweep (the
+/// transport edge resolves the real home, tests inject a temp one).
+pub(crate) fn current_agent_output_api_response(
+    home: &Path,
+    body: &str,
+    log_dir: &Path,
+) -> ApiResponse {
     match agent_output_ids_from_json_body(body) {
-        Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
+        Ok(ids) => current_agent_output_response_for_ids(home, ids, log_dir),
         Err(e) => session_wildcard_json_error(400, &e),
     }
 }
@@ -217,7 +223,7 @@ pub(crate) fn session_agent_output_response_for_ids(
         let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
             return session_wildcard_json_error(404, "session not found");
         };
-        return current_agent_output_response_for_ids(ids, &session_dir);
+        return current_agent_output_response_for_ids(home, ids, &session_dir);
     }
     external_agent_output_response_for_ids(home, &source, session_id, ids)
 }
@@ -225,8 +231,10 @@ pub(crate) fn session_agent_output_response_for_ids(
 /// Transport-neutral core of the by-id agent-output read
 /// (`POST /api/session/{id}/agent-output`, a POST-shaped read; tunnel twin
 /// `api_session_agent_output`): bare-id policy, output-id decode from the
-/// JSON body, then the persisted-chunk fetch.
+/// JSON body, then the persisted-chunk fetch. The transport edge resolves
+/// `home`; tests inject a temp one.
 pub(crate) fn session_agent_output_api_response(
+    home: &Path,
     body: &str,
     session_id: &str,
     source: &str,
@@ -236,12 +244,7 @@ pub(crate) fn session_agent_output_api_response(
         return session_wildcard_json_error(400, "invalid session id");
     }
     match agent_output_ids_from_json_body(body) {
-        Ok(ids) => session_agent_output_response_for_ids(
-            &crate::platform::home_dir(),
-            session_id,
-            source,
-            ids,
-        ),
+        Ok(ids) => session_agent_output_response_for_ids(home, session_id, source, ids),
         Err(e) => session_wildcard_json_error(400, &e),
     }
 }
@@ -316,6 +319,7 @@ pub(crate) enum SessionReportZipError {
 }
 
 pub(crate) fn session_report_zip_for_request(
+    home: &Path,
     session_id: &str,
     session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<&WebQueryCtx>,
@@ -327,7 +331,7 @@ pub(crate) fn session_report_zip_for_request(
     let resolved_dir: Option<PathBuf> = if session_id == "current" {
         current_session_log_dir(session_log, query_ctx)
     } else {
-        resolve_session_dir(session_id)
+        resolve_bare_session_dir_from_home(home, session_id)
     };
     let Some(dir) = resolved_dir else {
         return Err(SessionReportZipError::NotFound);
@@ -2603,7 +2607,11 @@ pub(crate) async fn handle_current_agent_output(
 ) {
     let log_dir = current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
     let response = match log_dir {
-        Some(dir) => current_agent_output_api_response(&body_text, &dir),
+        // The transport edge resolves the real home for the fallback
+        // sweep — only when there is an active log to serve from.
+        Some(dir) => {
+            current_agent_output_api_response(&crate::platform::home_dir(), &body_text, &dir)
+        }
         None => session_wildcard_json_error(404, "no active session log"),
     };
     write_api_response(stream, response, cors, fleet_origin).await;
@@ -2617,12 +2625,13 @@ pub(crate) async fn handle_current_agent_output(
 /// wildcard-CORS tail so the multi-host Stats tab can fetch sibling
 /// daemons' session lists for its "All Sessions" / "Disk Usage" cards.
 pub(crate) fn sessions_list_api_response(
+    home: &Path,
     ids_filter: Option<Vec<String>>,
     limit: Option<usize>,
     usage_view: bool,
 ) -> ApiResponse {
     let body = match ids_filter {
-        Some(ids) => cached_list_sessions_for_ids(&ids),
+        Some(ids) => cached_list_sessions_for_ids(home, &ids),
         None => match limit {
             Some(limit) => cached_list_sessions_with_limit(limit),
             None => cached_list_sessions(),
@@ -2646,8 +2655,9 @@ pub(crate) async fn handle_sessions_list(
     let ids_filter = session_ids_filter_from_request(request_line);
     let limit = session_list_limit_from_request(request_line);
     let usage_view = session_list_usage_view_from_request(request_line);
+    let home = crate::platform::home_dir();
     let response = match tokio::task::spawn_blocking(move || {
-        sessions_list_api_response(ids_filter, limit, usage_view)
+        sessions_list_api_response(&home, ids_filter, limit, usage_view)
     })
     .await
     {
@@ -2668,10 +2678,10 @@ pub(crate) async fn handle_sessions_list(
 /// resolution, and store removal live in `delete_session_data`; the
 /// delete tail historically orders the wildcard CORS header before
 /// `Cache-Control`, unlike the list/search tail.
-pub(crate) fn session_delete_api_response(session_id: &str, target: &str) -> ApiResponse {
+pub(crate) fn session_delete_api_response(home: &Path, session_id: &str, target: &str) -> ApiResponse {
     ApiResponse::Json {
         status: 200,
-        body: JsonBody::PreSerialized(delete_session_data(session_id, target)),
+        body: JsonBody::PreSerialized(delete_session_data(home, session_id, target)),
         headers: vec![
             ("Access-Control-Allow-Origin", "*".to_string()),
             ("Cache-Control", "no-cache".to_string()),
@@ -2686,6 +2696,25 @@ pub(crate) async fn handle_session_delete(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    // Transport edge: resolve the real home once; the golden transcripts
+    // drive the `_from_home` variant with an injected temp home.
+    handle_session_delete_from_home(
+        stream,
+        request_line,
+        cors,
+        fleet_origin,
+        &crate::platform::home_dir(),
+    )
+    .await;
+}
+
+pub(crate) async fn handle_session_delete_from_home(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+    home: &Path,
+) {
     // DELETE /api/session/{id}[/{target}]  (native DELETE)
     // POST  /api/session/{id}/delete[/{target}]  (WKWebView fallback)
     let rest = request_line
@@ -2699,7 +2728,7 @@ pub(crate) async fn handle_session_delete(
         .collect();
     let session_id = rest_parts.first().copied().unwrap_or("");
     let target = rest_parts.get(1).copied().unwrap_or("session");
-    let response = session_delete_api_response(session_id, target);
+    let response = session_delete_api_response(home, session_id, target);
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -2709,6 +2738,27 @@ pub(crate) async fn handle_session_agent_output(
     request_line: &str,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
+) {
+    // Transport edge: resolve the real home once; the golden transcripts
+    // drive the `_from_home` variant with an injected temp home.
+    handle_session_agent_output_from_home(
+        stream,
+        body_text,
+        request_line,
+        cors,
+        fleet_origin,
+        &crate::platform::home_dir(),
+    )
+    .await;
+}
+
+pub(crate) async fn handle_session_agent_output_from_home(
+    stream: DemuxStream,
+    body_text: String,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+    home: &Path,
 ) {
     let rest = request_line
         .split("/api/session/")
@@ -2721,7 +2771,7 @@ pub(crate) async fn handle_session_agent_output(
     let is_agent_output_route = rest_parts.get(1).copied() == Some("agent-output");
     let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
     let response = if is_agent_output_route {
-        session_agent_output_api_response(&body_text, session_id, &source)
+        session_agent_output_api_response(home, &body_text, session_id, &source)
     } else {
         session_wildcard_json_error(404, "unknown session output route")
     };
@@ -2729,10 +2779,29 @@ pub(crate) async fn handle_session_agent_output(
 }
 
 pub(crate) async fn handle_session_sub_router(
+    stream: DemuxStream,
+    request_line: &str,
+    session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    query_ctx: Option<WebQueryCtx>,
+) {
+    // Transport edge: resolve the real home once; the golden transcripts
+    // drive the `_from_home` variant with an injected temp home.
+    handle_session_sub_router_from_home(
+        stream,
+        request_line,
+        session_log,
+        query_ctx,
+        &crate::platform::home_dir(),
+    )
+    .await;
+}
+
+pub(crate) async fn handle_session_sub_router_from_home(
     mut stream: DemuxStream,
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<WebQueryCtx>,
+    home: &Path,
 ) {
     use tokio::io::AsyncWriteExt;
     // Extract the rest after /api/session/ and split into parts
@@ -2765,6 +2834,7 @@ pub(crate) async fn handle_session_sub_router(
             match context_snapshot_selector_parts_from_request(request_line) {
                 Ok((file, request_id, request_index, ts)) => {
                     session_context_snapshot_api_response(
+                        home,
                         session_id,
                         &source,
                         file,
@@ -2795,8 +2865,12 @@ pub(crate) async fn handle_session_sub_router(
             // GET /api/session/{id}/recordings/{stream}/{segments|playlist.m3u8}
             // — the tunnel twin's listing-asset vocabulary, resolved
             // through the shared content core.
-            let response =
-                session_recording_listing_asset_api_response(session_id, rec_rest[0], rec_rest[1]);
+            let response = session_recording_listing_asset_api_response(
+                home,
+                session_id,
+                rec_rest[0],
+                rec_rest[1],
+            );
             let bytes = api_response_http_bytes(
                 response,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
@@ -2817,7 +2891,7 @@ pub(crate) async fn handle_session_sub_router(
                 } else {
                     "video/mp4"
                 };
-                let seg_path = resolve_session_dir(session_id)
+                let seg_path = resolve_bare_session_dir_from_home(home, session_id)
                     .map(|d| d.join("recordings").join(stream_name).join(filename));
                 if let Some(path) = seg_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
@@ -2859,7 +2933,7 @@ pub(crate) async fn handle_session_sub_router(
             }
         } else {
             // GET /api/session/{id}/recordings — list streams
-            let response = session_recordings_api_response(session_id);
+            let response = session_recordings_api_response(home, session_id);
             let bytes = api_response_http_bytes(
                 response,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
@@ -2874,6 +2948,7 @@ pub(crate) async fn handle_session_sub_router(
         // live daemon's own session via WebQueryCtx.
         let session_id = rest_parts[0];
         let response = match session_report_zip_for_request(
+            home,
             session_id,
             session_log.as_ref(),
             query_ctx.as_ref(),
@@ -2919,8 +2994,8 @@ pub(crate) async fn handle_session_sub_router(
                 } else {
                     "image/jpeg"
                 };
-                let frame_path =
-                    resolve_session_dir(session_id).map(|d| d.join("frames").join(filename));
+                let frame_path = resolve_bare_session_dir_from_home(home, session_id)
+                    .map(|d| d.join("frames").join(filename));
                 if let Some(path) = frame_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
@@ -2961,7 +3036,8 @@ pub(crate) async fn handle_session_sub_router(
             }
         } else {
             // GET /api/session/{id}/frames — list frame filenames
-            let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+            let body = if let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id)
+            {
                 let frames_dir = session_dir.join("frames");
                 let mut names: Vec<String> = Vec::new();
                 if frames_dir.is_dir() {
@@ -2993,8 +3069,9 @@ pub(crate) async fn handle_session_sub_router(
         let entry_limit = session_detail_entry_limit_from_request(request_line);
         let entry_before = session_detail_before_from_request(request_line);
         let session_id_owned = session_id.to_string();
+        let home = home.to_path_buf();
         let response = match tokio::task::spawn_blocking(move || {
-            session_detail_api_response(&session_id_owned, &source, entry_limit, entry_before)
+            session_detail_api_response(&home, &session_id_owned, &source, entry_limit, entry_before)
         })
         .await
         {
@@ -3027,6 +3104,7 @@ pub(crate) async fn handle_session_sub_router(
 /// trims before delegating), then the paged replay body with its
 /// historical status mapping (404 only for "session not found").
 pub(crate) fn session_detail_api_response(
+    home: &Path,
     session_id: &str,
     source: &str,
     limit: Option<usize>,
@@ -3035,7 +3113,7 @@ pub(crate) fn session_detail_api_response(
     if !session_lookup_id_is_safe(session_id) {
         return ApiResponse::json_error(400, "invalid session id");
     }
-    let body = session_detail_response_body_with_page(session_id, source, limit, before);
+    let body = session_detail_response_body_with_page(home, session_id, source, limit, before);
     let status = if session_detail_http_status(&body) == "404 Not Found" {
         404
     } else {
@@ -3092,8 +3170,8 @@ pub(crate) fn session_report_api_response(report: SessionReportZip) -> ApiRespon
 /// Transport-neutral core of the recordings stream list
 /// (`GET /api/session/{id}/recordings`, tunnel twin
 /// `api_session_recordings`).
-pub(crate) fn session_recordings_api_response(session_id: &str) -> ApiResponse {
-    let (status_line, body) = session_recordings_list_response_body(session_id);
+pub(crate) fn session_recordings_api_response(home: &Path, session_id: &str) -> ApiResponse {
+    let (status_line, body) = session_recordings_list_response_body(home, session_id);
     ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
 
@@ -3103,11 +3181,16 @@ pub(crate) fn session_recordings_api_response(session_id: &str) -> ApiResponse {
 /// pair. Segment files stay on their own transport-owned carriage (the
 /// tunnel streams ranged and capped; HTTP serves the whole file).
 pub(crate) fn session_recording_listing_asset_api_response(
+    home: &Path,
     session_id: &str,
     stream_name: &str,
     asset: &str,
 ) -> ApiResponse {
-    match resolve_session_recording_asset(resolve_session_dir(session_id), stream_name, asset) {
+    match resolve_session_recording_asset(
+        resolve_bare_session_dir_from_home(home, session_id),
+        stream_name,
+        asset,
+    ) {
         Ok(RecordingAsset::Bytes {
             bytes,
             content_type,
@@ -3129,6 +3212,7 @@ pub(crate) fn session_recording_listing_asset_api_response(
 }
 
 pub(crate) fn session_context_snapshot_api_response(
+    home: &Path,
     session_id: &str,
     source: &str,
     file: Option<String>,
@@ -3137,7 +3221,7 @@ pub(crate) fn session_context_snapshot_api_response(
     ts: Option<String>,
 ) -> ApiResponse {
     let (status_line, body) = session_context_snapshot_response_body(
-        &crate::platform::home_dir(),
+        home,
         session_id,
         source,
         file,
@@ -3448,11 +3532,15 @@ pub(crate) async fn handle_displays(
 }
 
 #[cfg(test)]
-pub(crate) fn managed_context_anchors_response(request_line: &str, log_dir: &Path) -> String {
+pub(crate) fn managed_context_anchors_response(
+    request_line: &str,
+    log_dir: &Path,
+    home: &Path,
+) -> String {
     test_render_api_response(managed_context_anchors_response_from_home(
         request_line,
         Some(log_dir),
-        &crate::platform::home_dir(),
+        home,
     ))
 }
 
@@ -3556,11 +3644,15 @@ pub(crate) fn managed_context_records_response_from_home(
 }
 
 #[cfg(test)]
-pub(crate) fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
+pub(crate) fn managed_context_records_response(
+    request_line: &str,
+    log_dir: &Path,
+    home: &Path,
+) -> String {
     test_render_api_response(managed_context_records_response_from_home(
         request_line,
         Some(log_dir),
-        &crate::platform::home_dir(),
+        home,
     ))
 }
 
@@ -3765,13 +3857,13 @@ pub(crate) fn managed_context_fission_response_from_home(
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
-pub(crate) fn delete_session_data(session_id: &str, target: &str) -> String {
+pub(crate) fn delete_session_data(home: &Path, session_id: &str, target: &str) -> String {
     // Path traversal protection
     if !session_lookup_id_is_safe(session_id) {
         return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();
     }
 
-    let dir = match resolve_session_dir(session_id) {
+    let dir = match resolve_bare_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"ok": false, "error": "session not found"}).to_string(),
     };
@@ -3815,11 +3907,7 @@ pub(crate) fn delete_session_data(session_id: &str, target: &str) -> String {
                     let mut body =
                         serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes});
                     if let Some((source, external_id)) = external_delete_target {
-                        match mark_external_session_deleted(
-                            &crate::platform::home_dir(),
-                            &source,
-                            &external_id,
-                        ) {
+                        match mark_external_session_deleted(home, &source, &external_id) {
                             Ok(()) => {
                                 body["external_session_hidden"] = serde_json::json!(true);
                             }
@@ -4131,9 +4219,11 @@ mod tests {
         )
         .unwrap();
 
+        let home = tempfile::tempdir().unwrap();
         let response = managed_context_records_response(
             "GET /api/managed-context/records?session_id=dashboard%20session HTTP/1.1",
             dir.path(),
+            home.path(),
         );
         let body = response_json_body(&response);
         let ids: Vec<_> = body["records"]
@@ -4160,9 +4250,11 @@ mod tests {
         record.pressure_band_at_rewind = Some("high".to_string());
         crate::context_rewind::persist_record(dir.path(), &record).unwrap();
 
+        let home = tempfile::tempdir().unwrap();
         let response = managed_context_records_response(
             "GET /api/managed-context/records?session_id=dashboard%20session HTTP/1.1",
             dir.path(),
+            home.path(),
         );
         let body = response_json_body(&response);
         // The Managed tab renders the SURGICAL badge and the pressure chip
@@ -4190,9 +4282,11 @@ mod tests {
         )
         .unwrap();
 
+        let home = tempfile::tempdir().unwrap();
         let response = managed_context_records_response(
             "GET /api/managed-context/records?session=session-a HTTP/1.1",
             dir.path(),
+            home.path(),
         );
         let body = response_json_body(&response);
         assert_eq!(body["records"].as_array().unwrap().len(), 1);
@@ -4466,9 +4560,11 @@ mod tests {
         )
         .unwrap();
 
+        let home = tempfile::tempdir().unwrap();
         let response = managed_context_anchors_response(
             "GET /api/managed-context/anchors?session_id=codex-thread-a HTTP/1.1",
             dir.path(),
+            home.path(),
         );
         let body = response_json_body(&response);
         let anchors = body["anchors"].as_array().unwrap();
@@ -5141,6 +5237,9 @@ mod tests {
 
     #[test]
     fn agent_output_post_response_reads_json_ids() {
+        // The injected temp home scopes the missing-id fallback sweep: an
+        // empty `<home>/.intendant/logs` instead of the machine's real
+        // store.
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
@@ -5148,6 +5247,7 @@ mod tests {
         drop(log);
 
         let response = test_render_api_response(current_agent_output_api_response(
+            dir.path(),
             r#"{"ids":["out-1","missing-out"]}"#,
             &log_dir,
         ));
@@ -5163,8 +5263,11 @@ mod tests {
     #[test]
     fn agent_output_post_response_rejects_empty_json_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let response =
-            test_render_api_response(current_agent_output_api_response(r#"{"ids":[""]}"#, dir.path()));
+        let response = test_render_api_response(current_agent_output_api_response(
+            dir.path(),
+            r#"{"ids":[""]}"#,
+            dir.path(),
+        ));
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("missing output ids"));
     }
@@ -5190,9 +5293,11 @@ mod tests {
     // is hand-written below — never built through the response helpers
     // under conversion. Store-dependent bodies (detail success,
     // agent-output success) come from the store-layer fns the conversion
-    // does not touch, over fixtures written into the live `~/.intendant`
-    // logs store (the bin-test convention — unique id per run, dir
-    // removed afterwards).
+    // does not touch, over fixtures written into an injected tempdir
+    // home's `.intendant/logs` store — the handlers' `_from_home`
+    // variants take the same home, so no golden ever reads or writes the
+    // machine's real store (tests-are-hermetic convention; the public
+    // handler wrappers resolve the real home at the transport edge).
 
     /// Run one stream-consuming handler and collect every byte it wrote.
     async fn collect_session_handler_response<Fut>(
@@ -5235,15 +5340,13 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    /// Unique-per-run id for fixtures written into the live logs store.
-    fn golden_unique_session_id(prefix: &str) -> String {
-        format!(
-            "{prefix}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
+    /// A fixture session's log dir under an injected tempdir home
+    /// (`<home>/.intendant/logs/<session_id>`). Fixed ids are fine: each
+    /// test owns its whole temp store.
+    fn golden_home_log_dir(home: &tempfile::TempDir, session_id: &str) -> std::path::PathBuf {
+        crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join(session_id)
     }
 
     #[tokio::test]
@@ -5355,9 +5458,10 @@ mod tests {
     #[tokio::test]
     async fn golden_session_detail_invalid_id_transcript() {
         // `..` fails the bare-id policy (session_lookup_id_is_safe).
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/.. HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5368,10 +5472,11 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_detail_missing_transcript() {
-        let session_id = golden_unique_session_id("golden-detail-missing");
-        let request_line = format!("GET /api/session/{session_id} HTTP/1.1");
+        // The empty temp home makes the miss deterministic.
+        let home = tempfile::tempdir().unwrap();
+        let request_line = "GET /api/session/golden-detail-missing HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5382,43 +5487,39 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_detail_success_transcript() {
-        let session_id = golden_unique_session_id("golden-detail");
-        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-detail";
+        let log_dir = golden_home_log_dir(&home, session_id);
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.agent_output_with_id("golden detail stdout", "", Some("Codex"), Some("gd-out-1"));
         drop(log);
 
         let request_line = format!("GET /api/session/{session_id}?limit=5 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         // Body from the store layer (untouched by the conversion); the
         // framing around it is the golden contract.
-        let body = get_session_detail_from_home_with_page(
-            &crate::platform::home_dir(),
-            &session_id,
-            Some(5),
-            None,
-        );
-        let cleanup = std::fs::remove_dir_all(&log_dir);
+        let body = get_session_detail_from_home_with_page(home.path(), session_id, Some(5), None);
         assert_eq!(
             golden_transcript(&response),
             golden_session_json_transcript("200 OK", &body)
         );
-        cleanup.expect("golden detail fixture cleanup");
     }
 
     #[tokio::test]
     async fn golden_session_agent_output_missing_ids_transcript() {
+        let home = tempfile::tempdir().unwrap();
         let request_line = "POST /api/session/abc123/agent-output HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_agent_output(
+            handle_session_agent_output_from_home(
                 stream,
                 "{}".to_string(),
                 request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
+                home.path(),
             )
         })
         .await;
@@ -5433,15 +5534,16 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_agent_output_missing_session_transcript() {
-        let session_id = golden_unique_session_id("golden-output-missing");
-        let request_line = format!("POST /api/session/{session_id}/agent-output HTTP/1.1");
+        let home = tempfile::tempdir().unwrap();
+        let request_line = "POST /api/session/golden-output-missing/agent-output HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_agent_output(
+            handle_session_agent_output_from_home(
                 stream,
                 r#"{"ids":["out-1"]}"#.to_string(),
-                &request_line,
+                request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
+                home.path(),
             )
         })
         .await;
@@ -5456,20 +5558,22 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_agent_output_success_transcript() {
-        let session_id = golden_unique_session_id("golden-output");
-        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-output";
+        let log_dir = golden_home_log_dir(&home, session_id);
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.agent_output_with_id("golden stdout", "", Some("Codex"), Some("go-out-1"));
         drop(log);
 
         let request_line = format!("POST /api/session/{session_id}/agent-output HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_agent_output(
+            handle_session_agent_output_from_home(
                 stream,
                 r#"{"ids":["go-out-1","go-missing"]}"#.to_string(),
                 &request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
+                home.path(),
             )
         })
         .await;
@@ -5484,19 +5588,18 @@ mod tests {
             "missing": ["go-missing"],
         })
         .to_string();
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(
             golden_transcript(&response),
             golden_session_wildcard_json_transcript("200 OK", &body)
         );
-        cleanup.expect("golden agent-output fixture cleanup");
     }
 
     #[tokio::test]
     async fn golden_session_context_snapshot_missing_selector_transcript() {
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5510,9 +5613,10 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_context_snapshot_invalid_index_transcript() {
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5527,9 +5631,10 @@ mod tests {
     #[tokio::test]
     async fn golden_session_context_snapshot_invalid_id_transcript() {
         // `..` fails the bare-id policy (session_lookup_id_is_safe).
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5543,9 +5648,10 @@ mod tests {
         // Invalid id AND invalid request_index: the bare-id check answers
         // first on the HTTP lane (historical precedence, kept through the
         // S4a conversion; the tunnel's decode keeps index-error-first).
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5556,11 +5662,11 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_context_snapshot_not_found_transcript() {
-        let session_id = golden_unique_session_id("golden-snapshot-missing");
+        let home = tempfile::tempdir().unwrap();
         let request_line =
-            format!("GET /api/session/{session_id}/context-snapshot?file=snapshot.json HTTP/1.1");
+            "GET /api/session/golden-snapshot-missing/context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5612,6 +5718,7 @@ mod tests {
     async fn golden_session_delete_five_wire_shapes_transcripts() {
         // All five accepted shapes answer 200 with the wildcard-CORS tail;
         // `..` fails the bare-id policy so the body is deterministic.
+        let home = tempfile::tempdir().unwrap();
         for request_line in [
             "DELETE /api/session/.. HTTP/1.1",
             "DELETE /api/session/../recordings HTTP/1.1",
@@ -5620,11 +5727,12 @@ mod tests {
             "POST /api/session/../recordings/delete HTTP/1.1",
         ] {
             let response = collect_session_handler_response(|stream| {
-                handle_session_delete(
+                handle_session_delete_from_home(
                     stream,
                     request_line,
                     crate::gateway_routes::CorsPosture::OwnOrigin,
                     None,
+                    home.path(),
                 )
             })
             .await;
@@ -5638,14 +5746,15 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_delete_missing_session_transcript() {
-        let session_id = golden_unique_session_id("golden-delete-missing");
-        let request_line = format!("DELETE /api/session/{session_id} HTTP/1.1");
+        let home = tempfile::tempdir().unwrap();
+        let request_line = "DELETE /api/session/golden-delete-missing HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_delete(
+            handle_session_delete_from_home(
                 stream,
-                &request_line,
+                request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
+                home.path(),
             )
         })
         .await;
@@ -5657,9 +5766,10 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_report_invalid_id_transcript() {
+        let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5673,10 +5783,10 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_report_missing_transcript() {
-        let session_id = golden_unique_session_id("golden-report-missing");
-        let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
+        let home = tempfile::tempdir().unwrap();
+        let request_line = "GET /api/session/golden-report-missing/report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5687,21 +5797,21 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_report_success_transcript() {
-        let session_id = golden_unique_session_id("golden-report");
-        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-report";
+        let log_dir = golden_home_log_dir(&home, session_id);
         std::fs::create_dir_all(log_dir.join("turns")).unwrap();
         std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
         std::fs::write(log_dir.join("turns").join("turn_001_stdout.txt"), "hi\n").unwrap();
 
         let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         // Zip bytes from the store layer (same-run mtimes make the two
         // builds byte-identical); the framing around them is the pin.
         let bytes = build_session_report_zip(&log_dir).unwrap();
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         let mut expected = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"intendant-session-{session_id}.zip\"\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
             bytes.len()
@@ -5709,13 +5819,15 @@ mod tests {
         .into_bytes();
         expected.extend_from_slice(&bytes);
         assert_eq!(golden_transcript(&response), golden_transcript(&expected));
-        cleanup.expect("golden report fixture cleanup");
     }
 
-    /// Live-store recordings fixture: one stream with one playable
-    /// segment (csv row + on-disk file).
-    fn golden_recordings_fixture(session_id: &str) -> (std::path::PathBuf, Vec<u8>) {
-        let log_dir = crate::platform::intendant_home().join("logs").join(session_id);
+    /// Temp-home recordings fixture: one stream with one playable
+    /// segment (csv row + on-disk file) under the injected home's store.
+    fn golden_recordings_fixture(
+        home: &tempfile::TempDir,
+        session_id: &str,
+    ) -> (std::path::PathBuf, Vec<u8>) {
+        let log_dir = golden_home_log_dir(home, session_id);
         let stream_dir = log_dir.join("recordings").join("screen");
         std::fs::create_dir_all(&stream_dir).unwrap();
         let seg_bytes = b"golden fake mp4 segment bytes".to_vec();
@@ -5727,8 +5839,15 @@ mod tests {
     #[tokio::test]
     async fn golden_session_recordings_list_transcripts() {
         // Invalid id: the branch precheck answers under the wildcard tail.
+        let home = tempfile::tempdir().unwrap();
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, "GET /api/session/../recordings HTTP/1.1", None, None)
+            handle_session_sub_router_from_home(
+                stream,
+                "GET /api/session/../recordings HTTP/1.1",
+                None,
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -5740,10 +5859,9 @@ mod tests {
         );
 
         // Missing session: empty list under the canonical tail.
-        let missing = golden_unique_session_id("golden-recordings-missing");
-        let request_line = format!("GET /api/session/{missing}/recordings HTTP/1.1");
+        let request_line = "GET /api/session/golden-recordings-missing/recordings HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5752,33 +5870,32 @@ mod tests {
         );
 
         // Fixture stream: body from the store layer.
-        let session_id = golden_unique_session_id("golden-recordings");
-        let (log_dir, _seg) = golden_recordings_fixture(&session_id);
+        let session_id = "golden-recordings";
+        let (_log_dir, _seg) = golden_recordings_fixture(&home, session_id);
         let request_line = format!("GET /api/session/{session_id}/recordings HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
-        let (status, body) = session_recordings_list_response_body(&session_id);
-        let cleanup = std::fs::remove_dir_all(&log_dir);
+        let (status, body) = session_recordings_list_response_body(home.path(), session_id);
         assert_eq!(status, "200 OK");
         assert_eq!(
             golden_transcript(&response),
             golden_session_json_transcript("200 OK", &body)
         );
-        cleanup.expect("golden recordings fixture cleanup");
     }
 
     #[tokio::test]
     async fn golden_recording_segments_and_playlist_transcripts() {
-        let session_id = golden_unique_session_id("golden-rec-assets");
-        let (log_dir, _seg) = golden_recordings_fixture(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-rec-assets";
+        let (_log_dir, _seg) = golden_recordings_fixture(&home, session_id);
 
         // Segments listing: json array under the canonical tail.
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/segments HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         let body = r#"[{"end_secs":2.0,"filename":"seg_00001.mp4","start_secs":0.0}]"#;
@@ -5791,7 +5908,7 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/playlist.m3u8 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\nseg_00001.mp4\n#EXT-X-ENDLIST\n";
@@ -5799,21 +5916,20 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{m3u8}",
             m3u8.len()
         );
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(golden_transcript(&response), expected);
-        cleanup.expect("golden rec-assets fixture cleanup");
     }
 
     #[tokio::test]
     async fn golden_recording_segment_file_transcripts() {
-        let session_id = golden_unique_session_id("golden-seg-file");
-        let (log_dir, seg_bytes) = golden_recordings_fixture(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-seg-file";
+        let (_log_dir, seg_bytes) = golden_recordings_fixture(&home, session_id);
 
         // Success: video content type under the immutable-asset tail.
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_00001.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5825,7 +5941,7 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/evil.txt HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5836,28 +5952,27 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_09999.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(
             golden_transcript(&response),
             golden_text_plain_transcript("404 Not Found", "Segment not found")
         );
-        cleanup.expect("golden seg-file fixture cleanup");
     }
 
     #[tokio::test]
     async fn golden_session_frame_asset_transcripts() {
-        let session_id = golden_unique_session_id("golden-frame");
-        let log_dir = crate::platform::intendant_home().join("logs").join(&session_id);
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "golden-frame";
+        let log_dir = golden_home_log_dir(&home, session_id);
         std::fs::create_dir_all(log_dir.join("frames")).unwrap();
         let frame_bytes = b"golden fake jpeg bytes".to_vec();
         std::fs::write(log_dir.join("frames").join("frame_0001.jpg"), &frame_bytes).unwrap();
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_0001.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5867,7 +5982,7 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/evil.exe HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
         assert_eq!(
@@ -5877,15 +5992,13 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_9.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router(stream, &request_line, None, None)
+            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
         })
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(
             golden_transcript(&response),
             golden_text_plain_transcript("404 Not Found", "Frame not found")
         );
-        cleanup.expect("golden frame fixture cleanup");
     }
 
     #[tokio::test]

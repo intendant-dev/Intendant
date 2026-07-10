@@ -665,7 +665,7 @@ fn cached_session_list_body_if_serveable() -> Option<String> {
     serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref())
 }
 
-pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
+pub(crate) fn cached_list_sessions_for_ids(home: &Path, ids: &[String]) -> String {
     if ids.is_empty() {
         return "[]".to_string();
     }
@@ -689,7 +689,7 @@ pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
             }
         }
     }
-    cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
+    cached_list_sessions_for_ids_from_home(home, ids)
 }
 
 /// Strip session rows down to what the Stats tab folds: usage, costs,

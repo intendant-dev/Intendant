@@ -1773,6 +1773,16 @@ async fn api_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_sessions_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+async fn api_sessions_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let limit = control_session_limit(&params);
     let ids = control_session_ids(&params);
@@ -1786,8 +1796,9 @@ async fn api_sessions_response(
     } else {
         (Some(ids), None)
     };
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::sessions_list_api_response(ids_filter, limit, usage_view)
+        crate::web_gateway::sessions_list_api_response(&home, ids_filter, limit, usage_view)
     })
     .await;
     let response = match result {

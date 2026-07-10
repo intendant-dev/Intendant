@@ -1480,7 +1480,10 @@ mod tests {
 
     #[test]
     fn find_session_by_id_nonexistent() {
-        let result = SessionLog::find_session_by_id("nonexistent-uuid-12345");
+        // An injected empty home: the lookup must miss without scanning
+        // the machine's real logs store.
+        let home = tempfile::tempdir().unwrap();
+        let result = SessionLog::find_session_by_id_in_home(home.path(), "nonexistent-uuid-12345");
         assert!(result.is_none());
     }
 

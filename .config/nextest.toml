@@ -42,31 +42,10 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 # The mTLS pairing e2e provisions a real access cert store (3× RSA-2048
 # keygen) and boots a TLS daemon before its first assertion — seconds of
 # setup before any poll starts, more under load.
+#
+# (The routes_sessions/dashboard_control home-scan lanes that used to sit
+# below are gone: their fixtures now inject tempdir session stores instead
+# of walking the real ~/.intendant — tests-are-hermetic convention.)
 [[profile.default.overrides]]
 filter = 'test(/ctl_peer_mtls_pairing/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
-
-# These handlers walk the real ~/.intendant/logs via dirs::home_dir()
-# (routes_sessions.rs agent-output / managed-context scans; the S4a
-# golden transcripts and tunnel/HTTP parity fixtures pin missing-session
-# 404s and fallback sweeps through the same live store); on a box whose
-# log tree has grown to tens of GB their ~12s baseline breaches the
-# default terminator under suite parallelism while passing in isolation.
-# Headroom until that home scan is cfg(test)-gated like listener.rs's
-# session-index warm scan.
-[[profile.default.overrides]]
-filter = 'test(/^web_gateway::routes_sessions::tests::(agent_output_post_response_reads_json_ids|managed_context_anchors_response_reads_trace_anchors_by_backend_session|managed_context_records_response_|golden_session)/)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-[[profile.default.overrides]]
-filter = 'test(/^dashboard_control::(api_sessions|api_media)::tests::parity_/)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-# The managed-context parity fixture walks the real ~/.intendant/logs
-# candidate scan (the routes_sessions home-scan class above). The
-# worktrees parity fixtures run against an injected temp home and need
-# no lane; this one joins the hermeticity sweep that retires the
-# home-scan lanes together.
-[[profile.default.overrides]]
-filter = 'test(/^dashboard_control::api_control::tests::parity_managed_context/)'
-slow-timeout = { period = "60s", terminate-after = 4 }

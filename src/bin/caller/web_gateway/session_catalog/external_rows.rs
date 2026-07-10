@@ -522,10 +522,6 @@ pub(crate) fn resolve_session_dir_from_listed_external_row(
     None
 }
 
-pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    resolve_bare_session_dir_from_home(&crate::platform::home_dir(), session_id)
-}
-
 pub(crate) fn deleted_external_sessions_path(home: &Path) -> PathBuf {
     crate::platform::intendant_home_in(home).join(DELETED_EXTERNAL_SESSIONS_FILE)
 }
@@ -726,14 +722,17 @@ pub(crate) async fn recordings_list_response_body(
     serde_json::to_string(&all_entries).unwrap_or("[]".to_string())
 }
 
-pub(crate) fn session_recordings_list_response_body(session_id: &str) -> (&'static str, String) {
+pub(crate) fn session_recordings_list_response_body(
+    home: &Path,
+    session_id: &str,
+) -> (&'static str, String) {
     if !session_lookup_id_is_safe(session_id) {
         return (
             "400 Bad Request",
             serde_json::json!({ "error": "invalid session id" }).to_string(),
         );
     }
-    let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+    let body = if let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) {
         let recordings_dir = session_dir.join("recordings");
         let entries = list_recording_streams(&recordings_dir);
         serde_json::to_string(&entries).unwrap_or("[]".to_string())

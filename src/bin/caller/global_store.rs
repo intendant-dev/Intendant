@@ -78,7 +78,13 @@ impl StoreScope {
     /// store under the state dir is used, logging the fallback once per
     /// process.
     pub fn resolve(project_root: Option<&Path>) -> Self {
-        let scope = Self::resolve_in(project_root, &crate::platform::intendant_home());
+        // Resolve the state root lazily: a project-rooted daemon never
+        // consults `intendant_home()` (keeps project-scoped test fixtures
+        // free of ambient state-root resolution).
+        if let Some(root) = project_root {
+            return StoreScope::Project(root.to_path_buf());
+        }
+        let scope = Self::resolve_in(None, &crate::platform::intendant_home());
         if let StoreScope::Global(base) = &scope {
             static FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
             FALLBACK_LOGGED.call_once(|| {
