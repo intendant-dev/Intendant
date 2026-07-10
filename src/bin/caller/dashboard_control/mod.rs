@@ -3491,9 +3491,12 @@ mod tests {
         // Coverage pin: the F1 family's twinned methods (fs + staged
         // uploads), the F2 sessions-family reads (managed-context,
         // worktrees, the session list and its NDJSON stream, search,
-        // detail, report, context snapshots), and the F3 settings/keys
+        // detail, report, context snapshots), the F3 settings/keys
         // family (settings GET/POST, api-keys save, key-status,
-        // project-root, external-agents, displays). The `api_transfer_*`
+        // project-root, external-agents, displays), and the F4 access
+        // dialogs family (overview, IAM state, enrollment reads + decide,
+        // IAM grant upsert/update, the connect admin quartet, the tier
+        // pair, fleet-cert request, dashboard targets). The `api_transfer_*`
         // methods join when their HTTP rows land (task #6, /api/transfers);
         // adding or dropping an entry updates this list in the same change,
         // deliberately.
@@ -3530,6 +3533,20 @@ mod tests {
             "api_project_root",
             "api_external_agents",
             "api_displays",
+            "api_access_overview",
+            "api_access_iam_state",
+            "api_access_enrollment_requests",
+            "api_access_enrollment_decide",
+            "api_access_iam_upsert_user_client_grant",
+            "api_access_iam_update_grant",
+            "api_access_connect_status",
+            "api_access_connect_claim_code",
+            "api_access_connect_config",
+            "api_access_connect_unclaim",
+            "api_access_set_tier",
+            "api_access_set_hosted_ceiling",
+            "api_fleet_cert_request",
+            "api_dashboard_targets",
         ]
         .into_iter()
         .collect();
