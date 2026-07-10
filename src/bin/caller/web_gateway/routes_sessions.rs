@@ -5907,4 +5907,132 @@ mod tests {
             golden_session_json_transcript("400 Bad Request", &body)
         );
     }
+    // ── S4c golden transcripts: current-session + managed-context ──
+    // Same discipline as the S4a/S4b sets: byte-exact pins captured
+    // before the transport-neutral conversion (design §6 S4, risk R1).
+
+    #[tokio::test]
+    async fn golden_current_history_and_mutations_without_watcher_transcripts() {
+        for (make, expect_status) in [
+            ("GET", "503 Service Unavailable"),
+        ] {
+            let _ = make;
+            let response = collect_session_handler_response(|stream| {
+                handle_current_history(stream, None)
+            })
+            .await;
+            assert_eq!(
+                golden_transcript(&response),
+                golden_session_wildcard_json_transcript(
+                    expect_status,
+                    r#"{"error":"file watcher not active"}"#
+                )
+            );
+        }
+        let response = collect_session_handler_response(|stream| {
+            handle_current_redo(stream, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+        let response = collect_session_handler_response(|stream| {
+            handle_current_prune(stream, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+        let bus = crate::event::EventBus::new();
+        let response = collect_session_handler_response(|stream| {
+            handle_current_rollback(stream, "{}".to_string(), bus, None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_current_changes_without_context_transcript() {
+        let response = collect_session_handler_response(|stream| {
+            handle_session_current_changes(
+                stream,
+                "GET /api/session/current/changes HTTP/1.1",
+                None,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_current_agent_output_without_log_transcript() {
+        let response = collect_session_handler_response(|stream| {
+            handle_current_agent_output(stream, r#"{"ids":["x"]}"#.to_string(), None, None)
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "404 Not Found",
+                r#"{"error":"no active session log"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_managed_context_empty_home_transcripts() {
+        // A tempdir home: the candidate scan finds nothing — the empty
+        // bodies and framing are the pin (query names one session id so
+        // the scan stays home-scoped).
+        let home = tempfile::tempdir().unwrap();
+        let anchors = managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        );
+        assert_eq!(
+            anchors,
+            golden_session_json_transcript("200 OK", r#"{"anchors":[]}"#)
+        );
+        let records = managed_context_records_response_from_home(
+            "GET /api/managed-context/records?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        );
+        assert_eq!(
+            records,
+            golden_session_json_transcript("200 OK", r#"{"records":[]}"#)
+        );
+        let fission = managed_context_fission_response_from_home(
+            "GET /api/managed-context/fission?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        );
+        assert_eq!(
+            fission,
+            golden_session_json_transcript("200 OK", r#"{"groups":[]}"#)
+        );
+    }
+
 }

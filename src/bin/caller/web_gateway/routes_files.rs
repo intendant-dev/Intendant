@@ -3788,4 +3788,170 @@ mod tests {
         );
         assert!(target.join("kept.txt").exists());
     }
+    // ── S4c golden transcripts: the staged-upload family (design §6 S4,
+    // risk R1). The POST body rides the `discard` prefix (dispatch's
+    // already-read bytes), so the duplex harness needs no writer side.
+
+    async fn collect_upload_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    fn upload_golden_tail() -> &'static str {
+        "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+    }
+
+    /// POST success over a project-rooted store: framing pinned exactly
+    /// around the store-generated descriptor body.
+    #[tokio::test]
+    async fn golden_current_uploads_post_project_rooted_transcript() {
+        let project = tempfile::tempdir().unwrap();
+        let body = b"golden staged upload bytes".to_vec();
+        let header_text = format!(
+            "POST /api/session/current/uploads?name=golden.txt HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let bus = crate::event::EventBus::new();
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_post(
+                stream,
+                &header_text,
+                "POST /api/session/current/uploads?name=golden.txt HTTP/1.1",
+                [header_text.as_bytes(), body.as_slice()].concat(),
+                bus,
+                Some(root),
+                None,
+                Some("golden-session".to_string()),
+            )
+        })
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(text.contains(upload_golden_tail()), "{head}");
+        let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert_eq!(descriptor["name"], "golden.txt");
+        assert_eq!(descriptor["size"], body.len());
+        assert!(descriptor["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(&project.path().to_string_lossy().to_string()));
+    }
+
+    /// POST success on a projectless daemon: the commit resolves the
+    /// daemon-global store (PR #129 semantics), same wire framing.
+    #[tokio::test]
+    async fn golden_current_uploads_post_projectless_transcript() {
+        let body = b"golden projectless upload bytes".to_vec();
+        let session_id = format!(
+            "golden-projectless-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let header_text = format!(
+            "POST /api/session/current/uploads?name=global.txt HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let bus = crate::event::EventBus::new();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_post(
+                stream,
+                &header_text,
+                "POST /api/session/current/uploads?name=global.txt HTTP/1.1",
+                [header_text.as_bytes(), body.as_slice()].concat(),
+                bus,
+                None,
+                None,
+                Some(session_id.clone()),
+            )
+        })
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(text.contains(upload_golden_tail()), "{head}");
+        let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        let store_root = crate::global_store::global_store_root();
+        let path = descriptor["path"].as_str().unwrap().to_string();
+        assert!(
+            path.starts_with(&store_root.to_string_lossy().to_string()),
+            "projectless upload must land in the global store: {path}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.json"));
+    }
+
+    #[tokio::test]
+    async fn golden_current_uploads_get_and_delete_transcripts() {
+        let project = tempfile::tempdir().unwrap();
+        // Empty list.
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_get(
+                stream,
+                "GET /api/session/current/uploads HTTP/1.1",
+                Some(root),
+                None,
+            )
+        })
+        .await;
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{}[]",
+            upload_golden_tail()
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+
+        // Raw fetch of a missing upload.
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_get(
+                stream,
+                "GET /api/session/current/uploads/nope/raw HTTP/1.1",
+                Some(root),
+                None,
+            )
+        })
+        .await;
+        let body = r#"{"error":"upload not found"}"#;
+        let expected = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}{}",
+            body.len(),
+            upload_golden_tail(),
+            body
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+
+        // Delete of an id that is not there stays idempotent-ok, under
+        // the canonical json tail (json_response framing).
+        let root = project.path().to_path_buf();
+        let bus = crate::event::EventBus::new();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_upload_delete(
+                stream,
+                "DELETE /api/session/current/uploads/nope HTTP/1.1",
+                bus,
+                Some(root),
+                None,
+            )
+        })
+        .await;
+        let body = r#"{"ok":true}"#;
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        assert_eq!(String::from_utf8_lossy(&response), expected);
+    }
+
 }
