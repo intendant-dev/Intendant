@@ -368,7 +368,10 @@ pub(crate) fn scan_worktree_inventory_response(home: &Path, project_root: Option
 /// `api_worktrees_inspect`, `api_worktrees_scan`, `api_worktrees_remove`):
 /// the inventory (status, body) helpers plus the shared cache
 /// side-effects, rendered as [`ApiResponse`]s. Spawn placement and
-/// task-failure shapes stay transport-owned.
+/// task-failure shapes stay transport-owned — and so is `home`: the
+/// transport edge resolves the real home dir (like the merge adapters
+/// already do), keeping these cores deterministic so tests inject a
+/// temp home instead of scanning the machine they run on.
 pub(crate) fn worktrees_list_api_response(cache: &Arc<Mutex<Option<String>>>) -> ApiResponse {
     let body = cache
         .lock()
@@ -378,18 +381,17 @@ pub(crate) fn worktrees_list_api_response(cache: &Arc<Mutex<Option<String>>>) ->
     ApiResponse::json(200, JsonBody::PreSerialized(body))
 }
 
-pub(crate) fn worktrees_inspect_api_response(body_text: &str) -> ApiResponse {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let (status_line, body) = inspect_worktree_inventory_response(&home, body_text);
+pub(crate) fn worktrees_inspect_api_response(home: &Path, body_text: &str) -> ApiResponse {
+    let (status_line, body) = inspect_worktree_inventory_response(home, body_text);
     ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
 
 pub(crate) fn worktrees_scan_api_response(
+    home: &Path,
     project_root: Option<&Path>,
     cache: &Arc<Mutex<Option<String>>>,
 ) -> ApiResponse {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let body = scan_worktree_inventory_response(&home, project_root);
+    let body = scan_worktree_inventory_response(home, project_root);
     if let Ok(mut guard) = cache.lock() {
         *guard = Some(body.clone());
     }
@@ -397,11 +399,11 @@ pub(crate) fn worktrees_scan_api_response(
 }
 
 pub(crate) fn worktrees_remove_api_response(
+    home: &Path,
     body_text: &str,
     cache: &Arc<Mutex<Option<String>>>,
 ) -> ApiResponse {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let (status_line, body) = remove_worktree_inventory_response(&home, body_text);
+    let (status_line, body) = remove_worktree_inventory_response(home, body_text);
     if status_line == "200 OK" {
         if let Ok(mut guard) = cache.lock() {
             *guard = None;
@@ -3306,8 +3308,10 @@ pub(crate) async fn handle_worktrees_inspect(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let response =
-        match tokio::task::spawn_blocking(move || worktrees_inspect_api_response(&body_text)).await
+        match tokio::task::spawn_blocking(move || worktrees_inspect_api_response(&home, &body_text))
+            .await
         {
             Ok(response) => response,
             Err(e) => ApiResponse::json(
@@ -3331,8 +3335,9 @@ pub(crate) async fn handle_worktrees_remove(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let response = match tokio::task::spawn_blocking(move || {
-        worktrees_remove_api_response(&body_text, &worktree_inventory_cache)
+        worktrees_remove_api_response(&home, &body_text, &worktree_inventory_cache)
     })
     .await
     {
@@ -3394,8 +3399,9 @@ pub(crate) async fn handle_worktrees_scan(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let response = match tokio::task::spawn_blocking(move || {
-        worktrees_scan_api_response(project_root.as_deref(), &worktree_inventory_cache)
+        worktrees_scan_api_response(&home, project_root.as_deref(), &worktree_inventory_cache)
     })
     .await
     {

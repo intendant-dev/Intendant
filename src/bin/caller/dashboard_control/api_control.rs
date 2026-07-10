@@ -655,8 +655,9 @@ pub(crate) async fn api_worktrees_inspect_response(
     _runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::worktrees_inspect_api_response(&body_text)
+        crate::web_gateway::worktrees_inspect_api_response(&home, &body_text)
     })
     .await;
     match result {
@@ -677,8 +678,9 @@ pub(crate) async fn api_worktrees_inspect_response(
 pub(crate) async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
     let project_root = runtime.project_root.clone();
     let cache = runtime.worktree_inventory_cache.clone();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::worktrees_scan_api_response(project_root.as_deref(), &cache)
+        crate::web_gateway::worktrees_scan_api_response(&home, project_root.as_deref(), &cache)
     })
     .await;
     match result {
@@ -702,8 +704,9 @@ pub(crate) async fn api_worktrees_remove_response(
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
     let cache = runtime.worktree_inventory_cache.clone();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::worktrees_remove_api_response(&body_text, &cache)
+        crate::web_gateway::worktrees_remove_api_response(&home, &body_text, &cache)
     })
     .await;
     match result {
@@ -1760,8 +1763,11 @@ mod tests {
     async fn parity_worktrees_inspect_shares_bodies_with_status_metadata() {
         let rt = crate::dashboard_control::tests::runtime();
         // Invalid request body: deterministic serde wording on both lanes.
+        // The injected temp home is never reached on this path, but the
+        // fixture still must not hand the core a real home dir.
+        let tmp_home = tempfile::tempdir().expect("temp home");
         let (status, http_body) = parity_worktrees_http_body(
-            crate::web_gateway::worktrees_inspect_api_response("not json"),
+            crate::web_gateway::worktrees_inspect_api_response(tmp_home.path(), "not json"),
         );
         assert_eq!(status, 400);
         let frame = api_worktrees_inspect_response(
@@ -1790,30 +1796,58 @@ mod tests {
 
     #[tokio::test]
     async fn parity_worktrees_scan_rides_the_shared_core_and_plain_envelope() {
-        // Both lanes call the ONE neutral scan (worktrees_scan_api_response)
-        // by construction; live worktree state moves between scans on a
-        // multi-agent box, so this fixture runs a single tunnel scan and
-        // pins the envelope mapping plus the shared cache side-effect
-        // (byte-equal double scans would race the fleet).
-        let rt = crate::dashboard_control::tests::runtime();
-        let frame = api_worktrees_scan_response("parity-wt-scan".to_string(), &rt).await;
+        // Both lanes render the ONE neutral scan (worktrees_scan_api_response)
+        // over an injected temp home. A fixture must never run the real
+        // scan: on a fleet runner that walks the runner account's
+        // ~/projects and agent-worktree roots and reads its session
+        // metadata — machine-dependent, git-subprocess-per-worktree slow,
+        // and a hermeticity violation. The temp home is also what makes
+        // the cross-lane equality assertable at all (live worktree state
+        // moves between scans on a multi-agent box; only `scanned_at`
+        // varies here).
+        let tmp_home = tempfile::tempdir().expect("temp home");
+        let strip_scanned_at = |mut body: serde_json::Value| {
+            body.as_object_mut()
+                .expect("inventory object")
+                .remove("scanned_at")
+                .expect("scan stamps scanned_at");
+            body
+        };
+
+        let http_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (status, http_body) = parity_worktrees_http_body(
+            crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &http_cache),
+        );
+        assert_eq!(status, 200);
+
+        let tunnel_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let frame = frame_api_json_body_response(
+            "parity-wt-scan".to_string(),
+            crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &tunnel_cache),
+            "worktree scan",
+        );
         assert_eq!(frame["t"], "response");
         assert_eq!(frame["ok"], true);
         // Body-only envelope: no injected status metadata.
         let result = frame["result"].as_object().expect("inventory object");
         assert!(!result.contains_key("_httpStatus"), "{frame}");
         assert!(result.contains_key("worktrees"), "{frame}");
-        let cached = rt
-            .worktree_inventory_cache
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("scan must warm the shared cache");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&cached).unwrap(),
-            frame["result"],
-            "the cache holds the served body"
+            strip_scanned_at(frame["result"].clone()),
+            strip_scanned_at(http_body.clone()),
+            "the two lanes serve the same scan body"
         );
+        // The shared cache side-effect holds each lane's served body,
+        // byte-exact (same scan produced both).
+        for (cache, served) in [(&http_cache, &http_body), (&tunnel_cache, &frame["result"])] {
+            let cached = cache
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("scan must warm the shared cache");
+            let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
+            assert_eq!(&cached, served, "the cache holds the served body");
+        }
     }
 
     // ── S4c parity: managed context (the S4c envelope differences are
