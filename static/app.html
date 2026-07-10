@@ -50154,7 +50154,22 @@ function updateStatusBar(d) {
   if (d.model) document.getElementById('sb-model').textContent = d.model;
   if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
   if (d.budget_pct !== undefined && d.budget_pct !== null) {
-    setContextUsagePct(d.budget_pct);
+    // Status events are session-scoped: only the foreground session's
+    // budget may drive the header meter. Unscoped ticks (daemon primary)
+    // apply only while no session window is focused — a busy background
+    // session used to stomp the meter on every status tick, freezing the
+    // number across grid-window switches.
+    const statusSid = String(d.session_id || '').trim();
+    const foreground = typeof resolvePromptTargetSessionId === 'function'
+      ? resolvePromptTargetSessionId() : '';
+    const drivesForeground = !foreground
+      ? true
+      : (statusSid
+          ? (statusSid === foreground
+             || (typeof relatedSessionIdsForSession === 'function'
+                 && relatedSessionIdsForSession(statusSid).has(foreground)))
+          : false);
+    if (drivesForeground) setContextUsagePct(d.budget_pct);
   }
   if (d.autonomy) {
     const el = document.getElementById('sb-autonomy');
