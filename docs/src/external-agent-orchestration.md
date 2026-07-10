@@ -526,7 +526,17 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   announces its own session id on its first prompt, which upgrades its
   identity and emits the `fork` relationship from the persisted
   `forked_from` lineage. Until that first prompt the forked window has no
-  native identity yet — expected, not a bug.
+  native identity yet — expected, not a bug. `side` (`/btw`) rides the
+  same respawn: Claude Code's native `/btw` is interactive-only (over
+  stream-json the CLI answers with a synthetic "isn't available in this
+  environment" result — probed on 2.1.206), so the side conversation is a
+  respawned `--fork-session` child whose first prompt carries the side
+  boundary (inherited history is reference-only, no mutations) plus the
+  question, and whose lineage persists as `fork_relationship: "side"` —
+  the identity upgrade emits a `side` relationship, so the dashboard
+  renders a side child window, fully conversable for follow-ups. Both
+  dispatch sites (the external drain and the presence loop's inline
+  mirror) share `respawn_resume_thread_action`.
 - **Live reconfig** (wired): `control_request` subtypes `set_model` and
   `set_permission_mode` (verified on 2.1.201) back the `model` /
   `permission-mode` thread actions; the Launch-config modal applies both

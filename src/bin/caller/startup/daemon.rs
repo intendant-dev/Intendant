@@ -224,6 +224,7 @@ pub(crate) async fn run_daemon(
             direct: None,
             attachments: Vec::new(),
             fork: false,
+            relationship_kind: None,
             agent_command: None,
             codex_sandbox: None,
             codex_approval_policy: None,

@@ -1482,6 +1482,13 @@ pub enum ControlMsg {
         /// id on the first turn.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fork: bool,
+        /// Lineage kind recorded for a `fork` resume and emitted as the
+        /// parent→child relationship once the child announces its native id.
+        /// `None` means a plain `fork`; `side` marks an ephemeral side
+        /// conversation (`/btw`) on backends whose side conversations are
+        /// respawned forks rather than in-process threads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relationship_kind: Option<String>,
         /// Per-session executable override. When omitted, the supervisor
         /// rehydrates the persisted session value before falling back to the
         /// global Settings value.
@@ -4021,6 +4028,7 @@ mod tests {
                 source,
                 session_id,
                 resume_id,
+                relationship_kind,
                 project_root,
                 task,
                 direct,
@@ -4045,6 +4053,7 @@ mod tests {
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("summary"));
+                assert_eq!(relationship_kind, None, "absent field defaults to None");
             }
             _ => panic!("expected ResumeSession"),
         }

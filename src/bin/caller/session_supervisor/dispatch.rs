@@ -242,6 +242,7 @@ impl SessionSupervisor {
                 direct,
                 attachments,
                 fork,
+                relationship_kind,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -257,6 +258,7 @@ impl SessionSupervisor {
                     direct,
                     attachments,
                     fork,
+                    relationship_kind,
                     LaunchOverrides {
                         agent_command,
                         codex_sandbox,

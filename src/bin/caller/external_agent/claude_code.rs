@@ -2358,10 +2358,11 @@ impl ExternalAgent for ClaudeCodeAgent {
             "permission-mode" | "permission_mode" | "permissions" => {
                 self.set_permission_mode_live(params).await
             }
-            // `fork` never reaches this method: the drain sees
-            // `ForkHandling::RespawnResume` and respawns instead.
+            // `fork` and `side`/`btw` never reach this method: the drain
+            // sees `ForkHandling::RespawnResume` and respawns instead
+            // (side carries the boundary + question as the first prompt).
             other => Err(CallerError::ExternalAgent(format!(
-                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…, model, permission-mode)",
+                "thread action /{} not supported by Claude Code (supported: compact, fork, side, goal…, model, permission-mode)",
                 other
             ))),
         }

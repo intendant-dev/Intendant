@@ -368,6 +368,7 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         fork: bool,
+        relationship_kind: Option<String>,
         overrides: LaunchOverrides,
         force_new: bool,
     ) {
@@ -431,9 +432,15 @@ impl SessionSupervisor {
             // Record what this session forks from. While the child's own
             // native id is unknown, spawners treat `resume == forked_from`
             // as "add the backend's fork flag"; afterwards it documents
-            // lineage and drives the `fork` relationship emit.
+            // lineage and drives the relationship emit (`fork`, or the
+            // requested kind — `side` for /btw conversations).
             if let Some(config) = session_agent_config.as_mut() {
                 config.forked_from = Some(resume_token.clone());
+                config.fork_relationship = relationship_kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|kind| !kind.is_empty() && *kind != "fork")
+                    .map(str::to_string);
             }
         }
         let project_root = if external_backend.is_some() {
@@ -1768,6 +1775,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -1821,6 +1829,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -2009,6 +2018,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             ),
@@ -2101,6 +2111,7 @@ mod tests {
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
