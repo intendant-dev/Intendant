@@ -99,7 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let had_keys = store.vapid_private_pk8_b64.is_some() && store.log_private_pk8_b64.is_some();
     let vapid = load_or_create_vapid_keypair(&mut store)?;
     let log_key = load_or_create_log_keypair(&mut store)?;
-    if !had_keys {
+    // Code transparency: commit what this process will serve before it
+    // serves anything (docs/src/self-hosted-rendezvous.md). Appends only
+    // when the manifest changed since the last logged one.
+    let manifest_logged = record_artifact_manifest(&mut store, &config);
+    if !had_keys || manifest_logged {
         save_store(&config.data_file, &store).map_err(|e| format!("persist service keys: {e}"))?;
     }
     // Fleet DNS: build the zone, hydrate persisted records, and bind the
@@ -211,6 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(log_consistency).options(orl_preflight),
         )
         .route("/api/log/find", get(log_find).options(orl_preflight))
+        .route(
+            "/api/log/artifact-manifest",
+            get(log_artifact_manifest).options(orl_preflight),
+        )
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))

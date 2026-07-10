@@ -87,19 +87,6 @@ pub(crate) fn session_wildcard_json_error(status: u16, message: &str) -> ApiResp
     session_wildcard_json_response(status, serde_json::json!({ "error": message }).to_string())
 }
 
-/// Transitional raw-HTTP rendering for the current-session callers that
-/// have not yet converted to [`ApiResponse`] (S4 slices 2–3); byte-
-/// identical to the historical hand-rolled strings (the HTTP adapter's
-/// parity tests pin the framing).
-fn api_response_to_http_string(response: ApiResponse) -> String {
-    String::from_utf8_lossy(&api_response_http_bytes(
-        response,
-        crate::gateway_routes::CorsPosture::OwnOrigin,
-        None,
-    ))
-    .into_owned()
-}
-
 pub(crate) fn current_agent_output_response_for_ids(
     ids: Vec<String>,
     log_dir: &Path,
@@ -146,12 +133,16 @@ pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>,
     Ok(ids)
 }
 
-pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
-    let response = match agent_output_ids_from_json_body(body) {
+/// Transport-neutral core of `POST /api/session/current/agent-output`
+/// (tunnel twin `api_session_current_agent_output`): output-id decode
+/// from the JSON body, then the persisted-chunk fetch against the active
+/// session log dir. The no-active-log 404 stays with each lane's log
+/// resolution step.
+pub(crate) fn current_agent_output_api_response(body: &str, log_dir: &Path) -> ApiResponse {
+    match agent_output_ids_from_json_body(body) {
         Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
         Err(e) => session_wildcard_json_error(400, &e),
-    };
-    api_response_to_http_string(response)
+    }
 }
 
 pub(crate) fn external_agent_output_response_for_ids(
@@ -1999,11 +1990,15 @@ pub(crate) fn managed_context_anchor_matches_session(
         || anchor.intendant_session_id.as_deref() == Some(session_id)
 }
 
+/// Transport-neutral core of `GET /api/managed-context/anchors` (tunnel
+/// twin `api_managed_context_anchors`): the deduped, capped anchor
+/// catalog from the home-scoped candidate scan, under the canonical
+/// json tail.
 pub(crate) fn managed_context_anchors_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,
-) -> String {
+) -> ApiResponse {
     let session_id = managed_context_query_session_id(request_line);
     let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
     let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
@@ -2024,24 +2019,27 @@ pub(crate) fn managed_context_anchors_response_from_home(
                 &log_dir,
                 filter_session_id,
             ) {
-                return json_error(
-                    "500 Internal Server Error",
+                return ApiResponse::json_error(
+                    500,
                     format!("failed to read managed-context anchors: {err}"),
                 );
             }
         }
     } else if active_log_dir.is_some() {
         // Active log was present but unreadable or raced with session teardown.
-        return json_ok(serde_json::json!({ "anchors": [] }));
+        return ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "anchors": [] })));
     } else if session_id.is_none() && wrapper_session_id.is_none() {
-        return json_error(
-            "404 Not Found",
+        return ApiResponse::json_error(
+            404,
             "managed-context anchors need an active session log",
         );
     } else {
         let Some(log_dir) = active_log_dir else {
             anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            return json_ok(serde_json::json!({ "anchors": anchors }));
+            return ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "anchors": anchors })),
+            );
         };
         if let Err(err) = append_managed_context_anchors_from_dir(
             &mut anchors,
@@ -2049,8 +2047,8 @@ pub(crate) fn managed_context_anchors_response_from_home(
             log_dir,
             filter_session_id,
         ) {
-            return json_error(
-                "500 Internal Server Error",
+            return ApiResponse::json_error(
+                500,
                 format!("failed to read managed-context anchors: {err}"),
             );
         }
@@ -2060,7 +2058,7 @@ pub(crate) fn managed_context_anchors_response_from_home(
     let mut seen_items = HashSet::new();
     anchors.retain(|anchor| seen_items.insert(anchor.item_id.clone()));
     anchors.truncate(MANAGED_CONTEXT_ANCHOR_LIMIT);
-    json_ok(serde_json::json!({ "anchors": anchors }))
+    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "anchors": anchors })))
 }
 
 pub(crate) fn append_managed_context_records_from_dir(
@@ -2454,126 +2452,161 @@ pub(crate) async fn handle_history_prune(
     }
 }
 
+/// Transport-neutral core of `GET /api/session/current/changes[/…]`
+/// (tunnel twin `api_session_current_changes`): the change list / one
+/// file's unified diff under the wildcard-CORS tail. The request line
+/// arrives transport-decoded — HTTP passes it verbatim, the tunnel
+/// synthesizes it from its path/query params.
+pub(crate) fn session_current_changes_api_response(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    home: &Path,
+) -> ApiResponse {
+    let (status, body) =
+        handle_changes_request_for_home(request_line, snapshot_dir, project_root, home);
+    session_wildcard_json_response(status_line_code(status), body)
+}
+
 pub(crate) async fn handle_session_current_changes(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     project_root_for_changes: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // File change tracking endpoints:
     //   GET /api/session/current/changes        — list all changed files
     //   GET /api/session/current/changes/{path} — unified diff for one file
-    use tokio::io::AsyncWriteExt;
-    let (status, body) = handle_changes_request_for_home(
+    let response = session_current_changes_api_response(
         request_line,
         snapshot_dir.as_deref(),
         project_root_for_changes.as_deref(),
         &crate::platform::home_dir(),
     );
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `GET /api/session/current/history` (tunnel
+/// twin `api_session_current_history`): the serialized rewind History —
+/// or the 503 watcher-absent shape — under the wildcard-CORS tail.
+pub(crate) async fn current_history_api_response(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+) -> ApiResponse {
+    let (status, body) = handle_history_get(file_watcher).await;
+    session_wildcard_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_history(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // GET /api/session/current/history — serialized History.
-    use tokio::io::AsyncWriteExt;
-    let (status, body) = handle_history_get(file_watcher.as_ref()).await;
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = current_history_api_response(file_watcher.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `POST /api/session/current/rollback`
+/// (tunnel twin `api_session_current_rollback`): the shared rollback
+/// core — validation, file revert, conversation-rollback event — under
+/// the wildcard-CORS tail.
+pub(crate) async fn current_rollback_api_response(
+    body_text: &str,
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+    agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+    bus: &EventBus,
+) -> ApiResponse {
+    let (status, body) =
+        handle_history_rollback(body_text, file_watcher, agent_state, bus).await;
+    session_wildcard_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_rollback(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     bus: EventBus,
     query_ctx: Option<WebQueryCtx>,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // POST /api/session/current/rollback body:
     //   {"round_id": N,
     //    "revert_files": bool (default true),
     //    "revert_conversation": bool (default false)}
-    use tokio::io::AsyncWriteExt;
     let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
-    let (status, body) = handle_history_rollback(
+    let response = current_rollback_api_response(
         &body_text,
         file_watcher.as_ref(),
         agent_state.as_ref(),
         &bus,
     )
     .await;
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `POST /api/session/current/redo` (tunnel
+/// twin `api_session_current_redo`), under the wildcard-CORS tail.
+pub(crate) async fn current_redo_api_response(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+    agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+) -> ApiResponse {
+    let (status, body) = handle_history_redo(file_watcher, agent_state).await;
+    session_wildcard_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_redo(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     query_ctx: Option<WebQueryCtx>,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // POST /api/session/current/redo — no body required (dispatch
     // drains any body sent anyway).
-    use tokio::io::AsyncWriteExt;
     let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
-    let (status, body) = handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = current_redo_api_response(file_watcher.as_ref(), agent_state.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `POST /api/session/current/prune` (tunnel
+/// twin `api_session_current_prune`), under the wildcard-CORS tail.
+pub(crate) async fn current_prune_api_response(
+    file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
+) -> ApiResponse {
+    let (status, body) = handle_history_prune(file_watcher).await;
+    session_wildcard_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_prune(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // POST /api/session/current/prune — no body required (dispatch
     // drains any body sent anyway).
-    use tokio::io::AsyncWriteExt;
-    let (status, body) = handle_history_prune(file_watcher.as_ref()).await;
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = current_prune_api_response(file_watcher.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_current_agent_output(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     query_ctx: Option<WebQueryCtx>,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let log_dir = current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
     let response = match log_dir {
-        Some(dir) => current_agent_output_post_response(&body_text, &dir),
-        None => upload_error_response("404 Not Found", "no active session log"),
+        Some(dir) => current_agent_output_api_response(&body_text, &dir),
+        None => session_wildcard_json_error(404, "no active session log"),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Transport-neutral core of `GET /api/sessions` (tunnel twin
@@ -3119,11 +3152,12 @@ pub(crate) fn session_context_snapshot_api_response(
 }
 
 pub(crate) async fn handle_mc_anchors(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match session_log.as_ref() {
         Some(log) => match log.lock() {
             Ok(log) => {
@@ -3134,7 +3168,7 @@ pub(crate) async fn handle_mc_anchors(
                     &crate::platform::home_dir(),
                 )
             }
-            Err(_) => json_error("500 Internal Server Error", "session log lock poisoned"),
+            Err(_) => ApiResponse::json_error(500, "session log lock poisoned"),
         },
         None => managed_context_anchors_response_from_home(
             request_line,
@@ -3142,16 +3176,16 @@ pub(crate) async fn handle_mc_anchors(
             &crate::platform::home_dir(),
         ),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_mc_records(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match session_log.as_ref() {
         Some(log) => match log.lock() {
             Ok(log) => {
@@ -3162,7 +3196,7 @@ pub(crate) async fn handle_mc_records(
                     &crate::platform::home_dir(),
                 )
             }
-            Err(_) => json_error("500 Internal Server Error", "session log lock poisoned"),
+            Err(_) => ApiResponse::json_error(500, "session log lock poisoned"),
         },
         None => managed_context_records_response_from_home(
             request_line,
@@ -3170,16 +3204,16 @@ pub(crate) async fn handle_mc_records(
             &crate::platform::home_dir(),
         ),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_mc_fission(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     let response = match session_log.as_ref() {
         Some(log) => match log.lock() {
             Ok(log) => {
@@ -3190,7 +3224,7 @@ pub(crate) async fn handle_mc_fission(
                     &crate::platform::home_dir(),
                 )
             }
-            Err(_) => json_error("500 Internal Server Error", "session log lock poisoned"),
+            Err(_) => ApiResponse::json_error(500, "session log lock poisoned"),
         },
         None => managed_context_fission_response_from_home(
             request_line,
@@ -3198,8 +3232,7 @@ pub(crate) async fn handle_mc_fission(
             &crate::platform::home_dir(),
         ),
     };
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_sessions_stream(mut stream: DemuxStream, request_line: &str) {
@@ -3416,18 +3449,21 @@ pub(crate) async fn handle_displays(
 
 #[cfg(test)]
 pub(crate) fn managed_context_anchors_response(request_line: &str, log_dir: &Path) -> String {
-    managed_context_anchors_response_from_home(
+    test_render_api_response(managed_context_anchors_response_from_home(
         request_line,
         Some(log_dir),
         &crate::platform::home_dir(),
-    )
+    ))
 }
 
+/// Transport-neutral core of `GET /api/managed-context/records` (tunnel
+/// twin `api_managed_context_records`): the rewind-record index from the
+/// home-scoped candidate scan, under the canonical json tail.
 pub(crate) fn managed_context_records_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,
-) -> String {
+) -> ApiResponse {
     let session_id = managed_context_query_session_id(request_line);
     let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
     let mut filter_session_ids = Vec::new();
@@ -3481,23 +3517,26 @@ pub(crate) fn managed_context_records_response_from_home(
                 &log_dir,
                 &filter_session_ids,
             ) {
-                return json_error(
-                    "500 Internal Server Error",
+                return ApiResponse::json_error(
+                    500,
                     format!("failed to read managed-context records: {err}"),
                 );
             }
         }
     } else if active_log_dir.is_some() {
-        return json_ok(serde_json::json!({ "records": [] }));
+        return ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "records": [] })));
     } else if session_id.is_none() && wrapper_session_id.is_none() {
-        return json_error(
-            "404 Not Found",
+        return ApiResponse::json_error(
+            404,
             "managed-context records need an active session log",
         );
     } else {
         let Some(log_dir) = active_log_dir else {
             records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            return json_ok(serde_json::json!({ "records": records }));
+            return ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "records": records })),
+            );
         };
         if let Err(err) = append_managed_context_records_from_dir(
             &mut records,
@@ -3505,24 +3544,36 @@ pub(crate) fn managed_context_records_response_from_home(
             log_dir,
             &filter_session_ids,
         ) {
-            return json_error(
-                "500 Internal Server Error",
+            return ApiResponse::json_error(
+                500,
                 format!("failed to read managed-context records: {err}"),
             );
         }
     }
 
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    json_ok(serde_json::json!({ "records": records }))
+    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "records": records })))
 }
 
 #[cfg(test)]
 pub(crate) fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
-    managed_context_records_response_from_home(
+    test_render_api_response(managed_context_records_response_from_home(
         request_line,
         Some(log_dir),
         &crate::platform::home_dir(),
-    )
+    ))
+}
+
+/// Test-only wire render of a neutral response through the real HTTP
+/// adapter under the managed-context rows' own-origin posture.
+#[cfg(test)]
+pub(crate) fn test_render_api_response(response: ApiResponse) -> String {
+    String::from_utf8_lossy(&api_response_http_bytes(
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    ))
+    .into_owned()
 }
 
 /// Merged dashboard view of one fission group: the wire ledger fields from
@@ -3610,11 +3661,15 @@ pub(crate) fn managed_context_fission_group_view(
     }
 }
 
+/// Transport-neutral core of `GET /api/managed-context/fission` (tunnel
+/// twin `api_managed_context_fission`): the deduped, capped fission
+/// groups from the home-scoped candidate scan, under the canonical json
+/// tail.
 pub(crate) fn managed_context_fission_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,
-) -> String {
+) -> ApiResponse {
     let session_id = managed_context_query_session_id(request_line);
     let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
     let mut filter_session_ids = Vec::new();
@@ -3668,22 +3723,25 @@ pub(crate) fn managed_context_fission_response_from_home(
                 &log_dir,
                 &filter_session_ids,
             ) {
-                return json_error(
-                    "500 Internal Server Error",
+                return ApiResponse::json_error(
+                    500,
                     format!("failed to read managed-context fission groups: {err}"),
                 );
             }
         }
     } else if active_log_dir.is_some() {
-        return json_ok(serde_json::json!({ "groups": [] }));
+        return ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "groups": [] })));
     } else if session_id.is_none() && wrapper_session_id.is_none() {
-        return json_error(
-            "404 Not Found",
+        return ApiResponse::json_error(
+            404,
             "managed-context fission groups need an active session log",
         );
     } else {
         let Some(log_dir) = active_log_dir else {
-            return json_ok(serde_json::json!({ "groups": groups }));
+            return ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "groups": groups })),
+            );
         };
         if let Err(err) = append_managed_context_fission_groups_from_dir(
             &mut groups,
@@ -3691,8 +3749,8 @@ pub(crate) fn managed_context_fission_response_from_home(
             log_dir,
             &filter_session_ids,
         ) {
-            return json_error(
-                "500 Internal Server Error",
+            return ApiResponse::json_error(
+                500,
                 format!("failed to read managed-context fission groups: {err}"),
             );
         }
@@ -3702,7 +3760,7 @@ pub(crate) fn managed_context_fission_response_from_home(
     let mut seen_groups = HashSet::new();
     groups.retain(|group| seen_groups.insert(group.group_id.clone()));
     groups.truncate(MANAGED_CONTEXT_FISSION_GROUP_LIMIT);
-    json_ok(serde_json::json!({ "groups": groups }))
+    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "groups": groups })))
 }
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
@@ -4171,11 +4229,11 @@ mod tests {
         )
         .unwrap();
 
-        let response = managed_context_records_response_from_home(
+        let response = test_render_api_response(managed_context_records_response_from_home(
             "GET /api/managed-context/records?session_id=codex-thread-a HTTP/1.1",
             Some(active.path()),
             home.path(),
-        );
+        ));
         let body = response_json_body(&response);
         let ids: Vec<_> = body["records"]
             .as_array()
@@ -4224,11 +4282,11 @@ mod tests {
         )
         .unwrap();
 
-        let response = managed_context_records_response_from_home(
+        let response = test_render_api_response(managed_context_records_response_from_home(
             "GET /api/managed-context/records?session_id=wrapper-session HTTP/1.1",
             Some(active.path()),
             home.path(),
-        );
+        ));
         let body = response_json_body(&response);
         let ids: Vec<_> = body["records"]
             .as_array()
@@ -4299,11 +4357,11 @@ mod tests {
         crate::fission_ledger::detach_group(dir.path(), &detached.group_id, "anchor rewound away")
             .unwrap();
 
-        let response = managed_context_fission_response_from_home(
+        let response = test_render_api_response(managed_context_fission_response_from_home(
             "GET /api/managed-context/fission?session_id=fission-web-parent HTTP/1.1",
             Some(dir.path()),
             home.path(),
-        );
+        ));
         let body = response_json_body(&response);
         let groups = body["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
@@ -4347,11 +4405,11 @@ mod tests {
         );
 
         // A session id outside the connected component sees no groups.
-        let unrelated = managed_context_fission_response_from_home(
+        let unrelated = test_render_api_response(managed_context_fission_response_from_home(
             "GET /api/managed-context/fission?session_id=unrelated-session HTTP/1.1",
             Some(dir.path()),
             home.path(),
-        );
+        ));
         let unrelated_body = response_json_body(&unrelated);
         assert_eq!(unrelated_body["groups"].as_array().unwrap().len(), 0);
     }
@@ -4452,11 +4510,11 @@ mod tests {
         )
         .unwrap();
 
-        let response = managed_context_anchors_response_from_home(
+        let response = test_render_api_response(managed_context_anchors_response_from_home(
             "GET /api/managed-context/anchors?session_id=wrapper-a HTTP/1.1",
             Some(active.path()),
             home.path(),
-        );
+        ));
         let body = response_json_body(&response);
         let anchors = body["anchors"].as_array().unwrap();
         assert_eq!(anchors.len(), 1);
@@ -4492,11 +4550,11 @@ mod tests {
         )
         .unwrap();
 
-        let response = managed_context_anchors_response_from_home(
+        let response = test_render_api_response(managed_context_anchors_response_from_home(
             "GET /api/managed-context/anchors?session_id=codex-thread-a&backend_session_id=codex-thread-a&intendant_session_id=wrapper-stale HTTP/1.1",
             Some(active.path()),
             home.path(),
-        );
+        ));
         let body = response_json_body(&response);
         let anchors = body["anchors"].as_array().unwrap();
         assert_eq!(anchors.len(), 1);
@@ -5089,8 +5147,10 @@ mod tests {
         log.agent_output_with_id("first output", "", Some("Codex"), Some("out-1"));
         drop(log);
 
-        let response =
-            current_agent_output_post_response(r#"{"ids":["out-1","missing-out"]}"#, &log_dir);
+        let response = test_render_api_response(current_agent_output_api_response(
+            r#"{"ids":["out-1","missing-out"]}"#,
+            &log_dir,
+        ));
         assert!(response.starts_with("HTTP/1.1 200 OK"));
 
         let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -5103,7 +5163,8 @@ mod tests {
     #[test]
     fn agent_output_post_response_rejects_empty_json_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let response = current_agent_output_post_response(r#"{"ids":[""]}"#, dir.path());
+        let response =
+            test_render_api_response(current_agent_output_api_response(r#"{"ids":[""]}"#, dir.path()));
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("missing output ids"));
     }
@@ -5913,4 +5974,165 @@ mod tests {
             golden_session_json_transcript("400 Bad Request", &body)
         );
     }
+    // ── S4c golden transcripts: current-session + managed-context ──
+    // Same discipline as the S4a/S4b sets: byte-exact pins captured
+    // before the transport-neutral conversion (design §6 S4, risk R1).
+
+    #[tokio::test]
+    async fn golden_current_history_and_mutations_without_watcher_transcripts() {
+        for (make, expect_status) in [
+            ("GET", "503 Service Unavailable"),
+        ] {
+            let _ = make;
+            let response = collect_session_handler_response(|stream| {
+                handle_current_history(
+                    stream,
+                    None,
+                    crate::gateway_routes::CorsPosture::OwnOrigin,
+                    None,
+                )
+            })
+            .await;
+            assert_eq!(
+                golden_transcript(&response),
+                golden_session_wildcard_json_transcript(
+                    expect_status,
+                    r#"{"error":"file watcher not active"}"#
+                )
+            );
+        }
+        let response = collect_session_handler_response(|stream| {
+            handle_current_redo(
+                stream,
+                None,
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+        let response = collect_session_handler_response(|stream| {
+            handle_current_prune(
+                stream,
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+        let bus = crate::event::EventBus::new();
+        let response = collect_session_handler_response(|stream| {
+            handle_current_rollback(
+                stream,
+                "{}".to_string(),
+                bus,
+                None,
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_current_changes_without_context_transcript() {
+        let response = collect_session_handler_response(|stream| {
+            handle_session_current_changes(
+                stream,
+                "GET /api/session/current/changes HTTP/1.1",
+                None,
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "503 Service Unavailable",
+                r#"{"error":"file watcher not active"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_current_agent_output_without_log_transcript() {
+        let response = collect_session_handler_response(|stream| {
+            handle_current_agent_output(
+                stream,
+                r#"{"ids":["x"]}"#.to_string(),
+                None,
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_transcript(&response),
+            golden_session_wildcard_json_transcript(
+                "404 Not Found",
+                r#"{"error":"no active session log"}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_managed_context_empty_home_transcripts() {
+        // A tempdir home: the candidate scan finds nothing — the empty
+        // bodies and framing are the pin (query names one session id so
+        // the scan stays home-scoped).
+        let home = tempfile::tempdir().unwrap();
+        let anchors = test_render_api_response(managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        ));
+        assert_eq!(
+            anchors,
+            golden_session_json_transcript("200 OK", r#"{"anchors":[]}"#)
+        );
+        let records = test_render_api_response(managed_context_records_response_from_home(
+            "GET /api/managed-context/records?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        ));
+        assert_eq!(
+            records,
+            golden_session_json_transcript("200 OK", r#"{"records":[]}"#)
+        );
+        let fission = test_render_api_response(managed_context_fission_response_from_home(
+            "GET /api/managed-context/fission?session_id=abc123 HTTP/1.1",
+            None,
+            home.path(),
+        ));
+        assert_eq!(
+            fission,
+            golden_session_json_transcript("200 OK", r#"{"groups":[]}"#)
+        );
+    }
+
 }

@@ -815,7 +815,7 @@ pub(crate) async fn api_managed_context_response(
             });
         }
     };
-    http_wire_response(id, response, "managed context")
+    frame_api_response(id, response, "managed context")
 }
 
 pub(crate) async fn api_mcp_tool_call_response(
@@ -1848,6 +1848,85 @@ mod tests {
             let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
             assert_eq!(&cached, served, "the cache holds the served body");
         }
+    }
+
+    // ── S4c parity: managed context (the S4c envelope differences are
+    // enumerated on the current-session fixture set in api_sessions.rs;
+    // the tunnel's query synthesis is difference #5, the injected-status
+    // envelope difference #1) ──
+
+    #[tokio::test]
+    async fn parity_managed_context_shares_bodies_with_status_metadata() {
+        // A unique session id keeps the home-scoped candidate scan empty
+        // and deterministic on a live box; both lanes then serve the
+        // scoped empty bodies from the ONE neutral fn per kind.
+        let rt = runtime();
+        let session_id = format!(
+            "parity-mc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let home = crate::platform::home_dir();
+        for (kind, empty_key) in [
+            ("anchors", "anchors"),
+            ("records", "records"),
+            ("fission", "groups"),
+        ] {
+            let request_line =
+                format!("GET /api/managed-context/{kind}?session_id={session_id} HTTP/1.1");
+            let response = match kind {
+                "anchors" => crate::web_gateway::managed_context_anchors_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+                "records" => crate::web_gateway::managed_context_records_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+                _ => crate::web_gateway::managed_context_fission_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+            };
+            let (status, http_body) = parity_worktrees_http_body(response);
+            assert_eq!(status, 200, "{kind}");
+            assert_eq!(http_body[empty_key], serde_json::json!([]), "{kind}");
+
+            let frame = api_managed_context_response(
+                format!("parity-mc-{kind}"),
+                kind,
+                Some(&serde_json::json!({ "session_id": session_id })),
+                &rt,
+            )
+            .await;
+            let mut result = frame["result"].clone();
+            let map = result.as_object_mut().expect("result object");
+            assert_eq!(
+                map.remove("_httpStatus"),
+                Some(serde_json::json!(200)),
+                "{kind}: {frame}"
+            );
+            assert_eq!(
+                map.remove("_httpOk"),
+                Some(serde_json::json!(true)),
+                "{kind}"
+            );
+            assert_eq!(result, http_body, "{kind}");
+        }
+
+        // The tunnel-only missing-selector shape (difference #5): no
+        // session selector at all cannot be synthesized into a request
+        // line, so the tunnel answers its own decode error.
+        let frame =
+            api_managed_context_response("parity-mc-missing".to_string(), "records", None, &rt)
+                .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing query", "{frame}");
     }
 
     use crate::*;

@@ -122,16 +122,6 @@ const fn uploadable(name: &'static str, op: PeerOperation) -> ControlMethodSpec 
     }
 }
 
-/// Upload-frame-only method (no request-lane dispatch, no feature entry).
-const fn upload_only(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
-    ControlMethodSpec {
-        name,
-        op: Some(op),
-        advertised: false,
-        upload: true,
-    }
-}
-
 /// The residue half of the tunnel method table: methods not (yet) declared
 /// as a `tunnel:` column on a `gateway_routes::ROUTES` row. Do NOT add a
 /// method here if its HTTP twin has a route row — declare it on the row
@@ -264,25 +254,12 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // The session artifact reads (api_session_report,
     // api_session_recordings, api_session_recording_asset,
     // api_session_frame_asset), api_session_delete, and the worktrees
-    // quartet live as tunnel columns on their route rows (S4b).
+    // quartet live as tunnel columns on their route rows (S4b), and so
+    // does the whole current-session family — history/rollback/redo/
+    // prune, changes, agent-output, uploads list/raw/delete, and the
+    // upload-frame-only api_session_current_upload (S4c).
     method("api_sessions_stream", PeerOperation::SessionInspect),
-    method("api_session_current_history", PeerOperation::SessionManage),
-    method("api_session_current_rollback", PeerOperation::SessionManage),
-    method("api_session_current_redo", PeerOperation::SessionManage),
-    method("api_session_current_prune", PeerOperation::SessionManage),
-    method("api_session_current_changes", PeerOperation::SessionManage),
-    method("api_session_current_uploads", PeerOperation::SessionManage),
-    method("api_session_current_upload_raw", PeerOperation::SessionManage),
-    method(
-        "api_session_current_upload_delete",
-        PeerOperation::SessionManage,
-    ),
-    method(
-        "api_session_current_agent_output",
-        PeerOperation::SessionManage,
-    ),
     method("api_session_control_msg", PeerOperation::SessionManage),
-    upload_only("api_session_current_upload", PeerOperation::SessionManage),
     method("api_transfer_jobs", PeerOperation::FilesystemRead),
     method("api_transfer_download_read", PeerOperation::FilesystemRead),
     // The api_fs_* methods live as tunnel columns on their route rows
@@ -341,9 +318,8 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         PeerOperation::SessionInspect,
     ),
     method("api_dashboard_bootstrap", PeerOperation::SessionInspect),
-    method("api_managed_context_records", PeerOperation::SessionInspect),
-    method("api_managed_context_anchors", PeerOperation::SessionInspect),
-    method("api_managed_context_fission", PeerOperation::SessionInspect),
+    // The api_managed_context_* trio lives as tunnel columns on the
+    // /api/managed-context/* route rows (S4c).
     method("api_external_agents", PeerOperation::SessionInspect),
 ];
 
@@ -1756,23 +1732,6 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
             "error": format!("{label} returned invalid JSON"),
         }),
     }
-}
-
-fn http_wire_response(id: String, response: String, label: &str) -> serde_json::Value {
-    let (status, body) = split_http_response(&response);
-    http_body_response(id, status, body.to_string(), label)
-}
-
-fn split_http_response(response: &str) -> (u16, &str) {
-    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", response));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(200);
-    (status, body)
 }
 
 // One status-line parser across both lanes (the api core's (status,
@@ -3220,43 +3179,43 @@ mod tests {
             ("api_session_delete", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_history",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_rollback",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
-            ("api_session_current_redo", Residue, Some(Op::SessionManage)),
+            ("api_session_current_redo", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_prune",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_changes",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_uploads",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_upload_raw",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_upload_delete",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_agent_output",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             ("api_session_control_msg", Residue, Some(Op::SessionManage)),
@@ -3265,7 +3224,7 @@ mod tests {
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
@@ -3369,17 +3328,17 @@ mod tests {
             ("api_dashboard_bootstrap", Residue, Some(Op::SessionInspect)),
             (
                 "api_managed_context_records",
-                Residue,
+                Row,
                 Some(Op::SessionInspect),
             ),
             (
                 "api_managed_context_anchors",
-                Residue,
+                Row,
                 Some(Op::SessionInspect),
             ),
             (
                 "api_managed_context_fission",
-                Residue,
+                Row,
                 Some(Op::SessionInspect),
             ),
             ("api_external_agents", Residue, Some(Op::SessionInspect)),
@@ -4374,17 +4333,6 @@ mod tests {
             "GET /api/managed-context/anchors?session_id=wrapper+id&backend_session_id=thread%2F1&intendant_session_id=daemon%2Bsession HTTP/1.1"
         );
         assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
-    }
-
-    #[test]
-    fn http_wire_response_preserves_http_status_metadata() {
-        let response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"missing\"}";
-        let frame = http_wire_response("m1".into(), response.into(), "managed context");
-        assert_eq!(frame["t"], "response");
-        assert_eq!(frame["ok"], true);
-        assert_eq!(frame["result"]["error"], "missing");
-        assert_eq!(frame["result"]["_httpStatus"], 404);
-        assert_eq!(frame["result"]["_httpOk"], false);
     }
 
 }

@@ -61,3 +61,12 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'test(/^dashboard_control::(api_sessions|api_media)::tests::parity_/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# The managed-context parity fixture walks the real ~/.intendant/logs
+# candidate scan (the routes_sessions home-scan class above). The
+# worktrees parity fixtures run against an injected temp home and need
+# no lane; this one joins the hermeticity sweep that retires the
+# home-scan lanes together.
+[[profile.default.overrides]]
+filter = 'test(/^dashboard_control::api_control::tests::parity_managed_context/)'
+slow-timeout = { period = "60s", terminate-after = 4 }

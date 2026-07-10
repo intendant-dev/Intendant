@@ -54925,6 +54925,19 @@ function renderAccessConnectCard() {
         'No local co-signed record for this claim (made before this daemon kept records, or via an older service) — the owner shown is the rendezvous’s assertion.'));
     }
   }
+  // Hosted-bundle code transparency (the CT tripwire's sibling): this
+  // daemon periodically fetches what the rendezvous serves and compares
+  // it against the rendezvous's own public transparency log.
+  if (status.hosted_bundle_state === 'alert') {
+    headRow.appendChild(accessRouteChip('danger', 'HOSTED CODE ALERT',
+      `This daemon fetched the dashboard code the rendezvous serves and it does not match the rendezvous's public transparency log: ${(status.hosted_bundle_mismatches || []).join(' | ')}. Until the operator explains, treat hosted tabs against this rendezvous as compromised — reach this daemon directly or by its fleet name instead. Re-check out of band with: intendant hosted-verify.`));
+  } else if (status.hosted_bundle_state === 'ok') {
+    headRow.appendChild(accessRouteChip('webrtc', 'hosted code ✓',
+      'What this rendezvous serves matches its public transparency log'
+      + (status.hosted_bundle_checked_unix_ms ? ` (checked ${new Date(Number(status.hosted_bundle_checked_unix_ms)).toLocaleString()})` : '')
+      + (status.hosted_bundle_last_error ? `. Last attempt failed: ${status.hosted_bundle_last_error} — the verdict shown is from the last completed check.` : '')
+      + '. Verified out of band by this daemon (page JS can never honestly verify the origin serving it).'));
+  }
   card.appendChild(headRow);
 
   if (status.claimed === true && status.claim_binding === 'mismatch') {

@@ -110,16 +110,22 @@ pub(crate) async fn favicon_png() -> impl IntoResponse {
 /// Product screenshots for the landing page, embedded like the installer so
 /// every deployment serves visuals that match its own UI. Captured from a
 /// staged local rig (daemon "atlas", account "@ada") — synthetic content only.
+/// A table rather than a match so the artifact-transparency manifest
+/// (transparency.rs) enumerates exactly what this route serves.
+pub(crate) const LANDING_ASSETS: &[(&str, &[u8])] = &[
+    ("hero.webp", include_bytes!("assets/landing-hero.webp")),
+    ("video.webp", include_bytes!("assets/landing-video.webp")),
+    ("vault.webp", include_bytes!("assets/landing-vault.webp")),
+    ("station.webp", include_bytes!("assets/landing-station.webp")),
+    ("claim.webp", include_bytes!("assets/landing-claim.webp")),
+    ("phone.webp", include_bytes!("assets/landing-phone.webp")),
+];
+
 pub(crate) fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
-    match name {
-        "hero.webp" => Some(include_bytes!("assets/landing-hero.webp")),
-        "video.webp" => Some(include_bytes!("assets/landing-video.webp")),
-        "vault.webp" => Some(include_bytes!("assets/landing-vault.webp")),
-        "station.webp" => Some(include_bytes!("assets/landing-station.webp")),
-        "claim.webp" => Some(include_bytes!("assets/landing-claim.webp")),
-        "phone.webp" => Some(include_bytes!("assets/landing-phone.webp")),
-        _ => None,
-    }
+    LANDING_ASSETS
+        .iter()
+        .find(|(asset_name, _)| *asset_name == name)
+        .map(|(_, bytes)| *bytes)
 }
 
 pub(crate) async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -166,12 +172,23 @@ pub(crate) async fn landing_ui(State(state): State<Arc<AppState>>) -> Html<Strin
     Html(landing_ui_html(&state.config.public_origin))
 }
 
+/// The `/connect` page body — shared by the route handler and the
+/// artifact-transparency manifest so both hash/serve identical bytes.
+pub(crate) fn connect_page_html(origin: &str) -> String {
+    connect_ui_html(origin, "Intendant Connect", "Rendezvous account")
+}
+
+/// The `/access` page body (see `connect_page_html`).
+pub(crate) fn access_page_html(origin: &str) -> String {
+    connect_ui_html(
+        origin,
+        "Intendant Access",
+        "Rendezvous and fleet navigation",
+    )
+}
+
 pub(crate) async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(connect_ui_html(
-        &state.config.public_origin,
-        "Intendant Connect",
-        "Rendezvous account",
-    ))
+    Html(connect_page_html(&state.config.public_origin))
 }
 
 pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -179,11 +196,7 @@ pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>) -> Html<String>
 }
 
 pub(crate) async fn access_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(connect_ui_html(
-        &state.config.public_origin,
-        "Intendant Access",
-        "Rendezvous and fleet navigation",
-    ))
+    Html(access_page_html(&state.config.public_origin))
 }
 
 pub(crate) async fn app_html(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {

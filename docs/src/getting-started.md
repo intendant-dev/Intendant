@@ -162,7 +162,10 @@ cargo build --release -p intendant   # re-embed
 `scripts/bundle-macos.sh` compiles a small Swift wrapper
 (`macos-app/*.swift`) with `swiftc`, bundles it with the release `intendant`
 binary, codesigns it (a persistent self-signed identity, ad-hoc fallback), and
-installs to `/Applications/Intendant.app`.
+installs to `/Applications/Intendant.app`. The same script carries the
+[release signing seam](#macos-releases-signing-and-notarization): with
+`INTENDANT_SIGN_IDENTITY` (and optionally the notary variables) set, it
+produces the Developer ID-signed, notarized bundle that tagged releases ship.
 
 The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 `intendant://` URL scheme. This is deliberate: `WKWebView` does not treat
@@ -205,6 +208,74 @@ back to the placeholder automatically. Two environment variables tune this:
 ./scripts/bundle-macos.sh debug     # debug build + install
 INSTALL_APP=0 ./scripts/bundle-macos.sh   # build the bundle without installing
 ```
+
+### macOS releases: signing and notarization
+
+Tagged releases ship a prebuilt, signed macOS app. Pushing a `v*` tag runs
+`.github/workflows/release.yml` on the self-hosted macOS runner: it
+release-builds the binaries, runs `scripts/bundle-macos.sh` with the signing
+seam active, and publishes a GitHub Release carrying
+`Intendant-<version>-macos-<arch>.zip` plus a `.sha256` checksum file.
+
+**Installing a release:** download the zip and checksum from
+[GitHub releases](https://github.com/intendant-dev/Intendant/releases),
+verify with `shasum -a 256 -c <zip>.sha256`, unzip, and drag `Intendant.app`
+to `/Applications`. On first launch macOS asks for the TCC permissions
+(Screen Recording, Accessibility, Microphone) exactly as with a local build.
+The app checks GitHub for a newer release at launch (silently, release builds
+only) and via **Intendant → Check for Updates…**; updating is always manual —
+the prompt only opens the release page in your browser.
+
+**What the signature means.** Release bundles are signed with a
+`Developer ID Application` certificate under the hardened runtime with a
+secure timestamp, notarized by Apple, and stapled — Gatekeeper opens them
+without warnings, and a tampered bundle fails validation. Signing is
+inside-out: bundled non-system dylibs (`Contents/Frameworks`, e.g. libvpx),
+then the embedded `intendant-bin` / `intendant-runtime`, then the bundle.
+All executables carry the minimal entitlements in
+`macos-app/entitlements.plist` — microphone (`device.audio-input`, live
+voice), camera (`device.camera`, presence video input), and Apple Events
+(`automation.apple-events`, the daemon's osascript paths); the rationale for
+what is present *and absent* is commented in that file. The app bundle stamps
+its version (`CFBundleShortVersionString`) from the tag; dev builds get a
+`git describe` stamp and an artifact suffixed `-unsigned-dev` so the two can
+never be confused. Versions are visible in **Intendant → About Intendant**.
+
+**Provisioning the release secrets** (repo → Settings → Secrets and
+variables → Actions). Without them the workflow still runs and publishes an
+unsigned dev artifact; each group is all-or-nothing and a partial group fails
+the run.
+
+Signing identity — `MACOS_SIGN_P12_B64`, `MACOS_SIGN_P12_PASSWORD`:
+
+1. In your Apple Developer account (Certificates → `+`), create a
+   **Developer ID Application** certificate, or use Xcode → Settings →
+   Accounts → Manage Certificates to create it in your login keychain.
+2. In **Keychain Access**, expand the certificate, select the certificate
+   *and* its private key, File → Export Items… → `.p12`, and set a strong
+   password. Export **with the certificate chain included** (select the
+   Developer ID intermediate alongside if offered) — the release job
+   validates the identity and rejects chain-less exports.
+3. `base64 -i cert.p12 | pbcopy`, paste into the `MACOS_SIGN_P12_B64`
+   secret; put the export password in `MACOS_SIGN_P12_PASSWORD`.
+
+Notarization — `NOTARY_KEY_B64`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`:
+
+1. In [App Store Connect](https://appstoreconnect.apple.com) → Users and
+   Access → Integrations → **App Store Connect API** → Team Keys, generate a
+   key with the **Developer** role. Download the `.p8` (one-time download).
+2. `base64 -i AuthKey_XXXX.p8 | pbcopy` → `NOTARY_KEY_B64`; the key's
+   **Key ID** → `NOTARY_KEY_ID`; the page's **Issuer ID** → `NOTARY_ISSUER_ID`.
+
+The workflow imports the identity into a throwaway keychain (created, used,
+and deleted with the original keychain search list restored even on failure)
+and materializes the `.p8` only for the run. To sign a build by hand instead,
+`scripts/bundle-macos.sh` takes the same seam as environment variables:
+`INTENDANT_SIGN_IDENTITY` (activates hardened-runtime distribution signing),
+`INTENDANT_SIGN_KEYCHAIN`, `INTENDANT_NOTARY_KEY_FILE` /
+`INTENDANT_NOTARY_KEY_ID` / `INTENDANT_NOTARY_ISSUER` (notarize + staple),
+`INTENDANT_ARTIFACT_DIR` (versioned zip + checksum), and
+`INTENDANT_APP_VERSION` (version override; defaults to `git describe`).
 
 ## API keys (.env)
 
