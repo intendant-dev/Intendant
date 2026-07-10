@@ -1414,6 +1414,13 @@ function refreshFilesDownloadAvailability() {
   }
 }
 
+// DELIBERATELY not routed through daemonApi.bytes (F1b): this direct-HTTP
+// ranged reader carries fs-read edge semantics the facade's HTTP adapter
+// does not model yet — the 416 empty-file carve-out below and the strict
+// 206-vs-200 status ladder. It is only reachable when the tunnel lane is
+// unavailable (useHttpFilesystemFallback), so the facade would serve it
+// over the same HTTP twin anyway. Folding these edges into the facade's
+// bytes adapter (then deleting this) is F1c/facade-hardening work.
 async function dashboardFetchHttpRangeBytes(path, offset, length, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
@@ -1487,6 +1494,35 @@ async function dashboardFetchHttpRangeBytesWithRetry(path, offset, length, optio
       await new Promise(resolve => setTimeout(resolve, 200 * attempt));
     }
   }
+}
+
+// Validate a daemonApi.bytes {bytes, meta} answer into the runner's range
+// shape — the same integrity checks (and error strings) that
+// dashboardNormalizeByteRangeResult applies to raw tunnel results: the
+// server must answer at the requested offset with a consistent length and
+// a sane total, or resumable bookkeeping would corrupt the reassembly.
+function filesTransferRangeFromMeta(method, bytes, meta, expectedOffset) {
+  const rangeStart = Number(meta.rangeStart ?? expectedOffset);
+  const rangeEnd = Number(meta.rangeEnd ?? (rangeStart + bytes.byteLength));
+  const totalSize = Number(meta.totalSize ?? rangeEnd);
+  if (!Number.isSafeInteger(rangeStart) || rangeStart !== expectedOffset) {
+    throw new Error(`${method} returned unexpected range start`);
+  }
+  if (!Number.isSafeInteger(rangeEnd) || rangeEnd < rangeStart || rangeEnd - rangeStart !== bytes.byteLength) {
+    throw new Error(`${method} returned inconsistent range length`);
+  }
+  if (!Number.isSafeInteger(totalSize) || totalSize < rangeEnd) {
+    throw new Error(`${method} returned invalid total size`);
+  }
+  return {
+    bytes,
+    rangeStart,
+    rangeEnd,
+    totalSize,
+    filename: meta.filename || '',
+    contentType: meta.contentType || '',
+    job: meta.job || null,
+  };
 }
 
 async function dashboardFetchPeerFileRangeBytesWithRetry(connection, path, offset, length, options = {}) {
@@ -1747,16 +1783,18 @@ function filesTransferMergeServerJob(job) {
 }
 
 async function refreshFilesTransferJobs() {
-  if (dashboardControlTransport?.lastStatus?.api_transfer_jobs_available !== true) {
+  // api_transfer_jobs is tunnel-only until the /api/transfers rows land
+  // (S9): gate on the tunnel lane being truly connected, not http-only.
+  if (daemonApi.availability('api_transfer_jobs').reason !== 'connected') {
     renderFilesTransfers();
     return [];
   }
   try {
-    const result = await dashboardTransport.request('api_transfer_jobs', {}, { timeoutMs: 60000 });
-    if (result?.ok === false || result?._httpOk === false) {
-      throw new Error(result.error || `transfer jobs returned ${result._httpStatus || 'error'}`);
+    const result = await daemonApi.request('api_transfer_jobs', {}, { timeoutMs: 60000 });
+    if (!result.ok) {
+      throw new Error(result.body.error || `transfer jobs returned ${result.status || 'error'}`);
     }
-    const jobs = Array.isArray(result.jobs) ? result.jobs : [];
+    const jobs = Array.isArray(result.body.jobs) ? result.body.jobs : [];
     for (const job of jobs) filesTransferMergeServerJob(job);
     filesTransferPersistState();
     renderFilesTransfers();
@@ -2108,14 +2146,14 @@ async function runFilesDownloadTransfer(transfer) {
             kind: 'download',
             path: transfer.path,
           };
-      const created = await dashboardTransport.request('api_transfer_job_create', payload, {
+      const created = await daemonApi.request('api_transfer_job_create', payload, {
         timeoutMs: transfer.timeoutMs || 120000,
         signal: controller.signal,
       });
-      if (created?.ok === false || created?._httpOk === false) {
-        throw new Error(created.error || `transfer create returned ${created._httpStatus || 'error'}`);
+      if (!created.ok) {
+        throw new Error(created.body.error || `transfer create returned ${created.status || 'error'}`);
       }
-      filesTransferApplyServerJob(transfer, created.job);
+      filesTransferApplyServerJob(transfer, created.body.job);
       filesTransferPersistState();
     }
     for (;;) {
@@ -2162,12 +2200,12 @@ async function runFilesDownloadTransfer(transfer) {
               offset: transfer.loaded,
               length: requested,
             };
-        const raw = await dashboardRequestBytesWithRetry(method, params, {
+        const { bytes, meta } = await daemonApi.bytes(method, params, {
           signal: controller.signal,
           retries: transfer.retries,
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
         });
-        range = dashboardNormalizeByteRangeResult(method, raw, transfer.loaded);
+        range = filesTransferRangeFromMeta(method, bytes, meta, transfer.loaded);
       }
       if (range.job) filesTransferApplyServerJob(transfer, range.job);
       transfer.totalSize = range.totalSize;
@@ -2209,9 +2247,10 @@ async function runFilesDownloadTransfer(transfer) {
     if (transfer.cancelRequested) {
       filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', 'Download cancelled');
-    } else if (transfer.pauseRequested || err?.name === 'AbortError') {
+    } else if (transfer.pauseRequested || err?.name === 'AbortError' || err?.kind === 'abort') {
       // Non-terminal teardown: the in-flight attempt's promise still
-      // rejects (failure) — Resume mints a fresh one.
+      // rejects (failure) — Resume mints a fresh one. Aborts arriving
+      // through the facade are DaemonApiError kind:'abort' (name differs).
       filesTransferTransition(transfer, 'paused', { actor: 'runner', error: '', failure: err });
       setFilesDownloadStatus('warn', `Paused at ${filesTransferProgressText(transfer)}`);
     } else {
@@ -2270,6 +2309,10 @@ function filesTransferFriendlyServerError(error, fallback) {
 // Staged-upload artifact download over plain HTTP: one-shot fetch of
 // /api/session/current/uploads/{id}/raw (the route streams the whole file;
 // staged uploads are bounded by the upload cap, so no ranged loop needed).
+// DELIBERATELY not routed through daemonApi.bytes (F1b): the declared
+// content-length cap check below aborts BEFORE the body downloads, and the
+// facade's bytes verb buffers the whole response before returning — no
+// early-abort equivalent yet. Facade-hardening candidate for F1c.
 async function runFilesStagedRawHttpDownload(transfer, controller) {
   transfer.transport = 'http-staged-raw';
   if (transfer.loaded > 0 || (Array.isArray(transfer.parts) && transfer.parts.length > 0)) {
@@ -2399,7 +2442,7 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
   transfer.mime = transfer.mime || file.type || 'application/octet-stream';
   transfer.name = transfer.name || file.name || 'upload.bin';
   if (!transfer.resumeToken && !transfer.serverJobId) {
-    const created = await dashboardTransport.request('api_transfer_job_create', {
+    const created = await daemonApi.request('api_transfer_job_create', {
       kind: 'upload',
       destination: transfer.destination,
       name: transfer.name,
@@ -2410,10 +2453,10 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       timeoutMs: transfer.timeoutMs || 120000,
       signal: controller.signal,
     });
-    if (created?.ok === false || created?._httpOk === false) {
-      throw new Error(created.error || `transfer create returned ${created._httpStatus || 'error'}`);
+    if (!created.ok) {
+      throw new Error(created.body.error || `transfer create returned ${created.status || 'error'}`);
     }
-    filesTransferApplyServerJob(transfer, created.job);
+    filesTransferApplyServerJob(transfer, created.body.job);
     filesTransferPersistState();
   }
   const chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
@@ -2423,7 +2466,7 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     const offset = Number(transfer.loaded || 0);
     const end = Math.min(offset + chunkBytes, transfer.totalSize);
     const chunk = file.slice(offset, end);
-    const result = await dashboardTransport.uploadBytes('api_transfer_upload_chunk', {
+    const result = await daemonApi.upload('api_transfer_upload_chunk', {
       id: transfer.serverJobId || undefined,
       resume_token: transfer.resumeToken || undefined,
       offset,
@@ -2431,10 +2474,10 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
       signal: controller.signal,
     });
-    if (result?.ok === false || result?._httpOk === false) {
-      throw new Error(result.error || `upload chunk returned ${result._httpStatus || 'error'}`);
+    if (!result.ok) {
+      throw new Error(result.body.error || `upload chunk returned ${result.status || 'error'}`);
     }
-    filesTransferApplyServerJob(transfer, result.job);
+    filesTransferApplyServerJob(transfer, result.body.job);
     transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
     filesTransferPersistState();
@@ -2449,28 +2492,28 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       throw new Error('synthetic upload interruption');
     }
   }
-  const committed = await dashboardTransport.request('api_transfer_upload_commit', {
+  const committed = await daemonApi.request('api_transfer_upload_commit', {
     id: transfer.serverJobId || undefined,
     resume_token: transfer.resumeToken || undefined,
   }, {
     timeoutMs: transfer.timeoutMs || 120000,
     signal: controller.signal,
   });
-  if (committed?.ok === false || committed?._httpOk === false) {
-    throw new Error(committed.error || `upload commit returned ${committed._httpStatus || 'error'}`);
+  if (!committed.ok) {
+    throw new Error(committed.body.error || `upload commit returned ${committed.status || 'error'}`);
   }
-  filesTransferApplyServerJob(transfer, committed.job);
+  filesTransferApplyServerJob(transfer, committed.body.job);
   transfer.loaded = transfer.totalSize;
-  transfer.descriptor = committed.job;
-  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.job });
+  transfer.descriptor = committed.body.job;
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.body.job });
   await filesTransferDeleteUploadBlob(transfer.id);
   setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
 }
 
 function filesDeleteServerTransfer(transfer) {
   if (!transfer?.serverJobId && !transfer?.resumeToken) return;
-  if (dashboardControlTransport?.lastStatus?.api_transfer_job_delete_available !== true) return;
-  dashboardTransport?.request?.('api_transfer_job_delete', {
+  if (daemonApi.availability('api_transfer_job_delete').reason !== 'connected') return;
+  daemonApi.request('api_transfer_job_delete', {
     id: transfer.serverJobId || undefined,
     resume_token: transfer.resumeToken || undefined,
   }, { timeoutMs: 30000 }).catch(() => {});
@@ -2506,43 +2549,29 @@ async function runFilesUploadTransfer(transfer) {
       await runFilesFilesystemUploadTransfer(transfer, controller);
     } else {
       if (!transfer.file) throw new Error('missing upload file');
-      let descriptor;
-      if (dashboardUploadRpcAvailable()) {
-        descriptor = await dashboardTransport.uploadBytes('api_session_current_upload', {
-          destination: 'task',
-          name: transfer.file.name || transfer.name || 'upload.bin',
-          mime: transfer.file.type || transfer.mime || 'application/octet-stream',
-        }, transfer.file, {
-          timeoutMs: transfer.timeoutMs || 120000,
-          signal: controller.signal,
-        });
-        if (descriptor?._httpOk === false) {
-          throw new Error(descriptor.error || `upload returned ${descriptor._httpStatus || 'error'}`);
-        }
-      } else if (!dashboardConnectModeEnabled()) {
-        // Direct connection without the dashboard-control channel: POST to
-        // the staged-upload HTTP route instead — it streams the body into a
-        // tempfile and commits into the same store as the RPC path.
-        transfer.transport = 'http-staged-upload';
-        const name = transfer.file.name || transfer.name || 'upload.bin';
-        setFilesUploadStatus('warn', `Uploading ${name}`);
-        const resp = await authedFetch(
-          `/api/session/current/uploads?name=${encodeURIComponent(name)}&destination=task`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': transfer.file.type || transfer.mime || 'application/octet-stream' },
-            body: transfer.file,
-            signal: dashboardComposeFetchSignal(controller.signal, transfer.timeoutMs || rangedDownloadTimeoutMs(transfer.file.size)),
-          }
-        );
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok || !payload || typeof payload !== 'object') {
-          throw new Error(filesTransferFriendlyServerError(payload?.error, `upload returned HTTP ${resp.status}`));
-        }
-        descriptor = payload;
-      } else {
+      // One facade call serves both lanes: upload frames on a connected
+      // tunnel, or the staged-upload HTTP route (raw streamed body — it
+      // spools into a tempfile and commits into the same store). Connect
+      // mode without the tunnel keeps its exact legacy message.
+      const stagedAvail = daemonApi.availability('api_session_current_upload');
+      if (dashboardConnectModeEnabled() && !stagedAvail.ok) {
         throw new Error('Upload is unavailable until dashboard access reconnects');
       }
+      if (stagedAvail.reason === 'http-only') transfer.transport = 'http-staged-upload';
+      const name = transfer.file.name || transfer.name || 'upload.bin';
+      setFilesUploadStatus('warn', `Uploading ${name}`);
+      const uploaded = await daemonApi.upload('api_session_current_upload', {
+        destination: 'task',
+        name,
+        mime: transfer.file.type || transfer.mime || 'application/octet-stream',
+      }, transfer.file, {
+        timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(transfer.file.size),
+        signal: controller.signal,
+      });
+      if (!uploaded.ok || !uploaded.body || typeof uploaded.body !== 'object') {
+        throw new Error(filesTransferFriendlyServerError(uploaded.body?.error, `upload returned HTTP ${uploaded.status}`));
+      }
+      const descriptor = uploaded.body;
       transfer.loaded = transfer.file.size;
       transfer.descriptor = descriptor;
       filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
@@ -2551,7 +2580,9 @@ async function runFilesUploadTransfer(transfer) {
       renderFilesStagedUploads();
     }
   } catch (err) {
-    if (transfer.cancelRequested || err?.name === 'AbortError') {
+    if (transfer.cancelRequested || err?.name === 'AbortError' || err?.kind === 'abort') {
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError this branch historically matched).
       filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
     } else {
       filesTransferTransition(transfer, 'failed', { actor: 'runner', error: err?.message || String(err), failure: err });
@@ -2780,18 +2811,14 @@ function renderFilesStagedUploads() {
 async function refreshFilesStagedUploads() {
   setFilesUploadStatus('warn', 'Loading staged uploads...');
   try {
-    let uploads = [];
-    if (
-      dashboardTransport?.canUseRpc?.() &&
-      dashboardControlTransport?.lastStatus?.api_session_current_uploads_available === true
-    ) {
-      uploads = await dashboardTransport.request('api_session_current_uploads', {}, { timeoutMs: 60000 });
-    } else {
-      if (dashboardConnectModeEnabled()) throw new Error('Staged uploads are unavailable until dashboard access reconnects');
-      const resp = await fetch('/api/session/current/uploads');
-      uploads = await resp.json().catch(() => []);
-      if (!resp.ok) throw new Error(`staged uploads returned ${resp.status}`);
+    if (dashboardConnectModeEnabled() && !daemonApi.availability('api_session_current_uploads').ok) {
+      throw new Error('Staged uploads are unavailable until dashboard access reconnects');
     }
+    const resp = await daemonApi.request('api_session_current_uploads', {}, { timeoutMs: 60000 });
+    if (!resp.ok) {
+      throw new Error(resp.body?.error || `staged uploads returned ${resp.status}`);
+    }
+    const uploads = resp.body;
     filesStagedUploads.clear();
     for (const upload of Array.isArray(uploads) ? uploads : []) {
       if (upload?.id) filesStagedUploads.set(String(upload.id), upload);
@@ -2842,7 +2869,14 @@ async function deleteFilesStagedUpload(id) {
   const key = String(id || '').trim();
   if (!key) return false;
   try {
-    await dashboardTransport.request('api_session_current_upload_delete', { id: key }, { timeoutMs: 60000 });
+    // The delete handler accepts upload_id/id on the tunnel; the HTTP twin
+    // lifts params.upload_id into DELETE /api/session/current/uploads/{upload_id},
+    // so the facade also serves this on direct dashboards without a tunnel
+    // (previously a tunnel-only dead end).
+    const resp = await daemonApi.request('api_session_current_upload_delete', { upload_id: key }, { timeoutMs: 60000 });
+    if (!resp.ok) {
+      throw new Error(resp.body?.error || `upload delete returned ${resp.status}`);
+    }
     filesStagedUploads.delete(key);
     renderFilesStagedUploads();
     setFilesUploadStatus('ok', 'Upload removed');

@@ -1806,43 +1806,27 @@ function dashboardReportRpcAvailable() {
   );
 }
 
+// "Can this method be served over the TUNNEL byte-stream lane right now?"
+// Derived through the facade (F1b): reason 'connected' requires a live
+// tunnel plus the daemon's own lane + per-method availability booleans
+// (server-derived from its method table). Deliberately NOT `.ok` — an
+// `http-only` answer means the direct HTTP lane could serve it, which is
+// not what this probe's consumers gate on. For descriptor methods the
+// byte_streams lane check rides the descriptor's lane; tunnel-only
+// methods (api_transfer_*) reduce to their per-method boolean — a daemon
+// that advertises those booleans always has byte streams.
 function dashboardByteStreamMethodAvailable(method) {
-  const status = dashboardControlTransport?.lastStatus || {};
-  const field = {
-    api_fs_read: 'api_fs_read_available',
-    api_transfer_download_read: 'api_transfer_download_read_available',
-    api_recording_asset: 'api_recording_asset_available',
-    api_session_recording_asset: 'api_session_recording_asset_available',
-    api_session_frame_asset: 'api_session_frame_asset_available',
-    api_session_current_upload_raw: 'api_session_current_upload_raw_available',
-    api_session_report: 'api_session_report_available',
-  }[method];
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    status.byte_streams_available === true &&
-    (!field || status[field] === true)
-  );
+  return daemonApi.availability(method).reason === 'connected';
 }
 
 function dashboardTransferDownloadAvailable() {
-  const status = dashboardControlTransport?.lastStatus || {};
   return dashboardByteStreamMethodAvailable('api_transfer_download_read') &&
-    status.api_transfer_job_create_available === true;
+    daemonApi.availability('api_transfer_job_create').reason === 'connected';
 }
 
 function dashboardTransferUploadAvailable() {
-  const status = dashboardControlTransport?.lastStatus || {};
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    status.upload_frames_available === true &&
-    status.api_transfer_job_create_available === true &&
-    status.api_transfer_upload_chunk_available === true &&
-    status.api_transfer_upload_commit_available === true
-  );
+  return ['api_transfer_job_create', 'api_transfer_upload_chunk', 'api_transfer_upload_commit']
+    .every(method => daemonApi.availability(method).reason === 'connected');
 }
 
 async function ensureDashboardTransferUploadAvailable(options = {}) {
