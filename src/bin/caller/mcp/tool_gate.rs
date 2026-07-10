@@ -100,6 +100,18 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
             matches!(
                 name,
                 "get_status"
+                    // Display-only transcript notes are a collaboration
+                    // primitive for supervised backends (the note's images
+                    // travel as base64 tool arguments), so they ride in
+                    // the small profile next to the shared-view set.
+                    | "post_session_note"
+                    // The agent→user primitives: blocking structured
+                    // questions and fire-and-forget notifications are core
+                    // collaboration affordances for every supervised
+                    // backend (also reachable as `intendant ctl ask` /
+                    // `ctl notify`).
+                    | "ask_user"
+                    | "notify_user"
                     | "show_shared_view"
                     | "focus_shared_view"
                     | "request_shared_view_input"
@@ -112,6 +124,9 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
                     | "grant_user_display"
+                    // The doorbell for the user's own display — exists
+                    // precisely for these scoped supervised callers.
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -134,6 +149,7 @@ pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profil
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
                     | "grant_user_display"
+                    | "request_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
                     | "read_screen"
@@ -189,8 +205,22 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "inspect_rewind_anchor" => PeerOperation::SessionInspect,
         // Resolving supervised approvals.
         "approve" | "deny" | "skip" | "approve_all" => PeerOperation::Approval,
-        // Injecting user-style messages into the session.
-        "respond" => PeerOperation::Message,
+        // Injecting user-style messages into the session — and the agent's
+        // own display-only transcript notes, which are the same
+        // session-surface write from the other direction (low-risk session
+        // output; deliberately reachable by session-scoped supervised
+        // agents, the tool's primary callers). ask_user and notify_user
+        // classify alike: agent→user session-surface writes for the same
+        // session-scoped callers — a question requests input, never
+        // permission, and answering one never widens autonomy.
+        //
+        // request_user_display classifies here too: the tool only ASKS the
+        // user (a popup with a reason — the same risk class as messaging
+        // them) and can grant nothing itself. The grant is minted by the
+        // owner's click, whose ControlMsg (`resolve_display_request`) is
+        // classified DisplayInput like grant_user_display.
+        "respond" | "post_session_note" | "ask_user" | "notify_user"
+        | "request_user_display" => PeerOperation::Message,
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -337,6 +367,30 @@ pub(crate) fn append_manual_http_tool_definitions(
         ),
     );
     push(
+        "post_session_note",
+        manual_http_tool_definition!(
+            "post_session_note",
+            "Post a display-only note into the session transcript, with optional base64 images. The note renders live in the dashboard transcript and persists for replay; it never enters any model's context. Images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total.",
+            PostSessionNoteParams
+        ),
+    );
+    push(
+        "ask_user",
+        manual_http_tool_definition!(
+            "ask_user",
+            "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform.",
+            AskUserParams
+        ),
+    );
+    push(
+        "notify_user",
+        manual_http_tool_definition!(
+            "notify_user",
+            "Send the user a fire-and-forget notification and return immediately (never blocks, never enters model context). urgency escalates delivery: \"info\" (default) renders a dashboard toast + transcript row; \"attention\" additionally badges the tab and raises a browser notification when the tab is hidden; \"urgent\" additionally pushes an immediate content-free nudge to the owner's opted-in browsers via the rendezvous — reserve urgent for being blocked or something requiring prompt human action. Caps: 4 KB text. Use ask_user instead when you need an answer.",
+            NotifyUserParams
+        ),
+    );
+    push(
         "show_shared_view",
         manual_http_tool_definition!(
             "show_shared_view",
@@ -398,6 +452,14 @@ pub(crate) fn append_manual_http_tool_definitions(
             "revoke_user_display",
             "Revoke access to the user's real display session.",
             RevokeUserDisplayParams
+        ),
+    );
+    push(
+        "request_user_display",
+        manual_http_tool_definition!(
+            "request_user_display",
+            "Ask the user for access to their real display (display 0, user_session). Raises a dedicated dashboard popup with your reason and blocks up to wait_seconds for their click — the user's click is the only thing that can grant it (no autonomy setting or approval action can). access=\"view\" shares the display stream (frames + dashboard visibility) without computer-use input; access=\"view_and_control\" requests the full grant. Returns a structured JSON result: approved (with granted duration), denied, denied_for_session, timed_out, cooldown, already_pending, already_granted, or unavailable.",
+            RequestUserDisplayParams
         ),
     );
     push(
@@ -553,6 +615,131 @@ mod tests {
     }
 
     #[test]
+    fn manual_http_session_note_description_matches_tool_attribute() {
+        // Same drift guard as the rewind/peer tools: post_session_note
+        // lives in a non-router impl block, so the HTTP transport serves
+        // the manual definition while the #[tool] attribute documents the
+        // method; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "post_session_note")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for post_session_note");
+        let attr = IntendantServer::post_session_note_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "post_session_note manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn session_note_tool_is_advertised_to_supervised_profiles() {
+        // The tool exists to be called by supervised session-scoped
+        // agents: it must be advertised in the small `core` profile and
+        // in the permissive default/full lists.
+        for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+            assert!(
+                tool_allowed_for_profile("post_session_note", false, profile),
+                "post_session_note must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual.iter().any(|tool| tool["name"] == "post_session_note"),
+            "core-profile manual definitions must include post_session_note"
+        );
+    }
+
+    #[test]
+    fn manual_http_request_user_display_description_matches_tool_attribute() {
+        // Same drift guard as the rewind/peer/session-note tools:
+        // request_user_display lives in a non-router impl block, so the
+        // HTTP transport serves the manual definition while the #[tool]
+        // attribute documents the method; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "request_user_display")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for request_user_display");
+        let attr = IntendantServer::request_user_display_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "request_user_display manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
+    fn request_user_display_is_advertised_to_supervised_profiles() {
+        // The doorbell exists FOR scoped supervised callers: it must be
+        // listed in the small core profile, the display profile, and the
+        // permissive default/full lists.
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+            Some("screen"),
+            Some("display"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("request_user_display", false, profile),
+                "request_user_display must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual
+                .iter()
+                .any(|tool| tool["name"] == "request_user_display"),
+            "core-profile manual definitions must include request_user_display"
+        );
+    }
+
+    #[test]
+    fn ask_and_notify_tools_are_advertised_to_supervised_profiles() {
+        // The agent→user primitives exist to be called by supervised
+        // session-scoped agents (and `intendant ctl` on their behalf):
+        // both must ride the small `core` profile and the permissive
+        // default/full lists, with manual HTTP definitions that match
+        // their #[tool] attributes.
+        for name in ["ask_user", "notify_user"] {
+            for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+                assert!(
+                    tool_allowed_for_profile(name, false, profile),
+                    "{name} must be listed for profile {profile:?}"
+                );
+            }
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        for (name, attr) in [
+            ("ask_user", IntendantServer::ask_user_tool_attr()),
+            ("notify_user", IntendantServer::notify_user_tool_attr()),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            assert_eq!(
+                manual_description,
+                attr.description.as_deref().unwrap_or_default(),
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+    }
+
+    #[test]
     fn fission_tool_profile_gating_matrix() {
         for name in [
             "fission_spawn",
@@ -607,6 +794,30 @@ mod tests {
         );
         assert_eq!(mcp_tool_operation("approve"), PeerOperation::Approval);
         assert_eq!(mcp_tool_operation("respond"), PeerOperation::Message);
+        // Display-only transcript notes classify with `respond`: a session
+        // message-surface write, deliberately below RuntimeControl so
+        // session-scoped supervised agents (the primary callers) pass.
+        assert_eq!(
+            mcp_tool_operation("post_session_note"),
+            PeerOperation::Message
+        );
+        // The agent→user primitives ride the same message-surface class:
+        // session-scoped supervised agents are their primary callers, a
+        // question is input (not permission), and a notification is
+        // display-only output. Pinned so a refactor can't silently drop
+        // them to the RuntimeControl default and lock supervised agents
+        // out of asking their own user.
+        assert_eq!(mcp_tool_operation("ask_user"), PeerOperation::Message);
+        assert_eq!(mcp_tool_operation("notify_user"), PeerOperation::Message);
+        // The display-request doorbell classifies as Message too: it only
+        // ASKS the user (popup + reason) and can grant nothing — scoped
+        // supervised agents, its primary callers, must be able to ring it.
+        // The grant itself is minted by the owner's resolve_display_request
+        // control message, which classifies DisplayInput.
+        assert_eq!(
+            mcp_tool_operation("request_user_display"),
+            PeerOperation::Message
+        );
         assert_eq!(mcp_tool_operation("start_task"), PeerOperation::Task);
         assert_eq!(
             mcp_tool_operation("rewind_context"),

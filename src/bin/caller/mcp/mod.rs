@@ -53,9 +53,23 @@ pub(crate) use tool_gate::*;
 mod tool_params;
 pub(crate) use tool_params::*;
 // tools_managed / tools_display / tools_peer contribute impl-block
-// methods only — nothing importable, so no re-export.
+// methods only — nothing importable, so no re-export. tools_notes also
+// exports the session-note caps, which `intendant ctl session note`
+// enforces client-side (derive, don't mirror); tools_ask likewise exports
+// its caps for `intendant ctl ask` / `ctl notify`, plus the pending-ask
+// probe the session supervisor's approval routing consults.
+mod tools_ask;
+pub(crate) use tools_ask::{
+    ask_user_question_pending, ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_OPTIONS,
+    ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
+};
 mod tools_display;
 mod tools_managed;
+mod tools_notes;
+pub(crate) use tools_notes::{
+    SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES, SESSION_NOTE_MAX_TEXT_BYTES,
+    SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES,
+};
 mod tools_peer;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
@@ -309,6 +323,34 @@ impl IntendantServer {
                 let params = parse_params::<RespondParams>(args)?;
                 Ok(text_tool_result(self.respond(params).await))
             }
+            "post_session_note" => {
+                let Parameters(params) = parse_params::<PostSessionNoteParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(match self.post_session_note_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => {
+                        text_tool_error(format!("post_session_note failed: {message}"))
+                    }
+                })
+            }
+            "ask_user" => {
+                let Parameters(params) =
+                    parse_params::<AskUserParams>(with_default_mcp_session_id(args, session_id))?;
+                Ok(match self.ask_user_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("ask_user failed: {message}")),
+                })
+            }
+            "notify_user" => {
+                let Parameters(params) = parse_params::<NotifyUserParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(match self.notify_user_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("notify_user failed: {message}")),
+                })
+            }
             "set_autonomy" => {
                 let params = parse_params::<SetAutonomyParams>(args)?;
                 Ok(text_tool_result(self.set_autonomy(params).await))
@@ -447,6 +489,18 @@ impl IntendantServer {
             "revoke_user_display" => {
                 let params = parse_params::<RevokeUserDisplayParams>(args)?;
                 Ok(text_tool_result(self.revoke_user_display(params).await))
+            }
+            "request_user_display" => {
+                // The doorbell: callable by Scoped callers by design — the
+                // tool only asks; the user's dashboard click is what mints
+                // the grant (control plane ResolveDisplayRequest arm).
+                let Parameters(params) = parse_params::<RequestUserDisplayParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(
+                    self.request_user_display_for_session(params, session_id)
+                        .await,
+                ))
             }
             "show_shared_view" => {
                 let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;

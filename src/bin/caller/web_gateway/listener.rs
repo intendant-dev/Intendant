@@ -487,10 +487,22 @@ pub fn spawn_web_gateway(
         dashboard_control.clone(),
         tcp_advertised_port,
     );
+    // Pending-request attention nudges: watch approvals/questions on the bus
+    // and ping the Connect rendezvous when they age with no dashboard around.
+    crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
+    // An owner surface (dashboards on this gateway) now exists in this
+    // process: display requests may block on the popup instead of failing
+    // closed with the headless no-approver refusal.
+    crate::display_requests::mark_approver_surface_available();
     // Fleet certificates: restore any stored certificate into the live
     // SNI resolver and keep it renewed (fleet_cert.rs).
     crate::fleet_cert::refresh_installed_state();
     crate::fleet_cert::spawn_renewal_loop();
+    // Hosted-bundle code transparency: when Connect is enabled,
+    // periodically verify what the rendezvous serves against its public
+    // transparency log (hosted_verify.rs — advisory and fail-open, the
+    // CT tripwire's sibling).
+    crate::hosted_verify::spawn_hosted_bundle_monitor();
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't
@@ -1464,6 +1476,29 @@ pub fn spawn_web_gateway(
                         }
                     }
 
+                    // Re-raise still-pending display requests so a
+                    // late-connecting dashboard (the exact browser the
+                    // attention nudge just summoned) shows the popup.
+                    // Requests are short-lived; expired entries are
+                    // filtered by the snapshot.
+                    for pending in crate::display_requests::registry()
+                        .pending_snapshot(crate::display_requests::now_unix_ms())
+                    {
+                        let line = serde_json::to_string(
+                            &crate::types::OutboundEvent::DisplayRequestRaised {
+                                session_id: Some(pending.session_key.clone())
+                                    .filter(|s| s != "main"),
+                                id: pending.id,
+                                access: pending.access.as_str().to_string(),
+                                reason: pending.reason.clone(),
+                                expires_unix_ms: pending.expires_unix_ms,
+                            },
+                        );
+                        if let Ok(line) = line {
+                            let _ = direct_tx.send(line);
+                        }
+                    }
+
                     let browser_workspaces = crate::browser_workspace::list_workspaces().await;
                     let browser_snapshot = serde_json::json!({
                         "t": "browser_workspace_snapshot",
@@ -1683,6 +1718,10 @@ pub fn spawn_web_gateway(
                     };
                     let inbound = tokio::spawn(ws_inbound_task(inbound_ctx, ws_rx, peer_id));
 
+                    // Attention-nudge presence: a live `/ws` client is the
+                    // "somebody is watching" signal that suppresses pushes.
+                    crate::attention_nudge::dashboard_connected();
+
                     // Phase 5a.1 outbound personalization plumbing: the authority
                     // change channel carries the holder's server-internal
                     // connection_id; ws_outbound_task converts each incoming change
@@ -1702,6 +1741,7 @@ pub fn spawn_web_gateway(
                     ));
 
                     let _ = tokio::join!(inbound, outbound);
+                    crate::attention_nudge::dashboard_disconnected();
                 } else {
                     let http_ctx = HttpRequestCtx {
                         bus: bus.clone(),

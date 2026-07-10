@@ -816,6 +816,201 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     child.kill().await.expect("stop the daemon");
 }
 
+/// Worktree sessions, the daemon lane: `CreateSession { worktree: true }`
+/// must branch a fresh worktree off the project's HEAD and run the session
+/// INSIDE it. The scripted loop proves the cwd through the real runtime by
+/// writing a relative-path probe file — it must land in the worktree
+/// checkout, not the base project — and the session's recorded meta pins
+/// the linkage (branch, checkout path, base branch/sha) plus the effective
+/// project root.
+#[tokio::test]
+async fn create_session_with_worktree_runs_inside_the_worktree() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    // The daemon's default project is a real git repo with one commit
+    // (worktree launches branch from HEAD, so an empty repo is an error by
+    // design). intendant.toml doubles as the rooted-daemon marker
+    // spawn_daemon_on_rig would write; committing it keeps the base clean.
+    let project = rig.project.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "e2e@test.com"]);
+    git(&["config", "user.name", "E2E"]);
+    std::fs::write(project.join("intendant.toml"), "").expect("project marker");
+    std::fs::write(project.join("README.md"), "# worktree e2e\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+    let base_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&project)
+            .output()
+            .expect("read base HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // `echo MARKER && echo done > wt_probe.txt` works under both sh and
+    // cmd; the relative redirect target is the cwd proof.
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Writing the cwd probe.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1,
+                                                  "command": "echo WORKTREE_E2E_ROUNDTRIP && echo done > wt_probe.txt" } }] },
+                { "expect_transcript_contains": "WORKTREE_E2E_ROUNDTRIP",
+                  "content": "Probe written.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "worktree session complete" } }] }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, free_loopback_port(), false).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", daemon.port))
+            .await
+            .expect("connect /ws");
+
+    // The very first control message can race daemon startup on a
+    // saturated box (the gateway accepts /ws a beat before the
+    // supervisor's bus subscription), so retry until session_started.
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "write the probe file in the isolated checkout",
+                "direct": true,
+                "worktree": true,
+                "worktree_branch": "wt-e2e",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send worktree create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("isolated checkout"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "worktree create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
+
+    // The worktree exists where the launch contract says (a `.git` file,
+    // not a directory, marks a linked worktree checkout).
+    let worktree_path = project.join(".intendant").join("worktrees").join("wt-e2e");
+    assert!(
+        worktree_path.join(".git").is_file(),
+        "expected a linked worktree checkout at {}",
+        worktree_path.display()
+    );
+
+    // cwd proof: the relative-path probe landed inside the worktree, and
+    // did NOT land in the base project.
+    assert!(
+        worktree_path.join("wt_probe.txt").is_file(),
+        "probe file missing from the worktree — the session did not run inside it; daemon log:\n{}",
+        daemon.log_tail()
+    );
+    assert!(
+        !project.join("wt_probe.txt").exists(),
+        "probe file leaked into the base project — the session ran in the wrong cwd"
+    );
+
+    // Recorded linkage: effective project root is the worktree, and the
+    // worktree meta names the branch and where it branched from.
+    let meta_raw = std::fs::read_to_string(
+        daemon
+            .rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id)
+            .join("session_meta.json"),
+    )
+    .expect("session_meta.json for the worktree session");
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("meta parses");
+    let recorded_root = meta
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .expect("meta records a project root");
+    assert!(
+        std::fs::canonicalize(recorded_root).expect("recorded root exists")
+            == std::fs::canonicalize(&worktree_path).expect("worktree exists"),
+        "meta project_root {recorded_root} is not the worktree {}",
+        worktree_path.display()
+    );
+    let linkage = meta.get("worktree").expect("meta records worktree linkage");
+    assert_eq!(linkage["branch"], "wt-e2e", "{linkage}");
+    assert_eq!(linkage["base_branch"], "main", "{linkage}");
+    assert_eq!(linkage["base_sha"], serde_json::json!(base_head), "{linkage}");
+    assert!(
+        linkage
+            .get("base_root")
+            .and_then(|v| v.as_str())
+            .is_some_and(
+                |root| std::fs::canonicalize(root).ok() == std::fs::canonicalize(&project).ok()
+            ),
+        "{linkage}"
+    );
+
+    // The done signal only fired after the runtime round-trip, and the
+    // base checkout never left its branch.
+    assert!(
+        daemon
+            .rig
+            .session_logs()
+            .contains("worktree session complete"),
+        "session log missing the done signal"
+    );
+    let base_branch_now = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(&project)
+        .output()
+        .expect("read base branch");
+    assert_eq!(
+        String::from_utf8_lossy(&base_branch_now.stdout).trim(),
+        "main",
+        "worktree launch must not move the base checkout"
+    );
+
+    daemon.child.kill().await.expect("stop the daemon");
+}
+
 #[tokio::test]
 async fn mock_provider_without_a_script_fails_closed() {
     let rig = TestRig::new();
@@ -840,6 +1035,604 @@ async fn mock_provider_without_a_script_fails_closed() {
         evidence.contains("INTENDANT_MOCK_SCRIPT"),
         "expected the mock-script configuration error, got:\n{evidence}"
     );
+}
+
+/// `intendant ctl session note` against a live daemon, end to end:
+/// (1) the note broadcasts as an `OutboundEvent::SessionNote` on `/ws`
+/// with the text, source, and attachment *references* (never bytes);
+/// (2) the referenced blob really serves from the upload store's `/raw`
+/// route with the stored MIME and exact bytes; (3) the note persists as a
+/// `session_note` row in the session log — the replay source of truth.
+#[tokio::test]
+async fn ctl_session_note_posts_a_display_only_note_with_image() {
+    const NOTE_TEXT: &str = "E2E_SESSION_NOTE milestone reached";
+    // Not a decodable PNG — the note rail stores and serves bytes verbatim,
+    // so any payload proves the round trip.
+    const IMAGE_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    let image_path = daemon.rig.project.path().join("note-image.png");
+    std::fs::write(&image_path, IMAGE_BYTES).expect("write note image");
+
+    // Subscribe before posting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "session",
+            "note",
+            NOTE_TEXT,
+            "--image",
+            image_path.to_str().expect("utf8 image path"),
+            "--session",
+            "note-e2e-session",
+            "--source",
+            "e2e",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let posted = stdout_json(&output);
+    assert_eq!(posted["status"], "posted", "{posted}");
+    assert_eq!(posted["session_id"], "note-e2e-session", "{posted}");
+    let note_id = posted["note_id"].as_str().expect("note_id").to_string();
+    let attachment_url = posted["attachments"][0]["url"]
+        .as_str()
+        .expect("attachment url")
+        .to_string();
+
+    // (1) The /ws broadcast carries the note as references, not bytes.
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_note")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "session_note never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["note_id"], note_id.as_str(), "{event}");
+    assert_eq!(event["text"], NOTE_TEXT, "{event}");
+    assert_eq!(event["source"], "e2e", "{event}");
+    assert_eq!(event["session_id"], "note-e2e-session", "{event}");
+    assert_eq!(event["attachments"][0]["url"], attachment_url.as_str(), "{event}");
+    assert_eq!(event["attachments"][0]["mime"], "image/png", "{event}");
+    assert!(
+        event["attachments"][0].get("data").is_none(),
+        "attachments must be references, never inline bytes: {event}"
+    );
+
+    // (2) The referenced blob serves with the stored MIME and exact bytes.
+    let response = client
+        .get(format!("http://127.0.0.1:{port}{attachment_url}"))
+        .send()
+        .await
+        .expect("GET note attachment");
+    assert!(
+        response.status().is_success(),
+        "attachment fetch failed: HTTP {}\n{}",
+        response.status(),
+        daemon.log_tail()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = response.bytes().await.expect("attachment bytes");
+    assert_eq!(&bytes[..], IMAGE_BYTES, "blob bytes must round-trip");
+
+    // (3) The note persisted to the session log for replay.
+    poll_until(
+        "the session_note row in the session log",
+        RUN_TIMEOUT,
+        || {
+            let logs = daemon.rig.session_logs();
+            let note_id = note_id.clone();
+            async move {
+                (logs.contains("\"event\":\"session_note\"") && logs.contains(&note_id))
+                    .then_some(())
+            }
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+}
+
+/// The display-request rail end to end: a caller rings the user-display
+/// doorbell (`ctl display request` → the `request_user_display` tool), a
+/// dashboard surface (here: a raw `/ws` client) receives the dedicated
+/// `display_request_raised` event and resolves it with the dedicated
+/// `resolve_display_request` action — approve mints the real grant
+/// (`user_display_granted` broadcast) and the blocked ctl call returns the
+/// structured approved result. The daemon runs at `--autonomy full`, which
+/// proves the rail's core invariant live: even full autonomy never
+/// auto-approves a display request — it waits for the click. The deny leg
+/// exercises deny + the per-session cooldown (the following ask is refused
+/// without raising anything).
+///
+/// Leg 0 pins the held-grant short-circuit, which is also what makes the
+/// test platform-uniform: a Windows daemon auto-registers the user desktop
+/// and holds the grant from startup
+/// (`display_glue::auto_activate_windows_user_display` — capture consent
+/// is implicit there by design), so a request on a fresh Windows daemon
+/// correctly answers `already_granted` without ringing. Granting
+/// explicitly first makes every platform take that same path, and the
+/// revoke that follows gives the popup legs one clean, grantless starting
+/// state everywhere.
+#[tokio::test]
+async fn display_request_rail_round_trips_over_ws() {
+    use futures_util::SinkExt;
+
+    const REASON: &str = "E2E_DISPLAY_REQUEST verify the deploy output";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before requesting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // ── Leg 0: a held grant short-circuits without ringing ──
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "is the door already open?",
+            "--session",
+            "display-e2e-pregrant",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "already_granted", "{result}");
+
+    // Clean slate for the popup legs (this also revokes the Windows
+    // startup auto-grant like any other grant).
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    // ── Leg 1: request(view_and_control) → user approves ──
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            REASON,
+            "--access",
+            "control",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-approve",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_raised never broadcast on /ws:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["session_id"], "display-e2e-approve", "{raised}");
+        assert_eq!(raised["access"], "view_and_control", "{raised}");
+        assert_eq!(raised["reason"], REASON, "{raised}");
+        assert!(
+            raised["expires_unix_ms"].as_u64().unwrap_or(0) > 0,
+            "{raised}"
+        );
+        let id = raised["id"].as_u64().expect("request id");
+
+        // The user's click: the dedicated resolution action (a display
+        // request is NEVER resolvable through approve/approve_all).
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-approve",
+                "id": id,
+                "decision": "approve",
+                "duration": "until_revoked",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send resolve_display_request");
+
+        // The approval minted the real grant through the existing path.
+        // Emission order inside the control plane's approve arm: the grant
+        // event first, then the resolution — and a /ws reader consumes
+        // frames in order, so wait for them in that order.
+        let granted = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_display_granted")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "user_display_granted never broadcast after approval:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(granted["display_id"], 0, "{granted}");
+        assert_eq!(granted["agent_visible"], true, "{granted}");
+
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["id"], id, "{resolved}");
+        assert_eq!(resolved["outcome"], "approved", "{resolved}");
+        assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "approved", "{result}");
+    assert_eq!(result["access"], "view_and_control", "{result}");
+    assert_eq!(result["duration"], "until_revoked", "{result}");
+
+    // ── Leg 2: revoke, then a request the user denies ──
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "second look please",
+            "--access",
+            "view",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-deny",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+                && json.get("session_id").and_then(|v| v.as_str()) == Some("display-e2e-deny")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_raised never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["access"], "view", "{raised}");
+        let id = raised["id"].as_u64().expect("request id");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-deny",
+                "id": id,
+                "decision": "deny",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send deny");
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+                && json.get("id").and_then(|v| v.as_u64()) == Some(id)
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["outcome"], "denied", "{resolved}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "denied", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+
+    // ── Leg 3: the cooldown refuses the next ask without a popup ──
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "asking again immediately",
+            "--session",
+            "display-e2e-deny",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "cooldown", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+}
+
+/// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
+/// renders the question on the rail (`user_question` on /ws), a frontend
+/// answers via `answer_question`, and the blocked ctl returns the exact
+/// answer — plus `approval_resolved` so every other dashboard clears.
+/// This is the codex/MCP/ctl path to the question rail that previously
+/// only the native loop and supervised Claude Code could reach.
+#[tokio::test]
+async fn ctl_ask_blocks_until_the_dashboard_answers() {
+    const QUESTION: &str = "Which color should the widget be?";
+    const ANSWER: &str = "cerulean";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before asking so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Spawn `ctl ask` WITHOUT awaiting: it must stay blocked until the
+    // answer lands (same construction as the ctl() helper).
+    let mut cmd = daemon.rig.command();
+    cmd.env_remove("INTENDANT_MCP_URL")
+        .env_remove("INTENDANT_PORT")
+        .env_remove("INTENDANT_SESSION_ID")
+        .env_remove("INTENDANT_MANAGED_CONTEXT");
+    cmd.arg("ctl")
+        .arg("--port")
+        .arg(daemon.port.to_string())
+        .args([
+            "--json",
+            "ask",
+            QUESTION,
+            "--option",
+            "red:Warm and bold",
+            "--option",
+            "blue",
+            "--header",
+            "Paint",
+            "--session",
+            "ask-e2e-session",
+        ]);
+    let ask_child = cmd.spawn().expect("spawn ctl ask");
+
+    // (1) The existing question rail event announces the structured ask.
+    let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+    })
+    .await
+    .unwrap_or_else(|| panic!("user_question never broadcast on /ws:\n{}", daemon.log_tail()));
+    assert_eq!(question["session_id"], "ask-e2e-session", "{question}");
+    assert_eq!(question["questions"][0]["question"], QUESTION, "{question}");
+    assert_eq!(question["questions"][0]["header"], "Paint", "{question}");
+    assert_eq!(
+        question["questions"][0]["options"][0]["label"], "red",
+        "{question}"
+    );
+    assert_eq!(
+        question["questions"][0]["options"][0]["description"], "Warm and bold",
+        "{question}"
+    );
+    assert_eq!(
+        question["questions"][0]["options"][1]["label"], "blue",
+        "{question}"
+    );
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("user_question must carry an id, got {question}"));
+
+    // (2) Answer from the dashboard wire (free text — always allowed).
+    {
+        use futures_util::SinkExt;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "answer_question",
+                "session_id": "ask-e2e-session",
+                "id": question_id,
+                "answers": { QUESTION: ANSWER },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send answer_question");
+    }
+
+    // (3) The blocked ctl returns the structured outcome with the answer.
+    let output = tokio::time::timeout(RUN_TIMEOUT, ask_child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("ctl ask did not return after the answer:\n{}", daemon.log_tail()))
+        .expect("collect ctl ask output");
+    assert!(output.status.success(), "{}", text_of(&output));
+    let outcome = stdout_json(&output);
+    assert_eq!(outcome["status"], "answered", "{outcome}");
+    assert_eq!(outcome["answer"], ANSWER, "{outcome}");
+    assert_eq!(outcome["answers"][QUESTION], ANSWER, "{outcome}");
+    assert_eq!(outcome["id"], question_id, "{outcome}");
+
+    // (4) The resolution broadcast clears the rail on other dashboards.
+    let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("approval_resolved")
+            && json.get("id").and_then(|v| v.as_u64()) == Some(question_id)
+    })
+    .await
+    .unwrap_or_else(|| panic!("approval_resolved never broadcast:\n{}", daemon.log_tail()));
+    assert_eq!(resolved["action"], "answer", "{resolved}");
+}
+
+/// `intendant ctl notify` end to end: fire-and-forget returns immediately,
+/// the `user_notification` event reaches /ws with its urgency, and the
+/// notification persists into the session log for replay.
+#[tokio::test]
+async fn ctl_notify_broadcasts_and_persists() {
+    const TEXT: &str = "E2E_NOTIFY deploy finished";
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before notifying so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "notify",
+            TEXT,
+            "--title",
+            "CI",
+            "--urgency",
+            "attention",
+            "--session",
+            "notify-e2e-session",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let sent = stdout_json(&output);
+    assert_eq!(sent["status"], "sent", "{sent}");
+    assert_eq!(sent["session_id"], "notify-e2e-session", "{sent}");
+    assert_eq!(sent["urgency"], "attention", "{sent}");
+    let notification_id = sent["id"].as_str().expect("notification id").to_string();
+
+    // (1) The /ws broadcast carries the notification for toast/attention.
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_notification")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "user_notification never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["id"], notification_id.as_str(), "{event}");
+    assert_eq!(event["text"], TEXT, "{event}");
+    assert_eq!(event["title"], "CI", "{event}");
+    assert_eq!(event["urgency"], "attention", "{event}");
+    assert_eq!(event["session_id"], "notify-e2e-session", "{event}");
+
+    // (2) The notification persisted to the session log for replay.
+    poll_until(
+        "the user_notification row in the session log",
+        RUN_TIMEOUT,
+        || {
+            let logs = daemon.rig.session_logs();
+            let notification_id = notification_id.clone();
+            async move {
+                (logs.contains("\"event\":\"user_notification\"")
+                    && logs.contains(&notification_id))
+                .then_some(())
+            }
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
 }
 
 /// `intendant ctl peer …` against a live federated pair: daemon A federates

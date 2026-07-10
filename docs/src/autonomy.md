@@ -39,6 +39,45 @@ MCP / `intendant ctl` expose the same choices ([MCP Server](./mcp-server.md)):
 approve, skip (continue with the next command), approve-all (which also flips
 autonomy to Full), or deny (and stop).
 
+A pending request does not depend on someone happening to look at a
+dashboard: an open-but-hidden tab badges its title/favicon with the pending
+count and can raise a browser notification
+([Web Dashboard](./web-dashboard.md)), and when *no* dashboard has been
+connected since the request appeared, a claimed daemon nudges the Connect
+rendezvous after a grace period so opted-in browsers get a Web Push that
+names only the request kind and the daemon/session labels — never the
+command or question itself (`attention_nudge.rs`;
+[Hosted rendezvous](./self-hosted-rendezvous.md)). Headless daemons with no
+frontend at all still auto-deny as before.
+
+## Questions and notifications are not permissions
+
+Two agent→user primitives share the approval *plumbing* (id space, rail,
+attention chain) without being approvals:
+
+- **Questions** (`ask_user`, the native loop's askHuman, supervised Claude
+  Code's AskUserQuestion) request *input*. Autonomy policy never
+  auto-resolves one — no level, per-category rule, or session-wide
+  approve-all grant answers a question — and answering (or approving one
+  through a verbs-only surface) never widens command autonomy. The asking
+  agent blocks until an answer, a dismissal, or its wait expires; the
+  timeout and the no-frontend shapes both hand the agent explicit
+  best-judgment guidance instead of a fabricated choice.
+- **Notifications** (`notify_user`) request *nothing*: fire-and-forget,
+  display-only, never blocking. `urgency` picks the delivery escalation —
+  `info` renders a dashboard toast plus a transcript row; `attention` also
+  registers in the attention center (tab badge, hidden-tab browser
+  notification); `urgent` also sends an immediate Connect nudge — an
+  explicit escalation, so it skips the pending-request grace period while
+  keeping the per-session cooldown and the content-free payload (kind +
+  labels only). Pending `ask_user` questions ride the ordinary
+  pending-request nudge above; they need no separate kind.
+
+`urgency: urgent` is also the designed attach point for audible/voice
+escalation ("ring the owner"): the `UserNotification` event carries the
+urgency on the bus, so a future voice leg (see [Presence](./presence.md))
+can subscribe to it without a new wire shape. No such leg exists yet.
+
 ## How `needs_approval` actually resolves
 
 The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:
@@ -102,3 +141,49 @@ agent-facing display lookup (a second fence, independent of the flag —
 see [Computer Use](./computer-use-and-audio.md)). Revoking *any*
 user-display session — shared or private — clears the per-daemon grant
 flag: over-revocation is the fail-closed direction.
+
+## The display request rail (doorbell)
+
+Scoped callers — supervised external agents, session-scoped grants,
+federated peers — cannot perform the owner's opt-in themselves
+(`grant_user_display` refuses them). What they can do is **ask**: the
+`request_user_display` MCP tool (`intendant ctl display request`) raises a
+dedicated dashboard popup with the agent's short reason and the requested
+access level, then blocks until the user decides or the wait window
+(default 120 s, max 600 s) closes.
+
+**Never auto-approved, by construction.** Display requests live in their
+own registry and id space, deliberately outside the approval registry:
+`approve` / `approve_all` / any autonomy level or per-category rule cannot
+reach them. The only resolution is the dedicated
+`resolve_display_request` control message — the popup's **Allow** /
+**Deny** / **Deny for this session** buttons — accepted from owner
+surfaces and classified `display.input` exactly like `GrantUserDisplay`
+(resolving a request is as powerful as granting directly). On approve, the
+control plane mints the grant through the same state flip and events the
+owner's own grant takes.
+
+Two access levels:
+
+- **`view`** — the display stream activates agent-visible (dashboard tile
+  + `list_frames`/`read_frame`), but the `DisplayControl` grant flag stays
+  **off**: computer-use input and screenshots against `user_session`
+  remain denied at the CU executor's fail-closed gate.
+- **`view_and_control`** — the full session grant described above.
+
+Three durations, chosen by the user at approval: **this session**
+(auto-revokes when the requesting session ends), **15 minutes** (a timer
+revokes through the normal revoke path; superseded if the owner grants or
+revokes manually in the meantime), **until revoked**.
+
+Spam resistance: one pending request per session (a second call reports
+the existing one); a deny — or a timeout, which counts as declined by
+absence — starts a 5-minute per-session cooldown during which new
+requests are refused without a popup; **Deny for this session**
+suppresses the session server-side until it ends. Pending requests feed
+the attention chain (tab badge, hidden-tab notification, and the
+Connect Web Push nudge with kind `display_request` — the push carries
+only the kind and session label, never the reason text). On a headless
+daemon with no owner surface, requests are refused immediately
+(`unavailable`) instead of blocking — the same fail-closed posture as
+headless approvals.

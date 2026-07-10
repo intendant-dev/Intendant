@@ -1808,9 +1808,10 @@ fn dns_acme_signing_payload(
     )
 }
 
-/// The signing context every fleet-DNS call needs: effective config,
-/// rendezvous URL, identity, and the effective daemon id.
-fn dns_signing_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
+/// The signing context every daemon-signed rendezvous call needs (fleet
+/// DNS, attention nudges): effective config, rendezvous URL, identity, and
+/// the effective daemon id.
+fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
     let mut config = crate::project::ConnectConfig::default().effective_with_env();
     if config.rendezvous_url.is_none() {
         config.rendezvous_url = status_snapshot().rendezvous_url;
@@ -1842,7 +1843,7 @@ async fn dns_signed_post(
     payload_tail: &str,
     extra: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let (config, base_url, identity, daemon_id) = dns_signing_context()?;
+    let (config, base_url, identity, daemon_id) = signed_daemon_context()?;
     let daemon_public_key = identity.public_key_b64u();
     let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
     let payload = format!(
@@ -1923,6 +1924,76 @@ pub(crate) async fn dns_acme_clear() -> Result<(), String> {
     .map(|_| ())
 }
 
+/* ── Pending-request attention nudge (attention_nudge.rs) ──
+Payload REPLICATES bin/connect/push.rs (twin golden test below); same
+resolution + signing discipline as the fleet-DNS publishes. PRIVACY: the
+body carries only a request KIND and a session display LABEL — never
+command text, question text, or paths; the service composes the push from
+those plus the daemon label it already stores. */
+
+const NOTIFY_PROTOCOL: &str = "intendant-connect-daemon-notify-v1";
+
+/// Mirrors `notify_signing_payload` in `intendant-connect`.
+fn notify_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    kind: &str,
+    session_label: &str,
+) -> String {
+    format!(
+        "{NOTIFY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{kind}\n{session_label}\n"
+    )
+}
+
+/// Tell the rendezvous an agent→user request (`kind`: "approval" |
+/// "question") has gone unseen, so it can Web-Push the owner's opted-in
+/// browsers. Errors are expected weather for unclaimed / offline daemons —
+/// the caller degrades silently.
+pub(crate) async fn notify_attention(kind: &str, session_label: &str) -> Result<(), String> {
+    // Only a claimed daemon has an owner to notify; the service would
+    // refuse an unclaimed nudge anyway, so skip the round-trip.
+    if status_snapshot().claimed != Some(true) {
+        return Err("daemon is not claimed on a rendezvous".to_string());
+    }
+    let (config, base_url, identity, daemon_id) = signed_daemon_context()?;
+    let daemon_public_key = identity.public_key_b64u();
+    let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let payload = notify_signing_payload(
+        &daemon_id,
+        &daemon_public_key,
+        issued_at_unix_ms,
+        kind,
+        session_label,
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = authenticated(
+        &config,
+        client.post(join_url(&base_url, "api/daemon/notify")?),
+    )
+    .json(&serde_json::json!({
+        "protocol": NOTIFY_PROTOCOL,
+        "daemon_id": daemon_id,
+        "daemon_public_key": daemon_public_key,
+        "issued_at_unix_ms": issued_at_unix_ms,
+        "signature": identity.sign_b64u(payload.as_bytes()),
+        "kind": kind,
+        "session_label": session_label,
+    }))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("notify rejected: HTTP {status} {text}"));
+    }
+    Ok(())
+}
+
 async fn post_error(
     client: &Client,
     base_url: &Url,
@@ -1994,7 +2065,7 @@ fn authenticated(config: &ConnectConfig, builder: RequestBuilder) -> RequestBuil
     }
 }
 
-fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
+pub(crate) fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
     let mut url = base_url.clone();
     {
         let mut segments = url
@@ -2314,6 +2385,16 @@ mod tests {
         assert_eq!(
             dns_acme_signing_payload("daemon-1", "PubKey", 1_700_000_000_000, "tok-value"),
             "intendant-connect-dns-acme-v1\ndaemon-1\nPubKey\n1700000000000\ntok-value\n"
+        );
+        assert_eq!(
+            notify_signing_payload(
+                "daemon-1",
+                "PubKey",
+                1_700_000_000_000,
+                "approval",
+                "deploy review"
+            ),
+            "intendant-connect-daemon-notify-v1\ndaemon-1\nPubKey\n1700000000000\napproval\ndeploy review\n"
         );
     }
 

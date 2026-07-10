@@ -1,21 +1,15 @@
-/* ── ui-v2 design tokens (design-overhaul program) ─────────────────────
-   Everything here is scoped under `html.ui-v2` and is completely inert
-   for the v1 UI: the flag is set pre-paint in 00-head.html (?ui=v2 or
-   localStorage intendant.ui2). Two layers live in this file:
+/* ── Design tokens (design-overhaul program) ───────────────────────────
+   Scoped under `html.ui-v2` — the permanent namespace class 00-head.html
+   stamps pre-paint (the v1 chrome and its runtime flag are gone). Two
+   layers live in this file:
 
-   1. The v2 token vocabulary (dark theme, Iris accent — light theme and
-      alternate accents are a later program phase). Values are the design
-      handoff's, verbatim; tokens the prototype used but never declared
-      (--iris-deep, --on-accent, --hover-wash, the -rgb triplets) are
-      declared here so no component ever hardcodes them.
-   2. The v1-bridge remaps: the Catppuccin names the existing fragments
-      consume, re-pointed at v2 tokens so not-yet-migrated panes render
-      acceptably under the v2 chrome during the migration. Deleted at
-      program end together with the v1 chrome.
-
-   Naming note: --text and --green exist in BOTH vocabularies by design —
-   under the flag the v2 definition wins everywhere, which IS the bridge
-   for those two names. */
+   1. The token vocabulary (dark + light themes, Iris accent). Values are
+      the design handoff's, verbatim; tokens the prototype used but never
+      declared (--iris-deep, --on-accent, --hover-wash, the -rgb
+      triplets) are declared here so no component ever hardcodes them.
+   2. The alias layer: the Catppuccin names the base stylesheets (10-14)
+      still consume, pointed at the tokens above. Since the v1 palette's
+      deletion this block IS those names' definition. */
 
 html.ui-v2 {
   /* — surfaces — */
@@ -86,7 +80,11 @@ html.ui-v2 {
   --t-med: .15s;
   --t-slow: .2s;
 
-  /* ── v1 bridge: Catppuccin vocabulary → v2 values ─────────────────── */
+  /* ── Alias layer: Catppuccin vocabulary → v2 values. Permanent —
+     the base stylesheets (10-14) consume these names ~1,900×; the
+     v1 palette that once defined them is gone, so this block IS
+     their definition now. Migrating consumers to v2 names is an
+     opportunistic mechanical refactor, per-file, no deadline. ── */
   --base: var(--bg);
   --mantle: var(--bg-1);
   --crust: var(--code-bg);
@@ -133,9 +131,9 @@ html.ui-v2 {
    Settings → Appearance segmented flips it). Values verbatim from the
    design system's tokens/colors-light.css: iris DEEPENS for contrast
    (--iris-2 becomes deeper ink, not brighter), semantics darken,
-   on-accent flips to white, shadows soften. The v1-bridge names follow
-   automatically; the handful of legacy rgba surfaces the v2 panes still
-   consume are remapped to the light surface vocabulary below. */
+   on-accent flips to white, shadows soften. The alias-layer names follow
+   automatically; the handful of legacy rgba surfaces still consumed via
+   the aliases are remapped to the light surface vocabulary below. */
 html.ui-v2[data-theme="light"] {
   /* — surfaces — */
   --bg: #F5F6FB;

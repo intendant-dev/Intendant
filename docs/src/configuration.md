@@ -50,7 +50,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations that are deliberately *not* under the state root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the platform-data-dir daemon identity key. |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations that are deliberately *not* under the state root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the platform-data-dir daemon identity key. |
 
 ### Model and behavior tuning
 
@@ -358,6 +358,12 @@ here), shows registration/claim state, reveals the twelve-word claim
 phrase to manage-grade sessions, and can release the claim binding. The
 `INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable still force-enables
 the client and overrides the file (the card reports when it does).
+
+**Projectless daemons** (the bundled macOS app's normal shape — no
+`.git`/`intendant.toml` at the launch directory) have no project file to
+persist into; for them the same `[connect]` table lives in the
+daemon-scoped `connect.toml` under the state root (`~/.intendant/`), and
+the toggle and daemon boot both use it. Rooted daemons are unaffected.
 
 Hosted Connect uses the same daemon-side settings:
 

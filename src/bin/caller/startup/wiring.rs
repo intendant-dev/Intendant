@@ -250,7 +250,18 @@ pub(crate) fn spawn_mode_web_gateway(
         project.config.webrtc.federation_allow_h264,
     );
     config.peer_access_requests = project.config.server.peer_access_requests.clone();
-    config.connect = project.config.connect.clone().effective_with_env();
+    // Connect config follows the same store the dashboard toggle writes:
+    // the project's intendant.toml when rooted, the daemon-scoped
+    // connect.toml when projectless — otherwise the bundled app's toggle
+    // would not survive a daemon restart.
+    let connect_base = match &project_root {
+        Some(_) => project.config.connect.clone(),
+        None => crate::project::load_daemon_connect_config().unwrap_or_else(|e| {
+            eprintln!("[connect] daemon-scoped connect.toml unreadable: {e}");
+            Default::default()
+        }),
+    };
+    config.connect = connect_base.effective_with_env();
     config.presence_enabled = runtime_presence_enabled;
     config.external_agent = initial_agent_backend
         .as_ref()
@@ -280,10 +291,17 @@ pub(crate) fn spawn_mode_web_gateway(
     mcp_http_state.codex_managed_context =
         project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
+    // Same value as ActiveSessionState.project_root_for_changes above, so
+    // MCP upload-store writes resolve to the scope the gateway serves.
+    mcp_http_state.project_root = project_root.clone();
     mcp_http_state.frame_registry = Some(frame_registry.clone());
     mcp_http_state.session_registry = Some(session_registry.clone());
     mcp_http_state.peer_registry = Some(peer_registry.clone());
     mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    // The gateway shape always has an answerable frontend: a dashboard can
+    // attach while an `ask_user` blocks, so asks wait instead of
+    // auto-answering.
+    mcp_http_state.interactive_frontends = true;
     let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
         Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
         bus.clone(),

@@ -150,11 +150,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
     'unknown',
     'Working directory not known yet'
   );
+  const worktreeBadge = document.createElement('span');
+  worktreeBadge.className = 'session-window-worktree hidden';
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
   metaRow.appendChild(relationStrip);
   metaRow.appendChild(project);
+  metaRow.appendChild(worktreeBadge);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
@@ -323,6 +326,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     relationStrip,
     project,
     cwd,
+    worktreeBadge,
     task,
     status,
     goal,
@@ -407,6 +411,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
+  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -442,6 +447,27 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
+}
+
+// Worktree badge next to the project path: branch name up front, the full
+// linkage (checkout path, base branch/commit) in the tooltip.
+function renderSessionWindowWorktreeBadge(win, worktree) {
+  if (!win?.worktreeBadge) return;
+  if (!worktree?.branch) {
+    win.worktreeBadge.className = 'session-window-worktree hidden';
+    win.worktreeBadge.textContent = '';
+    win.worktreeBadge.title = '';
+    return;
+  }
+  win.worktreeBadge.className = 'session-window-worktree';
+  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
+  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
+  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
+  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
+  if (worktree.baseBranch) {
+    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
+  }
+  win.worktreeBadge.title = lines.join('\n');
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
@@ -710,6 +736,7 @@ function sessionWindowRecordFromLogCommand(c) {
     superseded: !!c?.superseded,
     superseded_reason: c?.superseded_reason || c?.supersededReason || '',
     collapsible: !!c?.collapsible,
+    attachment_previews: Array.isArray(c?.attachment_previews) ? c.attachment_previews : [],
   };
 }
 
@@ -1995,6 +2022,218 @@ function appendEditUserMessageButton(entry, c) {
   entry.appendChild(btn);
 }
 
+// Render a log entry's attachment previews as a thumbnail strip.
+// Each preview is { dataUrl?, url?, name?, note?, frameId?, mime? }:
+// `dataUrl` (a data: URL or a same-origin /raw URL) renders as an <img>;
+// `url` additionally wraps the thumb in a click-through link that opens
+// the blob in a new tab. A preview without pixels — or one whose blob was
+// deleted from the upload store (the <img> error path) — degrades to a
+// named chip instead of a broken image.
+function appendLogAttachmentStrip(cnt, c) {
+  const attachmentPreviews = Array.isArray(c?.attachment_previews) ? c.attachment_previews : [];
+  if (attachmentPreviews.length === 0) return;
+  const strip = document.createElement('div');
+  strip.className = 'log-attachment-strip';
+  const missingChip = (att) => {
+    const chip = document.createElement('span');
+    chip.className = 'log-attachment-file';
+    chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
+    return chip;
+  };
+  for (const att of attachmentPreviews) {
+    if (att && att.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'log-attachment-thumb';
+      img.loading = 'lazy';
+      img.src = att.dataUrl;
+      img.alt = '';
+      img.title = att.note || att.name || att.frameId || 'attachment';
+      let holder = img;
+      if (att.url) {
+        const link = document.createElement('a');
+        link.className = 'log-attachment-link';
+        link.href = att.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.title = img.title;
+        link.appendChild(img);
+        holder = link;
+      }
+      img.addEventListener('error', () => {
+        const chip = missingChip(att);
+        chip.classList.add('log-attachment-missing');
+        chip.title = 'attachment unavailable (blob deleted from the upload store)';
+        holder.replaceWith(chip);
+      }, { once: true });
+      strip.appendChild(holder);
+    } else {
+      strip.appendChild(missingChip(att));
+    }
+  }
+  cnt.appendChild(strip);
+}
+
+// ── Session notes (display-only transcript notes) ──
+// Wire shape: { event: 'session_note', session_id, note_id, text,
+// attachments: [{upload_id, name, mime, url}], source?, ts }.
+// Rendered as an ordinary log entry with kind 'session_note' (distinct
+// styling via .log-entry[data-kind=session_note]) and the attachment
+// strip fed by the upload-store /raw URLs.
+
+function sessionNoteAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => ({
+    dataUrl: att?.url || '',
+    url: att?.url || '',
+    name: att?.name || 'image',
+    mime: att?.mime || '',
+  }));
+}
+
+// Normalize a session_note wire event (live WS or a raw replay/session-
+// detail entry) into the log-command shape renderLogEntry consumes.
+function sessionNoteLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: 'info',
+    source: String(d?.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: text,
+    note_id: d?.note_id || d?.noteId || '',
+    event_id: d?.event_id || d?.eventId || (d?.note_id ? `session-note:${d.note_id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+    attachment_previews: sessionNoteAttachmentPreviews(d),
+  };
+}
+
+// Live-path handler for the session_note WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleSessionNoteEvent(d) {
+  const c = sessionNoteLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+}
+
+// QA readback (window.qa convention): the dashboard validator exercises
+// the note rail's module-scoped pieces directly — the attachment strip
+// (including its deleted-blob chip degradation) and the wire-event
+// normalizers. Side-effect-free beyond the DOM node the caller passes in.
+window.qa = Object.assign(window.qa || {}, {
+  sessionNotes: {
+    renderStrip: (target, c) => appendLogAttachmentStrip(target, c),
+    logCommand: (d) => sessionNoteLogCommand(d),
+  },
+  userNotifications: {
+    logCommand: (d) => userNotificationLogCommand(d),
+    toastText: (d) => userNotificationToastText(d),
+  },
+});
+
+// Bootstrap-replay adapter: the WASM activity-feed pipeline only carries
+// log_entry-shaped replay rows (AddLogEntry has no attachment fields), so
+// session_note entries replay as note-styled text entries; the session
+// windows and the Sessions detail view re-attach the thumbnails from the
+// raw entries. The content deliberately stays byte-identical to the raw
+// note text so the transcript-signature dedupe collapses this row with
+// the attachment-bearing record the external window sync later inserts.
+// Everything else passes through untouched.
+function sessionNoteReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'session_note') return entry;
+  return {
+    event: 'log_entry',
+    level: 'info',
+    source: String(entry.source || '').trim() || 'note',
+    kind: 'session_note',
+    content: String(entry.text || '').trim(),
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
+// ── Agent→user notifications (notify_user) ──
+// Wire shape: { event: 'user_notification', session_id, id, title?, text,
+// urgency: 'info'|'attention'|'urgent', ts }. Display-only like session
+// notes: a transcript row (kind 'user_notification') plus a toast; the
+// attention center (fragment 57) separately badges the escalated
+// urgencies, and the daemon's attention monitor owns the urgent push.
+
+function userNotificationToastText(d) {
+  const title = String(d?.title || '').trim();
+  const text = String(d?.text || '').trim();
+  return title ? `${title}: ${text}` : text;
+}
+
+// Normalize a user_notification wire event (live WS or a raw
+// replay/session-detail entry) into the log-command shape renderLogEntry
+// consumes.
+function userNotificationLogCommand(d) {
+  const text = String(d?.text ?? d?.content ?? '').trim();
+  if (!text) return null;
+  const urgency = String(d?.urgency || 'info');
+  const title = String(d?.title || '').trim();
+  const tsMs = Number(d?.ts_ms ?? d?.tsMs ?? d?.ts);
+  const id = d?.id || d?.notification_id || d?.notificationId || '';
+  return {
+    session_id: String(d?.session_id || d?.sessionId || '').trim(),
+    level: urgency === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
+    event_id: d?.event_id || d?.eventId || (id ? `user-notification:${id}` : ''),
+    delivery: d?.delivery || d?.delivery_class || d?.deliveryClass || '',
+    // Raw wire events carry unix-ms in `ts`; replay entries carry the
+    // session log's HH:MM:SS string there instead, so only accept numbers.
+    ts_ms: Number.isFinite(tsMs) && tsMs > 0 ? tsMs : undefined,
+    ts: typeof d?.ts === 'string' ? d.ts : '',
+  };
+}
+
+// Live-path handler for the user_notification WS event (the WASM presence
+// layer does not know this event; the JS owns its rendering end to end).
+function handleUserNotificationEvent(d) {
+  const c = userNotificationLogCommand(d);
+  if (!c) return;
+  stationPushLogEvent(c);
+  renderLogEntry(c);
+  stationScheduleUpdate();
+  // Toast for at-a-glance visibility; urgent renders in the alarm style.
+  const urgency = String(d?.urgency || 'info');
+  if (typeof showControlToast === 'function') {
+    showControlToast(urgency === 'urgent' ? 'error' : 'info', userNotificationToastText(d));
+  }
+}
+
+// Bootstrap-replay adapter (same contract as
+// sessionNoteReplayEntryToLogEntry): notifications replay as plain
+// notify-styled text rows; no toast for history.
+function userNotificationReplayEntryToLogEntry(entry) {
+  if (!entry || entry.event !== 'user_notification') return entry;
+  const title = String(entry.title || '').trim();
+  const text = String(entry.text || '').trim();
+  return {
+    event: 'log_entry',
+    level: String(entry.urgency || '') === 'urgent' ? 'warn' : 'info',
+    source: 'notify',
+    kind: 'user_notification',
+    content: title ? `${title}: ${text}` : text,
+    session_id: entry.session_id || '',
+    ts: entry.ts,
+    event_id: entry.event_id || '',
+    delivery: entry.delivery || '',
+  };
+}
+
 function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
@@ -2018,34 +2257,13 @@ function renderLogEntry(c) {
   appendLogStateBadges(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
-  const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];
   if (hasImages) {
     const badge = document.createElement('span');
     badge.className = 'log-image-badge';
     badge.textContent = c.images.length === 1 ? '[screenshot]' : '[' + c.images.length + ' screenshots]';
     cnt.appendChild(badge);
   }
-  if (attachmentPreviews.length > 0) {
-    const strip = document.createElement('div');
-    strip.className = 'log-attachment-strip';
-    for (const att of attachmentPreviews) {
-      if (att && att.dataUrl) {
-        const img = document.createElement('img');
-        img.className = 'log-attachment-thumb';
-        img.loading = 'lazy';
-        img.src = att.dataUrl;
-        img.alt = '';
-        img.title = att.note || att.name || att.frameId || 'attachment';
-        strip.appendChild(img);
-      } else {
-        const chip = document.createElement('span');
-        chip.className = 'log-attachment-file';
-        chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
-        strip.appendChild(chip);
-      }
-    }
-    cnt.appendChild(strip);
-  }
+  appendLogAttachmentStrip(cnt, c);
 
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
@@ -2328,16 +2546,19 @@ function setPhase(phase) {
   stationScheduleUpdate();
 }
 
-// Cross-tab pending-approval indicator: badge the favicon + prefix the page
-// title so a pending approval is visible even when this tab is in the
-// background. Browsers (esp. Chrome) ignore an in-place href change on the
-// existing <link rel=icon>, so we remove it and append a fresh <link> each
-// time. The badged icon is composited on a canvas (app icon + attention dot),
-// with a solid-tile fallback if the base icon can't load; the title change
-// signals it regardless of canvas support.
-const _origDocTitle = document.title;
-let _approvalIndicatorOn = false;
+// Cross-tab pending-request indicator: SUPERSEDED by the attention center
+// (57-attention-notifications.js), which tracks the full pending set
+// (approvals + questions, across sessions, from the event stream) and owns
+// the title prefix + favicon count badge. The panel show/clear paths still
+// call this hook; it just nudges the center to repaint so panel-driven
+// transitions repaint promptly.
+function setApprovalIndicator(_pending) {
+  try { attentionRepaint(); } catch (_) {}
+}
 
+// Browsers (esp. Chrome) ignore an in-place href change on the existing
+// <link rel=icon>, so replace the element wholesale. Used by the attention
+// center's favicon badge.
 function _swapFavicon(href) {
   document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
   const link = document.createElement('link');
@@ -2346,42 +2567,6 @@ function _swapFavicon(href) {
   link.type = 'image/png';
   link.href = href;
   document.head.appendChild(link);
-}
-
-function _drawApprovalBadge(ctx, size) {
-  // bottom-right attention dot with a dark ring so it reads on any icon
-  const r = size * 0.30, cx = size - r - 1, cy = size - r - 1;
-  ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, 2 * Math.PI);
-  ctx.fillStyle = '#1e1e2e'; ctx.fill();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-  ctx.fillStyle = '#f38ba0'; ctx.fill();
-}
-
-function setApprovalIndicator(pending) {
-  if (pending === _approvalIndicatorOn) return;
-  _approvalIndicatorOn = pending;
-  document.title = pending ? '● Approval needed — ' + _origDocTitle : _origDocTitle;
-  if (!pending) { _swapFavicon('/icon-128.png'); return; }
-  const size = 64;
-  const c = document.createElement('canvas');
-  c.width = size; c.height = size;
-  const ctx = c.getContext('2d');
-  const finish = function() {
-    try { if (_approvalIndicatorOn) _swapFavicon(c.toDataURL('image/png')); } catch (_) {}
-  };
-  const img = new Image();
-  img.onload = function() {
-    try { ctx.drawImage(img, 0, 0, size, size); } catch (_) {}
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.onerror = function() {
-    ctx.fillStyle = '#313244';
-    ctx.fillRect(0, 0, size, size);
-    _drawApprovalBadge(ctx, size);
-    finish();
-  };
-  img.src = '/icon-128.png';
 }
 
 function clearPendingApproval() {
@@ -2592,6 +2777,9 @@ function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.
 function hidePanel(id) {
   if (id === 'approval-panel') clearPendingApproval();
   if (id === 'question-panel') clearPendingQuestion();
+  // Display-request state lives in 58-display-request.js (same module
+  // scope — function declarations hoist across fragments).
+  if (id === 'display-request-panel') clearPendingDisplayRequest();
   if (id === 'human-panel') {
     stationCurrentHumanQuestion = '';
     stationScheduleUpdate();
@@ -2601,6 +2789,7 @@ function hidePanel(id) {
 function hideAllPanels() {
   clearPendingApproval();
   clearPendingQuestion();
+  clearPendingDisplayRequest();
   stationCurrentHumanQuestion = '';
   document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
   stationScheduleUpdate();

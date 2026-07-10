@@ -389,6 +389,19 @@ pub enum AppEvent {
         id: u64,
         action: String,
     },
+    /// Fire-and-forget agent→user notification (`notify_user`). Display
+    /// only: rendered by dashboards (toast + transcript row), persisted to
+    /// the session log for replay, never injected into any model context,
+    /// and never blocking. `urgency` escalates delivery (attention center,
+    /// Connect nudge) — see [`crate::types::NotificationUrgency`].
+    UserNotification {
+        session_id: Option<String>,
+        id: String,
+        title: Option<String>,
+        text: String,
+        urgency: crate::types::NotificationUrgency,
+        ts: u64,
+    },
 
     // Vision display ready
     DisplayReady {
@@ -470,6 +483,39 @@ pub enum AppEvent {
         /// The display ID being revoked.  0 = primary (default).
         display_id: u32,
         note: Option<String>,
+    },
+
+    /// A scoped agent rang the user-display doorbell
+    /// (`request_user_display`): dashboards raise the dedicated popup.
+    /// Deliberately NOT `ApprovalRequired` — display requests never share
+    /// the approval id space, so `approve`/`approve_all`/autonomy rules
+    /// cannot reach them; the only resolution is
+    /// `ControlMsg::ResolveDisplayRequest` from an owner surface.
+    DisplayRequestRaised {
+        session_id: Option<String>,
+        /// Request id in the display-request registry's own id space.
+        id: u64,
+        /// "view" | "view_and_control" (crate::display_requests vocabulary).
+        access: String,
+        /// Short agent-provided justification shown verbatim to the user.
+        reason: String,
+        /// When the requesting tool call stops waiting (unix ms) — the
+        /// popup auto-expires then.
+        expires_unix_ms: u64,
+    },
+    /// A display request left the pending set: the user decided
+    /// ("approved" / "denied" / "denied_for_session"), the wait window
+    /// elapsed ("timeout"), or the requesting session ended ("cancelled").
+    /// Dashboards drop the popup and the attention chain clears the item.
+    DisplayRequestResolved {
+        session_id: Option<String>,
+        id: u64,
+        outcome: String,
+        /// Granted access level, present on "approved".
+        access: Option<String>,
+        /// Granted duration ("this_session" | "15m" | "until_revoked"),
+        /// present on "approved".
+        duration: Option<String>,
     },
 
     /// Browser workspace lifecycle/lease update. Browser workspaces are
@@ -772,6 +818,21 @@ pub enum AppEvent {
         source: String,
         content: String,
         turn: Option<usize>,
+    },
+    /// Display-only session note posted by an agent (`post_session_note`
+    /// MCP tool / `intendant ctl session note`). Presentation rail only:
+    /// broadcast to frontends and persisted to the session log, never
+    /// injected into any model conversation (that path is
+    /// [`ContextInjection`]). Attachments reference blobs already
+    /// committed to the session upload store.
+    SessionNote {
+        session_id: Option<String>,
+        note_id: String,
+        text: String,
+        attachments: Vec<crate::types::SessionNoteAttachment>,
+        source: Option<String>,
+        /// Unix epoch milliseconds when the note was posted.
+        ts: u64,
     },
     /// Active user-message edit rewound already-rendered session context.
     UserMessageRewind {
@@ -1391,6 +1452,17 @@ pub enum ControlMsg {
         /// Frame/upload IDs attached via the dashboard.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// Launch the session in a fresh git worktree branched off the
+        /// resolved project root's HEAD; the worktree checkout becomes the
+        /// session's effective project root. Requires the project root to
+        /// be a git repository with at least one commit.
+        #[serde(default)]
+        worktree: Option<bool>,
+        /// Branch name for the worktree (validated against a conservative
+        /// git-ref subset). Omitted: derived from the session name, else
+        /// `session-<short-id>`; collisions get a numeric suffix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_branch: Option<String>,
     },
     /// Delegate a task to a new supervised sub-agent under an existing
     /// internal session (the dashboard "delegate" action). The child is
@@ -1608,6 +1680,28 @@ pub enum ControlMsg {
         display_id: Option<u32>,
         #[serde(default)]
         note: Option<String>,
+    },
+    /// Resolve a pending user-display request (the doorbell popup's Allow
+    /// / Deny / Deny-for-this-session buttons). Owner-surface intent only:
+    /// classified `PeerOperation::DisplayInput` like `GrantUserDisplay` —
+    /// resolving a request is exactly as powerful as granting directly.
+    /// On approve, the control plane mints the grant through the same
+    /// state flip + events `grant_user_display` performs; deny arms the
+    /// per-session cooldown; deny_session suppresses the session. NEVER
+    /// reachable through the approval registry: `approve`/`approve_all`
+    /// target command approvals and cannot touch display requests.
+    ResolveDisplayRequest {
+        /// The requesting session (the popup echoes it back verbatim).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Display-request registry id from `DisplayRequestRaised`.
+        id: u64,
+        /// "approve" | "deny" | "deny_session".
+        decision: String,
+        /// Grant duration on approve: "this_session" | "15m" |
+        /// "until_revoked" (absent = until_revoked).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<String>,
     },
     /// Create a virtual (Xvfb) display from a frontend — the keyless path
     /// that gives a claimed headless box a working display without any
@@ -2125,6 +2219,21 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id: *id,
             questions: questions.clone(),
         }),
+        AppEvent::UserNotification {
+            session_id,
+            id,
+            title,
+            text,
+            urgency,
+            ts,
+        } => Some(OutboundEvent::UserNotification {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            title: title.clone(),
+            text: text.clone(),
+            urgency: *urgency,
+            ts: *ts,
+        }),
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
         }),
@@ -2191,6 +2300,32 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 note: note.clone(),
             })
         }
+        AppEvent::DisplayRequestRaised {
+            session_id,
+            id,
+            access,
+            reason,
+            expires_unix_ms,
+        } => Some(OutboundEvent::DisplayRequestRaised {
+            session_id: session_id.clone(),
+            id: *id,
+            access: access.clone(),
+            reason: reason.clone(),
+            expires_unix_ms: *expires_unix_ms,
+        }),
+        AppEvent::DisplayRequestResolved {
+            session_id,
+            id,
+            outcome,
+            access,
+            duration,
+        } => Some(OutboundEvent::DisplayRequestResolved {
+            session_id: session_id.clone(),
+            id: *id,
+            outcome: outcome.clone(),
+            access: access.clone(),
+            duration: duration.clone(),
+        }),
         AppEvent::ContextManagement { turn } => {
             Some(OutboundEvent::ContextManagement { turn: *turn })
         }
@@ -2449,6 +2584,21 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_revision: None,
             replacement_for_user_turn_index: None,
         }),
+        AppEvent::SessionNote {
+            session_id,
+            note_id,
+            text,
+            attachments,
+            source,
+            ts,
+        } => Some(OutboundEvent::SessionNote {
+            session_id: session_id.clone(),
+            note_id: note_id.clone(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+            source: source.clone(),
+            ts: *ts,
+        }),
         AppEvent::UserMessageRewind {
             session_id,
             user_turn_index,
@@ -2701,6 +2851,8 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::ApprovalResolved { .. }
             | AppEvent::HumanQuestionDetected { .. }
             | AppEvent::HumanResponseSent
+            | AppEvent::SessionNote { .. }
+            | AppEvent::UserNotification { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::DisplayResize { .. }
             | AppEvent::DisplayTaken { .. }
@@ -2861,6 +3013,40 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SubAgentResult { formatted } => {
             log.sub_agent_result(formatted);
+        }
+        AppEvent::SessionNote {
+            session_id,
+            note_id,
+            text,
+            attachments,
+            source,
+            ts,
+        } => {
+            log.session_note(
+                session_id.as_deref(),
+                note_id,
+                text,
+                attachments,
+                source.as_deref(),
+                *ts,
+            );
+        }
+        AppEvent::UserNotification {
+            session_id,
+            id,
+            title,
+            text,
+            urgency,
+            ts,
+        } => {
+            log.user_notification(
+                session_id.as_deref(),
+                id,
+                title.as_deref(),
+                text,
+                *urgency,
+                *ts,
+            );
         }
         AppEvent::RoundComplete {
             round,
@@ -3602,6 +3788,8 @@ mod tests {
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
                 display_target: Some("user_session".to_string()),
                 attachments: vec!["upload:u1".to_string()],
+                worktree: Some(true),
+                worktree_branch: Some("feature-branch".to_string()),
             },
             ControlMsg::StartTask {
                 session_id: None,
@@ -3875,6 +4063,8 @@ mod tests {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                worktree,
+                worktree_branch,
             } => {
                 assert_eq!(task, "fix bug");
                 assert!(claude_model.is_none());
@@ -3895,6 +4085,26 @@ mod tests {
                 assert!(reference_frame_ids.is_empty());
                 assert!(display_target.is_none());
                 assert_eq!(attachments, vec!["upload:u1"]);
+                // Legacy payloads without the worktree fields parse as "off".
+                assert!(worktree.is_none());
+                assert!(worktree_branch.is_none());
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_create_session_worktree_deserialize() {
+        let json = r#"{"action":"create_session","task":"fix bug","worktree":true,"worktree_branch":"fix/login"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::CreateSession {
+                worktree,
+                worktree_branch,
+                ..
+            } => {
+                assert_eq!(worktree, Some(true));
+                assert_eq!(worktree_branch.as_deref(), Some("fix/login"));
             }
             _ => panic!("expected CreateSession"),
         }
@@ -4465,6 +4675,90 @@ mod tests {
             }
             _ => panic!("expected RevokeUserDisplay"),
         }
+    }
+
+    #[test]
+    fn control_msg_resolve_display_request_deserialize() {
+        // The popup's wire shape: approve with a duration.
+        let json = r#"{"action":"resolve_display_request","session_id":"sess-1","id":7,"decision":"approve","duration":"15m"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 7);
+                assert_eq!(decision, "approve");
+                assert_eq!(duration.as_deref(), Some("15m"));
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // Deny needs no duration; session_id may be absent ("main").
+        let json = r#"{"action":"resolve_display_request","id":3,"decision":"deny"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(id, 3);
+                assert_eq!(decision, "deny");
+                assert_eq!(duration, None);
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // `id` and `decision` are required: a resolution cannot default
+        // its target or its verdict.
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","decision":"approve"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","id":3}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn display_request_events_map_to_outbound_wire_shapes() {
+        let raised = app_event_to_outbound(&AppEvent::DisplayRequestRaised {
+            session_id: Some("sess-1".to_string()),
+            id: 7,
+            access: "view".to_string(),
+            reason: "watch the migration".to_string(),
+            expires_unix_ms: 123_456,
+        })
+        .expect("raised maps to an outbound event");
+        let wire = serde_json::to_value(&raised).unwrap();
+        assert_eq!(wire["event"], "display_request_raised");
+        assert_eq!(wire["session_id"], "sess-1");
+        assert_eq!(wire["id"], 7);
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["reason"], "watch the migration");
+        assert_eq!(wire["expires_unix_ms"], 123_456);
+
+        let resolved = app_event_to_outbound(&AppEvent::DisplayRequestResolved {
+            session_id: None,
+            id: 7,
+            outcome: "approved".to_string(),
+            access: Some("view".to_string()),
+            duration: Some("this_session".to_string()),
+        })
+        .expect("resolved maps to an outbound event");
+        let wire = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(wire["event"], "display_request_resolved");
+        assert_eq!(wire["outcome"], "approved");
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["duration"], "this_session");
+        assert!(wire.get("session_id").is_none());
     }
 
     #[test]

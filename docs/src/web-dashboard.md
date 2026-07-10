@@ -7,9 +7,8 @@ mobile-responsive). Since the design-overhaul flip the default look is the
 **v2 chrome** (Iris accent: left navigation rail, oversight bar, ⌘K command
 palette, bottom composer). Dark is the default theme; a **light theme** ships
 alongside it (Settings → Appearance, or the ⌘K theme toggle — browser-scoped,
-persisted per browser). The previous Catppuccin Mocha generation remains
-reachable at `?ui=v1` as an escape hatch during the soak period, after which
-it will be deleted. The SPA is served as one
+persisted per browser). The previous Catppuccin Mocha generation and its
+`?ui=v1` escape hatch were deleted after the soak period. The SPA is served as one
 self-contained file, `static/app.html` — a **generated artifact**: `build.rs`
 assembles it from the ordered fragments in `static/app/` (`manifest.txt` fixes
 the order) via `crates/app-html-assembler`, and CI rejects any drift between
@@ -95,8 +94,7 @@ top carries the phase pill, stop control, context meter, transport state, the
 Activity Focus/Grid layout toggle, and the ⌘K command palette; the composer —
 the global task input — docks at the bottom and reaches the daemon from any
 destination. New events arriving while you are elsewhere raise a badge on the
-rail item. (Under `?ui=v1` the same panes hang off the classic top tab bar;
-Vault lives inside Access there.)
+rail item.
 
 The section headings below keep the internal pane names (`Video` is the Live
 display destination, `Stats` is Usage) — ids, routes, and deep links are
@@ -202,6 +200,20 @@ Five subtabs:
   the old approve-all — it lifts every gate, and is labeled for what it is.
   Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
   input sends a message after a round completes.
+
+  Pending requests also escalate beyond the open tab (the **attention
+  center**, `static/app/57-attention-notifications.js`): every pending
+  approval/question across sessions counts into a `(N)` document-title
+  prefix and favicon badge (on by default; toggle under Settings →
+  Appearance → Notifications), and — strictly opt-in from the same
+  card, which is the only place notification permission is ever
+  requested — a browser Notification fires when a request arrives while
+  the tab is hidden; clicking it focuses the tab and the owning session.
+  The badge clears as requests resolve and drops on stream disconnect
+  (the reconnect bootstrap rebuilds what still stands). For closed tabs
+  entirely, the daemon nudges the Connect rendezvous and opted-in
+  browsers get a Web Push (see `self-hosted-rendezvous.md` —
+  Notifications; payloads never carry work content).
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
@@ -352,8 +364,7 @@ concepts separate (see
   to the live presence (voice) model only.
 
 Both modes revoke from the same card (**Stop viewing** / **Revoke
-access**), the v1 status-bar chip (`off`/`view`/`on`) stays a pure
-toggle with its historical agent-share semantics, and
+access**), and
 `GET /api/displays` annotates entries with `capture_active` +
 `agent_visible` so pickers and chips can render live state.
 
@@ -599,9 +610,9 @@ Unified administration for how dashboards and daemons reach each other:
   identities, and every peer-profile grant in both directions.
 - **Diagnostics** owns dashboard route health, including hosted Connect,
   local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
-  self-tests. The status-bar access dot links here, and its prefix names the
-  actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is never
-  ambiguous.
+  self-tests. The oversight bar's access dot links here, and its prefix names
+  the actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is
+  never ambiguous.
 - **Advanced** is the poweruser den: the role catalog and the exact
   policy×permission matrix, every grant with policy/transport/reason detail,
   the raw model inspector (principals, grants, policies, permissions, IAM
@@ -1710,9 +1721,10 @@ include `offset`/`length`; the response carries `range_start`, `range_end`,
 tab uses repeated ranged reads to download staged uploads back to the browser.
 This is a bounded current-session attachment primitive, not yet a general
 daemon-filesystem upload/download adapter.
-Worktree cached inventory reads, explicit scans, and guarded removals use
-`api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
-the same no-replay fallback rule as other writes.
+Worktree cached inventory reads, explicit scans, guarded removals, and the
+session finish card's merge use `api_worktrees`, `api_worktrees_scan`,
+`api_worktrees_remove`, and `api_worktrees_merge`; the writes use the same
+no-replay fallback rule as other writes.
 The filesystem picker's path checks, directory listings, and mkdir operation use
 `api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
 fallback rule as other writes.
@@ -1785,7 +1797,7 @@ cross-refresh resume tokens, and any remaining non-allowlisted control
 mutations should move only after resumable stream/file-transfer semantics and
 per-action no-replay rules are settled.
 
-The dashboard status bar now exposes the selected control transport. Direct
+The oversight bar exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
 shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
 TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
@@ -1949,7 +1961,7 @@ family (sub-routes elided where the family is uniform):
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
-| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove}` | Agent worktree inventory and lifecycle |
+| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,merge}` | Agent worktree inventory and lifecycle (merge = session-linked worktree finish card) |
 | `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
 
 ### Declared API routes
@@ -1983,7 +1995,9 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
 | POST | `/api/session/current/uploads` | SessionManage | own origin | streaming | Upload a file attachment (raw streamed body; name/destination in query) |
-| GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | List uploads, or fetch one (subpath {id}/raw) |
+| GET | `/api/session/current/uploads` | SessionManage | own origin | none | List uploads for the current session |
+| GET | `/api/session/current/uploads/{id}/raw` | SessionManage | own origin | none | Fetch one upload's raw bytes (inline Content-Disposition) |
+| GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | Unknown upload subpaths (handler-owned JSON 404) |
 | DELETE | `/api/session/current/uploads/{upload_id}` | SessionManage | own origin | none | Delete one upload (file + sidecar) |
 | DELETE | `/api/session/{id}` | SessionManage | own origin | none | Delete a session's data |
 | DELETE | `/api/session/{id}/{target}` | SessionManage | own origin | none | Delete one data kind for a session (recordings, frames, …) |
@@ -1993,13 +2007,20 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
-| GET | `/api/session[/…]` | SessionInspect | own origin | none | Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames |
+| GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |
+| GET | `/api/session/{id}/report` | SessionInspect | own origin | none | Session report zip (text artifacts; id=current targets the live session) |
+| GET | `/api/session/{id}/recordings` | SessionInspect | own origin | none | List a session's recording streams |
+| GET | `/api/session/{id}/recordings/{stream}/{asset}` | SessionInspect | own origin | none | Recording assets: segments listing, playlist.m3u8, or a segment file |
+| GET | `/api/session/{id}/frames/{filename}` | SessionInspect | own origin | none | Session frame image asset |
+| GET | `/api/session/{id}` | SessionInspect | own origin | none | Session detail (paged replay entries; limit/before/source) |
+| GET | `/api/session[/…]` | SessionInspect | own origin | none | Session artifact sub-routes: recordings (+segments/playlist), report zip, frames |
 | POST | `/api/session[/…]` | SessionManage | own origin | none | Session detail sub-routes (POST fallback callers) |
 | GET | `/api/managed-context/anchors` | SessionInspect | own origin | none | Managed-context anchor catalog |
 | GET | `/api/managed-context/records` | SessionInspect | own origin | none | Managed-context record index |
 | GET | `/api/managed-context/fission` | SessionInspect | own origin | none | Managed-context fission state |
 | POST | `/api/worktrees/inspect` | SessionInspect | own origin | bounded | Inspect one worktree (branch, ahead/behind, dirty state) |
 | POST | `/api/worktrees/remove` | SessionManage | own origin | bounded | Remove a worktree from the inventory |
+| POST | `/api/worktrees/merge` | SessionManage | own origin | bounded | Merge a session's linked worktree branch into its base checkout, then remove the checkout |
 | POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
 | GET | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |

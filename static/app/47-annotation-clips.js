@@ -501,24 +501,18 @@ function humanBytes(n) {
   return n + ' B';
 }
 
+// "Can staged uploads ride the TUNNEL upload-frame / byte-stream lane?"
+// Derived through the facade (F1b): reason 'connected' folds the live
+// tunnel, the wire-lane feature (upload_frames / byte_streams via the
+// descriptor's lane), and the per-method availability boolean into one
+// answer. Deliberately not `.ok` — `http-only` means the direct HTTP twin
+// could serve it, which these tunnel-lane gates must not conflate.
 function dashboardUploadRpcAvailable() {
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
-    dashboardControlTransport?.lastStatus?.api_session_current_upload_available === true
-  );
+  return daemonApi.availability('api_session_current_upload').reason === 'connected';
 }
 
 function dashboardUploadRawRpcAvailable() {
-  return Boolean(
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.byte_streams_available === true &&
-    dashboardControlTransport?.lastStatus?.api_session_current_upload_raw_available === true
-  );
+  return daemonApi.availability('api_session_current_upload_raw').reason === 'connected';
 }
 
 async function uploadImagePreviewUrl(descriptor) {

@@ -154,13 +154,14 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   violation.
 - **Derive, don't mirror.** Daemon truth a frontend needs — permission
   catalogs, feature lists, availability booleans, option vocabularies — is
-  declared once and derived everywhere else (exemplar: `CONTROL_METHODS` in
-  `dashboard_control/mod.rs` drives the authorizer, the `features` list, and the
-  per-method availability booleans). When a static frontend fallback copy is
-  unavoidable (app.html's IAM catalog, the peer-profile picker), a
-  daemon-side parity test pins its ID sets to the source, so a catalog
-  change that forgets the mirror fails the suite instead of shipping as
-  drift.
+  declared once and derived everywhere else (exemplar: the tunnel method
+  table — `gateway_routes::ROUTES` tunnel columns ∪ the `CONTROL_METHODS`
+  residue in `dashboard_control/mod.rs` — drives the authorizer, the
+  `features` list, and the per-method availability booleans). When a static
+  frontend fallback copy is unavoidable (app.html's IAM catalog, the
+  peer-profile picker), a daemon-side parity test pins its ID sets to the
+  source, so a catalog change that forgets the mirror fails the suite
+  instead of shipping as drift.
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 - **Gateway API routes are declared once** in `src/bin/caller/gateway_routes.rs`
   (`ROUTES`): dispatch, the pre-dispatch IAM classification, the OPTIONS
@@ -169,17 +170,24 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   Never add an HTTP route by editing `web_gateway/http_dispatch.rs`'s dispatch chain —
   add a table row plus a `RouteHandlerId` match arm; the row also declares the
   request-body policy (dispatch reads and caps the body before the handler
-  runs). Unit tests enforce the table invariants, pin the docs chapter, and
-  pin every route-specific body cap.
+  runs). A route's dashboard-control (datachannel) twin is declared on the
+  same row: tunnel-twinned methods get the row's `tunnel:` column
+  (`TunnelSpec`) — never a `CONTROL_METHODS` entry; that table is the residue
+  for tunnel-only methods, and the tunnel derives each twinned method's IAM
+  operation from its row. Unit tests enforce the table invariants, pin the
+  docs chapter, pin every route-specific body cap, and freeze the tunnel
+  method partition (`tunnel_method_partition_is_pinned`).
 - `static/app.html` is **generated** from the `static/app/` fragments (order =
   `static/app/manifest.txt`; assembled by `build.rs` via
   `crates/app-html-assembler`; CI enforces the match). Edit the fragments,
   never the artifact. Merge conflicts: resolve them in the fragments, run
   `cargo run -p app-html-assembler`, then `git add static/app.html` — never
-  hand-reconcile the generated file. The dashboard ships the **ui-v2 chrome
-  by default** (design overhaul: `ui2-*` fragments + the `16-styles-v2-tokens`
-  palette, all scoped under `html.ui-v2`); `?ui=v1` is the soak-period escape
-  hatch until the v1 chrome/Catppuccin generation is deleted.
+  hand-reconcile the generated file. The dashboard ships the **ui-v2 chrome**
+  (design overhaul: `ui2-*` fragments + the `16-styles-v2-tokens` palette).
+  The v1 chrome, its Catppuccin palette, and the `?ui=v1` escape hatch were
+  deleted post-soak; `html.ui-v2` remains as the permanent scoping namespace,
+  and the tokens file's alias layer defines the Catppuccin-era var names the
+  base stylesheets still consume.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`

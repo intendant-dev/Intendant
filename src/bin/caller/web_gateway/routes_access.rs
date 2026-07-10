@@ -442,6 +442,9 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "ct_checked_unix_ms": fleet_cert.ct_checked_unix_ms,
         "ct_last_error": fleet_cert.ct_last_error,
     });
+    // Hosted-bundle code-transparency tripwire (hosted_verify.rs): does
+    // the rendezvous serve the dashboard code its public log commits to.
+    let hosted_bundle = crate::hosted_verify::status_snapshot();
     serde_json::json!({
         "schema_version": 1,
         "configured": status.configured,
@@ -462,6 +465,10 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "bootstrap": status.bootstrap,
         "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
         "fleet_cert": fleet_cert_value,
+        "hosted_bundle_state": hosted_bundle.state,
+        "hosted_bundle_checked_unix_ms": hosted_bundle.checked_unix_ms,
+        "hosted_bundle_last_error": hosted_bundle.last_error,
+        "hosted_bundle_mismatches": hosted_bundle.mismatches,
     })
 }
 
@@ -520,14 +527,26 @@ pub(crate) async fn handle_access_connect_claim_code(
     finalize_http_stream(&mut stream).await;
 }
 
-/// Enable/disable the Connect client: persist `[connect]` to
-/// intendant.toml, then apply the effective config to the running client
+/// Enable/disable the Connect client: persist `[connect]` to the
+/// daemon's Connect store — the project's intendant.toml when rooted,
+/// the daemon-scoped connect.toml when projectless (the bundled app's
+/// normal shape) — then apply the effective config to the running client
 /// (start/stop live). The environment override always wins over the
 /// file, so the response reports both what was written and what is
 /// actually in effect.
 pub(crate) fn access_connect_config_response_value(
     params: serde_json::Value,
     project_root: Option<&std::path::Path>,
+) -> Result<serde_json::Value, String> {
+    access_connect_config_response_value_in(
+        params,
+        &crate::project::ConnectConfigStore::for_project_root(project_root),
+    )
+}
+
+fn access_connect_config_response_value_in(
+    params: serde_json::Value,
+    store: &crate::project::ConnectConfigStore,
 ) -> Result<serde_json::Value, String> {
     let enabled = params
         .get("enabled")
@@ -539,17 +558,13 @@ pub(crate) fn access_connect_config_response_value(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
-    let mut project = crate::project::Project::from_root(root.to_path_buf())
-        .map_err(|e| format!("load project config: {e}"))?;
-    project.config.connect.enabled = enabled;
+    let mut config = store.load()?;
+    config.enabled = enabled;
     if let Some(url) = rendezvous_url {
-        project.config.connect.rendezvous_url = Some(url);
+        config.rendezvous_url = Some(url);
     }
-    project
-        .save_config()
-        .map_err(|e| format!("write intendant.toml: {e}"))?;
-    let effective = project.config.connect.clone().effective_with_env();
+    store.save(&config)?;
+    let effective = config.effective_with_env();
     let running = crate::connect_rendezvous::apply_config(effective.clone())?;
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -660,10 +675,8 @@ pub(crate) async fn handle_access_connect_unclaim(
 pub(crate) async fn access_connect_unclaim_response_value(
     project_root: Option<std::path::PathBuf>,
 ) -> Result<serde_json::Value, String> {
-    let root = project_root.ok_or_else(|| "no project root for this daemon".to_string())?;
-    let project = crate::project::Project::from_root(root)
-        .map_err(|e| format!("load project config: {e}"))?;
-    let mut config = project.config.connect.clone().effective_with_env();
+    let store = crate::project::ConnectConfigStore::for_project_root(project_root.as_deref());
+    let mut config = store.load()?.effective_with_env();
     if config.rendezvous_url.is_none() {
         // Enabled-by-dashboard-then-restarted edge: fall back to whatever
         // rendezvous the running client used.
@@ -2413,6 +2426,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connect_toggle_works_on_a_projectless_daemon_via_the_daemon_store() {
+        // The bundled app's daemon has no project root; the toggle must
+        // round-trip through the daemon-scoped connect.toml instead of
+        // failing with "no project root for this daemon". enabled=false
+        // keeps apply_config on its stop path (no client spawned).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+        let store = crate::project::ConnectConfigStore::DaemonFile(path.clone());
+
+        let value = access_connect_config_response_value_in(
+            serde_json::json!({ "enabled": false }),
+            &store,
+        )
+        .expect("projectless toggle must not require a project root");
+        assert_eq!(value["written_enabled"], serde_json::json!(false));
+        assert_eq!(value["running"], serde_json::json!(false));
+        assert!(path.exists(), "daemon-scoped connect.toml must be written");
+        assert!(!crate::project::load_daemon_connect_config_in(&path)
+            .unwrap()
+            .enabled);
+    }
+
+    #[test]
     fn fleet_origin_gate_normalizes_and_allowlists() {
         assert_eq!(
             normalized_origin("WSS://Daemon.Local:8765").as_deref(),
@@ -2581,6 +2617,110 @@ mod tests {
         assert_eq!(payload["iam"]["load_status"], "loaded");
         assert_eq!(payload["iam"]["managed_principals"], 1);
         assert_eq!(payload["iam"]["managed_grants"], 1);
+    }
+
+    /// FR-3 (design-overhaul QA fleet, Access tab): a manually added
+    /// same-host peer carries the same id as the local daemon — `PeerId`
+    /// is `intendant:<host label>`, so two daemons sharing a hostname
+    /// collide. The dashboard resolves every grant row's target label over
+    /// `targets[]` id-first with FIRST-writer-wins
+    /// (`accessOverviewTargetLabelMap` in static/app/42-usage-terminal.js),
+    /// so the payload contract pinned here is:
+    ///
+    /// 1. the local daemon is present and FIRST in `targets[]`, keeping its
+    ///    label authoritative for the shared id under first-wins;
+    /// 2. the colliding peer row still appears (a real configured peer is
+    ///    never silently dropped), carrying its own label; and
+    /// 3. the current-subject root grant is stamped with the local target
+    ///    id, so it resolves to the local daemon's label.
+    ///
+    /// Before the first-wins fix the peer row overwrote the shared map key
+    /// and every local-daemon grant rendered under the peer's name — the
+    /// audit screenshot showed "Root on qa-peer-b" for a grant on the
+    /// local daemon.
+    #[tokio::test]
+    async fn access_overview_same_host_peer_id_collision_keeps_local_label_authoritative() {
+        use crate::peer::id::{PeerId, PeerKind};
+
+        // Both daemons resolve the same host label, so both cards carry
+        // the same id — the local one via `build_local_agent_card`, the
+        // peer via its fetched card.
+        let shared_id = PeerId::new(PeerKind::Intendant, "qa-host");
+        let host_form_id = shared_id.as_str();
+        let agent_card = serde_json::json!({
+            "id": host_form_id,
+            "label": "This daemon",
+            "capabilities": [],
+        });
+
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        registry
+            .add_peer_with_card(crate::peer::AgentCard {
+                id: shared_id.clone(),
+                label: "qa-peer-b".to_string(),
+                version: "0.0.0".to_string(),
+                git_sha: None,
+                transports: vec![crate::peer::TransportSpec::IntendantWs {
+                    url: "ws://127.0.0.1:9/ws".to_string(),
+                }],
+                capabilities: Vec::new(),
+                auth: crate::peer::AuthRequirements::none(),
+            })
+            .await
+            .expect("register colliding same-host peer");
+
+        let iam_state = crate::access::iam::LoadedIamState {
+            path: std::path::PathBuf::from(crate::access::iam::IAM_STATE_FILE),
+            state: crate::access::iam::LocalIamState::default(),
+            status: crate::access::iam::IamStateStatus::Missing,
+        };
+        let payload = access_overview_response_value_with_identities_and_iam(
+            &agent_card,
+            Some(&registry),
+            &[],
+            &iam_state,
+            None,
+        );
+
+        let targets = payload["targets"].as_array().expect("targets");
+        assert_eq!(targets.len(), 2, "local + colliding peer");
+        assert_eq!(targets[0]["local"], true, "local target must stay first");
+        assert_eq!(targets[0]["id"], host_form_id);
+        assert_eq!(targets[0]["label"], "This daemon");
+        assert_eq!(targets[1]["id"], host_form_id, "collision is representable");
+        assert_eq!(targets[1]["label"], "qa-peer-b");
+
+        let grants = payload["grants"].as_array().expect("grants");
+        let root_grant = grants
+            .iter()
+            .find(|grant| grant["role"] == "root")
+            .expect("current-subject root grant");
+        assert_eq!(root_grant["target_id"], host_form_id);
+
+        // Mirror of the dashboard's target-label resolution
+        // (accessOverviewTargetLabelMap + accessCreateGrantRow): id-first
+        // over id/host_id, first writer wins. Under the payload order
+        // pinned above this resolves the root grant to the local label;
+        // the pre-fix last-writer-wins fill resolved it to "qa-peer-b".
+        let mut labels: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for target in targets {
+            for key in ["id", "host_id"] {
+                if let Some(id) = target[key].as_str().filter(|v| !v.trim().is_empty()) {
+                    labels
+                        .entry(id)
+                        .or_insert_with(|| target["label"].as_str().unwrap_or(id));
+                }
+            }
+        }
+        assert_eq!(
+            labels
+                .get(root_grant["target_id"].as_str().expect("root target id"))
+                .copied(),
+            Some("This daemon"),
+            "local root grant must resolve to the local daemon's label"
+        );
     }
 
     #[test]

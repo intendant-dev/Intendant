@@ -306,7 +306,16 @@ pub(crate) fn cached_limited_session_list_cache(
     SESSION_LIST_LIMITED_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) const SESSION_LIST_RESPONSE_STALE_MAX_SECS: u64 = 15 * 60;
+/// Serve-stale-while-revalidate ceiling for the session-list response
+/// caches. Native-session membership changes no longer ride this bound at
+/// all: the bus-driven invalidator (`spawn_session_list_cache_invalidator`
+/// in `startup/wiring.rs`) drops both cache tiers on session lifecycle
+/// events, so this window only limits staleness for changes the bus can't
+/// see — chiefly EXTERNAL backend session dirs (codex / claude) written by
+/// other processes. Three minutes keeps those reasonably fresh; the hard
+/// TTL (`SESSION_LIST_RESPONSE_CACHE_TTL_SECS`) stays at 30s as the storm
+/// shield for the 2026-07-05 relationship-hydration incident.
+pub(crate) const SESSION_LIST_RESPONSE_STALE_MAX_SECS: u64 = 3 * 60;
 
 pub(crate) fn session_list_refresh_inflight() -> &'static Mutex<HashSet<usize>> {
     static INFLIGHT: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
@@ -681,16 +690,6 @@ pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
         }
     }
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
-}
-
-pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) -> String {
-    if !ids.is_empty() {
-        cached_list_sessions_for_ids(ids)
-    } else if let Some(limit) = limit {
-        cached_list_sessions_with_limit(limit)
-    } else {
-        cached_list_sessions()
-    }
 }
 
 /// Strip session rows down to what the Stats tab folds: usage, costs,
@@ -1563,6 +1562,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut external_source: Option<String> = None;
     let mut canonical_session_id: Option<String> = None;
     let mut capabilities: Option<serde_json::Value> = None;
+    let mut worktree = serde_json::Value::Null;
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = session_activity_mtime_secs(dir);
 
@@ -1598,6 +1598,9 @@ pub(crate) fn intendant_session_list_row_from_dir(
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if let Some(value) = meta.get("worktree").filter(|v| v.is_object()) {
+                worktree = value.clone();
+            }
         }
     }
 
@@ -1956,6 +1959,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
         "total_bytes": total_bytes,
         "cwd": cwd.clone().or_else(|| project_root.clone()),
         "project_root": project_root.clone(),
+        "worktree": worktree,
         "path": dir.to_string_lossy().to_string(),
         "can_delete": true,
         "can_resume": true,
@@ -2067,6 +2071,7 @@ pub(crate) fn intendant_session_skeleton_from_dir(
     let mut project_root: Option<String> = None;
     let mut status = "in_progress".to_string();
     let mut role: Option<String> = None;
+    let mut worktree = serde_json::Value::Null;
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
             task = value_str(&meta, "task");
@@ -2077,6 +2082,9 @@ pub(crate) fn intendant_session_skeleton_from_dir(
                 status = value;
             }
             role = value_str(&meta, "role");
+            if let Some(value) = meta.get("worktree").filter(|v| v.is_object()) {
+                worktree = value.clone();
+            }
         }
     }
     if status != "completed" {
@@ -2121,6 +2129,7 @@ pub(crate) fn intendant_session_skeleton_from_dir(
         "total_bytes": 0,
         "cwd": project_root.clone(),
         "project_root": project_root,
+        "worktree": worktree,
         "path": dir.to_string_lossy().to_string(),
         "can_delete": true,
         "can_resume": true,
@@ -3019,9 +3028,11 @@ mod tests {
             "codex",
             vec!["call_large".to_string()],
         );
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let body = response.split("\r\n\r\n").nth(1).unwrap();
-        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let crate::web_gateway::ApiResponse::Json { status, body, .. } = response else {
+            panic!("agent output must answer on the json lane");
+        };
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body.into_string()).unwrap();
         assert_eq!(json["missing"].as_array().unwrap().len(), 0);
         let stdout = json["outputs"][0]["stdout"].as_str().unwrap();
         assert_eq!(

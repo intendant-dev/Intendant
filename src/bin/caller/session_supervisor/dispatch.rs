@@ -27,7 +27,14 @@ impl SessionSupervisor {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                worktree,
+                worktree_branch,
             } => {
+                let worktree_request = worktree
+                    .unwrap_or(false)
+                    .then(|| SessionWorktreeRequest {
+                        branch: worktree_branch,
+                    });
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
@@ -69,6 +76,7 @@ impl SessionSupervisor {
                                     crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
                                         .to_string(),
                                 ),
+                                worktree_request,
                             )
                             .await;
                             return;
@@ -89,6 +97,7 @@ impl SessionSupervisor {
                         || codex_context_archive.is_some()
                         || codex_service_tier.is_some()
                         || name.is_some()
+                        || worktree_request.is_some()
                     {
                         self.warn(
                             "Slash command dropped new-session metadata; routing to active Codex session",
@@ -118,6 +127,7 @@ impl SessionSupervisor {
                     display_target,
                     attachments,
                     codex_service_tier,
+                    worktree_request,
                 )
                 .await;
             }
@@ -184,6 +194,7 @@ impl SessionSupervisor {
                                     crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
                                         .to_string(),
                                 ),
+                                None,
                             )
                             .await;
                             return;
@@ -218,6 +229,7 @@ impl SessionSupervisor {
                     reference_frame_ids,
                     display_target,
                     attachments,
+                    None,
                     None,
                 )
                 .await;

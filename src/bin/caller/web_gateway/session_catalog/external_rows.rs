@@ -805,6 +805,264 @@ pub(crate) fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serd
         .collect()
 }
 
+// ── Recording/frame asset content core (moved verbatim from
+// dashboard_control/api_media.rs — transport-unification S4b). The
+// RecordingAsset vocabulary is the tunnel twin's asset addressing
+// ("segments" / "playlist.m3u8" / seg files); the HTTP artifact leaves
+// and the tunnel's ranged byte streams resolve through these.
+
+pub(crate) fn recording_stream_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 128
+        && name.trim() == name
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+pub(crate) fn recording_asset_name_is_safe(asset: &str) -> bool {
+    asset == "segments" || asset == "playlist.m3u8" || (recording_segment_filename_is_safe(asset))
+}
+
+pub(crate) fn recording_segment_filename_is_safe(filename: &str) -> bool {
+    filename.starts_with("seg_")
+        && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
+        && filename.len() < 30
+        && !filename.contains("..")
+        && !filename.contains('/')
+        && !filename.contains('\\')
+}
+
+pub(crate) enum RecordingAsset {
+    Bytes {
+        bytes: Vec<u8>,
+        content_type: &'static str,
+        filename: String,
+    },
+    File {
+        path: PathBuf,
+        content_type: &'static str,
+        filename: String,
+    },
+}
+
+pub(crate) fn resolve_session_recording_asset(
+    session_dir: Option<PathBuf>,
+    stream_name: &str,
+    asset: &str,
+) -> Result<RecordingAsset, (u16, serde_json::Value)> {
+    let stream_dir = session_dir
+        .as_ref()
+        .map(|dir| dir.join("recordings").join(stream_name));
+    let segments = stream_dir
+        .as_ref()
+        .map(|dir| crate::recording::parse_segment_csv_pub(&dir.join("segments.csv"), dir))
+        .unwrap_or_default();
+    resolve_recording_asset_from_dir_pair(stream_dir, None, segments, asset)
+}
+
+pub(crate) fn resolve_recording_asset_from_dir_pair(
+    primary_dir: Option<PathBuf>,
+    fallback_dir: Option<PathBuf>,
+    segments: Vec<crate::recording::SegmentInfo>,
+    asset: &str,
+) -> Result<RecordingAsset, (u16, serde_json::Value)> {
+    if asset == "segments" {
+        let seg_json: Vec<serde_json::Value> = segments
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "filename": s.filename,
+                    "start_secs": s.start_secs,
+                    "end_secs": s.end_secs,
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&seg_json).unwrap_or_else(|_| b"[]".to_vec());
+        return Ok(RecordingAsset::Bytes {
+            bytes,
+            content_type: "application/json",
+            filename: "segments.json".to_string(),
+        });
+    }
+    if asset == "playlist.m3u8" {
+        return Ok(RecordingAsset::Bytes {
+            bytes: crate::web_gateway::recording_playlist_m3u8(&segments).into_bytes(),
+            content_type: "application/vnd.apple.mpegurl",
+            filename: "playlist.m3u8".to_string(),
+        });
+    }
+    if !recording_segment_filename_is_safe(asset) {
+        return Err((
+            400,
+            serde_json::json!({ "ok": false, "error": "invalid recording asset" }),
+        ));
+    }
+    let path = primary_dir
+        .as_ref()
+        .map(|dir| dir.join(asset))
+        .filter(|path| path.exists())
+        .or_else(|| {
+            fallback_dir
+                .as_ref()
+                .map(|dir| dir.join(asset))
+                .filter(|path| path.exists())
+        });
+    let Some(path) = path else {
+        return Err((
+            404,
+            serde_json::json!({ "ok": false, "error": "recording asset not found" }),
+        ));
+    };
+    let content_type = if asset.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "video/mp4"
+    };
+    Ok(RecordingAsset::File {
+        path,
+        content_type,
+        filename: asset.to_string(),
+    })
+}
+
+pub(crate) fn read_recording_asset_bytes_range(
+    bytes: Vec<u8>,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
+    let total_size = bytes.len() as u64;
+    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
+    let start = usize::try_from(start).map_err(|_| {
+        (
+            413,
+            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
+        )
+    })?;
+    Ok((bytes[start..start + transfer_len].to_vec(), total_size, end))
+}
+
+pub(crate) fn read_recording_asset_file_range(
+    path: &std::path::Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("stat recording asset: {e}") }),
+        )
+    })?;
+    let total_size = metadata.len();
+    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("open recording asset: {e}") }),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("seek recording asset: {e}") }),
+        )
+    })?;
+    let mut bytes = vec![0u8; transfer_len];
+    file.read_exact(&mut bytes).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("read recording asset: {e}") }),
+        )
+    })?;
+    Ok((bytes, total_size, end))
+}
+
+pub(crate) fn recording_asset_range(
+    total_size: u64,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
+    if offset > total_size {
+        return Err((
+            416,
+            serde_json::json!({
+                "ok": false,
+                "error": "range start beyond recording asset size",
+                "total_size": total_size,
+            }),
+        ));
+    }
+    let available = total_size.saturating_sub(offset);
+    let requested = length.unwrap_or(available).min(available);
+    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
+        return Err((
+            413,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "range too large: {} bytes (cap is {})",
+                    requested,
+                    crate::web_gateway::UPLOAD_MAX_BYTES
+                ),
+            }),
+        ));
+    }
+    let transfer_len = usize::try_from(requested).map_err(|_| {
+        (
+            413,
+            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
+        )
+    })?;
+    Ok((offset, transfer_len, offset.saturating_add(requested)))
+}
+
+pub(crate) fn session_frame_filename_is_safe(filename: &str) -> bool {
+    (filename.ends_with(".jpg") || filename.ends_with(".png"))
+        && filename.len() < 80
+        && !filename.is_empty()
+        && filename.trim() == filename
+        && !filename.contains("..")
+        && !filename.contains('/')
+        && !filename.contains('\\')
+}
+
+pub(crate) fn read_frame_asset_file_range(
+    path: &std::path::Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("stat session frame: {e}") }),
+        )
+    })?;
+    let total_size = metadata.len();
+    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("open session frame: {e}") }),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("seek session frame: {e}") }),
+        )
+    })?;
+    let mut bytes = vec![0u8; transfer_len];
+    file.read_exact(&mut bytes).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("read session frame: {e}") }),
+        )
+    })?;
+    Ok((bytes, total_size, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

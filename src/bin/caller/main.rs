@@ -3,6 +3,7 @@ mod agent_runner;
 mod app_state_pricing;
 mod approval;
 mod atspi_read;
+mod attention_nudge;
 mod audio_routing;
 pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
@@ -23,6 +24,7 @@ mod daemon_log_tee;
 mod dashboard_control;
 mod debug;
 mod diagnostics;
+mod display_requests;
 pub(crate) use intendant_display as display;
 pub(crate) use intendant_core::error;
 mod event;
@@ -36,6 +38,7 @@ pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
 mod global_store;
+mod hosted_verify;
 pub(crate) use intendant_core::knowledge;
 mod lineage_ledger;
 mod linux_display_env;
@@ -76,6 +79,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
+mod vault_deposits;
 mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
@@ -346,6 +350,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
     println!("    service               Install, remove, inspect, or run the boot service");
@@ -3156,6 +3161,16 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
+    // Intercept `intendant hosted-verify` — the out-of-band code-transparency
+    // check against a rendezvous (docs/src/self-hosted-rendezvous.md). Like
+    // `org`, a local path with no project or provider setup: deliberately
+    // runnable from any machine, since page JS can never honestly
+    // self-verify the origin that serves it.
+    if env::args().nth(1).as_deref() == Some("hosted-verify") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(hosted_verify::run_cli(argv).await);
+    }
+
     // Intercept `intendant service <action>` — install/remove/inspect the
     // boot service for this binary (native supervisor per platform:
     // systemd / launchd / Task Scheduler / cron @reboot). Local path, no
@@ -3169,6 +3184,10 @@ async fn main() -> Result<(), CallerError> {
     // Intercept `intendant access <action>` before the main runtime setup.
     // This is a local certificate/enrollment path with no project, no .env,
     // and no provider selection.
+    if env::args().nth(1).as_deref() == Some("vault") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(vault_deposits::run_vault_cli(argv).await);
+    }
     if env::args().nth(1).as_deref() == Some("access") {
         #[cfg(not(target_os = "windows"))]
         {

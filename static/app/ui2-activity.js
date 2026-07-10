@@ -287,7 +287,7 @@ function ui2RailTick(force) {
   ui2RailSetRow('ui2-rail-changes', badgeShown ? `${badgeShown.trim()} — view diff` : 'none yet', null, null);
 }
 
-if (ui2Enabled()) {
+{
   const wire = () => {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();

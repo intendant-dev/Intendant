@@ -150,6 +150,8 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
+                    | AppEvent::SessionNote { .. }
+                    | AppEvent::UserNotification { .. }
                     | AppEvent::UserMessageRewind { .. }
                     | AppEvent::UserMessageEditStatus { .. }
                     | AppEvent::UserMessageLog { .. }
@@ -166,6 +168,8 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
                     | AppEvent::SharedView { .. }
+                    | AppEvent::DisplayRequestRaised { .. }
+                    | AppEvent::DisplayRequestResolved { .. }
                     | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..

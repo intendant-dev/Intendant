@@ -401,6 +401,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::ReleaseDisplay { .. }
         | ControlMsg::GrantUserDisplay { .. }
         | ControlMsg::RevokeUserDisplay { .. }
+        // Resolving a user-display request mints the same grant the
+        // direct GrantUserDisplay path does — identical gate.
+        | ControlMsg::ResolveDisplayRequest { .. }
         | ControlMsg::CreateVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. } => PeerOperation::DisplayInput,
         ControlMsg::Input { .. }

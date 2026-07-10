@@ -1418,8 +1418,22 @@ impl AppState {
                 continue;
             }
 
-            // All other entries are `OutboundEvent` JSON — run the live path.
-            cmds.extend(self.handle_event(entry));
+            // All other entries are `OutboundEvent` JSON — run the live path,
+            // but strip `SetPhase`: replay is history and must not drive the
+            // live oversight phase pill. A tail-replayed `turn_started` for a
+            // session that has since finished otherwise parks the pill on
+            // "Thinking…" indefinitely — a supervised session's own log has
+            // no terminal phase row to supersede it (round_complete /
+            // session_ended are bus-written to the daemon log only). Standing
+            // phases still reach the pill through the bootstrap state-line
+            // frames (session_started / approval_required / user_question
+            // arrive as live frames outside the replay bundle) and the next
+            // live event; per-window phases already ignore replayed status
+            // the same way (`update_status_bar` gate in
+            // 37-uicommand-changes-control.js).
+            let mut event_cmds = self.handle_event(entry);
+            event_cmds.retain(|cmd| !matches!(cmd, UiCommand::SetPhase { .. }));
+            cmds.extend(event_cmds);
         }
 
         cmds
@@ -4476,6 +4490,54 @@ mod tests {
             .filter(|c| matches!(c, UiCommand::AddLogEntry { .. }))
             .collect();
         assert_eq!(visible_entries.len(), 2);
+    }
+
+    #[test]
+    fn handle_log_replay_never_emits_set_phase() {
+        // A fresh dashboard bootstrap replays a tail of the shared session
+        // log. A supervised session's own log carries no terminal phase row
+        // (round_complete / session_ended are bus-written to the daemon log
+        // only), so a replayed `turn_started` for a session that has since
+        // finished used to park the oversight pill on "Thinking…" forever.
+        // Replay is history: it must never drive the live phase pill.
+        let mut s = AppState::new();
+        let entries = vec![
+            json!({"event": "replay_start", "provider": "mock", "model": "mock-1", "autonomy": "Medium"}),
+            json!({"event": "session_started", "session_id": "sess-x", "task": "probe", "ts": "10:00:00"}),
+            json!({"event": "turn_started", "turn": 1, "budget_pct": 5.0, "session_id": "sess-x", "ts": "10:00:01"}),
+            json!({"event": "model_response", "turn": 1, "summary": "done here", "source": "worker", "ts": "10:00:02"}),
+            json!({"event": "ask_human", "question": "parked?", "ts": "10:00:03"}),
+        ];
+        let cmds = s.handle_log_replay(&entries);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { .. })),
+            "replayed entries must not emit SetPhase: {:?}",
+            cmds
+        );
+        // History still renders and the status bar still seeds.
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. } if content == "Turn 1 started"
+        )));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateStatusBar { turn: Some(1), .. })));
+
+        // The live path is untouched: the same event outside a replay batch
+        // (e.g. the bootstrap state-line user_question rehydration, or any
+        // post-bootstrap broadcast) still drives the pill.
+        let live = s.handle_event(
+            &json!({"event": "user_question", "id": 7, "questions": [{"question": "parked?"}], "session_id": "sess-x"}),
+        );
+        assert!(live
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "waiting")));
+        let live = s.handle_event(
+            &json!({"event": "turn_started", "turn": 2, "budget_pct": 6.0, "session_id": "sess-x"}),
+        );
+        assert!(live
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
     }
 
     #[test]

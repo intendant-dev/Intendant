@@ -140,6 +140,8 @@ pub(crate) async fn run_mcp_mode(
     mcp_app_state.codex_managed_context =
         project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
+    // Matches the project root the gateway above serves uploads from.
+    mcp_app_state.project_root = Some(project.root.clone());
     mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
     mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
     mcp_app_state.session_id = session_log
@@ -154,6 +156,11 @@ pub(crate) async fn run_mcp_mode(
         .map(|gateway| gateway.peer_registry.clone());
     mcp_app_state.peer_registry = mcp_peer_registry.clone();
     mcp_app_state.screenshot_dir = Some(log_dir.join("screenshots"));
+    // The stdio MCP client is itself an answerable frontend (it receives
+    // UserQuestion events and can send answer_question), and a dashboard
+    // can attach through the optional gateway — asks block, never
+    // auto-answer, in this shape.
+    mcp_app_state.interactive_frontends = true;
     let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
 
     // Build a launcher closure that can spawn the agent loop on demand.

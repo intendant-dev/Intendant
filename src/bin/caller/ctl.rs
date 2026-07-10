@@ -60,7 +60,10 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "shared" | "shared-view" => run_shared(&client, &config, &command[1..]).await?,
         "approval" | "approvals" => run_approval(&client, &config, &command[1..]).await?,
         "input" => run_input(&client, &config, &command[1..]).await?,
+        "ask" => run_ask(&client, &config, &command[1..]).await?,
+        "notify" => run_notify(&client, &config, &command[1..]).await?,
         "settings" | "set" => run_settings(&client, &config, &command[1..]).await?,
+        "session" | "sessions" => run_session(&client, &config, &command[1..]).await?,
         "task" => run_task(&client, &config, &command[1..]).await?,
         "controller" => run_controller(&client, &config, &command[1..]).await?,
         "context" => run_context(&client, &config, &command[1..]).await?,
@@ -701,6 +704,37 @@ async fn run_display(
                 call_tool(client, config, "revoke_user_display", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "request" | "request-user" | "request_user" | "request_user_display" => {
+            ensure_help(&raw[1..], help_display_request)?;
+            let args = parse_command_args(
+                &raw[1..],
+                &["--reason", "--access", "--wait", "--session"],
+                &[],
+            )?;
+            let reason = args
+                .one("--reason")
+                .or_else(|| args.positional.first().map(String::as_str))
+                .ok_or_else(|| {
+                    "display request requires --reason \"why you need the display\"".to_string()
+                })?;
+            let mut map = Map::new();
+            map.insert("reason".to_string(), Value::String(reason.to_string()));
+            insert_string(&mut map, "access", args.one("--access"));
+            if let Some(wait) = args.one("--wait") {
+                let secs: u64 = wait
+                    .parse()
+                    .map_err(|_| format!("--wait must be a number of seconds, got '{wait}'"))?;
+                map.insert("wait_seconds".to_string(), Value::from(secs));
+            }
+            insert_string(
+                &mut map,
+                "session_id",
+                args.one("--session").or(config.session_id.as_deref()),
+            );
+            let response =
+                call_tool(client, config, "request_user_display", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         other => return Err(format!("unknown display command '{other}'")),
     }
     Ok(())
@@ -1099,6 +1133,287 @@ async fn run_settings(
         other => return Err(format!("unknown settings command '{other}'")),
     }
     Ok(())
+}
+
+async fn run_session(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_session();
+        return Ok(());
+    }
+    match raw[0].as_str() {
+        "note" => {
+            if is_help(&raw[1..]) {
+                help_session_note();
+                return Ok(());
+            }
+            let response = call_tool(
+                client,
+                config,
+                "post_session_note",
+                session_note_args(&raw[1..])?,
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        other => return Err(format!("unknown session command '{other}'")),
+    }
+    Ok(())
+}
+
+/// Build `post_session_note` arguments from `session note` flags. Reads
+/// each `--image` file locally (so the caller's own sandbox governs what
+/// is readable) and base64-encodes it into the tool arguments; the daemon
+/// deliberately accepts no file paths from MCP callers.
+fn session_note_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--image", "--source", "--session"], &[])?;
+    let text = if args.positional.is_empty() {
+        return Err("session note requires note text".to_string());
+    } else {
+        args.positional.join(" ")
+    };
+    if text.len() > crate::mcp::SESSION_NOTE_MAX_TEXT_BYTES {
+        return Err(format!(
+            "note text is {} bytes; max {} KB",
+            text.len(),
+            crate::mcp::SESSION_NOTE_MAX_TEXT_BYTES / 1024
+        ));
+    }
+    let mut map = Map::new();
+    map.insert("text".to_string(), Value::String(text));
+    insert_string(&mut map, "source", args.one("--source"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    let image_paths: Vec<&str> = args.all("--image").collect();
+    if image_paths.len() > crate::mcp::SESSION_NOTE_MAX_IMAGES {
+        return Err(format!(
+            "too many images: {} (max {} per note)",
+            image_paths.len(),
+            crate::mcp::SESSION_NOTE_MAX_IMAGES
+        ));
+    }
+    let mut images = Vec::new();
+    let mut total_bytes = 0usize;
+    for path in image_paths {
+        let (media_type, name, data, size) = read_session_note_image(Path::new(path))?;
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > crate::mcp::SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES {
+            return Err(format!(
+                "total image size exceeds the {} MB per-note cap",
+                crate::mcp::SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+        images.push(json_object([
+            ("media_type", Value::String(media_type.to_string())),
+            ("data", Value::String(data)),
+            ("name", Value::String(name)),
+        ]));
+    }
+    if !images.is_empty() {
+        map.insert("images".to_string(), Value::Array(images));
+    }
+    Ok(Value::Object(map))
+}
+
+/// Read one `--image` file: infer the MIME type from the extension,
+/// enforce the per-image cap, and return (mime, basename, base64, size).
+fn read_session_note_image(path: &Path) -> Result<(&'static str, String, String, usize), String> {
+    let media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        other => {
+            return Err(format!(
+                "unsupported image extension {:?} for {}; supported: png, jpg, jpeg, gif, webp, bmp",
+                other.unwrap_or(""),
+                path.display()
+            ));
+        }
+    };
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    if bytes.len() > crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES {
+        return Err(format!(
+            "{} is {} bytes; max {} MB per image",
+            path.display(),
+            bytes.len(),
+            crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image".to_string());
+    let size = bytes.len();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok((media_type, name, data, size))
+}
+
+/// `intendant ctl ask` — raise a structured question on the dashboard
+/// question rail and block until the user answers (or the wait expires).
+/// Prints the answer to stdout; exits nonzero on timeout so scripts can
+/// branch on "nobody answered".
+async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_ask();
+        return Ok(());
+    }
+    let arguments = ask_args(raw)?;
+    let response = call_tool(client, config, "ask_user", arguments).await?;
+    if config.raw {
+        return print_json(&response);
+    }
+    if let Some(error) = response.get("error") {
+        print_json(error)?;
+        return Err("MCP tool call failed".to_string());
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = single_text_content(result)
+        .ok_or_else(|| format!("unexpected ask_user result shape: {result}"))?;
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("{text}");
+        return Err("tool returned isError=true".to_string());
+    }
+    let outcome: Value = serde_json::from_str(text)
+        .map_err(|e| format!("unexpected ask_user result payload: {e}: {text}"))?;
+    if config.json {
+        print_json(&outcome)?;
+    } else {
+        // `answer` carries the user's choice(s) when answered, and the
+        // best-judgment guidance on pass/dismissed/auto_answered.
+        let answer = outcome
+            .get("answer")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        println!("{answer}");
+    }
+    match outcome.get("status").and_then(Value::as_str) {
+        Some("timeout") => Err("timed out waiting for an answer".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Build `ask_user` arguments from `ask` flags. Options arrive as
+/// repeatable `--option "Label"` / `--option "Label:what it means"`.
+fn ask_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(
+        raw,
+        &["--option", "--header", "--wait", "--session"],
+        &["--multi", "--free-text"],
+    )?;
+    if args.positional.is_empty() {
+        return Err("ask requires question text".to_string());
+    }
+    let question = args.positional.join(" ");
+    let options: Vec<&str> = args.all("--option").collect();
+    if options.len() > crate::mcp::ASK_USER_MAX_OPTIONS {
+        return Err(format!(
+            "too many options: {} (max {}; omit --option for free-text only)",
+            options.len(),
+            crate::mcp::ASK_USER_MAX_OPTIONS
+        ));
+    }
+    // `--free-text` documents intent; typed answers are always accepted by
+    // the rail, options or not.
+    let _ = args.has("--free-text");
+    let mut map = Map::new();
+    map.insert("question".to_string(), Value::String(question));
+    insert_string(&mut map, "header", args.one("--header"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    if args.has("--multi") {
+        map.insert("multi_select".to_string(), Value::Bool(true));
+    }
+    if let Some(wait) = args.one("--wait") {
+        let seconds: u64 = wait
+            .parse()
+            .map_err(|_| format!("--wait requires a number of seconds, got '{wait}'"))?;
+        if seconds == 0 || seconds > crate::mcp::ASK_USER_MAX_WAIT_SECS {
+            return Err(format!(
+                "--wait must be 1..={} seconds (default {})",
+                crate::mcp::ASK_USER_MAX_WAIT_SECS,
+                crate::mcp::ASK_USER_DEFAULT_WAIT_SECS
+            ));
+        }
+        map.insert("wait_seconds".to_string(), Value::from(seconds));
+    }
+    if !options.is_empty() {
+        let options: Vec<Value> = options
+            .iter()
+            .map(|option| {
+                let (label, description) = match option.split_once(':') {
+                    Some((label, description)) => (label.trim(), Some(description.trim())),
+                    None => (option.trim(), None),
+                };
+                let mut entry = Map::new();
+                entry.insert("label".to_string(), Value::String(label.to_string()));
+                if let Some(description) = description.filter(|d| !d.is_empty()) {
+                    entry.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        map.insert("options".to_string(), Value::Array(options));
+    }
+    Ok(Value::Object(map))
+}
+
+/// `intendant ctl notify` — fire-and-forget notification to the user.
+async fn run_notify(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_notify();
+        return Ok(());
+    }
+    let response = call_tool(client, config, "notify_user", notify_args(raw)?).await?;
+    print_tool_response(response, config, None)
+}
+
+/// Build `notify_user` arguments from `notify` flags.
+fn notify_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--title", "--urgency", "--session"], &[])?;
+    if args.positional.is_empty() {
+        return Err("notify requires notification text".to_string());
+    }
+    let text = args.positional.join(" ");
+    if text.len() > crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES {
+        return Err(format!(
+            "notification text is {} bytes; max {} KB",
+            text.len(),
+            crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES / 1024
+        ));
+    }
+    // Same closed vocabulary the daemon enforces — fail fast client-side.
+    crate::types::NotificationUrgency::parse(args.one("--urgency"))?;
+    let mut map = Map::new();
+    map.insert("text".to_string(), Value::String(text));
+    insert_string(&mut map, "title", args.one("--title"));
+    insert_string(&mut map, "urgency", args.one("--urgency"));
+    insert_string(&mut map, "session_id", args.one("--session"));
+    Ok(Value::Object(map))
 }
 
 async fn run_task(client: &reqwest::Client, config: &Config, raw: &[String]) -> Result<(), String> {
@@ -1975,7 +2290,10 @@ Commands:\n\
   shared                    Shared display collaboration\n\
   approval                  Pending approvals and approval responses\n\
   input                     Pending human question and response\n\
+  ask                       Ask the user a structured question; BLOCKS for the answer\n\
+  notify                    Fire-and-forget user notification (info/attention/urgent)\n\
   settings                  Autonomy and verbosity\n\
+  session                   Session transcript notes (display-only, optional images)\n\
   task                      Start tasks\n\
   controller                Controller loop and restart controls\n\
   context                   Managed-context rewind/backout controls\n\
@@ -2030,8 +2348,22 @@ fn help_display() {
   intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl display grant-user [DISPLAY_ID|--display-id ID]\n\
   intendant ctl display revoke-user [DISPLAY_ID|--display-id ID] [--note TEXT]\n\
+  intendant ctl display request --reason TEXT [--access view|control] [--wait SECS] [--session ID]\n\
   intendant ctl display take DISPLAY_ID\n\
   intendant ctl display release DISPLAY_ID [--note TEXT]"
+    );
+}
+
+fn help_display_request() {
+    println!(
+        "Usage: intendant ctl display request --reason TEXT [--access view|control] [--wait SECS] [--session ID]\n\
+Ask the user for access to their real display (display 0). Raises a dashboard\n\
+popup with your reason and blocks until they decide or --wait seconds pass\n\
+(default 120, max 600). Only the user's click grants it — no autonomy setting\n\
+or approval action can. --access view shares the display stream without\n\
+computer-use input; --access control requests the full user-display grant.\n\
+Prints the structured JSON result (approved/denied/denied_for_session/\n\
+timed_out/cooldown/already_pending/already_granted/unavailable)."
     );
 }
 
@@ -2154,6 +2486,70 @@ fn help_settings() {
     );
 }
 
+fn help_session() {
+    println!(
+        "Usage:\n\
+  intendant ctl session note TEXT [--image PATH ...] [--source LABEL] [--session ID]\n\
+\n\
+Run `intendant ctl session note --help` for details."
+    );
+}
+
+fn help_session_note() {
+    println!(
+        "Usage: intendant ctl session note TEXT [--image PATH ...] [--source LABEL] [--session ID]\n\
+\n\
+Post a display-only note into the session transcript. The note shows up\n\
+live in the dashboard and persists for replay; it never enters any model's\n\
+context. Each --image file (png, jpg, jpeg, gif, webp, bmp) is read locally,\n\
+stored in the session upload store, and rendered as a clickable thumbnail.\n\
+Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total.\n\
+\n\
+--session defaults to the calling session (INTENDANT_SESSION_ID or the\n\
+session bound into your injected MCP URL).\n\
+\n\
+Examples:\n\
+  intendant ctl session note \"Milestone: encoder pool rewired\"\n\
+  intendant ctl session note \"Before/after comparison\" --image before.png --image after.png"
+    );
+}
+
+fn help_ask() {
+    println!(
+        "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi] \\\n\
+\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json]\n\
+\n\
+Raises the question on the dashboard question rail and BLOCKS until the user\n\
+answers, then prints the answer to stdout. A question requests input, never\n\
+permission — it is never auto-approved. Up to 4 options; with none (or with\n\
+--free-text) the user types an answer — free text is always accepted on top\n\
+of options. --multi allows selecting several options (joined with \", \").\n\
+Default --wait 300 seconds, max 900; on timeout prints best-judgment guidance\n\
+and exits nonzero. --json prints {{status, answer, answers}} instead.\n\
+\n\
+Examples:\n\
+  intendant ctl ask \"Which database?\" --option \"postgres:Existing infra\" --option sqlite\n\
+  intendant ctl ask \"Name the release branch\" --free-text --wait 600"
+    );
+}
+
+fn help_notify() {
+    println!(
+        "Usage: intendant ctl notify \"TEXT\" [--title TEXT] [--urgency info|attention|urgent]\n\
+\n\
+Fire-and-forget notification to the user; returns immediately. It renders as\n\
+a dashboard toast plus a transcript row. Urgency escalates delivery:\n\
+  info       (default) dashboard only\n\
+  attention  + tab badge and a browser notification when the tab is hidden\n\
+  urgent     + immediate push nudge to the owner's opted-in browsers\n\
+             (content-free; reserve for being blocked)\n\
+\n\
+Examples:\n\
+  intendant ctl notify \"Test suite green, opening the PR\" --title \"CI\"\n\
+  intendant ctl notify \"Deploy blocked on expired credentials\" --urgency urgent"
+    );
+}
+
 fn help_task() {
     println!(
         "Usage: intendant ctl task start [--task TEXT] [--session ID] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
@@ -2230,6 +2626,151 @@ mod tests {
         let parsed = parse_command_args(&args(&["-vyeJaE3hyqm4"]), &[], &[])
             .expect("single-dash token is a positional, not a flag");
         assert_eq!(parsed.positional, vec!["-vyeJaE3hyqm4".to_string()]);
+    }
+
+    #[test]
+    fn ask_args_builds_tool_arguments() {
+        let value = ask_args(&args(&[
+            "Which",
+            "database?",
+            "--option",
+            "postgres:Existing infra",
+            "--option",
+            "sqlite",
+            "--multi",
+            "--header",
+            "Storage",
+            "--wait",
+            "120",
+            "--session",
+            "sess-1",
+        ]))
+        .expect("ask args");
+        assert_eq!(value["question"], "Which database?");
+        assert_eq!(value["header"], "Storage");
+        assert_eq!(value["multi_select"], true);
+        assert_eq!(value["wait_seconds"], 120);
+        assert_eq!(value["session_id"], "sess-1");
+        let options = value["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["label"], "postgres");
+        assert_eq!(options[0]["description"], "Existing infra");
+        assert_eq!(options[1]["label"], "sqlite");
+        assert!(options[1].get("description").is_none());
+    }
+
+    #[test]
+    fn ask_args_free_text_defaults_and_validation() {
+        // --free-text / no options → no options array, no multi_select.
+        let value = ask_args(&args(&["Name the branch", "--free-text"])).expect("ask args");
+        assert_eq!(value["question"], "Name the branch");
+        assert!(value.get("options").is_none());
+        assert!(value.get("multi_select").is_none());
+        assert!(value.get("wait_seconds").is_none());
+
+        let err = ask_args(&args(&["--multi"])).unwrap_err();
+        assert!(err.contains("requires question text"), "{err}");
+
+        let err = ask_args(&args(&["Q", "--wait", "soon"])).unwrap_err();
+        assert!(err.contains("--wait requires a number"), "{err}");
+        let err = ask_args(&args(&["Q", "--wait", "0"])).unwrap_err();
+        assert!(err.contains("--wait must be"), "{err}");
+        let err = ask_args(&args(&["Q", "--wait", "100000"])).unwrap_err();
+        assert!(err.contains("--wait must be"), "{err}");
+
+        // Client-side option cap derives from the tool's own constant.
+        let mut over = vec!["Q".to_string()];
+        for i in 0..crate::mcp::ASK_USER_MAX_OPTIONS + 1 {
+            over.push("--option".to_string());
+            over.push(format!("o{i}"));
+        }
+        let err = ask_args(&over).unwrap_err();
+        assert!(err.contains("too many options"), "{err}");
+    }
+
+    #[test]
+    fn notify_args_builds_tool_arguments_and_validates_urgency() {
+        let value = notify_args(&args(&[
+            "Deploy",
+            "finished",
+            "--title",
+            "CI",
+            "--urgency",
+            "attention",
+            "--session",
+            "sess-2",
+        ]))
+        .expect("notify args");
+        assert_eq!(value["text"], "Deploy finished");
+        assert_eq!(value["title"], "CI");
+        assert_eq!(value["urgency"], "attention");
+        assert_eq!(value["session_id"], "sess-2");
+
+        // Omitted urgency stays omitted (the daemon defaults to info).
+        let value = notify_args(&args(&["hello"])).expect("notify args");
+        assert!(value.get("urgency").is_none());
+
+        let err = notify_args(&args(&["hello", "--urgency", "loud"])).unwrap_err();
+        assert!(err.contains("unknown urgency"), "{err}");
+        let err = notify_args(&args(&["--title", "x"])).unwrap_err();
+        assert!(err.contains("requires notification text"), "{err}");
+        let err = notify_args(&args(&[&"x".repeat(
+            crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES + 1,
+        )]))
+        .unwrap_err();
+        assert!(err.contains("max"), "{err}");
+    }
+
+    #[test]
+    fn session_note_args_builds_tool_arguments_with_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("shot.png");
+        std::fs::write(&image_path, [0x89u8, b'P', b'N', b'G']).unwrap();
+
+        let value = session_note_args(&args(&[
+            "Milestone",
+            "reached",
+            "--image",
+            image_path.to_str().unwrap(),
+            "--source",
+            "codex",
+            "--session",
+            "sess-1",
+        ]))
+        .unwrap();
+        assert_eq!(value["text"], "Milestone reached");
+        assert_eq!(value["source"], "codex");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["images"][0]["media_type"], "image/png");
+        assert_eq!(value["images"][0]["name"], "shot.png");
+        use base64::Engine as _;
+        assert_eq!(
+            value["images"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G'])
+        );
+
+        // Text-only notes omit the images key entirely.
+        let value = session_note_args(&args(&["just", "text"])).unwrap();
+        assert_eq!(value["text"], "just text");
+        assert!(value.get("images").is_none());
+    }
+
+    #[test]
+    fn session_note_args_rejects_missing_text_bad_extension_and_missing_file() {
+        let err = session_note_args(&args(&[])).unwrap_err();
+        assert!(err.contains("requires note text"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let svg = dir.path().join("vector.svg");
+        std::fs::write(&svg, b"<svg/>").unwrap();
+        let err =
+            session_note_args(&args(&["text", "--image", svg.to_str().unwrap()])).unwrap_err();
+        assert!(err.contains("unsupported image extension"), "{err}");
+
+        let missing = dir.path().join("nope.png");
+        let err =
+            session_note_args(&args(&["text", "--image", missing.to_str().unwrap()])).unwrap_err();
+        assert!(err.contains("failed to read"), "{err}");
     }
 
     #[test]

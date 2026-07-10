@@ -695,6 +695,119 @@ fn default_connect_retry_delay_ms() -> u64 {
     1_000
 }
 
+/// On-disk shape of the daemon-scoped Connect config file: the same
+/// `[connect]` table `intendant.toml` carries, alone in its own file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DaemonConnectFile {
+    #[serde(default)]
+    connect: ConnectConfig,
+}
+
+/// Where a projectless daemon persists its Connect client config. Rooted
+/// daemons keep `[connect]` in the project's `intendant.toml`; a daemon
+/// with no project (the bundled app's normal shape) has no intendant.toml
+/// to write, so the config lives with the rest of the machine-local daemon
+/// state under the state root.
+pub fn daemon_connect_config_path() -> PathBuf {
+    crate::platform::intendant_home().join("connect.toml")
+}
+
+/// Load the daemon-scoped Connect config. An absent file is the normal
+/// never-enabled state, not an error.
+pub fn load_daemon_connect_config_in(path: &Path) -> Result<ConnectConfig, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConnectConfig::default())
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let file: DaemonConnectFile =
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    Ok(file.connect)
+}
+
+/// Daemon-scoped Connect config at the live state-root path.
+pub fn load_daemon_connect_config() -> Result<ConnectConfig, String> {
+    load_daemon_connect_config_in(&daemon_connect_config_path())
+}
+
+/// Persist the daemon-scoped Connect config (atomic tmp+rename; the file
+/// may carry `auth_token`, so it gets owner-only permissions like the
+/// vault blob).
+pub fn save_daemon_connect_config_in(path: &Path, config: &ConnectConfig) -> Result<(), String> {
+    let file = DaemonConnectFile {
+        connect: config.clone(),
+    };
+    let text =
+        toml::to_string_pretty(&file).map_err(|e| format!("serialize connect config: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    restrict_connect_file(&tmp);
+    std::fs::rename(&tmp, path).map_err(|e| format!("finalize {}: {e}", path.display()))
+}
+
+fn restrict_connect_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// Which store a Connect config round-trips through — resolved once from
+/// the daemon's project root so every surface (HTTP route, dashboard
+/// tunnel, boot) agrees on where the config lives.
+pub(crate) enum ConnectConfigStore {
+    /// Rooted daemon: `[connect]` in the project's `intendant.toml`.
+    Project(PathBuf),
+    /// Projectless daemon: the daemon-scoped `connect.toml` (path is
+    /// explicit so tests can point it at a scratch directory — the
+    /// default-path constructor hits the live state root).
+    DaemonFile(PathBuf),
+}
+
+impl ConnectConfigStore {
+    pub(crate) fn for_project_root(project_root: Option<&Path>) -> Self {
+        match project_root {
+            Some(root) => Self::Project(root.to_path_buf()),
+            None => Self::DaemonFile(daemon_connect_config_path()),
+        }
+    }
+
+    pub(crate) fn load(&self) -> Result<ConnectConfig, String> {
+        match self {
+            Self::Project(root) => Ok(Project::from_root(root.clone())
+                .map_err(|e| format!("load project config: {e}"))?
+                .config
+                .connect),
+            Self::DaemonFile(path) => load_daemon_connect_config_in(path),
+        }
+    }
+
+    pub(crate) fn save(&self, config: &ConnectConfig) -> Result<(), String> {
+        match self {
+            Self::Project(root) => {
+                let mut project = Project::from_root(root.clone())
+                    .map_err(|e| format!("load project config: {e}"))?;
+                project.config.connect = config.clone();
+                project
+                    .save_config()
+                    .map_err(|e| format!("write intendant.toml: {e}"))
+            }
+            Self::DaemonFile(path) => save_daemon_connect_config_in(path, config),
+        }
+    }
+}
+
 /// Daemon-level settings for what this Intendant advertises to peers
 /// and what it requires of inbound peer connections.
 /// Lives under `[server]` in intendant.toml.
@@ -2072,5 +2185,59 @@ context_recovery = "managed"
 "#;
         let config: ProjectConfig = toml::from_str(alias_toml).unwrap();
         assert_eq!(config.agent.codex.managed_context, "managed");
+    }
+
+    #[test]
+    fn daemon_connect_config_round_trips_and_defaults_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+
+        // Absent file = never enabled, not an error.
+        let absent = load_daemon_connect_config_in(&path).unwrap();
+        assert!(!absent.enabled);
+        assert!(absent.rendezvous_url.is_none());
+
+        let mut config = ConnectConfig::default();
+        config.enabled = true;
+        config.rendezvous_url = Some("https://rendezvous.example".to_string());
+        save_daemon_connect_config_in(&path, &config).unwrap();
+
+        let loaded = load_daemon_connect_config_in(&path).unwrap();
+        assert!(loaded.enabled);
+        assert_eq!(
+            loaded.rendezvous_url.as_deref(),
+            Some("https://rendezvous.example")
+        );
+
+        // The file is the same [connect] table intendant.toml carries.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[connect]"), "{text}");
+
+        // Disable round-trips too (the toggle's off path).
+        config.enabled = false;
+        save_daemon_connect_config_in(&path, &config).unwrap();
+        assert!(!load_daemon_connect_config_in(&path).unwrap().enabled);
+    }
+
+    #[test]
+    fn connect_config_store_uses_daemon_file_when_projectless() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+        let store = ConnectConfigStore::DaemonFile(path.clone());
+
+        let mut config = store.load().unwrap();
+        assert!(!config.enabled);
+        config.enabled = true;
+        store.save(&config).unwrap();
+        assert!(path.exists());
+        assert!(store.load().unwrap().enabled);
+
+        // Rooted daemons keep resolving to the project store.
+        match ConnectConfigStore::for_project_root(Some(std::path::Path::new("/tmp/p"))) {
+            ConnectConfigStore::Project(root) => {
+                assert_eq!(root, std::path::PathBuf::from("/tmp/p"))
+            }
+            ConnectConfigStore::DaemonFile(_) => panic!("rooted daemon must use the project store"),
+        }
     }
 }

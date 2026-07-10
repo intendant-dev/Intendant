@@ -48,10 +48,6 @@ pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
     let _ = stream.shutdown().await;
 }
 
-pub(crate) fn json_response_body(body: String) -> String {
-    HttpResponse::json("200 OK", body).into_string()
-}
-
 /// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
 pub(crate) fn gzip_compress(data: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
@@ -734,6 +730,17 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
         full.push_str(&String::from_utf8_lossy(&rest));
     }
     Ok(full)
+}
+
+/// Numeric code of a status line (`"404 Not Found"` → 404); unparseable
+/// input collapses to 500. Inverse of [`status_reason`] for the (status,
+/// body) helper cores predating [`crate::web_gateway::ApiResponse`].
+pub(crate) fn status_line_code(status_line: &str) -> u16 {
+    status_line
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(500)
 }
 
 pub(crate) fn status_reason(status: u16) -> &'static str {

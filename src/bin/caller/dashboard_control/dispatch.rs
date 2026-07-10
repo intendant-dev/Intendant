@@ -29,6 +29,31 @@ pub(crate) fn frame_api_response(
     }
 }
 
+/// Tunnel adapter for the pre-`_httpStatus` methods (the sessions
+/// list/detail/search trio predates the injected-status envelope):
+/// render only the neutral response's JSON body through the historical
+/// `json_body_response` wrapper — `{t:"response", id, ok:true,
+/// result:<body>}` with NO status metadata injected — so the wire stays
+/// byte-identical through the delegation. A byte response on these
+/// methods is a wiring bug and fails closed.
+pub(crate) fn frame_api_json_body_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { body, .. } => {
+            json_body_response(id, body.into_string(), label)
+        }
+        crate::web_gateway::ApiResponse::Bytes { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected byte response"),
+        }),
+    }
+}
+
 /// Tunnel adapter for byte-capable methods: `Bytes` becomes a
 /// `byte_stream_start/chunk/end` sequence — chunking, credits, and
 /// backpressure stay wire.rs-owned — with the neutral fn's `meta`
@@ -364,6 +389,101 @@ pub(crate) fn control_frame_response(
                         }),
                         Err(error) => dashboard_control_error_response(id, error.message()),
                     })
+                }
+                "api_daemon_vault_deposit_key_fetch" => {
+                    let result = match crate::vault_deposits::load_deposit_key_in(
+                        &crate::vault_deposits::deposit_key_path(),
+                    ) {
+                        Ok(Some(key)) => serde_json::json!({
+                            "present": true,
+                            "alg": key.alg,
+                            "pub_raw_b64u": key.pub_raw_b64u,
+                            "published_unix_ms": key.published_unix_ms,
+                        }),
+                        Ok(None) => serde_json::json!({ "present": false }),
+                        Err(error) => {
+                            return Some(dashboard_control_error_response(id, error))
+                        }
+                    };
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": result,
+                    }))
+                }
+                "api_daemon_vault_deposit_key_publish" => {
+                    let params_ref = params.as_ref();
+                    let pub_raw_b64u = params_ref
+                        .and_then(|p| p.get("pub_raw_b64u"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    let alg = params_ref
+                        .and_then(|p| p.get("alg"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ECDH-P256")
+                        .to_string();
+                    let key = crate::vault_deposits::DepositKey {
+                        alg,
+                        pub_raw_b64u,
+                        published_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    };
+                    Some(
+                        match crate::vault_deposits::save_deposit_key_in(
+                            &crate::vault_deposits::deposit_key_path(),
+                            &key,
+                        ) {
+                            Ok(()) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": { "stored": true },
+                            }),
+                            Err(error) => dashboard_control_error_response(id, error),
+                        },
+                    )
+                }
+                "api_daemon_vault_deposits_fetch" => {
+                    Some(
+                        match crate::vault_deposits::list_deposits_in(
+                            &crate::vault_deposits::deposits_dir(),
+                        ) {
+                            Ok(deposits) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": {
+                                    "deposits": serde_json::to_value(&deposits)
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                            }),
+                            Err(error) => dashboard_control_error_response(id, error),
+                        },
+                    )
+                }
+                "api_daemon_vault_deposits_consume" => {
+                    let ids: Vec<String> = params
+                        .as_ref()
+                        .and_then(|p| p.get("ids"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let removed = crate::vault_deposits::consume_deposits_in(
+                        &crate::vault_deposits::deposits_dir(),
+                        &ids,
+                    );
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "removed": removed },
+                    }))
                 }
                 "api_credential_egress_register" => {
                     let kinds: Vec<String> = params
@@ -799,6 +919,7 @@ pub(crate) fn control_frame_response(
                 | "api_worktrees_inspect"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
+                | "api_worktrees_merge"
                 | "api_managed_context_records"
                 | "api_managed_context_anchors"
                 | "api_managed_context_fission"
@@ -2189,11 +2310,12 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
 
     // Every gated api_* method derives its `<method>_available` boolean from
-    // `CONTROL_METHODS`: operation granted && backing subsystem wired
+    // the effective method table (route-row tunnel specs ∪ the
+    // CONTROL_METHODS residue): operation granted && backing subsystem wired
     // (`control_method_runtime_ready`). One boolean per advertised RPC lets
     // the SPA distinguish "denied for this session" from "unsupported
     // daemon" (feature list) without probing calls.
-    for spec in CONTROL_METHODS {
+    for spec in all_control_methods() {
         if !spec.name.starts_with("api_") {
             continue;
         }
@@ -2208,7 +2330,7 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 
     // Operation aggregates, composite rollups, and frame-transport
     // availability the SPA reads — none has a single backing method in
-    // `CONTROL_METHODS`, so they stay hand-written.
+    // the method table, so they stay hand-written.
     let capabilities = [
         ("access_inspect_available", access_inspect),
         ("access_manage_available", access_manage),
@@ -2345,7 +2467,7 @@ mod tests {
     fn status_advertises_an_availability_boolean_for_every_gated_api_method() {
         let rt = runtime();
         let status = status_response_frame("s1".to_string(), &rt);
-        for spec in CONTROL_METHODS {
+        for spec in all_control_methods() {
             if !spec.name.starts_with("api_") || spec.op.is_none() {
                 continue;
             }

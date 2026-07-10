@@ -1043,6 +1043,14 @@ impl SessionSupervisor {
         response: event::ApprovalResponse,
         action: &str,
     ) {
+        // An `ask_user` question is armed by the MCP layer, not by any
+        // session's approval registry: its own waiter observes the same
+        // ControlCommand on the bus, resolves, and emits ApprovalResolved.
+        // Nothing for the supervisor to do — and warning here would
+        // misreport a first-class flow as an unknown approval id.
+        if crate::mcp::ask_user_question_pending(approval_id) {
+            return;
+        }
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Approval response dropped: no active managed session");
             return;

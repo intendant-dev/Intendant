@@ -369,6 +369,9 @@ async function main() {
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
+      // Attention center (57-attention-notifications.js): tab badge +
+      // hidden-tab notifications for pending approvals/questions.
+      try { attentionObserveServerMessage(d); } catch (_) {}
       if (d.t === 'ws_denied') {
         const frame = String(d.frame || '');
         if (!wsDeniedToastShown.has(frame)) {
@@ -386,6 +389,30 @@ async function main() {
       }
       if (d.event === 'shared_view') {
         handleSharedViewEvent(d);
+        return;
+      }
+      if (d.event === 'session_note') {
+        // Display-only transcript note: rendered end to end in JS (the
+        // WASM presence layer does not know this event).
+        handleSessionNoteEvent(d);
+        return;
+      }
+      if (d.event === 'display_request_raised') {
+        // User-display doorbell: rendered end to end in JS
+        // (58-display-request.js); the attention center already saw it
+        // via attentionObserveServerMessage above.
+        handleDisplayRequestRaised(d);
+        return;
+      }
+      if (d.event === 'display_request_resolved') {
+        handleDisplayRequestResolved(d);
+        return;
+      }
+      if (d.event === 'user_notification') {
+        // Agent→user notification: toast + transcript row, end to end in
+        // JS like session notes (the attention center already saw it via
+        // attentionObserveServerMessage above).
+        handleUserNotificationEvent(d);
         return;
       }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
@@ -409,7 +436,16 @@ async function main() {
         const wasProcessingLogReplay = processingLogReplay;
         processingLogReplay = true;
         try {
-          const cmds = app.handle_server_message(filtered);
+          // session_note / user_notification entries ride the WASM
+          // pipeline as styled log_entry rows (see
+          // sessionNoteReplayEntryToLogEntry and its notification twin) so
+          // the replayed transcript keeps chronological order.
+          const cmds = app.handle_server_message({
+            ...filtered,
+            entries: filtered.entries
+              .map(sessionNoteReplayEntryToLogEntry)
+              .map(userNotificationReplayEntryToLogEntry),
+          });
           if (cmds) processCommands(cmds);
         } finally {
           processingLogReplay = wasProcessingLogReplay;
@@ -712,6 +748,9 @@ async function main() {
   app.set_on_server_state((connected) => {
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
+    // A dead event stream can't retract pending-request items — drop the
+    // attention badge; the reconnect bootstrap rebuilds what still stands.
+    try { attentionOnServerState(connected); } catch (_) {}
   });
 
   // ── Voice Callbacks ──

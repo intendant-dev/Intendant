@@ -72,6 +72,30 @@ pub struct SessionMeta {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
+    /// Git-worktree linkage for sessions launched into a fresh worktree
+    /// (`CreateSession { worktree: true }`): the branch, its checkout path
+    /// (the session's effective project root), and where it branched from.
+    /// The single source of truth the dashboard's worktree badge, the
+    /// session-end finish card, and the merge endpoint all derive from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<SessionWorktreeMeta>,
+}
+
+/// Worktree linkage recorded on a session (see [`SessionMeta::worktree`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorktreeMeta {
+    /// Branch checked out in the worktree.
+    pub branch: String,
+    /// Absolute worktree checkout path (the session's project root).
+    pub path: String,
+    /// Project root the worktree was created from (where merges run).
+    pub base_root: String,
+    /// Branch the base checkout was on at creation, if not detached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Commit `HEAD` resolved to when the worktree branched off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
 }
 
 static OPEN_SESSION_LOG_DIRS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -347,10 +371,12 @@ impl SessionLog {
         name: Option<&str>,
         role: Option<&str>,
     ) {
-        let existing_name = fs::read_to_string(self.dir.join("session_meta.json"))
+        let existing = fs::read_to_string(self.dir.join("session_meta.json"))
             .ok()
-            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
-            .and_then(|meta| meta.name);
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok());
+        let (existing_name, existing_worktree) = existing
+            .map(|meta| (meta.name, meta.worktree))
+            .unwrap_or((None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -361,9 +387,34 @@ impl SessionLog {
             last_turn: None,
             role: role.map(|r| r.to_string()),
             rounds: None,
+            // Worktree linkage is written once at launch and survives every
+            // later meta rewrite (resume, rename), like the session name.
+            worktree: existing_worktree,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record (or update) the session's git-worktree linkage in
+    /// `session_meta.json`. Call after `write_meta*` has created the file;
+    /// the linkage then survives later meta rewrites.
+    pub fn write_meta_worktree(&self, worktree: &SessionWorktreeMeta) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            eprintln!(
+                "session_log: cannot record worktree linkage before session_meta.json exists"
+            );
+            return;
+        };
+        meta.worktree = Some(worktree.clone());
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = fs::write(&meta_path, json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
             }
         }
@@ -1262,6 +1313,7 @@ mod tests {
             last_turn: None,
             role: None,
             rounds: None,
+            worktree: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -1310,6 +1362,31 @@ mod tests {
     }
 
     #[test]
+    fn write_meta_worktree_records_and_survives_meta_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp/wt/checkout")), Some("task"));
+
+        let linkage = SessionWorktreeMeta {
+            branch: "session-branch".to_string(),
+            path: "/tmp/wt/checkout".to_string(),
+            base_root: "/tmp/wt".to_string(),
+            base_branch: Some("main".to_string()),
+            base_sha: Some("abc123".to_string()),
+        };
+        log.write_meta_worktree(&linkage);
+        // A later meta rewrite (resume / rename) must not drop the linkage.
+        log.write_meta(Some(Path::new("/tmp/wt/checkout")), Some("resumed task"));
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.task.as_deref(), Some("resumed task"));
+        assert_eq!(meta.worktree, Some(linkage));
+    }
+
+    #[test]
     fn resolve_path_with_override() {
         let dir = tempfile::tempdir().unwrap();
         let custom = dir.path().join("custom_logs");
@@ -1344,6 +1421,7 @@ mod tests {
             last_turn: Some(5),
             role: None,
             rounds: None,
+            worktree: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -1363,6 +1441,7 @@ mod tests {
             last_turn: Some(3),
             role: None,
             rounds: None,
+            worktree: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -1420,6 +1499,7 @@ mod tests {
             last_turn: None,
             role: None,
             rounds: None,
+            worktree: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

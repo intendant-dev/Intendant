@@ -80,6 +80,45 @@ pub(crate) fn log_event(level: LogLevel, source: &str, message: String) -> PeerE
     }
 }
 
+/// Peer-facing text for a display-only session note: the note body plus a
+/// count marker for attachments, whose `/api/session/current/uploads/*`
+/// URLs only resolve against the origin daemon.
+pub(crate) fn session_note_peer_log_text(text: &str, attachment_count: usize) -> String {
+    match attachment_count {
+        0 => text.to_string(),
+        1 => format!("{text} [1 image attachment]"),
+        n => format!("{text} [{n} image attachments]"),
+    }
+}
+
+/// Peer-facing text for an agent→user notification: `title: text`, with an
+/// urgency marker for the escalated levels.
+pub(crate) fn user_notification_peer_log_text(
+    title: Option<&str>,
+    text: &str,
+    urgency: crate::types::NotificationUrgency,
+) -> String {
+    let body = match title {
+        Some(title) => format!("{title}: {text}"),
+        None => text.to_string(),
+    };
+    match urgency {
+        crate::types::NotificationUrgency::Info => body,
+        other => format!("[{}] {body}", other.as_str()),
+    }
+}
+
+/// Urgent notifications surface as warnings in the peer activity log;
+/// everything else is plain info.
+pub(crate) fn user_notification_peer_log_level(
+    urgency: crate::types::NotificationUrgency,
+) -> LogLevel {
+    match urgency {
+        crate::types::NotificationUrgency::Urgent => LogLevel::Warn,
+        _ => LogLevel::Info,
+    }
+}
+
 /// Map Intendant's internal multi-source `LogLevel` to the peer
 /// module's 5-level vocabulary. Source-specific variants
 /// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
@@ -538,6 +577,11 @@ impl AppEventUpcaster {
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
+            // Display requests are an owner-surface doorbell on THIS
+            // daemon's dashboards; the peer rail deliberately does not
+            // carry them (peers resolve nothing here).
+            | AppEvent::DisplayRequestRaised { .. }
+            | AppEvent::DisplayRequestResolved { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
@@ -1508,6 +1552,33 @@ impl AppEventUpcaster {
                 };
                 vec![log_event(log_level, source, content.clone())]
             }
+            // Display-only session note: forward the text as peer log
+            // activity. Attachment URLs are daemon-local (`/api/session/
+            // current/uploads/.../raw` on the origin daemon), so peers get
+            // a count marker instead of unreachable references.
+            AppEvent::SessionNote {
+                text,
+                attachments,
+                source,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                source.as_deref().unwrap_or("note"),
+                session_note_peer_log_text(text, attachments.len()),
+            )],
+            // Fire-and-forget agent→user notification: forward as peer log
+            // activity (the peer dashboard's own toast/attention machinery
+            // is for its local daemon, not relayed sessions).
+            AppEvent::UserNotification {
+                title,
+                text,
+                urgency,
+                ..
+            } => vec![log_event(
+                user_notification_peer_log_level(*urgency),
+                "notify",
+                user_notification_peer_log_text(title.as_deref(), text, *urgency),
+            )],
             AppEvent::UserMessageRewind {
                 user_turn_index,
                 turns_removed,
@@ -1854,6 +1925,11 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
+            // A secondary's display-request doorbell rings on its own
+            // dashboards; the peer rail does not mirror it (see the
+            // AppEvent upcaster twin above).
+            | OutboundEvent::DisplayRequestRaised { .. }
+            | OutboundEvent::DisplayRequestResolved { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }
@@ -2791,6 +2867,31 @@ impl WireEventUpcaster {
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
             }
+            // Same treatment as the AppEvent-side arm: note text as peer
+            // log activity, attachments as a count (their URLs only
+            // resolve on the origin daemon).
+            OutboundEvent::SessionNote {
+                text,
+                attachments,
+                source,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                source.as_deref().unwrap_or("note"),
+                session_note_peer_log_text(text, attachments.len()),
+            )],
+            // Same treatment as the AppEvent-side arm: notification text as
+            // peer log activity.
+            OutboundEvent::UserNotification {
+                title,
+                text,
+                urgency,
+                ..
+            } => vec![log_event(
+                user_notification_peer_log_level(*urgency),
+                "notify",
+                user_notification_peer_log_text(title.as_deref(), text, *urgency),
+            )],
             OutboundEvent::UserMessageRewind {
                 user_turn_index,
                 turns_removed,

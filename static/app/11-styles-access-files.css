@@ -1288,9 +1288,6 @@
 .files-ide-tab .files-ide-tab-close:focus-visible {
   opacity: 1;
 }
-.files-ide-tab.dirty:hover .files-ide-tab-dirty {
-  display: none;
-}
 .files-ide-tab .files-ide-tab-close:hover {
   background: var(--surface1);
   color: var(--text);
@@ -1485,11 +1482,6 @@
   .files-ide-toolbar {
     flex-wrap: wrap;
     min-height: 0;
-  }
-  .files-ide-target-summary {
-    order: 5;
-    flex-basis: 100%;
-    max-width: 100%;
   }
   .files-ide-body {
     grid-template-columns: 1fr;

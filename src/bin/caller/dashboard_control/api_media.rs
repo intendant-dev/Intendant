@@ -4,6 +4,19 @@
 
 use super::*;
 
+// The recording/frame asset content core — the RecordingAsset vocabulary,
+// its resolvers, safety predicates, and range readers — moved verbatim to
+// web_gateway::session_catalog (transport-unification S4b): both lanes
+// resolve assets through one core; this module keeps the tunnel's ranged
+// byte-stream carriage.
+pub(crate) use crate::web_gateway::{
+    read_frame_asset_file_range, read_recording_asset_bytes_range,
+    read_recording_asset_file_range, recording_asset_name_is_safe,
+    recording_stream_name_is_safe, resolve_recording_asset_from_dir_pair,
+    resolve_session_recording_asset, session_frame_filename_is_safe,
+    RecordingAsset,
+};
+
 pub(crate) fn media_http_response(id: String, status: u16, body: serde_json::Value) -> serde_json::Value {
     http_body_response(id, status, body.to_string(), "dashboard media")
 }
@@ -639,12 +652,9 @@ pub(crate) async fn api_session_recordings_response(
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
-    let (status_line, body) =
-        crate::web_gateway::session_recordings_list_response_body(&session_id);
-    http_body_response(
+    frame_api_response(
         id,
-        status_line_code(status_line),
-        body,
+        crate::web_gateway::session_recordings_api_response(&session_id),
         "session recordings",
     )
 }
@@ -732,43 +742,6 @@ pub(crate) fn recording_asset_request_params(
     Ok((stream_name, asset, offset, length))
 }
 
-pub(crate) fn recording_stream_name_is_safe(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() < 128
-        && name.trim() == name
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-}
-
-pub(crate) fn recording_asset_name_is_safe(asset: &str) -> bool {
-    asset == "segments" || asset == "playlist.m3u8" || (recording_segment_filename_is_safe(asset))
-}
-
-pub(crate) fn recording_segment_filename_is_safe(filename: &str) -> bool {
-    filename.starts_with("seg_")
-        && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-        && filename.len() < 30
-        && !filename.contains("..")
-        && !filename.contains('/')
-        && !filename.contains('\\')
-}
-
-pub(crate) enum RecordingAsset {
-    Bytes {
-        bytes: Vec<u8>,
-        content_type: &'static str,
-        filename: String,
-    },
-    File {
-        path: PathBuf,
-        content_type: &'static str,
-        filename: String,
-    },
-}
-
 pub(crate) async fn resolve_live_recording_asset(
     registry: Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
     stream_name: &str,
@@ -789,86 +762,6 @@ pub(crate) async fn resolve_live_recording_asset(
         segments,
         asset,
     )
-}
-
-pub(crate) fn resolve_session_recording_asset(
-    session_dir: Option<PathBuf>,
-    stream_name: &str,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    let stream_dir = session_dir
-        .as_ref()
-        .map(|dir| dir.join("recordings").join(stream_name));
-    let segments = stream_dir
-        .as_ref()
-        .map(|dir| crate::recording::parse_segment_csv_pub(&dir.join("segments.csv"), dir))
-        .unwrap_or_default();
-    resolve_recording_asset_from_dir_pair(stream_dir, None, segments, asset)
-}
-
-pub(crate) fn resolve_recording_asset_from_dir_pair(
-    primary_dir: Option<PathBuf>,
-    fallback_dir: Option<PathBuf>,
-    segments: Vec<crate::recording::SegmentInfo>,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    if asset == "segments" {
-        let seg_json: Vec<serde_json::Value> = segments
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "filename": s.filename,
-                    "start_secs": s.start_secs,
-                    "end_secs": s.end_secs,
-                })
-            })
-            .collect();
-        let bytes = serde_json::to_vec(&seg_json).unwrap_or_else(|_| b"[]".to_vec());
-        return Ok(RecordingAsset::Bytes {
-            bytes,
-            content_type: "application/json",
-            filename: "segments.json".to_string(),
-        });
-    }
-    if asset == "playlist.m3u8" {
-        return Ok(RecordingAsset::Bytes {
-            bytes: crate::web_gateway::recording_playlist_m3u8(&segments).into_bytes(),
-            content_type: "application/vnd.apple.mpegurl",
-            filename: "playlist.m3u8".to_string(),
-        });
-    }
-    if !recording_segment_filename_is_safe(asset) {
-        return Err((
-            400,
-            serde_json::json!({ "ok": false, "error": "invalid recording asset" }),
-        ));
-    }
-    let path = primary_dir
-        .as_ref()
-        .map(|dir| dir.join(asset))
-        .filter(|path| path.exists())
-        .or_else(|| {
-            fallback_dir
-                .as_ref()
-                .map(|dir| dir.join(asset))
-                .filter(|path| path.exists())
-        });
-    let Some(path) = path else {
-        return Err((
-            404,
-            serde_json::json!({ "ok": false, "error": "recording asset not found" }),
-        ));
-    };
-    let content_type = if asset.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "video/mp4"
-    };
-    Ok(RecordingAsset::File {
-        path,
-        content_type,
-        filename: asset.to_string(),
-    })
 }
 
 pub(crate) async fn recording_asset_task_response(
@@ -952,96 +845,6 @@ pub(crate) async fn recording_asset_task_response(
         }),
         done: true,
     }
-}
-
-pub(crate) fn read_recording_asset_bytes_range(
-    bytes: Vec<u8>,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let total_size = bytes.len() as u64;
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let start = usize::try_from(start).map_err(|_| {
-        (
-            413,
-            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-        )
-    })?;
-    Ok((bytes[start..start + transfer_len].to_vec(), total_size, end))
-}
-
-pub(crate) fn read_recording_asset_file_range(
-    path: &std::path::Path,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("stat recording asset: {e}") }),
-        )
-    })?;
-    let total_size = metadata.len();
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("open recording asset: {e}") }),
-        )
-    })?;
-    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("seek recording asset: {e}") }),
-        )
-    })?;
-    let mut bytes = vec![0u8; transfer_len];
-    file.read_exact(&mut bytes).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("read recording asset: {e}") }),
-        )
-    })?;
-    Ok((bytes, total_size, end))
-}
-
-pub(crate) fn recording_asset_range(
-    total_size: u64,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
-    if offset > total_size {
-        return Err((
-            416,
-            serde_json::json!({
-                "ok": false,
-                "error": "range start beyond recording asset size",
-                "total_size": total_size,
-            }),
-        ));
-    }
-    let available = total_size.saturating_sub(offset);
-    let requested = length.unwrap_or(available).min(available);
-    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
-        return Err((
-            413,
-            serde_json::json!({
-                "ok": false,
-                "error": format!(
-                    "range too large: {} bytes (cap is {})",
-                    requested,
-                    crate::web_gateway::UPLOAD_MAX_BYTES
-                ),
-            }),
-        ));
-    }
-    let transfer_len = usize::try_from(requested).map_err(|_| {
-        (
-            413,
-            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-        )
-    })?;
-    Ok((offset, transfer_len, offset.saturating_add(requested)))
 }
 
 pub(crate) fn recording_asset_error_task_response(
@@ -1175,51 +978,6 @@ pub(crate) async fn api_session_frame_asset_task_response(
     }
 }
 
-pub(crate) fn session_frame_filename_is_safe(filename: &str) -> bool {
-    (filename.ends_with(".jpg") || filename.ends_with(".png"))
-        && filename.len() < 80
-        && !filename.is_empty()
-        && filename.trim() == filename
-        && !filename.contains("..")
-        && !filename.contains('/')
-        && !filename.contains('\\')
-}
-
-pub(crate) fn read_frame_asset_file_range(
-    path: &std::path::Path,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("stat session frame: {e}") }),
-        )
-    })?;
-    let total_size = metadata.len();
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("open session frame: {e}") }),
-        )
-    })?;
-    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("seek session frame: {e}") }),
-        )
-    })?;
-    let mut bytes = vec![0u8; transfer_len];
-    file.read_exact(&mut bytes).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("read session frame: {e}") }),
-        )
-    })?;
-    Ok((bytes, total_size, end))
-}
-
 pub(crate) fn session_frame_asset_error_task_response(
     id: String,
     status: u16,
@@ -1236,6 +994,128 @@ pub(crate) fn session_frame_asset_error_task_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live-store recordings fixture (unique id; caller removes).
+    fn parity_recordings_fixture(prefix: &str) -> (String, std::path::PathBuf) {
+        let session_id = format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let log_dir = crate::platform::intendant_home()
+            .join("logs")
+            .join(&session_id);
+        let stream_dir = log_dir.join("recordings").join("screen");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        std::fs::write(stream_dir.join("seg_00001.mp4"), b"parity segment bytes").unwrap();
+        std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        (session_id, log_dir)
+    }
+
+    fn parity_http_json_body(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, serde_json::Value) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        (status, serde_json::from_slice(&bytes[split + 4..]).expect("json body"))
+    }
+
+    // ── S4b parity: recordings list + the listing-asset vocabulary ──
+
+    #[tokio::test]
+    async fn parity_session_recordings_list_shares_bodies_with_status_metadata() {
+        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-list");
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(&session_id),
+        );
+        assert_eq!(status, 200);
+        let frame = api_session_recordings_response(
+            "parity-rec-list".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+        )
+        .await;
+        let cleanup = std::fs::remove_dir_all(&log_dir);
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // The list body is a json ARRAY: the injected-status envelope
+        // only decorates objects, so the array passes through untouched.
+        assert!(frame["result"].is_array(), "{frame}");
+        assert_eq!(frame["result"], http_body);
+        cleanup.expect("parity recordings fixture cleanup");
+
+        // Invalid id: an object body — the injection appears and matches
+        // the HTTP status.
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(".."),
+        );
+        assert_eq!(status, 400);
+        let frame = api_session_recordings_response(
+            "parity-rec-list-invalid".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_recording_listing_assets_share_bytes_on_both_transports() {
+        let (session_id, log_dir) = parity_recordings_fixture("parity-rec-assets");
+        for asset in ["segments", "playlist.m3u8"] {
+            // HTTP: the shared resolver under the canonical tail.
+            let response = crate::web_gateway::session_recording_listing_asset_api_response(
+                &session_id,
+                "screen",
+                asset,
+            );
+            let (http_bytes, http_ct) = match response {
+                crate::web_gateway::ApiResponse::Bytes {
+                    bytes: crate::web_gateway::BytesPayload::InMemory(payload),
+                    content_type,
+                    ..
+                } => (payload, content_type),
+                _ => panic!("listing asset must ride the bytes lane"),
+            };
+            // Tunnel: the same asset vocabulary through the ranged
+            // byte-stream carriage (offset 0, unbounded).
+            let task = api_session_recording_asset_task_response(
+                format!("parity-asset-{asset}"),
+                Some(&serde_json::json!({
+                    "session_id": session_id,
+                    "stream_name": "screen",
+                    "asset": asset,
+                })),
+            )
+            .await;
+            let stream = task.byte_stream.expect("tunnel byte stream");
+            assert_eq!(stream.bytes, http_bytes, "{asset}");
+            assert_eq!(stream.content_type, http_ct, "{asset}");
+            assert_eq!(stream.result["ok"], true);
+            assert_eq!(stream.result["total_size"], http_bytes.len());
+        }
+        std::fs::remove_dir_all(&log_dir).expect("parity assets fixture cleanup");
+    }
+
     use crate::dashboard_control::tests::{runtime, test_upload_state};
 
     #[tokio::test]

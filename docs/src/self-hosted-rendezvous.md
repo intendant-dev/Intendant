@@ -275,25 +275,50 @@ anything that is not already org-public.
 ## Notifications
 
 Signed-in browsers can opt into Web Push alerts (Advanced →
-Notifications): the service notifies when a claimed daemon stops polling
-(default: offline for 3 minutes; `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS`)
-and when it returns. Alerts are composed purely from the polling
-presence the rendezvous already sees, payloads are encrypted to each
-browser subscription (RFC 8291 — the push relay carries ciphertext), and
-the VAPID signing key is generated automatically into the state file on
-first start. Dead subscriptions are pruned on 404/410.
+Notifications). Two alert kinds exist, flagged per subscription
+(`GET /api/push/subscriptions` lists yours;
+`POST /api/push/preferences` flips `notify_presence` /
+`notify_requests` per endpoint):
+
+- **Presence** (`notify_presence`, on by default when you enable push):
+  a claimed daemon stopped polling (default: offline for 3 minutes;
+  `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS`) or came back. Composed purely
+  from the polling presence the rendezvous already sees.
+- **Pending agent requests** (`notify_requests`, strictly opt-in): a
+  daemon reports that an agent→user request — a command approval or a
+  question — has sat unanswered with no dashboard connected
+  (`POST /api/daemon/notify`, signed with the daemon's registered
+  identity key like unclaim/DNS publishes, rate-limited, claimed daemons
+  only). **Privacy posture, load-bearing:** the nudge wire and the push
+  payload carry only the request *kind*, the daemon's display label, and
+  a session display label — never command text, question text, file
+  paths, or any other work content. The service stays zero-knowledge
+  about the work itself; the payload constructor in `push.rs` pins this
+  by test. The daemon side is conservative by construction: a 45-second
+  grace period, only when no dashboard has connected since the request
+  appeared, one nudge per session per 10 minutes, silent degrade when
+  unclaimed or offline (`attention_nudge.rs`).
+
+Payloads are encrypted to each browser subscription (RFC 8291 — the
+push relay carries ciphertext), and the VAPID signing key is generated
+automatically into the state file on first start. Dead subscriptions
+are pruned on 404/410. Self-hosters get both kinds with zero extra
+configuration — daemons pointed at your rendezvous nudge it exactly as
+they would the hosted one.
 
 ## Transparency log and attestations
 
 Every name binding the service hands out is committed to an append-only
 RFC 6962-shaped Merkle log: which public key a computer had when it was
 claimed, handle creations, org revocation-list publications, verified
-badges, and handle reclamations. The signed tree head is public
-(`/api/log/sth`, ES256 key auto-generated into the state file) along
-with entries, inclusion proofs, and consistency proofs
-(`/api/log/{entries,proof,consistency,find}`). Browsers pin the tree
-head and verify consistency on every visit (Advanced → Transparency
-log), so rewriting history is detectable, not merely forbidden.
+badges, handle reclamations — and the served-artifact manifests
+described below. The signed tree head is public (`/api/log/sth`, ES256
+key auto-generated into the state file) along with entries, inclusion
+proofs, and consistency proofs
+(`/api/log/{entries,proof,consistency,find,artifact-manifest}`).
+Browsers pin the tree head and verify consistency on every visit
+(Advanced → Transparency log), so rewriting history is detectable, not
+merely forbidden.
 
 Accounts can attach verified identities as decoration (Advanced →
 Verified identity): a `_intendant.<domain>` TXT record checked over
@@ -302,6 +327,73 @@ a public gist containing the claim line
 (`INTENDANT_CONNECT_GIST_BASE`). Badges appear in the public directory
 (`/api/directory/<handle>`) and in the log. Verification never gates
 anything — keys stay the identity.
+
+### Code transparency for the served dashboard
+
+The log also commits **what the service serves**, not just what it says
+([Trust Tiers](./trust-tiers.md), first-contact rung three: the hosted
+origin's residual power is serving a different bundle). At startup the
+service hashes every static artifact it can serve — each file under the
+static root at its URL path, plus the embedded routes exactly as this
+instance renders them (`/`, `/connect`, `/access`, `/trust`, the
+origin-injected `/install.sh` and `/install.ps1`, `/logo.svg`,
+`/favicon.png`, the landing screenshots) — and appends an
+`artifact_manifest` entry when the result differs from the latest logged
+one. The entry carries `artifacts` (a path-sorted list of
+`{path, sha256}` with lowercase-hex hashes, comparable to `sha256sum`
+output), `bundle_version` (the crate version), `git_sha` (the build's
+commit, `-dirty` suffixed for uncommitted trees), and `manifest_hash` —
+sha256 over the canonical byte string
+`intendant-artifact-manifest-v1\n` then `{path}\t{sha256}\n` per
+artifact. `GET /api/log/artifact-manifest` returns the current entry
+with its log index, an inclusion proof, and the signed tree head, all
+computed coherently.
+
+Verification is deliberately **out of band** — page JS can never
+honestly verify the origin that serves it:
+
+```bash
+intendant hosted-verify                     # the default rendezvous
+intendant hosted-verify --connect https://connect.example.com
+```
+
+The verifier fetches the logged manifest, checks the tree-head
+signature, the entry's inclusion proof, and consistency against the
+tree head pinned under the daemon state root
+(`~/.intendant/hosted-verify/<host>.json`, honoring `$INTENDANT_HOME`),
+then downloads every listed artifact exactly as a browser would and
+compares hashes — nonzero exit and a per-artifact diff on divergence.
+Every daemon with Connect enabled also runs this check twice daily as an
+advisory tripwire (the CT tripwire's sibling): a divergence flips
+`hosted_bundle_state` to `alert` on the Connect status payload and
+raises **HOSTED CODE ALERT** on the dashboard's Connect card; network
+failures only stamp `hosted_bundle_last_error` and never block anything.
+A deploy that replaces static files without restarting the service will
+read as a divergence — restart so the new manifest is logged.
+
+**Honest limits.** A malicious server can still serve targeted different
+bytes to one victim, once — no log prevents that. What the log plus
+independent monitors from multiple vantage points buy is that
+*sustained* or *later-denied* equivocation becomes evidenced: the
+operator is publicly committed to a manifest history, every daemon is a
+monitor from its own vantage point, and "we never served that" stops
+being deniable. Coverage is what the service declares — but the HTML
+entrypoints are declared, so undeclared payloads require serving
+modified (hash-diverging) entrypoints. A transforming proxy between
+verifier and service (one that rewrites bodies) will surface as a
+divergence; the verifier sends no `Accept-Encoding`, so ordinary
+compression layers do not.
+
+**Reproducibility.** A manifest entry maps back to source: take the
+entry's `git_sha`, check out that commit, and rebuild — the dashboard
+bundle is deterministic (`static/app/` fragments assemble into
+`static/app.html` via `cargo run -p app-html-assembler`; the committed
+WASM artifacts are pinned by `.wasm-pack-version`), so
+`sha256sum static/app.html static/wasm-web/* static/wasm-station/*`
+comparing clean against the logged hashes ties the served bytes to
+reviewable source. The embedded pages are deterministic functions of
+the public origin, reproducible by running `intendant-connect` locally
+with the same `--origin` and hashing what it serves.
 
 Dormant-handle reclamation is stated policy: an account with zero
 claimed daemons and no sign-in for the configured window loses its

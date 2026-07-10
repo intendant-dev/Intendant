@@ -55,7 +55,8 @@ model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises the bootstrap set:
 status, shared-view collaboration, and the minimal real-display/CU tools
-(`list_displays`, `grant_user_display`, `revoke_user_display`, `read_screen`,
+(`list_displays`, `grant_user_display`, `request_user_display`,
+`revoke_user_display`, `read_screen`,
 `take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
 context additionally advertises the managed-context rewind/backout and fission
 tools. Omitting `tool_profile` keeps the historical full tool list. Profile
@@ -184,6 +185,9 @@ Full MCP tool groups:
 | `skip`          | Skip, continue with the next command. | `id` |
 | `approve_all`   | Approve and set autonomy to Full. | `id` |
 | `respond`       | Answer an `askHuman` question. | `text` |
+| `post_session_note` | Post a **display-only note** into the session transcript — rendered live in the dashboard and persisted for replay, never added to any model's context. Optional base64 images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total; raster types only (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`). Session-scoped callers post into their own session by default. | `text`, `images?` (`[{media_type, data, name?}]`), `session_id?`, `source?` |
+| `ask_user`      | Ask the user one **structured question** on the dashboard question rail and **block** until answered or the wait expires. A question requests *input*, never permission: it is never auto-approved and answering it never widens autonomy. 0–4 options; free-text answers are always accepted (zero options = free-text only). Returns `{status, answer, answers}` — `answered` carries the choice(s); `timeout`/`dismissed`/`pass` carry best-judgment guidance; shapes with no answerable frontend auto-answer immediately with the same guidance. Session-scoped callers ask as their own session. Also `intendant ctl ask`. | `question`, `options?` (`[{label, description?}]`), `header?`, `multi_select?`, `wait_seconds?` (default 300, max 900), `session_id?` |
+| `notify_user`   | Fire-and-forget **notification** to the user; returns immediately, renders as a dashboard toast plus a transcript row (persisted for replay), never enters model context. `urgency` escalates delivery: `info` (default) dashboard-only; `attention` + tab badge and hidden-tab browser notification; `urgent` + an immediate content-free push nudge to the owner's opted-in browsers. Cap: 4 KB text. Also `intendant ctl notify`. | `text`, `title?`, `urgency?` (`info`/`attention`/`urgent`), `session_id?` |
 | `set_autonomy`  | Set autonomy. | `level`: `low`/`medium`/`high`/`full` |
 | `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
 | `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |
@@ -196,7 +200,8 @@ Full MCP tool groups:
 | `list_displays`      | Enumerate displays with their session state. | — |
 | `take_display`       | Take control of a display. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
-| `grant_user_display` | Grant access to the user's real display session; on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
+| `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
+| `request_user_display` | Ask the user for their display: raises the dashboard doorbell popup with your reason and blocks for their click — the only thing that can grant it (never auto-approved; see [Autonomy — the display request rail](./autonomy.md#the-display-request-rail-doorbell)). `access="view"` shares the stream without CU input; `"view_and_control"` requests the full grant. | `reason`, `access?`, `wait_seconds?`, `session_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
 | `read_screen`        | Frontmost app's accessibility element tree — cheap textual grounding (macOS user session). | `display_target?`, `format?` |

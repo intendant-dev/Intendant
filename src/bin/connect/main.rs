@@ -58,6 +58,11 @@ const UNCLAIM_MAX_SKEW_MS: u64 = 5 * 60 * 1000;
 /// identity key is the only authority over a name (docs/src/trust-tiers.md).
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
+/// Daemon-signed attention nudge: an agent→user request (approval /
+/// question) went unseen on the box, so this service fans a Web Push out to
+/// the owner's opted-in browsers. The signed body names a request KIND and
+/// a session display LABEL only — never work content (push.rs).
+const NOTIFY_PROTOCOL: &str = "intendant-connect-daemon-notify-v1";
 const COOKIE_NAME: &str = "ic_session";
 const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
@@ -94,7 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let had_keys = store.vapid_private_pk8_b64.is_some() && store.log_private_pk8_b64.is_some();
     let vapid = load_or_create_vapid_keypair(&mut store)?;
     let log_key = load_or_create_log_keypair(&mut store)?;
-    if !had_keys {
+    // Code transparency: commit what this process will serve before it
+    // serves anything (docs/src/self-hosted-rendezvous.md). Appends only
+    // when the manifest changed since the last logged one.
+    let manifest_logged = record_artifact_manifest(&mut store, &config);
+    if !had_keys || manifest_logged {
         save_store(&config.data_file, &store).map_err(|e| format!("persist service keys: {e}"))?;
     }
     // Fleet DNS: build the zone, hydrate persisted records, and bind the
@@ -206,9 +215,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(log_consistency).options(orl_preflight),
         )
         .route("/api/log/find", get(log_find).options(orl_preflight))
+        .route(
+            "/api/log/artifact-manifest",
+            get(log_artifact_manifest).options(orl_preflight),
+        )
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
+        .route("/api/push/subscriptions", get(push_subscriptions))
+        .route("/api/push/preferences", post(push_preferences))
         .route("/api/push/test", post(push_test))
         .route(
             "/api/admin/invites",
@@ -230,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemon/error", post(daemon_error))
         .route("/api/daemon/claim-proof", post(daemon_claim_proof))
         .route("/api/daemon/unclaim", post(daemon_unclaim))
+        .route("/api/daemon/notify", post(daemon_notify))
         .route("/api/dns/publish", post(dns_publish))
         .route("/api/dns/acme-challenge", post(dns_acme_challenge))
         .route("/api/daemon/dry", post(daemon_dry))
@@ -581,6 +597,10 @@ struct PushSubscriptionRecord {
     /// Alert when a claimed daemon goes offline / comes back.
     #[serde(default)]
     notify_presence: bool,
+    /// Alert when an agent→user request (approval / question) goes unseen
+    /// on a claimed daemon. Opt-in; absent on pre-existing records = false.
+    #[serde(default)]
+    notify_requests: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

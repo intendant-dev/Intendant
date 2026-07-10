@@ -1025,6 +1025,7 @@ function buildSessionWindowLogEntry(c) {
   cnt.className = 'log-content';
   renderLogContentElement(cnt, c);
   appendLogStateBadges(cnt, c);
+  appendLogAttachmentStrip(cnt, c);
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);

@@ -111,11 +111,11 @@ fn cert_dir() -> PathBuf {
     crate::access::backend::select_backend().cert_dir()
 }
 
-fn cert_path() -> PathBuf {
+pub(crate) fn cert_path() -> PathBuf {
     cert_dir().join("fleet-cert.pem")
 }
 
-fn key_path() -> PathBuf {
+pub(crate) fn key_path() -> PathBuf {
     cert_dir().join("fleet-key.pem")
 }
 

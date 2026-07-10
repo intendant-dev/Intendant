@@ -18,6 +18,13 @@
 //! 4. **Docs** — [`render_endpoint_docs`] renders the endpoint table in
 //!    `docs/src/web-dashboard.md`; the `endpoint_docs_match_chapter`
 //!    drift test pins the chapter to it.
+//! 5. **Tunnel exposure** — a row's optional [`TunnelSpec`] declares its
+//!    dashboard-control datachannel twin. The tunnel's method table
+//!    (`dashboard_control::control_method_spec`) resolves these rows
+//!    first, then its residue `CONTROL_METHODS`, so a twinned method's
+//!    IAM operation derives from the same declaration HTTP gates on
+//!    (transport-unification design §2.2) instead of a second table that
+//!    can drift.
 //!
 //! **Never add an API route by editing the dispatch chain**: declare it
 //! here and give it a handler arm in `web_gateway.rs`'s table-dispatch
@@ -221,6 +228,7 @@ pub(crate) enum RouteHandlerId {
     McFission,
     WorktreesInspect,
     WorktreesRemove,
+    WorktreesMerge,
     WorktreesScan,
     WorktreesList,
     SessionsStream,
@@ -271,6 +279,70 @@ pub(crate) enum RouteHandlerId {
     McpStream,
 }
 
+/// Datachannel (dashboard-control tunnel) twin of a route row — the
+/// `tunnel:` column of the transport-unification design (§2.2). The wire
+/// method name is unchanged from its legacy `CONTROL_METHODS` entry: the
+/// datachannel wire never changes; the name becomes an alias of this
+/// row. The IAM operation gating the tunnel method is **derived from the
+/// row** ([`Route::tunnel_operation`]) — declaring it once is the point
+/// of the column: the two transports cannot drift apart again. (§2.2's
+/// `lanes`/`http_params` fields arrive with the migration stages that
+/// consume them; adding them before a consumer exists would be dead
+/// weight.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TunnelSpec {
+    /// Wire method name (e.g. `"api_fs_write"`), exactly as datachannel
+    /// clients send it in `t:"request"` frames.
+    pub(crate) name: &'static str,
+    /// Documented divergent-by-design IAM override. `None` — the default
+    /// and the point — derives the operation from the row's
+    /// [`RouteAuthz::Operation`]. `Some((op, reason))` gates the tunnel
+    /// method on `op` instead; the reason string is mandatory, and the
+    /// `tunnel_op_overrides_are_a_closed_documented_enumeration` test
+    /// pins the override list closed (design §2.7: the signed-org
+    /// doorbell rows — Public on HTTP, session-gated on the tunnel — are
+    /// the intended occupants when their family ports).
+    pub(crate) op_override: Option<(PeerOperation, &'static str)>,
+    /// Advertised in the tunnel `features` handshake (the legacy
+    /// `advertised` flag).
+    pub(crate) advertised: bool,
+    /// May also (or only) be delivered as an upload frame (the legacy
+    /// `upload` flag; feeds `authorize_dashboard_control_upload`).
+    pub(crate) upload: bool,
+}
+
+/// Advertised, non-upload tunnel twin (the common shape).
+const fn tunnel_method(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: true,
+        upload: false,
+    }
+}
+
+/// Advertised tunnel twin that may also arrive as an upload frame.
+const fn tunnel_uploadable(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: true,
+        upload: true,
+    }
+}
+
+/// Upload-frame-only tunnel twin: never dispatched on the request lane,
+/// advertised through the "upload_frames" transport feature rather than
+/// by name (the legacy `upload_only` shape).
+const fn tunnel_upload_only(name: &'static str) -> TunnelSpec {
+    TunnelSpec {
+        name,
+        op_override: None,
+        advertised: false,
+        upload: true,
+    }
+}
+
 pub(crate) struct Route {
     pub(crate) method: RouteMethod,
     pub(crate) pattern: PathPattern,
@@ -281,6 +353,42 @@ pub(crate) struct Route {
     /// One line, becomes the docs endpoint-table row. Required — an
     /// empty doc string fails the invariant test.
     pub(crate) doc: &'static str,
+    /// Datachannel exposure of this row. `None` = HTTP-only, or the
+    /// tunnel twin has not yet ported out of `CONTROL_METHODS` (the
+    /// transitional state the migration drains family by family; the
+    /// differential pin test in `dashboard_control` freezes which
+    /// methods live where).
+    pub(crate) tunnel: Option<TunnelSpec>,
+}
+
+impl Route {
+    /// Attach the row's datachannel twin (builder-style; rows are const).
+    const fn with_tunnel(mut self, spec: TunnelSpec) -> Route {
+        self.tunnel = Some(spec);
+        self
+    }
+
+    /// The IAM operation this row's tunnel twin gates on: the documented
+    /// override when declared, otherwise the row's own
+    /// [`RouteAuthz::Operation`]. `None` means no fail-closed derivation
+    /// exists (a non-`Operation` row without an override): the tunnel
+    /// method table skips such a row entirely, so the authorizer's
+    /// unknown-method deny is the runtime backstop, and the
+    /// `tunnel_specs_are_unique_and_derive_operations_fail_closed`
+    /// invariant test keeps the state unlandable. `PeerFederation` rows
+    /// will derive from `federation_http_operation` on the row's
+    /// canonical leaf when the peers family ports (design §2.2 / S7);
+    /// until then they too must declare an override to carry a tunnel.
+    pub(crate) fn tunnel_operation(&self) -> Option<PeerOperation> {
+        let spec = self.tunnel.as_ref()?;
+        if let Some((op, _reason)) = spec.op_override {
+            return Some(op);
+        }
+        match self.authz {
+            RouteAuthz::Operation(op) => Some(op),
+            RouteAuthz::Public | RouteAuthz::McpToken | RouteAuthz::PeerFederation => None,
+        }
+    }
 }
 
 /// Compact constructor for the common row shape: IAM-gated via a
@@ -301,6 +409,7 @@ const fn op_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -321,6 +430,7 @@ const fn fleet_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -340,6 +450,7 @@ const fn public_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -360,6 +471,7 @@ const fn federation_route(
         body,
         handler,
         doc,
+        tunnel: None,
     }
 }
 
@@ -370,6 +482,9 @@ const fn federation_route(
 pub(crate) static ROUTES: &[Route] = &[
     // ── Filesystem (scoped by authorize_http_filesystem_access; the GET
     //    trio is additionally pre-gated by peer_filesystem_query_request).
+    //    First family carrying the tunnel column: the datachannel twins'
+    //    IAM operations derive from these rows (their legacy
+    //    CONTROL_METHODS entries are gone).
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/stat"),
@@ -377,7 +492,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsStat,
         "Stat a filesystem path (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_stat")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/list"),
@@ -385,7 +501,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsList,
         "List a directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_list")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/read"),
@@ -393,7 +510,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::FsRead,
         "Read file bytes (scope-checked; supports byte ranges)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_read")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/mkdir"),
@@ -401,7 +519,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsMkdir,
         "Create a directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_mkdir")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/write"),
@@ -413,7 +532,10 @@ pub(crate) static ROUTES: &[Route] = &[
         ),
         RouteHandlerId::FsWrite,
         "Write file bytes (scope-checked; sha256-guarded overwrite)",
-    ),
+    )
+    // Tunnel-side the content may also ride upload frames (the JSON
+    // `content_b64` / upload-frame asymmetry is preserved by design).
+    .with_tunnel(tunnel_uploadable("api_fs_write")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/rename"),
@@ -421,7 +543,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsRename,
         "Move/rename a file or directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_rename")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/fs/delete"),
@@ -429,7 +552,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::FsDelete,
         "Delete a file or directory (scope-checked)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_fs_delete")),
     // ── Current-session routes (exact/subtree rows precede the generic
     //    session sub-router rows below).
     op_route(
@@ -439,7 +563,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionCurrentChanges,
         "List the session's changed files, or the unified diff for one file (subpath)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_changes")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/session/current/history"),
@@ -447,7 +572,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::CurrentHistory,
         "Serialized rollback History for the current session",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_history")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/rollback"),
@@ -455,7 +581,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentRollback,
         "Roll the current session back to a round (optionally reverting files)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_rollback")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),
@@ -463,7 +590,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentRedo,
         "Redo the last rolled-back round",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_redo")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/prune"),
@@ -471,7 +599,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentPrune,
         "Prune rollback state for the current session",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_prune")),
     // POST-shaped read (the body carries output ids; nothing is written).
     // Manage-gated only because the whole current/* family deliberately
     // is (see the sub-router comment below), not because it mutates.
@@ -482,7 +611,10 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::CurrentAgentOutput,
         "Fetch the current session's persisted agent output by id (POST-shaped read)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_agent_output")),
+    // The staged-upload POST's datachannel twin arrives only as upload
+    // frames (upload_start/chunk/end), never on the request lane.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/uploads"),
@@ -490,14 +622,44 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Streaming,
         RouteHandlerId::CurrentUploadsPost,
         "Upload a file attachment (raw streamed body; name/destination in query)",
-    ),
+    )
+    .with_tunnel(tunnel_upload_only("api_session_current_upload")),
+    // The uploads GET family: list (exact) and raw-fetch (segments) rows
+    // carved ahead of the Under catch-all so each carries its
+    // datachannel twin; all three share the handler, which routes by
+    // path (the catch-all keeps the handler-owned JSON 404 for unknown
+    // upload subpaths).
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/session/current/uploads"),
+        PeerOperation::SessionManage,
+        BodyPolicy::None,
+        RouteHandlerId::CurrentUploadsGet,
+        "List uploads for the current session",
+    )
+    .with_tunnel(tunnel_method("api_session_current_uploads")),
+    // Capture named `id`: the facade's HTTP adapter lifts template
+    // segments by name and the raw fetch's callers pass `{ id }` (the
+    // tunnel's primary alias) — pinned by the descriptor parity test.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session/current/uploads",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("raw")],
+        ),
+        PeerOperation::SessionManage,
+        BodyPolicy::None,
+        RouteHandlerId::CurrentUploadsGet,
+        "Fetch one upload's raw bytes (inline Content-Disposition)",
+    )
+    .with_tunnel(tunnel_method("api_session_current_upload_raw")),
     op_route(
         RouteMethod::Get,
         PathPattern::Under("/api/session/current/uploads"),
         PeerOperation::SessionManage,
         BodyPolicy::None,
         RouteHandlerId::CurrentUploadsGet,
-        "List uploads, or fetch one (subpath {id}/raw)",
+        "Unknown upload subpaths (handler-owned JSON 404)",
     ),
     op_route(
         RouteMethod::Delete,
@@ -509,10 +671,13 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::CurrentUploadDelete,
         "Delete one upload (file + sidecar)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_current_upload_delete")),
     // ── Session deletion. Five accepted wire shapes (native DELETE plus
     //    the WKWebView POST fallback with a literal `delete` suffix); one
     //    handler serves all of them by filtering the `delete` segment.
+    //    The datachannel twin rides the canonical shape below (one tunnel
+    //    name per row; all five rows share the operation and handler).
     op_route(
         RouteMethod::Delete,
         PathPattern::Segments("/api/session", &[SegmentSpec::Capture("id")]),
@@ -520,7 +685,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionDelete,
         "Delete a session's data",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_delete")),
     op_route(
         RouteMethod::Delete,
         PathPattern::Segments(
@@ -574,15 +740,14 @@ pub(crate) static ROUTES: &[Route] = &[
         "Delete one data kind for a session (POST fallback)",
     ),
     // POST-shaped read: the body carries output ids and the handler
-    // (`session_agent_output_post_response`) only fetches persisted
+    // (`session_agent_output_api_response`) only fetches persisted
     // stdout/stderr chunks back out of the session's log — nothing is
     // appended, so it is inspect-grade like every other by-id session
     // read. The legacy verb-shaped classifier (POST under /api/session ⇒
-    // manage) mis-tagged it and diverged from the tunnel twin
-    // `api_session_agent_output`. Keep the two lanes' operations equal
-    // (pinned by dashboard_control's
-    // `formerly_divergent_twins_gate_identically_on_both_lanes`) until
-    // transport unification derives the tunnel op from this row.
+    // manage) mis-tagged it and diverged from the tunnel twin — now the
+    // twin is this row's tunnel column and its operation derives from
+    // here (`formerly_divergent_twins_gate_identically_on_both_lanes`
+    // stays as the end-to-end assertion).
     op_route(
         RouteMethod::Post,
         PathPattern::Segments(
@@ -596,7 +761,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::SessionAgentOutput,
         "Fetch a session's persisted agent output by id (POST-shaped read)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_session_agent_output")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
     //    split (current/* manage-gated on every method; {id} inspect on
@@ -617,13 +783,103 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::SessionSubRouter,
         "Current-session detail sub-routes (POST fallback callers)",
     ),
+    // Converted read leaves of the method-blind catch-all, carved as
+    // method-explicit rows so each can carry its datachannel twin
+    // (transport-unification S4a; one tunnel name per row). Same
+    // operation and shared handler as the Under rows they were served by
+    // — classification-preserving; the generic rows below keep the
+    // unconverted artifact leaves and the POST-fallback callers.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("context-snapshot"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Replay one archived context snapshot (file/request_id/request_index/ts selector)",
+    )
+    .with_tunnel(tunnel_method("api_session_context_snapshot")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("report")],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session report zip (text artifacts; id=current targets the live session)",
+    )
+    .with_tunnel(tunnel_method("api_session_report")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("recordings"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "List a session's recording streams",
+    )
+    .with_tunnel(tunnel_method("api_session_recordings")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("recordings"),
+                SegmentSpec::Capture("stream"),
+                SegmentSpec::Capture("asset"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Recording assets: segments listing, playlist.m3u8, or a segment file",
+    )
+    .with_tunnel(tunnel_method("api_session_recording_asset")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("frames"),
+                SegmentSpec::Capture("filename"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session frame image asset",
+    )
+    .with_tunnel(tunnel_method("api_session_frame_asset")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments("/api/session", &[SegmentSpec::Capture("id")]),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionSubRouter,
+        "Session detail (paged replay entries; limit/before/source)",
+    )
+    .with_tunnel(tunnel_method("api_session_detail")),
     op_route(
         RouteMethod::Get,
         PathPattern::Under("/api/session"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionSubRouter,
-        "Session detail; context-snapshot, recordings (+segments/playlist), report zip, frames",
+        "Session artifact sub-routes: recordings (+segments/playlist), report zip, frames",
     ),
     op_route(
         RouteMethod::Post,
@@ -641,7 +897,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McAnchors,
         "Managed-context anchor catalog",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_anchors")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/managed-context/records"),
@@ -649,7 +906,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McRecords,
         "Managed-context record index",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_records")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/managed-context/fission"),
@@ -657,7 +915,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::McFission,
         "Managed-context fission state",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_managed_context_fission")),
     // ── Worktrees.
     op_route(
         RouteMethod::Post,
@@ -666,7 +925,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::WorktreesInspect,
         "Inspect one worktree (branch, ahead/behind, dirty state)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_inspect")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/remove"),
@@ -674,7 +934,17 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::WorktreesRemove,
         "Remove a worktree from the inventory",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_remove")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/worktrees/merge"),
+        PeerOperation::SessionManage,
+        BodyPolicy::Default,
+        RouteHandlerId::WorktreesMerge,
+        "Merge a session's linked worktree branch into its base checkout, then remove the checkout",
+    )
+    .with_tunnel(tunnel_method("api_worktrees_merge")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/scan"),
@@ -682,7 +952,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::WorktreesScan,
         "Rescan the worktree inventory (refreshes the cache)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees_scan")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/worktrees"),
@@ -690,7 +961,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::WorktreesList,
         "Cached worktree inventory",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_worktrees")),
     // ── Session listing. The stream/search rows close a historical gap:
     //    dispatch served them but the hand classifier never gated them
     //    for browser principals (peers were already SessionInspect-gated
@@ -711,7 +983,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionsSearch,
         "Search sessions (q, source, mode, project filters)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_sessions_search")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
@@ -719,7 +992,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionsList,
         "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_sessions")),
     // ── Settings / info endpoints. Ported method-blind from the legacy
     //    chain as `Any` rows, then tightened to their real methods: an
     //    undeclared method on a declared path now gets the dispatch-level
@@ -1034,6 +1308,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::Capped(MCP_BODY_CAP_BYTES),
         handler: RouteHandlerId::McpPost,
         doc: "MCP Streamable HTTP endpoint (JSON-RPC requests + notifications)",
+        tunnel: None,
     },
     Route {
         method: RouteMethod::Get,
@@ -1043,6 +1318,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::None,
         handler: RouteHandlerId::McpStream,
         doc: "MCP SSE stream (405: stateless server)",
+        tunnel: None,
     },
     Route {
         method: RouteMethod::Delete,
@@ -1052,6 +1328,7 @@ pub(crate) static ROUTES: &[Route] = &[
         body: BodyPolicy::None,
         handler: RouteHandlerId::McpStream,
         doc: "MCP session delete (405: stateless server)",
+        tunnel: None,
     },
 ];
 
@@ -1145,6 +1422,17 @@ pub(crate) fn classify(req_method: &str, req_path: &str) -> TableClassification 
         }),
         None => TableClassification::NoMatch,
     }
+}
+
+/// Every (route, tunnel spec) pair, in declaration order — the ROW half
+/// of the tunnel method partition. `dashboard_control` unions this with
+/// its residue `CONTROL_METHODS` (rows first) to build the effective
+/// method table; its differential pin test freezes exactly which methods
+/// live on which side.
+pub(crate) fn tunnel_specs() -> impl Iterator<Item = (&'static Route, &'static TunnelSpec)> {
+    ROUTES
+        .iter()
+        .filter_map(|route| route.tunnel.as_ref().map(|spec| (route, spec)))
 }
 
 /// CORS/preflight posture for a path: the first row matching it on any
@@ -1445,6 +1733,7 @@ mod tests {
         // Handlers deliberately serving several wire shapes; their rows
         // must be contiguous so the sharing is visible in the table.
         let shared: &[RouteHandlerId] = &[
+            RouteHandlerId::CurrentUploadsGet,
             RouteHandlerId::SessionDelete,
             RouteHandlerId::SessionSubRouter,
             RouteHandlerId::AccessIamGrants,
@@ -1648,6 +1937,24 @@ mod tests {
         let (route, captures) = match_route("DELETE", "/api/session/current/uploads/u1").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentUploadDelete);
         assert_eq!(captures, vec!["u1"]);
+        // The uploads GET family: list on the exact row, raw fetch on the
+        // segments row, anything else on the Under catch-all — all three
+        // share the handler (declared shared group), so the carve is
+        // routing-neutral; it exists to give list and raw their own
+        // datachannel twins.
+        let (route, captures) = match_route("GET", "/api/session/current/uploads").unwrap();
+        assert_eq!(route.pattern, PathPattern::Exact("/api/session/current/uploads"));
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_uploads"));
+        assert!(captures.is_empty());
+        let (route, captures) = match_route("GET", "/api/session/current/uploads/u1/raw").unwrap();
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_upload_raw"));
+        assert_eq!(captures, vec!["u1"]);
+        let (route, _) = match_route("GET", "/api/session/current/uploads/u1/other").unwrap();
+        assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
+        assert_eq!(route.pattern, PathPattern::Under("/api/session/current/uploads"));
+        assert!(route.tunnel.is_none());
         // Agent-output: current-exact row first, then the by-id row.
         let (route, _) = match_route("POST", "/api/session/current/agent-output").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentAgentOutput);
@@ -1733,6 +2040,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tunnel_specs_are_unique_and_derive_operations_fail_closed() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (route, spec) in tunnel_specs() {
+            assert!(
+                seen.insert(spec.name),
+                "tunnel method {} is declared on more than one row",
+                spec.name,
+            );
+            // The status `<method>_available` derivation keys on the
+            // api_ prefix; a differently-named tunnel method would
+            // silently lose its availability boolean.
+            assert!(
+                spec.name.starts_with("api_"),
+                "tunnel method {} must be api_-prefixed",
+                spec.name,
+            );
+            // Fail-closed derivation must exist: a Public / McpToken /
+            // PeerFederation row may only carry a tunnel twin with an
+            // explicit documented op override — otherwise the method
+            // would resolve to nothing and (correctly, but uselessly) be
+            // denied as unknown.
+            assert!(
+                route.tunnel_operation().is_some(),
+                "tunnel method {} has no derivable IAM operation: \
+                 non-Operation rows must declare an op_override",
+                spec.name,
+            );
+        }
+    }
+
+    /// The op-override slot is a closed, documented enumeration (design
+    /// §2.7 / risk R2): every override names its reason, and this test
+    /// pins the exact set so a tunnel/HTTP divergence can only ever be
+    /// added deliberately. Empty today — S0 (PR #128) settled the two
+    /// formerly-divergent twins identically on both lanes, so the first
+    /// legitimate entries arrive with the signed-org doorbell rows
+    /// (Public on HTTP, session-gated on the tunnel) when their family
+    /// ports.
+    #[test]
+    fn tunnel_op_overrides_are_a_closed_documented_enumeration() {
+        let documented: &[&str] = &[];
+        let mut actual: Vec<&str> = Vec::new();
+        for (_, spec) in tunnel_specs() {
+            if let Some((_, reason)) = spec.op_override {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "tunnel op override on {} must state a non-empty reason",
+                    spec.name,
+                );
+                actual.push(spec.name);
+            }
+        }
+        actual.sort_unstable();
+        assert_eq!(
+            actual, documented,
+            "tunnel op overrides drifted from the documented divergence set",
+        );
     }
 
     /// The docs chapter's generated endpoint table must equal the one

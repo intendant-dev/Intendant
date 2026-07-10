@@ -46,6 +46,12 @@ pub struct McpAppState {
     pub should_quit: bool,
     /// Session log directory for askHuman files.
     pub log_dir: std::path::PathBuf,
+    /// The daemon's project root, when it serves one. Must match the web
+    /// gateway's `project_root_for_changes` so upload-store writes made by
+    /// MCP tools (`post_session_note` image commits) resolve to the same
+    /// [`crate::global_store::StoreScope`] the gateway's
+    /// `/api/session/current/uploads/<id>/raw` route reads from.
+    pub project_root: Option<std::path::PathBuf>,
     pub(crate) controller_loop_dir_override: Option<std::path::PathBuf>,
     pub(crate) controller_loop_status_override: Option<serde_json::Value>,
     /// Test override for the home that anchors persisted-session lookup
@@ -122,6 +128,14 @@ pub struct McpAppState {
     /// reaches rewind-only, keyed by Intendant/backend session id.
     density_maintenance_satisfied:
         std::collections::HashMap<String, DensityMaintenanceSatisfaction>,
+    /// Whether a human-facing frontend can (now or later) answer blocking
+    /// questions raised through this server: the web-gateway shape sets it
+    /// (a dashboard can always attach while the ask waits) and the stdio
+    /// MCP shape sets it (the client supervisor sees the question and can
+    /// answer). Defaults to `false` — with no answerable frontend,
+    /// `ask_user` auto-answers immediately with best-judgment guidance
+    /// instead of blocking on nobody.
+    pub interactive_frontends: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +201,7 @@ impl McpAppState {
             human_question: None,
             should_quit: false,
             log_dir,
+            project_root: None,
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
             session_logs_home_override: None,
@@ -220,6 +235,7 @@ impl McpAppState {
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
             insufficient_rewind_notices: std::collections::HashMap::new(),
             density_maintenance_satisfied: std::collections::HashMap::new(),
+            interactive_frontends: false,
         }
     }
 

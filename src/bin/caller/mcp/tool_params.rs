@@ -72,6 +72,84 @@ pub struct StartTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionNoteImageParams {
+    /// Image MIME type: image/png, image/jpeg, image/gif, image/webp, or image/bmp.
+    pub media_type: String,
+    /// Base64-encoded image bytes (standard alphabet; an optional data-URL prefix is tolerated).
+    pub data: String,
+    /// Optional display filename for the attachment.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PostSessionNoteParams {
+    /// Note text shown in the session transcript. Plain text (rendered escaped).
+    pub text: String,
+    /// Optional target session id. Omit to post into the calling session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Optional short source label shown on the entry (e.g. "codex"). Defaults to "note".
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Optional images to attach. Each is committed to the session upload store and rendered as a clickable thumbnail.
+    #[serde(default)]
+    pub images: Vec<SessionNoteImageParams>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskUserOptionParams {
+    /// Short option label the user clicks (also the answer value returned).
+    pub label: String,
+    /// Optional one-line explanation of what choosing this option means.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskUserParams {
+    /// The question to ask the user. Keep it self-contained — it renders on
+    /// the dashboard question rail without surrounding context.
+    pub question: String,
+    /// Optional very short topic chip (e.g. "Auth method").
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Structured choices (0..=4). With zero options the rail shows a
+    /// free-text field only; free-text answers are always allowed on top.
+    #[serde(default)]
+    pub options: Vec<AskUserOptionParams>,
+    /// Allow selecting multiple options (answers join with ", ").
+    #[serde(default)]
+    pub multi_select: Option<bool>,
+    /// How long to block waiting for the answer, in seconds
+    /// (default 300, max 900). On timeout the call returns a structured
+    /// timeout result telling the agent to proceed on its best judgment.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+    /// Optional target session id. Omit to ask as the calling session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NotifyUserParams {
+    /// Notification text shown to the user. Plain text (rendered escaped).
+    pub text: String,
+    /// Optional short title (e.g. "Build finished").
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Delivery urgency: "info" (default; dashboard toast + transcript row),
+    /// "attention" (+ tab badge and hidden-tab browser notification), or
+    /// "urgent" (+ immediate push nudge to the owner's opted-in browsers —
+    /// reserve for being blocked).
+    #[serde(default)]
+    pub urgency: Option<String>,
+    /// Optional target session id. Omit to notify as the calling session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RewindContextAnchorParams {
     /// Exact Codex thread item/tool-call id to roll back to. Once a rewind is needed, use list_rewind_anchors first when the id is not already known.
     pub item_id: String,
@@ -269,6 +347,26 @@ pub struct RevokeUserDisplayParams {
     /// Optional note explaining why access was revoked.
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestUserDisplayParams {
+    /// Short justification shown to the user in the request popup
+    /// (required; capped at 280 bytes).
+    pub reason: String,
+    /// Access level to request: "view" (the agent can see the display
+    /// stream/frames; no input) or "view_and_control" (the full
+    /// user-display grant: screenshots + input). Default: "view".
+    #[serde(default)]
+    pub access: Option<String>,
+    /// How long to wait for the user's decision, in seconds.
+    /// Default 120, capped at 600. Timing out counts as a decline.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+    /// Session the request is attributed to. Normally injected from the
+    /// session-scoped MCP URL; explicit values win.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
