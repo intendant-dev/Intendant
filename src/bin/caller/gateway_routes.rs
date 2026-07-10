@@ -1208,7 +1208,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessEnrollmentRequests,
         "Pending enrollment requests",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_enrollment_requests")),
     fleet_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/access/iam/state"),
@@ -1216,7 +1217,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessIamState,
         "Local IAM state (roles, grants, bindings)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_iam_state")),
     fleet_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/access/overview"),
@@ -1224,7 +1226,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessOverview,
         "Access overview for the calling principal",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_overview")),
     // ── Connect rendezvous administration. Status is inspect-grade but
     //    never carries the claim phrase; the phrase reveal is its own
     //    manage-gated route so the one secret-bearing response has the
@@ -1236,7 +1239,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessConnectStatus,
         "Connect rendezvous status (claim state, binding provenance; no claim phrase)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_connect_status")),
     fleet_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/access/connect/claim-code"),
@@ -1244,7 +1248,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::AccessConnectClaimCode,
         "Reveal the current twelve-word claim phrase (unclaimed daemons only)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_connect_claim_code")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/connect/config"),
@@ -1252,7 +1257,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessConnectConfig,
         "Enable/disable the Connect client (persists to intendant.toml, applies live)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_connect_config")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/connect/unclaim"),
@@ -1260,7 +1266,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessConnectUnclaim,
         "Release this daemon's claim binding at the rendezvous (daemon-signed)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_connect_unclaim")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/tier"),
@@ -1268,7 +1275,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessTierSettings,
         "Set this daemon's trust tier label (integrated/disposable; null clears)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_set_tier")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/hosted-ceiling"),
@@ -1276,7 +1284,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::AccessTierSettings,
         "Set the hosted-control ceiling role for hosted-provenance sessions",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_access_set_hosted_ceiling")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/dashboard/targets"),
@@ -1284,7 +1293,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::DashboardTargets,
         "Dashboard target list (this daemon + connected peers)",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_dashboard_targets")),
     // ── Federation surface: registry, pairing, quick controls,
     //    capability routing. The peers sub-router keeps its method-`Any`
     //    catch-all row on purpose: IAM already classifies per leaf through

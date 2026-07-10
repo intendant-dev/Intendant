@@ -54,6 +54,53 @@ pub(crate) fn frame_api_json_body_response(
     }
 }
 
+/// Tunnel adapter for the access family's historical ok/error envelope:
+/// a 2xx JSON body renders as `{t:"response", id, ok:true,
+/// result:<body>}` — the body-only shape, no `_httpStatus` metadata
+/// (this family predates the injected-status envelope) — while an error
+/// status surfaces the body's `error` string as the frame-level
+/// `{ok:false, error}` shape the family has always answered with. A
+/// byte response on these JSON-only methods is a wiring bug and fails
+/// closed.
+pub(crate) fn frame_api_ok_error_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { status, body, .. } => {
+            let body = body.into_string();
+            if (200..300).contains(&status) {
+                return json_body_response(id, body, label);
+            }
+            // The family's error bodies are the shared cores'
+            // `{"error": <string>}` shape; the frame carries the string
+            // itself (with the whole body as a defensive fallback).
+            let error = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or(body);
+            serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": error,
+            })
+        }
+        crate::web_gateway::ApiResponse::Bytes { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected byte response"),
+        }),
+    }
+}
+
 /// Tunnel adapter for byte-capable methods: `Bytes` becomes a
 /// `byte_stream_start/chunk/end` sequence — chunking, credits, and
 /// backpressure stay wire.rs-owned — with the neutral fn's `meta`
@@ -562,40 +609,46 @@ pub(crate) fn control_frame_response(
                         "error": "peer registry unavailable",
                     })),
                 },
-                "api_dashboard_targets" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::dashboard_targets_response_value(
+                // The access inspect/connect/tier twins delegate to the
+                // S6 neutral cores under the family's historical
+                // ok/error envelope; the transport edge resolves the
+                // ambient cert dir (hermeticity convention).
+                "api_dashboard_targets" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::dashboard_targets_api_response(
                         &runtime.agent_card,
                         runtime.peer_registry.as_ref(),
                     ),
-                })),
+                    "dashboard targets",
+                )),
                 "api_access_overview" => {
                     let current_principal = runtime.grant.access_principal();
-                    Some(serde_json::json!({
-                        "t": "response",
-                        "id": id,
-                        "ok": true,
-                        "result": crate::web_gateway::access_overview_response_value_for_principal(
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_overview_api_response(
+                            &cert_dir,
                             &runtime.agent_card,
                             runtime.peer_registry.as_ref(),
-                            Some(&current_principal),
+                            &current_principal,
                         ),
-                    }))
+                        "access overview",
+                    ))
                 }
-                "api_access_iam_state" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_iam_state_response_value(),
-                })),
-                "api_access_enrollment_requests" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_enrollment_requests_response_value(),
-                })),
+                "api_access_iam_state" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_iam_state_api_response(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
+                    "access iam state",
+                )),
+                "api_access_enrollment_requests" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_enrollment_requests_api_response(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
+                    "access enrollment requests",
+                )),
                 "api_access_enrollment_decide" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     match crate::web_gateway::access_enrollment_decide_response_value(
@@ -616,60 +669,43 @@ pub(crate) fn control_frame_response(
                         })),
                     }
                 }
-                "api_access_connect_status" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_connect_status_response_value(),
-                })),
-                "api_access_connect_claim_code" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_connect_claim_code_response_value(),
-                })),
+                "api_access_connect_status" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_connect_status_api_response(),
+                    "connect status",
+                )),
+                "api_access_connect_claim_code" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_connect_claim_code_api_response(),
+                    "connect claim code",
+                )),
                 "api_access_connect_config" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_connect_config_response_value(
-                        params,
-                        runtime.project_root.as_deref(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_connect_config_api_response(
+                            params,
+                            runtime.project_root.as_deref(),
+                        ),
+                        "connect config",
+                    ))
                 }
                 "api_access_set_tier" | "api_access_set_hosted_ceiling" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let actor = runtime.grant.access_principal();
-                    let result = if method == "api_access_set_hosted_ceiling" {
-                        crate::web_gateway::access_set_hosted_ceiling_response_value(params, &actor)
-                    } else {
-                        crate::web_gateway::access_set_tier_response_value(params, &actor)
-                    };
-                    match result {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_tier_settings_api_response(
+                            &cert_dir,
+                            method == "api_access_set_hosted_ceiling",
+                            params,
+                            &actor,
+                        ),
+                        "trust tier settings",
+                    ))
                 }
                 "api_fleet_cert_request" => {
                     // Optional explicit addresses; default = every

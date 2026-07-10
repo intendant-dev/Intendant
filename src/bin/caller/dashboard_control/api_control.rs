@@ -2289,6 +2289,231 @@ mod tests {
         assert_eq!(frame["error"], "missing body");
     }
 
+    // ── S6 tunnel/HTTP parity: access inspect/connect/tier family ──
+    //
+    // Extends the S4/S5 enumerations. The S6-specific envelope
+    // differences, deliberate and pinned across this set (the org and
+    // grant-mutation slices extend it):
+    //
+    //  10. The ok/error envelope: this family predates `_httpStatus` —
+    //      2xx bodies ride the body-only `{t,id,ok:true,result}` frame,
+    //      and error statuses surface the shared cores' `{"error": …}`
+    //      body as the frame-level `{ok:false, error}` shape
+    //      (frame_api_ok_error_response). No status metadata on either
+    //      shape.
+    //  11. Fleet-CORS decoration is HTTP-lane-only: the fleet-allowlist
+    //      origin echo + `Vary: Origin` — and the historical
+    //      undecorated shapes underneath it (the belt-and-suspenders
+    //      manage-recheck 403, the tier pair's parse-error 400) — never
+    //      appear on the tunnel (the golden transcripts in
+    //      routes_access.rs pin the HTTP side).
+    //  12. The manage re-check is an HTTP-edge belt: the tunnel's
+    //      equivalent gate is the pre-dispatch method authorizer (the
+    //      row-derived operation), whose denial is the authorizer's own
+    //      `{ok:false, error:"…is not allowed…"}` frame, not a 403
+    //      body.
+    //  13. Transport-owned request carriage: the tunnel's params object
+    //      is the canonical shape (§2.1) and absent params read as
+    //      `{}`; HTTP parses its body text at the edge with the
+    //      historical wordings ("invalid request body: …"), so
+    //      parse-failure shapes are HTTP-only.
+    //  14. Store resolution at the edges: both lanes resolve the
+    //      ambient cert dir / project root at their dispatch arms and
+    //      hand paths to the shared cores (hermeticity convention) —
+    //      these fixtures inject tempdirs and never touch the live
+    //      account's stores.
+
+    #[tokio::test]
+    async fn parity_dashboard_targets_rides_the_ok_error_envelope() {
+        // Both lanes render the ONE neutral fn over the same inputs (an
+        // empty agent card, no registry — the deterministic local-only
+        // list).
+        let card = serde_json::json!({});
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::dashboard_targets_api_response(&card, None),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-targets".to_string(),
+            crate::web_gateway::dashboard_targets_api_response(&card, None),
+            "dashboard targets",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_access_inspect_reads_share_bodies_over_an_injected_cert_dir() {
+        // iam/state and enrollment-requests: deterministic empty-store
+        // bodies from the one core each, body-only envelope on the
+        // tunnel.
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_iam_state_api_response(tmp.path()),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-iam-state".to_string(),
+            crate::web_gateway::access_iam_state_api_response(tmp.path()),
+            "access iam state",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+        assert_eq!(frame["result"]["schema_version"], 1);
+
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_enrollment_requests_api_response(tmp.path()),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-enrollment".to_string(),
+            crate::web_gateway::access_enrollment_requests_api_response(tmp.path()),
+            "access enrollment requests",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+
+        // Overview: same principal, same card, same store on both lanes.
+        let card = serde_json::json!({});
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_overview_api_response(tmp.path(), &card, None, &principal),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-overview".to_string(),
+            crate::web_gateway::access_overview_api_response(tmp.path(), &card, None, &principal),
+            "access overview",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_access_tier_settings_shares_the_core_across_lanes() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+
+        // Validation error: the shared core's wording surfaces as the
+        // HTTP `{"error"}` body and the tunnel's frame-level error
+        // (difference #10) — no store touched.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                false,
+                serde_json::json!({"tier": 123}),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "tier must be a string or null"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-tier-bad".to_string(),
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                false,
+                serde_json::json!({"tier": 123}),
+                &actor,
+            ),
+            "trust tier settings",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "tier must be a string or null");
+
+        // Success over the injected store: both lanes set the tier
+        // through the one core (the `iam` overview metadata carries
+        // store fingerprints, so equality is asserted on the mutation's
+        // own fields).
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                false,
+                serde_json::json!({"tier": "disposable"}),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body["tier"], "disposable");
+        let frame = frame_api_ok_error_response(
+            "parity-tier".to_string(),
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                false,
+                serde_json::json!({"tier": "disposable"}),
+                &actor,
+            ),
+            "trust tier settings",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"]["tier"], "disposable");
+        assert_eq!(frame["result"]["schema_version"], http_body["schema_version"]);
+
+        // Hosted ceiling validation on both lanes.
+        let frame = frame_api_ok_error_response(
+            "parity-ceiling-bad".to_string(),
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                true,
+                serde_json::json!({}),
+                &actor,
+            ),
+            "trust tier settings",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "role_id is required");
+    }
+
+    #[tokio::test]
+    async fn parity_connect_config_and_unclaim_deterministic_errors() {
+        // Connect config, missing `enabled`: the shared validation
+        // error before any store access, on both lanes.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_connect_config_api_response(serde_json::json!({}), None),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "enabled must be true or false"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-connect-config".to_string(),
+            crate::web_gateway::access_connect_config_api_response(serde_json::json!({}), None),
+            "connect config",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "enabled must be true or false");
+
+        // Unclaim over a tempdir project root: the deterministic
+        // no-rendezvous error through the tunnel twin fn (the live
+        // release path stays smoke-covered). The tempdir root keeps the
+        // store off the daemon-scoped connect.toml.
+        let dir = tempfile::tempdir().expect("temp project root");
+        let mut rt = runtime();
+        rt.project_root = Some(dir.path().to_path_buf());
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_connect_unclaim_api_response(
+                Some(dir.path().to_path_buf()),
+            )
+            .await,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "no rendezvous_url configured"})
+        );
+        let frame = api_access_connect_unclaim_response("parity-unclaim".to_string(), &rt).await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "no rendezvous_url configured");
+    }
+
     use crate::*;
     use crate::dashboard_control::tests::{runtime};
 

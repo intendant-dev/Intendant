@@ -143,21 +143,12 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_cached_bootstrap_events", PeerOperation::SessionInspect),
     internal("subscribe_events", PeerOperation::SessionInspect),
     internal("unsubscribe_events", PeerOperation::SessionInspect),
-    method("api_access_overview", PeerOperation::AccessInspect),
-    method("api_access_iam_state", PeerOperation::AccessInspect),
-    method("api_access_enrollment_requests", PeerOperation::AccessInspect),
-    method("api_dashboard_targets", PeerOperation::AccessInspect),
-    // Connect rendezvous administration. Status is inspect-grade and
-    // never carries the claim phrase; the phrase reveal, config toggle,
-    // and unclaim are manage-gated (mirrors the HTTP route rows).
-    method("api_access_connect_status", PeerOperation::AccessInspect),
-    method("api_access_connect_claim_code", PeerOperation::AccessManage),
-    method("api_access_connect_config", PeerOperation::AccessManage),
-    method("api_access_connect_unclaim", PeerOperation::AccessManage),
-    // Trust-tier settings (docs/src/trust-tiers.md): the tier label and
-    // the hosted-control ceiling knob (mirrors the HTTP route rows).
-    method("api_access_set_tier", PeerOperation::AccessManage),
-    method("api_access_set_hosted_ceiling", PeerOperation::AccessManage),
+    // The access inspect reads (api_access_overview, api_access_iam_state,
+    // api_access_enrollment_requests, api_dashboard_targets), the connect
+    // admin quartet (status, claim-code, config, unclaim), and the
+    // trust-tier pair (set_tier, set_hosted_ceiling) live as tunnel
+    // columns on their route rows — their IAM operations derive from the
+    // rows (S6).
     // Fleet certificate: publish this daemon's addresses for its fleet
     // name and run the ACME DNS-01 order (fleet_cert.rs). Slow flow,
     // started async; progress rides the connect status payload.
@@ -3019,34 +3010,34 @@ mod tests {
             ),
             ("subscribe_events", Residue, Some(Op::SessionInspect)),
             ("unsubscribe_events", Residue, Some(Op::SessionInspect)),
-            ("api_access_overview", Residue, Some(Op::AccessInspect)),
-            ("api_access_iam_state", Residue, Some(Op::AccessInspect)),
+            ("api_access_overview", Row, Some(Op::AccessInspect)),
+            ("api_access_iam_state", Row, Some(Op::AccessInspect)),
             (
                 "api_access_enrollment_requests",
-                Residue,
+                Row,
                 Some(Op::AccessInspect),
             ),
-            ("api_dashboard_targets", Residue, Some(Op::AccessInspect)),
+            ("api_dashboard_targets", Row, Some(Op::AccessInspect)),
             (
                 "api_access_connect_status",
-                Residue,
+                Row,
                 Some(Op::AccessInspect),
             ),
             (
                 "api_access_connect_claim_code",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_access_connect_config", Residue, Some(Op::AccessManage)),
+            ("api_access_connect_config", Row, Some(Op::AccessManage)),
             (
                 "api_access_connect_unclaim",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_access_set_tier", Residue, Some(Op::AccessManage)),
+            ("api_access_set_tier", Row, Some(Op::AccessManage)),
             (
                 "api_access_set_hosted_ceiling",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             ("api_fleet_cert_request", Residue, Some(Op::AccessManage)),

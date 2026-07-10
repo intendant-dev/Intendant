@@ -128,14 +128,18 @@ pub(crate) fn dashboard_targets_response_body(
 /// gives every dashboard route the same vocabulary - principals, targets,
 /// grants, policies, and transports - while the existing mTLS, Connect, and
 /// peer-profile paths continue to enforce their current rules.
+/// `cert_dir` arrives from the transport edges (the identity and IAM
+/// stores are read under it), so tests inject a tempdir instead of
+/// reading the live account's stores (the CLAUDE.md tests-are-hermetic
+/// convention).
 pub(crate) fn access_overview_response_value_for_principal(
+    cert_dir: &std::path::Path,
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
-    let inbound_peer_identities = access_overview_inbound_peer_identities();
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let iam_state = crate::access::iam::load_state_for_overview(&cert_dir);
+    let inbound_peer_identities = access_overview_inbound_peer_identities(cert_dir);
+    let iam_state = crate::access::iam::load_state_for_overview(cert_dir);
     access_overview_response_value_with_identities_and_iam(
         agent_card,
         registry,
@@ -146,9 +150,9 @@ pub(crate) fn access_overview_response_value_for_principal(
 }
 
 pub(crate) fn access_overview_inbound_peer_identities(
+    cert_dir: &std::path::Path,
 ) -> Vec<crate::peer::access_policy::PeerIdentityRecord> {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    match crate::peer::access_policy::list_identities(&cert_dir) {
+    match crate::peer::access_policy::list_identities(cert_dir) {
         Ok(records) => records,
         Err(e) => {
             eprintln!("intendant: failed to list inbound peer identities for access overview: {e}");
@@ -158,16 +162,15 @@ pub(crate) fn access_overview_inbound_peer_identities(
 }
 
 pub(crate) async fn handle_dashboard_targets(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     peer_registry: Option<crate::peer::PeerRegistry>,
     agent_card_value_for_targets: serde_json::Value,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body =
-        dashboard_targets_response_body(&agent_card_value_for_targets, peer_registry.as_ref());
-    let response = json_response("200 OK", body);
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response =
+        dashboard_targets_api_response(&agent_card_value_for_targets, peer_registry.as_ref());
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_org_grant_present(
@@ -402,25 +405,23 @@ pub(crate) async fn handle_access_enrollment_decide(
 }
 
 pub(crate) async fn handle_access_enrollment_requests(
-    mut stream: DemuxStream,
-    fleet_cors_origin: Option<String>,
+    stream: DemuxStream,
+    cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body = access_enrollment_requests_response_body();
-    let response = with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = access_enrollment_requests_api_response(&cert_dir);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_iam_state(
-    mut stream: DemuxStream,
-    fleet_cors_origin: Option<String>,
+    stream: DemuxStream,
+    cert_dir: std::path::PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body = access_iam_state_response_body();
-    let response = with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = access_iam_state_api_response(&cert_dir);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Connect status for the Access card — inspect-grade. Everything EXCEPT
@@ -473,14 +474,11 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
 }
 
 pub(crate) async fn handle_access_connect_status(
-    mut stream: DemuxStream,
-    fleet_cors_origin: Option<String>,
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body = access_connect_status_response_value().to_string();
-    let response = with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, access_connect_status_api_response(), cors, fleet_origin).await;
 }
 
 pub(crate) fn access_connect_claim_code_response_value() -> serde_json::Value {
@@ -495,36 +493,36 @@ pub(crate) fn access_connect_claim_code_response_value() -> serde_json::Value {
 }
 
 pub(crate) async fn handle_access_connect_claim_code(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
     // Belt and suspenders on the one secret-bearing response: the
     // pre-dispatch gate already enforced AccessManage from the route
     // row; re-verify so a dispatch refactor can't quietly downgrade the
-    // claim phrase to inspect-grade.
+    // claim phrase to inspect-grade. The denial keeps its historical
+    // PLAIN tail (own-origin render, no fleet echo).
     let decision =
         http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
     if !decision.allowed {
-        let response = json_response(
-            "403 Forbidden",
-            serde_json::json!({
-                "error": "principal does not allow this operation",
-                "principal": http_access_context.principal.as_value(),
-                "permission": decision.permission,
-                "reason": decision.reason,
-            })
-            .to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let body = access_connect_claim_code_response_value().to_string();
-        let response =
-            with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
-        let _ = stream.write_all(response.as_bytes()).await;
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    write_api_response(
+        stream,
+        access_connect_claim_code_api_response(),
+        cors,
+        fleet_origin,
+    )
+    .await;
 }
 
 /// Enable/disable the Connect client: persist `[connect]` to the
@@ -577,96 +575,59 @@ fn access_connect_config_response_value_in(
 }
 
 pub(crate) async fn handle_access_connect_config(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     http_access_context: HttpAccessContext,
     project_root: Option<std::path::PathBuf>,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let (status, body) = match serde_json::from_str::<serde_json::Value>(&body_text)
-                .map_err(|e| format!("invalid request body: {e}"))
-                .and_then(|params| {
-                    access_connect_config_response_value(params, project_root.as_deref())
-                }) {
-                Ok(value) => (200, value.to_string()),
-                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-            };
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    // Transport-owned body decode; this endpoint's parse-error 400
+    // historically rides the fleet tail like its value errors.
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) => access_connect_config_api_response(params, project_root.as_deref()),
+        Err(e) => ApiResponse::json_error(400, format!("invalid request body: {e}")),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_access_connect_unclaim(
-    mut stream: DemuxStream,
-    req_method: &str,
+    stream: DemuxStream,
     http_access_context: HttpAccessContext,
     project_root: Option<std::path::PathBuf>,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let (status, body) = match access_connect_unclaim_response_value(project_root).await {
-                Ok(value) => (200, value.to_string()),
-                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-            };
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    let response = access_connect_unclaim_api_response(project_root).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Shared by the HTTP route and the dashboard-control method: resolve the
@@ -690,22 +651,162 @@ pub(crate) async fn access_connect_unclaim_response_value(
     }))
 }
 
+// ── Transport-neutral cores (transport-unification design §2.1, S6):
+//    the access inspect/connect/tier family. Each fn is the single
+//    response builder both lanes render — the HTTP shims hand them to
+//    `write_api_response` under the row's CORS posture; the tunnel twins
+//    frame them through the ok/error dispatch adapter. Store paths
+//    arrive from the transport edges (hermeticity convention).
+
+/// The family's shared `Result` framing: `Ok` bodies answer 200, `Err`
+/// strings answer `error_status` as the historical `{"error": …}` body.
+fn access_result_api_response(
+    result: Result<serde_json::Value, String>,
+    error_status: u16,
+) -> ApiResponse {
+    match result {
+        Ok(value) => ApiResponse::json(200, JsonBody::PreSerialized(value.to_string())),
+        Err(error) => ApiResponse::json_error(error_status, error),
+    }
+}
+
+/// The in-handler manage re-check's 403 (belt and suspenders under the
+/// pre-dispatch row gate; kept so a dispatch refactor cannot quietly
+/// downgrade these writes). Historically written under the PLAIN
+/// canonical tail — no fleet decoration even for an allowlisted origin —
+/// so the shims render it with an own-origin posture on purpose.
+pub(crate) fn access_manage_denied_api_response(
+    context: &HttpAccessContext,
+    decision: crate::access::iam::AccessDecision,
+) -> ApiResponse {
+    ApiResponse::json(
+        403,
+        JsonBody::Value(serde_json::json!({
+            "error": "principal does not allow this operation",
+            "principal": context.principal.as_value(),
+            "permission": decision.permission,
+            "reason": decision.reason,
+        })),
+    )
+}
+
+/// GET /api/dashboard/targets + the tunnel's `api_dashboard_targets`.
+pub(crate) fn dashboard_targets_api_response(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(dashboard_targets_response_body(agent_card, registry)),
+    )
+}
+
+/// GET /api/access/overview + the tunnel's `api_access_overview`.
+pub(crate) fn access_overview_api_response(
+    cert_dir: &std::path::Path,
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+    current_principal: &crate::access::iam::AccessPrincipal,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(access_overview_response_body_for_principal(
+            cert_dir,
+            agent_card,
+            registry,
+            current_principal,
+        )),
+    )
+}
+
+/// GET /api/access/iam/state + the tunnel's `api_access_iam_state`.
+pub(crate) fn access_iam_state_api_response(cert_dir: &std::path::Path) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(access_iam_state_response_body(cert_dir)),
+    )
+}
+
+/// GET /api/access/enrollment-requests + the tunnel's
+/// `api_access_enrollment_requests`.
+pub(crate) fn access_enrollment_requests_api_response(
+    cert_dir: &std::path::Path,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(access_enrollment_requests_response_body(cert_dir)),
+    )
+}
+
+/// GET /api/access/connect/status + the tunnel's
+/// `api_access_connect_status`.
+pub(crate) fn access_connect_status_api_response() -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(access_connect_status_response_value().to_string()),
+    )
+}
+
+/// GET /api/access/connect/claim-code + the tunnel's
+/// `api_access_connect_claim_code` (the manage gate stays at each
+/// transport's edge: the row/method op plus the HTTP shim's re-check).
+pub(crate) fn access_connect_claim_code_api_response() -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(access_connect_claim_code_response_value().to_string()),
+    )
+}
+
+/// POST /api/access/connect/config + the tunnel's
+/// `api_access_connect_config`. `params` is the canonical structured
+/// shape (design §2.1) — the HTTP shim owns the body parse.
+pub(crate) fn access_connect_config_api_response(
+    params: serde_json::Value,
+    project_root: Option<&std::path::Path>,
+) -> ApiResponse {
+    access_result_api_response(access_connect_config_response_value(params, project_root), 400)
+}
+
+/// POST /api/access/connect/unclaim + the tunnel's
+/// `api_access_connect_unclaim`.
+pub(crate) async fn access_connect_unclaim_api_response(
+    project_root: Option<std::path::PathBuf>,
+) -> ApiResponse {
+    access_result_api_response(access_connect_unclaim_response_value(project_root).await, 400)
+}
+
+/// POST /api/access/tier | /api/access/hosted-ceiling + the tunnel's
+/// `api_access_set_tier` / `api_access_set_hosted_ceiling`.
+pub(crate) fn access_tier_settings_api_response(
+    cert_dir: &std::path::Path,
+    hosted_ceiling: bool,
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> ApiResponse {
+    let result = if hosted_ceiling {
+        access_set_hosted_ceiling_response_value(cert_dir, params, actor)
+    } else {
+        access_set_tier_response_value(cert_dir, params, actor)
+    };
+    access_result_api_response(result, 400)
+}
+
 pub(crate) async fn handle_access_overview(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
+    cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
     peer_registry: Option<crate::peer::PeerRegistry>,
     agent_card_value_for_targets: serde_json::Value,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body = access_overview_response_body_for_principal(
+    let response = access_overview_api_response(
+        &cert_dir,
         &agent_card_value_for_targets,
         peer_registry.as_ref(),
         &http_access_context.principal,
     );
-    let response = with_fleet_cors(json_response("200 OK", body), fleet_cors_origin.as_deref());
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 #[cfg(test)]
@@ -1161,17 +1262,23 @@ pub(crate) fn current_access_overview_transport(
 }
 
 pub(crate) fn access_overview_response_body_for_principal(
+    cert_dir: &std::path::Path,
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     current_principal: &crate::access::iam::AccessPrincipal,
 ) -> String {
-    access_overview_response_value_for_principal(agent_card, registry, Some(current_principal))
-        .to_string()
+    access_overview_response_value_for_principal(
+        cert_dir,
+        agent_card,
+        registry,
+        Some(current_principal),
+    )
+    .to_string()
 }
 
-pub(crate) fn access_iam_state_response_value() -> serde_json::Value {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let iam_state = crate::access::iam::load_state_for_overview(&cert_dir);
+/// `cert_dir` arrives from the transport edges (hermeticity convention).
+pub(crate) fn access_iam_state_response_value(cert_dir: &std::path::Path) -> serde_json::Value {
+    let iam_state = crate::access::iam::load_state_for_overview(cert_dir);
     serde_json::json!({
         "schema_version": 1,
         "iam": crate::access::iam::overview_metadata(&iam_state),
@@ -1179,8 +1286,8 @@ pub(crate) fn access_iam_state_response_value() -> serde_json::Value {
     })
 }
 
-pub(crate) fn access_iam_state_response_body() -> String {
-    access_iam_state_response_value().to_string()
+pub(crate) fn access_iam_state_response_body(cert_dir: &std::path::Path) -> String {
+    access_iam_state_response_value(cert_dir).to_string()
 }
 
 pub(crate) fn access_iam_upsert_user_client_grant_response_value(
@@ -1218,8 +1325,11 @@ pub(crate) fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
 
 /// Set (or clear) this daemon's trust tier (docs/src/trust-tiers.md):
 /// `{"tier": "integrated" | "disposable" | null}`. Shared by the HTTP
-/// route and the dashboard-control method.
+/// route and the dashboard-control method. `cert_dir` arrives from the
+/// transport edges (the IAM state under it is read AND written), so
+/// tests inject a tempdir (hermeticity convention).
 pub(crate) fn access_set_tier_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> Result<serde_json::Value, String> {
@@ -1228,14 +1338,13 @@ pub(crate) fn access_set_tier_response_value(
         Some(serde_json::Value::String(value)) => Some(value.as_str()),
         Some(_) => return Err("tier must be a string or null".to_string()),
     };
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let stored =
         crate::access::iam::set_daemon_tier(&mut state, tier, actor).map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
+    crate::access::iam::save_state(cert_dir, &state)
         .map_err(|e| format!("save local IAM state: {e}"))?;
-    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
         "tier": stored,
@@ -1246,8 +1355,10 @@ pub(crate) fn access_set_tier_response_value(
 /// Set the hosted-control ceiling (docs/src/trust-tiers.md):
 /// `{"role_id": "role:operator" | "role:observer" | "role:none" | …}` —
 /// any defined, enforced role. Writes both hosted-provenance binding
-/// ceilings; per-binding divergence stays an `iam.json` edit.
+/// ceilings; per-binding divergence stays an `iam.json` edit. `cert_dir`
+/// arrives from the transport edges (hermeticity convention).
 pub(crate) fn access_set_hosted_ceiling_response_value(
+    cert_dir: &std::path::Path,
     params: serde_json::Value,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> Result<serde_json::Value, String> {
@@ -1257,14 +1368,13 @@ pub(crate) fn access_set_hosted_ceiling_response_value(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "role_id is required".to_string())?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
+    let mut state = crate::access::iam::load_state(cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     crate::access::iam::set_hosted_control_ceiling(&mut state, role_id, actor)
         .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
+    crate::access::iam::save_state(cert_dir, &state)
         .map_err(|e| format!("save local IAM state: {e}"))?;
-    let loaded = crate::access::iam::load_state_for_overview(&cert_dir);
+    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
         "role_ceilings": loaded.state.role_ceilings,
@@ -1275,70 +1385,56 @@ pub(crate) fn access_set_hosted_ceiling_response_value(
 /// One handler for the trust-tier settings pair; `req_path` picks the
 /// mutation. Both are manage-gated POSTs mirroring the IAM grant writes.
 pub(crate) async fn handle_access_tier_settings(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
-    req_method: &str,
     req_path: &str,
+    cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
-    fleet_cors_origin: Option<String>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    if req_method != "POST" {
-        let response = json_response(
-            "405 Method Not Allowed",
-            serde_json::json!({"error": "method not allowed"}).to_string(),
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else {
-        let decision =
-            http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
-        if !decision.allowed {
-            let response = json_response(
-                "403 Forbidden",
-                serde_json::json!({
-                    "error": "principal does not allow this operation",
-                    "principal": http_access_context.principal.as_value(),
-                    "permission": decision.permission,
-                    "reason": decision.reason,
-                })
-                .to_string(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        } else {
-            let params: serde_json::Value = if body_text.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                match serde_json::from_str(&body_text) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        let response = json_response(
-                            "400 Bad Request",
-                            serde_json::json!({"error": format!("invalid request body: {e}")})
-                                .to_string(),
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        finalize_http_stream(&mut stream).await;
-                        return;
-                    }
-                }
-            };
-            let result = if req_path == "/api/access/hosted-ceiling" {
-                access_set_hosted_ceiling_response_value(params, &http_access_context.principal)
-            } else {
-                access_set_tier_response_value(params, &http_access_context.principal)
-            };
-            let (status, body) = match result {
-                Ok(value) => (200, value.to_string()),
-                Err(error) => (400, serde_json::json!({"error": error}).to_string()),
-            };
-            let response = with_fleet_cors(
-                json_response(status_reason(status), body),
-                fleet_cors_origin.as_deref(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+    // Belt-and-suspenders manage re-check (see the claim-code shim).
+    let decision =
+        http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+    if !decision.allowed {
+        let response = access_manage_denied_api_response(&http_access_context, decision);
+        write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        return;
     }
-    finalize_http_stream(&mut stream).await;
+    // Transport-owned body decode: an empty body reads as `{}`, and the
+    // parse-error 400 keeps its historical PLAIN tail (own-origin
+    // render, no fleet echo) unlike this pair's fleet-decorated value
+    // errors.
+    let params: serde_json::Value = if body_text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&body_text) {
+            Ok(value) => value,
+            Err(e) => {
+                write_api_response(
+                    stream,
+                    ApiResponse::json_error(400, format!("invalid request body: {e}")),
+                    crate::gateway_routes::CorsPosture::OwnOrigin,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+    };
+    let response = access_tier_settings_api_response(
+        &cert_dir,
+        req_path == "/api/access/hosted-ceiling",
+        params,
+        &http_access_context.principal,
+    );
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// The Access API paths that participate in fleet cross-origin access: the
@@ -1898,12 +1994,14 @@ pub(crate) fn access_org_renew_response_value(
     }))
 }
 
-pub(crate) fn access_enrollment_requests_response_value() -> serde_json::Value {
+/// `cert_dir` arrives from the transport edges (hermeticity convention).
+pub(crate) fn access_enrollment_requests_response_value(
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     // Route provenance is classified daemon-side (derive, don't mirror):
     // the browser gets a ready `origin_class` per request instead of
     // re-deriving hosted/fleet membership from its own copies.
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let hosted_origins = crate::access::iam::load_state(&cert_dir)
+    let hosted_origins = crate::access::iam::load_state(cert_dir)
         .map(|state| state.hosted_origins)
         .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
     let fleet_zone = crate::fleet_cert::status_snapshot().zone;
@@ -1933,8 +2031,8 @@ pub(crate) fn access_enrollment_requests_response_value() -> serde_json::Value {
     })
 }
 
-pub(crate) fn access_enrollment_requests_response_body() -> String {
-    access_enrollment_requests_response_value().to_string()
+pub(crate) fn access_enrollment_requests_response_body(cert_dir: &std::path::Path) -> String {
+    access_enrollment_requests_response_value(cert_dir).to_string()
 }
 
 /// Approve or deny a pending browser-key enrollment. Approval reuses the
@@ -3213,5 +3311,546 @@ mod tests {
             &steer,
             &bus
         ));
+    }
+
+    // ── S6 golden transcripts: access inspect/connect/tier family ──
+    //
+    // Byte-exact pins of the access overview / IAM state / enrollment
+    // list / dashboard targets / connect admin / trust-tier HTTP
+    // responses, captured before the transport-neutral conversion
+    // (transport-unification design §6 S6, risk R1) and kept as the
+    // conversion's proof. This family's hazard is the FLEET-CORS
+    // decoration (docs/src/trust-architecture.md): the anchor-served
+    // Access page reads sibling daemons cross-origin, so every fleet pin
+    // here covers both the no-Origin shape (bare `Vary: Origin`) and the
+    // allowlisted fleet-origin shape (echoed
+    // `Access-Control-Allow-Origin` + `Vary: Origin`). The expected
+    // framing is hand-written below — never built through the response
+    // helpers under conversion. Store-backed bodies compute through the
+    // untouched builders over injected tempdir cert stores (never the
+    // live account's stores); process-global bodies (connect status /
+    // claim code) are framing-only pins, spliced around whatever the
+    // snapshot says at run time. Historical quirks pinned deliberately:
+    // the in-handler manage re-check 403 and the tier parse-error 400
+    // answer WITHOUT the fleet decoration (no echo, no Vary), and
+    // dashboard-targets answers under the bare canonical tail.
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_access_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(Box::pin(server)).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    fn golden_access_transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// The canonical JSON framing (`Cache-Control` + `Connection` tail),
+    /// spelled out literally.
+    fn golden_access_canonical_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The fleet-allowlist JSON framing: the canonical tail, then the
+    /// origin echo (only when the origin passed the allowlist), then
+    /// `Vary: Origin` — spelled out literally.
+    fn golden_access_fleet_json_transcript(
+        status_line: &str,
+        body: &str,
+        echoed_origin: Option<&str>,
+    ) -> String {
+        let echo = match echoed_origin {
+            Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\n"),
+            None => String::new(),
+        };
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The CORS posture dispatch hands the shim — read from the route
+    /// table AND asserted, so a row-posture change fails these byte pins
+    /// instead of silently changing the wire.
+    fn access_route_cors(
+        method: &str,
+        path: &str,
+        expected: crate::gateway_routes::CorsPosture,
+    ) -> crate::gateway_routes::CorsPosture {
+        let cors = crate::gateway_routes::match_route(method, path)
+            .expect("access route declared")
+            .0
+            .cors;
+        assert_eq!(cors, expected, "{method} {path}");
+        cors
+    }
+
+    const GOLDEN_FLEET_ORIGIN: &str = "https://fleet-anchor.example:8765";
+
+    /// Head/body split of a raw HTTP transcript.
+    fn split_transcript(text: &str) -> (&str, &str) {
+        text.split_once("\r\n\r\n").expect("header/body split")
+    }
+
+    #[tokio::test]
+    async fn golden_dashboard_targets_transcript() {
+        let cors = access_route_cors(
+            "GET",
+            "/api/dashboard/targets",
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+        );
+        // An empty agent card and no registry produce the deterministic
+        // local-only target list through the untouched builder.
+        let card = serde_json::json!({});
+        let body = dashboard_targets_response_body(&card, None);
+        let response = collect_access_handler_response(|stream| {
+            handle_dashboard_targets(stream, None, card.clone(), cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_access_fleet_get_transcripts() {
+        // The fleet inspect reads: iam/state, enrollment-requests, and
+        // overview over an injected tempdir cert store (deterministic
+        // empty-store bodies), each pinned with and without the
+        // allowlisted fleet origin.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+
+        let cors = access_route_cors(
+            "GET",
+            "/api/access/iam/state",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let body = access_iam_state_response_body(&cert_dir);
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let dir = cert_dir.clone();
+            let response = collect_access_handler_response(|stream| {
+                handle_access_iam_state(stream, dir, cors, origin)
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript("200 OK", &body, origin)
+            );
+        }
+
+        let cors = access_route_cors(
+            "GET",
+            "/api/access/enrollment-requests",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let body = access_enrollment_requests_response_body(&cert_dir);
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let dir = cert_dir.clone();
+            let response = collect_access_handler_response(|stream| {
+                handle_access_enrollment_requests(stream, dir, cors, origin)
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript("200 OK", &body, origin)
+            );
+        }
+
+        let cors = access_route_cors(
+            "GET",
+            "/api/access/overview",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let card = serde_json::json!({});
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("golden", "https");
+        let body =
+            access_overview_response_body_for_principal(&cert_dir, &card, None, &principal);
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let dir = cert_dir.clone();
+            let card = card.clone();
+            let context = HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                    "golden", "https",
+                ),
+                iam_state: None,
+            };
+            let response = collect_access_handler_response(|stream| {
+                handle_access_overview(stream, dir, context, None, card, cors, origin)
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript("200 OK", &body, origin)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_access_connect_status_framing() {
+        // The status body reads process-global snapshots (connect client,
+        // fleet cert, hosted-bundle tripwire), so the FRAMING is the pin:
+        // head hand-written around the served body's length, body sanity-
+        // checked through the schema marker.
+        let cors = access_route_cors(
+            "GET",
+            "/api/access/connect/status",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let response = collect_access_handler_response(|stream| {
+                handle_access_connect_status(stream, cors, origin)
+            })
+            .await;
+            let text = golden_access_transcript(&response);
+            let (_, body) = split_transcript(&text);
+            assert_eq!(
+                text,
+                golden_access_fleet_json_transcript("200 OK", body, origin)
+            );
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed["schema_version"], 1, "{body}");
+        }
+    }
+
+    /// A hermetically-built DENIED manage context: a scoped browser-cert
+    /// grant in a tempdir cert store (the
+    /// `scoped_browser_cert_denies_http_access_management` recipe).
+    fn golden_denied_manage_context(tmp: &std::path::Path) -> HttpAccessContext {
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("golden", "https");
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp,
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Golden scoped browser",
+                "fingerprint": "60:1D",
+                "role_id": "role:scoped-human"
+            }),
+            &actor,
+        )
+        .unwrap();
+        let context = http_access_context(tmp, None, Some("601d"), true, true).unwrap();
+        assert!(
+            !context
+                .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
+        );
+        context
+    }
+
+    /// The in-handler manage re-check's 403 body for a context/decision
+    /// pair, exactly as every access handler builds it.
+    fn golden_denied_manage_body(context: &HttpAccessContext) -> String {
+        let decision =
+            context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+        serde_json::json!({
+            "error": "principal does not allow this operation",
+            "principal": context.principal.as_value(),
+            "permission": decision.permission,
+            "reason": decision.reason,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn golden_access_connect_claim_code_transcripts() {
+        let cors = access_route_cors(
+            "GET",
+            "/api/access/connect/claim-code",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        // Allowed: the claim-code body reads the process-global connect
+        // snapshot — framing-only pin, both origin shapes.
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let context = HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                    "golden", "https",
+                ),
+                iam_state: None,
+            };
+            let response = collect_access_handler_response(|stream| {
+                handle_access_connect_claim_code(stream, context, cors, origin)
+            })
+            .await;
+            let text = golden_access_transcript(&response);
+            let (_, body) = split_transcript(&text);
+            assert_eq!(
+                text,
+                golden_access_fleet_json_transcript("200 OK", body, origin)
+            );
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed["schema_version"], 1, "{body}");
+        }
+
+        // Denied: the belt-and-suspenders re-check answers 403 under the
+        // PLAIN canonical tail — historically no fleet decoration even
+        // when an allowlisted origin is present. Pinned deliberately.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = golden_denied_manage_context(tmp.path());
+        let body = golden_denied_manage_body(&context);
+        let response = collect_access_handler_response(|stream| {
+            handle_access_connect_claim_code(stream, context, cors, Some(GOLDEN_FLEET_ORIGIN))
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("403 Forbidden", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_access_connect_config_transcripts() {
+        let cors = access_route_cors(
+            "POST",
+            "/api/access/connect/config",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let root_context = || HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "golden", "https",
+            ),
+            iam_state: None,
+        };
+
+        // Invalid JSON: serde's wording for this exact input, derived
+        // through the same parse — 400 under the fleet tail (echo case).
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_connect_config(
+                stream,
+                invalid.to_string(),
+                root_context(),
+                None,
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                &expected_body,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Missing `enabled`: the validation error, before any store access.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_connect_config(
+                stream,
+                "{}".to_string(),
+                root_context(),
+                None,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"enabled must be true or false"}"#,
+                None
+            )
+        );
+
+        // Success on a tempdir project root (enabled=false keeps
+        // apply_config on its stop path): framing pinned, body computed
+        // through the untouched core over the same store.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_connect_config(
+                stream,
+                r#"{"enabled":false}"#.to_string(),
+                root_context(),
+                Some(root.clone()),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        let text = golden_access_transcript(&response);
+        let (_, body) = split_transcript(&text);
+        assert_eq!(
+            text,
+            golden_access_fleet_json_transcript("200 OK", body, Some(GOLDEN_FLEET_ORIGIN))
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["written_enabled"], serde_json::json!(false));
+        assert!(root.join("intendant.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn golden_access_connect_unclaim_transcript() {
+        let cors = access_route_cors(
+            "POST",
+            "/api/access/connect/unclaim",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        // A tempdir project root has no rendezvous configured — the
+        // deterministic no-rendezvous error, 400 under the fleet tail.
+        // The live release path needs a claimed rendezvous and stays
+        // smoke-covered (validate-connect-* / fresh-VPS e2e).
+        let dir = tempfile::TempDir::new().unwrap();
+        for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
+            let context = HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                    "golden", "https",
+                ),
+                iam_state: None,
+            };
+            let root = dir.path().to_path_buf();
+            let response = collect_access_handler_response(|stream| {
+                handle_access_connect_unclaim(stream, context, Some(root), cors, origin)
+            })
+            .await;
+            assert_eq!(
+                golden_access_transcript(&response),
+                golden_access_fleet_json_transcript(
+                    "400 Bad Request",
+                    r#"{"error":"no rendezvous_url configured"}"#,
+                    origin
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_access_tier_transcripts() {
+        let cors = access_route_cors(
+            "POST",
+            "/api/access/tier",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let ceiling_cors = access_route_cors(
+            "POST",
+            "/api/access/hosted-ceiling",
+            crate::gateway_routes::CorsPosture::FleetAllowlist,
+        );
+        let root_context = || HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "golden", "https",
+            ),
+            iam_state: None,
+        };
+
+        // Non-string tier: the validation 400 under the fleet tail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cert_dir = tmp.path().to_path_buf();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_tier_settings(
+                stream,
+                r#"{"tier":123}"#.to_string(),
+                "/api/access/tier",
+                cert_dir.clone(),
+                root_context(),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"tier must be a string or null"}"#,
+                Some(GOLDEN_FLEET_ORIGIN)
+            )
+        );
+
+        // Unparseable body: the early-return 400 answers under the PLAIN
+        // canonical tail — historically no fleet decoration. Pinned
+        // deliberately (serde wording derived through the same parse).
+        let invalid = "not json";
+        let serde_error = serde_json::from_str::<serde_json::Value>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                .to_string();
+        let response = collect_access_handler_response(|stream| {
+            handle_access_tier_settings(
+                stream,
+                invalid.to_string(),
+                "/api/access/tier",
+                cert_dir.clone(),
+                root_context(),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_canonical_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Success over the injected tempdir store: an empty body reads as
+        // `{}` (tier cleared) — framing pinned, body asserted through the
+        // parse (the `iam` metadata carries store timestamps).
+        let response = collect_access_handler_response(|stream| {
+            handle_access_tier_settings(
+                stream,
+                String::new(),
+                "/api/access/tier",
+                cert_dir.clone(),
+                root_context(),
+                cors,
+                Some(GOLDEN_FLEET_ORIGIN),
+            )
+        })
+        .await;
+        let text = golden_access_transcript(&response);
+        let (_, body) = split_transcript(&text);
+        assert_eq!(
+            text,
+            golden_access_fleet_json_transcript("200 OK", body, Some(GOLDEN_FLEET_ORIGIN))
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["tier"], serde_json::Value::Null, "{body}");
+
+        // Hosted ceiling, missing role_id: the validation 400.
+        let response = collect_access_handler_response(|stream| {
+            handle_access_tier_settings(
+                stream,
+                "{}".to_string(),
+                "/api/access/hosted-ceiling",
+                cert_dir.clone(),
+                root_context(),
+                ceiling_cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_access_transcript(&response),
+            golden_access_fleet_json_transcript(
+                "400 Bad Request",
+                r#"{"error":"role_id is required"}"#,
+                None
+            )
+        );
     }
 }

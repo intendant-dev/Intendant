@@ -146,6 +146,21 @@ pub(crate) async fn api_credential_egress_probe_response(
     }
 }
 
+/// The tunnel's `api_access_connect_unclaim` twin: the S6 neutral core
+/// under the family's historical ok/error envelope (the transport edge
+/// hands over this daemon's project root).
+pub(crate) async fn api_access_connect_unclaim_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_ok_error_response(
+        id,
+        crate::web_gateway::access_connect_unclaim_api_response(runtime.project_root.clone())
+            .await,
+        "connect unclaim",
+    )
+}
+
 pub(crate) async fn control_request_response(
     id: String,
     method: String,
@@ -161,24 +176,7 @@ pub(crate) async fn control_request_response(
             api_credential_egress_probe_response(id, params.as_ref()).await
         }
         "api_access_connect_unclaim" => {
-            match crate::web_gateway::access_connect_unclaim_response_value(
-                runtime.project_root.clone(),
-            )
-            .await
-            {
-                Ok(result) => serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": result,
-                }),
-                Err(error) => serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": error,
-                }),
-            }
+            api_access_connect_unclaim_response(id, &runtime).await
         }
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
