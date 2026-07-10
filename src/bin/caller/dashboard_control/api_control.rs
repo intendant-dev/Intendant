@@ -1767,6 +1767,10 @@ mod tests {
             || serde_json::json!({"action": "take_display", "display_id": 1}),
         ),
         (
+            "resolve_display_request",
+            || serde_json::json!({"action": "resolve_display_request", "session_id": "s", "id": 1, "decision": "approve", "duration": "this_session"}),
+        ),
+        (
             "release_display",
             || serde_json::json!({"action": "release_display", "display_id": 1}),
         ),
