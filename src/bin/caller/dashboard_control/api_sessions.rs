@@ -1593,6 +1593,27 @@ mod tests {
         assert_eq!(frames[4].frame["ok"], true);
         assert_eq!(frames[4].frame["result"]["events"], 3);
         assert!(frames[4].done);
+
+        // S10 goldens: the exact frame objects (serde_json's sorted-key
+        // serialization), so the framer's wire shapes — method echo,
+        // seq/chunk_id pairing, the events tally — are pinned byte for
+        // byte across the Stream-lane unification.
+        assert_eq!(
+            frames[0].frame.to_string(),
+            r#"{"id":"stream1","method":"api_sessions_stream","t":"stream_start"}"#
+        );
+        assert_eq!(
+            frames[1].frame.to_string(),
+            r#"{"chunk_id":"stream1:0","event":{"limit":1,"quick_limit":1,"type":"start"},"id":"stream1","seq":0,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[2].frame.to_string(),
+            r#"{"chunk_id":"stream1:1","event":{"partial":true,"session":{"session_id":"s1"},"type":"session"},"id":"stream1","seq":1,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[4].frame.to_string(),
+            r#"{"id":"stream1","ok":true,"result":{"events":3},"t":"stream_end"}"#
+        );
     }
 
     #[test]

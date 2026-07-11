@@ -1641,4 +1641,32 @@ mod tests {
         assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
         assert!(text.contains("Vary: Origin\r\n"), "{text}");
     }
+
+    // ── S10 golden: the sessions-stream NDJSON head (design §8) ──
+    // Captured from the hand-rolled `handle_sessions_stream` header
+    // block before the Stream-lane conversion: no Content-Length, no
+    // Transfer-Encoding — the response is EOF-delimited
+    // (`Connection: close`), with the wildcard-CORS tail the sessions
+    // family bakes into its responses (the row's posture is OwnOrigin;
+    // the header is response decoration, exactly like `/api/sessions`).
+
+    /// The historical head, byte for byte.
+    pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/x-ndjson\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n";
+
+    #[test]
+    fn golden_sessions_stream_http_head_is_pinned() {
+        // The exact builder chain the legacy handler wrote its head with.
+        let legacy = HttpResponse::new("200 OK")
+            .header("Content-Type", "application/x-ndjson")
+            .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Connection", "close")
+            .into_string();
+        assert_eq!(legacy, SESSIONS_STREAM_HEAD_GOLDEN);
+    }
 }
