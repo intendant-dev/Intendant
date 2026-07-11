@@ -242,8 +242,14 @@ stated non-goal:
 - **Lookalike names.** `d-<hash>` labels are deliberately opaque, which
   also means humans cannot eyeball them; a phished lookalike with its own
   valid certificate raises no CT alarm on *your* name, because it is not
-  your name. The mitigation is navigational: reach fleet names from the
-  fleet strip, bookmarks, or the app — never by retyping.
+  your name. Two mitigations now, one navigational and one nominal:
+  reach fleet names from the fleet strip, bookmarks, or the app — never
+  by retyping — and give machines **petnames**: the owner's name for a
+  daemon, signed into the fleet record (payload v5) and keyed to the
+  record's identity, shown first everywhere with the self-reported label
+  demoted to a muted secondary. A lookalike arrives *nameless* — no
+  store, phisher, or self-chosen label can dress it in a name you
+  assigned.
 - **The browser itself.** Every rung assumes the browser and OS are
   honest; an extension with page access reads all tiers alike. Outside
   Intendant's reach — stated so the ladder is not mistaken for covering
