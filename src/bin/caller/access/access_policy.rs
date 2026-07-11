@@ -925,12 +925,7 @@ mod tests {
             regex::Regex::new(r"(?m)^\s+'?([a-z][a-z-]*)'?: '([a-z-]+)',")
                 .unwrap()
                 .captures_iter(alias_block)
-                .map(|caps| {
-                    (
-                        caps.get(1).unwrap().as_str(),
-                        caps.get(2).unwrap().as_str(),
-                    )
-                })
+                .map(|caps| (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str()))
                 .collect();
         let rust_aliases: std::collections::BTreeSet<(&str, &str)> =
             PROFILE_ALIASES.iter().copied().collect();
@@ -941,7 +936,10 @@ mod tests {
 
         // Every alias lands on a canonical profile and classes agree.
         for (alias, target) in PROFILE_ALIASES {
-            assert!(canonical.contains(target), "alias {alias} → unknown {target}");
+            assert!(
+                canonical.contains(target),
+                "alias {alias} → unknown {target}"
+            );
             assert_eq!(profile_class(alias), profile_class(target));
         }
     }
@@ -1183,7 +1181,10 @@ mod tests {
         // The typo class that used to silently degrade to presence-only.
         let err = require_known_profile("read-only-dsplay").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unknown peer profile 'read-only-dsplay'"), "{msg}");
+        assert!(
+            msg.contains("unknown peer profile 'read-only-dsplay'"),
+            "{msg}"
+        );
         for (name, _) in PROFILES {
             assert!(msg.contains(name), "missing {name} in: {msg}");
         }
@@ -1198,10 +1199,7 @@ mod tests {
         // The strict CLI check must not tighten wire semantics: a stored
         // profile this build does not know keeps authorizing as the
         // least-capable class rather than erroring.
-        assert_eq!(
-            profile_class("future-profile"),
-            ProfileClass::PresenceOnly
-        );
+        assert_eq!(profile_class("future-profile"), ProfileClass::PresenceOnly);
         assert!(profile_allows_operation(
             "future-profile",
             PeerOperation::PresenceRead

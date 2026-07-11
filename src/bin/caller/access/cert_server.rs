@@ -1527,7 +1527,9 @@ fn cert_sans_cover_access_host(cert_path: &Path, access_host: &str) -> Option<(b
             GeneralName::IPAddress(bytes) => {
                 let ip: Option<std::net::IpAddr> = match bytes.len() {
                     4 => <[u8; 4]>::try_from(*bytes).ok().map(std::net::IpAddr::from),
-                    16 => <[u8; 16]>::try_from(*bytes).ok().map(std::net::IpAddr::from),
+                    16 => <[u8; 16]>::try_from(*bytes)
+                        .ok()
+                        .map(std::net::IpAddr::from),
                     _ => None,
                 };
                 if let Some(ip) = ip {
@@ -1555,7 +1557,9 @@ fn warn_if_access_host_missing_from_cert(cert_path: &Path, access_host: &str) {
         eprintln!("!! server certificate (SANs: {}).", sans.join(", "));
         eprintln!("!! Enrolling devices will refuse the connection (CertificateUnknown).");
         eprintln!("!! Run `intendant access setup --force` to mint certificates covering");
-        eprintln!("!! this machine's current addresses, then rerun `intendant access serve-certs`.");
+        eprintln!(
+            "!! this machine's current addresses, then rerun `intendant access serve-certs`."
+        );
         eprintln!();
     }
 }
@@ -1693,9 +1697,7 @@ fn live_fleet_cert_dns_name(cert_path: &Path) -> Option<String> {
     }
     let san = cert.subject_alternative_name().ok().flatten()?;
     san.value.general_names.iter().find_map(|name| match name {
-        GeneralName::DNSName(dns) => {
-            Some(dns.trim().trim_end_matches('.').to_ascii_lowercase())
-        }
+        GeneralName::DNSName(dns) => Some(dns.trim().trim_end_matches('.').to_ascii_lowercase()),
         _ => None,
     })
 }
@@ -1756,7 +1758,7 @@ mod tests {
         // A currently-valid cert: name comes from its SAN, lowercased.
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec![
-            "D-0123456789abcdef0123.Fleet.Example.Test".to_string(),
+            "D-0123456789abcdef0123.Fleet.Example.Test".to_string()
         ])
         .unwrap()
         .self_signed(&key)
@@ -1770,8 +1772,7 @@ mod tests {
 
         // An expired cert is not a front door.
         let mut params =
-            rcgen::CertificateParams::new(vec!["d-stale.fleet.example.test".to_string()])
-                .unwrap();
+            rcgen::CertificateParams::new(vec!["d-stale.fleet.example.test".to_string()]).unwrap();
         params.not_before = rcgen::date_time_ymd(2001, 1, 1);
         params.not_after = rcgen::date_time_ymd(2002, 1, 1);
         let key = rcgen::KeyPair::generate().unwrap();
@@ -1781,7 +1782,10 @@ mod tests {
         assert_eq!(live_fleet_cert_dns_name(&stale), None);
 
         // Absent file: no front door, no panic.
-        assert_eq!(live_fleet_cert_dns_name(&tmp.path().join("missing.pem")), None);
+        assert_eq!(
+            live_fleet_cert_dns_name(&tmp.path().join("missing.pem")),
+            None
+        );
     }
 
     #[test]
@@ -1819,10 +1823,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (mut client, server) = tokio::io::duplex(4096);
-            client
-                .write_all(b"GET / HTTP/1.0\r\n\r\n")
-                .await
-                .unwrap();
+            client.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
             redirect_plaintext_to_https(server, "10.0.0.42", 9000)
                 .await
                 .unwrap();
@@ -1849,8 +1850,7 @@ mod tests {
 
         let (covered, _) = cert_sans_cover_access_host(&cert_path, "10.0.0.42").unwrap();
         assert!(covered, "primary IP SAN must count as covered");
-        let (covered, _) =
-            cert_sans_cover_access_host(&cert_path, "station.example.test").unwrap();
+        let (covered, _) = cert_sans_cover_access_host(&cert_path, "station.example.test").unwrap();
         assert!(covered, "DNS SAN must count as covered (case-insensitive)");
         let (covered, sans) = cert_sans_cover_access_host(&cert_path, "100.64.0.7").unwrap();
         assert!(

@@ -1309,7 +1309,10 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
     }
 }
 
-pub(crate) fn session_log_dir_matches_requested_session(log_dir: &std::path::Path, session_id: &str) -> bool {
+pub(crate) fn session_log_dir_matches_requested_session(
+    log_dir: &std::path::Path,
+    session_id: &str,
+) -> bool {
     if log_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1342,7 +1345,8 @@ pub(crate) fn requested_session_log_dirs(
     {
         dirs.push(current_log_dir.to_path_buf());
     }
-    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
+    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)
+    {
         if !dirs.iter().any(|existing| existing == &dir) {
             dirs.push(dir);
         }

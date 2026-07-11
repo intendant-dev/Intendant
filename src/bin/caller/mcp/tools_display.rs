@@ -152,7 +152,10 @@ impl IntendantServer {
     #[tool(
         description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions."
     )]
-    pub(crate) async fn take_display(&self, Parameters(params): Parameters<TakeDisplayParams>) -> String {
+    pub(crate) async fn take_display(
+        &self,
+        Parameters(params): Parameters<TakeDisplayParams>,
+    ) -> String {
         self.bus.send(AppEvent::DisplayTaken {
             display_id: params.display_id,
         });
@@ -476,9 +479,7 @@ impl IntendantServer {
                     TimeoutOutcome::AlreadyResolved => {
                         // The resolution won the race; its outcome is on
                         // the channel (sent under the registry lock).
-                        let outcome = rx
-                            .try_recv()
-                            .unwrap_or(DisplayRequestOutcome::Denied);
+                        let outcome = rx.try_recv().unwrap_or(DisplayRequestOutcome::Denied);
                         let mut result = serde_json::json!({
                             "status": outcome.as_str(),
                             "request_id": id,
@@ -837,8 +838,13 @@ impl IntendantServer {
         Parameters(params): Parameters<CaptureSharedViewFrameParams>,
     ) -> Result<CallToolResult, McpError> {
         // Stdio MCP transport: owner surface (the owner's own client config).
-        self.capture_shared_view_frame_for_session(params, None, false, ToolCallerTrust::OwnerSurface)
-            .await
+        self.capture_shared_view_frame_for_session(
+            params,
+            None,
+            false,
+            ToolCallerTrust::OwnerSurface,
+        )
+        .await
     }
 
     #[tool(description = "Take a screenshot of a display. Returns an MCP image content block.")]
@@ -1164,7 +1170,10 @@ impl IntendantServer {
     #[tool(
         description = "List available display frames with metadata. Frames are captured from display streams."
     )]
-    pub(crate) async fn list_frames(&self, Parameters(params): Parameters<ListFramesParams>) -> String {
+    pub(crate) async fn list_frames(
+        &self,
+        Parameters(params): Parameters<ListFramesParams>,
+    ) -> String {
         let state = self.state.read().await;
         let registry = match &state.frame_registry {
             Some(r) => r.clone(),
@@ -1193,7 +1202,10 @@ impl IntendantServer {
     #[tool(
         description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent."
     )]
-    pub(crate) async fn read_frame(&self, Parameters(params): Parameters<ReadFrameParams>) -> String {
+    pub(crate) async fn read_frame(
+        &self,
+        Parameters(params): Parameters<ReadFrameParams>,
+    ) -> String {
         use base64::Engine;
 
         let state = self.state.read().await;
@@ -1321,8 +1333,8 @@ impl IntendantServer {
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
-    use tokio::time::{timeout, Duration};
     use crate::mcp::tests::{test_session_registry_with_display, test_state};
+    use tokio::time::{timeout, Duration};
 
     /// A fragment unique to the user-session opt-in refusal
     /// (`computer_use::user_session_denied_message`, which both gated MCP
@@ -1368,7 +1380,10 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                })) => {
                     assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 99);
                 }
@@ -1441,7 +1456,9 @@ mod tests {
             // refusal exists precisely so a scoped caller cannot perform
             // the owner's opt-in (the old code flipped the grant here).
             assert!(
-                timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+                timeout(Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
                 "no event may fire for a refused user-session share"
             );
             let autonomy = { state.read().await.autonomy.clone() };
@@ -1478,7 +1495,10 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                })) => {
                     assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }
@@ -1586,7 +1606,9 @@ mod tests {
                 "scoped grant_user_display must be refused, got: {rendered}"
             );
             assert!(
-                timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+                timeout(Duration::from_millis(200), rx.recv())
+                    .await
+                    .is_err(),
                 "no grant event may fire for a refused grant"
             );
             let autonomy = { state.read().await.autonomy.clone() };
@@ -1632,7 +1654,10 @@ mod tests {
         let json = tool_result_json(&result);
         assert_eq!(json["status"], "invalid");
         assert!(
-            json["error"].as_str().unwrap_or_default().contains("access"),
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("access"),
             "unknown access is named: {json}"
         );
     }
@@ -1846,7 +1871,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_timeout_resolution, "timeout emits DisplayRequestResolved");
+        assert!(
+            saw_timeout_resolution,
+            "timeout emits DisplayRequestResolved"
+        );
 
         // Declined by absence: the cooldown applies like an explicit deny.
         let again = server
@@ -1974,7 +2002,10 @@ mod tests {
             assert!(!result.is_error.unwrap_or(false));
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                })) => {
                     assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 2);
                 }
@@ -2058,7 +2089,10 @@ mod tests {
             );
 
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                })) => {
                     assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }
@@ -2166,7 +2200,10 @@ mod tests {
                 "refreshed pending timestamp should be current"
             );
             match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Ok(AppEvent::UserDisplayGranted { display_id, agent_visible })) => {
+                Ok(Ok(AppEvent::UserDisplayGranted {
+                    display_id,
+                    agent_visible,
+                })) => {
                     assert!(agent_visible, "MCP grant paths always share with the agent");
                     assert_eq!(display_id, 0);
                 }

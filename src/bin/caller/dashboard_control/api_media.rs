@@ -11,13 +11,17 @@ use super::*;
 // (transport-unification S4b/S8): both lanes resolve assets through one
 // core; this module keeps the tunnel's ranged byte-stream carriage.
 pub(crate) use crate::web_gateway::{
-    read_frame_asset_file_range, read_recording_asset_bytes_range,
-    read_recording_asset_file_range, recording_asset_name_is_safe,
-    recording_stream_name_is_safe, resolve_live_recording_asset_in_daemon_dir,
-    resolve_session_recording_asset, session_frame_filename_is_safe, RecordingAsset,
+    read_frame_asset_file_range, read_recording_asset_bytes_range, read_recording_asset_file_range,
+    recording_asset_name_is_safe, recording_stream_name_is_safe,
+    resolve_live_recording_asset_in_daemon_dir, resolve_session_recording_asset,
+    session_frame_filename_is_safe, RecordingAsset,
 };
 
-pub(crate) fn media_http_response(id: String, status: u16, body: serde_json::Value) -> serde_json::Value {
+pub(crate) fn media_http_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> serde_json::Value {
     http_body_response(id, status, body.to_string(), "dashboard media")
 }
 
@@ -41,7 +45,11 @@ pub(crate) fn media_error_task_response(
     }
 }
 
-pub(crate) fn media_task_response(id: String, status: u16, body: serde_json::Value) -> ControlTaskResponse {
+pub(crate) fn media_task_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> ControlTaskResponse {
     ControlTaskResponse {
         id: id.clone(),
         frame: media_http_response(id, status, body),
@@ -50,7 +58,9 @@ pub(crate) fn media_task_response(id: String, status: u16, body: serde_json::Val
     }
 }
 
-pub(crate) fn read_inbound_upload_bytes(upload: &mut InboundUploadState) -> Result<Vec<u8>, String> {
+pub(crate) fn read_inbound_upload_bytes(
+    upload: &mut InboundUploadState,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(upload.received_bytes);
     upload
         .tmp
@@ -511,12 +521,14 @@ pub(crate) async fn api_media_clip_cancel_response(
     )
 }
 
-pub(crate) async fn api_recordings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_recordings_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     // Transport edge: resolve the real daemon recordings dir once; the
     // parity fixture drives the `_in_daemon_dir` variant with an
     // injected tempdir.
-    api_recordings_response_in_daemon_dir(id, runtime, &crate::debug::daemon_recordings_dir())
-        .await
+    api_recordings_response_in_daemon_dir(id, runtime, &crate::debug::daemon_recordings_dir()).await
 }
 
 pub(crate) async fn api_recordings_response_in_daemon_dir(
@@ -610,12 +622,8 @@ pub(crate) async fn api_session_recording_asset_task_response(
 ) -> ControlTaskResponse {
     // Transport edge: resolve the real home once; the parity fixture
     // drives the `_from_home` variant with an injected temp home.
-    api_session_recording_asset_task_response_from_home(
-        id,
-        params,
-        &crate::platform::home_dir(),
-    )
-    .await
+    api_session_recording_asset_task_response_from_home(id, params, &crate::platform::home_dir())
+        .await
 }
 
 pub(crate) async fn api_session_recording_asset_task_response_from_home(
@@ -834,7 +842,8 @@ pub(crate) async fn api_session_frame_asset_task_response_from_home(
         }
     };
 
-    let Some(session_dir) = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id)
+    let Some(session_dir) =
+        crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id)
     else {
         return session_frame_asset_error_task_response(
             id,
@@ -958,7 +967,10 @@ mod tests {
             .and_then(|line| line.split_whitespace().next())
             .and_then(|code| code.parse::<u16>().ok())
             .expect("status line");
-        (status, serde_json::from_slice(&bytes[split + 4..]).expect("json body"))
+        (
+            status,
+            serde_json::from_slice(&bytes[split + 4..]).expect("json body"),
+        )
     }
 
     // ── S4b parity: recordings list + the listing-asset vocabulary ──
@@ -1286,8 +1298,7 @@ mod tests {
         // the machine's real ~/.intendant/recordings).
         let daemon_dir = tempfile::tempdir().unwrap();
         let recordings =
-            api_recordings_response_in_daemon_dir("rec1".to_string(), &rt, daemon_dir.path())
-                .await;
+            api_recordings_response_in_daemon_dir("rec1".to_string(), &rt, daemon_dir.path()).await;
         assert_eq!(recordings["t"], "response");
         assert_eq!(recordings["ok"], true);
         assert!(recordings["result"].as_array().is_some());

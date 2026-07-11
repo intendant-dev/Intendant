@@ -913,11 +913,7 @@ pub(crate) async fn ws_inbound_task(
                             // Optional context injection through the same
                             // store fn as the tunnel's api_media_clip_end.
                             let injected = acc.inject
-                                && inject_clip_context(
-                                    query_ctx_inbound.as_ref(),
-                                    &clip_id,
-                                    &acc,
-                                );
+                                && inject_clip_context(query_ctx_inbound.as_ref(), &clip_id, &acc);
 
                             let _ = direct_tx_inbound.send(
                                 serde_json::json!({

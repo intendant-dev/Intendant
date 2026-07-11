@@ -3952,7 +3952,10 @@ mod tests {
 
         // A later "share with agent" upgrade makes it visible in place.
         private_view.set_agent_visible(true);
-        assert!(reg.get(0).is_some(), "upgraded session becomes agent-visible");
+        assert!(
+            reg.get(0).is_some(),
+            "upgraded session becomes agent-visible"
+        );
         let mut ids = reg.display_ids();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 99]);
@@ -5331,10 +5334,7 @@ mod tests {
 
         #[async_trait]
         impl DisplayBackend for SyntheticCaptureBackend {
-            async fn start_capture(
-                &self,
-                _fps: u32,
-            ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
                 // Contract: implicit teardown of any session still running.
                 self.stop_capture().await;
 

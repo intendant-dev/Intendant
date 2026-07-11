@@ -80,7 +80,11 @@ pub(crate) fn with_default_mcp_session_id(
     args
 }
 
-pub(crate) fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&str>) -> bool {
+pub(crate) fn tool_allowed_for_profile(
+    name: &str,
+    managed_context: bool,
+    profile: Option<&str>,
+) -> bool {
     if !managed_context && (managed_context_tool(name) || fission_tool(name)) {
         return false;
     }
@@ -219,8 +223,9 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // them) and can grant nothing itself. The grant is minted by the
         // owner's click, whose ControlMsg (`resolve_display_request`) is
         // classified DisplayInput like grant_user_display.
-        "respond" | "post_session_note" | "ask_user" | "notify_user"
-        | "request_user_display" => PeerOperation::Message,
+        "respond" | "post_session_note" | "ask_user" | "notify_user" | "request_user_display" => {
+            PeerOperation::Message
+        }
         // Starting or delegating agent work.
         "start_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
@@ -640,7 +645,14 @@ mod tests {
         // The tool exists to be called by supervised session-scoped
         // agents: it must be advertised in the small `core` profile and
         // in the permissive default/full lists.
-        for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+        ] {
             assert!(
                 tool_allowed_for_profile("post_session_note", false, profile),
                 "post_session_note must be listed for profile {profile:?}"
@@ -649,7 +661,9 @@ mod tests {
         let mut manual = Vec::new();
         append_manual_http_tool_definitions(&mut manual, false, Some("core"));
         assert!(
-            manual.iter().any(|tool| tool["name"] == "post_session_note"),
+            manual
+                .iter()
+                .any(|tool| tool["name"] == "post_session_note"),
             "core-profile manual definitions must include post_session_note"
         );
     }
@@ -713,7 +727,14 @@ mod tests {
         // default/full lists, with manual HTTP definitions that match
         // their #[tool] attributes.
         for name in ["ask_user", "notify_user"] {
-            for profile in [None, Some("full"), Some("core"), Some("codex-core"), Some("cli"), Some("minimal")] {
+            for profile in [
+                None,
+                Some("full"),
+                Some("core"),
+                Some("codex-core"),
+                Some("cli"),
+                Some("minimal"),
+            ] {
                 assert!(
                     tool_allowed_for_profile(name, false, profile),
                     "{name} must be listed for profile {profile:?}"

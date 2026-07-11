@@ -819,16 +819,11 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessOrgRevocations => {
-                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors)
-                    .await;
+                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors).await;
             }
             RouteHandlerId::AccessOrgApplyRenew => {
                 return handle_access_org_apply_renew(
-                    stream,
-                    route_body,
-                    req_path,
-                    cert_dir,
-                    route.cors,
+                    stream, route_body, req_path, cert_dir, route.cors,
                 )
                 .await;
             }
@@ -1455,8 +1450,7 @@ pub(crate) fn api_response_http_bytes(
             meta: _,
         } => {
             let BytesPayload::InMemory(payload) = bytes;
-            let mut http =
-                HttpResponse::with_content(status_reason(status), content_type, payload);
+            let mut http = HttpResponse::with_content(status_reason(status), content_type, payload);
             for (name, value) in headers {
                 http = http.header(name, value);
             }

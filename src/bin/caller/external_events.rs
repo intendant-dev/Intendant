@@ -27,7 +27,8 @@ pub(crate) fn provider_request_item_count(raw: &serde_json::Value) -> Option<usi
 /// drain's select arms. An unbounded await there freezes event and control
 /// processing — including the interrupt-again escape hatch — whenever the
 /// backend stops responding.
-pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Time-bounded `interrupt_turn()`. Every call inside the drain must go
 /// through this so an unresponsive backend can't wedge the drain loop itself.
@@ -2321,7 +2322,9 @@ pub(crate) fn external_turn_status_task(agent_name: &str, round: usize, text: &s
     }
 }
 
-pub(crate) fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<String, String> {
+pub(crate) fn codex_subagent_parent_threads_from_log(
+    log_dir: &std::path::Path,
+) -> HashMap<String, String> {
     let path = log_dir.join("session.jsonl");
     let Ok(contents) = std::fs::read_to_string(path) else {
         return HashMap::new();

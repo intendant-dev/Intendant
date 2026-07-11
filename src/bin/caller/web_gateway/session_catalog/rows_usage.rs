@@ -1000,10 +1000,7 @@ pub(crate) mod tests {
 
         // Fresh-counter fork: first reading far below the baseline.
         let fresh = summary_with_first_event(Some(30));
-        assert_eq!(
-            codex_parent_baseline_for_summary(&fresh, &baselines),
-            None
-        );
+        assert_eq!(codex_parent_baseline_for_summary(&fresh, &baselines), None);
 
         // Carryover fork: first reading contains the parent history.
         let carryover = summary_with_first_event(Some(3_000_050));

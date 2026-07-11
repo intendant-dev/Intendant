@@ -491,7 +491,10 @@ pub(crate) fn resolve_diff_file_path(project_root: &Path, display_path: &str) ->
     Some(project_root.join(path))
 }
 
-pub(crate) fn read_diff_file_text(project_root: &Path, display_path: &str) -> Option<Option<String>> {
+pub(crate) fn read_diff_file_text(
+    project_root: &Path,
+    display_path: &str,
+) -> Option<Option<String>> {
     let path = resolve_diff_file_path(project_root, display_path)?;
     match std::fs::read_to_string(path) {
         Ok(text) => Some(Some(text)),
@@ -895,7 +898,9 @@ pub(crate) struct ExternalBackendRecovery {
 
 /// Build the control plane's live Claude Code runtime config from the
 /// project TOML. Mirrors the inline Codex/Gemini seeding blocks.
-pub(crate) fn shared_claude_config_from_project(project: &Project) -> control_plane::SharedClaudeConfig {
+pub(crate) fn shared_claude_config_from_project(
+    project: &Project,
+) -> control_plane::SharedClaudeConfig {
     let cfg = &project.config.agent.claude_code;
     Arc::new(tokio::sync::RwLock::new(
         control_plane::ClaudeRuntimeConfig {
@@ -916,20 +921,22 @@ pub(crate) fn shared_codex_config_from_project(
     project: &Project,
 ) -> control_plane::SharedCodexConfig {
     let cfg = &project.config.agent.codex;
-    Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-        command: cfg.command.clone(),
-        managed_command: cfg.managed_command.clone(),
-        sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-        approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-        model: cfg.model.clone(),
-        reasoning_effort: project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref()),
-        service_tier: project::normalize_codex_service_tier(cfg.service_tier.as_deref()),
-        web_search: cfg.web_search,
-        network_access: cfg.network_access,
-        writable_roots: cfg.writable_roots.clone(),
-        managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
-        context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
-    }))
+    Arc::new(tokio::sync::RwLock::new(
+        control_plane::CodexRuntimeConfig {
+            command: cfg.command.clone(),
+            managed_command: cfg.managed_command.clone(),
+            sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+            approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+            model: cfg.model.clone(),
+            reasoning_effort: project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref()),
+            service_tier: project::normalize_codex_service_tier(cfg.service_tier.as_deref()),
+            web_search: cfg.web_search,
+            network_access: cfg.network_access,
+            writable_roots: cfg.writable_roots.clone(),
+            managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+            context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+        },
+    ))
 }
 
 #[cfg(test)]

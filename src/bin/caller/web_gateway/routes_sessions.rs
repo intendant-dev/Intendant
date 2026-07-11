@@ -2033,10 +2033,7 @@ pub(crate) fn managed_context_anchors_response_from_home(
         // Active log was present but unreadable or raced with session teardown.
         return ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "anchors": [] })));
     } else if session_id.is_none() && wrapper_session_id.is_none() {
-        return ApiResponse::json_error(
-            404,
-            "managed-context anchors need an active session log",
-        );
+        return ApiResponse::json_error(404, "managed-context anchors need an active session log");
     } else {
         let Some(log_dir) = active_log_dir else {
             anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -2062,7 +2059,10 @@ pub(crate) fn managed_context_anchors_response_from_home(
     let mut seen_items = HashSet::new();
     anchors.retain(|anchor| seen_items.insert(anchor.item_id.clone()));
     anchors.truncate(MANAGED_CONTEXT_ANCHOR_LIMIT);
-    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "anchors": anchors })))
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "anchors": anchors })),
+    )
 }
 
 pub(crate) fn append_managed_context_records_from_dir(
@@ -2523,8 +2523,7 @@ pub(crate) async fn current_rollback_api_response(
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
     bus: &EventBus,
 ) -> ApiResponse {
-    let (status, body) =
-        handle_history_rollback(body_text, file_watcher, agent_state, bus).await;
+    let (status, body) = handle_history_rollback(body_text, file_watcher, agent_state, bus).await;
     session_wildcard_json_response(status_line_code(status), body)
 }
 
@@ -2678,7 +2677,11 @@ pub(crate) async fn handle_sessions_list(
 /// resolution, and store removal live in `delete_session_data`; the
 /// delete tail historically orders the wildcard CORS header before
 /// `Cache-Control`, unlike the list/search tail.
-pub(crate) fn session_delete_api_response(home: &Path, session_id: &str, target: &str) -> ApiResponse {
+pub(crate) fn session_delete_api_response(
+    home: &Path,
+    session_id: &str,
+    target: &str,
+) -> ApiResponse {
     ApiResponse::Json {
         status: 200,
         body: JsonBody::PreSerialized(delete_session_data(home, session_id, target)),
@@ -2832,17 +2835,15 @@ pub(crate) async fn handle_session_sub_router_from_home(
             ApiResponse::json_error(400, "invalid session id")
         } else {
             match context_snapshot_selector_parts_from_request(request_line) {
-                Ok((file, request_id, request_index, ts)) => {
-                    session_context_snapshot_api_response(
-                        home,
-                        session_id,
-                        &source,
-                        file,
-                        request_id,
-                        request_index,
-                        ts,
-                    )
-                }
+                Ok((file, request_id, request_index, ts)) => session_context_snapshot_api_response(
+                    home,
+                    session_id,
+                    &source,
+                    file,
+                    request_id,
+                    request_index,
+                    ts,
+                ),
                 Err(error) => ApiResponse::json_error(400, error),
             }
         };
@@ -2860,7 +2861,8 @@ pub(crate) async fn handle_session_sub_router_from_home(
         if !session_lookup_id_is_safe(session_id) {
             let response = upload_error_response("400 Bad Request", "invalid session id");
             let _ = stream.write_all(response.as_bytes()).await;
-        } else if rec_rest.len() == 2 && (rec_rest[1] == "segments" || rec_rest[1] == "playlist.m3u8")
+        } else if rec_rest.len() == 2
+            && (rec_rest[1] == "segments" || rec_rest[1] == "playlist.m3u8")
         {
             // GET /api/session/{id}/recordings/{stream}/{segments|playlist.m3u8}
             // — the tunnel twin's listing-asset vocabulary, resolved
@@ -3036,25 +3038,25 @@ pub(crate) async fn handle_session_sub_router_from_home(
             }
         } else {
             // GET /api/session/{id}/frames — list frame filenames
-            let body = if let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id)
-            {
-                let frames_dir = session_dir.join("frames");
-                let mut names: Vec<String> = Vec::new();
-                if frames_dir.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(&frames_dir) {
-                        for e in entries.flatten() {
-                            let n = e.file_name().to_string_lossy().to_string();
-                            if n.ends_with(".jpg") || n.ends_with(".png") {
-                                names.push(n);
+            let body =
+                if let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) {
+                    let frames_dir = session_dir.join("frames");
+                    let mut names: Vec<String> = Vec::new();
+                    if frames_dir.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&frames_dir) {
+                            for e in entries.flatten() {
+                                let n = e.file_name().to_string_lossy().to_string();
+                                if n.ends_with(".jpg") || n.ends_with(".png") {
+                                    names.push(n);
+                                }
                             }
                         }
+                        names.sort();
                     }
-                    names.sort();
-                }
-                serde_json::to_string(&names).unwrap_or("[]".to_string())
-            } else {
-                "[]".to_string()
-            };
+                    serde_json::to_string(&names).unwrap_or("[]".to_string())
+                } else {
+                    "[]".to_string()
+                };
             let response = HttpResponse::with_content("200 OK", "application/json", body)
                 .header("Cache-Control", "no-cache")
                 .header("Connection", "close")
@@ -3071,7 +3073,13 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let session_id_owned = session_id.to_string();
         let home = home.to_path_buf();
         let response = match tokio::task::spawn_blocking(move || {
-            session_detail_api_response(&home, &session_id_owned, &source, entry_limit, entry_before)
+            session_detail_api_response(
+                &home,
+                &session_id_owned,
+                &source,
+                entry_limit,
+                entry_before,
+            )
         })
         .await
         {
@@ -3229,10 +3237,7 @@ pub(crate) fn session_context_snapshot_api_response(
         request_index,
         ts,
     );
-    ApiResponse::json(
-        status_line_code(status_line),
-        JsonBody::PreSerialized(body),
-    )
+    ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
 
 pub(crate) async fn handle_mc_anchors(
@@ -3393,22 +3398,23 @@ pub(crate) async fn handle_worktrees_inspect(
     fleet_origin: Option<&str>,
 ) {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let response =
-        match tokio::task::spawn_blocking(move || worktrees_inspect_api_response(&home, &body_text))
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => ApiResponse::json(
-                500,
-                JsonBody::PreSerialized(
-                    serde_json::json!({
-                        "ok": false,
-                        "error": format!("worktree inspect task failed: {e}")
-                    })
-                    .to_string(),
-                ),
+    let response = match tokio::task::spawn_blocking(move || {
+        worktrees_inspect_api_response(&home, &body_text)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => ApiResponse::json(
+            500,
+            JsonBody::PreSerialized(
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("worktree inspect task failed: {e}")
+                })
+                .to_string(),
             ),
-        };
+        ),
+    };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -3631,10 +3637,7 @@ pub(crate) fn managed_context_records_response_from_home(
     } else if active_log_dir.is_some() {
         return ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "records": [] })));
     } else if session_id.is_none() && wrapper_session_id.is_none() {
-        return ApiResponse::json_error(
-            404,
-            "managed-context records need an active session log",
-        );
+        return ApiResponse::json_error(404, "managed-context records need an active session log");
     } else {
         let Some(log_dir) = active_log_dir else {
             records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -3657,7 +3660,10 @@ pub(crate) fn managed_context_records_response_from_home(
     }
 
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "records": records })))
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "records": records })),
+    )
 }
 
 #[cfg(test)]
@@ -3869,7 +3875,10 @@ pub(crate) fn managed_context_fission_response_from_home(
     let mut seen_groups = HashSet::new();
     groups.retain(|group| seen_groups.insert(group.group_id.clone()));
     groups.truncate(MANAGED_CONTEXT_FISSION_GROUP_LIMIT);
-    ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "groups": groups })))
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "groups": groups })),
+    )
 }
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
@@ -4101,7 +4110,10 @@ mod tests {
             // Divergent edit to the same file in the base checkout.
             std::fs::write(repo_dir.path().join("feature.txt"), "from main\n").unwrap();
             git(repo_dir.path(), &["add", "feature.txt"]);
-            git(repo_dir.path(), &["commit", "-m", "conflicting main change"]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", "conflicting main change"],
+            );
 
             let err = merge_linked_session_worktree(session_dir.path(), &[]).unwrap_err();
             assert!(err.contains("wt-conflict"), "{err}");
@@ -5317,9 +5329,7 @@ mod tests {
     // handler wrappers resolve the real home at the transport edge).
 
     /// Run one stream-consuming handler and collect every byte it wrote.
-    async fn collect_session_handler_response<Fut>(
-        run: impl FnOnce(DemuxStream) -> Fut,
-    ) -> Vec<u8>
+    async fn collect_session_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
     where
         Fut: std::future::Future<Output = ()>,
     {
@@ -5371,8 +5381,7 @@ mod tests {
         // A present-but-empty ids filter answers the empty list without
         // touching the session stores — fully deterministic.
         let request_line = "GET /api/sessions?ids= HTTP/1.1";
-        let response =
-            collect_session_handler_response(|stream| {
+        let response = collect_session_handler_response(|stream| {
             handle_sessions_list(
                 stream,
                 request_line,
@@ -5380,7 +5389,7 @@ mod tests {
                 None,
             )
         })
-                .await;
+        .await;
         assert_eq!(
             golden_transcript(&response),
             golden_session_wildcard_json_transcript("200 OK", "[]")
@@ -5392,8 +5401,7 @@ mod tests {
         // The limit and view=usage knobs ride the same empty-filter body:
         // pins the query-parameter plumbing end to end.
         let request_line = "GET /api/sessions?ids=&limit=3&view=usage HTTP/1.1";
-        let response =
-            collect_session_handler_response(|stream| {
+        let response = collect_session_handler_response(|stream| {
             handle_sessions_list(
                 stream,
                 request_line,
@@ -5401,7 +5409,7 @@ mod tests {
                 None,
             )
         })
-                .await;
+        .await;
         assert_eq!(
             golden_transcript(&response),
             golden_session_wildcard_json_transcript("200 OK", "[]")
@@ -5415,8 +5423,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // An empty query short-circuits before any store scan.
         let request_line = "GET /api/sessions/search?q= HTTP/1.1";
-        let response =
-            collect_session_handler_response(|stream| {
+        let response = collect_session_handler_response(|stream| {
             handle_sessions_search(
                 stream,
                 request_line,
@@ -5424,7 +5431,7 @@ mod tests {
                 None,
             )
         })
-                .await;
+        .await;
         let body = serde_json::json!({
             "query": "",
             "mode": "all_keywords",
@@ -5450,8 +5457,7 @@ mod tests {
         // The single-flight guard answers 200 with the busy body.
         assert!(!SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst));
         let request_line = "GET /api/sessions/search?q=anything HTTP/1.1";
-        let response =
-            collect_session_handler_response(|stream| {
+        let response = collect_session_handler_response(|stream| {
             handle_sessions_search(
                 stream,
                 request_line,
@@ -5459,7 +5465,7 @@ mod tests {
                 None,
             )
         })
-                .await;
+        .await;
         SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
         let body = serde_json::json!({
             "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
@@ -6110,9 +6116,7 @@ mod tests {
 
     #[tokio::test]
     async fn golden_current_history_and_mutations_without_watcher_transcripts() {
-        for (make, expect_status) in [
-            ("GET", "503 Service Unavailable"),
-        ] {
+        for (make, expect_status) in [("GET", "503 Service Unavailable")] {
             let _ = make;
             let response = collect_session_handler_response(|stream| {
                 handle_current_history(
@@ -6318,5 +6322,4 @@ mod tests {
             golden_session_wildcard_json_transcript("200 OK", &body)
         );
     }
-
 }

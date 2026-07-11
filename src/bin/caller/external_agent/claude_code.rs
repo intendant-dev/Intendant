@@ -810,12 +810,13 @@ impl CcReader {
                     }
                     _ => self.handle_user(&msg, &mut child_out, Some(child_id.as_str())),
                 }
-                out.events.extend(child_out.events.into_iter().map(|ev| match ev {
-                    // Already-scoped events (a nested task's terminal state
-                    // targets the grandchild) keep their own scope.
-                    ev @ AgentEvent::Scoped { .. } => ev,
-                    ev => AgentEvent::scoped(Some(child_id.clone()), None, ev),
-                }));
+                out.events
+                    .extend(child_out.events.into_iter().map(|ev| match ev {
+                        // Already-scoped events (a nested task's terminal state
+                        // targets the grandchild) keep their own scope.
+                        ev @ AgentEvent::Scoped { .. } => ev,
+                        ev => AgentEvent::scoped(Some(child_id.clone()), None, ev),
+                    }));
                 out.outbound.extend(child_out.outbound);
                 return out;
             }
@@ -840,7 +841,11 @@ impl CcReader {
     /// transcript replay, or a spawn that predates this supervisor). The
     /// registration event this may push must stay unscoped: the drain
     /// learns the child→parent route from it.
-    fn task_scope_for(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) -> Option<String> {
+    fn task_scope_for(
+        &mut self,
+        msg: &serde_json::Value,
+        out: &mut CcLineOutcome,
+    ) -> Option<String> {
         let ptid = msg
             .get("parent_tool_use_id")
             .and_then(|v| v.as_str())
@@ -1999,8 +2004,7 @@ impl ClaudeCodeAgent {
     /// The configured budget when it cannot be passed to the CLI (zero,
     /// negative, or non-finite). `initialize` refuses to spawn on `Some`.
     fn invalid_max_budget(&self) -> Option<f64> {
-        self.max_budget_usd
-            .filter(|b| !(b.is_finite() && *b > 0.0))
+        self.max_budget_usd.filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
     /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
@@ -2112,10 +2116,7 @@ impl ClaudeCodeAgent {
     /// Live model switch. Only changes the RUNNING process (and the latch a
     /// respawn reads); the persisted per-session pin is the Launch-config
     /// overlay's job (`ConfigureSessionAgent`).
-    async fn set_model_live(
-        &mut self,
-        params: &serde_json::Value,
-    ) -> Result<String, CallerError> {
+    async fn set_model_live(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
         let model = params
             .get("model")
             .or_else(|| params.get("value"))
@@ -2625,8 +2626,12 @@ mod tests {
         // `invalid_max_budget().is_some()`), never silently disarm: the CLI
         // crashes on --max-budget-usd 0, and dropping the flag would run the
         // session uncapped against the operator's explicit ceiling.
-        let base = || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
-        assert_eq!(base().with_max_budget_usd(Some(2.5)).invalid_max_budget(), None);
+        let base =
+            || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(2.5)).invalid_max_budget(),
+            None
+        );
         assert_eq!(base().with_max_budget_usd(None).invalid_max_budget(), None);
         assert_eq!(
             base().with_max_budget_usd(Some(0.0)).invalid_max_budget(),
@@ -2641,7 +2646,10 @@ mod tests {
             .invalid_max_budget()
             .is_some_and(f64::is_nan));
         // The raw value is preserved so the refusal names what was configured.
-        assert_eq!(base().with_max_budget_usd(Some(0.0)).max_budget_usd, Some(0.0));
+        assert_eq!(
+            base().with_max_budget_usd(Some(0.0)).max_budget_usd,
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -3435,7 +3443,9 @@ mod tests {
             "bash task spawned: {:?}",
             out.events
         );
-        assert!(!reader.task_children.contains_key("toolu_01SLOWBASH00000000"));
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01SLOWBASH00000000"));
         // Its notification stays silent too (no child to end).
         let out = reader.process_line(
             r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
@@ -3469,7 +3479,9 @@ mod tests {
         let out = reader.process_line(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"partial output"}]},"parent_tool_use_id":"toolu_01OPENLAZY00000000","session_id":"s1"}"#,
         );
-        assert!(!reader.task_children.contains_key("toolu_01OPENLAZY00000000"));
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01OPENLAZY00000000"));
         assert!(
             !out.events
                 .iter()
@@ -3491,7 +3503,9 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"zz1","tool_use_id":"toolu_01OPENBASH00000000","description":"Find all key Rust files by name","task_type":"local_agent","session_id":"s1"}"#,
         );
         assert!(out.events.is_empty(), "open tool spawned: {:?}", out.events);
-        assert!(!reader.task_children.contains_key("toolu_01OPENBASH00000000"));
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01OPENBASH00000000"));
     }
 
     #[test]
@@ -4079,7 +4093,10 @@ mod tests {
             payload["updatedInput"]["questions"][0]["question"],
             "Which DB?"
         );
-        assert_eq!(payload["updatedInput"]["answers"]["Which DB?"], "PostgreSQL");
+        assert_eq!(
+            payload["updatedInput"]["answers"]["Which DB?"],
+            "PostgreSQL"
+        );
     }
 
     #[test]

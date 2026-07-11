@@ -30,11 +30,9 @@ impl SessionSupervisor {
                 worktree,
                 worktree_branch,
             } => {
-                let worktree_request = worktree
-                    .unwrap_or(false)
-                    .then(|| SessionWorktreeRequest {
-                        branch: worktree_branch,
-                    });
+                let worktree_request = worktree.unwrap_or(false).then(|| SessionWorktreeRequest {
+                    branch: worktree_branch,
+                });
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
@@ -498,7 +496,11 @@ impl SessionSupervisor {
         }
     }
 
-    pub(crate) async fn report_unattached_codex_thread_action(&self, session_id: Option<String>, op: String) {
+    pub(crate) async fn report_unattached_codex_thread_action(
+        &self,
+        session_id: Option<String>,
+        op: String,
+    ) {
         let Some(target_id) = session_id
             .as_deref()
             .map(str::trim)
@@ -651,15 +653,13 @@ mod tests {
         // managed non-external session.
         {
             let mut state = supervisor.state.lock().await;
-            state
-                .sessions
-                .insert("native-1".to_string(), managed_session("native-1", "intendant"));
+            state.sessions.insert(
+                "native-1".to_string(),
+                managed_session("native-1", "intendant"),
+            );
         }
         supervisor
-            .report_unattached_codex_thread_action(
-                Some("native-1".to_string()),
-                "side".to_string(),
-            )
+            .report_unattached_codex_thread_action(Some("native-1".to_string()), "side".to_string())
             .await;
         let results = drain_results(&mut rx);
         assert_eq!(results.len(), 1);

@@ -2151,7 +2151,10 @@ pub fn role_ceiling_for_session(
 /// routing distinction is [`origin_route_class`]), `local` (the owner's
 /// own dashboard / loopback), or `peer` (a federated daemon).
 /// Classification mirrors [`role_ceiling_for_session`]'s hosted test.
-pub fn session_origin_class(hosted_origins: &[String], principal: &AccessPrincipal) -> &'static str {
+pub fn session_origin_class(
+    hosted_origins: &[String],
+    principal: &AccessPrincipal,
+) -> &'static str {
     if principal.kind == "peer_daemon" {
         return "peer";
     }
@@ -2160,9 +2163,9 @@ pub fn session_origin_class(hosted_origins: &[String], principal: &AccessPrincip
         Some("client_key") => {
             let origin = principal.authn_origin.as_deref().unwrap_or("");
             let hosted = !origin.is_empty()
-                && hosted_origins
-                    .iter()
-                    .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'));
+                && hosted_origins.iter().any(|candidate| {
+                    candidate.trim_end_matches('/') == origin.trim_end_matches('/')
+                });
             if hosted {
                 "hosted"
             } else {
@@ -3852,7 +3855,10 @@ mod tests {
         )
         .is_owner_surface());
         assert!(AccessPrincipal::root_dashboard_session_with_client_key(
-            "test", "dashboard", "fp", "pk"
+            "test",
+            "dashboard",
+            "fp",
+            "pk"
         )
         .is_owner_surface());
         assert!(AccessPrincipal::local_loopback_mcp_default("http").is_owner_surface());
@@ -4100,7 +4106,11 @@ mod tests {
             "hosted"
         );
         assert_eq!(
-            origin_route_class("https://d-30a08371a38c1b.fleet.intendant.dev:8765", &hosted, zone),
+            origin_route_class(
+                "https://d-30a08371a38c1b.fleet.intendant.dev:8765",
+                &hosted,
+                zone
+            ),
             "fleet"
         );
         // The zone apex itself is fleet-classed; a lookalike suffix is not.

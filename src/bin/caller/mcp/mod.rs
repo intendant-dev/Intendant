@@ -339,9 +339,7 @@ impl IntendantServer {
                 )?;
                 Ok(match self.post_session_note_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
-                    Err(message) => {
-                        text_tool_error(format!("post_session_note failed: {message}"))
-                    }
+                    Err(message) => text_tool_error(format!("post_session_note failed: {message}")),
                 })
             }
             "ask_user" => {
@@ -981,7 +979,11 @@ impl IntendantServer {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
             {
-                hydrate_requested_session_status_from_logs(&self.home, &mut s, requested_session_id);
+                hydrate_requested_session_status_from_logs(
+                    &self.home,
+                    &mut s,
+                    requested_session_id,
+                );
             }
             let target_session_id = session_id_override
                 .map(str::trim)

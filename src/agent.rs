@@ -681,10 +681,8 @@ impl Agent {
                 // account's real home (tests-are-hermetic). Production
                 // keeps the user's real HOME.
                 if cfg!(test) {
-                    let scratch = std::env::temp_dir().join(format!(
-                        "intendant-test-shell-home-{}",
-                        std::process::id()
-                    ));
+                    let scratch = std::env::temp_dir()
+                        .join(format!("intendant-test-shell-home-{}", std::process::id()));
                     let _ = std::fs::create_dir_all(&scratch);
                     c.env("HOME", &scratch);
                 }

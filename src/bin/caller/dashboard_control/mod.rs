@@ -157,11 +157,26 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
     // see which providers are fueled. Raw egress_* relay frames are a
     // separate wire family and deliberately not methods here.
-    method("api_credential_lease_grant", PeerOperation::CredentialsManage),
-    method("api_credential_lease_renew", PeerOperation::CredentialsManage),
-    method("api_credential_lease_revoke", PeerOperation::CredentialsManage),
-    method("api_credential_lease_status", PeerOperation::CredentialsManage),
-    method("api_credential_custody_trail", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_lease_grant",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_renew",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_revoke",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_status",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_custody_trail",
+        PeerOperation::CredentialsManage,
+    ),
     // Daemon-local vault blob storage (the local-vault half of custody):
     // blind E2E ciphertext the daemon can neither read nor forge, so a
     // direct dashboard has a vault home without any Connect service in
@@ -173,10 +188,22 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // publishes the vault's deposit public key here and folds queued
     // deposits into the blob on unlock. All ciphertext/public material —
     // the daemon can neither read deposits nor mint vault entries.
-    method("api_daemon_vault_deposit_key_fetch", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposit_key_publish", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposits_fetch", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposits_consume", PeerOperation::CredentialsManage),
+    method(
+        "api_daemon_vault_deposit_key_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposit_key_publish",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_consume",
+        PeerOperation::CredentialsManage,
+    ),
     method(
         "api_credential_egress_register",
         PeerOperation::CredentialsManage,
@@ -185,7 +212,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_credential_egress_unregister",
         PeerOperation::CredentialsManage,
     ),
-    method("api_credential_egress_probe", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_egress_probe",
+        PeerOperation::CredentialsManage,
+    ),
     // The IAM grant mutations (upsert/update), enrollment decide, and
     // the seven org-manage methods live as tunnel columns on their route
     // rows — their IAM operations derive from the rows (S6).
@@ -264,7 +294,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_media_clip_cancel", PeerOperation::RuntimeControl),
     method("api_recordings", PeerOperation::RuntimeControl),
     method("api_recording_asset", PeerOperation::RuntimeControl),
-    method("api_browser_workspace_snapshot", PeerOperation::SessionInspect),
+    method(
+        "api_browser_workspace_snapshot",
+        PeerOperation::SessionInspect,
+    ),
     method("api_state_snapshot", PeerOperation::SessionInspect),
     method("api_session_log_replay", PeerOperation::SessionInspect),
     method(
@@ -2944,28 +2977,12 @@ mod tests {
                 Some(Op::AccessInspect),
             ),
             ("api_dashboard_targets", Row, Some(Op::AccessInspect)),
-            (
-                "api_access_connect_status",
-                Row,
-                Some(Op::AccessInspect),
-            ),
-            (
-                "api_access_connect_claim_code",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_connect_status", Row, Some(Op::AccessInspect)),
+            ("api_access_connect_claim_code", Row, Some(Op::AccessManage)),
             ("api_access_connect_config", Row, Some(Op::AccessManage)),
-            (
-                "api_access_connect_unclaim",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_connect_unclaim", Row, Some(Op::AccessManage)),
             ("api_access_set_tier", Row, Some(Op::AccessManage)),
-            (
-                "api_access_set_hosted_ceiling",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_set_hosted_ceiling", Row, Some(Op::AccessManage)),
             ("api_fleet_cert_request", Row, Some(Op::AccessManage)),
             (
                 "api_credential_lease_grant",
@@ -3042,39 +3059,19 @@ mod tests {
                 Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_iam_update_grant",
-                Row,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_enrollment_decide",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_iam_update_grant", Row, Some(Op::AccessManage)),
+            ("api_access_enrollment_decide", Row, Some(Op::AccessManage)),
             ("api_access_org_trust", Row, Some(Op::AccessManage)),
             ("api_access_org_revoke", Row, Some(Op::AccessManage)),
             ("api_access_org_issue", Row, Some(Op::AccessManage)),
-            (
-                "api_access_org_revoke_member",
-                Row,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_org_issuer_init",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_org_revoke_member", Row, Some(Op::AccessManage)),
+            ("api_access_org_issuer_init", Row, Some(Op::AccessManage)),
             (
                 "api_access_org_issuer_delegate",
                 Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_org_issuer_install",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_org_issuer_install", Row, Some(Op::AccessManage)),
             ("api_access_org_present", Row, Some(Op::AccessInspect)),
             ("api_access_org_orl", Row, Some(Op::AccessInspect)),
             ("api_access_org_renew", Row, Some(Op::AccessInspect)),
@@ -3085,11 +3082,7 @@ mod tests {
             // row's canonical leaf, asserted per method by
             // gateway_routes::peers_family_tunnel_ops_assert_against_the_federation_ladder.
             ("api_peer_pairing_requests", Row, Some(Op::AccessInspect)),
-            (
-                "api_peer_pairing_identities",
-                Row,
-                Some(Op::AccessInspect),
-            ),
+            ("api_peer_pairing_identities", Row, Some(Op::AccessInspect)),
             (
                 "api_peer_pairing_request_decision",
                 Row,
@@ -3105,22 +3098,14 @@ mod tests {
             ("api_peer_eligible", Row, Some(Op::PeerInspect)),
             ("api_peer_webrtc_signal", Row, Some(Op::PeerUse)),
             ("api_peer_file_transfer_signal", Row, Some(Op::PeerUse)),
-            (
-                "api_peer_dashboard_control_signal",
-                Row,
-                Some(Op::PeerUse),
-            ),
+            ("api_peer_dashboard_control_signal", Row, Some(Op::PeerUse)),
             ("api_peer_message", Row, Some(Op::PeerUse)),
             ("api_peer_task", Row, Some(Op::PeerUse)),
             ("api_peer_approval", Row, Some(Op::PeerUse)),
             ("api_peer_add", Row, Some(Op::PeerManage)),
             ("api_peer_remove", Row, Some(Op::PeerManage)),
             ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
-            (
-                "api_peer_pairing_request_access",
-                Row,
-                Some(Op::PeerManage),
-            ),
+            ("api_peer_pairing_request_access", Row, Some(Op::PeerManage)),
             (
                 "api_peer_pairing_request_access_poll",
                 Row,
@@ -3141,41 +3126,17 @@ mod tests {
             ),
             ("api_sessions_search", Row, Some(Op::SessionInspect)),
             ("api_session_recordings", Row, Some(Op::SessionInspect)),
-            (
-                "api_session_recording_asset",
-                Row,
-                Some(Op::SessionInspect),
-            ),
+            ("api_session_recording_asset", Row, Some(Op::SessionInspect)),
             ("api_session_frame_asset", Row, Some(Op::SessionInspect)),
             ("api_worktrees", Row, Some(Op::SessionInspect)),
             ("api_worktrees_inspect", Row, Some(Op::SessionInspect)),
             ("api_session_delete", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_history",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_rollback",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_history", Row, Some(Op::SessionManage)),
+            ("api_session_current_rollback", Row, Some(Op::SessionManage)),
             ("api_session_current_redo", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_prune",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_changes",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_uploads",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_prune", Row, Some(Op::SessionManage)),
+            ("api_session_current_changes", Row, Some(Op::SessionManage)),
+            ("api_session_current_uploads", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload_raw",
                 Row,
@@ -3195,11 +3156,7 @@ mod tests {
             ("api_worktrees_scan", Row, Some(Op::SessionManage)),
             ("api_worktrees_remove", Row, Some(Op::SessionManage)),
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_upload",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_upload", Row, Some(Op::SessionManage)),
             ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
             (
                 "api_transfer_download_read",
@@ -3299,21 +3256,9 @@ mod tests {
                 Some(Op::SessionInspect),
             ),
             ("api_dashboard_bootstrap", Residue, Some(Op::SessionInspect)),
-            (
-                "api_managed_context_records",
-                Row,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_anchors",
-                Row,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_fission",
-                Row,
-                Some(Op::SessionInspect),
-            ),
+            ("api_managed_context_records", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_anchors", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_fission", Row, Some(Op::SessionInspect)),
             ("api_external_agents", Row, Some(Op::SessionInspect)),
         ];
 
@@ -3408,7 +3353,9 @@ mod tests {
             .expect("DAEMON_API_HTTP_MAP not found in app.html")
             + start.len();
         let rest = &app[from..];
-        let to = rest.find("});").expect("DAEMON_API_HTTP_MAP is unterminated");
+        let to = rest
+            .find("});")
+            .expect("DAEMON_API_HTTP_MAP is unterminated");
 
         // One `name: { verb: '…', path: '…', … },` entry per line — the
         // fragment documents that contract next to the literal.
@@ -3418,8 +3365,7 @@ mod tests {
             let rest = &entry[at..];
             Some(rest[..rest.find('\'')?].to_string())
         }
-        let mut entries: std::collections::BTreeMap<String, (String, String)> =
-            Default::default();
+        let mut entries: std::collections::BTreeMap<String, (String, String)> = Default::default();
         for line in rest[..to].lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
@@ -3542,8 +3488,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let actual: std::collections::BTreeSet<&str> =
-            entries.keys().map(String::as_str).collect();
+        let actual: std::collections::BTreeSet<&str> = entries.keys().map(String::as_str).collect();
         assert_eq!(actual, expected, "DAEMON_API_HTTP_MAP coverage drifted");
 
         for (method_name, (verb, template)) in &entries {
@@ -3658,7 +3603,10 @@ mod tests {
             // happen to resolve through it.
             match route.pattern {
                 PathPattern::Exact(base) => {
-                    assert_eq!(template, base, "{method_name}: template != exact route path")
+                    assert_eq!(
+                        template, base,
+                        "{method_name}: template != exact route path"
+                    )
                 }
                 PathPattern::Under(base) => assert!(
                     template == base || template.starts_with(&format!("{base}/")),
@@ -4454,5 +4402,4 @@ mod tests {
         );
         assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
     }
-
 }

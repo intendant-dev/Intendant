@@ -2566,7 +2566,8 @@ mod tests {
     }
 
     fn empty_test_registry() -> crate::peer::PeerRegistry {
-        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
         crate::peer::PeerRegistry::new(log_tx)
     }
 
@@ -2703,9 +2704,14 @@ mod tests {
         let serde_error = serde_json::from_str::<PairingInviteRequest>(invalid)
             .err()
             .expect("invite body must not decode");
-        let response =
-            peers_sub_router_transcript("POST", "/api/peers/pairing/invite", invalid, cert_dir, None)
-                .await;
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/pairing/invite",
+            invalid,
+            cert_dir,
+            None,
+        )
+        .await;
         assert_eq!(
             response,
             golden_peers_transcript(

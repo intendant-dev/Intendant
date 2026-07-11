@@ -1423,7 +1423,13 @@ mod tests {
         assert_eq!(cfg.claude_permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(
             cfg.claude_allowed_tools.as_deref(),
-            Some(&["Read".to_string(), "Edit".into(), "Bash(cargo test *)".into()][..]),
+            Some(
+                &[
+                    "Read".to_string(),
+                    "Edit".into(),
+                    "Bash(cargo test *)".into()
+                ][..]
+            ),
             "comma-split must preserve spaces inside a rule"
         );
         assert_eq!(cfg.claude_effort.as_deref(), Some("xhigh"));
@@ -1450,7 +1456,10 @@ mod tests {
                 claude_effort: Some(sentinel),
                 ..Default::default()
             });
-            assert!(cfg.claude_model.is_none(), "model {sentinel:?} should clear");
+            assert!(
+                cfg.claude_model.is_none(),
+                "model {sentinel:?} should clear"
+            );
             assert!(
                 cfg.claude_permission_mode.is_none(),
                 "mode {sentinel:?} should clear"
@@ -1459,7 +1468,10 @@ mod tests {
                 cfg.claude_allowed_tools.is_none(),
                 "tools {sentinel:?} should clear"
             );
-            assert!(cfg.claude_effort.is_none(), "effort {sentinel:?} should clear");
+            assert!(
+                cfg.claude_effort.is_none(),
+                "effort {sentinel:?} should clear"
+            );
         }
         // "default" is a REAL permission mode and must pin, while it clears
         // the other three fields (never a valid model/tool/effort value).

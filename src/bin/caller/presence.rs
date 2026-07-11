@@ -1280,8 +1280,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.phase = "waiting_human".to_string();
             s.pending_question = Some(presence_core::PendingQuestionSnapshot {
                 id: *id,
-                questions: serde_json::to_value(questions)
-                    .unwrap_or(serde_json::Value::Null),
+                questions: serde_json::to_value(questions).unwrap_or(serde_json::Value::Null),
             });
         }
         AppEvent::SubAgentResult { formatted } => {

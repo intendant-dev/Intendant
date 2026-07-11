@@ -9,8 +9,8 @@ use crate::external_agent;
 use crate::provider;
 use crate::{ExternalToolFailureLogLimiter, ExternalToolOutputLimiter};
 
-use std::time::Duration;
 use crate::*;
+use std::time::Duration;
 
 pub(crate) const SAFETY_CAP: usize = 500;
 pub(crate) const MIN_BUDGET_TOKENS: u64 = 4096;
@@ -309,7 +309,12 @@ pub(crate) async fn handle_spawn_sub_agent_call(
     };
     match orchestration
         .supervisor
-        .start_sub_agent_session(&orchestration.session_id, project, orchestration.depth, params)
+        .start_sub_agent_session(
+            &orchestration.session_id,
+            project,
+            orchestration.depth,
+            params,
+        )
         .await
     {
         Ok(started) => {
@@ -516,24 +521,23 @@ pub(crate) async fn handle_wait_sub_agents_call(
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                                 child.rx = None;
-                                child.completed =
-                                    Some(session_supervisor::SubAgentCompletion {
-                                        child_session_id: id.clone(),
-                                        name: child.name.clone(),
-                                        result: sub_agent::SubAgentResult {
-                                            id: child.name.clone(),
-                                            status: sub_agent::SubAgentStatus::Failed(
-                                                "session ended without a result".to_string(),
-                                            ),
-                                            summary:
-                                                "Sub-agent session ended without reporting a result"
-                                                    .to_string(),
-                                            brief: "Sub-agent ended without a result.".to_string(),
-                                            findings: vec![],
-                                            artifacts: vec![],
-                                            usage: provider::TokenUsage::default(),
-                                        },
-                                    });
+                                child.completed = Some(session_supervisor::SubAgentCompletion {
+                                    child_session_id: id.clone(),
+                                    name: child.name.clone(),
+                                    result: sub_agent::SubAgentResult {
+                                        id: child.name.clone(),
+                                        status: sub_agent::SubAgentStatus::Failed(
+                                            "session ended without a result".to_string(),
+                                        ),
+                                        summary:
+                                            "Sub-agent session ended without reporting a result"
+                                                .to_string(),
+                                        brief: "Sub-agent ended without a result.".to_string(),
+                                        findings: vec![],
+                                        artifacts: vec![],
+                                        usage: provider::TokenUsage::default(),
+                                    },
+                                });
                             }
                         }
                     }
@@ -733,7 +737,10 @@ pub(crate) async fn handle_peer_tool_call(
                 Ok(value) => value,
                 Err(error) => return PeerToolOutput::error(error),
             };
-            let Some(actions) = args.get("actions").filter(|value| value.is_array()).cloned()
+            let Some(actions) = args
+                .get("actions")
+                .filter(|value| value.is_array())
+                .cloned()
             else {
                 return PeerToolOutput::error(
                     serde_json::json!({

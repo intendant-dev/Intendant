@@ -1625,7 +1625,10 @@ mod tests {
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
-    pub(crate) fn read_events(log_dir: &std::path::Path, event_type: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn read_events(
+        log_dir: &std::path::Path,
+        event_type: &str,
+    ) -> Vec<serde_json::Value> {
         let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         content
             .lines()
@@ -1634,7 +1637,10 @@ mod tests {
             .collect()
     }
 
-    pub(crate) fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
+    pub(crate) fn read_last_event(
+        log_dir: &std::path::Path,
+        event_type: &str,
+    ) -> serde_json::Value {
         read_events(log_dir, event_type)
             .into_iter()
             .last()

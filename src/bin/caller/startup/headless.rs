@@ -242,8 +242,7 @@ pub(crate) async fn run_headless_mode(
                                 // approval slot in JSON mode.
                                 let mut guard = approval_slot.lock().unwrap();
                                 if let Some((_id, tx)) = guard.take() {
-                                    let _ =
-                                        tx.send(event::ApprovalResponse::Answer { answers });
+                                    let _ = tx.send(event::ApprovalResponse::Answer { answers });
                                 }
                             }
                             event::ControlMsg::Input { text } => {
@@ -349,9 +348,7 @@ pub(crate) async fn run_headless_mode(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 let (id, response) = match ctrl {
-                    event::ControlMsg::Approve { id, .. } => {
-                        (id, event::ApprovalResponse::Approve)
-                    }
+                    event::ControlMsg::Approve { id, .. } => (id, event::ApprovalResponse::Approve),
                     event::ControlMsg::ApproveAll { id, .. } => {
                         (id, event::ApprovalResponse::ApproveAll)
                     }

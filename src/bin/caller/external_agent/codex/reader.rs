@@ -888,7 +888,9 @@ pub(crate) struct CodexNotificationState {
 /// Parse an `account/rateLimits/updated` payload (app-server v2 shape:
 /// `rateLimits.{primary,secondary}.{usedPercent,windowDurationMins,
 /// resetsAt}`, camelCase with snake_case tolerated) into vitals windows.
-pub(crate) fn codex_rate_limit_windows(params: &serde_json::Value) -> Vec<crate::types::SessionLimitWindow> {
+pub(crate) fn codex_rate_limit_windows(
+    params: &serde_json::Value,
+) -> Vec<crate::types::SessionLimitWindow> {
     let snapshot = params
         .get("rateLimits")
         .or_else(|| params.get("rate_limits"))
@@ -1407,7 +1409,11 @@ pub(crate) fn compact_codex_output_line(line: &str) -> String {
     }
 }
 
-pub(crate) fn truncate_middle_chars_with_notice(text: &str, max_chars: usize, label: &str) -> String {
+pub(crate) fn truncate_middle_chars_with_notice(
+    text: &str,
+    max_chars: usize,
+    label: &str,
+) -> String {
     let total = text.chars().count();
     if total <= max_chars {
         return text.to_string();
@@ -2698,7 +2704,9 @@ pub(crate) fn codex_mcp_tool_result_text(result: &serde_json::Value) -> String {
     }
 }
 
-pub(crate) fn sanitize_codex_mcp_tool_result_for_text(value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn sanitize_codex_mcp_tool_result_for_text(
+    value: &serde_json::Value,
+) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
@@ -2749,7 +2757,9 @@ pub(crate) fn sanitize_codex_mcp_tool_result_for_text(value: &serde_json::Value)
     }
 }
 
-pub(crate) fn codex_mcp_result_object_is_image(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+pub(crate) fn codex_mcp_result_object_is_image(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     let type_text = map
         .get("type")
         .or_else(|| map.get("mimeType"))

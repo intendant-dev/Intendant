@@ -870,8 +870,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -916,8 +921,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,

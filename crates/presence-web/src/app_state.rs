@@ -264,7 +264,10 @@ pub enum UiCommand {
     /// A federated peer's display stopped being available (capture
     /// lost, or the peer's user revoked their grant); JS drops it from
     /// the peer row's `displays` list.
-    PeerDisplayRemoved { host_id: String, display_id: u32 },
+    PeerDisplayRemoved {
+        host_id: String,
+        display_id: u32,
+    },
     /// One leg of a federation-driven WebRTC signaling exchange
     /// arriving from a peer. JS feeds the `signal` payload to the
     /// matching per-peer `RTCPeerConnection` keyed by
@@ -4035,10 +4038,9 @@ mod tests {
         });
         let cmds = s.handle_state_snapshot(&snapshot);
         assert_eq!(s.pending_question_id, Some(4));
-        assert!(cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::ShowUserQuestion { id: 4, .. }
-        )));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowUserQuestion { id: 4, .. })));
     }
 
     #[test]
@@ -5703,8 +5705,7 @@ mod tests {
             } => Some((host_id, *display_id, *width, *height)),
             _ => None,
         });
-        let (host_id, display_id, width, height) =
-            upsert.expect("PeerDisplayReady emitted");
+        let (host_id, display_id, width, height) = upsert.expect("PeerDisplayReady emitted");
         assert_eq!(host_id, "intendant:alpha");
         assert_eq!((display_id, width, height), (99, 1920, 1080));
         assert!(
@@ -5773,8 +5774,7 @@ mod tests {
         assert_eq!(session["session_id"], "s1");
         assert_eq!(session["label"], "federated task");
         assert!(
-            cmds.iter()
-                .any(|c| matches!(c, UiCommand::PeerLog { .. })),
+            cmds.iter().any(|c| matches!(c, UiCommand::PeerLog { .. })),
             "session_started keeps its log line"
         );
 

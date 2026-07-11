@@ -477,8 +477,7 @@ pub(crate) async fn run_with_presence(
                     // boundary of a running task, surviving idle gaps to
                     // prelude the next prompt (idle updates never buy a
                     // turn).
-                    let result_session =
-                        session_id.clone().or_else(|| local_session_id.clone());
+                    let result_session = session_id.clone().or_else(|| local_session_id.clone());
                     let fresh = goal_fresh_tokens(&cumulative_stats.usage);
                     let (success, message) =
                         match native_goal_engine.dispatch(&op, &action_params, fresh) {
@@ -486,10 +485,9 @@ pub(crate) async fn run_with_presence(
                                 // goal_event: None = nothing to broadcast;
                                 // Some(None) = cleared; Some(goal) = state.
                                 let (message, goal_event, notice) = match outcome {
-                                    external_agent::GoalActionOutcome::Report {
-                                        message,
-                                        goal,
-                                    } => (message, goal.map(Some), None),
+                                    external_agent::GoalActionOutcome::Report { message, goal } => {
+                                        (message, goal.map(Some), None)
+                                    }
                                     external_agent::GoalActionOutcome::Cleared {
                                         message,
                                         notice,
@@ -1265,11 +1263,7 @@ pub(crate) async fn run_with_presence(
                         }
                     }
                     external_agent::AgentEvent::GoalUpdated { goal } => {
-                        emit_external_session_goal(
-                            &idle_drain_config,
-                            event_thread_id,
-                            Some(goal),
-                        );
+                        emit_external_session_goal(&idle_drain_config, event_thread_id, Some(goal));
                     }
                     external_agent::AgentEvent::GoalCleared => {
                         emit_external_session_goal(&idle_drain_config, event_thread_id, None);
@@ -1305,17 +1299,14 @@ pub(crate) async fn run_with_presence(
                         will_retry,
                         ..
                     } => {
-                        let label = external_agent_log_source(
-                            idle_drain_config.agent_source.as_deref(),
-                        );
+                        let label =
+                            external_agent_log_source(idle_drain_config.agent_source.as_deref());
                         let mut content = if let Some(code) = code.as_deref() {
                             format!("{label} backend error while idle ({code}): {message}")
                         } else {
                             format!("{label} backend error while idle: {message}")
                         };
-                        if let Some(details) =
-                            details.as_deref().filter(|s| !s.trim().is_empty())
-                        {
+                        if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
                             content.push('\n');
                             content.push_str(details.trim());
                         }
@@ -1411,10 +1402,9 @@ pub(crate) async fn run_with_presence(
                             if let Some(native) =
                                 cumulative_stats.announced_native_session_id.take()
                             {
-                                let is_canonical =
-                                    persistent_agent_backend.as_ref().is_some_and(|backend| {
-                                        backend.thread_id_is_canonical(&native)
-                                    });
+                                let is_canonical = persistent_agent_backend
+                                    .as_ref()
+                                    .is_some_and(|backend| backend.thread_id_is_canonical(&native));
                                 if is_canonical {
                                     if let Some(thread) = persistent_thread.as_mut() {
                                         if thread.thread_id != native {

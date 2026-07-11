@@ -265,9 +265,13 @@ async fn spawn_daemon_on_rig(
         // to a file instead.
         .stdout(log.try_clone().expect("clone daemon log"))
         .stderr(log);
-    cmd.arg("--web")
-        .arg(port.to_string())
-        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", "full"]);
+    cmd.arg("--web").arg(port.to_string()).args([
+        "--bind",
+        "127.0.0.1",
+        "--no-tui",
+        "--autonomy",
+        "full",
+    ]);
     let (ws_scheme, http_scheme) = if tls {
         ("wss", "https")
     } else {
@@ -987,7 +991,11 @@ async fn create_session_with_worktree_runs_inside_the_worktree() {
     let linkage = meta.get("worktree").expect("meta records worktree linkage");
     assert_eq!(linkage["branch"], "wt-e2e", "{linkage}");
     assert_eq!(linkage["base_branch"], "main", "{linkage}");
-    assert_eq!(linkage["base_sha"], serde_json::json!(base_head), "{linkage}");
+    assert_eq!(
+        linkage["base_sha"],
+        serde_json::json!(base_head),
+        "{linkage}"
+    );
     assert!(
         linkage
             .get("base_root")
@@ -1125,7 +1133,11 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     assert_eq!(event["text"], NOTE_TEXT, "{event}");
     assert_eq!(event["source"], "e2e", "{event}");
     assert_eq!(event["session_id"], "note-e2e-session", "{event}");
-    assert_eq!(event["attachments"][0]["url"], attachment_url.as_str(), "{event}");
+    assert_eq!(
+        event["attachments"][0]["url"],
+        attachment_url.as_str(),
+        "{event}"
+    );
     assert_eq!(event["attachments"][0]["mime"], "image/png", "{event}");
     assert!(
         event["attachments"][0].get("data").is_none(),
@@ -1535,7 +1547,12 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
         json.get("event").and_then(|v| v.as_str()) == Some("user_question")
     })
     .await
-    .unwrap_or_else(|| panic!("user_question never broadcast on /ws:\n{}", daemon.log_tail()));
+    .unwrap_or_else(|| {
+        panic!(
+            "user_question never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
     assert_eq!(question["session_id"], "ask-e2e-session", "{question}");
     assert_eq!(question["questions"][0]["question"], QUESTION, "{question}");
     assert_eq!(question["questions"][0]["header"], "Paint", "{question}");
@@ -1576,7 +1593,12 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
     // (3) The blocked ctl returns the structured outcome with the answer.
     let output = tokio::time::timeout(RUN_TIMEOUT, ask_child.wait_with_output())
         .await
-        .unwrap_or_else(|_| panic!("ctl ask did not return after the answer:\n{}", daemon.log_tail()))
+        .unwrap_or_else(|_| {
+            panic!(
+                "ctl ask did not return after the answer:\n{}",
+                daemon.log_tail()
+            )
+        })
         .expect("collect ctl ask output");
     assert!(output.status.success(), "{}", text_of(&output));
     let outcome = stdout_json(&output);
@@ -1974,7 +1996,8 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
             ]
         }]
     });
-    let mut daemon_b = spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
+    let mut daemon_b =
+        spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
 
     // Side A: a bare project, nothing else.
     let rig_a = TestRig::new();
@@ -2129,7 +2152,13 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 
     let approve_op = {
         let mut cmd = daemon_b.rig.command();
-        cmd.args(["peer", "approve", &approval_op_code, "--profile", "peer-operator"]);
+        cmd.args([
+            "peer",
+            "approve",
+            &approval_op_code,
+            "--profile",
+            "peer-operator",
+        ]);
         daemon_b.rig.run(cmd).await
     };
     assert!(
@@ -2140,7 +2169,13 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 
     let complete_op = {
         let mut cmd = rig_a.command();
-        cmd.args(["peer", "complete", &request_op_id, "--label", "peer-e2e-b-op"]);
+        cmd.args([
+            "peer",
+            "complete",
+            &request_op_id,
+            "--label",
+            "peer-e2e-b-op",
+        ]);
         rig_a.run(cmd).await
     };
     let complete_op_text = text_of(&complete_op);

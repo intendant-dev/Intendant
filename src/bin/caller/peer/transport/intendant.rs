@@ -804,8 +804,7 @@ mod tests {
         let mut started_seen = false;
         let mut merged = None;
         for _ in 0..40 {
-            let Ok(Some(event)) =
-                tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
             else {
                 break;
             };

@@ -701,7 +701,10 @@ pub(crate) fn byte_stream_frame_text_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn byte_stream_frame_texts(byte_stream: ControlByteStream, chunk_bytes: usize) -> Vec<String> {
+pub(crate) fn byte_stream_frame_texts(
+    byte_stream: ControlByteStream,
+    chunk_bytes: usize,
+) -> Vec<String> {
     match byte_stream_frame_text_parts(byte_stream, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
@@ -853,7 +856,10 @@ pub(crate) fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     }
 }
 
-pub(crate) fn dashboard_control_error_response(id: String, message: impl Into<String>) -> serde_json::Value {
+pub(crate) fn dashboard_control_error_response(
+    id: String,
+    message: impl Into<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "t": "response",
         "id": id,

@@ -738,7 +738,11 @@ impl SessionLog {
                 display_id,
                 width,
                 height,
-                if agent_visible { "" } else { " [private user view]" }
+                if agent_visible {
+                    ""
+                } else {
+                    " [private user view]"
+                }
             )),
             data: Some(serde_json::json!({
                 "display_id": display_id,
@@ -931,7 +935,6 @@ impl SessionLog {
             file2: None,
         });
     }
-
 
     /// Log presence layer log message.
     pub fn presence_log(&mut self, message: &str, level: Option<&str>) {

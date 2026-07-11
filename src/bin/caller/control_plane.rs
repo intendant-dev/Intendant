@@ -1195,7 +1195,9 @@ mod tests {
         assert!(!autonomy.read().await.user_display_granted);
     }
 
-    fn display_request_test_state(bus: &EventBus) -> (ControlPlaneState, crate::autonomy::SharedAutonomy) {
+    fn display_request_test_state(
+        bus: &EventBus,
+    ) -> (ControlPlaneState, crate::autonomy::SharedAutonomy) {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let state = ControlPlaneState {
             autonomy: autonomy.clone(),
@@ -1212,7 +1214,9 @@ mod tests {
     /// task requires `'static`, and isolation keeps parallel tests off the
     /// process-global singleton.
     fn test_registry() -> &'static crate::display_requests::DisplayRequestRegistry {
-        Box::leak(Box::new(crate::display_requests::DisplayRequestRegistry::new()))
+        Box::leak(Box::new(
+            crate::display_requests::DisplayRequestRegistry::new(),
+        ))
     }
 
     /// Drain everything currently on the bus receiver into a Vec.
@@ -1264,7 +1268,10 @@ mod tests {
         assert!(
             observed.iter().any(|event| matches!(
                 event,
-                AppEvent::UserDisplayGranted { display_id: 0, agent_visible: true }
+                AppEvent::UserDisplayGranted {
+                    display_id: 0,
+                    agent_visible: true
+                }
             )),
             "the grant activates display 0 agent-visible, got {observed:?}"
         );
@@ -1334,7 +1341,10 @@ mod tests {
         assert!(
             observed.iter().any(|event| matches!(
                 event,
-                AppEvent::UserDisplayGranted { display_id: 0, agent_visible: true }
+                AppEvent::UserDisplayGranted {
+                    display_id: 0,
+                    agent_visible: true
+                }
             )),
             "view still activates display 0 agent-visible, got {observed:?}"
         );
@@ -1515,7 +1525,10 @@ mod tests {
         assert!(
             observed.iter().any(|event| matches!(
                 event,
-                AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay { display_id: Some(0), .. })
+                AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+                    display_id: Some(0),
+                    ..
+                })
             )),
             "session end routes revocation through RevokeUserDisplay, got {observed:?}"
         );
@@ -1545,8 +1558,15 @@ mod tests {
         )
         .await;
         // And an invalid decision through the parser gate.
-        resolve_display_request(&state, registry, Some("cp-nonexistent"), 1, "approve_all", "")
-            .await;
+        resolve_display_request(
+            &state,
+            registry,
+            Some("cp-nonexistent"),
+            1,
+            "approve_all",
+            "",
+        )
+        .await;
         assert!(
             !autonomy.read().await.user_display_granted,
             "resolving a non-pending request must mint nothing"

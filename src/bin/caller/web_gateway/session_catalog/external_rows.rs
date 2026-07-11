@@ -1321,16 +1321,19 @@ mod tests {
             "seg_00001.mp4",
             b"live session segment bytes",
         );
-        golden_seed_stream(daemon_dir.path(), "daemon0", "seg_00001.mp4", b"daemon segment");
+        golden_seed_stream(
+            daemon_dir.path(),
+            "daemon0",
+            "seg_00001.mp4",
+            b"daemon segment",
+        );
         let registry = golden_live_registry(session_dir.path());
 
         // The framing pin: the body is the untouched store listing
         // (registry streams first, then the daemon-scoped store).
-        let body = recordings_list_response_body_in_daemon_dir(
-            Some(registry.clone()),
-            daemon_dir.path(),
-        )
-        .await;
+        let body =
+            recordings_list_response_body_in_daemon_dir(Some(registry.clone()), daemon_dir.path())
+                .await;
         assert!(body.contains("\"stream_name\":\"daemon0\""), "{body}");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.as_array().map(|entries| entries.len()), Some(2));
@@ -1347,13 +1350,15 @@ mod tests {
         );
 
         // No live registry: the daemon-scoped store still lists.
-        let body =
-            recordings_list_response_body_in_daemon_dir(None, daemon_dir.path()).await;
+        let body = recordings_list_response_body_in_daemon_dir(None, daemon_dir.path()).await;
         let transcript = golden_live_transcript(
             recordings_list_api_response_in_daemon_dir(None, daemon_dir.path()).await,
         );
         assert!(transcript.ends_with(&body), "{transcript}");
-        assert!(transcript.starts_with("HTTP/1.1 200 OK\r\n"), "{transcript}");
+        assert!(
+            transcript.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{transcript}"
+        );
     }
 
     #[tokio::test]
@@ -1362,7 +1367,12 @@ mod tests {
         // fallback resolves (the historical chain's fallback branch).
         let session_dir = tempfile::tempdir().unwrap();
         let daemon_dir = tempfile::tempdir().unwrap();
-        golden_seed_stream(daemon_dir.path(), "display_0", "seg_00001.mp4", b"daemon bytes");
+        golden_seed_stream(
+            daemon_dir.path(),
+            "display_0",
+            "seg_00001.mp4",
+            b"daemon bytes",
+        );
         let registry = golden_live_registry(session_dir.path());
 
         let expected_body = serde_json::to_string(&vec![serde_json::json!({
@@ -1424,7 +1434,12 @@ mod tests {
             "seg_00001.mp4",
             &session_bytes,
         );
-        golden_seed_stream(daemon_dir.path(), "display_0", "seg_00001.mp4", b"daemon copy");
+        golden_seed_stream(
+            daemon_dir.path(),
+            "display_0",
+            "seg_00001.mp4",
+            b"daemon copy",
+        );
         std::fs::write(
             daemon_dir.path().join("display_0").join("seg_00002.ts"),
             b"transport stream bytes",
@@ -1461,7 +1476,10 @@ mod tests {
             ),
             "{transcript}"
         );
-        assert!(transcript.ends_with("transport stream bytes"), "{transcript}");
+        assert!(
+            transcript.ends_with("transport stream bytes"),
+            "{transcript}"
+        );
     }
 
     #[tokio::test]
@@ -1472,8 +1490,7 @@ mod tests {
 
         // No registry wired: everything under /recordings/ answers 404.
         let transcript = golden_live_transcript(
-            live_recordings_path_api_response(None, daemon_dir.path(), "display_0/segments")
-                .await,
+            live_recordings_path_api_response(None, daemon_dir.path(), "display_0/segments").await,
         );
         assert_eq!(
             transcript,

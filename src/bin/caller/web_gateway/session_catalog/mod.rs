@@ -2855,7 +2855,11 @@ mod tests {
     #[test]
     fn intendant_row_preview_collects_prose_and_respects_slots() {
         let home = tempfile::tempdir().unwrap();
-        let log_dir = home.path().join(".intendant").join("logs").join("preview-1");
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("preview-1");
         std::fs::create_dir_all(&log_dir).unwrap();
         std::fs::write(
             log_dir.join("session_meta.json"),

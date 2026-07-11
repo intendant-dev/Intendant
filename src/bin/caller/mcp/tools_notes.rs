@@ -208,7 +208,11 @@ impl IntendantServer {
                         Some(fallback.to_string())
                     }
                 });
-            (session_id, state.project_root.clone(), state.log_dir.clone())
+            (
+                session_id,
+                state.project_root.clone(),
+                state.log_dir.clone(),
+            )
         };
         let Some(session_id) = session_id else {
             return Err(
@@ -332,7 +336,11 @@ mod tests {
         let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3];
         let decoded = decode_session_note_images(&[
             image("image/png", b64(&png), Some("shot one.png")),
-            image("image/jpg", format!("data:image/jpeg;base64,{}", b64(&png)), None),
+            image(
+                "image/jpg",
+                format!("data:image/jpeg;base64,{}", b64(&png)),
+                None,
+            ),
             // Whitespace-wrapped base64 (agents often hard-wrap).
             image("image/webp", format!("{}\n", b64(&png)), None),
         ])
@@ -353,12 +361,11 @@ mod tests {
         let err = decode_session_note_images(&[image("text/html", b64(b"x"), None)]).unwrap_err();
         assert!(err.contains("unsupported media_type"), "{err}");
         // SVG is deliberately not an accepted note attachment type.
-        let err =
-            decode_session_note_images(&[image("image/svg+xml", b64(b"<svg/>"), None)])
-                .unwrap_err();
-        assert!(err.contains("unsupported media_type"), "{err}");
-        let err = decode_session_note_images(&[image("image/png", "!!".to_string(), None)])
+        let err = decode_session_note_images(&[image("image/svg+xml", b64(b"<svg/>"), None)])
             .unwrap_err();
+        assert!(err.contains("unsupported media_type"), "{err}");
+        let err =
+            decode_session_note_images(&[image("image/png", "!!".to_string(), None)]).unwrap_err();
         assert!(err.contains("invalid base64"), "{err}");
         let err =
             decode_session_note_images(&[image("image/png", "  ".to_string(), None)]).unwrap_err();
@@ -405,10 +412,7 @@ mod tests {
         );
         state.project_root = Some(project_root.to_path_buf());
         state.session_id = session_id.to_string();
-        let server = IntendantServer::new(
-            Arc::new(tokio::sync::RwLock::new(state)),
-            bus.clone(),
-        );
+        let server = IntendantServer::new(Arc::new(tokio::sync::RwLock::new(state)), bus.clone());
         (server, bus)
     }
 

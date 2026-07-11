@@ -530,9 +530,7 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
 pub fn select_provider_for_project(
     project_root: Option<&std::path::Path>,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
-    let keys = project_root
-        .map(ProjectEnvKeys::load)
-        .unwrap_or_default();
+    let keys = project_root.map(ProjectEnvKeys::load).unwrap_or_default();
     select_provider_with_project_keys(&keys)
 }
 
@@ -623,9 +621,8 @@ fn select_provider_with_project_keys(
 /// session" is the fix, not editing .env. The opening sentence is stable:
 /// automation greps stderr for it.
 fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
-    let mut text = String::from(
-        "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.",
-    );
+    let mut text =
+        String::from("No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.");
     let mut checked: Vec<String> =
         vec!["credential leases and browser relays (none active)".to_string()];
     if let Some(report) = ENV_SEARCH.get() {
@@ -643,7 +640,11 @@ fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
                 checked.push(format!(
                     "{} ({})",
                     path.display(),
-                    if *loaded { "loaded at startup" } else { "missing" }
+                    if *loaded {
+                        "loaded at startup"
+                    } else {
+                        "missing"
+                    }
                 ));
             }
         }
@@ -1595,5 +1596,4 @@ mod tests {
             ..Default::default()
         }
     }
-
 }

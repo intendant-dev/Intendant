@@ -5,7 +5,9 @@
 
 use super::*;
 
-pub(crate) fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot) -> u64 {
+pub(crate) fn external_context_snapshot_key(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -536,7 +538,10 @@ pub(crate) fn shell_command_has_background_operator(command: &str) -> bool {
     false
 }
 
-pub(crate) fn shell_command_has_explicit_dashboard_cleanup(command: &str, tokens: &[String]) -> bool {
+pub(crate) fn shell_command_has_explicit_dashboard_cleanup(
+    command: &str,
+    tokens: &[String],
+) -> bool {
     if !shell_command_has_background_operator(command) {
         return false;
     }
@@ -551,7 +556,10 @@ pub(crate) fn shell_command_has_explicit_dashboard_cleanup(command: &str, tokens
     has_kill && (has_trap || references_background_pid)
 }
 
-pub(crate) fn shell_command_has_owned_dashboard_lifecycle(command: &str, tokens: &[String]) -> bool {
+pub(crate) fn shell_command_has_owned_dashboard_lifecycle(
+    command: &str,
+    tokens: &[String],
+) -> bool {
     let lower = command.to_ascii_lowercase();
     if lower.contains("validate-dashboard.cjs") && lower.contains("--launch-dashboard") {
         return true;
@@ -666,7 +674,9 @@ pub(crate) fn managed_context_recovery_kickstart_text(
     )
 }
 
-pub(crate) fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure) -> String {
+pub(crate) fn managed_context_density_handoff_text(
+    pressure: ManagedContextDensityPressure,
+) -> String {
     let hard = pressure
         .hard_context_window
         .map(|hard| format!(" hard_limit={hard}"))

@@ -83,7 +83,10 @@ fn registry() -> &'static Mutex<FleetCertStatus> {
 }
 
 pub fn status_snapshot() -> FleetCertStatus {
-    registry().lock().expect("fleet cert status poisoned").clone()
+    registry()
+        .lock()
+        .expect("fleet cert status poisoned")
+        .clone()
 }
 
 fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
@@ -185,8 +188,7 @@ fn acme_directory() -> String {
 async fn acme_account() -> Result<instant_acme::Account, String> {
     let path = acme_account_path();
     if let Ok(stored) = std::fs::read_to_string(&path) {
-        if let Ok(credentials) = serde_json::from_str::<instant_acme::AccountCredentials>(&stored)
-        {
+        if let Ok(credentials) = serde_json::from_str::<instant_acme::AccountCredentials>(&stored) {
             return instant_acme::Account::builder()
                 .map_err(|e| format!("acme http client: {e}"))?
                 .from_credentials(credentials)

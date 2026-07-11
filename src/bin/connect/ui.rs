@@ -21,7 +21,8 @@ pub(crate) async fn healthz() -> impl IntoResponse {
 /// phone home to intendant.dev; serve-time injection keeps self-hosting
 /// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 pub(crate) const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
-pub(crate) const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
+pub(crate) const INSTALL_SH_CONNECT_DEFAULT: &str =
+    r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
 /// Only a plain URL charset may be spliced into the scripts — anything
 /// else (quotes, spaces, `$`) could change what the shell parses. A
@@ -116,7 +117,10 @@ pub(crate) const LANDING_ASSETS: &[(&str, &[u8])] = &[
     ("hero.webp", include_bytes!("assets/landing-hero.webp")),
     ("video.webp", include_bytes!("assets/landing-video.webp")),
     ("vault.webp", include_bytes!("assets/landing-vault.webp")),
-    ("station.webp", include_bytes!("assets/landing-station.webp")),
+    (
+        "station.webp",
+        include_bytes!("assets/landing-station.webp"),
+    ),
     ("claim.webp", include_bytes!("assets/landing-claim.webp")),
     ("phone.webp", include_bytes!("assets/landing-phone.webp")),
 ];
@@ -223,7 +227,10 @@ pub(crate) fn valid_connect_app_query(query: Option<&str>) -> bool {
     connect_mode && daemon_id
 }
 
-pub(crate) async fn static_asset(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
+pub(crate) async fn static_asset(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+) -> ApiResult<Response> {
     let path = safe_static_path(&state.config.static_root, uri.path())
         .ok_or_else(|| ApiError::not_found("not found"))?;
     serve_file(&state.config.static_root, &path)

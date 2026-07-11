@@ -271,7 +271,10 @@ fn main() {
     // generated file is reverted to fragment truth on the next build rather
     // than silently shipping. Fail loudly on manifest ↔ directory mismatch:
     // a silently dropped fragment would embed a broken dashboard.
-    println!("cargo:rerun-if-changed={}/", app_html_assembler::FRAGMENT_DIR);
+    println!(
+        "cargo:rerun-if-changed={}/",
+        app_html_assembler::FRAGMENT_DIR
+    );
     println!("cargo:rerun-if-changed={}", app_html_assembler::OUTPUT);
     // The vault crypto kernel's sha256 is pinned into the assembled
     // app.html (VAULT_KERNEL_SHA256), so a kernel edit must re-assemble.

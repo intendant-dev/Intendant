@@ -70,9 +70,7 @@ pub async fn send_message_json(
         content: MessageContent::Text { text: message },
     };
     match handle.send_message(message).await {
-        Ok(message_id) => {
-            serde_json::json!({ "ok": true, "message_id": message_id.0 }).to_string()
-        }
+        Ok(message_id) => serde_json::json!({ "ok": true, "message_id": message_id.0 }).to_string(),
         Err(err) => error_json(err.to_string()),
     }
 }
@@ -199,8 +197,12 @@ pub async fn take_screenshot(
         arguments.insert("display_target".into(), target.into());
     }
     peer_tool_output(
-        mcp_http::call_peer_mcp_tool(&handle, "take_screenshot", serde_json::Value::Object(arguments))
-            .await,
+        mcp_http::call_peer_mcp_tool(
+            &handle,
+            "take_screenshot",
+            serde_json::Value::Object(arguments),
+        )
+        .await,
     )
 }
 

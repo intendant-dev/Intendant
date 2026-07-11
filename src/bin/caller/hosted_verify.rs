@@ -85,7 +85,10 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
+    sha256(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn leaf_hash(leaf_json: &str) -> [u8; 32] {
@@ -388,7 +391,9 @@ fn pin_path(state_root: &Path, base: &Url) -> PathBuf {
         }
     })
     .collect();
-    state_root.join("hosted-verify").join(format!("{name}.json"))
+    state_root
+        .join("hosted-verify")
+        .join(format!("{name}.json"))
 }
 
 fn load_pin(path: &Path) -> Option<SthPin> {
@@ -398,8 +403,7 @@ fn load_pin(path: &Path) -> Option<SthPin> {
 
 fn save_pin(path: &Path, pin: &SthPin) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(pin).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
@@ -460,10 +464,7 @@ enum ArtifactFetch {
 }
 
 /// The per-artifact verdict: `None` = matches the log.
-fn artifact_mismatch(
-    artifact: &ManifestArtifact,
-    fetched: &ArtifactFetch,
-) -> Option<String> {
+fn artifact_mismatch(artifact: &ManifestArtifact, fetched: &ArtifactFetch) -> Option<String> {
     match fetched {
         ArtifactFetch::Hashed { sha256_hex } if *sha256_hex == artifact.sha256 => None,
         ArtifactFetch::Hashed { sha256_hex } => Some(format!(
@@ -472,9 +473,7 @@ fn artifact_mismatch(
             short_hash(&artifact.sha256),
             short_hash(sha256_hex),
         )),
-        ArtifactFetch::HttpStatus(status) => {
-            Some(format!("{}: HTTP {status}", artifact.path))
-        }
+        ArtifactFetch::HttpStatus(status) => Some(format!("{}: HTTP {status}", artifact.path)),
         ArtifactFetch::TooLarge => Some(format!(
             "{}: response exceeded {} MiB",
             artifact.path,
@@ -587,9 +586,13 @@ pub(crate) async fn verify_hosted_bundle(
     let client = http_client().map_err(Unavailable)?;
     let manifest_url = crate::connect_rendezvous::join_url(base, "api/log/artifact-manifest")
         .map_err(Unavailable)?;
-    let response = fetch_json(&client, manifest_url).await.map_err(Unavailable)?;
+    let response = fetch_json(&client, manifest_url)
+        .await
+        .map_err(Unavailable)?;
     if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        return Err(Unavailable("artifact-manifest endpoint returned an error".to_string()));
+        return Err(Unavailable(
+            "artifact-manifest endpoint returned an error".to_string(),
+        ));
     }
     if response.get("found").and_then(|v| v.as_bool()) != Some(true) {
         return Err(Unavailable(
@@ -598,8 +601,8 @@ pub(crate) async fn verify_hosted_bundle(
     }
 
     // 1. The signed tree head stands on its own signature.
-    let sth = Sth::parse(response.get("sth").unwrap_or(&serde_json::Value::Null))
-        .map_err(Unavailable)?;
+    let sth =
+        Sth::parse(response.get("sth").unwrap_or(&serde_json::Value::Null)).map_err(Unavailable)?;
     sth.verify_signature().map_err(verification)?;
 
     // 2. The manifest entry is IN the tree the head signs.
@@ -742,7 +745,10 @@ pub(crate) async fn check_once() {
         Err(VerifyFailure::Unavailable(error)) => with_status(|s| {
             s.last_error = Some(error);
         }),
-        Err(VerifyFailure::Verification { summary, mismatches }) => {
+        Err(VerifyFailure::Verification {
+            summary,
+            mismatches,
+        }) => {
             with_status(|s| {
                 s.state = "alert".to_string();
                 s.checked_unix_ms = Some(now);
@@ -838,10 +844,7 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
     println!("hosted-verify: {}", base_raw.trim_end_matches('/'));
     match verify_hosted_bundle(&base, &crate::platform::intendant_home()).await {
         Ok(report) => {
-            println!(
-                "tree head: {} entries — signature OK",
-                report.log_size
-            );
+            println!("tree head: {} entries — signature OK", report.log_size);
             match report.pinned_from_size {
                 Some(size) => println!("pin: consistent with pinned size {size} — pin advanced"),
                 None => println!("pin: first contact — this tree head is now pinned"),
@@ -864,7 +867,10 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
             println!("PASS — what this origin serves is what its transparency log commits to");
             0
         }
-        Err(VerifyFailure::Verification { summary, mismatches }) => {
+        Err(VerifyFailure::Verification {
+            summary,
+            mismatches,
+        }) => {
             eprintln!("FAIL — {summary}");
             for line in &mismatches {
                 eprintln!("  {line}");
@@ -966,7 +972,13 @@ mod tests {
             for index in 0..size {
                 let proof = inclusion_proof(index, tree);
                 assert!(verify_inclusion(&tree[index], index, size, &proof, &root));
-                assert!(!verify_inclusion(&leaf_hash("evil"), index, size, &proof, &root));
+                assert!(!verify_inclusion(
+                    &leaf_hash("evil"),
+                    index,
+                    size,
+                    &proof,
+                    &root
+                ));
             }
             for old in 1..=size {
                 let proof = consistency_proof(old, tree);
@@ -1183,7 +1195,10 @@ mod tests {
         assert_eq!(loaded.public_key, "a2V5");
         assert_eq!(loaded.pinned_unix_ms, 77);
         // Distinct hosts pin separately.
-        let other = pin_path(dir.path(), &Url::parse("https://other.example.test").unwrap());
+        let other = pin_path(
+            dir.path(),
+            &Url::parse("https://other.example.test").unwrap(),
+        );
         assert_ne!(path, other);
     }
 }

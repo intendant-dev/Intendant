@@ -194,7 +194,13 @@ fn upload_create_params(
             .ok_or_else(|| {
                 TransferStoreError::new(400, "conflict policy must be fail, rename, or overwrite")
             })?;
-    Ok((destination, original_name, mime, total_size, conflict_policy))
+    Ok((
+        destination,
+        original_name,
+        mime,
+        total_size,
+        conflict_policy,
+    ))
 }
 
 /// The path a path-based create targets — the download source (its
@@ -210,10 +216,9 @@ pub(crate) fn transfer_create_target_path(
     kind: TransferKind,
 ) -> Option<String> {
     match kind {
-        TransferKind::Download => optional_string_param(
-            params,
-            &["path", "source_path", "sourcePath", "source"],
-        ),
+        TransferKind::Download => {
+            optional_string_param(params, &["path", "source_path", "sourcePath", "source"])
+        }
         TransferKind::Upload => optional_string_param(
             params,
             &["destination", "destination_path", "destinationPath", "path"],
@@ -280,10 +285,9 @@ pub(crate) async fn transfer_job_create_http_api_response(
 ) -> ApiResponse {
     match classify_transfer_create(&params) {
         Err(response) => response,
-        Ok(TransferCreateRequest::Artifact(_)) => transfer_error_api_response(
-            400,
-            "artifact transfers require the dashboard tunnel",
-        ),
+        Ok(TransferCreateRequest::Artifact(_)) => {
+            transfer_error_api_response(400, "artifact transfers require the dashboard tunnel")
+        }
         Ok(TransferCreateRequest::Path(kind)) => {
             transfer_path_create_api_response(scope, params, kind).await
         }
@@ -551,7 +555,13 @@ mod tests {
 
     fn bytes_parts(
         response: ApiResponse,
-    ) -> (u16, String, Vec<(&'static str, String)>, Vec<u8>, serde_json::Value) {
+    ) -> (
+        u16,
+        String,
+        Vec<(&'static str, String)>,
+        Vec<u8>,
+        serde_json::Value,
+    ) {
         match response {
             ApiResponse::Bytes {
                 status,
@@ -631,7 +641,10 @@ mod tests {
             .await,
         );
         assert_eq!(status, 409);
-        assert_eq!(premature["error"], "upload is not complete enough to commit");
+        assert_eq!(
+            premature["error"],
+            "upload is not complete enough to commit"
+        );
 
         // The client vanished and came back: re-list (filtered by the
         // resume token) and read the received extent off the job.
@@ -658,7 +671,10 @@ mod tests {
             .await,
         );
         assert_eq!(status, 409);
-        assert_eq!(stale["error"], "upload chunk overlaps already persisted bytes");
+        assert_eq!(
+            stale["error"],
+            "upload chunk overlaps already persisted bytes"
+        );
 
         let (status, second) = json_body(
             &transfer_upload_chunk_api_response(
@@ -710,16 +726,10 @@ mod tests {
         let source_b = dir.path().join("b.txt");
         std::fs::write(&source_a, b"aaa").unwrap();
         std::fs::write(&source_b, b"bbb").unwrap();
-        let job_a = crate::transfer_store::create_download_job(
-            &scope,
-            source_a.to_str().unwrap(),
-        )
-        .unwrap();
-        let job_b = crate::transfer_store::create_download_job(
-            &scope,
-            source_b.to_str().unwrap(),
-        )
-        .unwrap();
+        let job_a =
+            crate::transfer_store::create_download_job(&scope, source_a.to_str().unwrap()).unwrap();
+        let job_b =
+            crate::transfer_store::create_download_job(&scope, source_b.to_str().unwrap()).unwrap();
 
         let (_, all) =
             json_body(&transfer_jobs_api_response(scope.clone(), &serde_json::json!({})).await);
@@ -727,7 +737,10 @@ mod tests {
 
         for (params, expect) in [
             (serde_json::json!({ "id": job_a.id }), &job_a),
-            (serde_json::json!({ "resume_token": job_b.resume_token }), &job_b),
+            (
+                serde_json::json!({ "resume_token": job_b.resume_token }),
+                &job_b,
+            ),
         ] {
             let (status, filtered) =
                 json_body(&transfer_jobs_api_response(scope.clone(), &params).await);
@@ -834,8 +847,7 @@ mod tests {
                 headers,
             } => {
                 assert_eq!(status, 416);
-                let body: serde_json::Value =
-                    serde_json::from_str(&body.into_string()).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&body.into_string()).unwrap();
                 assert_eq!(body["error"], "Range must use bytes");
                 assert_eq!(body["ok"], false);
                 assert_eq!(

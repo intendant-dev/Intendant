@@ -107,7 +107,9 @@ pub(crate) fn normalize_optional_string_field(value: &mut Option<String>) {
     }
 }
 
-pub(crate) fn normalize_schedule_controller_restart_params(params: &mut ScheduleControllerRestartParams) {
+pub(crate) fn normalize_schedule_controller_restart_params(
+    params: &mut ScheduleControllerRestartParams,
+) {
     normalize_string_field(&mut params.controller_id);
     normalize_string_field(&mut params.north_star_goal);
     normalize_optional_string_field(&mut params.reason);
@@ -124,7 +126,9 @@ pub(crate) fn normalize_controller_turn_complete_params(params: &mut ControllerT
     normalize_optional_string_field(&mut params.handoff_summary);
 }
 
-pub(crate) fn normalize_cancel_controller_restart_params(params: &mut CancelControllerRestartParams) {
+pub(crate) fn normalize_cancel_controller_restart_params(
+    params: &mut CancelControllerRestartParams,
+) {
     normalize_optional_string_field(&mut params.restart_id);
 }
 
@@ -165,7 +169,10 @@ pub(crate) fn restart_state_path(log_dir: &std::path::Path) -> std::path::PathBu
     log_dir.join("controller_restart.json")
 }
 
-pub(crate) fn persist_restart_state(log_dir: &std::path::Path, state: &Option<ControllerRestartState>) {
+pub(crate) fn persist_restart_state(
+    log_dir: &std::path::Path,
+    state: &Option<ControllerRestartState>,
+) {
     let path = restart_state_path(log_dir);
     if let Some(s) = state {
         if let Ok(json) = serde_json::to_string_pretty(s) {
@@ -176,7 +183,9 @@ pub(crate) fn persist_restart_state(log_dir: &std::path::Path, state: &Option<Co
     }
 }
 
-pub(crate) fn restart_state_public_value(state: Option<&ControllerRestartState>) -> serde_json::Value {
+pub(crate) fn restart_state_public_value(
+    state: Option<&ControllerRestartState>,
+) -> serde_json::Value {
     let mut value = serde_json::to_value(state).unwrap_or(serde_json::Value::Null);
     if let Some(obj) = value.as_object_mut() {
         if obj.contains_key("turn_complete_token") {
@@ -728,7 +737,9 @@ pub(crate) fn controller_loop_intervention_markers_are_stale(
         .all(controller_loop_active_wrapper_is_idle_external_app_server)
 }
 
-pub(crate) fn controller_loop_active_wrapper_is_idle_external_app_server(wrapper: &serde_json::Value) -> bool {
+pub(crate) fn controller_loop_active_wrapper_is_idle_external_app_server(
+    wrapper: &serde_json::Value,
+) -> bool {
     if wrapper.get("source").and_then(|value| value.as_str()) != Some("external_wrapper_index") {
         return false;
     }
@@ -853,7 +864,12 @@ where
     )
 }
 
-pub(crate) fn active_external_wrappers_from_index_homes_for_processes_with_probe_and_cwd<'a, I, F, G>(
+pub(crate) fn active_external_wrappers_from_index_homes_for_processes_with_probe_and_cwd<
+    'a,
+    I,
+    F,
+    G,
+>(
     candidate_homes: I,
     live_codex_processes: &[LiveCodexAppServerProcess],
     mut process_tree_active: F,
@@ -966,7 +982,9 @@ pub(crate) fn live_codex_process_matches_wrapper_record(
 }
 
 #[allow(dead_code)]
-pub(crate) fn live_codex_processes_from_pids(live_codex_pids: &[u32]) -> Vec<LiveCodexAppServerProcess> {
+pub(crate) fn live_codex_processes_from_pids(
+    live_codex_pids: &[u32],
+) -> Vec<LiveCodexAppServerProcess> {
     live_codex_pids
         .iter()
         .copied()
@@ -1051,7 +1069,9 @@ pub(crate) fn controller_loop_latest_status_with_codex(
     latest_status_file
 }
 
-pub(crate) fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<serde_json::Value> {
+pub(crate) fn latest_status_from_active_wrappers(
+    wrappers: &[serde_json::Value],
+) -> Option<serde_json::Value> {
     let wrapper = wrappers.iter().find(|wrapper| {
         wrapper.get("source").and_then(|v| v.as_str()) == Some("external_wrapper_index")
     })?;
@@ -1412,7 +1432,9 @@ pub(crate) fn controller_loop_home(loop_dir: &std::path::Path) -> Option<std::pa
     intendant_dir.parent().map(std::path::Path::to_path_buf)
 }
 
-pub(crate) fn controller_loop_wrapper_index_homes(loop_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn controller_loop_wrapper_index_homes(
+    loop_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
     let mut homes = Vec::new();
     let mut seen = HashSet::new();
     for home in [
@@ -1436,7 +1458,9 @@ pub(crate) struct ExternalWrapperSessionMetaSnapshot {
     rounds: Option<usize>,
 }
 
-pub(crate) fn session_meta_snapshot(log_dir: &std::path::Path) -> Option<ExternalWrapperSessionMetaSnapshot> {
+pub(crate) fn session_meta_snapshot(
+    log_dir: &std::path::Path,
+) -> Option<ExternalWrapperSessionMetaSnapshot> {
     let text = std::fs::read_to_string(log_dir.join("session_meta.json")).ok()?;
     serde_json::from_str::<crate::session_log::SessionMeta>(&text)
         .ok()
@@ -1454,7 +1478,10 @@ pub(crate) fn external_wrapper_status_is_terminal(status: Option<&str>) -> bool 
     )
 }
 
-pub(crate) fn effective_external_wrapper_status(status: Option<&str>, process_tree_active: bool) -> String {
+pub(crate) fn effective_external_wrapper_status(
+    status: Option<&str>,
+    process_tree_active: bool,
+) -> String {
     let status = status.map(str::trim).filter(|status| !status.is_empty());
     if process_tree_active && status.map(controller_loop_state_is_idle).unwrap_or(true) {
         return "unknown_running".to_string();
@@ -1573,7 +1600,10 @@ pub(crate) fn live_codex_app_server_process_infos(
     )
 }
 
-pub(crate) fn live_codex_app_server_pids(root_pid: u32, known_codex_pids: &HashSet<u32>) -> Vec<u32> {
+pub(crate) fn live_codex_app_server_pids(
+    root_pid: u32,
+    known_codex_pids: &HashSet<u32>,
+) -> Vec<u32> {
     live_codex_app_server_process_infos(root_pid, known_codex_pids)
         .into_iter()
         .map(|process| process.pid)
@@ -1691,7 +1721,10 @@ pub(crate) fn hex_mcp_query_value(byte: u8) -> Option<u8> {
     }
 }
 
-pub(crate) fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Result<(), String> {
+pub(crate) fn request_loop_halt_marker(
+    loop_dir: &std::path::Path,
+    persistent: bool,
+) -> Result<(), String> {
     std::fs::create_dir_all(loop_dir).map_err(|e| format!("Failed to create loop dir: {}", e))?;
     if persistent {
         std::fs::write(loop_dir.join("request_halt"), b"")
@@ -2005,9 +2038,9 @@ pub(crate) fn schedule_error_response(
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
+    use crate::mcp::tests::test_state_with_log_dir;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
-    use crate::mcp::tests::{test_state_with_log_dir};
 
     #[test]
     fn parse_restart_after_defaults_to_turn_end() {

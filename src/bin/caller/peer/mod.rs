@@ -107,26 +107,22 @@ pub mod transport;
 pub mod upcast;
 
 pub use card::{
-    AgentCard, ApplicationAuth, AuthRequirements, Capability,
-    TransportAuth, TransportSpec,
+    AgentCard, ApplicationAuth, AuthRequirements, Capability, TransportAuth, TransportSpec,
 };
 pub use coordinator::{Coordinator, CoordinatorError, TaskRequest};
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
-    MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
-    PeerMessage, PeerStatus, SessionInfo, UsageSnapshot,
-    WebRtcSessionId, WebRtcSignal,
+    MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent, PeerMessage,
+    PeerStatus, SessionInfo, UsageSnapshot, WebRtcSessionId, WebRtcSignal,
 };
-pub use handle::{
-    ConnectionState, PeerHandle, PeerSnapshot,
-};
+pub use handle::{ConnectionState, PeerHandle, PeerSnapshot};
 pub use id::PeerId;
 // LOG_CHANNEL_CAPACITY has cfg(test) consumers only (the mcp_http and
 // mcp tools_peer rigs) — a plain build's unused-import lint can't see
 // them, so the allow keeps a cleanup pass from stripping it again.
+pub use log_writer::spawn_peer_log_writer;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use log_writer::LOG_CHANNEL_CAPACITY;
-pub use log_writer::spawn_peer_log_writer;
 pub use registry::{PeerRegistry, RegistryEvent};
 pub use traits::PeerTask;
 

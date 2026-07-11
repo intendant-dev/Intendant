@@ -130,7 +130,9 @@ pub(crate) fn normalize_settings_agent_command(input: Option<&str>, fallback: &s
     }
 }
 
-pub(crate) fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> SettingsPayload {
+pub(crate) fn settings_payload_from_config(
+    config: &crate::project::ProjectConfig,
+) -> SettingsPayload {
     let mut env_overrides = std::collections::HashMap::new();
     for (key, var) in [
         ("CU_PROVIDER", "CU_PROVIDER"),
@@ -242,7 +244,10 @@ pub(crate) async fn settings_get_response_body(
     }
 }
 
-pub(crate) fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
+pub(crate) fn apply_settings_payload(
+    config: &mut crate::project::ProjectConfig,
+    payload: &SettingsPayload,
+) {
     config.computer_use.provider = payload.cu_provider.clone();
     config.computer_use.model = payload.cu_model.clone();
     config.computer_use.backend = payload.cu_backend.clone();
@@ -612,19 +617,13 @@ pub(crate) fn settings_post_api_response(
 /// the historical lane reports failures in the body — under the bare
 /// wildcard tail. `env_path` arrives from the transport edge
 /// ([`api_keys_env_path`]).
-pub(crate) fn api_keys_save_api_response(
-    env_path: Option<&Path>,
-    body_text: &str,
-) -> ApiResponse {
+pub(crate) fn api_keys_save_api_response(env_path: Option<&Path>, body_text: &str) -> ApiResponse {
     bare_wildcard_json_response(200, set_api_keys_result(env_path, body_text))
 }
 
 /// GET /api/api-key-status + the tunnel's `api_key_status`.
 pub(crate) fn api_key_status_api_response() -> ApiResponse {
-    ApiResponse::json(
-        200,
-        JsonBody::PreSerialized(api_key_status_response_body()),
-    )
+    ApiResponse::json(200, JsonBody::PreSerialized(api_key_status_response_body()))
 }
 
 /// GET /api/project-root + the tunnel's `api_project_root`.
@@ -657,7 +656,6 @@ pub(crate) fn external_agents_api_response(
 //
 // Returning 200+JSON for notifications causes rmcp to try deserializing the
 // body as ServerJsonRpcMessage, which fails because there's no valid `id`.
-
 
 pub(crate) async fn handle_project_root(
     stream: DemuxStream,
@@ -965,9 +963,7 @@ mod tests {
     // resolution).
 
     /// Run one stream-consuming handler and collect every byte it wrote.
-    async fn collect_settings_handler_response<Fut>(
-        run: impl FnOnce(DemuxStream) -> Fut,
-    ) -> Vec<u8>
+    async fn collect_settings_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
     where
         Fut: std::future::Future<Output = ()>,
     {
@@ -1114,8 +1110,7 @@ mod tests {
         let invalid = "{\"external_agent\":";
         let serde_error = serde_json::from_str::<SettingsPayload>(invalid).unwrap_err();
         let expected_body =
-            serde_json::json!({"error": format!("Invalid settings: {}", serde_error)})
-                .to_string();
+            serde_json::json!({"error": format!("Invalid settings: {}", serde_error)}).to_string();
         let response = collect_settings_handler_response(|stream| {
             handle_settings_post(
                 stream,
@@ -1270,8 +1265,7 @@ mod tests {
         // A tempdir project root loads the default agent config — same
         // framing, same builder.
         let root = tempfile::tempdir().unwrap();
-        let body =
-            external_agents_response_body(Some(root.path()), home.path());
+        let body = external_agents_response_body(Some(root.path()), home.path());
         let root_path = root.path().to_path_buf();
         let home_path = home.path().to_path_buf();
         let response = collect_settings_handler_response(|stream| {

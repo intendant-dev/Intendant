@@ -209,7 +209,9 @@ pub(crate) fn codex_context_payload_snapshot_sync(
     })
 }
 
-pub(crate) fn codex_request_sort_key(request: &CodexRequestPayloadRef) -> (i64, u64, String, String, String) {
+pub(crate) fn codex_request_sort_key(
+    request: &CodexRequestPayloadRef,
+) -> (i64, u64, String, String, String) {
     (
         request.order.0,
         request.order.1,
@@ -1185,7 +1187,9 @@ pub(crate) fn codex_usage_component_tokens(value: &serde_json::Value) -> u64 {
         )
 }
 
-pub(crate) fn codex_usage_token_count_kind(value: &serde_json::Value) -> Option<AgentContextTokenCountKind> {
+pub(crate) fn codex_usage_token_count_kind(
+    value: &serde_json::Value,
+) -> Option<AgentContextTokenCountKind> {
     if let Some(last) = codex_usage_bucket(value, &["last", "last_token_usage"]) {
         let total = first_u64_at(last, &["/totalTokens", "/total_tokens"])?;
         return Some(if total > 0 && codex_usage_component_tokens(last) > 0 {
@@ -1453,7 +1457,10 @@ pub(crate) fn codex_usage_cached_tokens(value: &serde_json::Value) -> Option<u64
     )
 }
 
-pub(crate) fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentUsageSnapshot> {
+pub(crate) fn codex_usage_snapshot(
+    value: &serde_json::Value,
+    model: &str,
+) -> Option<AgentUsageSnapshot> {
     if codex_usage_token_count_kind(value) != Some(AgentContextTokenCountKind::BackendReported) {
         return None;
     }

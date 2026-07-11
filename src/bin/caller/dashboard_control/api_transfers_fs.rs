@@ -57,8 +57,7 @@ pub(crate) async fn transfer_create_artifact_download_job(
                 .await
         }
         "session_recording_asset" | "session-recording-asset" => {
-            transfer_create_recording_asset_download_job(home, scope, artifact, runtime, true)
-                .await
+            transfer_create_recording_asset_download_job(home, scope, artifact, runtime, true).await
         }
         "session_frame_asset" | "session-frame-asset" | "frame_asset" | "frame-asset" => {
             transfer_create_session_frame_download_job(home, scope, artifact).await
@@ -486,7 +485,10 @@ fn control_api_request(
     }
 }
 
-pub(crate) async fn api_fs_stat_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
+pub(crate) async fn api_fs_stat_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let request = control_api_request(params, None);
     let result =
         tokio::task::spawn_blocking(move || crate::web_gateway::fs_stat_api_response(&request))
@@ -502,7 +504,10 @@ pub(crate) async fn api_fs_stat_response(id: String, params: Option<&serde_json:
     }
 }
 
-pub(crate) async fn api_fs_list_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
+pub(crate) async fn api_fs_list_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let request = control_api_request(params, None);
     let result =
         tokio::task::spawn_blocking(move || crate::web_gateway::fs_list_api_response(&request))
@@ -891,7 +896,10 @@ mod tests {
             Some(stream.content_type.as_str()),
             header_value(&headers, "Content-Type")
         );
-        assert_eq!(stream.result["total_size"].as_u64(), Some(body.len() as u64));
+        assert_eq!(
+            stream.result["total_size"].as_u64(),
+            Some(body.len() as u64)
+        );
 
         // Ranged read: offset=7,length=10 ≙ `Range: bytes=7-16` — same
         // bytes; inclusive header vs exclusive range_end (difference #4).
@@ -1075,11 +1083,8 @@ mod tests {
         std::fs::write(&file, b"bytes").unwrap();
         let params = serde_json::json!({ "path": file.to_string_lossy() });
         let (status, _headers, body) = http_parts(
-            crate::web_gateway::fs_delete_api_response(
-                file.to_string_lossy().into_owned(),
-                false,
-            )
-            .await,
+            crate::web_gateway::fs_delete_api_response(file.to_string_lossy().into_owned(), false)
+                .await,
         );
         assert_eq!(status, 200);
         let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1094,11 +1099,8 @@ mod tests {
         std::fs::write(full.join("keep.txt"), b"keep").unwrap();
         let params = serde_json::json!({ "path": full.to_string_lossy() });
         let (status, _headers, body) = http_parts(
-            crate::web_gateway::fs_delete_api_response(
-                full.to_string_lossy().into_owned(),
-                false,
-            )
-            .await,
+            crate::web_gateway::fs_delete_api_response(full.to_string_lossy().into_owned(), false)
+                .await,
         );
         assert_eq!(status, 409);
         let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1820,7 +1822,10 @@ mod tests {
         (dir, rt, source)
     }
 
-    async fn create_download_job_frame(rt: &ControlRuntime, source: &std::path::Path) -> serde_json::Value {
+    async fn create_download_job_frame(
+        rt: &ControlRuntime,
+        source: &std::path::Path,
+    ) -> serde_json::Value {
         api_transfer_job_create_response(
             "g-create".to_string(),
             Some(&serde_json::json!({
@@ -2192,12 +2197,8 @@ mod tests {
         let mut rt = runtime();
         rt.project_root = Some(project);
 
-        let missing_commit = api_transfer_upload_commit_response(
-            "g-commit-noid".to_string(),
-            None,
-            &rt,
-        )
-        .await;
+        let missing_commit =
+            api_transfer_upload_commit_response("g-commit-noid".to_string(), None, &rt).await;
         assert_eq!(
             missing_commit,
             serde_json::json!({
