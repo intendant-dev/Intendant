@@ -1790,9 +1790,6 @@ function deleteSessionData(sessionId, target, label) {
 async function confirmSessionDeleteModal() {
   if (!sessionDeletePending) return;
   const { sessionId, target, label } = sessionDeletePending;
-  const url = target === 'session'
-    ? `/api/session/${sessionId}/delete`
-    : `/api/session/${sessionId}/delete/${target}`;
 
   const confirmBtn = document.getElementById('session-delete-confirm');
   if (confirmBtn) {
@@ -1802,11 +1799,14 @@ async function confirmSessionDeleteModal() {
   showSessionDeleteStatus('Deleting...');
 
   try {
-    const resp = await dashboardJsonFetch('api_session_delete', { session_id: sessionId, target }, () => (
-      fetch(url, { method: 'POST' })
-    ), 'api_session_delete', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
-    if (!resp.ok || !result.ok) throw new Error(result.error || resp.statusText || 'unknown');
+    // Transport F8a: facade DELETE twin (/api/session/{id}/{target};
+    // target 'session' deletes the whole session, a data kind deletes
+    // that kind) — the verb-derived no-replay policy is the legacy
+    // fallbackAfterRpcFailure:false semantics. The endpoint answers 200
+    // with an {ok, error} body, so the body is the real verdict.
+    const resp = await daemonApi.request('api_session_delete', { session_id: sessionId, target });
+    const result = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+    if (!resp.ok || !result.ok) throw new Error(result.error || `HTTP ${resp.status}`);
     if (target === 'session') {
       _cachedSessions = _cachedSessions.filter(s => s.session_id !== sessionId);
     } else {
@@ -2133,10 +2133,10 @@ async function loadSessionRecordings(sessionId) {
 
   let streams;
   try {
-    const resp = await dashboardJsonFetch('api_session_recordings', { session_id: sessionId }, () => (
-      fetch(`/api/session/${encodeURIComponent(sessionId)}/recordings`)
-    ), 'api_session_recordings');
-    streams = await resp.json();
+    // Transport F8a: facade GET twin (tunnel first, HTTP fallback); the
+    // listing is a bare array, so the Array check below is the verdict.
+    const resp = await daemonApi.request('api_session_recordings', { session_id: sessionId });
+    streams = resp.body;
   } catch { return; }
   if (!Array.isArray(streams) || streams.length === 0) return;
 

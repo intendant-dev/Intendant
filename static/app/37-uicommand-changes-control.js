@@ -404,15 +404,13 @@ function renderChangesDiffHeader(path, info, stateText = '') {
     + (resolvedMeta ? `<span class="changes-diff-meta">${escapeHtml(resolvedMeta)}</span>` : '');
 }
 
-function encodeChangePath(path) {
-  if (isAbsolutePath(path)) return encodeURIComponent(path);
-  return String(path).split('/').map(part => encodeURIComponent(part)).join('/');
-}
-
+// Unwrap a facade envelope from fetchChangesResponse: delivered errors
+// surface as data.error (the endpoint's structured shape) or the HTTP
+// status; the list shape is a bare array and passes through untouched.
 async function parseChangesResponse(resp) {
-  const data = await resp.json().catch(() => ({}));
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok || data.error) {
-    throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+    throw new Error(data.error || `HTTP ${resp.status}`);
   }
   return data;
 }
@@ -458,12 +456,6 @@ function currentChangesTargetQuery() {
   return params.toString();
 }
 
-function changesRequestUrl(path = '') {
-  const suffix = path ? `/${encodeChangePath(path)}` : '';
-  const query = currentChangesTargetQuery();
-  return `/api/session/current/changes${suffix}${query ? `?${query}` : ''}`;
-}
-
 function changesRequestParams(path = '') {
   return {
     path: String(path || ''),
@@ -471,10 +463,13 @@ function changesRequestParams(path = '') {
   };
 }
 
+// Transport F8a: the changes reads ride the daemonApi facade — tunnel
+// first, HTTP twin per the GET fallback policy. The descriptor's
+// pathSuffix entry rebuilds the /changes/{path} sub-path on the HTTP
+// lane (the legacy encodeChangePath/changesRequestUrl builders retired
+// onto it); resolves with the facade envelope for parseChangesResponse.
 function fetchChangesResponse(path = '') {
-  return dashboardJsonFetch('api_session_current_changes', changesRequestParams(path), () => (
-    fetch(changesRequestUrl(path))
-  ), 'api_session_current_changes');
+  return daemonApi.request('api_session_current_changes', changesRequestParams(path));
 }
 
 function showChangesTargetMismatch(message) {
@@ -622,7 +617,8 @@ async function refreshHistory() {
     return;
   }
   try {
-    const r = await dashboardJsonFetch('api_session_current_history', {}, () => fetch('/api/session/current/history'), 'api_session_current_history');
+    // Transport F8a: facade GET twin (tunnel first, HTTP fallback).
+    const r = await daemonApi.request('api_session_current_history', {});
     if (!r.ok) {
       // Older sessions or sessions without history support return 404.
       // Hide the timeline rather than showing a confusing error.
@@ -631,7 +627,7 @@ async function refreshHistory() {
       if (wrap) wrap.style.display = 'none';
       return;
     }
-    historyCache = await r.json();
+    historyCache = r.body;
     renderTimeline();
   } catch (e) {
     // Network error — stay silent; the WS event for the next mutation
@@ -900,23 +896,13 @@ async function confirmRollback() {
       revert_files: revertFiles,
       revert_conversation: revertConv,
     };
-    const resp = await dashboardJsonFetch('api_session_current_rollback', payload, () => fetch('/api/session/current/rollback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_session_current_rollback', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin — the verb-derived no-replay policy
+    // is the legacy fallbackAfterRpcFailure:false semantics.
+    const resp = await daemonApi.request('api_session_current_rollback', payload);
     if (!resp.ok) {
       // Prefer the structured {error} shape the server already uses for
-      // this endpoint; fall back to raw text for unexpected error bodies.
-      let errMsg = resp.statusText;
-      try {
-        const j = await resp.clone().json();
-        if (j && j.error) errMsg = j.error;
-      } catch (_) {
-        const t = await resp.text().catch(() => '');
-        if (t) errMsg = t;
-      }
-      showControlToast('error', `Rollback failed: ${errMsg}`);
+      // this endpoint; fall back to the status for unexpected bodies.
+      showControlToast('error', `Rollback failed: ${resp.body?.error || `HTTP ${resp.status}`}`);
     }
     // Success: backend emits `rolled_back` / `conversation_rolled_back`
     // events, the WASM layer raises HistoryChanged, and the UI refreshes.
@@ -928,10 +914,10 @@ window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
-    const r = await dashboardJsonFetch('api_session_current_redo', {}, () => fetch('/api/session/current/redo', { method: 'POST' }), 'api_session_current_redo', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_redo', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Redo failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Redo failed: ${r.body?.error || `HTTP ${r.status}`}`);
     }
   } catch (e) {
     showControlToast('error', `Redo error: ${e.message || e}`);
@@ -948,15 +934,15 @@ async function doPrune() {
   });
   if (!ok) return;
   try {
-    const r = await dashboardJsonFetch('api_session_current_prune', {}, () => fetch('/api/session/current/prune', { method: 'POST' }), 'api_session_current_prune', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_prune', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Prune failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Prune failed: ${r.body?.error || `HTTP ${r.status}`}`);
       return;
     }
     // History event will redraw; the console line is a belt-and-suspenders
     // confirmation so curious users can verify the server response shape.
-    const data = await r.json().catch(() => ({}));
+    const data = (r.body && typeof r.body === 'object') ? r.body : {};
     if (typeof data.bytes_freed === 'number') {
       const mb = (data.bytes_freed / 1024 / 1024).toFixed(1);
       console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);

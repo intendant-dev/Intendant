@@ -3406,7 +3406,11 @@ mod tests {
         // Coverage pin: the F1 family's twinned methods (fs + staged
         // uploads), the F2 sessions-family reads (managed-context,
         // worktrees, the session list and its NDJSON stream, search,
-        // detail, report, context snapshots), the F3 settings/keys
+        // detail, report, context snapshots) plus the F8a sessions
+        // stragglers (recordings list, agent output by id and for the
+        // current session, session delete via the {id}/{target} shape,
+        // and the current-session rounds family — changes, history,
+        // rollback, redo, prune), the F3 settings/keys
         // family (settings GET/POST, api-keys save, key-status,
         // project-root, external-agents, displays), and the F4 access
         // family: the dialogs set (overview, IAM state, enrollment reads
@@ -3465,6 +3469,15 @@ mod tests {
             "api_session_detail",
             "api_session_report",
             "api_session_context_snapshot",
+            "api_session_recordings",
+            "api_session_agent_output",
+            "api_session_delete",
+            "api_session_current_changes",
+            "api_session_current_history",
+            "api_session_current_rollback",
+            "api_session_current_redo",
+            "api_session_current_prune",
+            "api_session_current_agent_output",
             "api_managed_context_records",
             "api_managed_context_anchors",
             "api_managed_context_fission",

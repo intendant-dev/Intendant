@@ -1724,13 +1724,11 @@ async function loadCommandOutputIntoBody(group, body) {
     return;
   }
   const payload = { ids: group.outputIds };
-  const resp = await dashboardJsonFetch('api_session_current_agent_output', payload, () => authedFetch('/api/session/current/agent-output', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }), 'api_session_current_agent_output');
-  const json = await resp.json();
-  if (!resp.ok) throw new Error(json.error || resp.statusText || `HTTP ${resp.status}`);
+  // Transport F8a: facade POST-shaped read — tunnel first, the HTTP twin
+  // serves a dashboard with no tunnel (no replay after an attempt).
+  const resp = await daemonApi.request('api_session_current_agent_output', payload);
+  const json = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+  if (!resp.ok) throw new Error(json.error || `HTTP ${resp.status}`);
   body.innerHTML = '';
   for (const out of (json.outputs || [])) {
     const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');

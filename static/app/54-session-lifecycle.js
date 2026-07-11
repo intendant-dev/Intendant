@@ -944,10 +944,10 @@ function setNewSessionCreateVisible(visible) {
 
 async function fetchProjectPathStatus(path) {
   const target = path || '';
-  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
-  ), 'api_fs_stat');
-  const data = await resp.json().catch(() => ({}));
+  // Transport F8a: facade GET twin (tunnel first, HTTP fallback) — the
+  // same api_fs_stat lane the Files IDE rides (F1).
+  const resp = await daemonApi.request('api_fs_stat', { path: target });
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok) throw new Error(data.error || `Path check failed (${resp.status})`);
   return data;
 }
@@ -1041,14 +1041,10 @@ async function ensureNewSessionProjectDirectory(projectRoot) {
   }
 
   setNewSessionProjectStatus('warn', 'Creating directory on this host...');
-  const resp = await dashboardJsonFetch('api_fs_mkdir', { path: projectRoot }, () => (
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectRoot }),
-    })
-  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // Transport F8a: facade POST twin — the verb-derived no-replay policy
+  // is the legacy fallbackAfterRpcFailure:false semantics.
+  const resp = await daemonApi.request('api_fs_mkdir', { path: projectRoot });
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok) {
     setNewSessionProjectStatus('error', data.error || `Create failed (${resp.status})`);
     return null;
