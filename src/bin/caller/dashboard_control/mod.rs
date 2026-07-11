@@ -214,9 +214,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // api_session_frame_asset), api_session_delete, and the worktrees
     // quartet live as tunnel columns on their route rows (S4b), and so
     // does the whole current-session family — history/rollback/redo/
-    // prune, changes, agent-output, uploads list/raw/delete, and the
-    // upload-frame-only api_session_current_upload (S4c).
-    method("api_sessions_stream", PeerOperation::SessionInspect),
+    // prune, changes, agent-output, uploads list/raw/delete, the
+    // upload-frame-only api_session_current_upload (S4c), and the
+    // Stream-lane api_sessions_stream (S10).
     method("api_session_control_msg", PeerOperation::SessionManage),
     // The api_fs_* methods live as tunnel columns on their route rows
     // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
@@ -3126,7 +3126,7 @@ mod tests {
             // override (the ladder classifies the HTTP leaf as Task).
             ("api_coordinator_route", Row, Some(Op::PeerManage)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
-            ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
             ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),

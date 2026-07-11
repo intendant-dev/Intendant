@@ -153,6 +153,20 @@ pub(crate) enum BytesPayload {
     InMemory(Vec<u8>),
 }
 
+/// The Stream lane's one line source (design §2.5, S10): the neutral
+/// handler spawns the producer and hands both transports this handle —
+/// the HTTP adapter writes the received lines verbatim under the
+/// response head; the tunnel framer wraps each in a `stream_event`
+/// frame between `stream_start`/`stream_end`. Items are complete
+/// NDJSON lines (trailing `\n` included). `source` is the producer
+/// task: writers drop `lines` first (hanging up unblocks a producer
+/// still sending after an early exit), then await it, so a panicked
+/// source is observable as the lane's error tail.
+pub(crate) struct LineStream {
+    pub(crate) lines: tokio::sync::mpsc::Receiver<String>,
+    pub(crate) source: tokio::task::JoinHandle<()>,
+}
+
 /// One API response, however it will leave the daemon. The HTTP adapter
 /// renders it byte-identically to the historical handler output (the
 /// golden transcripts prove it); the tunnel adapter (S2) frames `Json`
@@ -182,6 +196,19 @@ pub(crate) enum ApiResponse {
         /// the transfer rows (S9) define meta's HTTP rendering. `Null`
         /// when the response has no sidecar.
         meta: serde_json::Value,
+    },
+    /// NDJSON line stream (`GET /api/sessions/stream`, tunnel twin
+    /// `api_sessions_stream`): an unbounded-length response fed line by
+    /// line from one source task. The HTTP adapter writes the head
+    /// (EOF-delimited — no Content-Length) then each line verbatim; the
+    /// tunnel framer emits `stream_start`/`stream_event`/`stream_end`
+    /// and consumes only the lines.
+    Stream {
+        status: u16,
+        content_type: String,
+        /// Same contract as `Json::headers` (HTTP-lane decoration).
+        headers: Vec<(&'static str, String)>,
+        stream: LineStream,
     },
 }
 
