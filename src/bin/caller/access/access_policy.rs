@@ -425,6 +425,9 @@ pub struct FrameLaneSpec {
     pub tunnel: bool,
     /// Why the row is shaped this way — op rationale, `None` reason, or
     /// single-lane reason. Mandatory; an invariant test pins it non-empty.
+    /// Documentation-bearing only: no runtime path reads it (the lookup
+    /// keys on `frame` + lanes), hence the targeted allow.
+    #[allow(dead_code)]
     pub note: &'static str,
 }
 
