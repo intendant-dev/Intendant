@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions fresh: Dependabot bumps the pin and the
+  # trailing version comment together. Grouped weekly so action bumps
+  # cost one queue cycle, not one PR per action.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    groups:
+      actions:
+        patterns:
+          - "*"
