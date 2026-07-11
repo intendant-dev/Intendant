@@ -1,4 +1,5 @@
-//! Browser-side presence layer in Rust+WASM.
+//! Browser-side presence layer in Rust+WASM. (Comment-only touch: the
+//! wasm-drift gate's rebuild path was first exercised by this line.)
 //!
 //! Wraps `presence-core` (pure logic) with browser WebSocket transport for:
 //! - Server connection (TUI frames, control messages, tool requests)
