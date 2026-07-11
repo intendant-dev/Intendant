@@ -314,10 +314,16 @@ fn ensure_idle(
 }
 
 
-pub(crate) async fn displays_response_body(
+/// Transport-neutral core of the displays body, given an
+/// already-enumerated display set: the OS enumeration resolves at the
+/// production edge (`displays_api_response`), so tests inject a fixture
+/// set — a real enumeration is machine state (tests-are-hermetic
+/// convention), and on a session-less CI account macOS's
+/// SCShareableContent call never completes at all.
+pub(crate) async fn displays_response_body_from(
+    displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
-    let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
     // This route serves the owner's dashboards (the display picker), so
     // each entry is annotated with its live capture state via the
     // unfiltered registry view: `capture_active` plus `agent_visible`
