@@ -49,3 +49,11 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'test(/ctl_peer_mtls_pairing/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# rustc-governor acceptance tests spawn the real governor binary plus
+# /bin/sh fixtures and hand flock permits between processes with
+# deliberately generous deadlines; pure fork/exec + scheduling headroom on
+# a saturated box (same class as the worktree_inventory override above).
+[[profile.default.overrides]]
+filter = 'package(rustc-governor)'
+slow-timeout = { period = "60s", terminate-after = 4 }
