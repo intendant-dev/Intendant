@@ -888,92 +888,19 @@ pub(crate) fn control_frame_response(
                     );
                     None
                 }
-                "api_sessions"
-                | "api_session_detail"
-                | "api_session_report"
-                | "api_session_delete"
-                | "api_session_agent_output"
-                | "api_session_current_agent_output"
-                | "api_session_current_history"
-                | "api_session_current_rollback"
-                | "api_session_current_redo"
-                | "api_session_current_prune"
-                | "api_session_current_changes"
-                | "api_session_context_snapshot"
-                | "api_session_current_uploads"
-                | "api_session_current_upload_raw"
-                | "api_session_current_upload_delete"
-                | "api_transfer_jobs"
-                | "api_transfer_job_create"
-                | "api_transfer_job_delete"
-                | "api_transfer_download_read"
-                | "api_transfer_upload_commit"
-                | "api_media_clip_start"
-                | "api_media_clip_end"
-                | "api_media_clip_cancel"
-                | "api_fs_stat"
-                | "api_fs_list"
-                | "api_fs_mkdir"
-                | "api_fs_rename"
-                | "api_fs_delete"
-                | "api_fs_read"
-                | "api_sessions_search"
-                | "api_settings"
-                | "api_settings_save"
-                | "api_control_msg"
-                | "api_session_control_msg"
-                | "api_dashboard_action_msg"
-                | "api_diagnostics_visual_freshness"
-                | "api_key_status"
-                | "api_api_keys_save"
-                | "api_external_agents"
-                | "api_voice_session"
-                | "api_project_root"
-                | "api_displays"
-                | "api_recordings"
-                | "api_recording_asset"
-                | "api_session_recordings"
-                | "api_session_recording_asset"
-                | "api_session_frame_asset"
-                | "api_browser_workspace_snapshot"
-                | "api_state_snapshot"
-                | "api_display_bootstrap"
-                | "api_display_webrtc_signal"
-                | "api_display_input_authority_snapshot"
-                | "api_display_input_authority_request"
-                | "api_display_input_authority_release"
-                | "api_session_log_replay"
-                | "api_external_session_activity_replay"
-                | "api_dashboard_bootstrap"
-                | "api_worktrees"
-                | "api_worktrees_inspect"
-                | "api_worktrees_scan"
-                | "api_worktrees_remove"
-                | "api_worktrees_merge"
-                | "api_managed_context_records"
-                | "api_managed_context_anchors"
-                | "api_managed_context_fission"
-                | "api_mcp_tool_call"
-                | "api_peer_add"
-                | "api_peer_remove"
-                | "api_peer_eligible"
-                | "api_peer_message"
-                | "api_peer_task"
-                | "api_peer_approval"
-                | "api_peer_webrtc_signal"
-                | "api_peer_file_transfer_signal"
-                | "api_peer_dashboard_control_signal"
-                | "api_peer_pairing_invite"
-                | "api_peer_pairing_join"
-                | "api_peer_pairing_request_access"
-                | "api_peer_pairing_request_access_poll"
-                | "api_peer_pairing_requests"
-                | "api_peer_pairing_request_decision"
-                | "api_peer_pairing_identities"
-                | "api_peer_pairing_identity_revoke"
-                | "api_credential_egress_probe"
-                | "api_access_connect_unclaim"
-                | "api_coordinator_route" => {
+                // Every other declared method rides the spawned request
+                // lane (transport-unification S11): the authorizer above
+                // fail-closes undeclared names against the effective
+                // method table (route-row tunnel specs ∪ the
+                // `CONTROL_ONLY_METHODS` residue), so reaching this arm
+                // means the method is declared — the per-name mirror list
+                // this arm replaces could only drift out of sync with
+                // those declarations. The spawned lane owns the
+                // method→handler binding (byte-stream tasks and JSON
+                // arms alike); a declared name it does not bind answers
+                // with the same `unknown method` shape this match used to
+                // return inline.
+                _ => {
                     spawn_control_request(
                         id,
                         method.to_string(),
@@ -984,12 +911,6 @@ pub(crate) fn control_frame_response(
                     );
                     None
                 }
-                _ => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": format!("unknown method: {method}"),
-                })),
             }
         }
         "cancel" => {
@@ -1052,16 +973,13 @@ pub(crate) fn control_upload_start_frame(
         return Some(control_upload_error_response(id, 400, "missing request id"));
     }
     let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(
-        method,
-        "api_session_current_upload"
-            | "api_transfer_upload_chunk"
-            | "api_fs_write"
-            | "api_media_annotation_attach"
-            | "api_media_annotation_submit"
-            | "api_media_clip_frame"
-            | "api_presence_video_frame"
-    ) {
+    // Derived, not mirrored (transport-unification S11): a method is
+    // upload-deliverable iff its declaration says so — the `upload` flag
+    // on its route-row tunnel spec or `CONTROL_ONLY_METHODS` residue
+    // entry — replacing the per-name list this gate used to restate.
+    // Undeclared names keep the historical 400 shape; the operation gate
+    // below answers 403 like every other authorization failure.
+    if !control_method_spec(method).is_some_and(|spec| spec.upload) {
         return Some(control_upload_error_response(
             id,
             400,
@@ -2369,7 +2287,7 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 
     // Every gated api_* method derives its `<method>_available` boolean from
     // the effective method table (route-row tunnel specs ∪ the
-    // CONTROL_METHODS residue): operation granted && backing subsystem wired
+    // CONTROL_ONLY_METHODS residue): operation granted && backing subsystem wired
     // (`control_method_runtime_ready`). One boolean per advertised RPC lets
     // the SPA distinguish "denied for this session" from "unsupported
     // daemon" (feature list) without probing calls.

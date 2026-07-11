@@ -978,7 +978,7 @@ function daemonApiTunnelMethodAvailability(transport, method) {
   }
   if (features.length) {
     // Upload-only methods are not named in `features` — they advertise
-    // through the upload_frames umbrella (CONTROL_METHODS upload_only).
+    // through the upload_frames umbrella (CONTROL_ONLY_METHODS upload_only).
     const advertised = features.includes(method) || (lane === 'upload' && features.includes('upload_frames'));
     return advertised ? { ok: true, reason: 'connected' } : { ok: false, reason: 'unsupported' };
   }
