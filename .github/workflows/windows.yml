@@ -26,24 +26,20 @@ name: Cross-platform tests
 # end on every platform.
 
 on:
-  push:
-    branches: [main]
-    # Only platform-relevant sources can introduce a compile regression, so
-    # skip pure-docs / static-asset pushes. Mirrors audit.yml's scoping.
-    paths:
-      - "**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**/Cargo.toml"
-      - ".github/workflows/windows.yml"
+  # NO push trigger (dropped 2026-07-10, after the external per-listener
+  # target caches landed): the push-to-main run was a check-only "warm
+  # pass" whose only value was compile warmth, and the constant PR +
+  # merge-group flow keeps the external caches warm without it — the
+  # merge-group run just validated the identical tree. Same reasoning
+  # that removed smokes.yml's push trigger on 2026-07-07 (~8 fleet
+  # runner-minutes returned per landing).
+  #
   # Required-check trigger #1 — deliberately unfiltered. This job is a
   # required status check, and GitHub only lets a PR *enter* the merge
   # queue once its own required checks have passed: a paths-skipped
   # required check leaves the PR BLOCKED at "Expected" forever (verified
   # live on the first docs-only PR through this repo's queue). Every PR
-  # pays the full matrix; that is the price of a required check. The push
-  # trigger above keeps its paths — push runs are check-only warm passes
-  # (see the fast-path step), not gates.
+  # pays the full matrix; that is the price of a required check.
   pull_request:
     branches: [main]
   # Required-check trigger #2 — the merge-queue revalidation against the
@@ -309,22 +305,15 @@ jobs:
       # actual gate, revalidating the speculative merge state) and the
       # Linux pull_request leg (the one pre-queue runtime signal — most
       # test failures are platform-agnostic, and catching them before the
-      # queue saves a far more expensive group ejection). Everything else
-      # runs a compile check only:
-      #   - non-Linux PR legs (since 2026-07: cross-platform compile
-      #     breakage is the dominant non-Linux regression class, and the
-      #     single Mac hosts both mac runner instances PLUS the
-      #     interactive agents — stacked full-suite runs starved the
-      #     label queue at ~55-minute waits);
-      #   - ALL push-to-main warm runs (since 2026-07-07: the merge-group
-      #     run just built and tested the identical tree on this same
-      #     fleet, so a push-side full suite re-validates nothing — its
-      #     cache-warming value IS the compile, which the constant PR +
-      #     group flow already provides; dropping the Linux push suite
-      #     returned ~19 runner-minutes per landing on the dell, the
-      #     fleet's current bottleneck).
+      # queue saves a far more expensive group ejection). The non-Linux
+      # PR legs run this compile check only (since 2026-07:
+      # cross-platform compile breakage is the dominant non-Linux
+      # regression class, and the single Mac hosts both mac runner
+      # instances PLUS the interactive agents — stacked full-suite runs
+      # starved the label queue at ~55-minute waits). Push-to-main runs
+      # are gone entirely (2026-07-10, the `on:` comment).
       - name: cargo check (fast path)
-        if: github.event_name != 'merge_group' && (runner.os != 'Linux' || github.event_name == 'push') && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
           cargo check -p intendant --bins --locked --target ${{ matrix.target }}
           cargo check -p intendant-core -p intendant-display -p intendant-platform --tests --locked --target ${{ matrix.target }}

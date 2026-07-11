@@ -2242,16 +2242,32 @@ mod tests {
 
     #[tokio::test]
     async fn parity_displays_serves_the_same_body_on_both_transports() {
-        // No session registry on either lane: both render the ONE
-        // neutral enumeration (annotations need a registry; the OS
-        // display set is stable across the two back-to-back calls).
-        let rt = runtime();
+        // Injected display set on both lanes (a fixture must never
+        // enumerate the machine's real displays — on a session-less CI
+        // account the macOS enumeration never completes); no session
+        // registry on either lane, so both render the ONE neutral body
+        // through the `_from` core the production edges delegate to.
+        let displays = vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }];
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::displays_api_response(&None).await,
+            crate::web_gateway::displays_api_response_from(displays.clone(), &None).await,
         );
         assert_eq!(status, 200);
         assert!(http_body["displays"].is_array(), "{http_body}");
-        let frame = api_displays_response("parity-displays".to_string(), &rt).await;
+        let frame = frame_api_json_body_response(
+            "parity-displays".to_string(),
+            crate::web_gateway::displays_api_response_from(displays, &None).await,
+            "displays",
+        );
         assert_eq!(frame["ok"], true);
         assert!(frame["result"]
             .as_object()

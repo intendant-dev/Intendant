@@ -67,19 +67,25 @@ const vaultRevealedEntries = new Set();
    copying between them is an explicit user action, never implicit. */
 function vaultDaemonStoreReady() {
   if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // An empty feature list means the hello_ack hasn't landed yet: fall
-    // through and let the RPCs answer (mirrors vaultLeaseTransportReady).
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_daemon_vault_fetch');
-    }
-    return true;
-  } catch {
-    return false;
+  // daemonApi availability (transport F6): the tunnel status boolean when
+  // it has landed (false = this session's role is refused the custody
+  // gate), the hello_ack features list before that (absent = the daemon
+  // predates local vault storage), optimistic only while the handshake is
+  // still in flight — the pre-facade "let the RPCs answer" semantics.
+  return daemonApi.availability('api_daemon_vault_fetch').ok;
+}
+
+/* Why the daemon store is out of reach, for the 'unavailable' status line
+   — the honest split the conflated pre-facade copy could not make. */
+function vaultDaemonStoreUnavailableText() {
+  const reason = daemonApi.availability('api_daemon_vault_fetch').reason;
+  if (reason === 'denied') {
+    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Hosted Connect dashboards use the account vault instead.";
   }
+  if (reason === 'unsupported') {
+    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect dashboards use the account vault instead.';
+  }
+  return 'No vault store reachable yet: the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
 }
 
 function vaultBackendKind() {
@@ -336,6 +342,9 @@ async function vaultServerFetch() {
       vault: result?.vault || null,
     };
   }
+  // The account store lives on the Connect service, not on any daemon —
+  // deliberately raw fetch, outside the daemonApi facade (the facade
+  // speaks to daemons only; rendezvous calls stay on their own lane).
   const resp = await fetch(accessFleetHostedUrl('/api/vault'));
   if (resp.status === 401) return { authenticated: false };
   const body = await resp.json().catch(() => ({}));
@@ -1127,7 +1136,8 @@ const VAULT_OFFLINE_CHOICES = [
 const VAULT_OFFLINE_DEFAULT_MS = 24 * 60 * 60 * 1000;
 
 const vaultLeaseState = {
-  supported: null,   // null until first probe; false when the daemon lacks the RPCs / gate
+  supported: null,   // null until first verdict; false only on the daemon's own refusal
+  availability: '',  // honest cause: 'denied' | 'unsupported' | 'connected' (transport F6)
   leases: [],
   egress: [],        // active client-egress relays (the path indicator)
   expiredNote: '',
@@ -1301,40 +1311,47 @@ async function vaultOauthAccessTokenMaterial(entry, kind) {
   return vaultOauthAccessMaterial(kind, secretJson);
 }
 
+/* Availability of the lease RPC family here (transport F6, design §3.4):
+   the daemon's own word, before any RPC fires. Reasons the render paths
+   branch on — 'denied' (the status boolean says this session's role is
+   refused credentials.manage; custody methods have no runtime-ready
+   ladder, so false means exactly that), 'unsupported' (the hello_ack
+   features list omits the family — the daemon predates it),
+   'transport-down' (no verified tunnel; custody has no HTTP twin by
+   design, so no other lane can answer), 'connected' (go — optimistically
+   so while the handshake is still digesting, letting the RPCs answer
+   exactly as the pre-facade probes did). */
+function vaultLeaseAvailability() {
+  return daemonApi.availability('api_credential_lease_status');
+}
+
 function vaultLeaseTransportReady() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // Leases need the credential RPC family. A daemon that advertises its
-    // control surface but not these methods is too old — report
-    // unsupported instead of firing calls that fail one by one. An empty
-    // list means the hello_ack hasn't landed yet: fall through and let
-    // the RPCs answer.
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_credential_lease_status');
-    }
-    return true;
-  } catch {
-    return false;
-  }
+  return vaultLeaseAvailability().ok;
 }
 
-function vaultLeaseRpc(method, params = {}) {
-  return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
+/* One custody RPC. Tunnel-only by design (docs/src/credential-custody.md;
+   the transport design keeps the family off HTTP rows), which the facade
+   enforces: no fallback lane exists, so a custody mutation can never
+   replay elsewhere after an ambiguous failure, and a down tunnel rejects
+   immediately. Resolves with the result payload (the pre-facade contract
+   every call site and window.intendantVault.probeEgress keeps);
+   rejections are DaemonApiError, whose `kind` the refreshers classify
+   into availability verdicts. Per-method timeouts live in
+   dashboardControlRequestTimeoutMs — the `{ timeoutMs: 15000 }` option
+   the pre-facade call passed here was silently ignored by the request
+   verb; the custody rows of that table now carry the intent. */
+async function vaultLeaseRpc(method, params = {}) {
+  const { body } = await daemonApi.request(method, params);
+  return body;
 }
 
-/* Whether the tunneled daemon advertises local vault storage — strict
-   (feature must be listed) because this only gates an optional action. */
+/* Whether the tunneled daemon offers local vault storage to THIS session —
+   'connected' only: the daemon must have confirmed the method (status
+   boolean or features list), because this gates an optional action (the
+   sealed-copy button) that a credentials.manage-denied session or an
+   older daemon could only bounce. */
 function vaultTunnelDaemonVaultAvailable() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    const features = status.controlFeatures;
-    return Array.isArray(features) && features.includes('api_daemon_vault_publish');
-  } catch {
-    return false;
-  }
+  return daemonApi.availability('api_daemon_vault_publish').reason === 'connected';
 }
 
 /* The lease kind a vault entry fuels, or null when it cannot fuel.
@@ -1353,11 +1370,22 @@ function vaultEntryLeaseKind(entry) {
 }
 
 async function vaultRefreshLeases({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = vaultLeaseAvailability();
+  if (!avail.ok) {
+    // The daemon already answered through features/status — record the
+    // verdict without firing RPCs that can only bounce (the render paths
+    // read the same availability live, so no re-render is needed here).
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = avail.reason;
+    }
+    return;
+  }
   if (!force && Date.now() - vaultLeaseState.fetchedAt < 30_000) return;
   try {
     const result = await vaultLeaseRpc('api_credential_lease_status');
     vaultLeaseState.supported = true;
+    vaultLeaseState.availability = 'connected';
     vaultLeaseState.leases = Array.isArray(result?.leases) ? result.leases : [];
     vaultLeaseState.egress = Array.isArray(result?.egress) ? result.egress : [];
     vaultLeaseState.expiredNote = String(result?.expired_note || '');
@@ -1368,12 +1396,20 @@ async function vaultRefreshLeases({ force = false } = {}) {
     }
     vaultEgressEnsure().catch(() => {});
   } catch (err) {
-    const message = String(err?.message || err);
-    // A daemon predating the lease RPCs, or a session without the
-    // credentials.manage gate, reads as unsupported rather than broken.
-    vaultLeaseState.supported = false;
-    vaultLeaseState.lastError = message;
+    vaultLeaseState.lastError = String(err?.message || err);
     vaultLeaseState.fetchedAt = Date.now();
+    // Availability honesty (transport F6): only the daemon's own refusals
+    // are verdicts about this session or this daemon. 'denied' is the
+    // authorizer refusing the gate, 'unavailable' is a daemon without the
+    // method (races where the pre-flight was still optimistic). A timeout
+    // or a dropped channel says nothing about support — keep the last
+    // known verdict and surface the error text instead of the old
+    // conflated "cannot manage leases" reading.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
@@ -1381,20 +1417,41 @@ async function vaultRefreshLeases({ force = false } = {}) {
 }
 
 /* Custody trail: the daemon's own record of lease/relay lifecycle events,
-   fetched over the same credentials.manage-gated channel as the leases. */
-const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+   fetched over the same credentials.manage-gated channel as the leases.
+   `availability` carries the honest cause when supported goes false:
+   'denied' (role refused the gate) vs 'unsupported' (daemon predates the
+   trail) — transient lane failures flip neither. */
+const custodyTrailState = { events: [], supported: null, availability: '', fetchedAt: 0 };
 
 async function vaultRefreshCustody({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = daemonApi.availability('api_credential_custody_trail');
+  if (!avail.ok) {
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      const changed = custodyTrailState.supported !== false
+        || custodyTrailState.availability !== avail.reason;
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = avail.reason;
+      custodyTrailState.fetchedAt = Date.now();
+      if (changed) renderAccessCustodySection();
+    }
+    return;
+  }
   if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
   custodyTrailState.fetchedAt = Date.now();
   try {
     const result = await vaultLeaseRpc('api_credential_custody_trail');
     custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
     custodyTrailState.supported = true;
-  } catch {
-    // Older daemon or a session without credentials.manage.
-    custodyTrailState.supported = false;
+    custodyTrailState.availability = 'connected';
+  } catch (err) {
+    // Verdicts only from the daemon's own refusals (see
+    // vaultRefreshLeases); a timeout or dropped channel keeps whatever
+    // the last connected read established.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessCustodySection();
 }
@@ -1419,7 +1476,10 @@ function renderAccessCustodySection() {
     mount.appendChild(el);
   };
   if (custodyTrailState.supported === false) {
-    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    // The honest split (transport F6): the daemon said which it is.
+    note(custodyTrailState.availability === 'unsupported'
+      ? 'This daemon predates the custody trail — upgrade it to see lease and relay lifecycle events.'
+      : "This session can't read the custody trail — its role needs credentials.manage.");
     return;
   }
   if (!custodyTrailState.events.length) {
@@ -2135,21 +2195,32 @@ function vaultRenderFueling(card) {
   head.appendChild(title);
   card.appendChild(head);
 
-  if (!vaultLeaseTransportReady()) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = 'Connect to the daemon to fuel it — leases travel only over the verified tunnel.';
-    card.appendChild(note);
+  const fuelingNote = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    card.appendChild(el);
+  };
+  // Availability honesty (transport F6): the daemon's features/status
+  // answer BEFORE any RPC fires, so the panel names the actual cause —
+  // a session whose role is refused the gate, a daemon predating the
+  // family, or simply no tunnel yet — instead of the old conflated
+  // "cannot manage leases" catch-all. The stored verdict covers the
+  // race where a still-optimistic pre-flight let an RPC bounce.
+  const avail = vaultLeaseAvailability();
+  if (avail.reason === 'denied' || vaultLeaseState.availability === 'denied') {
+    fuelingNote("This session's role can't manage credential leases — fueling needs credentials.manage.");
+    return;
+  }
+  if (avail.reason === 'unsupported' || vaultLeaseState.availability === 'unsupported') {
+    fuelingNote('This daemon predates credential leases — upgrade it to fuel from the vault.');
+    return;
+  }
+  if (!avail.ok) {
+    fuelingNote('Connect to the daemon to fuel it — leases travel only over the verified tunnel.');
     return;
   }
   vaultRefreshLeases().catch(() => {});
-  if (vaultLeaseState.supported === false) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = `This session cannot manage credential leases: ${vaultLeaseState.lastError || 'the daemon predates leases or this role lacks credentials.manage.'}`;
-    card.appendChild(note);
-    return;
-  }
 
   if (vaultLeaseState.expiredNote) {
     const warning = document.createElement('div');
@@ -2157,7 +2228,9 @@ function vaultRenderFueling(card) {
     warning.textContent = vaultLeaseState.expiredNote;
     card.appendChild(warning);
   }
-  if (vaultLeaseState.lastError && vaultLeaseState.supported) {
+  // Transient lane failures (timeouts, channel drops) are errors, not
+  // support verdicts — show them even before the first successful probe.
+  if (vaultLeaseState.lastError && vaultLeaseState.supported !== false) {
     const error = document.createElement('div');
     error.className = 'vault-error';
     error.textContent = vaultLeaseState.lastError;
@@ -2436,7 +2509,7 @@ function renderAccessVaultSection() {
         ? 'This browser lacks the WebCrypto features the vault needs.'
         : DASHBOARD_CONNECT_MODE
           ? 'The hosted vault store is unreachable right now.'
-          : 'No vault store reachable yet: this daemon predates local vault storage, this session lacks credentials.manage, or the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
+          : vaultDaemonStoreUnavailableText();
       break;
     case 'signed-out':
       chip.textContent = 'signed out';
@@ -2618,6 +2691,7 @@ window.intendantVault = {
   voiceApiKeyGet: storageKey => voiceApiKeyGet(storageKey),
   leases: () => ({
     supported: vaultLeaseState.supported,
+    availability: vaultLeaseState.availability,
     leases: vaultLeaseState.leases.map(lease => ({ ...lease })),
     expiredNote: vaultLeaseState.expiredNote,
     lastError: vaultLeaseState.lastError,
@@ -2656,6 +2730,7 @@ window.intendantVault = {
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
   custody: () => ({
     supported: custodyTrailState.supported,
+    availability: custodyTrailState.availability,
     events: custodyTrailState.events.map(event => ({ ...event })),
   }),
   refreshCustody: () => vaultRefreshCustody({ force: true }),

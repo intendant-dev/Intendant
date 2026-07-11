@@ -29,10 +29,13 @@
 // staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
 // external-agents, displays), the F4 access dialogs family
-// (overview/enrollment/connect/tier + IAM grant writes), and the F5
+// (overview/enrollment/connect/tier + IAM grant writes), the F5
 // peers/approvals/coordinator family (peer list + quick controls, the
 // pairing dialogs, the coordinator forms, and the peer WebRTC signal
-// relays); the remaining
+// relays), and the F6 credential-custody family (vault leases, the
+// custody trail, the daemon vault store + deposit lane, client-egress
+// registration/probe — tunnel-only methods whose per-cause availability
+// the vault UI surfaces); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -77,7 +80,12 @@
 // delegate IAM to the federation ladder, S7). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
-// their entries when those rows land.
+// their entries when those rows land. The F6 credential-custody family
+// (api_credential_*, api_daemon_vault_*) is deliberately absent too, and
+// stays so: custody is tunnel-scoped by design — no HTTP rows exist or
+// are planned (docs/src/credential-custody.md; the transport design
+// parks custody HTTP rows as an explicit future decision), so those
+// methods ride the facade with no fallback lane at all.
 // Entry shape: verb + path template (`{name}` segments are lifted from
 // params), `alias` = capture-name -> param-key lift map (the session rows
 // capture `id` while the tunnel's canonical param is `session_id` — the
@@ -974,6 +982,10 @@ window.qa = Object.assign(window.qa || {}, {
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
         api_sessions: daemonApiAvailability('api_sessions'),
         api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
+        // Tunnel-only custody sample (F6): 'denied' vs 'unsupported' vs
+        // 'transport-down' is directly observable here — no HTTP twin
+        // ever answers for it.
+        api_credential_lease_status: daemonApiAvailability('api_credential_lease_status'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,

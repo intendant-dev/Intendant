@@ -109,8 +109,10 @@ else
     # with no -password argument (verified live on Darwin 25.4). It is
     # inert while the record has no AuthenticationAuthority, but a later
     # tool could add one — delete the hash so password auth has nothing to
-    # verify against, ever.
-    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
+    # verify against, ever. NB: deletes take the BARE attribute name; the
+    # dsAttrTypeNative: prefix (which reads print) makes the delete a
+    # silent no-op.
+    dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
 fi
 
 CI_GROUP="$(id -gn "$CI_ACCOUNT")"
@@ -231,6 +233,58 @@ else
     fi
 fi
 
+# ---- supervised sccache server (one per account, shared by listeners) ----
+# Never rely on in-job server spawning: the cargo [env] port above does
+# not reach every in-job sccache invocation (the rustc version probe
+# failed on the default port, 2026-07-10), and a client racing a dying
+# or job-reaped server reads a truncated response header ("failed to
+# fill whole buffer" — cargo exit 101 within seconds). One
+# launchd-supervised FOREGROUND server owns the account's port instead
+# (SCCACHE_NO_DAEMON: a forked server dies with its launchd process
+# group); job clients only ever connect. The per-listener .env mirrors
+# the port/dir into job env (migrate-runner-macos.sh).
+if [ -n "$sccache_bin" ]; then
+    SCCACHE_LABEL="com.intendant.ci.sccache"
+    SCCACHE_PLIST="/Library/LaunchDaemons/$SCCACHE_LABEL.plist"
+    cat > "$SCCACHE_PLIST.tmp" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SCCACHE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$sccache_bin</string>
+  </array>
+  <key>UserName</key><string>$CI_ACCOUNT</string>
+  <key>GroupName</key><string>$CI_GROUP</string>
+  <key>WorkingDirectory</key><string>$CI_HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$CI_HOME</string>
+    <key>SCCACHE_START_SERVER</key><string>1</string>
+    <key>SCCACHE_NO_DAEMON</key><string>1</string>
+    <key>SCCACHE_SERVER_PORT</key><string>4227</string>
+    <key>SCCACHE_DIR</key><string>$CI_HOME/.cache/sccache</string>
+    <key>SCCACHE_IDLE_TIMEOUT</key><string>0</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$CI_HOME/Library/Logs/sccache-server.log</string>
+  <key>StandardErrorPath</key><string>$CI_HOME/Library/Logs/sccache-server.log</string>
+</dict>
+</plist>
+PLIST_EOF
+    mv "$SCCACHE_PLIST.tmp" "$SCCACHE_PLIST"
+    chown root:wheel "$SCCACHE_PLIST"
+    chmod 0644 "$SCCACHE_PLIST"
+    # Idempotent re-run: bootout the old instance first (brief server
+    # blip; this script is a maintenance operation, not a hot path).
+    launchctl bootout "system/$SCCACHE_LABEL" 2>/dev/null || true
+    launchctl bootstrap system "$SCCACHE_PLIST"
+    echo "bootstrapped $SCCACHE_LABEL ($sccache_bin, port 4227, foreground under launchd)"
+fi
+
 echo "== wasm-pack"
 # Same convention as scripts/setup-macos.sh: cargo install pinned by the
 # repo's .wasm-pack-version (build.rs skips WASM rebuilds under any other
@@ -309,12 +363,19 @@ fi
 
 # Password material: check the hash data itself, not just the authority
 # list — sysadminctl mints ShadowHashData unasked. Idempotent runs
-# converge (delete) rather than warn.
-if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
-    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
+# converge (delete) rather than warn. dscl -read exits 0 for an existing
+# RECORD whether or not the queried key exists (absent keys print "No
+# such key"), so presence must be parsed from the output — anchored,
+# because the No-such-key line also contains the attribute name.
+shadow_present() {
+    dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null \
+        | grep -q '^dsAttrTypeNative:ShadowHashData:'
+}
+if shadow_present; then
+    dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
 fi
 auth_auth="$(dscl . -read "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true)"
-if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
+if shadow_present; then
     echo "FAIL: $CI_ACCOUNT still has ShadowHashData after delete" >&2
     fail=1
 elif echo "$auth_auth" | grep -q "ShadowHash"; then
