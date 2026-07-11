@@ -1582,10 +1582,19 @@ function dashboardControlRequestTimeoutMs(method) {
     // Peer quick controls cross the federation transport and wait for the
     // remote daemon's ack — the generic 5 s default was sized for local
     // reads, not a peer round trip (transport F5's deliberate
-    // normalization; the legacy HTTP lane ran signal-less).
+    // normalization; the legacy HTTP lane ran signal-less). The same
+    // budget covers the dials that reach a REMOTE daemon before
+    // answering: peer add (card fetch + transport spawn), pairing
+    // join/request-access/poll (doorbell round trips), and coordinator
+    // routing (delegation ack).
     case 'api_peer_message':
     case 'api_peer_task':
     case 'api_peer_approval':
+    case 'api_peer_add':
+    case 'api_peer_pairing_join':
+    case 'api_peer_pairing_request_access':
+    case 'api_peer_pairing_request_access_poll':
+    case 'api_coordinator_route':
       return 30000;
     default:
       return 5000;
