@@ -54,10 +54,13 @@ pub(crate) enum SegmentSpec {
     /// This exact segment.
     Literal(&'static str),
     /// One of these exact segments; the matched value is also captured.
-    /// Vocabulary reserved for future multi-leaf declarations. The peers
-    /// and doorbell sub-routers deliberately did NOT adopt it (phase 4d):
-    /// their `Any` catch-all rows preserve handler-owned JSON 404s for
-    /// garbage subpaths that per-leaf rows would drop to the SPA shell.
+    /// Vocabulary reserved for future multi-leaf declarations — still
+    /// unadopted. The S7 peers carve settled the sub-router shape
+    /// without it: per-leaf `Capture`/`Literal` rows declare each leaf
+    /// (and its datachannel twin) while the family's `Any` catch-all
+    /// row stays last, so garbage subpaths keep the handler-owned JSON
+    /// 404s instead of dropping to the SPA shell. The doorbell keeps
+    /// its bare catch-all (phase 4d).
     #[allow(dead_code)]
     OneOf(&'static [&'static str]),
 }
