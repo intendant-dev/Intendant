@@ -24,6 +24,15 @@ name: Cross-platform tests
 # scripted mock provider (PROVIDER=mock), so it is equally keyless and
 # headless while covering the CLI → loop → sandboxed-runtime path end to
 # end on every platform.
+#
+# Since 2026-07-11 this workflow is also the WHOLE Linux gate: the keyless
+# smokes and the dashboard-boot probe run as tail steps of the Linux leg,
+# reusing its checkout and warm build tree. They were smokes.yml's two
+# jobs (deleted in the same change; the separate `smokes (ubuntu-latest)`
+# required context was retired from the ruleset, and dashboard-boot —
+# advisory since birth — was promoted into the required gate on its
+# 40/40-green soak record). Collapsing 3 Linux jobs into 1 returns two
+# runner slots per entry and removes two duplicate checkout+build cycles.
 
 on:
   # NO push trigger (dropped 2026-07-10, after the external per-listener
@@ -78,8 +87,13 @@ jobs:
       # debuginfo when a CI backtrace is too thin.
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug }}
     # Full test builds are much heavier than the old `cargo check`; a cold
-    # Windows runner can take a while, but a hung run shouldn't burn hours.
-    timeout-minutes: 90
+    # Windows runner can take a while, but a hung run shouldn't burn hours
+    # — and with no per-test timeout under plain `cargo test`, one hung
+    # test otherwise holds a queue slot for the whole budget (2026-07-10's
+    # display-enumeration hang held the Mac runner ~15 min per entry only
+    # because an operator intervened). 60 covers a cold self-hosted build
+    # with margin; tighten toward 45 at the post-toolchain-pin re-baseline.
+    timeout-minutes: 60
     strategy:
       # One platform failing shouldn't mask the others — we want to see every
       # target's result on a regression.
@@ -344,3 +358,129 @@ jobs:
       - name: cargo test e2e (mock provider, headless)
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
+
+      # ── Linux gate tail: keyless smokes + dashboard-boot ──────────────
+      # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
+      # rationale preserved in its git history): the live-fire subset of
+      # the landing battery that needs NO API keys and NO display — real
+      # binaries driven end to end by the scripted mock provider.
+      #   - session-vitals-smoke: daemon in a dirty git repo; vitals event
+      #     carries git + cache + limits sections end to end.
+      #   - native-goal-smoke: the /goal engine over the control socket.
+      #   - peer-sessions-smoke: two federated daemons, task delegation,
+      #     folded per-session state on /api/peers. API mode only.
+      #   - dashboard-boot: the SPA booted from a keyless mock daemon in
+      #     headless Chromium over raw CDP (scripts/smoke-dashboard-boot.cjs)
+      #     — born advisory 2026-07-09 after a cross-fragment TDZ error
+      #     killed the SPA silently under all-green gates; PROMOTED into
+      #     the required gate 2026-07-11 on a 40/40-green soak record.
+      # Linux-only (the drivers are platform-agnostic protocol probes over
+      # Unix control sockets; a second platform duplicates coverage while
+      # doubling flake surface), and the Linux leg runs full on both
+      # pull_request and merge_group, so `runner.os == 'Linux'` +
+      # relevance is the whole gate here.
+
+      # peer-rig.py drives stop_session over a raw WebSocket. A venv
+      # sidesteps PEP 668 (externally-managed pythons reject bare pip
+      # installs); prepending its bin to GITHUB_PATH makes it the
+      # `python3` later steps get.
+      - name: Install python websockets (smokes)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyws"
+          "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
+          echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
+
+      # The real binaries for the smoke rigs — incremental on top of the
+      # test/e2e build above (same target dir, same profile): seconds,
+      # not a second build. Debug profile deliberately (the smokes probe
+      # protocol behavior, which the profile doesn't change).
+      - name: cargo build (smoke binaries)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo build -p intendant --bins --locked --target ${{ matrix.target }}
+
+      - name: session-vitals smoke
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: node tests/skills/session-vitals-smoke/driver.cjs "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
+
+      - name: native-goal smoke
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: node tests/skills/native-goal-smoke/driver.cjs "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
+
+      - name: peer-sessions smoke
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: |
+          export INTENDANT_BIN="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant"
+          python3 tests/skills/peer-sessions-smoke/peer-rig.py
+
+      # Idle keyless daemon for the dashboard-boot probe: mock provider
+      # (no API keys by construction), kernel-assigned port parsed from
+      # the Dashboard line, empty intendant.toml as the minimal project
+      # marker, isolated temp HOME.
+      - name: Launch keyless daemon (dashboard-boot)
+        id: daemon
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        shell: bash
+        run: |
+          rig="$RUNNER_TEMP/dashboard-boot"
+          rm -rf "$rig"
+          mkdir -p "$rig/home" "$rig/proj" "$rig/artifacts"
+          printf '{"profiles":[{"steps":[{"content":"ok"}]}]}' > "$rig/home/mock_script.json"
+          : > "$rig/proj/intendant.toml"
+          cd "$rig/proj"
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u MODEL_NAME \
+            HOME="$rig/home" PROVIDER=mock INTENDANT_MOCK_SCRIPT="$rig/home/mock_script.json" \
+            "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/${{ matrix.target }}/debug/intendant" --web 0 --bind 127.0.0.1 --no-tls \
+            > "$rig/daemon.log" 2>&1 &
+          pid=$!
+          echo "pid=$pid" >> "$GITHUB_OUTPUT"
+          echo "rig=$rig" >> "$GITHUB_OUTPUT"
+          port=""
+          for _ in $(seq 1 120); do
+            port=$(sed -nE 's#.*Dashboard: https?://127\.0\.0\.1:([0-9]+).*#\1#p' "$rig/daemon.log" | head -1)
+            [ -n "$port" ] && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::daemon exited during startup"
+              tail -n 40 "$rig/daemon.log"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if [ -z "$port" ]; then
+            echo "::error::daemon did not print its Dashboard URL within 60s"
+            tail -n 40 "$rig/daemon.log"
+            exit 1
+          fi
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          echo "daemon pid=$pid port=$port"
+
+      - name: dashboard-boot smoke
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: >
+          node scripts/smoke-dashboard-boot.cjs
+          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/"
+          --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
+
+      - name: Stop daemon (dashboard-boot)
+        if: always() && steps.daemon.outputs.pid != ''
+        shell: bash
+        run: kill "${{ steps.daemon.outputs.pid }}" 2>/dev/null || true
+
+      # Inline visibility first (the artifact needs a download), then the
+      # full daemon log + the smoke's screenshot/error dumps as artifacts.
+      - name: Daemon log tail (failure)
+        if: failure() && steps.daemon.outputs.rig != ''
+        shell: bash
+        run: tail -n 80 "${{ steps.daemon.outputs.rig }}/daemon.log" || true
+
+      - name: Upload failure artifacts (dashboard-boot)
+        if: failure() && steps.daemon.outputs.rig != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dashboard-boot-failure-${{ matrix.os }}
+          path: |
+            ${{ steps.daemon.outputs.rig }}/daemon.log
+            ${{ steps.daemon.outputs.rig }}/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
