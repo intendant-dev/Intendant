@@ -3451,10 +3451,13 @@ mod tests {
         // signed-org doorbell quartet), and the F5 peers/coordinator
         // family (registry list/add/remove, eligible, the quick
         // controls — message/task/approval, the three signal relays,
-        // the pairing set, and the coordinator route). The `api_transfer_*`
-        // methods join when their HTTP rows land (task #6, /api/transfers);
-        // adding or dropping an entry updates this list in the same change,
-        // deliberately. The F6 credential-custody family (api_credential_*,
+        // the pairing set, and the coordinator route), plus the
+        // `api_transfer_*` sextet riding the S9 /api/transfers rows
+        // (task #6 / F1c — the SPA feature-detects the rows with one
+        // GET probe before using the lane, so old daemons keep honest
+        // availability); adding or dropping an entry updates this list
+        // in the same change, deliberately. The F6 credential-custody
+        // family (api_credential_*,
         // api_daemon_vault_*) is deliberately NOT here and stays out:
         // custody is tunnel-scoped by design with no HTTP rows planned
         // (docs/src/credential-custody.md; the transport design parks
@@ -3469,6 +3472,12 @@ mod tests {
             "api_fs_write",
             "api_fs_rename",
             "api_fs_delete",
+            "api_transfer_jobs",
+            "api_transfer_job_create",
+            "api_transfer_upload_chunk",
+            "api_transfer_upload_commit",
+            "api_transfer_job_delete",
+            "api_transfer_download_read",
             "api_session_current_uploads",
             "api_session_current_upload",
             "api_session_current_upload_raw",
