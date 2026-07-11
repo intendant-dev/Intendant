@@ -202,10 +202,17 @@ them.
 `hooks/hook-lib.sh`) are wired through each runner root's `.env` —
 `ACTIONS_RUNNER_HOOK_JOB_STARTED=…` / `…_JOB_COMPLETED=…`, the
 documented runner mechanism; the runner reads `.env` at listener
-startup, so re-wiring needs a listener restart. Per invocation,
-bounded by a 60s self-timeout (a watchdog subshell reaps hung work —
-GitHub applies no timeout of its own, and a wedged started-hook would
-wedge the job):
+startup, so re-wiring needs a listener restart. Every invocation is
+**account-gated** before anything else: `run_hook` refuses (one log
+line, exit 0) unless `id -un` matches `INTENDANT_CI_HOOK_ACCOUNT`
+from the same `.env` (the migrate script wires it). The rules below
+are only safe inside the dedicated CI account — executed as anyone
+else they apply "everything here is CI residue" to a real user's
+session and daemon state, which is precisely the 2026-07-10 incident.
+Work is bounded by a 60s self-timeout — a foreground poll in the
+hook's own shell, deliberately not a detached timer subshell, which
+bash 3.2 leaked and later fired at recycled pids (GitHub applies no
+timeout of its own, and a wedged started-hook would wedge the job):
 
 - wipe `$RUNNER_TEMP` contents (per-runner, recreated every job);
 - reap stale (>24h) temp/test-home residue — `$TMPDIR` and
@@ -225,6 +232,24 @@ wedge the job):
 Never touched: `~/.cache/intendant-ci` (the watchdog owns the warm
 target caches), `~/.cargo`, `~/.rustup`.
 
+### sccache: one supervised server per account
+
+The account's `rustc-wrapper` clients rendezvous with ONE server on
+the account's port (4227; the operator's server keeps the 4226
+default). Never rely on in-job server spawning: cargo's `[env]` port
+does not reach every in-job sccache invocation (2026-07-10: the rustc
+version probe missed it), and a client racing a dying or job-reaped
+server reads a truncated response header — "failed to fill whole
+buffer", cargo exit 101 within seconds, every job on the listener red.
+Instead `setup-ci-account-macos.sh` installs
+`com.intendant.ci.sccache`, a launchd-supervised **foreground** server
+(`SCCACHE_NO_DAEMON`: a forked server dies with its launchd process
+group; `KeepAlive` revives crashes; idle timeout disabled), and the
+migrate script mirrors `SCCACHE_SERVER_PORT`/`SCCACHE_DIR` into each
+listener's `.env` so every job process agrees. The Linux runner
+accounts still use on-demand servers (a systemd twin of the daemon is
+listed under "Deliberately deferred").
+
 ### Watchdog interplay
 
 `fleet-watchdog.sh` understands both listener shapes at once —
@@ -243,9 +268,14 @@ before-images land in `/etc/intendant-ci/migration/` for audit.
 - **Windows host equivalent** of the hooks + migration ergonomics (the
   Windows runner already runs as a dedicated non-admin user; see the
   watchdog "Windows" note above).
-- **sccache cache custody**: the CI account's sccache cache lives in
-  its own `~/Library/Caches` under sccache's default 10G self-cap; the
-  watchdog does not manage it yet.
+- **sccache cache custody**: the CI account's sccache cache lives at
+  `~/.cache/sccache` (pinned by the supervised server's `SCCACHE_DIR`)
+  under sccache's default 10G self-cap; the watchdog does not manage
+  it yet.
+- **Linux twin of the supervised sccache server**: the Dell runner
+  accounts still spawn sccache servers on demand; port a systemd unit
+  of `com.intendant.ci.sccache` when the Linux hosts get the hooks
+  treatment.
 
 ## Interlocks
 
