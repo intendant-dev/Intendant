@@ -21,7 +21,7 @@
 //! 5. **Tunnel exposure** — a row's optional [`TunnelSpec`] declares its
 //!    dashboard-control datachannel twin. The tunnel's method table
 //!    (`dashboard_control::control_method_spec`) resolves these rows
-//!    first, then its residue `CONTROL_METHODS`, so a twinned method's
+//!    first, then its residue `CONTROL_ONLY_METHODS`, so a twinned method's
 //!    IAM operation derives from the same declaration HTTP gates on
 //!    (transport-unification design §2.2) instead of a second table that
 //!    can drift.
@@ -296,7 +296,7 @@ pub(crate) enum RouteHandlerId {
 
 /// Datachannel (dashboard-control tunnel) twin of a route row — the
 /// `tunnel:` column of the transport-unification design (§2.2). The wire
-/// method name is unchanged from its legacy `CONTROL_METHODS` entry: the
+/// method name is unchanged from its legacy `CONTROL_ONLY_METHODS` entry: the
 /// datachannel wire never changes; the name becomes an alias of this
 /// row. The IAM operation gating the tunnel method is **derived from the
 /// row** ([`Route::tunnel_operation`]) — declaring it once is the point
@@ -385,11 +385,10 @@ pub(crate) struct Route {
     /// One line, becomes the docs endpoint-table row. Required — an
     /// empty doc string fails the invariant test.
     pub(crate) doc: &'static str,
-    /// Datachannel exposure of this row. `None` = HTTP-only, or the
-    /// tunnel twin has not yet ported out of `CONTROL_METHODS` (the
-    /// transitional state the migration drains family by family; the
-    /// differential pin test in `dashboard_control` freezes which
-    /// methods live where).
+    /// Datachannel exposure of this row. `None` = HTTP-only. Methods
+    /// with no HTTP twin live in `CONTROL_ONLY_METHODS` instead (the
+    /// residue half of the tunnel method table; the differential pin
+    /// test in `dashboard_control` freezes which methods live where).
     pub(crate) tunnel: Option<TunnelSpec>,
 }
 
@@ -559,7 +558,7 @@ pub(crate) static ROUTES: &[Route] = &[
     //    trio is additionally pre-gated by peer_filesystem_query_request).
     //    First family carrying the tunnel column: the datachannel twins'
     //    IAM operations derive from these rows (their legacy
-    //    CONTROL_METHODS entries are gone).
+    //    CONTROL_ONLY_METHODS entries are gone).
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/fs/stat"),
@@ -1889,7 +1888,7 @@ pub(crate) fn classify(req_method: &str, req_path: &str) -> TableClassification 
 
 /// Every (route, tunnel spec) pair, in declaration order — the ROW half
 /// of the tunnel method partition. `dashboard_control` unions this with
-/// its residue `CONTROL_METHODS` (rows first) to build the effective
+/// its residue `CONTROL_ONLY_METHODS` (rows first) to build the effective
 /// method table; its differential pin test freezes exactly which methods
 /// live on which side.
 pub(crate) fn tunnel_specs() -> impl Iterator<Item = (&'static Route, &'static TunnelSpec)> {

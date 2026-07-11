@@ -427,7 +427,16 @@ fn cmd_requests() -> Result<(), CallerError> {
     }
     for request in requests {
         let caller = match request.requester_daemon_id.as_deref() {
-            Some(id) => format!("caller={}… (verified)", &id[..id.len().min(12)]),
+            // A stored tier claim only exists when it was signed inside
+            // the verified caller-ID (docs/src/trust-tiers.md § Where
+            // fleet metadata rides), so it always rides the verified arm.
+            Some(id) => match request.requester_tier.as_deref() {
+                Some(tier) => format!(
+                    "caller={}… (verified, says: {tier})",
+                    &id[..id.len().min(12)]
+                ),
+                None => format!("caller={}… (verified)", &id[..id.len().min(12)]),
+            },
             None => "caller=unverified".to_string(),
         };
         println!(
