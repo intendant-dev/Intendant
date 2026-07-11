@@ -82,35 +82,15 @@ pub(crate) async fn dashboard_media_session_handles(
     (session.frame_registry.clone(), session.query_ctx.clone())
 }
 
-pub(crate) async fn register_dashboard_media_frame(
-    registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
-    frame_id: &str,
-    stream: &str,
-    note: Option<String>,
-    bytes: &[u8],
-    log_label: &str,
-) -> (String, bool) {
-    let Some(registry) = registry else {
-        return (String::new(), false);
-    };
-    let meta = presence_core::FrameMeta {
-        frame_id: frame_id.to_string(),
-        stream: stream.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        sent_to_live: false,
-        live_resolution: None,
-        hq_resolution: None,
-        note,
-    };
-    let mut reg = registry.write().await;
-    match reg.register(meta, bytes) {
-        Ok(path) => (path.display().to_string(), true),
-        Err(e) => {
-            eprintln!("{log_label} frame registry write failed: {e}");
-            (String::new(), false)
-        }
-    }
-}
+// The media store core — frame registration, presence-video
+// register+record, annotation/clip context injection, and the clip
+// operation type — moved verbatim to web_gateway::media_store
+// (transport-unification S8): the /ws media twins commit through the
+// same fns; this module keeps the tunnel's upload-frame carriage and
+// response shapes.
+pub(crate) use crate::web_gateway::{
+    inject_annotation_context, inject_clip_context, register_dashboard_media_frame,
+};
 
 pub(crate) async fn api_presence_video_frame_upload_task_response(
     id: String,
@@ -145,6 +125,9 @@ pub(crate) async fn api_presence_video_frame_upload_task_response(
     )
 }
 
+/// Tunnel edge of the presence-video store op: read the registries off
+/// the shared session, then commit through the neutral store fn the
+/// `/ws` `video_frame` twin shares.
 pub(crate) async fn register_dashboard_presence_video_frame(
     runtime: &ControlRuntime,
     frame_id: &str,
@@ -155,124 +138,15 @@ pub(crate) async fn register_dashboard_presence_video_frame(
     let frame_registry = session.frame_registry.clone();
     let recording_registry = session.recording_registry.clone();
     drop(session);
-
-    let mut registered = false;
-    if let Some(registry) = frame_registry {
-        let meta = presence_core::FrameMeta {
-            frame_id: frame_id.to_string(),
-            stream: stream.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            sent_to_live: true,
-            live_resolution: Some("768x768".to_string()),
-            hq_resolution: None,
-            note: None,
-        };
-        let mut reg = registry.write().await;
-        match reg.register(meta, jpeg_bytes) {
-            Ok(_) => registered = true,
-            Err(e) => eprintln!("presence video frame registry write failed: {e}"),
-        }
-    }
-
-    let mut recorded = false;
-    if let Some(registry) = recording_registry {
-        let mut rec = registry.write().await;
-        if rec.is_enabled() {
-            if !rec.is_recording(stream) && crate::recording::is_ffmpeg_available() {
-                match rec.start_stream(stream).await {
-                    Ok(()) => {
-                        runtime.bus.send(AppEvent::RecordingStarted {
-                            stream_name: stream.to_string(),
-                        });
-                    }
-                    Err(e) => eprintln!("presence video recording start failed: {e}"),
-                }
-            }
-            if let Err(e) = rec.feed_frame(stream, jpeg_bytes).await {
-                eprintln!("presence video recording frame failed: {e}");
-            } else {
-                recorded = true;
-            }
-        }
-    }
-
-    (registered, recorded)
-}
-
-pub(crate) fn inject_annotation_context(
-    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
-    note: &str,
-    data_b64: String,
-) -> bool {
-    let Some(ctx) = query_ctx else {
-        return false;
-    };
-    let Some(ciq) = ctx.context_injection.as_ref() else {
-        return false;
-    };
-    let Ok(mut queue) = ciq.lock() else {
-        return false;
-    };
-    let label = if note.is_empty() {
-        "[User Annotation] User highlighted something on the screen.".to_string()
-    } else {
-        format!("[User Annotation] {note}")
-    };
-    queue.push(crate::event::ContextInjection {
-        text: label,
-        images: vec![crate::conversation::ImageData {
-            media_type: "image/jpeg".to_string(),
-            data: data_b64,
-        }],
-        source: crate::event::InjectionSource::User,
-        target_session_id: None,
-        steer_id: None,
-    });
-    true
-}
-
-pub(crate) fn inject_clip_context(
-    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
-    _clip_id: &str,
-    clip: &DashboardMediaClipOperation,
-) -> bool {
-    let Some(ctx) = query_ctx else {
-        return false;
-    };
-    let Some(ciq) = ctx.context_injection.as_ref() else {
-        return false;
-    };
-    let Ok(mut queue) = ciq.lock() else {
-        return false;
-    };
-    let frames_registered = clip.frames.len();
-    let label = if clip.note.is_empty() {
-        format!(
-            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps)",
-            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps,
-        )
-    } else {
-        format!(
-            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps). {}",
-            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps, clip.note,
-        )
-    };
-    let images = clip
-        .frames
-        .iter()
-        .map(|(_, data)| crate::conversation::ImageData {
-            media_type: "image/jpeg".to_string(),
-            data: data.clone(),
-        })
-        .collect();
-    queue.push(crate::event::ContextInjection {
-        text: label,
-        images,
-        source: crate::event::InjectionSource::User,
-        target_session_id: None,
-        steer_id: None,
-    });
-    true
+    crate::web_gateway::register_presence_video_frame(
+        frame_registry,
+        recording_registry,
+        &runtime.bus,
+        frame_id,
+        stream,
+        jpeg_bytes,
+    )
+    .await
 }
 
 pub(crate) async fn api_media_annotation_upload_task_response(

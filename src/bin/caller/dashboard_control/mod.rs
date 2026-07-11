@@ -1192,17 +1192,10 @@ pub(crate) struct ControlRuntime {
     state_root: PathBuf,
 }
 
-#[derive(Debug)]
-pub(crate) struct DashboardMediaClipOperation {
-    stream: String,
-    note: String,
-    inject: bool,
-    in_secs: f64,
-    out_secs: f64,
-    fps: u32,
-    expected_frames: usize,
-    frames: Vec<(String, String)>,
-}
+// The clip-operation type moved to web_gateway::media_store
+// (transport-unification S8): the /ws lane accumulates with the same
+// type the tunnel's media_clip_ops map stores.
+pub(crate) use crate::web_gateway::DashboardMediaClipOperation;
 
 pub(crate) enum ControlCommand {
     AddIceCandidate(String),
