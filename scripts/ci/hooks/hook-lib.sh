@@ -15,6 +15,15 @@
 #   4. log exactly one summary line to $LOG (rotated), and
 #   5. always exit 0, within HOOK_TIMEOUT_SECS.
 #
+# ALL of it is account-gated: run_hook refuses outright (one log line,
+# exit 0) unless `id -un` matches INTENDANT_CI_HOOK_ACCOUNT from the
+# runner's .env wiring. The payload's safety model is the account
+# boundary — reap_orphans treats every account process outside a live
+# runner tree as residue, and wipe_stale_test_home treats ~/.intendant
+# as fixture escape. Executed under any other account, those same rules
+# dismantle a real login session and delete real daemon state
+# (2026-07-10: a developer-account invocation did exactly that).
+#
 # Never touched: ~/.cache/intendant-ci (the warm external cargo target
 # caches — the fleet watchdog owns those), ~/.cargo, ~/.rustup.
 #
@@ -204,6 +213,17 @@ reap_orphans() {
 # breath.
 run_hook() {
     local phase="$1"
+    # Account gate — refuse anywhere but the dedicated CI account (see
+    # the header). The expected name comes from the runner wiring, not a
+    # hardcoded convention, so the same lib serves any fleet host; unset
+    # or mismatched means an inert janitor and a green job, never a
+    # payload run in the wrong account.
+    local account
+    account=$(id -un 2>/dev/null)
+    if [ -z "${INTENDANT_CI_HOOK_ACCOUNT:-}" ] || [ "$account" != "${INTENDANT_CI_HOOK_ACCOUNT}" ]; then
+        log_line "$phase REFUSED account=${account:-?} expected=${INTENDANT_CI_HOOK_ACCOUNT:-unset} (payload skipped)"
+        exit 0
+    fi
     rotate_log
     local t0 result_file work outcome detail="" waited=0
     t0=$(date +%s)

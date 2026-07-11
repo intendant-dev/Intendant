@@ -202,10 +202,17 @@ them.
 `hooks/hook-lib.sh`) are wired through each runner root's `.env` —
 `ACTIONS_RUNNER_HOOK_JOB_STARTED=…` / `…_JOB_COMPLETED=…`, the
 documented runner mechanism; the runner reads `.env` at listener
-startup, so re-wiring needs a listener restart. Per invocation,
-bounded by a 60s self-timeout (a watchdog subshell reaps hung work —
-GitHub applies no timeout of its own, and a wedged started-hook would
-wedge the job):
+startup, so re-wiring needs a listener restart. Every invocation is
+**account-gated** before anything else: `run_hook` refuses (one log
+line, exit 0) unless `id -un` matches `INTENDANT_CI_HOOK_ACCOUNT`
+from the same `.env` (the migrate script wires it). The rules below
+are only safe inside the dedicated CI account — executed as anyone
+else they apply "everything here is CI residue" to a real user's
+session and daemon state, which is precisely the 2026-07-10 incident.
+Work is bounded by a 60s self-timeout — a foreground poll in the
+hook's own shell, deliberately not a detached timer subshell, which
+bash 3.2 leaked and later fired at recycled pids (GitHub applies no
+timeout of its own, and a wedged started-hook would wedge the job):
 
 - wipe `$RUNNER_TEMP` contents (per-runner, recreated every job);
 - reap stale (>24h) temp/test-home residue — `$TMPDIR` and

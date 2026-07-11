@@ -230,6 +230,10 @@ set_env_kv() {
 }
 set_env_kv "$DEST/.env" ACTIONS_RUNNER_HOOK_JOB_STARTED "$LIB_DIR/hooks/job-started.sh"
 set_env_kv "$DEST/.env" ACTIONS_RUNNER_HOOK_JOB_COMPLETED "$LIB_DIR/hooks/job-completed.sh"
+# The hooks' account gate: hook-lib.sh refuses to run its payload unless
+# `id -un` matches this — the reaper/wipe rules are only safe inside the
+# dedicated CI account.
+set_env_kv "$DEST/.env" INTENDANT_CI_HOOK_ACCOUNT "$CI_ACCOUNT"
 chown "$CI_ACCOUNT:$CI_GROUP" "$DEST/.env"
 echo "wired job hooks into .env"
 
