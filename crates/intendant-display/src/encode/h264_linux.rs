@@ -287,8 +287,8 @@ impl FfmpegH264Encoder {
             Err(e) => return Err(format!("ffmpeg wait: {e}")),
         }
 
-        let uv_w = ((width + 1) / 2) as usize;
-        let uv_h = ((height + 1) / 2) as usize;
+        let uv_w = width.div_ceil(2) as usize;
+        let uv_h = height.div_ceil(2) as usize;
         let frame_size = (width as usize * height as usize) + 2 * (uv_w * uv_h);
 
         // Spawn a dedicated reader thread that reads ffmpeg stdout in
@@ -504,11 +504,8 @@ impl Encoder for FfmpegH264Encoder {
             .iter()
             .any(|n| n.nal_type == 1 || n.nal_type == 5);
 
-        loop {
-            let nal = match self.nal_rx.try_recv() {
-                Ok(n) => n,
-                Err(_) => break, // no more NALs right now
-            };
+        // Drain until the channel is empty (`Err` = no more NALs right now).
+        while let Ok(nal) = self.nal_rx.try_recv() {
             // Cache parameter sets as they flow through. libx264 emits
             // SPS+PPS at stream start (and on encoder resets), so the
             // cache populates on the first complete IDR access unit and
@@ -591,8 +588,8 @@ impl Drop for FfmpegH264Encoder {
 /// `GOP_PERIOD_FRAMES` frames. At the 30 fps feed rate, 60 frames is a
 /// keyframe every ~2 s — short enough that a fresh peer or a
 /// post-loss-burst decoder recovers promptly, long enough that periodic
-/// IDRs don't dominate the bitrate. Combined with the quarter-resolution
-/// + capped-bitrate federated layer (`encode/pool/types.rs`), each such IDR is
+/// IDRs don't dominate the bitrate. Combined with the quarter-resolution +
+/// capped-bitrate federated layer (`encode/pool/types.rs`), each such IDR is
 /// only a handful of RTP packets, so it survives the lossy relay it has
 /// to cross. Replaces the earlier intra-refresh experiment, which left a
 /// desynced decoder with no clean recovery point (Linux ffmpeg ignores
@@ -840,16 +837,10 @@ fn nal_reader_thread(
         // A NAL is complete when we find the *next* start code after it.
         // Any data before the first start code is discarded (shouldn't
         // happen in practice with ffmpeg, but defensive).
-        loop {
-            // Find the first start code in buf.
-            let first = match find_start_code(&buf, 0) {
-                Some(pos) => pos,
-                None => {
-                    // No start code at all -- keep buffering.
-                    break;
-                }
-            };
-
+        //
+        // Find the first start code in buf; no start code at all means
+        // keep buffering.
+        while let Some(first) = find_start_code(&buf, 0) {
             // Discard any bytes before the first start code.
             if first.offset > 0 {
                 buf.drain(..first.offset);
@@ -1495,8 +1486,8 @@ mod tests {
             Ok(e) => e,
             Err(e) => panic!("no H.264 encoder available on this host: {e}"),
         };
-        let uv_w = ((w + 1) / 2) as usize;
-        let uv_h = ((h + 1) / 2) as usize;
+        let uv_w = w.div_ceil(2) as usize;
+        let uv_h = h.div_ceil(2) as usize;
         let frame_size = (w as usize * h as usize) + 2 * (uv_w * uv_h);
 
         let mut keyframes = 0usize;

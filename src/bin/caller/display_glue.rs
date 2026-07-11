@@ -990,7 +990,7 @@ pub(crate) fn frame_has_visible_rgb(frame: &display::Frame) -> bool {
     for y in 0..frame.height as usize {
         let row = y * stride;
         for x in 0..frame.width as usize {
-            if pixel_index % step == 0 {
+            if pixel_index.is_multiple_of(step) {
                 let px = row + x * 4;
                 if frame.data[px] > 3 || frame.data[px + 1] > 3 || frame.data[px + 2] > 3 {
                     return true;
@@ -1051,13 +1051,14 @@ pub(crate) fn detect_wayland_socket() -> Option<String> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Match "wayland-0", "wayland-1", etc. but not ".lock" files
-        if name.starts_with("wayland-") && !name.ends_with(".lock") {
-            if entry.file_type().ok().is_some_and(|ft| {
+        if name.starts_with("wayland-")
+            && !name.ends_with(".lock")
+            && entry.file_type().ok().is_some_and(|ft| {
                 use std::os::unix::fs::FileTypeExt;
                 ft.is_socket() || ft.is_file()
-            }) {
-                return Some(name.to_string());
-            }
+            })
+        {
+            return Some(name.to_string());
         }
     }
     None

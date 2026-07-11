@@ -151,7 +151,7 @@ fn parse_xrandr_output(text: &str) -> Vec<super::DisplayInfo> {
         }
 
         let output_name = parts[0];
-        let is_primary = parts.iter().any(|p| *p == "primary");
+        let is_primary = parts.contains(&"primary");
 
         // Find the resolution+offset token: "WxH+X+Y".
         let mode_token = parts.iter().find(|p| {
@@ -370,6 +370,7 @@ fn x11_button_from_browser(b: u8) -> u8 {
 ///
 /// Connects to the X server, sets up XShm (or falls back to XGetImage),
 /// and loops at the target framerate sending frames via `try_send()`.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_x11_capture(
     display_str: String,
     tx: mpsc::Sender<Frame>,
@@ -459,6 +460,7 @@ fn query_root_geometry(conn: &impl x11rb::connection::Connection, root: u32) -> 
 }
 
 /// XShm-based capture loop.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_shm_capture(
     conn: &impl x11rb::connection::Connection,
     root: u32,
@@ -542,7 +544,7 @@ fn run_shm_capture(
         let start = std::time::Instant::now();
 
         // Periodically check for root window resize (e.g. xrandr change).
-        if frame_count > 0 && frame_count % GEOMETRY_CHECK_INTERVAL == 0 {
+        if frame_count > 0 && frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
             if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
                 if new_w != width || new_h != height {
                     eprintln!(
@@ -623,7 +625,7 @@ fn run_shm_capture(
                 };
 
                 frame_count += 1;
-                if frame_count == 1 || frame_count % 300 == 0 {
+                if frame_count == 1 || frame_count.is_multiple_of(300) {
                     eprintln!(
                         "[display/x11] shm frame #{} {}x{} stride={} size={}B depth={}",
                         frame_count, width, height, stride, data_len, reply.depth
@@ -656,6 +658,7 @@ fn run_shm_capture(
 }
 
 /// Fallback XGetImage-based capture loop (no shared memory).
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_getimage_capture(
     conn: &impl x11rb::connection::Connection,
     root: u32,
@@ -685,7 +688,7 @@ fn run_getimage_capture(
         let start = std::time::Instant::now();
 
         // Periodically check for root window resize.
-        if frame_count > 0 && frame_count % GEOMETRY_CHECK_INTERVAL == 0 {
+        if frame_count > 0 && frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
             if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
                 if new_w != width || new_h != height {
                     eprintln!(
@@ -742,7 +745,7 @@ fn run_getimage_capture(
                 };
 
                 frame_count += 1;
-                if frame_count == 1 || frame_count % 300 == 0 {
+                if frame_count == 1 || frame_count.is_multiple_of(300) {
                     eprintln!(
                         "[display/x11] getimage frame #{} {}x{} stride={} size={}B",
                         frame_count,

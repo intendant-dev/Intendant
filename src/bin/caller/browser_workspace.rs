@@ -16,7 +16,10 @@ static GLOBAL_BROWSER_WORKSPACES: OnceLock<SharedBrowserWorkspaceRegistry> = Onc
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_EXECUTABLE";
 const LEGACY_BROWSER_EXECUTABLE_ENV: &str = "INTENDANT_BROWSER_EXECUTABLE";
+// macOS-only system-browser escape hatch; other platforms' discovery path never consults it.
+#[cfg(target_os = "macos")]
 const ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER";
+#[cfg(target_os = "macos")]
 const LEGACY_ALLOW_SYSTEM_BROWSER_ENV: &str = "INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_CHROME";
 const CHROME_FOR_TESTING_DOWNLOADS_URL: &str =
     "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
@@ -909,10 +912,13 @@ fn configured_browser_executable() -> Option<(&'static str, PathBuf)> {
     None
 }
 
+// macOS-only system-browser escape hatch; other platforms' discovery path never consults it.
+#[cfg(target_os = "macos")]
 fn allow_system_browser() -> bool {
     env_truthy(ALLOW_SYSTEM_BROWSER_ENV) || env_truthy(LEGACY_ALLOW_SYSTEM_BROWSER_ENV)
 }
 
+#[cfg(target_os = "macos")]
 fn env_truthy(env_name: &str) -> bool {
     std::env::var(env_name)
         .ok()
@@ -920,6 +926,8 @@ fn env_truthy(env_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// Also compiled under `test`: the truthy-vocabulary unit test pins it on every platform.
+#[cfg(any(target_os = "macos", test))]
 fn env_value_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
