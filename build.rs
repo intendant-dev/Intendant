@@ -191,7 +191,27 @@ impl WasmCrate {
             // `-Wl,-rpath,/usr/lib/swift` from .cargo/config.toml break
             // rust-lld. Scrub them so the inner build resolves flags fresh.
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("RUSTFLAGS")
+            // Then set exactly the canonical artifact flags — keep in
+            // LOCKSTEP with scripts/build-wasm.sh (the CI drift gate
+            // rebuilds through that script and byte-diffs the result, so
+            // any divergence here fails the gate rather than shipping):
+            // dependency panic-locations embed the building account's
+            // cargo registry path; remapping it is what makes artifact
+            // bytes account-independent.
+            .env("RUSTFLAGS", {
+                let cargo_home = std::env::var_os("CARGO_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+                    })
+                    .unwrap_or_else(|| std::path::PathBuf::from(".cargo"));
+                format!(
+                    "--remap-path-prefix {}=/cargo/registry/src",
+                    cargo_home.join("registry").join("src").display()
+                )
+            })
             .env("CARGO_TARGET_DIR", &wasm_target_abs)
             .status();
 

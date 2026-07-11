@@ -115,12 +115,16 @@ jobs:
           fi
           wasm-pack --version
 
+      # Through the canonical builder so the gate's flags can never
+      # drift from the producers' (scripts/build-wasm.sh carries the
+      # registry-path remap that makes artifact bytes
+      # account-independent — without it, dependency panic-locations
+      # embed the building account's cargo registry path and the CI
+      # account's rebuild can never byte-match dev-built artifacts).
       - name: Rebuild WASM artifacts
         if: steps.relevance.outputs.relevant == 'true'
         shell: bash
-        run: |
-          (cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web)
-          (cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web)
+        run: bash scripts/build-wasm.sh
 
       - name: Committed artifacts must match the rebuild
         if: steps.relevance.outputs.relevant == 'true'
