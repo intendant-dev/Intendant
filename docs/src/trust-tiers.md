@@ -232,11 +232,13 @@ stated non-goal:
   *serving* channel the evidence leg is shipped: served-artifact
   manifests live in the rendezvous's public transparency log, verified
   out of band by `hosted-verify` and advisorily by every daemon's
-  bundle tripwire. The *release* channel is thinner: app builds ship as
-  GitHub releases (public source, public workflow runs, and — once
-  signing is provisioned — Developer ID + notarization), but release
-  artifacts are not yet committed to the same transparency log. That
-  tie is the remaining open thread here.
+  bundle tripwire. The *release* channel now carries the same tie: app
+  builds ship as GitHub releases (public source, public workflow runs,
+  and — once signing is provisioned — Developer ID + notarization),
+  the release pipeline commits every artifact's hash to the same log
+  (`release_manifest` entries), `hosted-verify --releases` checks the
+  log against GitHub out of band, and the app's update check surfaces
+  logged / not-logged as a fail-open advisory.
 - **Lookalike names.** `d-<hash>` labels are deliberately opaque, which
   also means humans cannot eyeball them; a phished lookalike with its own
   valid certificate raises no CT alarm on *your* name, because it is not
