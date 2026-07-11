@@ -390,15 +390,17 @@ impl Route {
 
     /// The IAM operation this row's tunnel twin gates on: the documented
     /// override when declared, otherwise the row's own
-    /// [`RouteAuthz::Operation`]. `None` means no fail-closed derivation
-    /// exists (a non-`Operation` row without an override): the tunnel
-    /// method table skips such a row entirely, so the authorizer's
-    /// unknown-method deny is the runtime backstop, and the
+    /// [`RouteAuthz::Operation`] — or, for `PeerFederation` rows, the
+    /// `federation_http_operation` ladder applied to the row's
+    /// [`Route::canonical_leaf`] (design §2.2 / S7): the same source the
+    /// HTTP gate consults classifies the twin, so the two transports
+    /// cannot drift. `None` means no fail-closed derivation exists (a
+    /// Public/McpToken row without an override; a federation row whose
+    /// leaf the ladder does not classify): the tunnel method table skips
+    /// such a row entirely, so the authorizer's unknown-method deny is
+    /// the runtime backstop, and the
     /// `tunnel_specs_are_unique_and_derive_operations_fail_closed`
-    /// invariant test keeps the state unlandable. `PeerFederation` rows
-    /// will derive from `federation_http_operation` on the row's
-    /// canonical leaf when the peers family ports (design §2.2 / S7);
-    /// until then they too must declare an override to carry a tunnel.
+    /// invariant test keeps the state unlandable.
     pub(crate) fn tunnel_operation(&self) -> Option<PeerOperation> {
         let spec = self.tunnel.as_ref()?;
         if let Some((op, _reason)) = spec.op_override {
@@ -406,8 +408,49 @@ impl Route {
         }
         match self.authz {
             RouteAuthz::Operation(op) => Some(op),
-            RouteAuthz::Public | RouteAuthz::McpToken | RouteAuthz::PeerFederation => None,
+            RouteAuthz::PeerFederation => {
+                let (verb, path) = self.canonical_leaf()?;
+                crate::peer::access_policy::federation_http_operation(verb, &path)
+            }
+            RouteAuthz::Public | RouteAuthz::McpToken => None,
         }
+    }
+
+    /// The single (verb, path) leaf this row canonically declares —
+    /// captures render as `{name}` placeholders, which the federation
+    /// ladder treats like any non-empty segment. `None` for shapes with
+    /// no single leaf (method-`Any` rows, `Under` subtrees, `OneOf`
+    /// segments): a federation row of those shapes cannot carry a
+    /// ladder-derived tunnel twin (fail-closed; the invariant test
+    /// rejects the combination).
+    fn canonical_leaf(&self) -> Option<(&'static str, String)> {
+        let verb = match self.method {
+            RouteMethod::Get => "GET",
+            RouteMethod::Post => "POST",
+            RouteMethod::Delete => "DELETE",
+            RouteMethod::Any => return None,
+        };
+        let path = match self.pattern {
+            PathPattern::Exact(base) => base.to_string(),
+            PathPattern::Under(_) => return None,
+            PathPattern::Segments(base, specs) => {
+                let mut out = base.to_string();
+                for spec in specs {
+                    out.push('/');
+                    match spec {
+                        SegmentSpec::Capture(name) => {
+                            out.push('{');
+                            out.push_str(name);
+                            out.push('}');
+                        }
+                        SegmentSpec::Literal(literal) => out.push_str(literal),
+                        SegmentSpec::OneOf(_) => return None,
+                    }
+                }
+                out
+            }
+        };
+        Some((verb, path))
     }
 }
 
@@ -1355,26 +1398,269 @@ pub(crate) static ROUTES: &[Route] = &[
     )
     .with_tunnel(tunnel_method("api_dashboard_targets")),
     // ── Federation surface: registry, pairing, quick controls,
-    //    capability routing. The peers sub-router keeps its method-`Any`
-    //    catch-all row on purpose: IAM already classifies per leaf through
-    //    federation_http_operation (see RouteAuthz::PeerFederation), the
-    //    handler routes methods per leaf internally, and unknown subpaths
-    //    get its JSON 404 — per-leaf rows would either drop garbage to the
-    //    SPA-shell fallback or need a catch-all that neuters them.
+    //    capability routing. Carved per-leaf rows (S7) declare each
+    //    leaf's datachannel twin — the twin's IAM operation derives from
+    //    federation_http_operation on the row's canonical leaf, the same
+    //    ladder the HTTP gate consults — while every row shares the one
+    //    sub-router handler and the same BodyPolicy the legacy catch-all
+    //    carried, so dispatch behavior is unchanged row by row. The
+    //    method-`Any` catch-all row stays LAST on purpose: unknown
+    //    subpaths and undeclared methods keep the handler's JSON 404/405
+    //    shapes instead of dropping to the SPA-shell fallback (per-leaf
+    //    rows alone would either lose that or need a catch-all that
+    //    neuters them — this carve keeps both).
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[SegmentSpec::Literal("pairing"), SegmentSpec::Literal("invite")],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Issue a peer-scoped mTLS pairing invite",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_invite")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("request-access"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Start an outgoing access request against a remote daemon's doorbell",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_request_access")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("request-access"),
+                SegmentSpec::Literal("poll"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Poll an outgoing access request (installs the approved identity)",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_request_access_poll")),
+    federation_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("requests"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "List pending/decided peer access requests",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_requests")),
+    federation_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("identities"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "List approved/revoked peer identities",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_identities")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("identities"),
+                SegmentSpec::Literal("revoke"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Revoke a peer identity",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_identity_revoke")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Literal("pairing"),
+                SegmentSpec::Literal("requests"),
+                SegmentSpec::Capture("code"),
+                SegmentSpec::Capture("decision"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Decide a pending access request (approve or deny)",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_request_decision")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[SegmentSpec::Literal("pairing"), SegmentSpec::Literal("join")],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Import a pairing invite and register the peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_pairing_join")),
+    federation_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/peers"),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "List registered peers (snapshots)",
+    )
+    .with_tunnel(tunnel_method("api_peers")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/peers"),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Add a peer by card URL (optionally persisted)",
+    )
+    .with_tunnel(tunnel_method("api_peer_add")),
+    federation_route(
+        RouteMethod::Delete,
+        PathPattern::Exact("/api/peers"),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Remove a registered peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_remove")),
+    federation_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/peers/eligible"),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "List connected peers satisfying every ?capability= filter",
+    )
+    .with_tunnel(tunnel_method("api_peer_eligible")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("message"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Send a message to a connected peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_message")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[SegmentSpec::Capture("peer_id"), SegmentSpec::Literal("task")],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Delegate a task to a connected peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_task")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("approval"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Resolve a peer-forwarded approval request",
+    )
+    .with_tunnel(tunnel_method("api_peer_approval")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("webrtc"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Relay display WebRTC signaling to a connected peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_webrtc_signal")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("file-transfer-webrtc"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Relay file-transfer WebRTC signaling to a connected peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_file_transfer_signal")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("dashboard-control-webrtc"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Relay dashboard-control WebRTC signaling to a connected peer",
+    )
+    .with_tunnel(tunnel_method("api_peer_dashboard_control_signal")),
     federation_route(
         RouteMethod::Any,
         PathPattern::Under("/api/peers"),
         BodyPolicy::Default,
         RouteHandlerId::PeersSubRouter,
-        "Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays",
+        "Peers sub-router catch-all (handler-owned JSON 404/405 for unknown subpaths and undeclared methods)",
     ),
+    // The coordinator twin carries a documented op override: the ladder
+    // classifies POST /api/coordinator/* as Task (a federated peer
+    // routing work here needs task authority), while the tunnel method
+    // has always gated on PeerManage for dashboard sessions. The
+    // override preserves both historical mappings exactly — see the
+    // enumeration test — pending an owner decision on unifying them.
     federation_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/coordinator/route"),
         BodyPolicy::Default,
         RouteHandlerId::CoordinatorRoute,
         "Capability-based task routing through the Coordinator",
-    ),
+    )
+    .with_tunnel(tunnel_method_with_op(
+        "api_coordinator_route",
+        PeerOperation::PeerManage,
+        "historical per-lane divergence, preserved: the federation ladder \
+         classifies POST /api/coordinator/* as Task for the HTTP lane, but \
+         the datachannel method has always required PeerManage of a \
+         dashboard session — re-gating either lane is an owner decision, \
+         not a migration rider",
+    )),
     // ── MCP Streamable HTTP (token-bound inside the handler; the
     //    per-tool IAM gate lives in the MCP layer).
     Route {
@@ -1817,6 +2103,7 @@ mod tests {
             RouteHandlerId::AccessOrgApplyRenew,
             RouteHandlerId::AccessOrgManage,
             RouteHandlerId::AccessTierSettings,
+            RouteHandlerId::PeersSubRouter,
             RouteHandlerId::McpStream,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();
@@ -2153,10 +2440,14 @@ mod tests {
     /// The op-override slot is a closed, documented enumeration (design
     /// §2.7 / risk R2): every override names its reason, and this test
     /// pins the exact set so a tunnel/HTTP divergence can only ever be
-    /// added deliberately. The occupants are the signed-org doorbell
-    /// twins (S6): Public rows on HTTP — the signed document/list is
-    /// the authorization — while the tunnel methods deliberately gate
-    /// on a bound session's operation.
+    /// added deliberately. The occupants: the signed-org doorbell twins
+    /// (S6) — Public rows on HTTP (the signed document/list is the
+    /// authorization) while the tunnel methods deliberately gate on a
+    /// bound session's operation — and the coordinator twin (S7), whose
+    /// historical PeerManage gate diverges from the federation ladder's
+    /// Task classification; the override preserves both lanes' historical
+    /// mappings verbatim (see
+    /// `peers_family_tunnel_ops_assert_against_the_federation_ladder`).
     #[test]
     fn tunnel_op_overrides_are_a_closed_documented_enumeration() {
         let documented: &[&str] = &[
@@ -2164,6 +2455,7 @@ mod tests {
             "api_access_org_orl_apply",
             "api_access_org_present",
             "api_access_org_renew",
+            "api_coordinator_route",
         ];
         let mut actual: Vec<&str> = Vec::new();
         for (_, spec) in tunnel_specs() {
@@ -2181,6 +2473,127 @@ mod tests {
             actual, documented,
             "tunnel op overrides drifted from the documented divergence set",
         );
+    }
+
+    /// The peers family's federation-op assertions (design §2.2 / S7):
+    /// each twinned method's IAM operation is no longer a free-floating
+    /// declaration — it derives from `federation_http_operation` on the
+    /// row's canonical leaf, and this test asserts, per method, that
+    /// (a) the ladder classifies the canonical leaf exactly as the
+    /// method's historical tunnel operation, (b) the row derivation
+    /// reproduces it, and (c) the canonical leaf really is served by
+    /// this row (first match), so the leaf a twin is derived from can
+    /// never silently belong to a different row. The coordinator twin
+    /// is the documented exception: the ladder says Task, the tunnel
+    /// stays PeerManage via its pinned override.
+    #[test]
+    fn peers_family_tunnel_ops_assert_against_the_federation_ladder() {
+        use crate::peer::access_policy::{federation_http_operation, PeerOperation as Op};
+        let expected: &[(&str, &str, &str, Op)] = &[
+            ("api_peer_pairing_invite", "POST", "/api/peers/pairing/invite", Op::AccessManage),
+            (
+                "api_peer_pairing_request_access",
+                "POST",
+                "/api/peers/pairing/request-access",
+                Op::PeerManage,
+            ),
+            (
+                "api_peer_pairing_request_access_poll",
+                "POST",
+                "/api/peers/pairing/request-access/poll",
+                Op::PeerManage,
+            ),
+            (
+                "api_peer_pairing_requests",
+                "GET",
+                "/api/peers/pairing/requests",
+                Op::AccessInspect,
+            ),
+            (
+                "api_peer_pairing_identities",
+                "GET",
+                "/api/peers/pairing/identities",
+                Op::AccessInspect,
+            ),
+            (
+                "api_peer_pairing_identity_revoke",
+                "POST",
+                "/api/peers/pairing/identities/revoke",
+                Op::AccessManage,
+            ),
+            (
+                "api_peer_pairing_request_decision",
+                "POST",
+                "/api/peers/pairing/requests/{code}/{decision}",
+                Op::AccessManage,
+            ),
+            ("api_peer_pairing_join", "POST", "/api/peers/pairing/join", Op::PeerManage),
+            ("api_peers", "GET", "/api/peers", Op::PeerInspect),
+            ("api_peer_add", "POST", "/api/peers", Op::PeerManage),
+            ("api_peer_remove", "DELETE", "/api/peers", Op::PeerManage),
+            ("api_peer_eligible", "GET", "/api/peers/eligible", Op::PeerInspect),
+            ("api_peer_message", "POST", "/api/peers/{peer_id}/message", Op::PeerUse),
+            ("api_peer_task", "POST", "/api/peers/{peer_id}/task", Op::PeerUse),
+            ("api_peer_approval", "POST", "/api/peers/{peer_id}/approval", Op::PeerUse),
+            ("api_peer_webrtc_signal", "POST", "/api/peers/{peer_id}/webrtc", Op::PeerUse),
+            (
+                "api_peer_file_transfer_signal",
+                "POST",
+                "/api/peers/{peer_id}/file-transfer-webrtc",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_dashboard_control_signal",
+                "POST",
+                "/api/peers/{peer_id}/dashboard-control-webrtc",
+                Op::PeerUse,
+            ),
+        ];
+        for (name, verb, leaf, op) in expected {
+            // (a) The ladder classifies the canonical leaf as the
+            // method's historical operation.
+            assert_eq!(
+                federation_http_operation(verb, leaf),
+                Some(*op),
+                "{name}: the federation ladder no longer classifies {verb} {leaf} as {op:?}",
+            );
+            let (route, _) = tunnel_specs()
+                .find(|(_, spec)| spec.name == *name)
+                .unwrap_or_else(|| panic!("{name} must be declared as a tunnel column"));
+            // (b) The row derivation reproduces the ladder's answer.
+            assert_eq!(
+                route.tunnel_operation(),
+                Some(*op),
+                "{name}: row derivation disagrees with the ladder",
+            );
+            assert_eq!(
+                route.canonical_leaf(),
+                Some((*verb, (*leaf).to_string())),
+                "{name}: the row's canonical leaf drifted",
+            );
+            // (c) The canonical leaf is served by this very row.
+            let (matched, _) = match_route(verb, leaf)
+                .unwrap_or_else(|| panic!("{name}: no route matches {verb} {leaf}"));
+            assert!(
+                std::ptr::eq(matched, route),
+                "{name}: {verb} {leaf} is served by a different row than the one \
+                 declaring the twin",
+            );
+            assert_eq!(matched.handler, RouteHandlerId::PeersSubRouter, "{name}");
+        }
+        // The one deliberate exception, pinned from both directions: the
+        // HTTP lane classifies coordinator routing as Task, the tunnel
+        // twin keeps its historical PeerManage through the documented
+        // override (the enumeration test above pins the override set).
+        assert_eq!(
+            federation_http_operation("POST", "/api/coordinator/route"),
+            Some(Op::Task),
+        );
+        let (route, spec) = tunnel_specs()
+            .find(|(_, spec)| spec.name == "api_coordinator_route")
+            .expect("coordinator twin declared");
+        assert!(spec.op_override.is_some(), "coordinator override present");
+        assert_eq!(route.tunnel_operation(), Some(Op::PeerManage));
     }
 
     /// The docs chapter's generated endpoint table must equal the one

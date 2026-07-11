@@ -193,39 +193,16 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // live as tunnel columns on their PUBLIC route rows with documented
     // op overrides — session-gated on the tunnel by design (S6; the
     // override enumeration test in gateway_routes pins the set).
-    method("api_peer_pairing_requests", PeerOperation::AccessInspect),
-    method("api_peer_pairing_identities", PeerOperation::AccessInspect),
-    method(
-        "api_peer_pairing_request_decision",
-        PeerOperation::AccessManage,
-    ),
-    method(
-        "api_peer_pairing_identity_revoke",
-        PeerOperation::AccessManage,
-    ),
-    method("api_peer_pairing_invite", PeerOperation::AccessManage),
-    method("api_peers", PeerOperation::PeerInspect),
-    method("api_peer_eligible", PeerOperation::PeerInspect),
-    // Acting through a connected peer — signaling relays that open tunnels,
-    // and the message/task/approval quick controls — is peer use, not peer
-    // administration: the receiving peer authorizes each action against its
-    // own grants for this daemon. Mirrors the HTTP lane's
-    // `federation_http_operation`.
-    method("api_peer_webrtc_signal", PeerOperation::PeerUse),
-    method("api_peer_file_transfer_signal", PeerOperation::PeerUse),
-    method("api_peer_dashboard_control_signal", PeerOperation::PeerUse),
-    method("api_peer_message", PeerOperation::PeerUse),
-    method("api_peer_task", PeerOperation::PeerUse),
-    method("api_peer_approval", PeerOperation::PeerUse),
-    method("api_peer_add", PeerOperation::PeerManage),
-    method("api_peer_remove", PeerOperation::PeerManage),
-    method("api_peer_pairing_join", PeerOperation::PeerManage),
-    method("api_peer_pairing_request_access", PeerOperation::PeerManage),
-    method(
-        "api_peer_pairing_request_access_poll",
-        PeerOperation::PeerManage,
-    ),
-    method("api_coordinator_route", PeerOperation::PeerManage),
+    // The peers/coordinator federation family (registry, eligibility,
+    // pairing, quick controls, signaling relays, coordinator routing)
+    // lives as tunnel columns on its carved per-leaf route rows (S7):
+    // each twin's IAM operation derives from federation_http_operation
+    // on its row's canonical leaf — acting through a connected peer
+    // (quick controls + signaling relays) classifies as peer use, not
+    // peer administration, exactly as the HTTP gate has always ruled.
+    // api_coordinator_route carries the family's one documented op
+    // override (PeerManage; the ladder says Task) — see the closed
+    // enumeration in gateway_routes.
     // The sessions read-core methods (api_sessions, api_sessions_search,
     // api_session_detail, api_session_agent_output,
     // api_session_context_snapshot) live as tunnel columns on their
@@ -3135,53 +3112,56 @@ mod tests {
             ("api_access_org_orl", Row, Some(Op::AccessInspect)),
             ("api_access_org_renew", Row, Some(Op::AccessInspect)),
             ("api_access_org_orl_apply", Row, Some(Op::PresenceRead)),
-            (
-                "api_peer_pairing_requests",
-                Residue,
-                Some(Op::AccessInspect),
-            ),
+            // The peers/coordinator family flipped Residue → Row in S7
+            // with every operation unchanged (the no-re-gating proof);
+            // the ops now derive from federation_http_operation on each
+            // row's canonical leaf, asserted per method by
+            // gateway_routes::peers_family_tunnel_ops_assert_against_the_federation_ladder.
+            ("api_peer_pairing_requests", Row, Some(Op::AccessInspect)),
             (
                 "api_peer_pairing_identities",
-                Residue,
+                Row,
                 Some(Op::AccessInspect),
             ),
             (
                 "api_peer_pairing_request_decision",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_peer_pairing_identity_revoke",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_peer_pairing_invite", Residue, Some(Op::AccessManage)),
-            ("api_peers", Residue, Some(Op::PeerInspect)),
-            ("api_peer_eligible", Residue, Some(Op::PeerInspect)),
-            ("api_peer_webrtc_signal", Residue, Some(Op::PeerUse)),
-            ("api_peer_file_transfer_signal", Residue, Some(Op::PeerUse)),
+            ("api_peer_pairing_invite", Row, Some(Op::AccessManage)),
+            ("api_peers", Row, Some(Op::PeerInspect)),
+            ("api_peer_eligible", Row, Some(Op::PeerInspect)),
+            ("api_peer_webrtc_signal", Row, Some(Op::PeerUse)),
+            ("api_peer_file_transfer_signal", Row, Some(Op::PeerUse)),
             (
                 "api_peer_dashboard_control_signal",
-                Residue,
+                Row,
                 Some(Op::PeerUse),
             ),
-            ("api_peer_message", Residue, Some(Op::PeerUse)),
-            ("api_peer_task", Residue, Some(Op::PeerUse)),
-            ("api_peer_approval", Residue, Some(Op::PeerUse)),
-            ("api_peer_add", Residue, Some(Op::PeerManage)),
-            ("api_peer_remove", Residue, Some(Op::PeerManage)),
-            ("api_peer_pairing_join", Residue, Some(Op::PeerManage)),
+            ("api_peer_message", Row, Some(Op::PeerUse)),
+            ("api_peer_task", Row, Some(Op::PeerUse)),
+            ("api_peer_approval", Row, Some(Op::PeerUse)),
+            ("api_peer_add", Row, Some(Op::PeerManage)),
+            ("api_peer_remove", Row, Some(Op::PeerManage)),
+            ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
             (
                 "api_peer_pairing_request_access",
-                Residue,
+                Row,
                 Some(Op::PeerManage),
             ),
             (
                 "api_peer_pairing_request_access_poll",
-                Residue,
+                Row,
                 Some(Op::PeerManage),
             ),
-            ("api_coordinator_route", Residue, Some(Op::PeerManage)),
+            // The coordinator's PeerManage rides its documented op
+            // override (the ladder classifies the HTTP leaf as Task).
+            ("api_coordinator_route", Row, Some(Op::PeerManage)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
             ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),

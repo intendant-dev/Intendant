@@ -2061,7 +2061,25 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
 | POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
-| any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
+| POST | `/api/peers/pairing/invite` | federation (per method/path) | own origin | bounded | Issue a peer-scoped mTLS pairing invite |
+| POST | `/api/peers/pairing/request-access` | federation (per method/path) | own origin | bounded | Start an outgoing access request against a remote daemon's doorbell |
+| POST | `/api/peers/pairing/request-access/poll` | federation (per method/path) | own origin | bounded | Poll an outgoing access request (installs the approved identity) |
+| GET | `/api/peers/pairing/requests` | federation (per method/path) | own origin | bounded | List pending/decided peer access requests |
+| GET | `/api/peers/pairing/identities` | federation (per method/path) | own origin | bounded | List approved/revoked peer identities |
+| POST | `/api/peers/pairing/identities/revoke` | federation (per method/path) | own origin | bounded | Revoke a peer identity |
+| POST | `/api/peers/pairing/requests/{code}/{decision}` | federation (per method/path) | own origin | bounded | Decide a pending access request (approve or deny) |
+| POST | `/api/peers/pairing/join` | federation (per method/path) | own origin | bounded | Import a pairing invite and register the peer |
+| GET | `/api/peers` | federation (per method/path) | own origin | bounded | List registered peers (snapshots) |
+| POST | `/api/peers` | federation (per method/path) | own origin | bounded | Add a peer by card URL (optionally persisted) |
+| DELETE | `/api/peers` | federation (per method/path) | own origin | bounded | Remove a registered peer |
+| GET | `/api/peers/eligible` | federation (per method/path) | own origin | bounded | List connected peers satisfying every ?capability= filter |
+| POST | `/api/peers/{peer_id}/message` | federation (per method/path) | own origin | bounded | Send a message to a connected peer |
+| POST | `/api/peers/{peer_id}/task` | federation (per method/path) | own origin | bounded | Delegate a task to a connected peer |
+| POST | `/api/peers/{peer_id}/approval` | federation (per method/path) | own origin | bounded | Resolve a peer-forwarded approval request |
+| POST | `/api/peers/{peer_id}/webrtc` | federation (per method/path) | own origin | bounded | Relay display WebRTC signaling to a connected peer |
+| POST | `/api/peers/{peer_id}/file-transfer-webrtc` | federation (per method/path) | own origin | bounded | Relay file-transfer WebRTC signaling to a connected peer |
+| POST | `/api/peers/{peer_id}/dashboard-control-webrtc` | federation (per method/path) | own origin | bounded | Relay dashboard-control WebRTC signaling to a connected peer |
+| any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peers sub-router catch-all (handler-owned JSON 404/405 for unknown subpaths and undeclared methods) |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
 | POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
