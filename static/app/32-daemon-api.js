@@ -38,10 +38,16 @@
 // the vault UI surfaces), the F1c transfer-jobs adapter (the
 // resumable jobs protocol over the S9 /api/transfers rows, presence
 // feature-detected through the probe registry below), and the F7
-// control-msg dispatchers (api_control_msg, api_session_control_msg,
-// api_dashboard_action_msg — WS-twin residue: their HTTP-era twin is the
-// /ws intent stream, so the facade serves the tunnel leg only and the
-// call sites keep their own /ws fallback); the remaining
+// families: the control-msg dispatchers (api_control_msg,
+// api_session_control_msg, api_dashboard_action_msg — WS-twin residue:
+// their HTTP-era twin is the /ws intent stream, so the facade serves the
+// tunnel leg only and the call sites keep their own /ws fallback) plus
+// the display RPCs — the input-authority trio and the display WebRTC
+// signal RPC (WS-twin residue too: /ws display_offer/display_ice/
+// display_input are the twins) and the visual-freshness diagnostics
+// sink (twinned — the one rawBody entry below). Realtime display frames
+// (display_input events, media channels) are NOT facade calls and never
+// will be; the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -95,7 +101,12 @@
 // stays so: custody is tunnel-scoped by design — no HTTP rows exist or
 // are planned (docs/src/credential-custody.md; the transport design
 // parks custody HTTP rows as an explicit future decision), so those
-// methods ride the facade with no fallback lane at all.
+// methods ride the facade with no fallback lane at all. The F7 display
+// residue (api_display_bootstrap, api_display_webrtc_signal, the
+// api_display_input_authority_* trio) is absent for the same reason:
+// their HTTP-era twin is the /ws signaling socket, not a route (design
+// §2.7 pins them residue), so the facade serves their tunnel leg only —
+// api_diagnostics_visual_freshness is the family's one twinned entry.
 // Entry shape: verb + path template (`{name}` segments are lifted from
 // params), `alias` = capture-name -> param-key lift map (the session rows
 // capture `id` while the tunnel's canonical param is `session_id` — the
@@ -112,6 +123,12 @@
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
 // the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `rawBody` = the named string param is the raw REQUEST BODY the HTTP
+// twin takes verbatim, sent as `rawBodyType` (the visual-freshness
+// NDJSON sink: the tunnel carries the transcript as a `body` param, the
+// HTTP row appends its raw body unparsed — a JSON-encoded body would be
+// written into the transcript verbatim). rawBody twins carry all other
+// metadata in the query string, like encode:'raw' uploads.
 // `probe` = the twin's rows may be absent on a deployed daemon; name the
 // DAEMON_API_HTTP_PROBES entry whose result gates the http-only lane.
 // `mutation` is DERIVED from the verb (POST/DELETE), never
@@ -155,6 +172,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_project_root: { verb: 'GET', path: '/api/project-root' },
   api_external_agents: { verb: 'GET', path: '/api/external-agents' },
   api_displays: { verb: 'GET', path: '/api/displays' },
+  api_diagnostics_visual_freshness: { verb: 'POST', path: '/api/diagnostics/visual-freshness', query: ['session_id'], rawBody: 'body', rawBodyType: 'application/x-ndjson' },
   api_access_overview: { verb: 'GET', path: '/api/access/overview' },
   api_access_iam_state: { verb: 'GET', path: '/api/access/iam/state' },
   api_access_enrollment_requests: { verb: 'GET', path: '/api/access/enrollment-requests' },
@@ -503,13 +521,29 @@ async function daemonApiHttpRequest(method, params, opts) {
   // Caller cache posture passes through (session detail/metadata reads
   // send 'no-store', exactly as their pre-facade fetches did).
   if (opts && opts.cache) init.cache = opts.cache;
-  // Body-less POST twins stay body-less (api_worktrees_scan rides a
-  // BodyPolicy::None row, and every legacy empty-payload POST call site
-  // sent no body/Content-Type either). DELETE twins carry their leftover
-  // params the same way: api_peer_remove's HTTP shape has always been a
-  // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
-  // consume their params into the path and stay body-less).
-  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
+  // rawBody twins: the named param IS the request body, verbatim (the
+  // visual-freshness NDJSON sink appends its body unparsed — JSON-encoding
+  // it would corrupt the transcript). Everything else rides the query
+  // string; any other leftover param has no lane and must not silently
+  // become a body.
+  if (spec.rawBody) {
+    const raw = rest[spec.rawBody];
+    delete rest[spec.rawBody];
+    const extras = Object.keys(rest);
+    if (extras.length > 0) {
+      throw new TypeError(
+        `daemonApi: ${method} rawBody twin cannot carry extra params (${extras.join(', ')}) — declare them as query keys`
+      );
+    }
+    init.headers = { 'Content-Type': spec.rawBodyType || 'application/octet-stream' };
+    init.body = String(raw ?? '');
+  } else if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
+    // Body-less POST twins stay body-less (api_worktrees_scan rides a
+    // BodyPolicy::None row, and every legacy empty-payload POST call site
+    // sent no body/Content-Type either). DELETE twins carry their leftover
+    // params the same way: api_peer_remove's HTTP shape has always been a
+    // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
+    // consume their params into the path and stay body-less).
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -1068,6 +1102,9 @@ window.qa = Object.assign(window.qa || {}, {
         // 'transport-down' is directly observable here — no HTTP twin
         // ever answers for it.
         api_credential_lease_status: daemonApiAvailability('api_credential_lease_status'),
+        // WS-twin residue sample (F7): the display input-authority gate
+        // the display slots and the input frame sender derive from.
+        api_display_input_authority_request: daemonApiAvailability('api_display_input_authority_request'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,
