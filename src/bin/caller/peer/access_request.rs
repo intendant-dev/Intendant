@@ -45,6 +45,23 @@ pub(crate) struct AccessRequestCreate {
     pub requested_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_card_url: Option<String>,
+    /// Doorbell caller-ID (docs/src/trust-tiers.md § Two lanes): the
+    /// requesting daemon proves its Ed25519 identity over this relayed,
+    /// unauthenticated exchange. The signature covers the origin the
+    /// requester DIALED, the enrollment key, the nonce, and a timestamp
+    /// — so a captured request cannot be replayed against a different
+    /// target, key, or ceremony. All-absent = a legacy requester
+    /// (admitted, shown as an unverified caller). A target that predates
+    /// these fields rejects them (`deny_unknown_fields`); the requester
+    /// retries once without and notes the downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_daemon_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_daemon_sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_daemon_sig_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialed_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +122,12 @@ pub(crate) struct StoredAccessRequest {
     pub nonce: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_card_url: Option<String>,
+    /// The VERIFIED requesting daemon's Ed25519 identity (base64url
+    /// public key). Set only when the caller-ID signature checked out —
+    /// an absent value means a legacy/unproven caller, never a failed
+    /// one (failures refuse the request outright).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_daemon_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hint: Option<String>,
     pub target_label: String,
@@ -157,6 +180,109 @@ pub(crate) struct PollAccessRequestOutcome {
     pub install: Option<JoinOutcome>,
 }
 
+/// Doorbell caller-ID transcript (v1). Binds the origin the requester
+/// dialed, the enrollment key being certified, the nonce, and a
+/// timestamp under the requesting daemon's Ed25519 identity.
+pub(crate) fn doorbell_transcript(
+    dialed_origin: &str,
+    public_key_pem: &str,
+    nonce: &str,
+    ts_unix_ms: i64,
+) -> Vec<u8> {
+    let key_digest = {
+        let digest = ring::digest::digest(&ring::digest::SHA256, public_key_pem.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
+    };
+    format!("intendant-peer-doorbell-v1\n{dialed_origin}\n{key_digest}\n{nonce}\n{ts_unix_ms}")
+        .into_bytes()
+}
+
+/// Doorbell clock-skew tolerance. Wider than the dashboard offer bound:
+/// pairing spans machines that have never met, where several minutes of
+/// drift is routine; the nonce + one-shot request id carry replay
+/// resistance.
+const DOORBELL_MAX_SKEW_MS: i64 = 300_000;
+
+/// Verify a doorbell request's caller-ID fields. Pure core:
+/// - all fields absent → `Ok(None)` (legacy caller, admitted unverified);
+/// - a valid signature whose dialed origin matches the origin this
+///   daemon received the request on → `Ok(Some(daemon_id))`;
+/// - anything else (partial fields, bad signature, origin mismatch,
+///   stale timestamp) → `Err` — the request is refused, so a captured
+///   or tampered caller-ID can never demote itself to merely
+///   "unverified" and still ring the doorbell.
+pub(crate) fn verify_doorbell_caller(
+    request: &AccessRequestCreate,
+    received_origin: &str,
+    now_unix_ms: i64,
+) -> Result<Option<String>, String> {
+    let present = request.requester_daemon_id.is_some()
+        || request.requester_daemon_sig.is_some()
+        || request.requester_daemon_sig_ts.is_some()
+        || request.dialed_origin.is_some();
+    if !present {
+        return Ok(None);
+    }
+    let daemon_id = request
+        .requester_daemon_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or("caller id is missing requester_daemon_id")?;
+    if daemon_id.len() > 128 {
+        return Err("requester_daemon_id is too long".into());
+    }
+    let sig = request
+        .requester_daemon_sig
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or("caller id is missing its signature")?;
+    let ts = request
+        .requester_daemon_sig_ts
+        .ok_or("caller id is missing its timestamp")?;
+    let dialed = request
+        .dialed_origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or("caller id is missing the dialed origin")?;
+    let skew = (now_unix_ms - ts).abs();
+    if skew > DOORBELL_MAX_SKEW_MS {
+        return Err(format!(
+            "caller id timestamp is {skew}ms from daemon time (max {DOORBELL_MAX_SKEW_MS}ms)"
+        ));
+    }
+    if !origins_match(dialed, received_origin) {
+        return Err(format!(
+            "caller dialed {dialed} but this daemon received the request at {received_origin}"
+        ));
+    }
+    let transcript = doorbell_transcript(dialed, &request.public_key_pem, &request.nonce, ts);
+    if !crate::daemon_identity::verify_b64u(daemon_id, &transcript, sig) {
+        return Err("caller id signature verification failed".into());
+    }
+    Ok(Some(daemon_id.to_string()))
+}
+
+/// Origin comparison for the dialed-vs-received check: scheme + host +
+/// port, case-insensitive host, default ports normalized.
+fn origins_match(a: &str, b: &str) -> bool {
+    fn norm(v: &str) -> Option<(String, String, u16)> {
+        let url = url::Url::parse(v.trim()).ok()?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url
+            .port()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        Some((scheme, host, port))
+    }
+    match (norm(a), norm(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub(crate) fn create_pending_request(
     cert_dir: &Path,
     request: AccessRequestCreate,
@@ -170,6 +296,21 @@ pub(crate) fn create_pending_request(
         ));
     }
     validate_create_request(&request)?;
+    // Caller-ID (docs/src/trust-tiers.md § Two lanes): the origin we
+    // received the request on is the card URL's origin — the Host the
+    // requester actually dialed. Invalid caller-ID refuses the request;
+    // absent caller-ID is a legacy requester, admitted unverified.
+    let received_origin = target_card_url
+        .strip_suffix(super::pairing::AGENT_CARD_PATH)
+        .unwrap_or(&target_card_url)
+        .trim_end_matches('/')
+        .to_string();
+    let verified_requester_daemon_id = verify_doorbell_caller(
+        &request,
+        &received_origin,
+        (unix_timestamp() as i64) * 1000,
+    )
+    .map_err(|e| CallerError::Config(format!("caller identity verification failed: {e}")))?;
     enforce_create_rate_limits(source_hint.as_deref(), config)?;
     prune_expired(cert_dir)?;
     enforce_pending_limits(cert_dir, source_hint.as_deref(), config)?;
@@ -220,6 +361,7 @@ pub(crate) fn create_pending_request(
         public_key_pem: request.public_key_pem,
         nonce: request.nonce,
         requester_card_url: request.requester_card_url,
+        requester_daemon_id: verified_requester_daemon_id,
         source_hint,
         target_label: target_label.clone(),
         target_card_url: target_card_url.clone(),
@@ -354,26 +496,74 @@ pub(crate) async fn initiate_access_request(
         .as_deref()
         .map(clean_profile)
         .transpose()?;
-    let request = AccessRequestCreate {
+    let mut request = AccessRequestCreate {
         version: 1,
         requester_label: requester_label.clone(),
         public_key_pem: key.public_key_pem.clone(),
         nonce: uuid::Uuid::new_v4().to_string(),
         requested_profile: requested_profile.clone(),
         requester_card_url: options.requester_card_url,
+        requester_daemon_id: None,
+        requester_daemon_sig: None,
+        requester_daemon_sig_ts: None,
+        dialed_origin: None,
     };
+    // Caller-ID: prove this daemon's identity over the doorbell. Best
+    // effort — a box without a loadable identity still rings the bell,
+    // it just shows as an unverified caller on the approval side.
+    if let Some(origin) = request_origin(&endpoint) {
+        match crate::daemon_identity::DaemonIdentity::load_or_create_default() {
+            Ok(identity) => {
+                let ts = (unix_timestamp() as i64) * 1000;
+                let transcript =
+                    doorbell_transcript(&origin, &request.public_key_pem, &request.nonce, ts);
+                request.requester_daemon_id = Some(identity.public_key_b64u());
+                request.requester_daemon_sig = Some(identity.sign_b64u(&transcript));
+                request.requester_daemon_sig_ts = Some(ts);
+                request.dialed_origin = Some(origin);
+            }
+            Err(e) => eprintln!("[peer-request] caller-id skipped (no daemon identity): {e}"),
+        }
+    }
     let client = bootstrap_http_client()?;
-    let resp = client
+    let mut sent_caller_id = request.requester_daemon_id.is_some();
+    let mut resp = client
         .post(&endpoint)
         .json(&request)
         .send()
         .await
         .map_err(|e| CallerError::Config(format!("send access request: {e}")))?;
-    let status = resp.status();
-    let text = resp
+    let mut status = resp.status();
+    let mut text = resp
         .text()
         .await
         .map_err(|e| CallerError::Config(format!("read access request response: {e}")))?;
+    // A target that predates caller-ID rejects the unknown fields
+    // (`deny_unknown_fields` → 400 before any handler logic). Retry once
+    // bare and say so — the ceremony still works, the approval card just
+    // shows an unverified caller.
+    if status.as_u16() == 400 && sent_caller_id {
+        eprintln!(
+            "[peer-request] target rejected caller-id fields (likely an older daemon) — retrying without: {text}"
+        );
+        request.requester_daemon_id = None;
+        request.requester_daemon_sig = None;
+        request.requester_daemon_sig_ts = None;
+        request.dialed_origin = None;
+        sent_caller_id = false;
+        resp = client
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| CallerError::Config(format!("send access request: {e}")))?;
+        status = resp.status();
+        text = resp
+            .text()
+            .await
+            .map_err(|e| CallerError::Config(format!("read access request response: {e}")))?;
+    }
+    let _ = sent_caller_id;
     if !status.is_success() {
         return Err(CallerError::Config(format!(
             "target rejected access request ({status}): {text}"
@@ -887,6 +1077,18 @@ fn target_request_endpoint(raw: &str) -> Result<String, CallerError> {
     Ok(format!("{base}{PUBLIC_REQUEST_PATH}"))
 }
 
+/// The origin (scheme://host:port) of the doorbell endpoint — the value
+/// the caller-ID signature binds as "where I meant to ring".
+fn request_origin(endpoint: &str) -> Option<String> {
+    let url = url::Url::parse(endpoint).ok()?;
+    let host = url.host_str()?;
+    let scheme = url.scheme();
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
 fn bootstrap_http_client() -> Result<reqwest::Client, CallerError> {
     reqwest::Client::builder()
         .timeout(REQUEST_HTTP_TIMEOUT)
@@ -911,6 +1113,88 @@ mod tests {
         ensure_certs(dir, &names, "access-request-test", false).unwrap();
     }
 
+    fn signed_create_request(
+        identity: &crate::daemon_identity::DaemonIdentity,
+        dialed_origin: &str,
+        public_key_pem: &str,
+        ts: i64,
+    ) -> AccessRequestCreate {
+        let nonce = "0123456789abcdef".to_string();
+        let transcript = doorbell_transcript(dialed_origin, public_key_pem, &nonce, ts);
+        AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: public_key_pem.to_string(),
+            nonce,
+            requested_profile: None,
+            requester_card_url: None,
+            requester_daemon_id: Some(identity.public_key_b64u()),
+            requester_daemon_sig: Some(identity.sign_b64u(&transcript)),
+            requester_daemon_sig_ts: Some(ts),
+            dialed_origin: Some(dialed_origin.to_string()),
+        }
+    }
+
+    fn test_identity() -> crate::daemon_identity::DaemonIdentity {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        crate::daemon_identity::DaemonIdentity::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn doorbell_caller_id_verifies_and_binds_origin_key_and_time() {
+        let identity = test_identity();
+        let ts = (unix_timestamp() as i64) * 1000;
+        let request = signed_create_request(&identity, "https://target:8765", "PEM", ts);
+
+        // Valid: verified id comes back.
+        let verified =
+            verify_doorbell_caller(&request, "https://target:8765", ts + 1_000).unwrap();
+        assert_eq!(verified.as_deref(), Some(identity.public_key_b64u().as_str()));
+
+        // Origin mismatch (replay against a different daemon) refuses.
+        assert!(verify_doorbell_caller(&request, "https://other:8765", ts).is_err());
+
+        // Stale timestamp refuses.
+        assert!(verify_doorbell_caller(
+            &request,
+            "https://target:8765",
+            ts + DOORBELL_MAX_SKEW_MS + 1
+        )
+        .is_err());
+
+        // Tampered enrollment key (splicing the attacker's key under the
+        // victim's caller-ID) refuses.
+        let mut tampered = request.clone();
+        tampered.public_key_pem = "EVIL".into();
+        assert!(verify_doorbell_caller(&tampered, "https://target:8765", ts).is_err());
+
+        // Partial fields refuse (a relay cannot strip the signature and
+        // keep the identity claim).
+        let mut partial = request.clone();
+        partial.requester_daemon_sig = None;
+        assert!(verify_doorbell_caller(&partial, "https://target:8765", ts).is_err());
+
+        // Absent fields = legacy caller, admitted unverified.
+        let mut absent = request;
+        absent.requester_daemon_id = None;
+        absent.requester_daemon_sig = None;
+        absent.requester_daemon_sig_ts = None;
+        absent.dialed_origin = None;
+        assert!(verify_doorbell_caller(&absent, "https://target:8765", ts)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn doorbell_origin_comparison_normalizes_defaults_and_case() {
+        assert!(origins_match("HTTPS://Target.example", "https://target.example:443"));
+        assert!(origins_match("http://t:80", "http://t"));
+        assert!(!origins_match("https://t:8765", "https://t:8766"));
+        assert!(!origins_match("https://t", "http://t"));
+        assert!(!origins_match("not a url", "https://t"));
+    }
+
     #[test]
     fn disabled_public_access_request_config_rejects_before_creating() {
         let certs = tempfile::TempDir::new().unwrap();
@@ -921,6 +1205,10 @@ mod tests {
             nonce: "0123456789abcdef".into(),
             requested_profile: None,
             requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
         };
         let config = PeerAccessRequestConfig {
             enabled: false,
@@ -964,6 +1252,10 @@ mod tests {
             nonce: "0123456789abcdef".into(),
             requested_profile: None,
             requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
         };
         let created = create_pending_request(
             certs.path(),
@@ -995,6 +1287,10 @@ mod tests {
             nonce: "0123456789abcdef".into(),
             requested_profile: Some("peer-daemon".into()),
             requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
         };
 
         let created = create_pending_request(
@@ -1032,6 +1328,10 @@ mod tests {
             nonce: "0123456789abcdef".into(),
             requested_profile: None,
             requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
         };
 
         let created = create_pending_request(
@@ -1066,6 +1366,10 @@ mod tests {
             nonce: "0123456789abcdef".into(),
             requested_profile: Some("future-profile".into()),
             requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
         };
 
         let created = create_pending_request(
