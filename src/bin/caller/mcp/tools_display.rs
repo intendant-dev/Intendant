@@ -1243,6 +1243,17 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<SpawnLiveAudioParams>,
     ) -> String {
+        self.spawn_live_audio_for_session(params, None).await
+    }
+
+    /// Core of `spawn_live_audio`, shared by the stdio `#[tool]` method and
+    /// the HTTP dispatch arm (which passes the URL-bound session id so the
+    /// consent prompt lands on the calling session's rail).
+    pub(crate) async fn spawn_live_audio_for_session(
+        &self,
+        params: SpawnLiveAudioParams,
+        session_id: Option<&str>,
+    ) -> String {
         use crate::{audio_routing, live_audio, live_audio_types, prompts};
 
         let spec_json = serde_json::to_value(&params).unwrap_or_default();
@@ -1251,6 +1262,48 @@ impl IntendantServer {
             Ok(s) => s,
             Err(e) => return format!("Error parsing LiveAudioSpec: {}", e),
         };
+
+        // Always-consent gate: `LiveAudioSpawn` is policy-pinned to "ask at
+        // every autonomy level" and never auto-approves — coarse IAM on this
+        // tool authorizes the *caller*, not the spawn. Gate before any audio
+        // side effect (bridge creation, default-device switch).
+        let (approval_registry, interactive_frontends, state_session_id) = {
+            let state = self.state.read().await;
+            (
+                state.approval_registry.clone(),
+                state.interactive_frontends,
+                state.session_id.clone(),
+            )
+        };
+        // Same session resolution as ask_user: the URL-bound id wins, then
+        // the single-session state fallback.
+        let consent_session_id = session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let fallback = state_session_id.trim();
+                if fallback.is_empty() {
+                    None
+                } else {
+                    Some(fallback.to_string())
+                }
+            });
+        if let Err(denied) = live_audio::request_spawn_consent(
+            live_audio::SpawnConsentRequest {
+                bus: &self.bus,
+                approval_registry: Some(&approval_registry),
+                json_approval: None,
+                no_approver: !interactive_frontends,
+                session_id: consent_session_id,
+                preview: live_audio::spawn_consent_preview(&spec),
+            },
+            live_audio::SPAWN_CONSENT_WAIT,
+        )
+        .await
+        {
+            return denied;
+        }
 
         // Build system prompt from playbook + schema
         let project_root = std::env::var("INTENDANT_PROJECT_ROOT")
@@ -1624,6 +1677,117 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("expected text content, got {rendered}"));
         serde_json::from_str(text).unwrap_or_else(|e| panic!("expected JSON result ({e}): {text}"))
+    }
+
+    /// Extract the tool's plain-text result from a CallToolResult.
+    fn tool_result_text(result: &CallToolResult) -> String {
+        let rendered = serde_json::to_value(result).expect("serializable tool result");
+        rendered["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected text content, got {rendered}"))
+            .to_string()
+    }
+
+    fn spawn_live_audio_args() -> serde_json::Value {
+        serde_json::json!({
+            "id": "consent-mcp",
+            "provider": "gemini",
+            "playbook": "say hi",
+            "response_schema": { "fields": [] },
+        })
+    }
+
+    /// The MCP dispatch path fails closed when no frontend could ever answer
+    /// the always-required live-audio consent prompt (default MCP state).
+    #[tokio::test]
+    async fn spawn_live_audio_fails_closed_without_interactive_frontends() {
+        let bus = EventBus::new();
+        let server = IntendantServer::new(test_state(), bus);
+
+        let result = server
+            .call_tool_by_name_for_session(
+                "spawn_live_audio",
+                spawn_live_audio_args(),
+                Some("sess-la-headless"),
+                None,
+            )
+            .await
+            .expect("tool should dispatch");
+        let text = tool_result_text(&result);
+        assert!(
+            text.contains("requires explicit human approval"),
+            "headless MCP spawn is denied before any spawn work: {text}"
+        );
+    }
+
+    /// The consent round trip on the MCP dispatch path: the tool blocks on
+    /// an `ApprovalRequired` with the live-audio category attributed to the
+    /// calling session, and a deny over the bus lane (how the dashboard,
+    /// tunnel, and control socket resolve) returns the denial to the model
+    /// before any spawn side effect (no bridge, no provider connection —
+    /// the gate sits ahead of both).
+    #[tokio::test]
+    async fn spawn_live_audio_consent_deny_round_trip() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let state = test_state();
+        {
+            state.write().await.interactive_frontends = true;
+        }
+        let server = IntendantServer::new(state, bus.clone());
+
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .call_tool_by_name_for_session(
+                        "spawn_live_audio",
+                        spawn_live_audio_args(),
+                        Some("sess-la-consent"),
+                        None,
+                    )
+                    .await
+                    .expect("tool should dispatch")
+            })
+        };
+
+        let id = loop {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(crate::event::AppEvent::ApprovalRequired {
+                    session_id,
+                    id,
+                    category,
+                    command_preview,
+                })) => {
+                    assert_eq!(category, crate::autonomy::ActionCategory::LiveAudioSpawn);
+                    assert_eq!(session_id.as_deref(), Some("sess-la-consent"));
+                    assert!(
+                        command_preview.contains("spawn_live_audio"),
+                        "{command_preview}"
+                    );
+                    break id;
+                }
+                Ok(Ok(_)) => continue,
+                other => panic!("expected the consent prompt, got {other:?}"),
+            }
+        };
+
+        bus.send(crate::event::AppEvent::ControlCommand(
+            crate::event::ControlMsg::Deny {
+                session_id: None,
+                id,
+            },
+        ));
+
+        let result = timeout(Duration::from_secs(5), call)
+            .await
+            .expect("tool returns after the denial")
+            .expect("tool task");
+        let text = tool_result_text(&result);
+        assert!(
+            text.contains("declined"),
+            "denial reaches the model as the tool result: {text}"
+        );
     }
 
     #[tokio::test]

@@ -1534,6 +1534,317 @@ async fn whisper_inbound_loop(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Always-consent spawn gate
+// ---------------------------------------------------------------------------
+//
+// Spawning a live audio session hands an untrusted sub-agent a microphone
+// and speaker, so `ActionCategory::LiveAudioSpawn` is policy-pinned to
+// "always ask" at every autonomy level (`AutonomyState::needs_approval`).
+// Runtime-command classification never sees controller-side tools, though,
+// so the policy has to be enforced at dispatch: this gate is the one
+// enforcement point shared by every path that can start live audio (the
+// native agent loop's tool batch and the MCP/ctl tool), and it runs before
+// any spawn side effect (audio bridge creation, default-device switch,
+// provider connection).
+//
+// Resolution mirrors `ask_user` (mcp/tools_ask.rs): the gate races the
+// dispatch path's approval registry (popped directly by the MCP
+// approve/deny tools) against the event bus's `ControlCommand` approval
+// verbs (how the web dashboard, tunnel, and control socket resolve), so it
+// works uniformly across daemon shapes. Ids come from a dedicated high
+// range so they can never collide with per-session turn-keyed approvals or
+// the ask range, and the session supervisor's approval routing consults
+// [`spawn_consent_pending`] so a gate id is not misreported as an unknown
+// approval.
+
+/// Base of the live-audio consent id range. Per-session loops key approvals
+/// by small turn counters and `ask_user` draws from `1 << 40`; this range is
+/// disjoint from both while staying below JS's `Number.MAX_SAFE_INTEGER`.
+const SPAWN_CONSENT_ID_BASE: u64 = 1 << 41;
+
+static SPAWN_CONSENT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(SPAWN_CONSENT_ID_BASE);
+
+fn next_spawn_consent_id() -> u64 {
+    SPAWN_CONSENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Default blocking wait for the consent prompt (same as `ask_user`).
+pub(crate) const SPAWN_CONSENT_WAIT: Duration = Duration::from_secs(300);
+
+/// Ids of live-audio consent prompts currently blocked on a decision.
+/// Advisory: resolution happens in the gate's own waiter, but other
+/// resolution paths (the session supervisor's per-session approval
+/// registries) consult this set so a gate id is not misreported as an
+/// unknown/expired approval — the same contract as
+/// `mcp::ask_user_question_pending`.
+fn pending_consents() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether `id` is a live-audio consent prompt still waiting for a decision.
+/// Consulted by the session supervisor before warning about an approval id
+/// it does not know: the gate's own waiter resolves it and emits
+/// `ApprovalResolved`.
+pub(crate) fn spawn_consent_pending(id: u64) -> bool {
+    pending_consents()
+        .lock()
+        .map(|set| set.contains(&id))
+        .unwrap_or(false)
+}
+
+/// Everything the consent gate needs from a dispatch path.
+pub(crate) struct SpawnConsentRequest<'a> {
+    pub bus: &'a crate::event::EventBus,
+    /// The approval registry this path's direct resolvers pop (the session
+    /// loop's registry on the native path, the MCP state's on `/mcp`).
+    pub approval_registry: Option<&'a crate::event::ApprovalRegistry>,
+    /// Native JSON mode: approvals resolve over the stdin slot instead of
+    /// the registry/bus.
+    pub json_approval: Option<&'a crate::JsonApprovalSlot>,
+    /// True when no frontend can possibly answer (native headless without a
+    /// JSON slot; an MCP state without interactive frontends). The gate then
+    /// fails closed immediately with a clear error.
+    pub no_approver: bool,
+    pub session_id: Option<String>,
+    /// Human-readable request line for the approval rail.
+    pub preview: String,
+}
+
+/// Cleanup for one blocked consent prompt. Whatever way the gate returns —
+/// approved, denied, timed out, or the future dropped mid-wait (ctl killed,
+/// HTTP connection gone) — the pending entry, any unclaimed registry
+/// responder, and the frontend rails are all cleared, so a dead prompt can
+/// never leave a zombie approval pending on dashboards. Mirrors
+/// `PendingAskGuard`.
+struct ConsentGuard {
+    id: u64,
+    session_id: Option<String>,
+    bus: crate::event::EventBus,
+    registry: Option<crate::event::ApprovalRegistry>,
+    resolved: bool,
+}
+
+impl ConsentGuard {
+    fn register(
+        id: u64,
+        session_id: Option<String>,
+        bus: crate::event::EventBus,
+        registry: Option<crate::event::ApprovalRegistry>,
+    ) -> Self {
+        if let Ok(mut set) = pending_consents().lock() {
+            set.insert(id);
+        }
+        Self {
+            id,
+            session_id,
+            bus,
+            registry,
+            resolved: false,
+        }
+    }
+
+    /// Mark the prompt resolved as `action`: drop the pending entry, remove
+    /// any unclaimed registry responder, and tell every frontend to clear
+    /// the rail. Idempotent.
+    fn resolve(&mut self, action: &str) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        if let Ok(mut set) = pending_consents().lock() {
+            set.remove(&self.id);
+        }
+        if let Some(registry) = &self.registry {
+            if let Ok(mut reg) = registry.lock() {
+                reg.remove(&self.id);
+            }
+        }
+        self.bus.send(crate::event::AppEvent::ApprovalResolved {
+            session_id: self.session_id.clone(),
+            id: self.id,
+            action: action.to_string(),
+        });
+    }
+}
+
+impl Drop for ConsentGuard {
+    fn drop(&mut self) {
+        self.resolve("cancelled");
+    }
+}
+
+/// Denial handed to the model when nobody can approve.
+pub(crate) const SPAWN_CONSENT_NO_APPROVER: &str =
+    "Denied: live audio always requires explicit human approval, and no approver surface is \
+     available (headless). Ask the user to run with the dashboard or another interactive \
+     frontend if live audio is needed.";
+
+const SPAWN_CONSENT_DENIED: &str = "Denied: the user declined the live audio session.";
+const SPAWN_CONSENT_SKIPPED: &str = "Denied: the user skipped the live audio session.";
+
+fn spawn_consent_timeout_message(wait: Duration) -> String {
+    format!(
+        "Denied: no approval arrived within {}s for the live audio session. The user may be \
+         away; ask again later if it is still needed.",
+        wait.as_secs()
+    )
+}
+
+/// Block until a human approves or denies this live-audio spawn.
+///
+/// Returns `Ok(())` on approval and `Err(message_for_the_model)` otherwise
+/// (denied, skipped, timed out, or unapprovable). `ApproveAll` approves
+/// this prompt only — it never records a session-wide grant, because
+/// `LiveAudioSpawn` is always-ask by policy; the gate deliberately never
+/// touches the autonomy guard or the approved-command dedup set.
+pub(crate) async fn request_spawn_consent(
+    req: SpawnConsentRequest<'_>,
+    wait: Duration,
+) -> Result<(), String> {
+    use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
+
+    let id = next_spawn_consent_id();
+
+    // Native JSON mode: the stdin loop owns the response channel. Arm the
+    // slot before announcing so an instant response cannot miss it.
+    if let Some(slot) = req.json_approval {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = slot.lock().unwrap();
+            *guard = Some((id, tx));
+        }
+        req.bus.send(AppEvent::ApprovalRequired {
+            session_id: req.session_id.clone(),
+            id,
+            command_preview: req.preview.clone(),
+            category: crate::autonomy::ActionCategory::LiveAudioSpawn,
+        });
+        let outcome = tokio::time::timeout(wait, rx).await;
+        if outcome.is_err() {
+            // Timed out: clear the slot if our prompt still holds it.
+            let mut guard = slot.lock().unwrap();
+            if matches!(&*guard, Some((slot_id, _)) if *slot_id == id) {
+                *guard = None;
+            }
+        }
+        let (action, verdict) = match outcome {
+            Ok(Ok(ApprovalResponse::Approve | ApprovalResponse::ApproveAll)) => ("approve", Ok(())),
+            Ok(Ok(ApprovalResponse::Skip)) => ("skip", Err(SPAWN_CONSENT_SKIPPED.to_string())),
+            Ok(Ok(ApprovalResponse::Deny | ApprovalResponse::Answer { .. })) | Ok(Err(_)) => {
+                ("deny", Err(SPAWN_CONSENT_DENIED.to_string()))
+            }
+            Err(_) => ("timeout", Err(spawn_consent_timeout_message(wait))),
+        };
+        req.bus.send(AppEvent::ApprovalResolved {
+            session_id: req.session_id.clone(),
+            id,
+            action: action.to_string(),
+        });
+        return verdict;
+    }
+
+    if req.no_approver {
+        return Err(SPAWN_CONSENT_NO_APPROVER.to_string());
+    }
+
+    // Subscribe BEFORE announcing (an instant resolution must find the
+    // waiter listening), then arm both resolution sources.
+    let mut events = req.bus.subscribe();
+    let mut guard = ConsentGuard::register(
+        id,
+        req.session_id.clone(),
+        req.bus.clone(),
+        req.approval_registry.cloned(),
+    );
+    let mut registry_rx = req.approval_registry.map(|registry| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut reg) = registry.lock() {
+            reg.insert(id, tx);
+        }
+        rx
+    });
+    req.bus.send(AppEvent::ApprovalRequired {
+        session_id: req.session_id.clone(),
+        id,
+        command_preview: req.preview.clone(),
+        category: crate::autonomy::ActionCategory::LiveAudioSpawn,
+    });
+
+    let deadline = Instant::now() + wait;
+    loop {
+        tokio::select! {
+            response = async {
+                match registry_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A direct resolver popped the registry responder.
+                return match response {
+                    Ok(ApprovalResponse::Approve | ApprovalResponse::ApproveAll) => {
+                        guard.resolve("approve");
+                        Ok(())
+                    }
+                    Ok(ApprovalResponse::Skip) => {
+                        guard.resolve("skip");
+                        Err(SPAWN_CONSENT_SKIPPED.to_string())
+                    }
+                    Ok(ApprovalResponse::Deny | ApprovalResponse::Answer { .. }) | Err(_) => {
+                        guard.resolve("deny");
+                        Err(SPAWN_CONSENT_DENIED.to_string())
+                    }
+                };
+            }
+            event = tokio::time::timeout_at(deadline, events.recv()) => {
+                match event {
+                    Err(_) => {
+                        guard.resolve("timeout");
+                        return Err(spawn_consent_timeout_message(wait));
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                        guard.resolve("cancelled");
+                        return Err(
+                            "Denied: the approval channel closed before a decision arrived."
+                                .to_string(),
+                        );
+                    }
+                    Ok(Ok(AppEvent::ControlCommand(msg))) => match msg {
+                        // Ids from the dedicated consent range are globally
+                        // unique — match on id alone (same as `ask_user`).
+                        ControlMsg::Approve { id: verb_id, .. }
+                        | ControlMsg::ApproveAll { id: verb_id, .. }
+                            if verb_id == id =>
+                        {
+                            guard.resolve("approve");
+                            return Ok(());
+                        }
+                        ControlMsg::Deny { id: verb_id, .. } if verb_id == id => {
+                            guard.resolve("deny");
+                            return Err(SPAWN_CONSENT_DENIED.to_string());
+                        }
+                        ControlMsg::Skip { id: verb_id, .. } if verb_id == id => {
+                            guard.resolve("skip");
+                            return Err(SPAWN_CONSENT_SKIPPED.to_string());
+                        }
+                        _ => continue,
+                    },
+                    Ok(Ok(_)) => continue,
+                }
+            }
+        }
+    }
+}
+
+/// The approval-rail preview line for a spawn request.
+pub(crate) fn spawn_consent_preview(spec: &LiveAudioSpec) -> String {
+    format!("spawn_live_audio ({:?}, id: {})", spec.provider, spec.id)
+}
+
 /// Run a complete live audio session: connect, bridge audio, capture transcript,
 /// validate response, quarantine unexpected content.
 ///
@@ -2900,5 +3211,391 @@ mod tests {
                 panic!("unexpected session status: {:?}", other);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Always-consent spawn gate tests
+    // -----------------------------------------------------------------------
+
+    use crate::event::{AppEvent, ApprovalResponse, ControlMsg, EventBus};
+
+    fn consent_spec() -> LiveAudioSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": "consent-test",
+            "provider": "gemini",
+            "playbook": "test playbook",
+            "response_schema": { "fields": [] },
+        }))
+        .expect("valid spec")
+    }
+
+    /// Wait for the gate's ApprovalRequired and return its id, asserting the
+    /// prompt rides the approval rail with the live-audio category and an id
+    /// from the dedicated consent range.
+    async fn wait_for_consent_prompt(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> u64 {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("consent prompt within 5s")
+                .expect("bus open")
+            {
+                AppEvent::ApprovalRequired {
+                    id,
+                    category,
+                    command_preview,
+                    ..
+                } => {
+                    assert_eq!(category, crate::autonomy::ActionCategory::LiveAudioSpawn);
+                    assert!(
+                        id >= SPAWN_CONSENT_ID_BASE,
+                        "consent ids come from the dedicated range: {id}"
+                    );
+                    assert!(
+                        command_preview.contains("spawn_live_audio"),
+                        "{command_preview}"
+                    );
+                    return id;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Wait for the rail-clearing ApprovalResolved for `id`, returning its action.
+    async fn wait_for_consent_resolution(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        id: u64,
+    ) -> String {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("resolution within 5s")
+                .expect("bus open")
+            {
+                AppEvent::ApprovalResolved {
+                    id: resolved_id,
+                    action,
+                    ..
+                } if resolved_id == id => return action,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_denied_via_control_command() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let gate = {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: None,
+                        no_approver: false,
+                        session_id: Some("sess-deny".to_string()),
+                        preview: spawn_consent_preview(&consent_spec()),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+
+        let id = wait_for_consent_prompt(&mut rx).await;
+        assert!(spawn_consent_pending(id), "prompt registers as pending");
+        bus.send(AppEvent::ControlCommand(ControlMsg::Deny {
+            session_id: None,
+            id,
+        }));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        let denied = result.expect_err("deny fails the gate");
+        assert!(denied.contains("declined"), "{denied}");
+        assert!(!spawn_consent_pending(id), "pending entry cleared");
+        assert_eq!(wait_for_consent_resolution(&mut rx, id).await, "deny");
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_approved_via_control_command() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let gate = {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: None,
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+
+        let id = wait_for_consent_prompt(&mut rx).await;
+        bus.send(AppEvent::ControlCommand(ControlMsg::Approve {
+            session_id: None,
+            id,
+        }));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(result.is_ok(), "approve passes the gate: {result:?}");
+        assert_eq!(wait_for_consent_resolution(&mut rx, id).await, "approve");
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_approved_via_registry_responder() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let registry = crate::event::ApprovalRegistry::default();
+        let gate = {
+            let bus = bus.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: Some(&registry),
+                        json_approval: None,
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (OpenAI, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+
+        let id = wait_for_consent_prompt(&mut rx).await;
+        // A direct resolver (the MCP approve tool) pops the responder.
+        let responder = registry
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .expect("gate armed a registry responder");
+        responder
+            .send(ApprovalResponse::Approve)
+            .expect("gate is listening");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(
+            result.is_ok(),
+            "registry approve passes the gate: {result:?}"
+        );
+        assert_eq!(wait_for_consent_resolution(&mut rx, id).await, "approve");
+        assert!(!spawn_consent_pending(id));
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_times_out_fail_closed() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let registry = crate::event::ApprovalRegistry::default();
+        let result = request_spawn_consent(
+            SpawnConsentRequest {
+                bus: &bus,
+                approval_registry: Some(&registry),
+                json_approval: None,
+                no_approver: false,
+                session_id: None,
+                preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+            },
+            Duration::from_millis(100),
+        )
+        .await;
+        let denied = result.expect_err("timeout fails closed");
+        assert!(denied.contains("no approval arrived"), "{denied}");
+
+        let id = wait_for_consent_prompt(&mut rx).await;
+        assert_eq!(wait_for_consent_resolution(&mut rx, id).await, "timeout");
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "stale registry responder cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_no_approver_fails_closed_without_prompt() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let err = request_spawn_consent(
+            SpawnConsentRequest {
+                bus: &bus,
+                approval_registry: None,
+                json_approval: None,
+                no_approver: true,
+                session_id: None,
+                preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("fails closed with nobody to ask");
+        assert_eq!(err, SPAWN_CONSENT_NO_APPROVER);
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ApprovalRequired { .. }),
+                "no prompt is raised when nobody can answer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_json_slot_approve_and_deny() {
+        let bus = EventBus::new();
+        let slot = crate::new_json_approval_slot();
+
+        // Approve leg: the stdin loop answers over the armed slot.
+        let gate = {
+            let bus = bus.clone();
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: Some(&slot),
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+        let (_id, responder) = loop {
+            if let Some(armed) = slot.lock().unwrap().take() {
+                break armed;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        responder
+            .send(ApprovalResponse::Approve)
+            .expect("gate is listening");
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(result.is_ok(), "json-slot approve passes: {result:?}");
+
+        // Deny leg.
+        let gate = {
+            let bus = bus.clone();
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: Some(&slot),
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+        let (_id, responder) = loop {
+            if let Some(armed) = slot.lock().unwrap().take() {
+                break armed;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        responder
+            .send(ApprovalResponse::Deny)
+            .expect("gate is listening");
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        let denied = result.expect_err("json-slot deny fails the gate");
+        assert!(denied.contains("declined"), "{denied}");
+    }
+
+    #[tokio::test]
+    async fn spawn_consent_approve_all_grants_this_prompt_only() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        // ApproveAll resolves this prompt like Approve...
+        let gate = {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: None,
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+        let first_id = wait_for_consent_prompt(&mut rx).await;
+        bus.send(AppEvent::ControlCommand(ControlMsg::ApproveAll {
+            session_id: None,
+            id: first_id,
+        }));
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(result.is_ok(), "approve-all passes this prompt: {result:?}");
+
+        // ...but the next spawn still asks: the gate holds no grant state
+        // (LiveAudioSpawn is always-ask by policy).
+        let gate = {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                request_spawn_consent(
+                    SpawnConsentRequest {
+                        bus: &bus,
+                        approval_registry: None,
+                        json_approval: None,
+                        no_approver: false,
+                        session_id: None,
+                        preview: "spawn_live_audio (Gemini, id: t)".to_string(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+        let second_id = wait_for_consent_prompt(&mut rx).await;
+        assert_ne!(second_id, first_id, "every spawn prompts afresh");
+        bus.send(AppEvent::ControlCommand(ControlMsg::Deny {
+            session_id: None,
+            id: second_id,
+        }));
+        let result = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(result.is_err(), "second prompt still required a decision");
     }
 }
