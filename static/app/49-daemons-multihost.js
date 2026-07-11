@@ -733,18 +733,19 @@ class DashboardTransport {
     return Boolean(dashboardControlTransport?.canUseRpc());
   }
 
+  // Transport F7: the display capability booleans are one-line
+  // derivations over daemonApi.availability (§3.4) — the per-method
+  // status booleans once landed (each equals the daemon's
+  // api_display_input_authority_available composite by construction:
+  // same operation, same runtime-ready ladder), the hello_ack features
+  // list before that. They gate both the RPC wrappers below and the
+  // display_input frame sender — the frame lane itself stays bespoke.
   canUseDisplayInputAuthority() {
-    return Boolean(
-      this.canUseRpc() &&
-      dashboardControlTransport?.lastStatus?.api_display_input_authority_available === true
-    );
+    return daemonApi.availability('api_display_input_authority_request').ok;
   }
 
   canUseDisplayWebRtcSignal() {
-    return Boolean(
-      this.canUseRpc() &&
-      dashboardControlTransport?.lastStatus?.api_display_webrtc_signal_available === true
-    );
+    return daemonApi.availability('api_display_webrtc_signal').ok;
   }
 
   canUsePeerFileTransferSignal() {
@@ -807,48 +808,57 @@ class DashboardTransport {
     return dashboardControlTransport.displayInput(displayId, event);
   }
 
+  // The display authority/signaling RPC wrappers (transport F7): the RPC
+  // legs ride daemonApi.request and unwrap the envelope body, keeping the
+  // pre-facade result contract every consumer reads (result.ok /
+  // result.frames / result.sdp — the authority-unavailable 503 keeps its
+  // body ok:false shape). All four are WS-twin residue with no HTTP row
+  // by design, so the facade can only take the tunnel: a signaling or
+  // authority mutation is never replayed on another lane, and the
+  // availability guards refuse before firing RPCs that can only bounce.
+  // The display slots' own /ws fallback stays at their call sites.
   displayAuthoritySnapshot(options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_snapshot',
       {},
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   requestDisplayInputAuthority(displayId, options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_request',
       { display_id: Number(displayId) || 0 },
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   releaseDisplayInputAuthority(displayId, options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_release',
       { display_id: Number(displayId) || 0 },
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   displayWebRtcSignal(params = {}, options = {}) {
     if (!this.canUseDisplayWebRtcSignal()) {
       return Promise.reject(new Error('dashboard control display signaling is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_webrtc_signal',
       params,
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   // The two peer signal relays (transport F5). Signaling is a
@@ -1670,9 +1680,15 @@ window.intendantDashboardControl = {
         releaseReplayCount += 1;
       },
     };
+    // The capability derivation reads the per-method status booleans
+    // (transport F7); the composite rollup stays stubbed alongside for
+    // the pre-facade readers (debugStatus mirrors).
     dashboardControlTransport.lastStatus = {
       ...(previousStatus || {}),
       api_display_input_authority_available: false,
+      api_display_input_authority_snapshot_available: false,
+      api_display_input_authority_request_available: false,
+      api_display_input_authority_release_available: false,
     };
     let requestResult = null;
     let releaseResult = null;

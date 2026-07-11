@@ -1642,6 +1642,15 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_session_control_msg':
     case 'api_dashboard_action_msg':
       return 15000;
+    // Display WebRTC signaling (transport F7): the offer leg waits for
+    // the server's full answer negotiation (encoder spawn included) and
+    // asked for 30 s pre-facade; ICE posts share the method and resolve
+    // fast, so the longer budget is harmless there. The visual-freshness
+    // transcript flush asked for 10 s.
+    case 'api_display_webrtc_signal':
+      return 30000;
+    case 'api_diagnostics_visual_freshness':
+      return 10000;
     default:
       return 5000;
   }

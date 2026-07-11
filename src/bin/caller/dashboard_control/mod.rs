@@ -3444,7 +3444,14 @@ mod tests {
         // deliberately absent: WS-twin residue whose HTTP-era twin is the
         // /ws intent stream, not a route (transport design §2.7) — the
         // facade serves the tunnel leg only and the dispatchers keep
-        // their own /ws fallback.
+        // their own /ws fallback. So is the F7 display residue
+        // (api_display_bootstrap, api_display_webrtc_signal, the
+        // api_display_input_authority_* trio): their HTTP-era twin is
+        // the /ws signaling socket. api_diagnostics_visual_freshness IS
+        // here — the family's one twinned row (S5), and the descriptor's
+        // one rawBody entry (the tunnel carries the NDJSON transcript as
+        // a `body` param; the HTTP twin appends its raw body verbatim,
+        // so the adapter must never JSON-encode it).
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3484,6 +3491,7 @@ mod tests {
             "api_project_root",
             "api_external_agents",
             "api_displays",
+            "api_diagnostics_visual_freshness",
             "api_access_overview",
             "api_access_iam_state",
             "api_access_enrollment_requests",

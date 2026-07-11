@@ -243,39 +243,35 @@ function peerCanShareDisplay(d) {
 // 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
 // sample at (col*16+8, row*16+8); luma threshold 128 splits the
 // limited-range 16/235 pair the peer writes.
-function dashboardVisualFreshnessRpcAvailable() {
-  return Boolean(
-    dashboardTransport &&
-    typeof dashboardTransport.canUseRpc === 'function' &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_diagnostics_visual_freshness_available === true
-  );
-}
-
+// Transport F7: the transcript POST rides the daemonApi facade. The
+// method is twinned (POST /api/diagnostics/visual-freshness — the
+// descriptor's one rawBody entry: the tunnel carries the NDJSON as a
+// `body` param, the HTTP twin takes it as its raw request body), so the
+// facade keeps the legacy lane order by policy: tunnel first, the
+// POST-derived mutation rule refuses HTTP after any tunnel attempt, a
+// tunnel-less direct dashboard still POSTs pre-attempt, Connect mode
+// never touches HTTP. The daemon's own refusals (denied session /
+// too-old daemon) are consulted up front instead of firing an RPC that
+// can only bounce (F6 pattern); a transport-down verdict falls through —
+// the facade picks the honest lane.
 async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
-  if (dashboardVisualFreshnessRpcAvailable()) {
-    const result = await dashboardTransport.request('api_diagnostics_visual_freshness', {
-      session_id: sessionId,
-      body: ndjson,
-    }, { timeoutMs: 10000 });
-    if (result?.ok === false || result?._httpOk === false) {
-      throw new Error(result?.error || `diagnostics upload failed (${result?._httpStatus || 'error'})`);
-    }
-    return result;
+  const avail = daemonApi.availability('api_diagnostics_visual_freshness');
+  if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+    throw new daemonApi.Error(
+      avail.reason === 'denied' ? 'denied' : 'unavailable',
+      'api_diagnostics_visual_freshness',
+      null,
+      `visual diagnostics are ${avail.reason} on this daemon`
+    );
   }
-  if (dashboardConnectModeEnabled()) {
-    throw new Error('Hosted Connect visual diagnostics are not available');
-  }
-  const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(sessionId)}`;
-  const resp = await authedFetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-ndjson' },
+  const resp = await daemonApi.request('api_diagnostics_visual_freshness', {
+    session_id: sessionId,
     body: ndjson,
-  });
+  }, { timeoutMs: 10000 });
   if (!resp.ok) {
-    throw new Error(`${url} returned ${resp.status}`);
+    throw new Error(resp.body?.error || `diagnostics upload failed (${resp.status})`);
   }
-  return resp.json().catch(() => ({}));
+  return resp.body;
 }
 
 class VisualFreshnessSampler {
