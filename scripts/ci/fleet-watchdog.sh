@@ -44,7 +44,17 @@ RUNNER_DAEMON_LABELS="${RUNNER_DAEMON_LABELS:-}"  # macOS: LaunchDaemon labels (
 RUNNER_DAEMON_PLIST_DIR="${RUNNER_DAEMON_PLIST_DIR:-/Library/LaunchDaemons}"
 RUNNER_UNITS="${RUNNER_UNITS:-}"    # Linux: systemd units
 
-PAUSED_MARKER="$STATE_DIR/listeners.paused"
+PAUSED_MARKER="$STATE_DIR/listeners.paused"          # disk-pressure pause
+MEM_PAUSED_MARKER="$STATE_DIR/listeners.paused-mem"  # memory-pressure pause
+MEM_TICKS_FILE="$STATE_DIR/mem-pressure-ticks"
+MEM_NORMAL_FILE="$STATE_DIR/mem-normal-ticks"
+# Memory-pressure thresholds. macOS: kern.memorystatus_vm_pressure_level
+# (1 normal / 2 warning / 4 critical). Linux: PSI `some avg10` percentage
+# from /proc/pressure/memory.
+MEM_PRESSURE_LEVEL="${MEM_PRESSURE_LEVEL:-4}"
+MEM_PSI_PAUSE="${MEM_PSI_PAUSE:-40}"
+MEM_PAUSE_TICKS="${MEM_PAUSE_TICKS:-2}"
+MEM_RESUME_TICKS="${MEM_RESUME_TICKS:-2}"
 mkdir -p "$STATE_DIR"
 
 log() {
@@ -96,7 +106,6 @@ stop_listeners() {
                 || log "listener $unit was not running"
         done
     fi
-    touch "$PAUSED_MARKER"
 }
 
 start_listeners() {
@@ -118,7 +127,26 @@ start_listeners() {
                 || log "listener $unit failed to start — check manually"
         done
     fi
-    rm -f "$PAUSED_MARKER"
+}
+
+# Sustained host memory pressure? Fail-open: a missing/unreadable probe
+# reads as "not pressured" — the watchdog must never wedge assignment on
+# probe quirks. This is an ASSIGNMENT gate only: it cannot and does not
+# constrain builds already running (bounding those is the rustc
+# governor's job — scripts/ci/README.md "Governor").
+mem_pressured() {
+    if is_macos; then
+        level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
+        [ "$level" -ge "$MEM_PRESSURE_LEVEL" ] 2>/dev/null
+    else
+        [ -r /proc/pressure/memory ] || return 1
+        awk -v cap="$MEM_PSI_PAUSE" '/^some/ {
+            for (i = 1; i <= NF; i++) if ($i ~ /^avg10=/) {
+                sub(/^avg10=/, "", $i); exit !($i + 0 > cap + 0)
+            }
+            exit 1
+        }' /proc/pressure/memory
+    fi
 }
 
 # Cache keys are the per-listener, per-toolchain dirs the workflows
@@ -188,6 +216,7 @@ main() {
         if [ "$free" -lt "$HARD_STOP_GB" ]; then
             log "free ${free}G below hard floor ${HARD_STOP_GB}G — pausing listeners (even mid-job)"
             stop_listeners
+            touch "$PAUSED_MARKER"
         else
             if [ "$free" -lt "$STOP_GB" ]; then
                 log "free ${free}G below ${STOP_GB}G but a job is running — deferring pause and cache maintenance"
@@ -211,14 +240,57 @@ main() {
         else
             log "free ${free}G below ${STOP_GB}G — pausing listeners"
             stop_listeners
+            touch "$PAUSED_MARKER"
         fi
         evict_until "$RESUME_GB"
         free=$(free_gb)
     fi
 
     if [ -f "$PAUSED_MARKER" ] && [ "$free" -ge "$RESUME_GB" ]; then
-        log "free ${free}G cleared resume ceiling ${RESUME_GB}G — resuming listeners"
-        start_listeners
+        log "free ${free}G cleared resume ceiling ${RESUME_GB}G — clearing disk pause"
+        rm -f "$PAUSED_MARKER"
+        if [ ! -f "$MEM_PAUSED_MARKER" ]; then
+            start_listeners
+        else
+            log "memory pause still active — listeners stay down"
+        fi
+    fi
+
+    # Memory pressure: pause new-job ASSIGNMENT on sustained pressure,
+    # resume on sustained normal. Consecutive-tick counters give the
+    # hysteresis; never pause mid-job on memory alone (unlike the disk
+    # hard floor) — running compiles are the governor's problem, and a
+    # one-job listener assigns its next job only when idle anyway.
+    if mem_pressured; then
+        mem_ticks=$(( $(cat "$MEM_TICKS_FILE" 2>/dev/null || echo 0) + 1 ))
+        echo "$mem_ticks" > "$MEM_TICKS_FILE"
+        rm -f "$MEM_NORMAL_FILE"
+        if [ "$mem_ticks" -ge "$MEM_PAUSE_TICKS" ] && [ ! -f "$MEM_PAUSED_MARKER" ]; then
+            if job_running; then
+                log "memory pressure sustained (${mem_ticks} ticks) but a job is running — deferring pause to next tick"
+            else
+                log "memory pressure sustained (${mem_ticks} ticks) — pausing listeners (assignment gate)"
+                stop_listeners
+                touch "$MEM_PAUSED_MARKER"
+            fi
+        fi
+    else
+        rm -f "$MEM_TICKS_FILE"
+        if [ -f "$MEM_PAUSED_MARKER" ]; then
+            mem_normal=$(( $(cat "$MEM_NORMAL_FILE" 2>/dev/null || echo 0) + 1 ))
+            echo "$mem_normal" > "$MEM_NORMAL_FILE"
+            if [ "$mem_normal" -ge "$MEM_RESUME_TICKS" ]; then
+                log "memory pressure normal for ${mem_normal} ticks — clearing memory pause"
+                rm -f "$MEM_PAUSED_MARKER" "$MEM_NORMAL_FILE"
+                if [ ! -f "$PAUSED_MARKER" ]; then
+                    start_listeners
+                else
+                    log "disk pause still active — listeners stay down"
+                fi
+            fi
+        else
+            rm -f "$MEM_NORMAL_FILE"
+        fi
     fi
 }
 

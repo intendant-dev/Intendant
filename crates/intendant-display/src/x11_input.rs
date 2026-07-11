@@ -764,11 +764,11 @@ fn event_loop(dc: Arc<DisplayConn>) {
                         .send_event(false, req.requestor, xproto::EventMask::NO_EVENT, notify);
                 let _ = dc.conn.flush();
             }
-            Event::SelectionClear(clear) => {
-                if clear.owner == dc.selection_window && clear.selection == dc.atoms.clipboard {
-                    // Another client took the clipboard; stop serving.
-                    *dc.serving.lock().unwrap() = None;
-                }
+            Event::SelectionClear(clear)
+                if clear.owner == dc.selection_window && clear.selection == dc.atoms.clipboard =>
+            {
+                // Another client took the clipboard; stop serving.
+                *dc.serving.lock().unwrap() = None;
             }
             _ => {}
         }

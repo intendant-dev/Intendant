@@ -85,6 +85,12 @@ impl WaylandBackend {
     }
 }
 
+impl Default for WaylandBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl DisplayBackend for WaylandBackend {
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -585,11 +591,11 @@ async fn verify_remote_interaction(
     remote_desktop
         .notify_pointer_motion(session, 1.0, 0.0)
         .await
-        .map_err(|e| wayland_remote_interaction_error(e))?;
+        .map_err(wayland_remote_interaction_error)?;
     remote_desktop
         .notify_pointer_motion(session, -1.0, 0.0)
         .await
-        .map_err(|e| wayland_remote_interaction_error(e))?;
+        .map_err(wayland_remote_interaction_error)?;
     Ok(())
 }
 
@@ -670,6 +676,7 @@ fn mmap_fd_and_read(
 /// This function blocks until the `shutdown` flag is set or the PipeWire
 /// connection is lost. Frames are sent to `tx` via `try_send()` -- if the
 /// channel is full the frame is dropped (backpressure).
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_pipewire_capture(
     pw_fd: std::os::fd::OwnedFd,
     node_id: u32,

@@ -709,6 +709,8 @@ pub async fn target_pixel_size(
 /// Screenshots are resized to logical display size before sending to the model,
 /// so model coordinates are already in logical (input-injection) space.
 /// This function is a no-op but kept as the single place to adjust if needed.
+// Every call site lives in a `DisplayBackend::MacOS` match arm, so the seam is macOS-gated too.
+#[cfg(target_os = "macos")]
 fn scale_coords(x: i32, y: i32) -> (i32, i32) {
     (x, y)
 }

@@ -444,8 +444,7 @@ async function main() {
           status?.connected &&
           status?.verifiedBinding?.ok &&
           status?.signalingMode === 'connect-rendezvous' &&
-          status?.terminalFramesAvailable === true &&
-          status?.tuiFramesAvailable === false
+          status?.terminalFramesAvailable === true
         ) {
           return status;
         }
@@ -459,7 +458,6 @@ async function main() {
     assert.strictEqual(connected.verifiedBinding.daemonPublicKey, registered.daemon_public_key);
     assert(connected.sessionGrantSha256, 'Connect dashboard did not bind a session grant');
     assert.strictEqual(connected.terminalFramesAvailable, true, `Connect tunnel did not advertise terminal frames: ${JSON.stringify(connected)}`);
-    assert.strictEqual(connected.tuiFramesAvailable, false, `--no-tui daemon unexpectedly advertised TUI frames: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.byteStreamsAvailable, true, `Connect tunnel did not advertise byte streams: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.apiFsReadAvailable, true, `Connect tunnel did not advertise filesystem reads: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.apiTransferJobsAvailable, true, `Connect tunnel did not advertise transfer jobs: ${JSON.stringify(connected)}`);
@@ -545,17 +543,6 @@ async function main() {
     assert.strictEqual(reloadDownloadResumed.rawText, genericDownloadText, `Reload download resume returned wrong bytes: ${JSON.stringify(reloadDownloadResumed)}`);
 
     await click(page, '.tab-btn[data-tab="terminal"]');
-    await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
-    await page.waitForFunction(() => {
-      const el = document.getElementById('terminal-tui-unavailable');
-      return Boolean(
-        el &&
-        !el.classList.contains('hidden') &&
-        el.textContent.includes('TUI unavailable for this daemon')
-      );
-    }, {
-      timeout: START_TIMEOUT_MS,
-    });
 
     const shellToken = `connect_shell_${Date.now()}`;
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="shell"]');
@@ -587,7 +574,6 @@ async function main() {
         '_debugProbeDiagnosticsConnectNoHttp',
         '_debugProbeDisplaySignalConnectNoLegacy',
         '_debugProbeDisplayAuthorityConnectNoLegacy',
-        '_debugProbeTuiConnectNoLegacy',
         '_debugProbeShellQueuesUntilOpened',
         '_debugProbeTerminalOutputBypassesDedupe',
         '_debugProbeEventDedupeAllowlist',
@@ -623,10 +609,6 @@ async function main() {
     assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.releaseResult, false, `display authority release unexpectedly succeeded without tunnel support: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.requestReplayCount, 0, `display authority request used legacy path: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.releaseReplayCount, 0, `display authority release used legacy path: ${JSON.stringify(probes)}`);
-    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.keyReplayCount, 0, `TUI key used legacy path: ${JSON.stringify(probes)}`);
-    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.resizeReplayCount, 0, `TUI resize used legacy path: ${JSON.stringify(probes)}`);
-    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.wsReplayCount, 0, `TUI subscription used WS fallback: ${JSON.stringify(probes)}`);
-    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.subscriptionSent, false, `TUI subscription unexpectedly sent over WS: ${JSON.stringify(probes)}`);
     assert.deepStrictEqual(probes._debugProbeShellQueuesUntilOpened.framesBeforeAck, ['terminal_open'], `Shell input was sent before terminal_opened: ${JSON.stringify(probes)}`);
     assert.deepStrictEqual(probes._debugProbeShellQueuesUntilOpened.framesAfterAck, ['terminal_open', 'terminal_resize', 'terminal_input'], `Shell queued input did not flush after terminal_opened: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.queuedBeforeAck, 'queued-before-open', `Shell probe did not queue input before ACK: ${JSON.stringify(probes)}`);
