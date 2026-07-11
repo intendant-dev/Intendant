@@ -135,6 +135,7 @@ pub struct PresenceLayer {
 
 impl PresenceLayer {
     /// Create a new presence layer.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         provider: Box<dyn ChatProvider>,
         system_prompt: String,
@@ -738,6 +739,7 @@ impl ToolQueryResult {
 ///
 /// For action tools (approve, deny, submit_task, etc.), the caller must handle
 /// dispatch separately — this function only handles read-only query tools.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub async fn handle_tool_query(
     agent_state: &Arc<Mutex<AgentStateSnapshot>>,
     project_root: &std::path::Path,
@@ -1280,8 +1282,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.phase = "waiting_human".to_string();
             s.pending_question = Some(presence_core::PendingQuestionSnapshot {
                 id: *id,
-                questions: serde_json::to_value(questions)
-                    .unwrap_or(serde_json::Value::Null),
+                questions: serde_json::to_value(questions).unwrap_or(serde_json::Value::Null),
             });
         }
         AppEvent::SubAgentResult { formatted } => {

@@ -305,12 +305,10 @@ pub(crate) fn create_pending_request(
         .unwrap_or(&target_card_url)
         .trim_end_matches('/')
         .to_string();
-    let verified_requester_daemon_id = verify_doorbell_caller(
-        &request,
-        &received_origin,
-        (unix_timestamp() as i64) * 1000,
-    )
-    .map_err(|e| CallerError::Config(format!("caller identity verification failed: {e}")))?;
+    let verified_requester_daemon_id =
+        verify_doorbell_caller(&request, &received_origin, unix_timestamp() * 1000).map_err(
+            |e| CallerError::Config(format!("caller identity verification failed: {e}")),
+        )?;
     enforce_create_rate_limits(source_hint.as_deref(), config)?;
     prune_expired(cert_dir)?;
     enforce_pending_limits(cert_dir, source_hint.as_deref(), config)?;
@@ -514,7 +512,7 @@ pub(crate) async fn initiate_access_request(
     if let Some(origin) = request_origin(&endpoint) {
         match crate::daemon_identity::DaemonIdentity::load_or_create_default() {
             Ok(identity) => {
-                let ts = (unix_timestamp() as i64) * 1000;
+                let ts = unix_timestamp() * 1000;
                 let transcript =
                     doorbell_transcript(&origin, &request.public_key_pem, &request.nonce, ts);
                 request.requester_daemon_id = Some(identity.public_key_b64u());
@@ -1148,9 +1146,11 @@ mod tests {
         let request = signed_create_request(&identity, "https://target:8765", "PEM", ts);
 
         // Valid: verified id comes back.
-        let verified =
-            verify_doorbell_caller(&request, "https://target:8765", ts + 1_000).unwrap();
-        assert_eq!(verified.as_deref(), Some(identity.public_key_b64u().as_str()));
+        let verified = verify_doorbell_caller(&request, "https://target:8765", ts + 1_000).unwrap();
+        assert_eq!(
+            verified.as_deref(),
+            Some(identity.public_key_b64u().as_str())
+        );
 
         // Origin mismatch (replay against a different daemon) refuses.
         assert!(verify_doorbell_caller(&request, "https://other:8765", ts).is_err());
@@ -1188,7 +1188,10 @@ mod tests {
 
     #[test]
     fn doorbell_origin_comparison_normalizes_defaults_and_case() {
-        assert!(origins_match("HTTPS://Target.example", "https://target.example:443"));
+        assert!(origins_match(
+            "HTTPS://Target.example",
+            "https://target.example:443"
+        ));
         assert!(origins_match("http://t:80", "http://t"));
         assert!(!origins_match("https://t:8765", "https://t:8766"));
         assert!(!origins_match("https://t", "http://t"));

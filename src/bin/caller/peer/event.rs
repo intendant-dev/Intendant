@@ -143,7 +143,9 @@ pub enum PeerEvent {
     /// gateway also replays `display_ready` for every active display
     /// when a transport (re)connects, so a late-joining primary
     /// converges without snapshot special-casing.
-    DisplayReady { display: PeerDisplayInfo },
+    DisplayReady {
+        display: PeerDisplayInfo,
+    },
 
     /// A peer display stopped being available: its capture pipeline
     /// died (`display_capture_lost`) or the peer's user revoked their

@@ -224,6 +224,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn route_edit_user_message(
         &self,
         session_id: Option<String>,
@@ -758,6 +759,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn restart_session(
         &self,
         source: String,
@@ -855,8 +857,15 @@ impl SessionSupervisor {
                 )
             })
         };
-        let Some((managed_id, source, project_root, session_dir, tx, relation, requested_is_managed)) =
-            entry
+        let Some((
+            managed_id,
+            source,
+            project_root,
+            session_dir,
+            tx,
+            relation,
+            requested_is_managed,
+        )) = entry
         else {
             self.warn(&format!(
                 "Steer dropped: session {} is not managed by this daemon",
@@ -1427,7 +1436,10 @@ pub(crate) fn spawn_text_steer_fallback(
     });
 }
 
-pub(crate) fn steer_ack_targets_session(actual: &Option<String>, expected: &Option<String>) -> bool {
+pub(crate) fn steer_ack_targets_session(
+    actual: &Option<String>,
+    expected: &Option<String>,
+) -> bool {
     match (actual.as_deref(), expected.as_deref()) {
         (Some(actual), Some(expected)) => actual == expected,
         (None, _) | (_, None) => true,
@@ -1504,8 +1516,7 @@ mod tests {
                 }
                 AppEvent::SessionEnded {
                     session_id, reason, ..
-                } if session_id == "parent-thread" && reason == "stopped by user" =>
-                {
+                } if session_id == "parent-thread" && reason == "stopped by user" => {
                     saw_session_ended = true;
                 }
                 _ => {}

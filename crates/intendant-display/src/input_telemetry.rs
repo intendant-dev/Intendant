@@ -297,11 +297,7 @@ fn take(value: &AtomicU64) -> u64 {
 }
 
 fn avg(sum: u64, count: u64) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        sum / count
-    }
+    sum.checked_div(count).unwrap_or(0)
 }
 
 fn duration_micros(duration: Duration) -> u64 {

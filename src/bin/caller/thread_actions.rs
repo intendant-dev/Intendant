@@ -2,7 +2,10 @@
 //! fission spawn/import, context-rewind backout and anchor list/inspect
 //! actions, subagent state emits, and the thread-action dispatcher.
 
+use crate::event::{self, AppEvent, EventBus};
+use crate::external_agent;
 use crate::project::{self, Project};
+use crate::types;
 use crate::{context_rewind, fission_ledger, fission_lifecycle, platform, provider, worktree};
 use crate::{
     drain_external_agent_events, emit_child_turn_complete, emit_child_turn_complete_for_session,
@@ -10,12 +13,9 @@ use crate::{
     external_tool_failure_content, external_tool_preview_text,
     inspect_context_rewind_anchor_from_rollout, list_context_rewind_anchors_from_rollout,
     resolve_managed_context_edit_branch_target, scan_context_rewind_anchor_catalog,
-    truncate_string_copy, ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker, LoopStats,
-    PendingRuntimeSteer, UserTurnRevisionState,
+    truncate_string_copy, ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker,
+    LoopStats, PendingRuntimeSteer, UserTurnRevisionState,
 };
-use crate::event::{self, AppEvent, EventBus};
-use crate::external_agent;
-use crate::types;
 use crate::{slog, DrainConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -812,7 +812,11 @@ pub(crate) fn emit_session_relationship(
     });
 }
 
-pub(crate) fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_json::Value) {
+pub(crate) fn emit_codex_fork_session_name(
+    bus: &EventBus,
+    child_id: &str,
+    params: &serde_json::Value,
+) {
     let Some(name) = fork_session_name_from_params(params) else {
         return;
     };
@@ -2044,7 +2048,10 @@ pub(crate) fn side_rewind_first_turn_for_undo(
     Ok(current_turn_count as u32 - turns + 1)
 }
 
-pub(crate) fn parent_rewind_first_turn_for_undo(current_turn_count: usize, turns: u32) -> Result<u32, String> {
+pub(crate) fn parent_rewind_first_turn_for_undo(
+    current_turn_count: usize,
+    turns: u32,
+) -> Result<u32, String> {
     if turns == 0 {
         return Err("rollback count must be at least 1".to_string());
     }
@@ -2433,7 +2440,9 @@ pub(crate) fn emit_external_subagent_state(
         "interrupted" => (
             "warn",
             message
-                .map(|message| format!("Agent interrupted: {label} subagent interrupted: {message}"))
+                .map(|message| {
+                    format!("Agent interrupted: {label} subagent interrupted: {message}")
+                })
                 .unwrap_or_else(|| format!("Agent interrupted: {label} subagent interrupted")),
         ),
         "errored" => (
@@ -2783,6 +2792,7 @@ pub(crate) fn collab_agent_tool_preview(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_child_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -2949,7 +2959,11 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
 }
 
-pub(crate) fn emit_external_tool_output(config: &DrainConfig<'_>, session_id: Option<&str>, stdout: String) {
+pub(crate) fn emit_external_tool_output(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    stdout: String,
+) {
     if stdout.is_empty() {
         return;
     }
@@ -3632,8 +3646,14 @@ mod tests {
                 assert_eq!(relationship_kind.as_deref(), Some("side"));
                 assert_eq!(direct, Some(true));
                 let task = task.expect("side carries the question as the first prompt");
-                assert!(task.contains("side conversation"), "boundary missing: {task}");
-                assert!(task.ends_with("what is the plan?"), "question missing: {task}");
+                assert!(
+                    task.contains("side conversation"),
+                    "boundary missing: {task}"
+                );
+                assert!(
+                    task.ends_with("what is the plan?"),
+                    "question missing: {task}"
+                );
                 // The contract prologue is shared verbatim with Codex's
                 // in-process side threads — anti-drift by construction.
                 assert!(
@@ -3687,7 +3707,10 @@ mod tests {
         );
         assert!(!success);
         assert!(message.contains("native session id"), "{message}");
-        assert!(rx.try_recv().is_err(), "failures must not send ResumeSession");
+        assert!(
+            rx.try_recv().is_err(),
+            "failures must not send ResumeSession"
+        );
     }
 
     #[test]

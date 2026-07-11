@@ -164,7 +164,9 @@ pub(crate) fn should_nudge_escalation(input: NudgeInput) -> bool {
 }
 
 fn should_nudge_with_grace(input: NudgeInput, grace_ms: u64) -> bool {
-    let age = input.now_unix_ms.saturating_sub(input.pending_since_unix_ms);
+    let age = input
+        .now_unix_ms
+        .saturating_sub(input.pending_since_unix_ms);
     if age < grace_ms {
         return false;
     }
@@ -359,7 +361,12 @@ impl MonitorState {
 
     /// Sessions due a nudge now: `(session key, kind, display label)` for
     /// the oldest pending request per session that passes [`should_nudge`].
-    fn due(&self, now: u64, connected: bool, last_seen: Option<u64>) -> Vec<(String, AttentionKind, String)> {
+    fn due(
+        &self,
+        now: u64,
+        connected: bool,
+        last_seen: Option<u64>,
+    ) -> Vec<(String, AttentionKind, String)> {
         let mut oldest: HashMap<&str, &PendingRequest> = HashMap::new();
         for ((key, _, _), request) in &self.pending {
             let slot = oldest.entry(key.as_str()).or_insert(request);
@@ -719,7 +726,10 @@ mod tests {
         // id-prefix fallback, never the notification text.
         let now = now_unix_ms() + 1;
         let due = state.take_due_escalations(now, false, None);
-        assert_eq!(due, vec![("abc12345-XYZ".to_string(), "session abc12345".to_string())]);
+        assert_eq!(
+            due,
+            vec![("abc12345-XYZ".to_string(), "session abc12345".to_string())]
+        );
         // One-shot: dispatched escalations leave the queue.
         assert!(state.escalations.is_empty());
         assert!(state.take_due_escalations(now, false, None).is_empty());
@@ -738,7 +748,9 @@ mod tests {
         // the transcript row replayed — drop, no push.
         state.observe(&urgent_notification("abc"));
         let since = state.escalations["abc"];
-        assert!(state.take_due_escalations(now, false, Some(since + 1)).is_empty());
+        assert!(state
+            .take_due_escalations(now, false, Some(since + 1))
+            .is_empty());
         assert!(state.escalations.is_empty());
     }
 

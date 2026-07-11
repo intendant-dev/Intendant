@@ -297,7 +297,9 @@ mod tests {
     #[test]
     fn zero_usage_responses_are_ignored() {
         let mut rail = UsageRailState::new(identity());
-        assert!(rail.on_event(&response(Some("s1"), usage(0, 0, 0))).is_none());
+        assert!(rail
+            .on_event(&response(Some("s1"), usage(0, 0, 0)))
+            .is_none());
     }
 
     /// Events without a session id scope to the foreground session

@@ -356,19 +356,31 @@ mod tests {
         let bytes = expected.len();
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes })
+            Ok(Outcome::Written {
+                fragments: 3,
+                bytes
+            })
         );
-        assert_eq!(fs::read_to_string(dir.path().join(OUTPUT)).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(OUTPUT)).unwrap(),
+            expected
+        );
         // Second run: byte-identical, no rewrite.
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Unchanged { fragments: 3, bytes })
+            Ok(Outcome::Unchanged {
+                fragments: 3,
+                bytes
+            })
         );
         // A hand-edit to the artifact is overwritten by fragment truth.
         write(dir.path(), OUTPUT, "hand edit");
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes })
+            Ok(Outcome::Written {
+                fragments: 3,
+                bytes
+            })
         );
     }
 
@@ -414,7 +426,10 @@ mod tests {
         write(dir.path(), "static/app/10-b.css", "B\n");
         write(dir.path(), "static/app/manifest.txt", "00-a.html\n");
         let err = assemble(dir.path()).unwrap_err();
-        assert!(err.contains("not listed") && err.contains("10-b.css"), "{err}");
+        assert!(
+            err.contains("not listed") && err.contains("10-b.css"),
+            "{err}"
+        );
 
         write(
             dir.path(),
@@ -422,7 +437,10 @@ mod tests {
             "00-a.html\n10-b.css\n90-gone.js\n",
         );
         let err = assemble(dir.path()).unwrap_err();
-        assert!(err.contains("do not exist") && err.contains("90-gone.js"), "{err}");
+        assert!(
+            err.contains("do not exist") && err.contains("90-gone.js"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -432,8 +450,16 @@ mod tests {
         // fragment's `let` must fail assembly, not ship a dashboard that
         // dies at module evaluation.
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "static/app/30-open.html", "<script type=\"module\">\n");
-        write(dir.path(), "static/app/40-a.js", "if (laterFlag) { console.log(1); }\n");
+        write(
+            dir.path(),
+            "static/app/30-open.html",
+            "<script type=\"module\">\n",
+        );
+        write(
+            dir.path(),
+            "static/app/40-a.js",
+            "if (laterFlag) { console.log(1); }\n",
+        );
         write(dir.path(), "static/app/50-b.js", "let laterFlag = true;\n");
         write(dir.path(), "static/app/59-close.html", "</script>\n");
         write(
@@ -456,14 +482,22 @@ mod tests {
             "static/app/40-a.js",
             "let laterFlag = true;\nif (laterFlag) { console.log(1); }\n",
         );
-        write(dir.path(), "static/app/50-b.js", "console.log(laterFlag);\n");
+        write(
+            dir.path(),
+            "static/app/50-b.js",
+            "console.log(laterFlag);\n",
+        );
         assemble(dir.path()).unwrap();
     }
 
     #[test]
     fn vault_kernel_hash_pin_substitutes_and_settles() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "static/vault-kernel.js", "self.onmessage = () => {};\n");
+        write(
+            dir.path(),
+            "static/vault-kernel.js",
+            "self.onmessage = () => {};\n",
+        );
         write(
             dir.path(),
             "static/app/30-a.js",
@@ -494,10 +528,17 @@ mod tests {
             Ok(Outcome::Unchanged { .. })
         ));
         // A kernel edit changes the pin on the next assembly.
-        write(dir.path(), "static/vault-kernel.js", "self.onmessage = null;\n");
+        write(
+            dir.path(),
+            "static/vault-kernel.js",
+            "self.onmessage = null;\n",
+        );
         assert!(matches!(assemble(dir.path()), Ok(Outcome::Written { .. })));
         let out = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
-        assert!(!out.contains(&expected), "stale pin must not survive a kernel edit");
+        assert!(
+            !out.contains(&expected),
+            "stale pin must not survive a kernel edit"
+        );
     }
 
     #[test]

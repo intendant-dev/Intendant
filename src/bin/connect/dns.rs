@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
 
 use hickory_server::net::runtime::Time;
-use hickory_server::proto::op::{Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
+use hickory_server::proto::op::{
+    Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode,
+};
 use hickory_server::proto::rr::rdata::{HINFO, NS, SOA, TXT};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -113,7 +115,11 @@ impl FleetZone {
     /// The fully qualified name a daemon id resolves under, or None for
     /// an id that cannot be a DNS label.
     pub fn daemon_fqdn(&self, daemon_id: &str) -> Option<String> {
-        Some(format!("{}.{}", daemon_label(daemon_id)?, self.origin_utf8()))
+        Some(format!(
+            "{}.{}",
+            daemon_label(daemon_id)?,
+            self.origin_utf8()
+        ))
     }
 
     fn bump_serial(&self) {
@@ -121,7 +127,11 @@ impl FleetZone {
     }
 
     /// Replace the published addresses for a daemon (empty = remove).
-    pub fn set_daemon_addresses(&self, daemon_id: &str, addresses: &[IpAddr]) -> Result<(), String> {
+    pub fn set_daemon_addresses(
+        &self,
+        daemon_id: &str,
+        addresses: &[IpAddr],
+    ) -> Result<(), String> {
         let label = daemon_label(daemon_id).ok_or("daemon id is not a usable DNS label")?;
         let mut data = self.data.write().expect("fleet zone poisoned");
         let v4: Vec<Ipv4Addr> = addresses
@@ -171,7 +181,12 @@ impl FleetZone {
     /// Publish an ACME DNS-01 TXT value for a daemon (additive within
     /// the expiry window — Let's Encrypt may probe multiple values
     /// during retries; expired ones are swept on read and write).
-    pub fn set_acme_txt(&self, daemon_id: &str, value: &str, now_unix_ms: u64) -> Result<(), String> {
+    pub fn set_acme_txt(
+        &self,
+        daemon_id: &str,
+        value: &str,
+        now_unix_ms: u64,
+    ) -> Result<(), String> {
         let label = daemon_label(daemon_id).ok_or("daemon id is not a usable DNS label")?;
         let value = value.trim();
         if value.is_empty() || value.len() > 255 {
@@ -284,14 +299,12 @@ impl FleetZone {
                             ));
                         }
                     }
-                    RecordType::ANY => {
-                        if answer.name_exists {
-                            answer.records.push(Record::from_rdata(
-                                qname.clone(),
-                                RECORD_TTL,
-                                RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
-                            ));
-                        }
+                    RecordType::ANY if answer.name_exists => {
+                        answer.records.push(Record::from_rdata(
+                            qname.clone(),
+                            RECORD_TTL,
+                            RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
+                        ));
                     }
                     _ => {}
                 }
@@ -521,7 +534,10 @@ mod tests {
         let zone = zone();
         zone.set_daemon_addresses(
             "abc123",
-            &["192.168.1.50".parse().unwrap(), "2001:db8::7".parse().unwrap()],
+            &[
+                "192.168.1.50".parse().unwrap(),
+                "2001:db8::7".parse().unwrap(),
+            ],
         )
         .unwrap();
         zone.set_acme_txt("abc123", "tok-en_VALUE", 1_000).unwrap();
@@ -538,12 +554,20 @@ mod tests {
 
         // Daemon A (LAN addresses are legitimate) + AAAA.
         let a = zone
-            .lookup(&name("d-6ca13d52ca70c883e0f0.fleet.example.test."), RecordType::A, 1_000)
+            .lookup(
+                &name("d-6ca13d52ca70c883e0f0.fleet.example.test."),
+                RecordType::A,
+                1_000,
+            )
             .unwrap();
         assert!(a.name_exists);
         assert_eq!(a.records.len(), 1);
         let aaaa = zone
-            .lookup(&name("d-6ca13d52ca70c883e0f0.fleet.example.test."), RecordType::AAAA, 1_000)
+            .lookup(
+                &name("d-6ca13d52ca70c883e0f0.fleet.example.test."),
+                RecordType::AAAA,
+                1_000,
+            )
             .unwrap();
         assert_eq!(aaaa.records.len(), 1);
 
@@ -583,7 +607,11 @@ mod tests {
 
         // Known name, absent type: NODATA.
         let nodata = zone
-            .lookup(&name("d-6ca13d52ca70c883e0f0.fleet.example.test."), RecordType::AAAA, 0)
+            .lookup(
+                &name("d-6ca13d52ca70c883e0f0.fleet.example.test."),
+                RecordType::AAAA,
+                0,
+            )
             .unwrap();
         assert!(nodata.name_exists);
         assert!(nodata.records.is_empty());
@@ -615,7 +643,11 @@ mod tests {
         zone.set_daemon_addresses("abc123", &["10.0.0.10".parse().unwrap()])
             .unwrap();
         let a = zone
-            .lookup(&name("d-6ca13d52ca70c883e0f0.fleet.example.test."), RecordType::A, 0)
+            .lookup(
+                &name("d-6ca13d52ca70c883e0f0.fleet.example.test."),
+                RecordType::A,
+                0,
+            )
             .unwrap();
         assert_eq!(a.records.len(), 1);
 
@@ -641,7 +673,11 @@ mod tests {
 
         zone.remove_daemon("abc123");
         let gone = zone
-            .lookup(&name("d-6ca13d52ca70c883e0f0.fleet.example.test."), RecordType::A, 0)
+            .lookup(
+                &name("d-6ca13d52ca70c883e0f0.fleet.example.test."),
+                RecordType::A,
+                0,
+            )
             .unwrap();
         assert!(!gone.name_exists);
     }

@@ -4,7 +4,9 @@
 //! snapshots, and the rewind follow-up replay text machinery.
 
 use crate::error::CallerError;
-use crate::{context_rewind, external_wrapper_index, fission_ledger, fission_lifecycle, frontend, lineage_ledger};
+use crate::event::{AppEvent, EventBus};
+use crate::external_agent;
+use crate::session_log;
 use crate::{
     codex_payload_user_text, drain_external_agent_events, drain_steer_queue_as_followup,
     emit_external_turn_status, emit_fission_detach_relationships, emit_follow_up_status,
@@ -14,11 +16,12 @@ use crate::{
     ExternalBackendRecovery, ExternalContextSnapshotState, ExternalDiffDeltaTracker,
     PendingRuntimeSteer, UserAttachments, UserTurnRevisionState,
 };
-use serde::Serialize;
-use crate::event::{AppEvent, EventBus};
-use crate::external_agent;
-use crate::session_log;
+use crate::{
+    context_rewind, external_wrapper_index, fission_ledger, fission_lifecycle, frontend,
+    lineage_ledger,
+};
 use crate::{slog, DrainConfig, FollowUpMessage, LoopStats};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -216,7 +219,9 @@ impl ExternalContextRewindRequest {
     }
 }
 
-pub(crate) fn context_rewind_should_interrupt_active_turn(request: &ExternalContextRewindRequest) -> bool {
+pub(crate) fn context_rewind_should_interrupt_active_turn(
+    request: &ExternalContextRewindRequest,
+) -> bool {
     // Model-origin managed rewinds must make the active Codex turn idle before
     // Intendant can apply the rewrite. Relying on the model to stop after the
     // tool result is brittle under context pressure: a single response can keep
@@ -425,7 +430,7 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
 ) -> DrainOutcome {
     if let Some(request) = request {
         return DrainOutcome::ContextRewindRequested {
-            request,
+            request: Box::new(request),
             message,
             turns_in_round,
             turn_stop_status,
@@ -536,7 +541,10 @@ pub(crate) fn managed_context_density_recommended_limit(rewind_only_limit: u64) 
     (rewind_only_limit as f64 * MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT / 100.0).floor() as u64
 }
 
-pub(crate) fn context_rewind_anchor_has_density_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
+pub(crate) fn context_rewind_anchor_has_density_headroom(
+    used_tokens: u64,
+    rewind_only_limit: u64,
+) -> bool {
     used_tokens < managed_context_density_recommended_limit(rewind_only_limit)
 }
 
@@ -1079,5 +1087,4 @@ mod tests {
         let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
         assert_eq!(exact.item_id, "call_exact");
     }
-
 }

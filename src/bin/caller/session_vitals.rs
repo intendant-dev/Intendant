@@ -60,9 +60,7 @@ fn merge_tree_supported() -> bool {
             .arg("--version")
             .output()
             .ok()
-            .map(|out| {
-                git_version_at_least(&String::from_utf8_lossy(&out.stdout), 2, 38)
-            })
+            .map(|out| git_version_at_least(&String::from_utf8_lossy(&out.stdout), 2, 38))
             .unwrap_or(false)
     })
 }
@@ -97,9 +95,12 @@ impl GitVitalsProber {
             .unwrap_or(0);
 
         // Primary branch: origin's default when known, else local main/master.
-        let mut primary_branch = git(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-            .await
-            .map(|s| s.trim_start_matches("origin/").to_string());
+        let mut primary_branch = git(
+            cwd,
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .await
+        .map(|s| s.trim_start_matches("origin/").to_string());
         if primary_branch.is_none() {
             for candidate in ["main", "master"] {
                 let refname = format!("refs/heads/{candidate}");
@@ -130,23 +131,38 @@ impl GitVitalsProber {
             } else {
                 primary_branch.to_string()
             };
-            ahead = git_count(cwd, &format!("{primary_ref}..HEAD")).await.unwrap_or(0);
-            behind = git_count(cwd, &format!("HEAD..{primary_ref}")).await.unwrap_or(0);
+            ahead = git_count(cwd, &format!("{primary_ref}..HEAD"))
+                .await
+                .unwrap_or(0);
+            behind = git_count(cwd, &format!("HEAD..{primary_ref}"))
+                .await
+                .unwrap_or(0);
 
             merge_parity = if (ahead > 0) != (behind > 0) {
                 // Fast-forward in one direction: trivially clean.
                 "clean".to_string()
             } else if ahead > 0 && behind > 0 && merge_tree_supported() {
-                self.merge_parity(cwd, &primary_ref).await.unwrap_or_default()
+                self.merge_parity(cwd, &primary_ref)
+                    .await
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
 
             if branch != primary_branch {
                 let primary_upstream = format!("{primary_branch}@{{upstream}}");
-                if git(cwd, &["rev-parse", "--verify", "--quiet", "--abbrev-ref", &primary_upstream])
-                    .await
-                    .is_some()
+                if git(
+                    cwd,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--abbrev-ref",
+                        &primary_upstream,
+                    ],
+                )
+                .await
+                .is_some()
                 {
                     primary_unpushed =
                         git_count(cwd, &format!("{primary_upstream}..{primary_branch}")).await;
@@ -154,9 +170,18 @@ impl GitVitalsProber {
             }
         }
 
-        let unpushed = if git(cwd, &["rev-parse", "--verify", "--quiet", "--abbrev-ref", "@{upstream}"])
-            .await
-            .is_some()
+        let unpushed = if git(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--abbrev-ref",
+                "@{upstream}",
+            ],
+        )
+        .await
+        .is_some()
         {
             git_count(cwd, "@{upstream}..HEAD").await
         } else {
@@ -435,7 +460,15 @@ mod tests {
     }
 
     fn git_cmd(cwd: &Path, args: &[&str]) {
-        let mut full = vec!["git", "-c", "user.email=t@e2e", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+        let mut full = vec![
+            "git",
+            "-c",
+            "user.email=t@e2e",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ];
         full.extend_from_slice(args);
         sh(cwd, &full);
     }
@@ -502,17 +535,23 @@ mod tests {
     #[test]
     fn cache_vitals_hit_math_and_ttl_resolution() {
         // 90 read / 10 fresh → 90% hit; explicit flavor wins.
-        let vitals =
-            cache_vitals_from_usage(&usage_with_sample("anthropic", 90, 5, 5, Some(3600)), None, 42)
-                .expect("sample present");
+        let vitals = cache_vitals_from_usage(
+            &usage_with_sample("anthropic", 90, 5, 5, Some(3600)),
+            None,
+            42,
+        )
+        .expect("sample present");
         assert_eq!(vitals.hit_pct, Some(90));
         assert_eq!(vitals.last_activity_epoch, 42);
         assert_eq!(vitals.ttl_seconds, Some(3600));
 
         // Read-only response: no flavor statement — sticky TTL survives.
-        let sticky =
-            cache_vitals_from_usage(&usage_with_sample("anthropic", 100, 0, 0, None), Some(3600), 43)
-                .expect("sample present");
+        let sticky = cache_vitals_from_usage(
+            &usage_with_sample("anthropic", 100, 0, 0, None),
+            Some(3600),
+            43,
+        )
+        .expect("sample present");
         assert_eq!(sticky.hit_pct, Some(100));
         assert_eq!(sticky.ttl_seconds, Some(3600));
 
@@ -524,14 +563,17 @@ mod tests {
         assert_eq!(default_flavor.ttl_seconds, Some(300));
 
         // OpenAI: hit receipt without a countdown (TTL undocumented).
-        let openai = cache_vitals_from_usage(&usage_with_sample("openai", 75, 0, 25, None), None, 45)
-            .expect("sample present");
+        let openai =
+            cache_vitals_from_usage(&usage_with_sample("openai", 75, 0, 25, None), None, 45)
+                .expect("sample present");
         assert_eq!(openai.hit_pct, Some(75));
         assert_eq!(openai.ttl_seconds, None);
 
         // No per-request sample → nothing to learn.
-        assert!(cache_vitals_from_usage(&usage_with_sample("anthropic", 0, 0, 0, None), None, 46)
-            .is_none());
+        assert!(
+            cache_vitals_from_usage(&usage_with_sample("anthropic", 0, 0, 0, None), None, 46)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -570,7 +612,11 @@ mod tests {
                 emissions.push((session_id, vitals));
             }
         }
-        assert_eq!(emissions.len(), 3, "changes emit, no-ops and rewrites do not");
+        assert_eq!(
+            emissions.len(),
+            3,
+            "changes emit, no-ops and rewrites do not"
+        );
         assert_eq!(emissions[0].1.git.as_ref().unwrap().branch, "feature");
         assert!(emissions[0].1.cache.is_none());
         assert!(emissions[1].1.git.is_some(), "merged snapshot keeps git");
@@ -704,7 +750,8 @@ mod tests {
         let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
-                    if session_id == "s7" && vitals.cache.as_ref().and_then(|c| c.hit_pct) == Some(90)
+                    if session_id == "s7"
+                        && vitals.cache.as_ref().and_then(|c| c.hit_pct) == Some(90)
                     {
                         return vitals;
                     }

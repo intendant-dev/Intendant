@@ -605,7 +605,10 @@ mod tests {
             derive_branch_name(Some("  --- "), "abcd1234-rest"),
             "session-abcd1234"
         );
-        assert_eq!(derive_branch_name(None, "abcd1234-rest"), "session-abcd1234");
+        assert_eq!(
+            derive_branch_name(None, "abcd1234-rest"),
+            "session-abcd1234"
+        );
         // Long names are capped and never end on a dash.
         let long = derive_branch_name(Some(&"word ".repeat(30)), "abcd1234");
         assert!(long.len() <= 40, "{long}");

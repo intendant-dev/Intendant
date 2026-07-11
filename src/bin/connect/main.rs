@@ -351,16 +351,15 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let mut dns_listen: Option<SocketAddr> = match std::env::var("INTENDANT_CONNECT_DNS_LISTEN")
-        {
-            Ok(value) if !value.trim().is_empty() => Some(
-                value
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}"))?,
-            ),
-            _ => None,
-        };
+        let mut dns_listen: Option<SocketAddr> =
+            match std::env::var("INTENDANT_CONNECT_DNS_LISTEN") {
+                Ok(value) if !value.trim().is_empty() => {
+                    Some(value.trim().parse().map_err(|e| {
+                        format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}")
+                    })?)
+                }
+                _ => None,
+            };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -1270,5 +1269,4 @@ mod tests {
         assert_eq!(hours.len(), PRESENCE_HOURS_KEPT);
         assert_eq!(*hours.last().unwrap(), 209);
     }
-
 }

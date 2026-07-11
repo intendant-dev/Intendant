@@ -85,7 +85,10 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
+    sha256(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn leaf_hash(leaf_json: &str) -> [u8; 32] {
@@ -388,7 +391,9 @@ fn pin_path(state_root: &Path, base: &Url) -> PathBuf {
         }
     })
     .collect();
-    state_root.join("hosted-verify").join(format!("{name}.json"))
+    state_root
+        .join("hosted-verify")
+        .join(format!("{name}.json"))
 }
 
 fn load_pin(path: &Path) -> Option<SthPin> {
@@ -398,8 +403,7 @@ fn load_pin(path: &Path) -> Option<SthPin> {
 
 fn save_pin(path: &Path, pin: &SthPin) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(pin).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
@@ -460,10 +464,7 @@ enum ArtifactFetch {
 }
 
 /// The per-artifact verdict: `None` = matches the log.
-fn artifact_mismatch(
-    artifact: &ManifestArtifact,
-    fetched: &ArtifactFetch,
-) -> Option<String> {
+fn artifact_mismatch(artifact: &ManifestArtifact, fetched: &ArtifactFetch) -> Option<String> {
     match fetched {
         ArtifactFetch::Hashed { sha256_hex } if *sha256_hex == artifact.sha256 => None,
         ArtifactFetch::Hashed { sha256_hex } => Some(format!(
@@ -472,9 +473,7 @@ fn artifact_mismatch(
             short_hash(&artifact.sha256),
             short_hash(sha256_hex),
         )),
-        ArtifactFetch::HttpStatus(status) => {
-            Some(format!("{}: HTTP {status}", artifact.path))
-        }
+        ArtifactFetch::HttpStatus(status) => Some(format!("{}: HTTP {status}", artifact.path)),
         ArtifactFetch::TooLarge => Some(format!(
             "{}: response exceeded {} MiB",
             artifact.path,
@@ -604,8 +603,8 @@ async fn verify_logged_entry(
     };
 
     // 1. The signed tree head stands on its own signature.
-    let sth = Sth::parse(response.get("sth").unwrap_or(&serde_json::Value::Null))
-        .map_err(Unavailable)?;
+    let sth =
+        Sth::parse(response.get("sth").unwrap_or(&serde_json::Value::Null)).map_err(Unavailable)?;
     sth.verify_signature().map_err(verification)?;
 
     // 2. The manifest entry is IN the tree the head signs.
@@ -704,9 +703,13 @@ pub(crate) async fn verify_hosted_bundle(
     let client = http_client().map_err(Unavailable)?;
     let manifest_url = crate::connect_rendezvous::join_url(base, "api/log/artifact-manifest")
         .map_err(Unavailable)?;
-    let response = fetch_json(&client, manifest_url).await.map_err(Unavailable)?;
+    let response = fetch_json(&client, manifest_url)
+        .await
+        .map_err(Unavailable)?;
     if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        return Err(Unavailable("artifact-manifest endpoint returned an error".to_string()));
+        return Err(Unavailable(
+            "artifact-manifest endpoint returned an error".to_string(),
+        ));
     }
     if response.get("found").and_then(|v| v.as_bool()) != Some(true) {
         return Err(Unavailable(
@@ -1047,7 +1050,9 @@ pub(crate) async fn verify_hosted_release(
             .finish();
         manifest_url.set_query(Some(&query));
     }
-    let response = fetch_json(&client, manifest_url).await.map_err(Unavailable)?;
+    let response = fetch_json(&client, manifest_url)
+        .await
+        .map_err(Unavailable)?;
     if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return Err(Unavailable(
             "release-manifest endpoint returned an error".to_string(),
@@ -1090,7 +1095,9 @@ pub(crate) async fn verify_hosted_release(
     )
     .map_err(Unavailable)?;
     let release_url_display = release_url.to_string();
-    let (status, release) = fetch_github_json(&client, release_url).await.map_err(Unavailable)?;
+    let (status, release) = fetch_github_json(&client, release_url)
+        .await
+        .map_err(Unavailable)?;
     let release = match (status, release) {
         (200, Some(release)) => release,
         (200, None) => {
@@ -1224,7 +1231,10 @@ pub(crate) async fn check_once() {
         Err(VerifyFailure::Unavailable(error)) => with_status(|s| {
             s.last_error = Some(error);
         }),
-        Err(VerifyFailure::Verification { summary, mismatches }) => {
+        Err(VerifyFailure::Verification {
+            summary,
+            mismatches,
+        }) => {
             with_status(|s| {
                 s.state = "alert".to_string();
                 s.checked_unix_ms = Some(now);
@@ -1321,7 +1331,11 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
             },
             "--releases" => {
                 releases = true;
-                if iter.peek().map(|next| !next.starts_with('-')).unwrap_or(false) {
+                if iter
+                    .peek()
+                    .map(|next| !next.starts_with('-'))
+                    .unwrap_or(false)
+                {
                     release_tag = iter.next();
                 }
             }
@@ -1378,10 +1392,7 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
     println!("hosted-verify: {}", base_raw.trim_end_matches('/'));
     match verify_hosted_bundle(&base, &crate::platform::intendant_home()).await {
         Ok(report) => {
-            println!(
-                "tree head: {} entries — signature OK",
-                report.log_size
-            );
+            println!("tree head: {} entries — signature OK", report.log_size);
             print_pin_line(report.pinned_from_size);
             println!(
                 "manifest: log index {} · logged {} · bundle {} ({}) · {} artifacts · hash {}",
@@ -1422,7 +1433,10 @@ fn format_logged_at(unix_ms: u64) -> String {
 
 fn print_failure(failure: VerifyFailure, advice: &str) -> i32 {
     match failure {
-        VerifyFailure::Verification { summary, mismatches } => {
+        VerifyFailure::Verification {
+            summary,
+            mismatches,
+        } => {
             eprintln!("FAIL — {summary}");
             for line in &mismatches {
                 eprintln!("  {line}");
@@ -1599,7 +1613,13 @@ mod tests {
             for index in 0..size {
                 let proof = inclusion_proof(index, tree);
                 assert!(verify_inclusion(&tree[index], index, size, &proof, &root));
-                assert!(!verify_inclusion(&leaf_hash("evil"), index, size, &proof, &root));
+                assert!(!verify_inclusion(
+                    &leaf_hash("evil"),
+                    index,
+                    size,
+                    &proof,
+                    &root
+                ));
             }
             for old in 1..=size {
                 let proof = consistency_proof(old, tree);
@@ -1851,7 +1871,9 @@ mod tests {
         let tampered = good.replace(&sha256_hex(b"app zip"), &sha256_hex(b"evil zip"));
         assert!(parse_release_leaf(&tampered).is_err());
         // Wrong kind is rejected.
-        assert!(parse_release_leaf(&good.replace("release_manifest", "artifact_manifest")).is_err());
+        assert!(
+            parse_release_leaf(&good.replace("release_manifest", "artifact_manifest")).is_err()
+        );
         // No artifacts is rejected.
         let empty = serde_json::json!({
             "kind": "release_manifest",
@@ -1888,13 +1910,17 @@ mod tests {
         );
         // Missing from the release.
         let diff = check_release_artifact(&logged, &[]).unwrap_err();
-        assert!(diff.contains("not on the GitHub release"), "diff was {diff}");
+        assert!(
+            diff.contains("not on the GitHub release"),
+            "diff was {diff}"
+        );
         // Size divergence.
         let diff = check_release_artifact(&logged, &[asset(17, None)]).unwrap_err();
         assert!(diff.contains("logged 16 bytes"), "diff was {diff}");
         // Digest divergence.
-        let diff = check_release_artifact(&logged, &[asset(16, Some(sha256_hex(b"a swapped zip")))])
-            .unwrap_err();
+        let diff =
+            check_release_artifact(&logged, &[asset(16, Some(sha256_hex(b"a swapped zip")))])
+                .unwrap_err();
         assert!(diff.contains("logged sha256"), "diff was {diff}");
         // An asset the log never blessed is loud.
         let extra = GithubAsset {
@@ -1905,7 +1931,11 @@ mod tests {
         };
         let lines = unlogged_assets(&[logged.clone()], &[asset(16, None), extra]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("extra-payload.zip"), "line was {}", lines[0]);
+        assert!(
+            lines[0].contains("extra-payload.zip"),
+            "line was {}",
+            lines[0]
+        );
         assert!(unlogged_assets(&[logged], &[asset(16, None)]).is_empty());
     }
 
@@ -1942,7 +1972,10 @@ mod tests {
         }
 
         fn leaves(&self) -> Vec<[u8; 32]> {
-            self.leaves_json.iter().map(|leaf| leaf_hash(leaf)).collect()
+            self.leaves_json
+                .iter()
+                .map(|leaf| leaf_hash(leaf))
+                .collect()
         }
 
         fn sth_json(&self) -> serde_json::Value {
@@ -2141,7 +2174,10 @@ mod tests {
         .expect("grown-log verification passes via consistency proof");
         assert_eq!(report.log_size, 3);
         assert_eq!(report.pinned_from_size, Some(2));
-        assert_eq!(load_pin(&pin_path(state_root.path(), &base)).unwrap().size, 3);
+        assert_eq!(
+            load_pin(&pin_path(state_root.path(), &base)).unwrap().size,
+            3
+        );
 
         // History rewritten (log shrank below the pin): loud failure.
         fixture.lock().unwrap().log.leaves_json.truncate(2);
@@ -2190,10 +2226,12 @@ mod tests {
             serde_json::json!({ "name": "extra-payload.zip", "size": 3 }),
         ]);
         let state_root = tempfile::tempdir().unwrap();
-        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path())
-            .await
+        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path()).await
         {
-            Err(VerifyFailure::Verification { summary, mismatches }) => {
+            Err(VerifyFailure::Verification {
+                summary,
+                mismatches,
+            }) => {
                 assert!(summary.contains("v1.2.3"), "summary was {summary}");
                 assert_eq!(mismatches.len(), 2, "mismatches were {mismatches:?}");
                 assert!(mismatches[0].contains("logged sha256"));
@@ -2207,8 +2245,7 @@ mod tests {
         // GitHub not having the release at all is a verdict, not an
         // availability problem: the log commits something GitHub denies.
         fixture.lock().unwrap().release_status = 404;
-        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path())
-            .await
+        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path()).await
         {
             Err(VerifyFailure::Verification { summary, .. }) => {
                 assert!(summary.contains("no release"), "summary was {summary}")
@@ -2268,7 +2305,11 @@ mod tests {
         {
             Err(VerifyFailure::Verification { mismatches, .. }) => {
                 assert_eq!(mismatches.len(), 1);
-                assert!(mismatches[0].contains("downloaded"), "was {}", mismatches[0]);
+                assert!(
+                    mismatches[0].contains("downloaded"),
+                    "was {}",
+                    mismatches[0]
+                );
             }
             other => panic!("tampered download must fail verification, got {other:?}"),
         }
@@ -2302,17 +2343,13 @@ mod tests {
         .await
         {
             Err(VerifyFailure::Verification { summary, .. }) => {
-                assert!(
-                    summary.contains("not committed"),
-                    "summary was {summary}"
-                );
+                assert!(summary.contains("not committed"), "summary was {summary}");
             }
             other => panic!("explicit missing tag must fail verification, got {other:?}"),
         }
         // …while a log with no release entries at all is just nothing to
         // verify (older service).
-        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path())
-            .await
+        match verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path()).await
         {
             Err(VerifyFailure::Unavailable(error)) => {
                 assert!(error.contains("no release manifests"), "error was {error}")
@@ -2346,7 +2383,10 @@ mod tests {
         assert_eq!(loaded.public_key, "a2V5");
         assert_eq!(loaded.pinned_unix_ms, 77);
         // Distinct hosts pin separately.
-        let other = pin_path(dir.path(), &Url::parse("https://other.example.test").unwrap());
+        let other = pin_path(
+            dir.path(),
+            &Url::parse("https://other.example.test").unwrap(),
+        );
         assert_ne!(path, other);
     }
 }

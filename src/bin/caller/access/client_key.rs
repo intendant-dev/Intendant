@@ -118,14 +118,21 @@ pub fn verify_client_key_offer(
     now_unix_ms: i64,
 ) -> Result<VerifiedClientKey, String> {
     let payload = client_key_offer_payload(daemon_id, client_nonce, sdp, ts_unix_ms);
-    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
-        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
-            fingerprint,
-            public_key_b64u,
-            attested_account: None,
-        })
+    verify_signed_offer(
+        client_key_b64u,
+        signature_b64u,
+        ts_unix_ms,
+        now_unix_ms,
+        &payload,
+    )
+    .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+        fingerprint,
+        public_key_b64u,
+        attested_account: None,
+    })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn verify_client_key_offer_v2(
     client_key_b64u: &str,
     signature_b64u: &str,
@@ -145,12 +152,18 @@ pub fn verify_client_key_offer_v2(
         account_user_id,
         account_name,
     );
-    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
-        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
-            fingerprint,
-            public_key_b64u,
-            attested_account: Some((account_user_id.to_string(), account_name.to_string())),
-        })
+    verify_signed_offer(
+        client_key_b64u,
+        signature_b64u,
+        ts_unix_ms,
+        now_unix_ms,
+        &payload,
+    )
+    .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+        fingerprint,
+        public_key_b64u,
+        attested_account: Some((account_user_id.to_string(), account_name.to_string())),
+    })
 }
 
 /// Shared key/signature/timestamp mechanics for every payload version.
@@ -302,9 +315,7 @@ impl ClientKeyOfferFields {
         match proto {
             CLIENT_KEY_OFFER_PROTOCOL => {
                 if account_user_id.is_some() || account_name.is_some() {
-                    return Err(
-                        "client key account fields require a v2-signed offer".to_string()
-                    );
+                    return Err("client key account fields require a v2-signed offer".to_string());
                 }
                 verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms)
                     .map(Some)
@@ -521,7 +532,9 @@ mod tests {
             client_key_account_user_id: Some("mallory-user".to_string()),
             ..fields.clone()
         };
-        assert!(swapped.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+        assert!(swapped
+            .verify("daemon-a", "nonce-1", "v=0 sdp", ts)
+            .is_err());
 
         // Account fields glued onto a v1-signed offer are rejected: nothing
         // may ride outside the signature.
@@ -540,6 +553,8 @@ mod tests {
             client_key_proto: Some("intendant-client-key-offer-v9".to_string()),
             ..fields
         };
-        assert!(unknown.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+        assert!(unknown
+            .verify("daemon-a", "nonce-1", "v=0 sdp", ts)
+            .is_err());
     }
 }

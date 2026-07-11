@@ -197,7 +197,9 @@ pub(crate) fn log_verify_consistency(
     fr == *old_root && sr == *new_root && sn == 0
 }
 
-pub(crate) fn load_or_create_log_keypair(store: &mut Store) -> Result<ring::signature::EcdsaKeyPair, String> {
+pub(crate) fn load_or_create_log_keypair(
+    store: &mut Store,
+) -> Result<ring::signature::EcdsaKeyPair, String> {
     let rng = ring::rand::SystemRandom::new();
     if store.log_private_pk8_b64.is_none() {
         let document = ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -260,7 +262,10 @@ pub(crate) fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::V
     sth
 }
 
-pub(crate) async fn log_sth(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub(crate) async fn log_sth(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
     Ok(orl_cors(
@@ -468,7 +473,10 @@ pub(crate) struct ArtifactRecord {
 }
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
+    sha256(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The routes served from compiled-in bytes, rendered exactly as this
@@ -479,7 +487,10 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> {
     let origin = config.public_origin.as_str();
     let mut artifacts = vec![
-        ("/".to_string(), sha256_hex(landing_ui_html(origin).as_bytes())),
+        (
+            "/".to_string(),
+            sha256_hex(landing_ui_html(origin).as_bytes()),
+        ),
         (
             "/connect".to_string(),
             sha256_hex(connect_page_html(origin).as_bytes()),
@@ -840,7 +851,9 @@ pub(crate) fn validate_release_manifest(
         .trim()
         .to_string();
     if !valid_release_component(&tag, RELEASE_TAG_MAX) {
-        return Err("tag must be 1-100 chars of [A-Za-z0-9._+-], not starting with '-' or '.'".to_string());
+        return Err(
+            "tag must be 1-100 chars of [A-Za-z0-9._+-], not starting with '-' or '.'".to_string(),
+        );
     }
     let version = body
         .get("version")
@@ -870,45 +883,47 @@ pub(crate) fn validate_release_manifest(
             "platforms must name 1-{RELEASE_PLATFORM_LIMIT} targets"
         ));
     }
-    let mut artifacts: Vec<ReleaseArtifactRecord> = body
-        .get("artifacts")
-        .and_then(|v| v.as_array())
-        .ok_or("artifacts must be an array")?
-        .iter()
-        .map(|entry| {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !valid_release_component(&name, RELEASE_ARTIFACT_NAME_MAX) {
-                return Err(format!("invalid artifact name {:?}", name));
-            }
-            let sha256 = entry
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !valid_sha256_hex(&sha256) {
-                return Err(format!(
-                    "artifact {name}: sha256 must be 64 lowercase hex chars"
-                ));
-            }
-            let size = entry
-                .get("size")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| format!("artifact {name}: size must be a non-negative integer"))?;
-            Ok(ReleaseArtifactRecord { name, sha256, size })
-        })
-        .collect::<Result<_, String>>()?;
+    let mut artifacts: Vec<ReleaseArtifactRecord> =
+        body.get("artifacts")
+            .and_then(|v| v.as_array())
+            .ok_or("artifacts must be an array")?
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !valid_release_component(&name, RELEASE_ARTIFACT_NAME_MAX) {
+                    return Err(format!("invalid artifact name {:?}", name));
+                }
+                let sha256 = entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !valid_sha256_hex(&sha256) {
+                    return Err(format!(
+                        "artifact {name}: sha256 must be 64 lowercase hex chars"
+                    ));
+                }
+                let size = entry.get("size").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    format!("artifact {name}: size must be a non-negative integer")
+                })?;
+                Ok(ReleaseArtifactRecord { name, sha256, size })
+            })
+            .collect::<Result<_, String>>()?;
     if artifacts.is_empty() || artifacts.len() > RELEASE_ARTIFACT_LIMIT {
         return Err(format!(
             "artifacts must list 1-{RELEASE_ARTIFACT_LIMIT} files"
         ));
     }
     artifacts.sort_by(|a, b| a.name.cmp(&b.name));
-    if artifacts.windows(2).any(|pair| pair[0].name == pair[1].name) {
+    if artifacts
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
         return Err("artifact names must be unique".to_string());
     }
     let manifest_hash = release_manifest_hash_hex(&tag, &artifacts);
@@ -946,9 +961,7 @@ pub(crate) fn record_release_manifest(
             entry.kind == RELEASE_MANIFEST_KIND
                 && serde_json::from_str::<serde_json::Value>(&entry.leaf_json)
                     .ok()
-                    .and_then(|leaf| {
-                        leaf.get("tag").and_then(|t| t.as_str()).map(str::to_string)
-                    })
+                    .and_then(|leaf| leaf.get("tag").and_then(|t| t.as_str()).map(str::to_string))
                     .as_deref()
                     == Some(manifest.tag.as_str())
         });
@@ -1442,7 +1455,10 @@ mod tests {
         }
         let app = manifest.iter().find(|a| a.path == "/app.html").unwrap();
         assert_eq!(app.sha256, sha256_hex(b"hello"));
-        let kernel = manifest.iter().find(|a| a.path == "/vault-kernel.js").unwrap();
+        let kernel = manifest
+            .iter()
+            .find(|a| a.path == "/vault-kernel.js")
+            .unwrap();
         assert_eq!(kernel.sha256, sha256_hex(b"kernel"));
         // Deterministic: two computations agree (the pages embed only
         // the origin, never a timestamp or nonce).
@@ -1453,7 +1469,10 @@ mod tests {
         // The embedded route wins a path collision with the static root.
         std::fs::write(dir.path().join("logo.svg"), b"not the logo").unwrap();
         let with_collision = served_artifact_manifest(&config);
-        let logo = with_collision.iter().find(|a| a.path == "/logo.svg").unwrap();
+        let logo = with_collision
+            .iter()
+            .find(|a| a.path == "/logo.svg")
+            .unwrap();
         assert_eq!(logo.sha256, sha256_hex(LOGO_SVG.as_bytes()));
     }
 
@@ -1486,7 +1505,10 @@ mod tests {
             .find(|(_, e)| e.kind == ARTIFACT_MANIFEST_KIND)
             .unwrap();
         let leaf: serde_json::Value = serde_json::from_str(&entry.leaf_json).unwrap();
-        assert_eq!(leaf.get("kind").and_then(|v| v.as_str()), Some(ARTIFACT_MANIFEST_KIND));
+        assert_eq!(
+            leaf.get("kind").and_then(|v| v.as_str()),
+            Some(ARTIFACT_MANIFEST_KIND)
+        );
         assert!(leaf.get("unix_ms").and_then(|v| v.as_u64()).is_some());
         assert_eq!(
             leaf.get("bundle_version").and_then(|v| v.as_str()),
@@ -1504,7 +1526,11 @@ mod tests {
             "manifest_hash must recompute from the carried list"
         );
         assert_eq!(
-            artifacts.iter().find(|a| a.path == "/app.html").unwrap().sha256,
+            artifacts
+                .iter()
+                .find(|a| a.path == "/app.html")
+                .unwrap()
+                .sha256,
             sha256_hex(b"bundle-v2")
         );
 
@@ -1693,7 +1719,9 @@ mod tests {
         assert_eq!(leaf.get("tag").and_then(|v| v.as_str()), Some("v1.2.3"));
         assert_eq!(leaf.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
         assert_eq!(
-            leaf.get("platforms").and_then(|v| v.as_array()).map(Vec::len),
+            leaf.get("platforms")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
             Some(1)
         );
         let artifacts: Vec<ReleaseArtifactRecord> =
@@ -1740,7 +1768,11 @@ mod tests {
         let err = check_release_token(Some("s3cret"), &with_auth(Some("Bearer nope"))).unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         let err = check_release_token(Some("s3cret"), &with_auth(Some("s3cret"))).unwrap_err();
-        assert_eq!(err.status, StatusCode::UNAUTHORIZED, "bare token without Bearer");
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "bare token without Bearer"
+        );
         // The right bearer passes.
         assert!(check_release_token(Some("s3cret"), &with_auth(Some("Bearer s3cret"))).is_ok());
     }

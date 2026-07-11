@@ -342,6 +342,7 @@ enum TransferRequest {
     },
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     session_id: String,
     mut rtc: RTCPeerConnection<I>,
@@ -730,6 +731,7 @@ fn handle_transfer_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn stream_read_request(
     session_id: String,
     id: String,

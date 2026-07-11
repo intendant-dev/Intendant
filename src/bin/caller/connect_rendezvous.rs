@@ -328,11 +328,7 @@ fn normalize_claim_code(input: &str) -> String {
 /// page JS): SHA-256 of the normalized phrase, base64url unpadded.
 fn claim_code_hash(code: &str) -> String {
     crate::daemon_identity::b64u(
-        ring::digest::digest(
-            &ring::digest::SHA256,
-            normalize_claim_code(code).as_bytes(),
-        )
-        .as_ref(),
+        ring::digest::digest(&ring::digest::SHA256, normalize_claim_code(code).as_bytes()).as_ref(),
     )
 }
 
@@ -459,9 +455,7 @@ fn bootstrap_enroll_first_owner_at(
         role_id: Some("role:root".to_string()),
         user_id: (!account_user_id.is_empty()).then(|| account_user_id.to_string()),
         account_name: (!account_name.is_empty()).then(|| account_name.to_string()),
-        reason: Some(
-            "first-owner bootstrap: phrase-holder enrolled at claim time".to_string(),
-        ),
+        reason: Some("first-owner bootstrap: phrase-holder enrolled at claim time".to_string()),
         ..Default::default()
     };
     let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
@@ -575,7 +569,9 @@ pub fn spawn_connect_rendezvous_client(
     gateway_tcp_port: Option<u16>,
 ) {
     {
-        let mut state = client_state().lock().expect("connect client state poisoned");
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
         state.dashboard_control = Some(dashboard_control.clone());
         state.gateway_tcp_port = gateway_tcp_port;
     }
@@ -619,7 +615,9 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
         return Ok(false);
     }
     let (dashboard_control, gateway_tcp_port) = {
-        let state = client_state().lock().expect("connect client state poisoned");
+        let state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
         (state.dashboard_control.clone(), state.gateway_tcp_port)
     };
     let dashboard_control = dashboard_control
@@ -1007,9 +1005,7 @@ async fn register(
         // local phrase and register only its hash. `None` the moment an
         // owner exists — the service then reverts to minting its own
         // display-only codes.
-        bootstrap_code_hash: current_bootstrap_phrase()
-            .as_deref()
-            .map(claim_code_hash),
+        bootstrap_code_hash: current_bootstrap_phrase().as_deref().map(claim_code_hash),
     };
     authenticated(
         config,
@@ -1063,6 +1059,7 @@ async fn poll_next(
         .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn handle_event(
     client: &Client,
     base_url: &Url,
@@ -1206,8 +1203,7 @@ async fn handle_event(
                         // Prefer the account the device key itself attested
                         // (v2 signature); the relay-asserted identity is
                         // only the fallback hint.
-                        let (account_hint, account_attested) = match key.attested_account.as_ref()
-                        {
+                        let (account_hint, account_attested) = match key.attested_account.as_ref() {
                             Some((_, name)) if !name.is_empty() => (format!("@{name}"), true),
                             Some((user_id, _)) => {
                                 (user_id.chars().take(12).collect::<String>(), true)
@@ -1787,6 +1783,7 @@ same resolution + signing discipline as request_unclaim. */
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 
+#[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(
     daemon_id: &str,
     daemon_public_key: &str,
@@ -1798,6 +1795,7 @@ fn dns_publish_signing_payload(
     )
 }
 
+#[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_acme_signing_payload(
     daemon_id: &str,
     daemon_public_key: &str,
@@ -2417,8 +2415,7 @@ mod tests {
     fn bootstrap_enrolls_first_owner_only_with_a_valid_tag_on_a_fresh_box() {
         let dir = tempfile::tempdir().unwrap();
         let cert_dir = dir.path();
-        let phrase =
-            "legal-winner-thank-year-wave-sausage-worth-useful-legal-winner-thank-yellow";
+        let phrase = "legal-winner-thank-year-wave-sausage-worth-useful-legal-winner-thank-yellow";
         let mut raw = vec![0x04u8];
         raw.extend_from_slice(&[7u8; 64]);
         let client_key_b64u = crate::daemon_identity::b64u(&raw);
@@ -2431,13 +2428,8 @@ mod tests {
                 )
                 .as_ref(),
             );
-            let payload = bootstrap_tag_payload(
-                "daemon-1",
-                "DaemonPub",
-                &client_key_b64u,
-                "user-1",
-                "alice",
-            );
+            let payload =
+                bootstrap_tag_payload("daemon-1", "DaemonPub", &client_key_b64u, "user-1", "alice");
             crate::daemon_identity::b64u(ring::hmac::sign(&hmac_key, payload.as_bytes()).as_ref())
         };
 

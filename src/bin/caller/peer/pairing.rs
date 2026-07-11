@@ -555,8 +555,7 @@ fn cmd_set_profile(args: PeerArgs) -> Result<(), CallerError> {
         CallerError::Config("`intendant peer set-profile` requires --profile <NAME>".into())
     })?;
     let cert_dir = access::backend::select_backend().cert_dir();
-    let change =
-        crate::peer::access_policy::set_identity_profile(&cert_dir, &selector, &profile)?;
+    let change = crate::peer::access_policy::set_identity_profile(&cert_dir, &selector, &profile)?;
     println!(
         ":: peer identity {} ({}) profile: {} -> {}",
         change.record.fingerprint,
@@ -988,10 +987,7 @@ mod tests {
         let args = parse_args(&argv(&["request", "https://t", "--profile", "admin"])).unwrap();
         assert_eq!(args.profile.as_deref(), Some("peer-root"));
         let args = parse_args(&argv(&["set-profile", "aabb", "--profile", "spectator"])).unwrap();
-        assert_eq!(
-            args.profile.as_deref(),
-            Some("shared-session-spectator")
-        );
+        assert_eq!(args.profile.as_deref(), Some("shared-session-spectator"));
     }
 
     #[test]

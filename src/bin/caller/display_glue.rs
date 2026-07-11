@@ -870,8 +870,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -916,8 +921,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -1113,7 +1123,7 @@ pub(crate) const CU_TASK_MAX_TURNS: usize = 20;
 /// Result of an ephemeral CU task.
 pub(crate) enum CuTaskResult {
     /// Task completed by the CU agent.
-    Completed(LoopStats),
+    Completed(Box<LoopStats>),
     /// CU agent determined this isn't a display task; escalate to the full agent.
     Escalate { task: String },
 }
@@ -1422,7 +1432,7 @@ pub(crate) async fn run_cu_task(
         }
     }
 
-    Ok(CuTaskResult::Completed(stats))
+    Ok(CuTaskResult::Completed(Box::new(stats)))
 }
 
 /// Execute native computer-use tool calls via the platform-native executor

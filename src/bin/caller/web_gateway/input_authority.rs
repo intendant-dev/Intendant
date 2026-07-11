@@ -91,7 +91,11 @@ impl DisplayInputHolder {
     /// `(federation_connection_id, session_id)` pair. Used by the
     /// federated input gate (in F-2) and the federated close-cleanup
     /// path.
-    pub(crate) fn matches_federated(&self, federation_connection_id: &str, session_id: &str) -> bool {
+    pub(crate) fn matches_federated(
+        &self,
+        federation_connection_id: &str,
+        session_id: &str,
+    ) -> bool {
         match self {
             Self::FederatedWebRtc {
                 federation_connection_id: c,
@@ -1107,7 +1111,7 @@ pub(crate) fn compute_bootstrap_authority_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web_gateway::tests::{seed_holder};
+    use crate::web_gateway::tests::seed_holder;
 
     // ---------------------------------------------------------------
     // Phase 5a.1: input-authority closure semantics + emission tests
@@ -2327,7 +2331,6 @@ mod tests {
     // hashes to the same PeerId on both the Offer (insert) and the
     // WS-close (cleanup) sides.
     // ---------------------------------------------------------------
-
 
     /// Distinct `session_id`s map to distinct `PeerId`s in
     /// practice. (`u64` hash collisions are theoretically possible

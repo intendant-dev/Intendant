@@ -2381,10 +2381,7 @@ mod tests {
             BodyPolicy::None
         );
         assert_eq!(policy("DELETE", "/api/transfers/j1"), BodyPolicy::None);
-        assert_eq!(
-            policy("POST", "/api/transfers/j1/delete"),
-            BodyPolicy::None
-        );
+        assert_eq!(policy("POST", "/api/transfers/j1/delete"), BodyPolicy::None);
     }
 
     #[test]
@@ -2437,17 +2434,29 @@ mod tests {
         // routing-neutral; it exists to give list and raw their own
         // datachannel twins.
         let (route, captures) = match_route("GET", "/api/session/current/uploads").unwrap();
-        assert_eq!(route.pattern, PathPattern::Exact("/api/session/current/uploads"));
+        assert_eq!(
+            route.pattern,
+            PathPattern::Exact("/api/session/current/uploads")
+        );
         assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
-        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_uploads"));
+        assert_eq!(
+            route.tunnel.as_ref().map(|spec| spec.name),
+            Some("api_session_current_uploads")
+        );
         assert!(captures.is_empty());
         let (route, captures) = match_route("GET", "/api/session/current/uploads/u1/raw").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
-        assert_eq!(route.tunnel.as_ref().map(|spec| spec.name), Some("api_session_current_upload_raw"));
+        assert_eq!(
+            route.tunnel.as_ref().map(|spec| spec.name),
+            Some("api_session_current_upload_raw")
+        );
         assert_eq!(captures, vec!["u1"]);
         let (route, _) = match_route("GET", "/api/session/current/uploads/u1/other").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentUploadsGet);
-        assert_eq!(route.pattern, PathPattern::Under("/api/session/current/uploads"));
+        assert_eq!(
+            route.pattern,
+            PathPattern::Under("/api/session/current/uploads")
+        );
         assert!(route.tunnel.is_none());
         // Agent-output: current-exact row first, then the by-id row.
         let (route, _) = match_route("POST", "/api/session/current/agent-output").unwrap();
@@ -2567,11 +2576,9 @@ mod tests {
             ),
         ] {
             match classify(method, path) {
-                TableClassification::Matched(matched) => assert_eq!(
-                    matched,
-                    Some(op),
-                    "{method} {path} must classify {op:?}"
-                ),
+                TableClassification::Matched(matched) => {
+                    assert_eq!(matched, Some(op), "{method} {path} must classify {op:?}")
+                }
                 TableClassification::NoMatch => {
                     panic!("{method} {path} must classify via table")
                 }
@@ -2673,7 +2680,12 @@ mod tests {
     fn peers_family_tunnel_ops_assert_against_the_federation_ladder() {
         use crate::peer::access_policy::{federation_http_operation, PeerOperation as Op};
         let expected: &[(&str, &str, &str, Op)] = &[
-            ("api_peer_pairing_invite", "POST", "/api/peers/pairing/invite", Op::AccessManage),
+            (
+                "api_peer_pairing_invite",
+                "POST",
+                "/api/peers/pairing/invite",
+                Op::AccessManage,
+            ),
             (
                 "api_peer_pairing_request_access",
                 "POST",
@@ -2710,15 +2722,45 @@ mod tests {
                 "/api/peers/pairing/requests/{code}/{decision}",
                 Op::AccessManage,
             ),
-            ("api_peer_pairing_join", "POST", "/api/peers/pairing/join", Op::PeerManage),
+            (
+                "api_peer_pairing_join",
+                "POST",
+                "/api/peers/pairing/join",
+                Op::PeerManage,
+            ),
             ("api_peers", "GET", "/api/peers", Op::PeerInspect),
             ("api_peer_add", "POST", "/api/peers", Op::PeerManage),
             ("api_peer_remove", "DELETE", "/api/peers", Op::PeerManage),
-            ("api_peer_eligible", "GET", "/api/peers/eligible", Op::PeerInspect),
-            ("api_peer_message", "POST", "/api/peers/{peer_id}/message", Op::PeerUse),
-            ("api_peer_task", "POST", "/api/peers/{peer_id}/task", Op::PeerUse),
-            ("api_peer_approval", "POST", "/api/peers/{peer_id}/approval", Op::PeerUse),
-            ("api_peer_webrtc_signal", "POST", "/api/peers/{peer_id}/webrtc", Op::PeerUse),
+            (
+                "api_peer_eligible",
+                "GET",
+                "/api/peers/eligible",
+                Op::PeerInspect,
+            ),
+            (
+                "api_peer_message",
+                "POST",
+                "/api/peers/{peer_id}/message",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_task",
+                "POST",
+                "/api/peers/{peer_id}/task",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_approval",
+                "POST",
+                "/api/peers/{peer_id}/approval",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_webrtc_signal",
+                "POST",
+                "/api/peers/{peer_id}/webrtc",
+                Op::PeerUse,
+            ),
             (
                 "api_peer_file_transfer_signal",
                 "POST",

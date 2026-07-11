@@ -186,16 +186,61 @@ enum Prev {
 /// "reference" to them is harmless because no fragment `let`-declares them,
 /// and treating them as keywords would break their identifier uses.
 const KEYWORDS: &[&str] = &[
-    "var", "let", "const", "function", "class", "return", "if", "else", "for", "while", "do",
-    "switch", "case", "default", "break", "continue", "new", "delete", "typeof", "instanceof",
-    "void", "in", "this", "super", "null", "true", "false", "try", "catch", "finally", "throw",
-    "await", "yield", "extends", "import", "export", "debugger", "with",
+    "var",
+    "let",
+    "const",
+    "function",
+    "class",
+    "return",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "new",
+    "delete",
+    "typeof",
+    "instanceof",
+    "void",
+    "in",
+    "this",
+    "super",
+    "null",
+    "true",
+    "false",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "await",
+    "yield",
+    "extends",
+    "import",
+    "export",
+    "debugger",
+    "with",
 ];
 
 /// Keywords after which a `/` starts a regex literal (not division).
 const REGEX_AFTER_KEYWORD: &[&str] = &[
-    "return", "typeof", "case", "in", "instanceof", "new", "delete", "void", "do", "else",
-    "throw", "await", "yield",
+    "return",
+    "typeof",
+    "case",
+    "in",
+    "instanceof",
+    "new",
+    "delete",
+    "void",
+    "do",
+    "else",
+    "throw",
+    "await",
+    "yield",
 ];
 
 /// Declarator-list state for `var`/`let`/`const`.
@@ -831,8 +876,7 @@ impl Scanner<'_> {
         let depth = self.stack.len();
         self.arrow_exprs.retain(|d| *d != depth);
         if let Some(decl) = &mut self.decl {
-            if depth == decl.depth
-                && matches!(decl.mode, DeclMode::AfterBinding | DeclMode::InInit)
+            if depth == decl.depth && matches!(decl.mode, DeclMode::AfterBinding | DeclMode::InInit)
             {
                 decl.mode = DeclMode::AwaitBinding;
             }
@@ -1033,7 +1077,10 @@ mod tests {
             ("50-b.js", "let laterFlag = false;\n"),
         ])
         .unwrap_err();
-        assert!(err.contains("laterFlag") && err.contains("40-a.js:2"), "{err}");
+        assert!(
+            err.contains("laterFlag") && err.contains("40-a.js:2"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1152,7 +1199,10 @@ mod tests {
                     "function measure() { return { width: 1, height: 2 }; }\n",
                 ),
             ),
-            ("50-b.js", "let k = 1;\nlet v = 2;\nlet width = 3;\nlet h = 4;\n"),
+            (
+                "50-b.js",
+                "let k = 1;\nlet v = 2;\nlet width = 3;\nlet h = 4;\n",
+            ),
         ])
         .unwrap();
     }
