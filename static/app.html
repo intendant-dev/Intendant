@@ -26122,8 +26122,11 @@ async function accessFleetRefreshProvenance() {
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
 // staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
-// external-agents, displays), and the F4 access dialogs family
-// (overview/enrollment/connect/tier + IAM grant writes); the remaining
+// external-agents, displays), the F4 access dialogs family
+// (overview/enrollment/connect/tier + IAM grant writes), and the F5
+// peers/approvals/coordinator family (peer list + quick controls, the
+// pairing dialogs, the coordinator forms, and the peer WebRTC signal
+// relays); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -26161,7 +26164,11 @@ async function accessFleetRefreshProvenance() {
 // fleet-cert request, dashboard targets) plus the org set (trust/revoke,
 // issuance, issuer key management, and the signed-org doorbell quartet —
 // present, renew, ORL read, ORL apply, whose HTTP rows are Public by
-// design: the signed document is the authorization). The
+// design: the signed document is the authorization), and the F5 peers /
+// coordinator family (the peer registry list/add/remove, eligible,
+// quick controls — message/task/approval, the three WebRTC signal
+// relays, the pairing set, and the coordinator route; their rows
+// delegate IAM to the federation ladder, S7). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -26172,6 +26179,10 @@ async function accessFleetRefreshProvenance() {
 // lifted into the query string (arrays comma-join; empty arrays stay
 // absent), `queryJson` = query keys whose array value JSON-encodes instead
 // (the search `projects` filter, which the HTTP handler serde-parses),
+// `queryRepeat` = query-key -> array-param-key map emitting one
+// `key=value` pair per element (the eligible endpoint's repeated
+// `?capability=` keys from the tunnel's `capabilities` array; empty
+// arrays stay absent),
 // `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
@@ -26237,6 +26248,31 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_access_org_renew: { verb: 'POST', path: '/api/access/org-grants/renew' },
   api_access_org_orl: { verb: 'GET', path: '/api/access/orgs/{org_handle}/revocations', alias: { org_handle: 'handle' } },
   api_access_org_orl_apply: { verb: 'POST', path: '/api/access/orgs/revocations/apply' },
+  api_peers: { verb: 'GET', path: '/api/peers' },
+  api_peer_add: { verb: 'POST', path: '/api/peers' },
+  api_peer_remove: { verb: 'DELETE', path: '/api/peers' },
+  api_peer_eligible: { verb: 'GET', path: '/api/peers/eligible', queryRepeat: { capability: 'capabilities' } },
+  api_peer_message: { verb: 'POST', path: '/api/peers/{peer_id}/message' },
+  api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
+  api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
+  api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
+  api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
+  api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },
+  api_peer_pairing_invite: { verb: 'POST', path: '/api/peers/pairing/invite' },
+  api_peer_pairing_join: { verb: 'POST', path: '/api/peers/pairing/join' },
+  api_peer_pairing_request_access: { verb: 'POST', path: '/api/peers/pairing/request-access' },
+  api_peer_pairing_request_access_poll: { verb: 'POST', path: '/api/peers/pairing/request-access/poll' },
+  api_peer_pairing_requests: { verb: 'GET', path: '/api/peers/pairing/requests' },
+  api_peer_pairing_request_decision: { verb: 'POST', path: '/api/peers/pairing/requests/{code}/{decision}', alias: { code: 'request_id', decision: 'op' } },
+  api_peer_pairing_identities: { verb: 'GET', path: '/api/peers/pairing/identities' },
+  api_peer_pairing_identity_revoke: { verb: 'POST', path: '/api/peers/pairing/identities/revoke' },
+  // The coordinator twin carries the program's one live per-lane IAM
+  // divergence, preserved on purpose: the HTTP row classifies through the
+  // federation ladder as Task, while the datachannel method has always
+  // gated on PeerManage (documented op-override on the route row). The
+  // descriptor only names the twin's verb + path — it must not paper over
+  // that divergence, and the daemon-side parity pin asserts the override.
+  api_coordinator_route: { verb: 'POST', path: '/api/coordinator/route' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -26452,6 +26488,19 @@ function daemonApiHttpTarget(spec, method, params) {
     }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
+  // queryRepeat twins: the tunnel method takes an array param; the HTTP
+  // twin takes one repeated `key=value` pair per element (the eligible
+  // endpoint's `?capability=` vocabulary — its server parser rejects
+  // comma-joins, so these keys never ride the `query` lift).
+  for (const [key, paramKey] of Object.entries(spec.queryRepeat || {})) {
+    const value = source[paramKey];
+    used.add(paramKey);
+    if (!Array.isArray(value)) continue;
+    for (const element of value) {
+      if (element === undefined || element === null || String(element) === '') continue;
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(element))}`);
+    }
+  }
   // rawQuery twins: the tunnel method takes one pre-encoded query-string
   // param (the managed-context handlers rebuild a request line from it);
   // the HTTP twin takes that same string as the URL query verbatim.
@@ -26478,8 +26527,11 @@ async function daemonApiHttpRequest(method, params, opts) {
   if (opts && opts.cache) init.cache = opts.cache;
   // Body-less POST twins stay body-less (api_worktrees_scan rides a
   // BodyPolicy::None row, and every legacy empty-payload POST call site
-  // sent no body/Content-Type either).
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // sent no body/Content-Type either). DELETE twins carry their leftover
+  // params the same way: api_peer_remove's HTTP shape has always been a
+  // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
+  // consume their params into the path and stay body-less).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -26693,7 +26745,10 @@ async function daemonApiRemoteHttpRequest(origin, method, params, opts) {
   }
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, mode: 'cors', signal: daemonApiRemoteHttpSignal(method, opts) };
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // Same body rule as the local adapter: mutation verbs carry leftover
+  // params as the JSON body (no fleet-CORS DELETE twin exists today, but
+  // the adapters must agree on the descriptor's semantics).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -65759,34 +65814,32 @@ class DashboardTransport {
     );
   }
 
+  // The two peer signal relays (transport F5). Signaling is a
+  // delivered-once mutation: the facade derives no-replay from the POST
+  // verb (§3.7 — never replayed over HTTP after a tunnel attempt that MAY
+  // have reached the daemon, the exact legacy fallbackAfterRpcFailure:false
+  // semantics; Connect mode never uses HTTP), while a dashboard with no
+  // tunnel at all still signals over direct HTTP — that pre-attempt lane
+  // is how peer tunnels bootstrap on direct/mTLS dashboards. Both return
+  // the facade envelope {ok, status, body}.
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_file_transfer_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   peerDashboardControlSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_dashboard_control_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -68563,6 +68616,8 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
   }
 
   async sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerDashboardControlSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -68570,8 +68625,7 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -68751,6 +68805,14 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_session_detail':
       return 15000;
+    // Peer quick controls cross the federation transport and wait for the
+    // remote daemon's ack — the generic 5 s default was sized for local
+    // reads, not a peer round trip (transport F5's deliberate
+    // normalization; the legacy HTTP lane ran signal-less).
+    case 'api_peer_message':
+    case 'api_peer_task':
+    case 'api_peer_approval':
+      return 30000;
     default:
       return 5000;
   }
@@ -69705,23 +69767,13 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    let data = null;
-    if (dashboardTransport?.canUseRpc()) {
-      try {
-        data = await dashboardTransport.request('api_peers');
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
-      }
-    }
-    if (!data && dashboardConnectModeEnabled()) {
-      throw new Error('Peer list is unavailable until dashboard access reconnects');
-    }
-    if (!data) {
-      const resp = await authedFetch('/api/peers');
-      if (!resp.ok) return;
-      data = await resp.json();
-    }
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy, never HTTP in Connect mode — the exact
+    // legacy tri-form this replaces. A delivered error response leaves
+    // the stale list in place, like the legacy !resp.ok return did.
+    const resp = await daemonApi.request('api_peers');
+    if (!resp.ok) return;
+    const data = resp.body || {};
     if (!data.peers || !Array.isArray(data.peers)) return;
 
     // Build the new daemon entries from the API response via the
@@ -70103,13 +70155,6 @@ function applyDaemonExpandedState(hostId, expanded) {
     btn.title = expanded ? 'Hide peer controls' : 'Show peer controls';
   }
 }
-
-// POST a message to a peer via /api/peers/{id}/message and surface
-// the result in the row's status line. The peer id is embedded in
-// the URL path verbatim — colons are valid path chars per RFC 3986
-// and the server-side parser splits on the literal `:` to recover
-// the kind prefix; URL-encoding `:` as `%3A` would break the lookup
-// because the registry keys on the un-encoded id.
 /* ── static/app/51-peer-approvals.js ── */
 // ── Per-peer pending approvals ──
 //
@@ -70198,23 +70243,22 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
     : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_approval', {
+    // Approval decisions are mutations (transport F5): the facade derives
+    // no-replay from the POST verb — never re-delivered over HTTP after a
+    // tunnel attempt that may have reached the daemon, no retries, params
+    // unchanged (peer_id lifts into the HTTP twin's path).
+    const resp = await daemonApi.request('api_peer_approval', {
       peer_id: hostId,
       request_id: approvalId,
       decision,
-    }, () => authedFetch(`/api/peers/${hostId}/approval`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: approvalId, decision }),
-    }), 'api_peer_approval', { fallbackAfterRpcFailure: false });
+    });
     if (resp.ok) {
       // Optimistic removal. The peer will eventually emit
       // `approval_resolved` over the secondary stream which would
       // also remove it; doing it here keeps the UI snappy.
       removePendingApproval(hostId, approvalId);
     } else {
-      const result = await resp.json().catch(() => ({}));
-      console.error(`approval failed for ${hostId}#${approvalId}: ${result.error || resp.status}`);
+      console.error(`approval failed for ${hostId}#${approvalId}: ${resp.body?.error || resp.status}`);
       if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
     }
   } catch (e) {
@@ -70259,23 +70303,16 @@ async function submitPeerInput(hostId, kind) {
     statusEl.className = 'daemon-msg-status';
   }
 
-  const url = kind === 'task'
-    ? `/api/peers/${hostId}/task`
-    : `/api/peers/${hostId}/message`;
-  const body = kind === 'task'
-    ? JSON.stringify({ instructions: text })
-    : JSON.stringify({ text });
   const rpcMethod = kind === 'task' ? 'api_peer_task' : 'api_peer_message';
   const rpcParams = kind === 'task'
     ? { peer_id: hostId, instructions: text }
     : { peer_id: hostId, text };
   try {
-    const resp = await dashboardTransport.jsonFetch(rpcMethod, rpcParams, () => authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    }), rpcMethod, { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Outbound peer ops are mutations (transport F5): verb-derived
+    // no-replay, no retries; peer_id lifts into the HTTP twin's path so
+    // the body keeps its legacy `{instructions}` / `{text}` shape.
+    const resp = await daemonApi.request(rpcMethod, rpcParams);
+    const result = resp.body || {};
     if (!resp.ok) {
       if (statusEl) {
         statusEl.textContent = `Failed: ${result.error || `HTTP ${resp.status}`}`;
@@ -73285,6 +73322,8 @@ class PeerFileTransferConnection {
   }
 
   async _sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerFileTransferSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -73292,8 +73331,7 @@ class PeerFileTransferConnection {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer file-transfer signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer file-transfer signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 

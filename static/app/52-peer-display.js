@@ -1404,6 +1404,8 @@ class PeerFileTransferConnection {
   }
 
   async _sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerFileTransferSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -1411,8 +1413,7 @@ class PeerFileTransferConnection {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer file-transfer signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer file-transfer signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 

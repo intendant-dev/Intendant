@@ -85,23 +85,22 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
     : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_approval', {
+    // Approval decisions are mutations (transport F5): the facade derives
+    // no-replay from the POST verb — never re-delivered over HTTP after a
+    // tunnel attempt that may have reached the daemon, no retries, params
+    // unchanged (peer_id lifts into the HTTP twin's path).
+    const resp = await daemonApi.request('api_peer_approval', {
       peer_id: hostId,
       request_id: approvalId,
       decision,
-    }, () => authedFetch(`/api/peers/${hostId}/approval`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: approvalId, decision }),
-    }), 'api_peer_approval', { fallbackAfterRpcFailure: false });
+    });
     if (resp.ok) {
       // Optimistic removal. The peer will eventually emit
       // `approval_resolved` over the secondary stream which would
       // also remove it; doing it here keeps the UI snappy.
       removePendingApproval(hostId, approvalId);
     } else {
-      const result = await resp.json().catch(() => ({}));
-      console.error(`approval failed for ${hostId}#${approvalId}: ${result.error || resp.status}`);
+      console.error(`approval failed for ${hostId}#${approvalId}: ${resp.body?.error || resp.status}`);
       if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
     }
   } catch (e) {
@@ -146,23 +145,16 @@ async function submitPeerInput(hostId, kind) {
     statusEl.className = 'daemon-msg-status';
   }
 
-  const url = kind === 'task'
-    ? `/api/peers/${hostId}/task`
-    : `/api/peers/${hostId}/message`;
-  const body = kind === 'task'
-    ? JSON.stringify({ instructions: text })
-    : JSON.stringify({ text });
   const rpcMethod = kind === 'task' ? 'api_peer_task' : 'api_peer_message';
   const rpcParams = kind === 'task'
     ? { peer_id: hostId, instructions: text }
     : { peer_id: hostId, text };
   try {
-    const resp = await dashboardTransport.jsonFetch(rpcMethod, rpcParams, () => authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    }), rpcMethod, { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Outbound peer ops are mutations (transport F5): verb-derived
+    // no-replay, no retries; peer_id lifts into the HTTP twin's path so
+    // the body keeps its legacy `{instructions}` / `{text}` shape.
+    const resp = await daemonApi.request(rpcMethod, rpcParams);
+    const result = resp.body || {};
     if (!resp.ok) {
       if (statusEl) {
         statusEl.textContent = `Failed: ${result.error || `HTTP ${resp.status}`}`;
