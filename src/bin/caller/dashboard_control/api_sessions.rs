@@ -855,7 +855,10 @@ pub(crate) async fn api_session_current_upload_task_response(
     upload: InboundUploadState,
     runtime: ControlRuntime,
 ) -> ControlTaskResponse {
-    let params = upload.params.clone();
+    // The tunnel edge of the Streaming lane (S8): frame params parsed
+    // here in their wire form, the spool handed to the same neutral
+    // commit the HTTP staged-upload POST feeds its socket spool.
+    let (params, body) = upload.into_spooled_body();
     let name = optional_string_param(&params, &["name", "filename", "file_name"])
         .unwrap_or_else(|| "upload.bin".to_string());
     let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
@@ -883,8 +886,7 @@ pub(crate) async fn api_session_current_upload_task_response(
             &name,
             &mime,
             requested_destination,
-            upload.tmp,
-            upload.received_bytes,
+            body,
             &bus,
         )
     })
@@ -1388,8 +1390,10 @@ mod tests {
             "listed.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -1423,8 +1427,10 @@ mod tests {
             "raw.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -1513,8 +1519,10 @@ mod tests {
             "projectless.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -2329,8 +2337,10 @@ mod tests {
                 "parity.txt",
                 "text/plain",
                 crate::upload_store::UploadDestination::Task,
-                tmp,
-                payload.len(),
+                crate::web_gateway::SpooledBody {
+                    tmp,
+                    len: payload.len(),
+                },
                 &rt.bus,
             ),
         );

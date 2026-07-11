@@ -1192,17 +1192,10 @@ pub(crate) struct ControlRuntime {
     state_root: PathBuf,
 }
 
-#[derive(Debug)]
-pub(crate) struct DashboardMediaClipOperation {
-    stream: String,
-    note: String,
-    inject: bool,
-    in_secs: f64,
-    out_secs: f64,
-    fps: u32,
-    expected_frames: usize,
-    frames: Vec<(String, String)>,
-}
+// The clip-operation type moved to web_gateway::media_store
+// (transport-unification S8): the /ws lane accumulates with the same
+// type the tunnel's media_clip_ops map stores.
+pub(crate) use crate::web_gateway::DashboardMediaClipOperation;
 
 pub(crate) enum ControlCommand {
     AddIceCandidate(String),
@@ -1264,6 +1257,24 @@ pub(crate) struct InboundUploadState {
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
+}
+
+impl InboundUploadState {
+    /// The upload-frame spool as the Streaming lane's common handle
+    /// (transport-unification S8): the frame params plus the spooled
+    /// bytes, for handlers that commit the spool wholesale — the staged
+    /// upload today, the S9 transfer-chunk appends next. The media
+    /// handlers keep reading the tempfile in-memory instead (their
+    /// stores take byte slices).
+    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
+        (
+            self.params,
+            crate::web_gateway::SpooledBody {
+                tmp: self.tmp,
+                len: self.received_bytes,
+            },
+        )
+    }
 }
 
 pub(crate) struct OutboundControlQueue {

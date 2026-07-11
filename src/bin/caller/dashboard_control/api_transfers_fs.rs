@@ -1800,8 +1800,10 @@ mod tests {
             "raw.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");

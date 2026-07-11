@@ -34,6 +34,9 @@ pub(crate) use api_core::*;
 mod session_catalog;
 pub(crate) use session_catalog::*;
 
+mod media_store;
+pub(crate) use media_store::*;
+
 mod routes_files;
 pub(crate) use routes_files::*;
 

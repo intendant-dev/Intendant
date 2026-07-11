@@ -283,10 +283,11 @@ mod host_header_tests {
 /// Stream the body of an HTTP request into a fresh tempfile, honouring
 /// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
 ///
-/// Returns `(tempfile, size)` on success. Designed so the caller can then
-/// commit the tempfile into the upload store via
-/// [`crate::upload_store::commit_upload`], which atomically renames it
-/// into place.
+/// Returns the [`SpooledBody`] handle on success — the HTTP side of the
+/// Streaming lane (transport-unification S8): the tunnel's upload-frame
+/// spool ends in the same handle, and the shared neutral fns commit it
+/// into the store via [`crate::upload_store::commit_upload`], which
+/// atomically renames it into place.
 ///
 /// This is the binary counterpart to `read_request_body_capped` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
@@ -295,7 +296,7 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     initial_request_bytes: &[u8],
     stream: &mut S,
     max_bytes: usize,
-) -> Result<(tempfile::NamedTempFile, usize), String> {
+) -> Result<SpooledBody, String> {
     use std::io::Write;
     use tokio::io::AsyncReadExt;
 
@@ -352,7 +353,7 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     tmp.as_file_mut()
         .flush()
         .map_err(|e| format!("flush tempfile: {e}"))?;
-    Ok((tmp, written))
+    Ok(SpooledBody { tmp, len: written })
 }
 
 pub(crate) fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
