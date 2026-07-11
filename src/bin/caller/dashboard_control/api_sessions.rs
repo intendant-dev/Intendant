@@ -18,41 +18,57 @@ pub(crate) fn spawn_control_request(
     let cancel = CancellationToken::new();
     pending_requests.insert(id.clone(), cancel.clone());
     tokio::spawn(async move {
-        let response = match method.as_str() {
-            "api_session_report" => {
-                api_session_report_task_response(id.clone(), params.as_ref(), &runtime).await
-            }
-            "api_session_current_upload_raw" => {
-                api_session_current_upload_raw_task_response(id.clone(), params.as_ref(), &runtime)
-                    .await
-            }
-            "api_recording_asset" => {
-                api_recording_asset_task_response(id.clone(), params.as_ref(), &runtime).await
-            }
-            "api_session_recording_asset" => {
-                api_session_recording_asset_task_response(id.clone(), params.as_ref()).await
-            }
-            "api_session_frame_asset" => {
-                api_session_frame_asset_task_response(id.clone(), params.as_ref()).await
-            }
-            "api_fs_read" => api_fs_read_task_response(id.clone(), params.as_ref()).await,
-            "api_transfer_download_read" => {
-                api_transfer_download_read_task_response(id.clone(), params.as_ref(), &runtime)
-                    .await
-            }
-            _ => {
-                let frame =
-                    control_request_response(id.clone(), method, params, runtime, cancel).await;
-                ControlTaskResponse {
-                    id,
-                    frame,
-                    byte_stream: None,
-                    done: true,
-                }
-            }
-        };
+        let response = control_request_response(id, method, params, runtime, cancel).await;
         let _ = task_tx.send(response).await;
     });
+}
+
+/// The spawned request lane's one method→handler binding
+/// (transport-unification S11): byte-capable methods answer as complete
+/// task responses (`byte_stream_*` sequences, with their JSON error
+/// shapes riding the same task envelope); every other declared method
+/// produces its single JSON response frame through
+/// [`control_request_frame`], wrapped into the task envelope once at
+/// this seam. Each arm's body is the tunnel's transport edge — param
+/// decode, ambient resolution, the lane adapter — around the shared
+/// neutral core.
+pub(crate) async fn control_request_response(
+    id: String,
+    method: String,
+    params: Option<serde_json::Value>,
+    runtime: ControlRuntime,
+    cancel: CancellationToken,
+) -> ControlTaskResponse {
+    match method.as_str() {
+        "api_session_report" => {
+            api_session_report_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_session_current_upload_raw" => {
+            api_session_current_upload_raw_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_recording_asset" => {
+            api_recording_asset_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_session_recording_asset" => {
+            api_session_recording_asset_task_response(id, params.as_ref()).await
+        }
+        "api_session_frame_asset" => {
+            api_session_frame_asset_task_response(id, params.as_ref()).await
+        }
+        "api_fs_read" => api_fs_read_task_response(id, params.as_ref()).await,
+        "api_transfer_download_read" => {
+            api_transfer_download_read_task_response(id, params.as_ref(), &runtime).await
+        }
+        _ => {
+            let frame = control_request_frame(id.clone(), method, params, runtime, cancel).await;
+            ControlTaskResponse {
+                id,
+                frame,
+                byte_stream: None,
+                done: true,
+            }
+        }
+    }
 }
 
 pub(crate) fn spawn_control_stream(
@@ -160,7 +176,12 @@ pub(crate) async fn api_access_connect_unclaim_response(
     )
 }
 
-pub(crate) async fn control_request_response(
+/// The JSON half of the spawned lane's binding: one arm per method,
+/// each producing the single `response` frame its wire shape has always
+/// been. Split from [`control_request_response`] so the byte-capable
+/// arms above can keep the task-response envelope without re-wrapping
+/// every JSON arm.
+pub(crate) async fn control_request_frame(
     id: String,
     method: String,
     params: Option<serde_json::Value>,
