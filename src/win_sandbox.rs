@@ -351,11 +351,14 @@ fn remove_restricted_ace(path: &Path, mask: u32) -> Result<(), String> {
     let mut removed = false;
     // Iterate downward so DeleteAce index shifts don't skip entries.
     for i in (0..info.AceCount).rev() {
-        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: index is within AceCount for this ACL.
-        if unsafe { GetAce(dacl, i, &mut ace_ptr) }.is_err() {
+        let mut ace_out = std::mem::MaybeUninit::<*mut std::ffi::c_void>::uninit();
+        // SAFETY: index is within AceCount for this ACL; on success GetAce
+        // initializes the output pointer.
+        if unsafe { GetAce(dacl, i, ace_out.as_mut_ptr()) }.is_err() {
             continue;
         }
+        // SAFETY: a successful GetAce call initializes its output pointer.
+        let ace_ptr = unsafe { ace_out.assume_init() };
         if ace_ptr.is_null() {
             continue;
         }
