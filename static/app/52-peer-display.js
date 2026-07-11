@@ -2013,6 +2013,15 @@ function renderPeerAccessRequests(requests) {
     const pending = status === 'pending';
     const requestedProfile = req.approved_profile || req.requested_profile || 'read-only-display';
     const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
+    // Cross-owner tier claim (docs/src/trust-tiers.md § Where fleet
+    // metadata rides): the daemon stores requester_tier only when the
+    // claim was signed inside a verified caller-ID, so presence here
+    // already means "pinned to a proven daemon key". Unverified and
+    // legacy callers carry no claim and render exactly as before.
+    const requesterTier = String(req.requester_tier || '').trim();
+    // THE upward-grant alarm case: a self-declared disposable machine
+    // asking for authority on this integrated one.
+    const upwardAlarm = pending && integratedTier && requesterTier === 'disposable';
     return `
       <div class="daemon-access-request-card">
         <div class="daemon-access-request-head">
@@ -2021,7 +2030,10 @@ function renderPeerAccessRequests(requests) {
         </div>
         <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - ${roleLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-access-request-meta daemon-role-summary">${escapeHtml(role.summary)}</div>
-        ${pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : ''}
+        ${requesterTier ? `<div class="daemon-access-request-meta" title="Stated by the requesting daemon inside its verified caller-ID signature — stored and shown only because the signature checked out.">requester says: ${escapeHtml(requesterTier)}</div>` : ''}
+        ${upwardAlarm
+          ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. Approving would hand a disposable box authority on this integrated one — the tier bridge the doctrine warns about.">⚠ Upward grant: this is a disposable machine asking for authority on an integrated one. Approving bridges your tiers.</div>'
+          : (pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : '')}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
         ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
