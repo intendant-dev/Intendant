@@ -649,13 +649,14 @@ function invalidateAccessOverview() {
 
 async function refreshAccessOverviewFromApi(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_overview', {}, () => authedFetch('/api/access/overview', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — tunnel first, direct HTTP per
+    // the read fallback policy; Connect mode never falls back.
+    const resp = await daemonApi.request('api_access_overview', {}, {
       signal: options.signal,
-    }), 'api_access_overview', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/overview returned ${resp.status}`);
-    const payload = await resp.json();
-    return applyAccessOverview(payload);
+    return applyAccessOverview(resp.body);
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
     if (!options.silent) {
@@ -671,13 +672,13 @@ let accessPendingEnrollments = [];
 
 async function refreshAccessEnrollments(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_enrollment_requests', {}, () => authedFetch('/api/access/enrollment-requests', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_access_enrollment_requests', {}, {
       signal: options.signal,
-    }), 'api_access_enrollment_requests', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/enrollment-requests returned ${resp.status}`);
-    const payload = await resp.json();
-    const requests = Array.isArray(payload?.requests) ? payload.requests : [];
+    const requests = Array.isArray(resp.body?.requests) ? resp.body.requests : [];
     const changed = JSON.stringify(requests) !== JSON.stringify(accessPendingEnrollments);
     accessPendingEnrollments = requests;
     if (changed) renderAccessAdminSummaries();
@@ -695,12 +696,13 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
   const payload = { fingerprint, approve };
   if (approve && roleId) payload.role_id = roleId;
   try {
-    const resp = await dashboardJsonFetch('api_access_enrollment_decide', payload, () => authedFetch('/api/access/enrollment-requests/decide', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_enrollment_decide', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — the fallback policy derives
+    // no-replay from the verb, exactly the legacy
+    // fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt
+    // is never replayed over HTTP; with no tunnel the write goes direct).
+    // IAM-mutating write: the payload shape is unchanged, no retries.
+    const resp = await daemonApi.request('api_access_enrollment_decide', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
   } catch (err) {
@@ -720,12 +722,13 @@ let accessConnectStatus = null;
 
 async function refreshAccessConnectStatus(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_status', {}, () => authedFetch('/api/access/connect/status', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_access_connect_status', {}, {
       signal: options.signal,
-    }), 'api_access_connect_status', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/connect/status returned ${resp.status}`);
-    const payload = await resp.json();
+    const payload = resp.body;
     const changed = JSON.stringify(payload) !== JSON.stringify(accessConnectStatus);
     accessConnectStatus = payload;
     if (changed) renderAccessAdminSummaries();
@@ -738,10 +741,13 @@ async function refreshAccessConnectStatus(options = {}) {
 }
 
 async function accessConnectFetchClaimCode() {
-  const resp = await dashboardJsonFetch('api_access_connect_claim_code', {}, () => authedFetch('/api/access/connect/claim-code', {
-    cache: 'no-store',
-  }), 'api_access_connect_claim_code', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // daemonApi (transport F4): GET twin, so the derived policy allows the
+  // direct-HTTP retry after a failed tunnel attempt (the legacy call site
+  // opted out via fallbackAfterRpcFailure:false, but a manage-gated
+  // idempotent read replays safely — the policy is data, not per-site
+  // judgment). Connect mode never falls back.
+  const resp = await daemonApi.request('api_access_connect_claim_code', {}, { cache: 'no-store' });
+  const data = resp.body;
   if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
   return data;
 }
@@ -750,12 +756,10 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
   const payload = { enabled };
   if (rendezvousUrl) payload.rendezvous_url = rendezvousUrl;
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_config', payload, () => authedFetch('/api/access/connect/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_connect_config', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics.
+    const resp = await daemonApi.request('api_access_connect_config', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', enabled
       ? 'Connect enabled — this daemon is registering with the rendezvous'
@@ -770,12 +774,9 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
 async function accessSetTier(tier) {
   const payload = { tier: tier || null };
   try {
-    const resp = await dashboardJsonFetch('api_access_set_tier', payload, () => authedFetch('/api/access/tier', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_set_tier', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay.
+    const resp = await daemonApi.request('api_access_set_tier', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', tier
       ? `Trust tier set: ${tier}`
@@ -790,12 +791,9 @@ async function accessSetTier(tier) {
 async function accessSetHostedCeiling(roleId) {
   const payload = { role_id: roleId };
   try {
-    const resp = await dashboardJsonFetch('api_access_set_hosted_ceiling', payload, () => authedFetch('/api/access/hosted-ceiling', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_set_hosted_ceiling', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay.
+    const resp = await daemonApi.request('api_access_set_hosted_ceiling', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', roleId === 'role:none'
       ? 'Hosted-origin control refused. Reach this daemon directly, through the app, or from an enrolled peer — a hosted tab can no longer change this back.'
@@ -809,8 +807,12 @@ async function accessSetHostedCeiling(roleId) {
 
 async function accessFleetCertRequest() {
   try {
-    const resp = await dashboardJsonFetch('api_fleet_cert_request', {}, () => Promise.reject(new Error('fleet certificate requests ride the control channel — connect to the daemon first')), 'api_fleet_cert_request', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay. The
+    // tunnel-only reject fallback died with the S6 ROW-NEW
+    // (POST /api/access/fleet-cert/request): a dashboard with no tunnel
+    // now starts the request over direct HTTP instead of erroring.
+    const resp = await daemonApi.request('api_fleet_cert_request', {});
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', 'Certificate request started — publishing DNS records and answering the Let’s Encrypt challenge (usually under a minute).');
   } catch (err) {
@@ -829,12 +831,11 @@ async function accessFleetCertRequest() {
 
 async function accessConnectUnclaim() {
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }), 'api_access_connect_unclaim', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay. The
+    // empty params ride body-less on HTTP; the unclaim handler never
+    // reads a body.
+    const resp = await daemonApi.request('api_access_connect_unclaim', {});
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', 'Claim released — a fresh claim phrase will mint shortly');
   } catch (err) {
@@ -903,12 +904,13 @@ function dashboardAccessTargetForHost(hostId) {
 
 async function refreshDashboardTargetsFromApi(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_dashboard_targets', {}, () => authedFetch('/api/dashboard/targets', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_dashboard_targets', {}, {
       signal: options.signal,
-    }), 'api_dashboard_targets', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/dashboard/targets returned ${resp.status}`);
-    const payload = await resp.json();
+    const payload = resp.body;
     applyDashboardAccessTargets(payload);
     return payload;
   } catch (err) {
@@ -2294,7 +2296,10 @@ function accessAuditGrantCards() {
     const status = accessModelLabel(grant.status, 'active');
     const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
     const lifecycleBusy = accessGrantLifecycleSubmitting.has(grantId);
-    const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+    // daemonApi availability (transport F4): tunnel status boolean when
+    // connected, HTTP-twin reachability otherwise — honest in Connect
+    // mode, where a down tunnel means no lane at all.
+    const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
     const actions = [];
     if (localIamGrant && grantId) {
       if (status !== 'active') {
@@ -2544,24 +2549,22 @@ let accessGrantFanoutResults = null;
 
 async function accessApplyGrantToTarget(target, payload) {
   if (target.mode === 'self') {
-    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    return data;
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics. IAM-mutating
+    // write: payload shape unchanged, no retries.
+    const resp = await daemonApi.request('api_access_iam_upsert_user_client_grant', payload);
+    if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+    return resp.body;
   }
-  const resp = await fetch(`${target.origin}/api/access/iam/user-client-grants`, {
-    method: 'POST',
-    mode: 'cors',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  // Remote fleet daemon: the explicit remote-http target (transport F4).
+  // Naming the target names the transport — direct cross-origin HTTP to
+  // that daemon's fleet-CORS row, never a tunnel, never a fallback; the
+  // target daemon's own IAM authorizes the write (browser mTLS identity).
+  const resp = await daemonApi.request('api_access_iam_upsert_user_client_grant', payload, {
+    target: { remoteHttp: target.origin },
   });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 function renderAccessUserClientGrantForm() {
@@ -2584,8 +2587,10 @@ function renderAccessUserClientGrantForm() {
   const overview = accessOverviewModel();
   const iam = accessIamModel(overview);
   const writeApiAvailable = iam?.capabilities?.write_api_available !== false;
-  const rpcAvailable = dashboardControlTransport?.lastStatus?.api_access_iam_upsert_user_client_grant_available;
-  const canSubmit = writeApiAvailable && rpcAvailable !== false;
+  // daemonApi availability (transport F4): folds the tunnel status
+  // boolean and HTTP-twin reachability into one honest answer.
+  const canSubmit = writeApiAvailable
+    && daemonApi.availability('api_access_iam_upsert_user_client_grant').ok;
   const candidate = accessCurrentUserClientCandidate();
   mount.innerHTML = '';
 
@@ -3088,12 +3093,11 @@ async function accessUpdateGrantLifecycle(grantId, changes = {}) {
   accessGrantLifecycleSubmitting.add(id);
   renderAccessAdminSummaries();
   try {
-    const resp = await dashboardJsonFetch('api_access_iam_update_grant', payload, () => authedFetch('/api/access/iam/grants/update', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_update_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics. IAM-mutating
+    // write: payload shape unchanged, no retries.
+    const resp = await daemonApi.request('api_access_iam_update_grant', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     if (data?.iam) {
       dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };

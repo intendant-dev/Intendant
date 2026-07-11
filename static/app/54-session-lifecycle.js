@@ -1607,10 +1607,11 @@ function refreshFilesDownloadAvailability() {
 // DELIBERATELY not routed through daemonApi.bytes (F1b): this direct-HTTP
 // ranged reader carries fs-read edge semantics the facade's HTTP adapter
 // does not model yet — the 416 empty-file carve-out below and the strict
-// 206-vs-200 status ladder. It is only reachable when the tunnel lane is
-// unavailable (useHttpFilesystemFallback), so the facade would serve it
-// over the same HTTP twin anyway. Folding these edges into the facade's
-// bytes adapter (then deleting this) is F1c/facade-hardening work.
+// 206-vs-200 status ladder. Since F1c it is only reachable on daemons
+// that predate the /api/transfers rows (the HTTP jobs lane outranks it),
+// so it is the old-daemon legacy path; folding these edges into the
+// facade's bytes adapter (then deleting this) remains facade-hardening
+// work.
 async function dashboardFetchHttpRangeBytes(path, offset, length, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
@@ -1973,9 +1974,14 @@ function filesTransferMergeServerJob(job) {
 }
 
 async function refreshFilesTransferJobs() {
-  // api_transfer_jobs is tunnel-only until the /api/transfers rows land
-  // (S9): gate on the tunnel lane being truly connected, not http-only.
-  if (daemonApi.availability('api_transfer_jobs').reason !== 'connected') {
+  // Tunnel preferred; the GET /api/transfers row (S9) serves the list on
+  // direct-HTTP dashboards once the one-shot probe confirms this daemon
+  // has the rows (F1c) — this is also the probe's eager kick, since the
+  // Files pane refreshes jobs on open. Absent rows: legacy local-only.
+  const { reason } = daemonApi.availability('api_transfer_jobs');
+  const usable = reason === 'connected' ||
+    (reason === 'http-only' && await daemonApi.ensureHttpProbe('transfers'));
+  if (!usable) {
     renderFilesTransfers();
     return [];
   }
@@ -2267,10 +2273,23 @@ async function runFilesDownloadTransfer(transfer) {
     const peerId = String(transfer.peerId || '').trim();
     let usePeerDashboardControl = Boolean(peerId) && peerDashboardControlSignalAvailable(peerId);
     let usePeerFileTransfer = Boolean(peerId) && !usePeerDashboardControl;
-    const useDurableTransfer = !peerId && dashboardTransferDownloadAvailable();
+    const useTunnelDurableTransfer = !peerId && dashboardTransferDownloadAvailable();
     const hasArtifact = Boolean(transfer.artifact && typeof transfer.artifact === 'object');
     const fallbackMethod = String(transfer.directMethod || (!hasArtifact ? 'api_fs_read' : '')).trim();
     const canUseFallbackMethod = !peerId && Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
+    // HTTP jobs lane (F1c, task #6): path downloads ride the same durable
+    // jobs protocol over the S9 /api/transfers rows when no tunnel lane
+    // serves them, feature-detected once per page (the probe; the await
+    // only fires after every tunnel option said no). Artifact jobs stay
+    // tunnel-only by design — their creates resolve live session handles,
+    // and the HTTP create row 400s them.
+    const useHttpTransferJobs = !useTunnelDurableTransfer &&
+      !canUseFallbackMethod &&
+      !peerId &&
+      !hasArtifact &&
+      !dashboardConnectModeEnabled() &&
+      await daemonApi.ensureHttpProbe('transfers');
+    const useDurableTransfer = useTunnelDurableTransfer || useHttpTransferJobs;
     const useHttpFilesystemFallback = !useDurableTransfer &&
       !canUseFallbackMethod &&
       !peerId &&
@@ -2326,7 +2345,7 @@ async function runFilesDownloadTransfer(transfer) {
       });
     }
     if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
-      transfer.transport = 'durable-transfer';
+      transfer.transport = useHttpTransferJobs ? 'http-transfer-jobs' : 'durable-transfer';
       const payload = hasArtifact
         ? {
             kind: 'download',
@@ -2376,10 +2395,13 @@ async function runFilesDownloadTransfer(transfer) {
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
         });
       } else {
-        transfer.transport = transfer.transport || 'dashboard-control';
+        transfer.transport = transfer.transport ||
+          (useHttpTransferJobs ? 'http-transfer-jobs' : 'dashboard-control');
+        // The job handle rides `id` (the HTTP twin's `{id}` path capture;
+        // the server resolves a resume token anywhere an id goes).
         const params = useDurableTransfer
           ? {
-              id: transfer.serverJobId || undefined,
+              id: filesTransferJobHandle(transfer) || undefined,
               resume_token: transfer.resumeToken || undefined,
               offset: transfer.loaded,
               length: requested,
@@ -2542,10 +2564,11 @@ async function runFilesStagedRawHttpDownload(transfer, controller) {
   settleCompletedFilesDownload(transfer, { resumable: false });
 }
 
-// Filesystem upload over plain HTTP: the durable transfer-job RPC needs the
-// dashboard-control channel, but /api/fs/write covers the same size range
-// (its body cap is sized for UPLOAD_MAX_BYTES of base64 plus envelope), so
-// a single guarded write keeps direct-connected uploads working.
+// Filesystem upload over plain HTTP for daemons that predate the
+// /api/transfers rows (F1c probes them; absent ⇒ this legacy lane):
+// /api/fs/write covers the single-POST size range (its body cap is sized
+// for UPLOAD_MAX_BYTES of base64 plus envelope), so a guarded write keeps
+// direct-connected uploads working — capped, non-resumable.
 async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
   transfer.transport = 'http-fs-write';
   const file = await filesTransferGetUploadBlob(transfer);
@@ -2605,8 +2628,107 @@ async function filesResolveHttpUploadDestinationPath(transfer, file) {
   return raw;
 }
 
+// Client mirror of the server's TRANSFER_HTTP_CHUNK_MAX_BYTES
+// (web_gateway/routes_transfers.rs, pinned by the gateway body-cap test):
+// one POST /api/transfers/{id}/chunk body may carry at most this much, so
+// the HTTP jobs lane clamps its chunk size rather than bounce a 413.
+const FILES_TRANSFER_HTTP_CHUNK_MAX_BYTES = 32 * 1024 * 1024;
+
+// The job handle every transfer-family call addresses: the server job id
+// when known, else the resume token — the server resolves either alias
+// (transfer_store::find_job), and the HTTP twins lift it into their
+// `/api/transfers/{id}` path capture.
+function filesTransferJobHandle(transfer) {
+  return String(transfer?.serverJobId || transfer?.resumeToken || '').trim();
+}
+
+// Re-list step of the resume protocol (design §4): fetch this transfer's
+// server job over whichever lane serves api_transfer_jobs. The `id`
+// filter is additive — old tunnel daemons ignore it and answer the full
+// list; find() tolerates both. Returns null when the job is gone.
+async function filesTransferFetchServerJob(transfer, options = {}) {
+  if (!filesTransferJobHandle(transfer)) return null;
+  const result = await daemonApi.request('api_transfer_jobs', { id: filesTransferJobHandle(transfer) }, {
+    timeoutMs: 30000,
+    signal: options.signal,
+  });
+  if (!result.ok) {
+    throw new Error(result.body.error || `transfer jobs returned ${result.status || 'error'}`);
+  }
+  const jobs = Array.isArray(result.body.jobs) ? result.body.jobs : [];
+  return jobs.find(job =>
+    (transfer.serverJobId && String(job?.id || '') === String(transfer.serverJobId)) ||
+    (transfer.resumeToken && String(job?.resume_token || '') === String(transfer.resumeToken))
+  ) || null;
+}
+
+// Adopt the server's received extent as the next chunk boundary — the
+// upload half of the resume protocol. Called when a chunk outcome is
+// unknown (the lane failed mid-flight) or a delivered 409 says another
+// writer moved the extent: the re-list is the arbiter, never a guess.
+// Throws `cause` when the job cannot be re-listed (aborts pass through),
+// so the attempt settles through the normal failure path and Resume
+// re-runs the sync.
+async function filesTransferResyncUploadExtent(transfer, controller, cause) {
+  let job = null;
+  try {
+    job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
+    throw cause;
+  }
+  if (!job) throw cause;
+  filesTransferApplyServerJob(transfer, job);
+  const status = filesTransferStatusFromJob(job);
+  if (status === 'cancelled' || status === 'failed') {
+    throw new Error(job.error || `server transfer job is ${status}`);
+  }
+  transfer.loaded = Number(job.completed_bytes || 0);
+  filesTransferPersistState();
+}
+
+// Declared-checksum helper (design §4: sha256 rides create → commit, 409
+// on mismatch). crypto.subtle has no streaming digest — it takes one
+// contiguous buffer — so hash exactly the sizes the single-POST lanes
+// already deem bufferable (UPLOAD_MAX_BYTES) and let larger files upload
+// without one ("sha when available"). Any failure (insecure context,
+// memory) skips the checksum, never the upload.
+async function filesTransferComputeUploadSha256(file) {
+  try {
+    if (!(file instanceof Blob) || !file.size || file.size > UPLOAD_MAX_BYTES) return '';
+    if (!window.crypto?.subtle?.digest) return '';
+    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  } catch (_) {
+    return '';
+  }
+}
+
+// Shared settle for a committed filesystem upload: the normal commit,
+// the delivered-unknown re-list discovery ("it landed while we weren't
+// looking"), and the resumed-run already-completed path all end here.
+async function settleCommittedFilesUpload(transfer, job) {
+  const descriptor = job && typeof job === 'object' ? job : (transfer.serverJob || null);
+  if (descriptor) filesTransferApplyServerJob(transfer, descriptor);
+  transfer.loaded = transfer.totalSize;
+  transfer.descriptor = descriptor;
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
+  await filesTransferDeleteUploadBlob(transfer.id);
+  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+}
+
 async function runFilesFilesystemUploadTransfer(transfer, controller) {
-  if (!await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+  // Lane decision, policy-as-data: the tunnel jobs lane stays preferred
+  // whenever it is truly connected; the S9 /api/transfers rows serve the
+  // same protocol over direct HTTP once the one-shot probe confirms this
+  // daemon has them (F1c, task #6). Connect mode has no HTTP lane.
+  let lane = '';
+  if (await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+    lane = 'tunnel';
+  } else if (!dashboardConnectModeEnabled() && await daemonApi.ensureHttpProbe('transfers')) {
+    lane = 'http';
+  }
+  if (!lane) {
     if (transfer.serverJobId || transfer.resumeToken) {
       // A durable job already holds this upload's chunks server-side.
       // Rerouting to the whole-file fallback would orphan that job (no
@@ -2620,26 +2742,56 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     }
     throw new Error('Filesystem upload is unavailable until file-write access is ready');
   }
+  transfer.transport = lane === 'http' ? 'http-transfer-jobs' : 'durable-transfer';
   const file = await filesTransferGetUploadBlob(transfer);
   if (!(file instanceof Blob)) {
     throw new Error('Upload file is unavailable after reload');
   }
-  if (file.size > UPLOAD_MAX_BYTES) {
-    throw new Error(`File too large (${humanBytes(file.size)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
-  }
+  // No whole-file ceiling here (task #6): the jobs protocol IS how a
+  // >100 MiB upload rides either lane — capped chunks bound each request,
+  // and the store's own guards police totals server-side. Only the
+  // single-POST fallback lanes re-check UPLOAD_MAX_BYTES.
   transfer.totalSize = Number(file.size || 0);
   transfer.loaded = Number(transfer.loaded || 0);
   transfer.mime = transfer.mime || file.type || 'application/octet-stream';
   transfer.name = transfer.name || file.name || 'upload.bin';
+  if (transfer.serverJobId || transfer.resumeToken) {
+    // Resume protocol (design §4): the received extent is the SERVER's
+    // truth — re-list before chunking and continue from that boundary,
+    // never from local bookkeeping alone. A commit that answered into
+    // the void is discovered here too: completed ⇒ settle, never
+    // re-commit.
+    const job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+    if (job) {
+      filesTransferApplyServerJob(transfer, job);
+      if (filesTransferStatusFromJob(job) === 'completed') {
+        return settleCommittedFilesUpload(transfer, job);
+      }
+      transfer.loaded = Number(job.completed_bytes || 0);
+      filesTransferPersistState();
+    } else {
+      // The job is gone server-side (deleted, or a store the daemon
+      // dropped): restart from scratch under a fresh job rather than
+      // failing forever against a handle nothing resolves.
+      transfer.serverJob = null;
+      transfer.serverJobId = '';
+      transfer.resumeToken = '';
+      transfer.loaded = 0;
+      filesTransferPersistState();
+    }
+  }
   if (!transfer.resumeToken && !transfer.serverJobId) {
-    const created = await daemonApi.request('api_transfer_job_create', {
+    const params = {
       kind: 'upload',
       destination: transfer.destination,
       name: transfer.name,
       mime: transfer.mime,
       total_size: transfer.totalSize,
       conflict: transfer.conflictPolicy || 'fail',
-    }, {
+    };
+    const sha256 = await filesTransferComputeUploadSha256(file);
+    if (sha256) params.sha256 = sha256;
+    const created = await daemonApi.request('api_transfer_job_create', params, {
       timeoutMs: transfer.timeoutMs || 120000,
       signal: controller.signal,
     });
@@ -2649,24 +2801,61 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     filesTransferApplyServerJob(transfer, created.body.job);
     filesTransferPersistState();
   }
-  const chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
+  let chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
+  if (lane === 'http') chunkBytes = Math.min(chunkBytes, FILES_TRANSFER_HTTP_CHUNK_MAX_BYTES);
+  // Bounded re-syncs keep the runner terminating: every server round
+  // below either advances the boundary (finite file ⇒ finite loop) or
+  // spends one unit of this budget; exhaustion fails the attempt and
+  // Resume re-lists afresh. The pump's forward progress never hinges on
+  // a lucky retry.
+  let resyncBudget = 3;
   while (transfer.loaded < transfer.totalSize) {
     if (transfer.pauseRequested) throw dashboardControlAbortError('upload paused');
     if (transfer.cancelRequested) throw dashboardControlAbortError('upload cancelled');
     const offset = Number(transfer.loaded || 0);
     const end = Math.min(offset + chunkBytes, transfer.totalSize);
     const chunk = file.slice(offset, end);
-    const result = await daemonApi.upload('api_transfer_upload_chunk', {
-      id: transfer.serverJobId || undefined,
-      resume_token: transfer.resumeToken || undefined,
-      offset,
-    }, chunk, {
-      timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
-      signal: controller.signal,
-    });
+    let result;
+    try {
+      result = await daemonApi.upload('api_transfer_upload_chunk', {
+        id: filesTransferJobHandle(transfer) || undefined,
+        resume_token: transfer.resumeToken || undefined,
+        offset,
+      }, chunk, {
+        timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      // Delivered-unknown: the lane failed or timed out mid-flight, so
+      // the chunk may or may not have landed. Re-list and continue from
+      // the server's extent — the SAME offset when it never landed (a
+      // fully-duplicate append is idempotent server-side), the next one
+      // when it did. That re-list is the resume protocol, not a blind
+      // replay; delivered errors and aborts stay final.
+      if (err?.kind !== 'transport' && err?.kind !== 'timeout') throw err;
+      if (resyncBudget <= 0) throw err;
+      resyncBudget -= 1;
+      await filesTransferResyncUploadExtent(transfer, controller, err);
+      continue;
+    }
     if (!result.ok) {
+      // A delivered 409 is always an extent/state conflict (offset
+      // behind, overlap, another writer — a second tab on the same
+      // token, even a concurrent commit): the re-list is the arbiter for
+      // all of them, and the budget bounds a conflict that re-listing
+      // cannot cure. Every other delivered error is final.
+      if (result.status === 409 && resyncBudget > 0) {
+        resyncBudget -= 1;
+        await filesTransferResyncUploadExtent(
+          transfer,
+          controller,
+          new Error(result.body.error || 'upload chunk offset conflict')
+        );
+        continue;
+      }
       throw new Error(result.body.error || `upload chunk returned ${result.status || 'error'}`);
     }
+    resyncBudget = 3;
     filesTransferApplyServerJob(transfer, result.body.job);
     transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
@@ -2682,31 +2871,62 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       throw new Error('synthetic upload interruption');
     }
   }
-  const committed = await daemonApi.request('api_transfer_upload_commit', {
-    id: transfer.serverJobId || undefined,
+  if (filesTransferStatusFromJob(transfer.serverJob || {}) === 'completed') {
+    // A concurrent resume (second tab, same token) already committed
+    // while our chunks drained — commit is never re-sent at a completed
+    // job (its partial is gone; the failure would mask the success).
+    return settleCommittedFilesUpload(transfer, transfer.serverJob);
+  }
+  const commitParams = () => ({
+    id: filesTransferJobHandle(transfer) || undefined,
     resume_token: transfer.resumeToken || undefined,
-  }, {
-    timeoutMs: transfer.timeoutMs || 120000,
-    signal: controller.signal,
   });
+  let committed;
+  try {
+    committed = await daemonApi.request('api_transfer_upload_commit', commitParams(), {
+      timeoutMs: transfer.timeoutMs || 120000,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // Commit is NEVER blind-replayed: it renames the partial into place,
+    // so a second send against a committed job fails and would mask the
+    // success. A delivered-unknown outcome re-lists first — completed ⇒
+    // it landed; a job still awaiting commit proves it never arrived, so
+    // exactly one re-send is safe.
+    if (err?.kind !== 'transport' && err?.kind !== 'timeout') throw err;
+    const job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+    if (!job) throw err;
+    if (filesTransferStatusFromJob(job) === 'completed') {
+      return settleCommittedFilesUpload(transfer, job);
+    }
+    committed = await daemonApi.request('api_transfer_upload_commit', commitParams(), {
+      timeoutMs: transfer.timeoutMs || 120000,
+      signal: controller.signal,
+    });
+  }
   if (!committed.ok) {
     throw new Error(committed.body.error || `upload commit returned ${committed.status || 'error'}`);
   }
-  filesTransferApplyServerJob(transfer, committed.body.job);
-  transfer.loaded = transfer.totalSize;
-  transfer.descriptor = committed.body.job;
-  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.body.job });
-  await filesTransferDeleteUploadBlob(transfer.id);
-  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+  await settleCommittedFilesUpload(transfer, committed.body.job);
 }
 
 function filesDeleteServerTransfer(transfer) {
   if (!transfer?.serverJobId && !transfer?.resumeToken) return;
-  if (daemonApi.availability('api_transfer_job_delete').reason !== 'connected') return;
-  daemonApi.request('api_transfer_job_delete', {
-    id: transfer.serverJobId || undefined,
-    resume_token: transfer.resumeToken || undefined,
-  }, { timeoutMs: 30000 }).catch(() => {});
+  // Fire-and-forget on either lane: the tunnel when connected, else the
+  // DELETE /api/transfers/{id} row once the probe confirms this daemon
+  // has it (F1c) — cancelling on a direct-HTTP dashboard must not leave
+  // a ghost job the Files tab re-merges forever.
+  const params = { id: filesTransferJobHandle(transfer) };
+  if (daemonApi.availability('api_transfer_job_delete').reason === 'connected') {
+    daemonApi.request('api_transfer_job_delete', params, { timeoutMs: 30000 }).catch(() => {});
+    return;
+  }
+  if (dashboardConnectModeEnabled()) return;
+  daemonApi.ensureHttpProbe('transfers')
+    .then(present => (present
+      ? daemonApi.request('api_transfer_job_delete', params, { timeoutMs: 30000 })
+      : null))
+    .catch(() => {});
 }
 
 async function runFilesUploadTransfer(transfer) {
@@ -2723,15 +2943,30 @@ async function runFilesUploadTransfer(transfer) {
       setFilesUploadStatus('warn', `Preparing ${transfer.name || 'upload.bin'}`);
       const persisted = await transfer.uploadBlobPersistPromise;
       transfer.uploadBlobPersistPromise = null;
-      if (!persisted) {
+      if (!persisted && !transfer.file) {
+        // Nothing to upload from: the blob never reached IndexedDB and
+        // the in-memory handle is gone (restored transfer).
         throw new Error('Browser storage is unavailable for resumable uploads');
+      }
+      if (!persisted) {
+        // Storage refused the blob (quota — likely a very large file,
+        // exactly what the jobs protocol now carries; task #6 removed
+        // the ceiling that used to mask this). Proceed from the
+        // in-memory file: pause/resume still works for the life of the
+        // tab, only resume-after-reload is lost.
+        console.warn('[files-transfer] upload blob not persisted; resume-after-reload unavailable for', transfer.id);
       }
     }
     if (!transfer.file && !(filesystemUpload && transfer.uploadBlobStored)) {
       throw new Error('missing upload file');
     }
     const initialSize = Number(transfer.file?.size || transfer.totalSize || 0);
-    if (initialSize > UPLOAD_MAX_BYTES) {
+    // Staged attachments stay a single POST capped at UPLOAD_MAX_BYTES (a
+    // product decision — design §4). Filesystem uploads carry no
+    // whole-file ceiling here: they ride the resumable jobs protocol
+    // (task #6), and only their single-POST fallback lane re-checks the
+    // cap for itself.
+    if (!filesystemUpload && initialSize > UPLOAD_MAX_BYTES) {
       throw new Error(`File too large (${humanBytes(initialSize)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
     }
     transfer.totalSize = initialSize;

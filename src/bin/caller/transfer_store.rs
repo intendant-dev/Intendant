@@ -101,6 +101,11 @@ pub struct TransferJob {
     pub mime: Option<String>,
     #[serde(default)]
     pub total_size: Option<u64>,
+    /// Expected content hash for upload jobs (lowercase hex), declared
+    /// at create and verified at commit. Absent from serialized jobs
+    /// when unset, so pre-sha256 wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub completed_bytes: u64,
     #[serde(default)]
@@ -349,6 +354,7 @@ pub fn create_download_job_from_path(
         filename,
         mime: Some(mime.unwrap_or_else(|| content_type_for_path(&display_path))),
         total_size: Some(metadata.len()),
+        sha256: None,
         completed_bytes: 0,
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
@@ -412,6 +418,7 @@ pub fn create_download_job_from_bytes(
         filename: Some(safe_name),
         mime: Some(mime),
         total_size: Some(bytes.len() as u64),
+        sha256: None,
         completed_bytes: 0,
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
@@ -512,14 +519,53 @@ fn resolve_upload_destination(
     Ok((final_path, parent))
 }
 
+/// Normalize a declared upload checksum: lowercase hex, 64 chars.
+fn normalize_expected_sha256(raw: Option<String>) -> Result<Option<String>, TransferStoreError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(TransferStoreError::new(
+            400,
+            "sha256 must be 64 hex characters",
+        ));
+    }
+    Ok(Some(normalized))
+}
+
+/// Streaming content hash of a file (lowercase hex) — commit-time
+/// verification must not buffer a multi-gigabyte partial in memory.
+fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(crate::file_watcher::hex_encode(&digest))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn create_upload_job(
     scope: &StoreScope,
     raw_destination: &str,
     original_name: &str,
     mime: &str,
     total_size: Option<u64>,
+    sha256: Option<String>,
     conflict_policy: TransferConflictPolicy,
 ) -> Result<TransferJob, TransferStoreError> {
+    let sha256 = normalize_expected_sha256(sha256)?;
     let (final_path, parent) =
         resolve_upload_destination(raw_destination, original_name, conflict_policy)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -558,6 +604,7 @@ pub fn create_upload_job(
             mime.trim().to_string()
         }),
         total_size,
+        sha256,
         completed_bytes: 0,
         error: None,
         conflict_policy,
@@ -685,6 +732,16 @@ pub fn commit_upload_job(
             ));
         }
     }
+    // Verify the declared checksum before the partial is placed — a
+    // mismatch leaves the job resumable-from-scratch (delete + retry)
+    // rather than a corrupt file at the destination.
+    if let Some(expected) = &job.sha256 {
+        let actual = sha256_file_hex(&temp_path)
+            .map_err(|e| TransferStoreError::new(500, format!("hash upload partial: {e}")))?;
+        if &actual != expected {
+            return Err(TransferStoreError::new(409, "upload sha256 mismatch"));
+        }
+    }
     if destination.exists() {
         match job.conflict_policy {
             TransferConflictPolicy::Fail => {
@@ -723,14 +780,15 @@ pub fn commit_upload_job(
     Ok(job)
 }
 
-pub fn read_download_range(
+/// Resolve a download job's source: the job, its source path, and the
+/// on-disk size — the shared preamble of [`read_download_range`] and the
+/// HTTP lane's `Range`-header normalization (which must know the total
+/// before an end-inclusive header can become an offset/length read).
+pub fn download_source(
     scope: &StoreScope,
     id_or_token: &str,
-    offset: u64,
-    length: Option<u64>,
-    max_bytes: u64,
-) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
-    let mut job = required_job(scope, id_or_token)?;
+) -> Result<(TransferJob, PathBuf, u64), TransferStoreError> {
+    let job = required_job(scope, id_or_token)?;
     if job.kind != TransferKind::Download {
         return Err(TransferStoreError::new(
             400,
@@ -747,6 +805,17 @@ pub fn read_download_range(
         return Err(TransferStoreError::new(400, "path is not a regular file"));
     }
     let total_size = metadata.len();
+    Ok((job, path, total_size))
+}
+
+pub fn read_download_range(
+    scope: &StoreScope,
+    id_or_token: &str,
+    offset: u64,
+    length: Option<u64>,
+    max_bytes: u64,
+) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
+    let (mut job, path, total_size) = download_source(scope, id_or_token)?;
     if offset > total_size {
         return Err(TransferStoreError::new(416, "range start beyond file size"));
     }
@@ -990,6 +1059,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(11),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap();
@@ -1038,6 +1108,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap_err();
@@ -1049,6 +1120,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Rename,
         )
         .unwrap();
@@ -1075,6 +1147,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap_err();
@@ -1093,6 +1166,73 @@ mod tests {
     }
 
     #[test]
+    fn upload_commit_verifies_declared_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let payload = b"hello world";
+        let good_hash =
+            crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(payload));
+
+        // Malformed declarations refuse at create.
+        let err = create_upload_job(
+            &scope(&project),
+            dest_dir.join("bad-decl.bin").to_str().unwrap(),
+            "bad-decl.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some("not-a-hash".to_string()),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+        assert_eq!(err.message, "sha256 must be 64 hex characters");
+
+        // A wrong declared hash refuses at commit; the partial and job
+        // survive (delete + retry, never a corrupt destination).
+        let wrong = create_upload_job(
+            &scope(&project),
+            dest_dir.join("wrong.bin").to_str().unwrap(),
+            "wrong.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some("0".repeat(64)),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let wrong =
+            append_upload_tempfile(&scope(&project), &wrong.id, 0, write_chunk(payload), 11)
+                .unwrap();
+        let err = commit_upload_job(&scope(&project), &wrong.id).unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(err.message, "upload sha256 mismatch");
+        assert!(!dest_dir.join("wrong.bin").exists());
+        assert!(wrong.temp_path.unwrap().exists());
+
+        // The correct hash (declared uppercase — normalized at create)
+        // commits, and the job carries the normalized value.
+        let good = create_upload_job(
+            &scope(&project),
+            dest_dir.join("good.bin").to_str().unwrap(),
+            "good.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some(good_hash.to_ascii_uppercase()),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        assert_eq!(good.sha256.as_deref(), Some(good_hash.as_str()));
+        let good =
+            append_upload_tempfile(&scope(&project), &good.id, 0, write_chunk(payload), 11)
+                .unwrap();
+        let committed = commit_upload_job(&scope(&project), &good.id).unwrap();
+        assert_eq!(committed.status, TransferStatus::Completed);
+        assert_eq!(fs::read(dest_dir.join("good.bin")).unwrap(), payload);
+    }
+
+    #[test]
     fn duplicate_already_persisted_upload_chunk_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -1106,6 +1246,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(6),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap();
@@ -1134,6 +1275,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Overwrite,
         )
         .unwrap();
@@ -1166,6 +1308,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Overwrite,
         )
         .unwrap_err();

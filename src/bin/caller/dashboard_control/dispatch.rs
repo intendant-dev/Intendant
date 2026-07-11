@@ -26,6 +26,15 @@ pub(crate) fn frame_api_response(
             "ok": false,
             "error": format!("{label} returned an unexpected byte response"),
         }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
+        }),
     }
 }
 
@@ -50,6 +59,15 @@ pub(crate) fn frame_api_json_body_response(
             "id": id,
             "ok": false,
             "error": format!("{label} returned an unexpected byte response"),
+        }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
         }),
     }
 }
@@ -98,6 +116,15 @@ pub(crate) fn frame_api_ok_error_response(
             "ok": false,
             "error": format!("{label} returned an unexpected byte response"),
         }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
+        }),
     }
 }
 
@@ -141,6 +168,19 @@ pub(crate) fn frame_api_task_response(
         json @ crate::web_gateway::ApiResponse::Json { .. } => ControlTaskResponse {
             id: id.clone(),
             frame: frame_api_response(id, json, label),
+            byte_stream: None,
+            done: true,
+        },
+        // The Stream lane's writer is the stream_* framer (S10); a
+        // byte-capable buffered method never answers on it.
+        crate::web_gateway::ApiResponse::Stream { .. } => ControlTaskResponse {
+            id: id.clone(),
+            frame: serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("{label} returned an unexpected stream response"),
+            }),
             byte_stream: None,
             done: true,
         },
@@ -3075,7 +3115,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let list = api_transfer_jobs_response("transfer-list".to_string(), &rt).await;
+        let list = api_transfer_jobs_response("transfer-list".to_string(), None, &rt).await;
         assert_eq!(list["result"]["jobs"].as_array().unwrap().len(), 1);
         assert_eq!(list["result"]["jobs"][0]["id"], job_id);
 

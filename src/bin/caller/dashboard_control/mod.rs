@@ -193,39 +193,16 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // live as tunnel columns on their PUBLIC route rows with documented
     // op overrides — session-gated on the tunnel by design (S6; the
     // override enumeration test in gateway_routes pins the set).
-    method("api_peer_pairing_requests", PeerOperation::AccessInspect),
-    method("api_peer_pairing_identities", PeerOperation::AccessInspect),
-    method(
-        "api_peer_pairing_request_decision",
-        PeerOperation::AccessManage,
-    ),
-    method(
-        "api_peer_pairing_identity_revoke",
-        PeerOperation::AccessManage,
-    ),
-    method("api_peer_pairing_invite", PeerOperation::AccessManage),
-    method("api_peers", PeerOperation::PeerInspect),
-    method("api_peer_eligible", PeerOperation::PeerInspect),
-    // Acting through a connected peer — signaling relays that open tunnels,
-    // and the message/task/approval quick controls — is peer use, not peer
-    // administration: the receiving peer authorizes each action against its
-    // own grants for this daemon. Mirrors the HTTP lane's
-    // `federation_http_operation`.
-    method("api_peer_webrtc_signal", PeerOperation::PeerUse),
-    method("api_peer_file_transfer_signal", PeerOperation::PeerUse),
-    method("api_peer_dashboard_control_signal", PeerOperation::PeerUse),
-    method("api_peer_message", PeerOperation::PeerUse),
-    method("api_peer_task", PeerOperation::PeerUse),
-    method("api_peer_approval", PeerOperation::PeerUse),
-    method("api_peer_add", PeerOperation::PeerManage),
-    method("api_peer_remove", PeerOperation::PeerManage),
-    method("api_peer_pairing_join", PeerOperation::PeerManage),
-    method("api_peer_pairing_request_access", PeerOperation::PeerManage),
-    method(
-        "api_peer_pairing_request_access_poll",
-        PeerOperation::PeerManage,
-    ),
-    method("api_coordinator_route", PeerOperation::PeerManage),
+    // The peers/coordinator federation family (registry, eligibility,
+    // pairing, quick controls, signaling relays, coordinator routing)
+    // lives as tunnel columns on its carved per-leaf route rows (S7):
+    // each twin's IAM operation derives from federation_http_operation
+    // on its row's canonical leaf — acting through a connected peer
+    // (quick controls + signaling relays) classifies as peer use, not
+    // peer administration, exactly as the HTTP gate has always ruled.
+    // api_coordinator_route carries the family's one documented op
+    // override (PeerManage; the ladder says Task) — see the closed
+    // enumeration in gateway_routes.
     // The sessions read-core methods (api_sessions, api_sessions_search,
     // api_session_detail, api_session_agent_output,
     // api_session_context_snapshot) live as tunnel columns on their
@@ -237,23 +214,19 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // api_session_frame_asset), api_session_delete, and the worktrees
     // quartet live as tunnel columns on their route rows (S4b), and so
     // does the whole current-session family — history/rollback/redo/
-    // prune, changes, agent-output, uploads list/raw/delete, and the
-    // upload-frame-only api_session_current_upload (S4c).
-    method("api_sessions_stream", PeerOperation::SessionInspect),
+    // prune, changes, agent-output, uploads list/raw/delete, the
+    // upload-frame-only api_session_current_upload (S4c), and the
+    // Stream-lane api_sessions_stream (S10).
     method("api_session_control_msg", PeerOperation::SessionManage),
-    method("api_transfer_jobs", PeerOperation::FilesystemRead),
-    method("api_transfer_download_read", PeerOperation::FilesystemRead),
     // The api_fs_* methods live as tunnel columns on their route rows
     // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
-    // ops derive from the rows instead of entries here. The api_transfer_*
-    // methods join them when their HTTP rows land (design §4, task #6).
-    method("api_transfer_job_create", PeerOperation::FilesystemWrite),
-    method("api_transfer_job_delete", PeerOperation::FilesystemWrite),
-    // Transfer chunks arrive only as upload frames; their destination was
-    // path-scoped when the transfer job was created, so the chunk itself
-    // only needs the write operation (`authorize_dashboard_control_upload`).
-    uploadable("api_transfer_upload_chunk", PeerOperation::FilesystemWrite),
-    method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
+    // ops derive from the rows instead of entries here — and the
+    // api_transfer_* family joined them with its /api/transfers rows
+    // (S9, design §4, task #6). Tunnel-side transfer chunks still arrive
+    // only as upload frames: their destination was path-scoped when the
+    // job was created, so the chunk needs only the write operation
+    // (`authorize_dashboard_control_upload`), which now derives from the
+    // chunk row like everything else.
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
     // api_displays and api_diagnostics_visual_freshness live as tunnel
@@ -1247,17 +1220,10 @@ pub(crate) struct ControlRuntime {
     state_root: PathBuf,
 }
 
-#[derive(Debug)]
-pub(crate) struct DashboardMediaClipOperation {
-    stream: String,
-    note: String,
-    inject: bool,
-    in_secs: f64,
-    out_secs: f64,
-    fps: u32,
-    expected_frames: usize,
-    frames: Vec<(String, String)>,
-}
+// The clip-operation type moved to web_gateway::media_store
+// (transport-unification S8): the /ws lane accumulates with the same
+// type the tunnel's media_clip_ops map stores.
+pub(crate) use crate::web_gateway::DashboardMediaClipOperation;
 
 pub(crate) enum ControlCommand {
     AddIceCandidate(String),
@@ -1319,6 +1285,24 @@ pub(crate) struct InboundUploadState {
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
+}
+
+impl InboundUploadState {
+    /// The upload-frame spool as the Streaming lane's common handle
+    /// (transport-unification S8): the frame params plus the spooled
+    /// bytes, for handlers that commit the spool wholesale — the staged
+    /// upload today, the S9 transfer-chunk appends next. The media
+    /// handlers keep reading the tempfile in-memory instead (their
+    /// stores take byte slices).
+    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
+        (
+            self.params,
+            crate::web_gateway::SpooledBody {
+                tmp: self.tmp,
+                len: self.received_bytes,
+            },
+        )
+    }
 }
 
 pub(crate) struct OutboundControlQueue {
@@ -2138,54 +2122,10 @@ async fn active_recording_registry(
     session.recording_registry.clone()
 }
 
-fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
-    for name in names {
-        if let Some(value) = params.get(*name) {
-            if let Some(text) = value.as_str() {
-                return text.trim().to_string();
-            }
-            if !value.is_null() {
-                return value.to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
-    let value = string_param(params, names);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn optional_u64_param(params: &serde_json::Value, names: &[&str]) -> Result<Option<u64>, String> {
-    for name in names {
-        let Some(value) = params.get(*name) else {
-            continue;
-        };
-        if value.is_null() {
-            return Ok(None);
-        }
-        if let Some(number) = value.as_u64() {
-            return Ok(Some(number));
-        }
-        if let Some(text) = value.as_str() {
-            let text = text.trim();
-            if text.is_empty() {
-                return Ok(None);
-            }
-            return text
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| format!("invalid {name}"));
-        }
-        return Err(format!("invalid {name}"));
-    }
-    Ok(None)
-}
+// The lenient alias-param readers moved to the neutral api core
+// (`web_gateway::api_core`) with the S9 transfer conversion — the
+// re-export keeps every dashboard_control reference compiling.
+pub(crate) use crate::web_gateway::{optional_string_param, optional_u64_param, string_param};
 
 fn split_control_session_ids(value: &str) -> impl Iterator<Item = String> + '_ {
     value
@@ -3169,55 +3109,58 @@ mod tests {
             ("api_access_org_orl", Row, Some(Op::AccessInspect)),
             ("api_access_org_renew", Row, Some(Op::AccessInspect)),
             ("api_access_org_orl_apply", Row, Some(Op::PresenceRead)),
-            (
-                "api_peer_pairing_requests",
-                Residue,
-                Some(Op::AccessInspect),
-            ),
+            // The peers/coordinator family flipped Residue → Row in S7
+            // with every operation unchanged (the no-re-gating proof);
+            // the ops now derive from federation_http_operation on each
+            // row's canonical leaf, asserted per method by
+            // gateway_routes::peers_family_tunnel_ops_assert_against_the_federation_ladder.
+            ("api_peer_pairing_requests", Row, Some(Op::AccessInspect)),
             (
                 "api_peer_pairing_identities",
-                Residue,
+                Row,
                 Some(Op::AccessInspect),
             ),
             (
                 "api_peer_pairing_request_decision",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_peer_pairing_identity_revoke",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_peer_pairing_invite", Residue, Some(Op::AccessManage)),
-            ("api_peers", Residue, Some(Op::PeerInspect)),
-            ("api_peer_eligible", Residue, Some(Op::PeerInspect)),
-            ("api_peer_webrtc_signal", Residue, Some(Op::PeerUse)),
-            ("api_peer_file_transfer_signal", Residue, Some(Op::PeerUse)),
+            ("api_peer_pairing_invite", Row, Some(Op::AccessManage)),
+            ("api_peers", Row, Some(Op::PeerInspect)),
+            ("api_peer_eligible", Row, Some(Op::PeerInspect)),
+            ("api_peer_webrtc_signal", Row, Some(Op::PeerUse)),
+            ("api_peer_file_transfer_signal", Row, Some(Op::PeerUse)),
             (
                 "api_peer_dashboard_control_signal",
-                Residue,
+                Row,
                 Some(Op::PeerUse),
             ),
-            ("api_peer_message", Residue, Some(Op::PeerUse)),
-            ("api_peer_task", Residue, Some(Op::PeerUse)),
-            ("api_peer_approval", Residue, Some(Op::PeerUse)),
-            ("api_peer_add", Residue, Some(Op::PeerManage)),
-            ("api_peer_remove", Residue, Some(Op::PeerManage)),
-            ("api_peer_pairing_join", Residue, Some(Op::PeerManage)),
+            ("api_peer_message", Row, Some(Op::PeerUse)),
+            ("api_peer_task", Row, Some(Op::PeerUse)),
+            ("api_peer_approval", Row, Some(Op::PeerUse)),
+            ("api_peer_add", Row, Some(Op::PeerManage)),
+            ("api_peer_remove", Row, Some(Op::PeerManage)),
+            ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
             (
                 "api_peer_pairing_request_access",
-                Residue,
+                Row,
                 Some(Op::PeerManage),
             ),
             (
                 "api_peer_pairing_request_access_poll",
-                Residue,
+                Row,
                 Some(Op::PeerManage),
             ),
-            ("api_coordinator_route", Residue, Some(Op::PeerManage)),
+            // The coordinator's PeerManage rides its documented op
+            // override (the ladder classifies the HTTP leaf as Task).
+            ("api_coordinator_route", Row, Some(Op::PeerManage)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
-            ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
             ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
@@ -3287,10 +3230,13 @@ mod tests {
                 Row,
                 Some(Op::SessionManage),
             ),
-            ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
+            // The transfer family flipped Residue → Row with its
+            // /api/transfers rows (S9, task #6): ops now derive from
+            // the rows, same classes as always.
+            ("api_transfer_jobs", Row, Some(Op::FilesystemRead)),
             (
                 "api_transfer_download_read",
-                Residue,
+                Row,
                 Some(Op::FilesystemRead),
             ),
             ("api_fs_stat", Row, Some(Op::FilesystemRead)),
@@ -3298,22 +3244,22 @@ mod tests {
             ("api_fs_read", Row, Some(Op::FilesystemRead)),
             (
                 "api_transfer_job_create",
-                Residue,
+                Row,
                 Some(Op::FilesystemWrite),
             ),
             (
                 "api_transfer_job_delete",
-                Residue,
+                Row,
                 Some(Op::FilesystemWrite),
             ),
             (
                 "api_transfer_upload_chunk",
-                Residue,
+                Row,
                 Some(Op::FilesystemWrite),
             ),
             (
                 "api_transfer_upload_commit",
-                Residue,
+                Row,
                 Some(Op::FilesystemWrite),
             ),
             ("api_fs_mkdir", Row, Some(Op::FilesystemWrite)),
@@ -3472,7 +3418,11 @@ mod tests {
     /// (api_control.rs). Four facts per entry: the tunnel twin exists in
     /// `CONTROL_METHODS`; the verb + instantiated path resolve to a
     /// declared route whose verb is declared exactly (never via `Any`);
-    /// the row's IAM operation equals the tunnel method's; and the path
+    /// the row's IAM operation equals the tunnel method's (the signed-org
+    /// doorbell rows are Public on HTTP by design and instead pin their
+    /// documented tunnel op-override; the peers/coordinator federation
+    /// rows pin the row's own derivation — ladder on the canonical leaf,
+    /// or the coordinator's documented override); and the path
     /// template restates the row's declared pattern (captures by name).
     /// Plus the exact coverage set, so entries appear and disappear
     /// deliberately. When the route table grows its `tunnel:` column
@@ -3525,12 +3475,29 @@ mod tests {
         // Coverage pin: the F1 family's twinned methods (fs + staged
         // uploads), the F2 sessions-family reads (managed-context,
         // worktrees, the session list and its NDJSON stream, search,
-        // detail, report, context snapshots), and the F3 settings/keys
+        // detail, report, context snapshots), the F3 settings/keys
         // family (settings GET/POST, api-keys save, key-status,
-        // project-root, external-agents, displays). The `api_transfer_*`
-        // methods join when their HTTP rows land (task #6, /api/transfers);
-        // adding or dropping an entry updates this list in the same change,
-        // deliberately.
+        // project-root, external-agents, displays), and the F4 access
+        // family: the dialogs set (overview, IAM state, enrollment reads
+        // + decide, IAM grant upsert/update, the connect admin quartet,
+        // the tier pair, fleet-cert request, dashboard targets) plus the
+        // org set (trust/revoke, issuance, issuer keys, and the
+        // signed-org doorbell quartet), and the F5 peers/coordinator
+        // family (registry list/add/remove, eligible, the quick
+        // controls — message/task/approval, the three signal relays,
+        // the pairing set, and the coordinator route), plus the
+        // `api_transfer_*` sextet riding the S9 /api/transfers rows
+        // (task #6 / F1c — the SPA feature-detects the rows with one
+        // GET probe before using the lane, so old daemons keep honest
+        // availability); adding or dropping an entry updates this list
+        // in the same change, deliberately. The F6 credential-custody
+        // family (api_credential_*,
+        // api_daemon_vault_*) is deliberately NOT here and stays out:
+        // custody is tunnel-scoped by design with no HTTP rows planned
+        // (docs/src/credential-custody.md; the transport design parks
+        // custody rows as an explicit future decision), so its facade
+        // calls run with no fallback lane — absence below is the contract,
+        // not a gap.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3539,6 +3506,12 @@ mod tests {
             "api_fs_write",
             "api_fs_rename",
             "api_fs_delete",
+            "api_transfer_jobs",
+            "api_transfer_job_create",
+            "api_transfer_upload_chunk",
+            "api_transfer_upload_commit",
+            "api_transfer_job_delete",
+            "api_transfer_download_read",
             "api_session_current_uploads",
             "api_session_current_upload",
             "api_session_current_upload_raw",
@@ -3564,6 +3537,50 @@ mod tests {
             "api_project_root",
             "api_external_agents",
             "api_displays",
+            "api_access_overview",
+            "api_access_iam_state",
+            "api_access_enrollment_requests",
+            "api_access_enrollment_decide",
+            "api_access_iam_upsert_user_client_grant",
+            "api_access_iam_update_grant",
+            "api_access_connect_status",
+            "api_access_connect_claim_code",
+            "api_access_connect_config",
+            "api_access_connect_unclaim",
+            "api_access_set_tier",
+            "api_access_set_hosted_ceiling",
+            "api_fleet_cert_request",
+            "api_dashboard_targets",
+            "api_access_org_trust",
+            "api_access_org_revoke",
+            "api_access_org_issue",
+            "api_access_org_revoke_member",
+            "api_access_org_issuer_init",
+            "api_access_org_issuer_delegate",
+            "api_access_org_issuer_install",
+            "api_access_org_present",
+            "api_access_org_renew",
+            "api_access_org_orl",
+            "api_access_org_orl_apply",
+            "api_peers",
+            "api_peer_add",
+            "api_peer_remove",
+            "api_peer_eligible",
+            "api_peer_message",
+            "api_peer_task",
+            "api_peer_approval",
+            "api_peer_webrtc_signal",
+            "api_peer_file_transfer_signal",
+            "api_peer_dashboard_control_signal",
+            "api_peer_pairing_invite",
+            "api_peer_pairing_join",
+            "api_peer_pairing_request_access",
+            "api_peer_pairing_request_access_poll",
+            "api_peer_pairing_requests",
+            "api_peer_pairing_request_decision",
+            "api_peer_pairing_identities",
+            "api_peer_pairing_identity_revoke",
+            "api_coordinator_route",
         ]
         .into_iter()
         .collect();
@@ -3617,6 +3634,65 @@ mod tests {
                     op, tunnel_op,
                     "{method_name}: tunnel op {tunnel_op:?} != route op {op:?}"
                 ),
+                // The signed-org doorbell rows are Public on HTTP by
+                // design (the signed document is the authorization)
+                // while their tunnel twins gate stricter through
+                // documented op-overrides (F4). Require the row to carry
+                // this method's tunnel column with an override matching
+                // the effective tunnel operation; the override list
+                // itself is pinned closed by the gateway's
+                // tunnel_op_overrides_are_a_closed_documented_enumeration.
+                RouteAuthz::Public => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: Public descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved Public row carries a different tunnel method"
+                    );
+                    let (override_op, _reason) = tunnel.op_override.unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: Public twinned rows must carry a \
+                             documented tunnel op-override"
+                        )
+                    });
+                    assert_eq!(
+                        override_op, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != declared override {override_op:?}"
+                    );
+                }
+                // The peers/coordinator family rows delegate HTTP authz to
+                // the federation ladder (F5). Their tunnel op derives from
+                // the row itself — `Route::tunnel_operation` applies the
+                // same ladder to the row's canonical leaf, or the
+                // documented override (api_coordinator_route: the ladder
+                // classifies the HTTP leaf as Task while the tunnel method
+                // has always gated on PeerManage — a preserved per-lane
+                // divergence the descriptor must not paper over). Require
+                // the resolved row to carry THIS method's tunnel column
+                // and its derivation to equal the effective tunnel
+                // operation.
+                RouteAuthz::PeerFederation => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: federation descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved federation row carries a different tunnel method"
+                    );
+                    let derived = route.tunnel_operation().unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: federation twinned rows must derive \
+                             a fail-closed tunnel operation"
+                        )
+                    });
+                    assert_eq!(
+                        derived, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != row derivation {derived:?}"
+                    );
+                }
                 _ => panic!("{method_name}: twinned rows must be Operation-gated"),
             }
 

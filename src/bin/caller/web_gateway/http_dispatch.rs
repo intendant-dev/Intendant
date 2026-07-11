@@ -379,7 +379,7 @@ pub(crate) async fn serve_http_request(
         }
     }
 
-    if let Some((route, _route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
+    if let Some((route, route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
     {
         // Table-dispatched routes: every /api/* and /mcp route is
         // declared once in gateway_routes::ROUTES (which the IAM
@@ -426,6 +426,14 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // The transfer rows' `{id}` capture (both delete shapes capture
+        // exactly the id — the literal segments don't capture).
+        let transfer_job_id = || {
+            route_captures
+                .first()
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        };
         match route.handler {
             RouteHandlerId::FsWrite => {
                 return handle_fs_write(
@@ -434,6 +442,78 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobs => {
+                return handle_transfer_jobs(
+                    stream,
+                    request_line,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobCreate => {
+                return handle_transfer_job_create(
+                    stream,
+                    route_body,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadChunk => {
+                return handle_transfer_upload_chunk(
+                    stream,
+                    header_text,
+                    request_line,
+                    discard,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadCommit => {
+                return handle_transfer_upload_commit(
+                    stream,
+                    route_body,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobDelete => {
+                return handle_transfer_job_delete(
+                    stream,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferDownloadRead => {
+                return handle_transfer_download_read(
+                    stream,
+                    header_text,
+                    request_line,
+                    transfer_job_id(),
+                    project_root_for_changes,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -707,7 +787,13 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::SessionsStream => {
-                return handle_sessions_stream(stream, request_line).await;
+                return handle_sessions_stream(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsSearch => {
                 return handle_sessions_search(
@@ -978,6 +1064,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     request_line,
                     req_method,
+                    cert_dir,
                     bus,
                     project_root,
                     peer_registry,
@@ -1155,7 +1242,8 @@ pub(crate) async fn serve_http_request(
     } else if req_path.starts_with("/frames/") {
         // Serve HQ frame images from the frame registry.
         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
-        use tokio::io::AsyncWriteExt;
+        // The registry read stays at this edge; the response shapes are
+        // the neutral fn's (goldens pin the historical wire bytes).
         let frame_id = request_line
             .split("/frames/")
             .nth(1)
@@ -1167,22 +1255,13 @@ pub(crate) async fn serve_http_request(
         } else {
             None
         };
-        if let Some(jpeg_data) = data {
-            let header = HttpResponse::new("200 OK")
-                .header("Content-Type", "image/jpeg")
-                .header("Content-Length", jpeg_data.len().to_string())
-                .header("Cache-Control", "public, max-age=31536000, immutable")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&jpeg_data).await;
-        } else {
-            let body = "Frame not found";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+        return write_api_response(
+            stream,
+            frame_hq_api_response(data),
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_method == "POST" && req_path == "/session" {
         let result = mint_session_token(&session_provider, &session_model).await;
         let (status, body) = match result {
@@ -1198,148 +1277,40 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_path.starts_with("/recordings/") {
-        // Serve recording data: segment files and metadata.
-        use tokio::io::AsyncWriteExt;
+        // Serve recording data: segment files and metadata. Path routing
+        // (verbatim post-"/recordings/" token, historically including any
+        // query string) stays at this edge; resolution and the response
+        // shapes are the neutral fn's, shared with the tunnel's
+        // api_recording_asset (goldens pin the historical wire bytes).
         let path_part = request_line
             .split("/recordings/")
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("");
-        let parts: Vec<&str> = path_part.split('/').collect();
-
-        if let Some(ref rec_reg) = recording_registry {
-            let reg = rec_reg.read().await;
-
-            if parts.len() == 2 && parts[1] == "segments" {
-                // GET /recordings/{stream}/segments — check session then daemon dir
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    // Fallback to daemon recordings dir
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let json: Vec<serde_json::Value> = segments
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "filename": s.filename,
-                            "start_secs": s.start_secs,
-                            "end_secs": s.end_secs,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
-                let response = HttpResponse::with_content("200 OK", "application/json", body)
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
-                // GET /recordings/{stream}/playlist.m3u8 — HLS playlist
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let m3u8 = recording_playlist_m3u8(&segments);
-                let response =
-                    HttpResponse::with_content("200 OK", "application/vnd.apple.mpegurl", m3u8)
-                        .header("Cache-Control", "no-cache")
-                        .header("Connection", "close")
-                        .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 {
-                // GET /recordings/{stream}/{filename} — serve segment file
-                let stream_name = parts[0];
-                let filename = parts[1];
-                // Validate filename to prevent path traversal
-                let valid = filename.starts_with("seg_")
-                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-                    && filename.len() < 30
-                    && !filename.contains("..");
-                if valid {
-                    // Check session dir first, then daemon dir
-                    let session_path = reg
-                        .session_dir()
-                        .join("recordings")
-                        .join(stream_name)
-                        .join(filename);
-                    let daemon_path = crate::debug::daemon_recordings_dir()
-                        .join(stream_name)
-                        .join(filename);
-                    let seg_path = if session_path.exists() {
-                        session_path
-                    } else {
-                        daemon_path
-                    };
-                    let content_type = if filename.ends_with(".ts") {
-                        "video/mp2t"
-                    } else {
-                        "video/mp4"
-                    };
-                    match tokio::fs::read(&seg_path).await {
-                        Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", content_type)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(&data).await;
-                        }
-                        Err(_) => {
-                            let body = "Segment not found";
-                            let response =
-                                HttpResponse::with_content("404 Not Found", "text/plain", body)
-                                    .header("Connection", "close")
-                                    .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                    }
-                } else {
-                    let body = "Invalid filename";
-                    let response =
-                        HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                            .header("Connection", "close")
-                            .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            } else {
-                let body = "Not found";
-                let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        } else {
-            let body = "Recording not available";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+        let response = live_recordings_path_api_response(
+            recording_registry.clone(),
+            &crate::debug::daemon_recordings_dir(),
+            path_part,
+        )
+        .await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/recordings" {
-        // GET /recordings — list all streams (session + daemon-scoped)
-        use tokio::io::AsyncWriteExt;
-
-        let body = recordings_list_response_body(recording_registry.clone()).await;
-        let response = HttpResponse::with_content("200 OK", "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "close")
-            .into_string();
-        let _ = stream.write_all(response.as_bytes()).await;
+        // GET /recordings — list all streams (session + daemon-scoped),
+        // through the neutral fn the tunnel's api_recordings shares.
+        let response = recordings_list_api_response(recording_registry.clone()).await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/debug" {
         // Debug endpoint: returns agent state + voice connection info
         let state = query_ctx.as_ref().map(|ctx| {
@@ -1577,17 +1548,57 @@ pub(crate) fn api_response_http_bytes(
             }
             http
         }
+        // A line stream cannot be buffered — `write_api_response` owns
+        // that lane before delegating here. Reaching this arm is a
+        // wiring bug; fail closed with the canonical 500.
+        ApiResponse::Stream { .. } => {
+            debug_assert!(false, "ApiResponse::Stream reached the buffered HTTP renderer");
+            HttpResponse::json(
+                status_reason(500),
+                serde_json::json!({ "error": "stream response on the buffered lane" })
+                    .to_string(),
+            )
+        }
     };
-    let http = match cors {
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
+}
+
+/// The row-declared CORS posture, applied to a rendered response — one
+/// place for both the buffered renderer and the Stream-lane head.
+fn apply_cors_posture(
+    http: HttpResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> HttpResponse {
+    match cors {
         crate::gateway_routes::CorsPosture::OwnOrigin => http,
         crate::gateway_routes::CorsPosture::Public => http.public_cors(),
         crate::gateway_routes::CorsPosture::FleetAllowlist => http.fleet_cors(fleet_origin),
-    };
-    http.into_bytes()
+    }
+}
+
+/// Head of a Stream-lane response: status line + Content-Type + the
+/// carried header tail under the row's CORS posture. Deliberately no
+/// Content-Length — the body is EOF-delimited (`Connection: close`)
+/// NDJSON lines the writer appends as they arrive.
+pub(crate) fn stream_response_http_head(
+    status: u16,
+    content_type: &str,
+    headers: Vec<(&'static str, String)>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> Vec<u8> {
+    let mut http = HttpResponse::new(status_reason(status)).header("Content-Type", content_type);
+    for (name, value) in headers {
+        http = http.header(name, value);
+    }
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
 }
 
 /// Write an [`ApiResponse`] to the HTTP lane and finalize the stream —
-/// the whole tail of a converted handler shim.
+/// the whole tail of a converted handler shim. The Stream lane writes
+/// its head then pumps the shared line source until it drains (or the
+/// client hangs up); buffered lanes render in one piece.
 pub(crate) async fn write_api_response(
     mut stream: DemuxStream,
     response: ApiResponse,
@@ -1595,8 +1606,37 @@ pub(crate) async fn write_api_response(
     fleet_origin: Option<&str>,
 ) {
     use tokio::io::AsyncWriteExt;
-    let bytes = api_response_http_bytes(response, cors, fleet_origin);
-    let _ = stream.write_all(&bytes).await;
+    match response {
+        ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream: line_stream,
+        } => {
+            let head = stream_response_http_head(status, &content_type, headers, cors, fleet_origin);
+            let LineStream {
+                lines: mut line_rx,
+                source,
+            } = line_stream;
+            if stream.write_all(&head).await.is_ok() {
+                while let Some(line) = line_rx.recv().await {
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // Hang up before joining: after an early exit above (client
+            // gone) the source may still be sending into the channel;
+            // dropping the receiver fails those sends so the producer
+            // finishes instead of deadlocking the join.
+            drop(line_rx);
+            let _ = source.await;
+        }
+        buffered => {
+            let bytes = api_response_http_bytes(buffered, cors, fleet_origin);
+            let _ = stream.write_all(&bytes).await;
+        }
+    }
     finalize_http_stream(&mut stream).await;
 }
 
@@ -1675,5 +1715,48 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
         assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    // ── S10 golden: the sessions-stream NDJSON head (design §8) ──
+    // Captured from the hand-rolled `handle_sessions_stream` header
+    // block before the Stream-lane conversion: no Content-Length, no
+    // Transfer-Encoding — the response is EOF-delimited
+    // (`Connection: close`), with the wildcard-CORS tail the sessions
+    // family bakes into its responses (the row's posture is OwnOrigin;
+    // the header is response decoration, exactly like `/api/sessions`).
+
+    /// The historical head, byte for byte.
+    pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/x-ndjson\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n";
+
+    #[tokio::test]
+    async fn golden_sessions_stream_http_head_is_pinned() {
+        // The Stream-lane head the neutral core declares, rendered under
+        // the row's declared posture, byte-identical to the retired
+        // hand-rolled header block.
+        let (_line_tx, lines) = tokio::sync::mpsc::channel::<String>(1);
+        let crate::web_gateway::ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream,
+        } = crate::web_gateway::sessions_stream_api_response_from(crate::web_gateway::LineStream {
+            lines,
+            source: tokio::spawn(async {}),
+        })
+        else {
+            panic!("sessions stream core must answer on the Stream lane");
+        };
+        drop(stream);
+        let row_cors = crate::gateway_routes::match_route("GET", "/api/sessions/stream")
+            .expect("sessions stream route declared")
+            .0
+            .cors;
+        let head = stream_response_http_head(status, &content_type, headers, row_cors, None);
+        assert_eq!(String::from_utf8(head).unwrap(), SESSIONS_STREAM_HEAD_GOLDEN);
     }
 }

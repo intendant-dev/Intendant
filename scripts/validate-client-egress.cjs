@@ -312,7 +312,10 @@ async function main() {
     await page.locator('#register').click();
     await page.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: START_TIMEOUT_MS });
     await page.locator('#claim').click();
-    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), { timeout: START_TIMEOUT_MS });
+    // Two success copies since the first-owner bootstrap landed: a
+    // daemon-minted phrase claims AND enrolls ("…enrolled as its first
+    // owner…"); an account-route claim keeps the original copy.
+    await page.waitForFunction(() => /Rendezvous route claimed|enrolled as its first owner/.test(document.getElementById('claim-status').textContent), { timeout: START_TIMEOUT_MS });
     const me = await page.evaluate(async () => fetch('/api/me').then(r => r.json()));
     writeOperatorIamGrant(daemonHome, me.user || me);
 

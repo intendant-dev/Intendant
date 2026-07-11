@@ -1626,12 +1626,27 @@ pub(crate) async fn api_peer_pairing_join_response(
     http_body_response(id, status, body, "peer pairing join")
 }
 
+// The pairing arms below split transport edge from core (hermeticity
+// convention, the sessions family's `_from_home` shape): the ambient
+// wrapper resolves the daemon's cert store once, the `_from_cert_dir`
+// core is what the parity fixtures drive over injected tempdirs.
+
 pub(crate) async fn api_peer_pairing_request_access_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_request_access(&body_text).await;
+    let (status, body) =
+        crate::web_gateway::peers_pairing_request_access(cert_dir, &body_text).await;
     http_body_response(id, status, body, "peer access request")
 }
 
@@ -1640,10 +1655,22 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_poll_response_from_cert_dir(id, params, runtime, &cert_dir)
+        .await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_poll_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
     let (status, body) = crate::web_gateway::peers_pairing_request_access_poll(
         runtime.peer_registry.as_ref(),
         runtime.project_root.as_deref(),
+        cert_dir,
         &body_text,
     )
     .await;
@@ -1651,13 +1678,30 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
 }
 
 pub(crate) async fn api_peer_pairing_requests_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_requests_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_requests_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_requests_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_requests_list(cert_dir);
     http_body_response(id, status, body, "peer access requests")
 }
 
 pub(crate) async fn api_peer_pairing_request_decision_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_decision_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_decision_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let request_id = string_param(&params, &["request_id", "requestId", "code", "id"]);
@@ -1672,12 +1716,20 @@ pub(crate) async fn api_peer_pairing_request_decision_response(
     };
     let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
     let (status, body) =
-        crate::web_gateway::peers_pairing_request_decision(&request_id, &op, &body_text);
+        crate::web_gateway::peers_pairing_request_decision(cert_dir, &request_id, &op, &body_text);
     http_body_response(id, status, body, "peer access request decision")
 }
 
 pub(crate) async fn api_peer_pairing_identities_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_identities_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identities_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identities_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_identities_list_from_cert_dir(cert_dir);
     http_body_response(id, status, body, "peer identities")
 }
 
@@ -1685,8 +1737,18 @@ pub(crate) async fn api_peer_pairing_identity_revoke_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identity_revoke_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identity_revoke_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_identity_revoke(&body_text);
+    let (status, body) =
+        crate::web_gateway::peers_pairing_identity_revoke_from_cert_dir(cert_dir, &body_text);
     http_body_response(id, status, body, "peer identity revoke")
 }
 
@@ -1699,8 +1761,16 @@ pub(crate) async fn api_coordinator_route_response(
         return peer_registry_unavailable_response(id);
     };
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::coordinator_route(registry, &body_text).await;
-    http_body_response(id, status, body, "coordinator route")
+    // The datachannel twin runs the S7 neutral core (POST-shaped by
+    // construction); the registry check above keeps the tunnel's
+    // historical frame-level error instead of the core's 503 body
+    // (divergence #20 in the S7 parity enumeration).
+    frame_api_response(
+        id,
+        crate::web_gateway::coordinator_route_api_response("POST", &body_text, Some(registry))
+            .await,
+        "coordinator route",
+    )
 }
 
 #[cfg(test)]
@@ -2172,16 +2242,32 @@ mod tests {
 
     #[tokio::test]
     async fn parity_displays_serves_the_same_body_on_both_transports() {
-        // No session registry on either lane: both render the ONE
-        // neutral enumeration (annotations need a registry; the OS
-        // display set is stable across the two back-to-back calls).
-        let rt = runtime();
+        // Injected display set on both lanes (a fixture must never
+        // enumerate the machine's real displays — on a session-less CI
+        // account the macOS enumeration never completes); no session
+        // registry on either lane, so both render the ONE neutral body
+        // through the `_from` core the production edges delegate to.
+        let displays = vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }];
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::displays_api_response(&None).await,
+            crate::web_gateway::displays_api_response_from(displays.clone(), &None).await,
         );
         assert_eq!(status, 200);
         assert!(http_body["displays"].is_array(), "{http_body}");
-        let frame = api_displays_response("parity-displays".to_string(), &rt).await;
+        let frame = frame_api_json_body_response(
+            "parity-displays".to_string(),
+            crate::web_gateway::displays_api_response_from(displays, &None).await,
+            "displays",
+        );
         assert_eq!(frame["ok"], true);
         assert!(frame["result"]
             .as_object()
@@ -2824,6 +2910,243 @@ mod tests {
             "this daemon has no fleet name — enable Connect against a \
              rendezvous with fleet DNS and let it register first"
         );
+    }
+
+    // ── S7 tunnel/HTTP parity: the peers/coordinator federation
+    // family ──
+    //
+    // Extends the enumeration (#10–#19 in the S6 blocks above). Both
+    // lanes have long shared the peers leaves (`peers_*` in
+    // routes_peers.rs); S7 makes the HTTP side one neutral sub-router
+    // unit and pins the addressing equivalence. The slice-specific
+    // differences, deliberate and pinned:
+    //
+    //  20. Registry-gate shapes are per-lane: the HTTP sub-router and
+    //      coordinator answer 503 {"error":"peer registry not
+    //      configured"}; the tunnel arms pre-check and answer the
+    //      frame-level {ok:false, error:"peer registry unavailable"}
+    //      — a different string AND envelope, both historical.
+    //  21. Addressing is transport-owned: HTTP captures the peer id
+    //      (url-decoded) and the request code/decision from path
+    //      segments and reads eligible capabilities from the query
+    //      string; the tunnel reads params — peer_id under five
+    //      aliases, request_id under four, the decision op defaulting
+    //      to "approve", capabilities as array/CSV
+    //      (control_capability_query) — and answers its own
+    //      missing-param frame when the id is absent.
+    //  22. Envelope split: api_peers (the list) rides the body-only
+    //      envelope (inline dispatch arm — no injected status); every
+    //      other peer method rides the `_httpStatus` injection. The
+    //      family's wildcard-CORS tail and its reason ladder (502 Bad
+    //      Gateway on relay failures) are HTTP-lane decoration only.
+    //  23. Store resolution at the edges: both lanes resolve the
+    //      ambient cert store at their transport edges and share the
+    //      cert-dir-parameterized pairing leaves; fixtures inject
+    //      tempdirs (hermeticity convention).
+
+    fn empty_peer_registry() -> crate::peer::PeerRegistry {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        crate::peer::PeerRegistry::new(log_tx)
+    }
+
+    #[tokio::test]
+    async fn parity_coordinator_route_shares_the_neutral_core() {
+        // Decode failure: deterministic serde wording through the one
+        // core on both lanes (routing successes need a connected peer
+        // and stay smoke-covered by the peer validators).
+        let registry = empty_peer_registry();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::coordinator_route_api_response("POST", "{}", Some(&registry))
+                .await,
+        );
+        assert_eq!(status, 400);
+
+        let mut rt = runtime();
+        rt.peer_registry = Some(empty_peer_registry());
+        let frame = api_coordinator_route_response(
+            "parity-coordinator".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_registry_unavailable_shapes_stay_per_lane() {
+        // Divergence #20, pinned from both sides.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 503);
+        assert_eq!(http_body["error"], "peer registry not configured");
+
+        let rt = runtime();
+        let frame =
+            api_peer_add_response("parity-no-registry".to_string(), None, &rt).await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "peer registry unavailable");
+    }
+
+    #[tokio::test]
+    async fn parity_pairing_decision_addresses_by_params_on_the_tunnel() {
+        // Divergence #21: HTTP takes the code and decision from path
+        // segments, the tunnel from params; the unknown-decision 404
+        // rises from the one shared leaf over the same injected store.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "POST",
+                "/api/peers/pairing/requests/zzz/badop",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 404);
+
+        let frame = api_peer_pairing_request_decision_response_from_cert_dir(
+            "parity-decision".to_string(),
+            Some(&serde_json::json!({"request_id": "zzz", "op": "badop"})),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(404)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // The tunnel's own missing-param frame (no HTTP equivalent —
+        // the path shape cannot omit the code).
+        let frame = api_peer_pairing_request_decision_response_from_cert_dir(
+            "parity-decision-missing".to_string(),
+            Some(&serde_json::json!({})),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing request_id");
+    }
+
+    #[tokio::test]
+    async fn parity_pairing_requests_list_shares_the_leaf_store() {
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/pairing/requests",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"requests": []}));
+
+        let frame = api_peer_pairing_requests_response_from_cert_dir(
+            "parity-requests".to_string(),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_eligible_addresses_by_params_on_the_tunnel() {
+        // Divergence #21 on the read side: HTTP's ?capability= query vs
+        // the tunnel's capabilities param (array/CSV), one leaf behind
+        // both. The no-capability 400 is the deterministic shape.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let registry = empty_peer_registry();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/eligible",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                Some(&registry),
+            )
+            .await,
+        );
+        assert_eq!(status, 400);
+
+        let mut rt = runtime();
+        rt.peer_registry = Some(empty_peer_registry());
+        let frame = api_peer_eligible_response(
+            "parity-eligible".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Same params, capability satisfied on both lanes: the empty
+        // registry serves the empty snapshot list.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/eligible?capability=display",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                Some(&registry),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let frame = api_peer_eligible_response(
+            "parity-eligible-display".to_string(),
+            Some(&serde_json::json!({"capabilities": ["display"]})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
     }
 
     use crate::*;

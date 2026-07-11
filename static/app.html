@@ -26113,7 +26113,8 @@ async function accessFleetRefreshProvenance() {
 //   daemonApi.upload(method, params, source, opts)   -> {ok, status, body}   (source: Blob | Uint8Array)
 //   daemonApi.stream(method, params, opts, onEvent)  -> completion summary
 //   daemonApi.availability(method, target)           -> {ok, reason}
-//   // opts: { target?: hostId|null, signal?, timeoutMs?, retries?, fallback?: 'auto'|'never' }
+//   // opts: { target?: hostId|{remoteHttp: origin}|null, signal?,
+//   //         timeoutMs?, retries?, fallback?: 'auto'|'never' }
 //
 // `method` is always the tunnel method name; DAEMON_API_HTTP_MAP maps it to
 // the HTTP twin when the direct lane serves the call. Adapters:
@@ -26124,12 +26125,26 @@ async function accessFleetRefreshProvenance() {
 //     authenticates to a peer over HTTP);
 //   - HTTP: `authedFetch` + the descriptor table. Connect mode is policy,
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
-//     exactly this no-legacy-fallback behavior).
+//     exactly this no-legacy-fallback behavior);
+//   - remote-http (F4): `{remoteHttp: origin}` targets name a FLEET
+//     daemon's own HTTP origin — direct cross-origin fetch under the
+//     fleet-CORS rows, never a tunnel, never a fallback (design §5's F4
+//     caveat: fleet fan-out is explicit, not ambiguous).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
-// staged uploads), the F2 sessions-family reads, and the F3 settings/keys
+// staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
-// external-agents, displays); the remaining `rpcOrHttp`/`jsonFetch` call
+// external-agents, displays), the F4 access dialogs family
+// (overview/enrollment/connect/tier + IAM grant writes), the F5
+// peers/approvals/coordinator family (peer list + quick controls, the
+// pairing dialogs, the coordinator forms, and the peer WebRTC signal
+// relays), the F6 credential-custody family (vault leases, the
+// custody trail, the daemon vault store + deposit lane, client-egress
+// registration/probe — tunnel-only methods whose per-cause availability
+// the vault UI surfaces), and the F1c transfer-jobs adapter (the
+// resumable jobs protocol over the S9 /api/transfers rows, presence
+// feature-detected through the probe registry below); the remaining
+// `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
 // evaluates.
@@ -26158,12 +26173,31 @@ async function accessFleetRefreshProvenance() {
 //
 // Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots), and the
+// its NDJSON stream, search, detail, report, context snapshots), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
-// project-root, external-agents, displays). The
-// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
-// until the server-track stage that adds /api/transfers (task #6); F1 adds
-// their entries when those rows land.
+// project-root, external-agents, displays), and the F4 access family:
+// the dialogs set (overview, IAM state, enrollment reads + decide, IAM
+// grant upsert/update, the connect admin quartet, the tier pair,
+// fleet-cert request, dashboard targets) plus the org set (trust/revoke,
+// issuance, issuer key management, and the signed-org doorbell quartet —
+// present, renew, ORL read, ORL apply, whose HTTP rows are Public by
+// design: the signed document is the authorization), and the F5 peers /
+// coordinator family (the peer registry list/add/remove, eligible,
+// quick controls — message/task/approval, the three WebRTC signal
+// relays, the pairing set, and the coordinator route; their rows
+// delegate IAM to the federation ladder, S7), and the transfer-jobs
+// family (task #6 / F1c): the six /api/transfers rows (S9) twinning the
+// datachannel `api_transfer_*` methods. Unlike every other family, a
+// deployed daemon may predate those rows, so their entries carry
+// `probe: 'transfers'` — the availability derivation and the transfers
+// pump consult the one-shot GET /api/transfers probe (below) before
+// treating the HTTP lane as present (design §4: 404/405 ⇒ old daemon ⇒
+// legacy behavior + honest availability). The F6 credential-custody family
+// (api_credential_*, api_daemon_vault_*) is deliberately absent too, and
+// stays so: custody is tunnel-scoped by design — no HTTP rows exist or
+// are planned (docs/src/credential-custody.md; the transport design
+// parks custody HTTP rows as an explicit future decision), so those
+// methods ride the facade with no fallback lane at all.
 // Entry shape: verb + path template (`{name}` segments are lifted from
 // params), `alias` = capture-name -> param-key lift map (the session rows
 // capture `id` while the tunnel's canonical param is `session_id` — the
@@ -26171,11 +26205,17 @@ async function accessFleetRefreshProvenance() {
 // lifted into the query string (arrays comma-join; empty arrays stay
 // absent), `queryJson` = query keys whose array value JSON-encodes instead
 // (the search `projects` filter, which the HTTP handler serde-parses),
+// `queryRepeat` = query-key -> array-param-key map emitting one
+// `key=value` pair per element (the eligible endpoint's repeated
+// `?capability=` keys from the tunnel's `capabilities` array; empty
+// arrays stay absent),
 // `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
-// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `probe` = the twin's rows may be absent on a deployed daemon; name the
+// DAEMON_API_HTTP_PROBES entry whose result gates the http-only lane.
 // `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
@@ -26186,6 +26226,12 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
   api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
   api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
+  api_transfer_jobs: { verb: 'GET', path: '/api/transfers', query: ['id', 'resume_token'], probe: 'transfers' },
+  api_transfer_job_create: { verb: 'POST', path: '/api/transfers', probe: 'transfers' },
+  api_transfer_upload_chunk: { verb: 'POST', path: '/api/transfers/{id}/chunk', query: ['offset', 'resume_token'], lane: 'upload', encode: 'raw', probe: 'transfers' },
+  api_transfer_upload_commit: { verb: 'POST', path: '/api/transfers/{id}/commit', probe: 'transfers' },
+  api_transfer_job_delete: { verb: 'DELETE', path: '/api/transfers/{id}', probe: 'transfers' },
+  api_transfer_download_read: { verb: 'GET', path: '/api/transfers/{id}/download', lane: 'bytes', probe: 'transfers' },
   api_session_current_uploads: { verb: 'GET', path: '/api/session/current/uploads' },
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
@@ -26211,6 +26257,56 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_project_root: { verb: 'GET', path: '/api/project-root' },
   api_external_agents: { verb: 'GET', path: '/api/external-agents' },
   api_displays: { verb: 'GET', path: '/api/displays' },
+  api_access_overview: { verb: 'GET', path: '/api/access/overview' },
+  api_access_iam_state: { verb: 'GET', path: '/api/access/iam/state' },
+  api_access_enrollment_requests: { verb: 'GET', path: '/api/access/enrollment-requests' },
+  api_access_enrollment_decide: { verb: 'POST', path: '/api/access/enrollment-requests/decide' },
+  api_access_iam_upsert_user_client_grant: { verb: 'POST', path: '/api/access/iam/user-client-grants' },
+  api_access_iam_update_grant: { verb: 'POST', path: '/api/access/iam/grants/update' },
+  api_access_connect_status: { verb: 'GET', path: '/api/access/connect/status' },
+  api_access_connect_claim_code: { verb: 'GET', path: '/api/access/connect/claim-code' },
+  api_access_connect_config: { verb: 'POST', path: '/api/access/connect/config' },
+  api_access_connect_unclaim: { verb: 'POST', path: '/api/access/connect/unclaim' },
+  api_access_set_tier: { verb: 'POST', path: '/api/access/tier' },
+  api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
+  api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
+  api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
+  api_access_org_trust: { verb: 'POST', path: '/api/access/orgs/trust' },
+  api_access_org_revoke: { verb: 'POST', path: '/api/access/orgs/revoke' },
+  api_access_org_issue: { verb: 'POST', path: '/api/access/org-grants/issue' },
+  api_access_org_revoke_member: { verb: 'POST', path: '/api/access/org-grants/revoke-member' },
+  api_access_org_issuer_init: { verb: 'POST', path: '/api/access/org-grants/issuers/init' },
+  api_access_org_issuer_delegate: { verb: 'POST', path: '/api/access/org-grants/issuers/delegate' },
+  api_access_org_issuer_install: { verb: 'POST', path: '/api/access/org-grants/issuers/install' },
+  api_access_org_present: { verb: 'POST', path: '/api/access/org-grants' },
+  api_access_org_renew: { verb: 'POST', path: '/api/access/org-grants/renew' },
+  api_access_org_orl: { verb: 'GET', path: '/api/access/orgs/{org_handle}/revocations', alias: { org_handle: 'handle' } },
+  api_access_org_orl_apply: { verb: 'POST', path: '/api/access/orgs/revocations/apply' },
+  api_peers: { verb: 'GET', path: '/api/peers' },
+  api_peer_add: { verb: 'POST', path: '/api/peers' },
+  api_peer_remove: { verb: 'DELETE', path: '/api/peers' },
+  api_peer_eligible: { verb: 'GET', path: '/api/peers/eligible', queryRepeat: { capability: 'capabilities' } },
+  api_peer_message: { verb: 'POST', path: '/api/peers/{peer_id}/message' },
+  api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
+  api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
+  api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
+  api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
+  api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },
+  api_peer_pairing_invite: { verb: 'POST', path: '/api/peers/pairing/invite' },
+  api_peer_pairing_join: { verb: 'POST', path: '/api/peers/pairing/join' },
+  api_peer_pairing_request_access: { verb: 'POST', path: '/api/peers/pairing/request-access' },
+  api_peer_pairing_request_access_poll: { verb: 'POST', path: '/api/peers/pairing/request-access/poll' },
+  api_peer_pairing_requests: { verb: 'GET', path: '/api/peers/pairing/requests' },
+  api_peer_pairing_request_decision: { verb: 'POST', path: '/api/peers/pairing/requests/{code}/{decision}', alias: { code: 'request_id', decision: 'op' } },
+  api_peer_pairing_identities: { verb: 'GET', path: '/api/peers/pairing/identities' },
+  api_peer_pairing_identity_revoke: { verb: 'POST', path: '/api/peers/pairing/identities/revoke' },
+  // The coordinator twin carries the program's one live per-lane IAM
+  // divergence, preserved on purpose: the HTTP row classifies through the
+  // federation ladder as Task, while the datachannel method has always
+  // gated on PeerManage (documented op-override on the route row). The
+  // descriptor only names the twin's verb + path — it must not paper over
+  // that divergence, and the daemon-side parity pin asserts the override.
+  api_coordinator_route: { verb: 'POST', path: '/api/coordinator/route' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -26388,6 +26484,52 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
   if (tunnelError && !policy.replayAfterAttempt) throw tunnelError;
 }
 
+// ── HTTP row-presence probes (F1c, design §4) ─────────────────────────────
+// Most descriptor rows shipped with (or before) the facade, so map
+// presence == daemon presence. The transfer-jobs rows (task #6) landed
+// after deployed daemons existed, so their entries are `probe`-gated:
+// ONE GET probe per page load answers "does this daemon serve the rows?"
+// — 404/405 ⇒ old daemon (absent ⇒ legacy behavior + honest
+// availability); any delivered response, auth walls included, proves the
+// rows exist (the real request surfaces its own denial). A transport
+// failure leaves the state 'unknown' so a later ensure() re-probes; the
+// cached verdict feeds daemonApiAvailability below.
+const DAEMON_API_HTTP_PROBES = {
+  transfers: { path: '/api/transfers', state: 'unknown', promise: null },
+};
+
+function daemonApiHttpProbeState(name) {
+  return DAEMON_API_HTTP_PROBES[name]?.state || 'unknown';
+}
+
+// Resolve (and cache) a probe: Promise<boolean> — "the rows are present".
+// Callers that need a lane DECISION await this; sync availability reads
+// the cached state. Never called in connect mode (no HTTP lane there) —
+// the transfers pump gates on dashboardConnectModeEnabled() first.
+async function daemonApiEnsureHttpProbe(name) {
+  const probe = DAEMON_API_HTTP_PROBES[name];
+  if (!probe) return false;
+  if (probe.state !== 'unknown') return probe.state === 'present';
+  if (!probe.promise) {
+    probe.promise = (async () => {
+      try {
+        const resp = await authedFetch(probe.path, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: dashboardComposeFetchSignal(null, 15000),
+        });
+        probe.state = resp.status === 404 || resp.status === 405 ? 'absent' : 'present';
+      } catch (_) {
+        probe.state = 'unknown';
+      } finally {
+        probe.promise = null;
+      }
+      return probe.state === 'present';
+    })();
+  }
+  return probe.promise;
+}
+
 // ── HTTP adapter ──────────────────────────────────────────────────────────
 // Builds verb/path/query/body from the descriptor. `{name}` path segments
 // lift (and consume) params[name] — or params[alias[name]] when the entry
@@ -26426,6 +26568,19 @@ function daemonApiHttpTarget(spec, method, params) {
     }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
+  // queryRepeat twins: the tunnel method takes an array param; the HTTP
+  // twin takes one repeated `key=value` pair per element (the eligible
+  // endpoint's `?capability=` vocabulary — its server parser rejects
+  // comma-joins, so these keys never ride the `query` lift).
+  for (const [key, paramKey] of Object.entries(spec.queryRepeat || {})) {
+    const value = source[paramKey];
+    used.add(paramKey);
+    if (!Array.isArray(value)) continue;
+    for (const element of value) {
+      if (element === undefined || element === null || String(element) === '') continue;
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(element))}`);
+    }
+  }
   // rawQuery twins: the tunnel method takes one pre-encoded query-string
   // param (the managed-context handlers rebuild a request line from it);
   // the HTTP twin takes that same string as the URL query verbatim.
@@ -26452,8 +26607,11 @@ async function daemonApiHttpRequest(method, params, opts) {
   if (opts && opts.cache) init.cache = opts.cache;
   // Body-less POST twins stay body-less (api_worktrees_scan rides a
   // BodyPolicy::None row, and every legacy empty-payload POST call site
-  // sent no body/Content-Type either).
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // sent no body/Content-Type either). DELETE twins carry their leftover
+  // params the same way: api_peer_remove's HTTP shape has always been a
+  // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
+  // consume their params into the path and stay body-less).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -26609,6 +26767,81 @@ async function daemonApiHttpStream(method, params, opts, onEvent) {
   return null;
 }
 
+// ── Remote-http adapter (transport F4) ────────────────────────────────────
+// Cross-daemon fleet calls: the anchor page applies access changes to
+// OTHER daemons by direct cross-origin HTTP — the fleet-CORS rows, with
+// the browser's own identity to that origin (mTLS certificate) as the
+// authentication. This daemon's `authedFetch` bearer stays out of the
+// lane on purpose: nothing minted here carries authority there
+// (trust-architecture: authority is only ever minted by the target
+// daemon's local IAM). Naming the target names the transport — no tunnel
+// is ever attempted, no fallback is ever taken, and a delivered error is
+// final (design §5's F4 caveat: explicit remote-http, never fallback
+// ambiguity). JSON lane only: every fleet-CORS twin is a JSON verb, so
+// the bytes/upload/stream verbs refuse remote-http targets loudly.
+
+// The normalized origin for a `{remoteHttp: origin}` target: '' when the
+// target is not remote-http-shaped (null and string peer ids pass
+// through to the tunnel adapters); a throw when the shape is right but
+// the origin is not a usable absolute http(s) origin — a mis-built
+// target must fail loudly, never drift into another lane.
+function daemonApiRemoteHttpOrigin(target) {
+  if (!target || typeof target !== 'object') return '';
+  const raw = String(target.remoteHttp || '').trim();
+  let origin = '';
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'https:' || url.protocol === 'http:') origin = url.origin;
+    } catch { /* rejected below */ }
+  }
+  if (!origin) {
+    throw new TypeError(
+      `daemonApi: object targets must carry an absolute http(s) remoteHttp origin (got ${raw || 'nothing'})`
+    );
+  }
+  return origin;
+}
+
+// Fleet links cross networks the local per-method defaults (5 s for the
+// access family) were never sized for — floor the composed timeout at
+// the peer-dial default unless the caller sets one. Still never
+// signal-less (§3.6).
+function daemonApiRemoteHttpSignal(method, opts) {
+  const timeout = Number(opts && opts.timeoutMs);
+  const ms = Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : Math.max(daemonApiTimeoutMs(method, opts), 30000);
+  return dashboardComposeFetchSignal(opts && opts.signal, ms);
+}
+
+async function daemonApiRemoteHttpRequest(origin, method, params, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (!spec) {
+    throw new DaemonApiError(
+      'unavailable', method, origin,
+      `${method} has no HTTP twin (remote-http targets are direct-HTTP only)`
+    );
+  }
+  const { url, rest } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, mode: 'cors', signal: daemonApiRemoteHttpSignal(method, opts) };
+  // Same body rule as the local adapter: mutation verbs carry leftover
+  // params as the JSON body (no fleet-CORS DELETE twin exists today, but
+  // the adapters must agree on the descriptor's semantics).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(rest);
+  }
+  let resp;
+  try {
+    resp = await fetch(`${origin}${url}`, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method, origin);
+  }
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
 // ── Tunnel adapters ───────────────────────────────────────────────────────
 // Local and peer speak the same DashboardControlTransport protocol; the
 // peer adapter resolves (or dials) the per-host connection first. A peer
@@ -26654,6 +26887,8 @@ async function daemonApiTunnelBytes(transport, method, params, opts, target) {
 
 // ── The four verbs ────────────────────────────────────────────────────────
 async function daemonApiRequest(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) return daemonApiRemoteHttpRequest(remoteOrigin, method, params, opts);
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -26680,6 +26915,13 @@ async function daemonApiRequest(method, params = {}, opts = {}) {
 }
 
 async function daemonApiBytes(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS byte twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -26703,6 +26945,13 @@ async function daemonApiBytes(method, params = {}, opts = {}) {
 }
 
 async function daemonApiUpload(method, params = {}, source, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS upload twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -26731,6 +26980,13 @@ async function daemonApiUpload(method, params = {}, source, opts = {}) {
 }
 
 async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS stream twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -26764,7 +27020,8 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
 // `<method>_available` booleans (server-derived from its method table —
 // false rolls denial and runtime-not-ready into one honest "no");
 // connect-mode policy; HTTP-map presence (a direct dashboard with no
-// tunnel still reports twinned methods as reachable). The scattered
+// tunnel still reports twinned methods as reachable), qualified by the
+// row-presence probes for `probe`-gated entries. The scattered
 // canUse*/`*Available` probes become one-line derivations over this at
 // their family flips.
 function daemonApiTunnelMethodAvailability(transport, method) {
@@ -26799,6 +27056,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
 }
 
 function daemonApiAvailability(method, target = null) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(target);
+  if (remoteOrigin) {
+    // A REMOTE origin's reachability is unknowable without a request;
+    // the honest answer is lane presence — the descriptor names the
+    // methods fleet daemons serve over direct HTTP.
+    return DAEMON_API_HTTP_MAP[method]
+      ? { ok: true, reason: 'http-only' }
+      : { ok: false, reason: 'never' };
+  }
   if (target) {
     const conn = peerDashboardControlConnectionsByHost.get(String(target));
     if (conn && conn.canUseRpc()) return daemonApiTunnelMethodAvailability(conn, method);
@@ -26811,7 +27077,18 @@ function daemonApiAvailability(method, target = null) {
   const transport = dashboardControlTransport;
   if (transport && transport.canUseRpc()) return daemonApiTunnelMethodAvailability(transport, method);
   if (dashboardConnectModeEnabled()) return { ok: false, reason: 'transport-down' };
-  if (DAEMON_API_HTTP_MAP[method]) return { ok: true, reason: 'http-only' };
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (spec) {
+    // Probe-gated twins (the transfer-jobs rows): a probed-absent daemon
+    // answers the honest 'unsupported', exactly like a tunnel daemon too
+    // old for the method. Un-probed stays optimistic — the same posture
+    // as a tunnel whose hello_ack has not landed (the request itself
+    // reports the truth), and lane DECISIONS await the probe first.
+    if (spec.probe && daemonApiHttpProbeState(spec.probe) === 'absent') {
+      return { ok: false, reason: 'unsupported' };
+    }
+    return { ok: true, reason: 'http-only' };
+  }
   return { ok: false, reason: 'transport-down' };
 }
 
@@ -26841,6 +27118,8 @@ const daemonApi = Object.freeze({
   stream: daemonApiStream,
   availability: daemonApiAvailability,
   fallbackPolicy: daemonApiFallbackPolicy,
+  ensureHttpProbe: daemonApiEnsureHttpProbe,
+  httpProbeState: daemonApiHttpProbeState,
   httpMap: DAEMON_API_HTTP_MAP,
   descriptorChecksum: daemonApiDescriptorChecksum,
   Error: DaemonApiError,
@@ -26875,6 +27154,7 @@ window.qa = Object.assign(window.qa || {}, {
         http: {
           connectMode: Boolean(dashboardConnectModeEnabled()),
           reachable: !dashboardConnectModeEnabled(),
+          transfersProbe: daemonApiHttpProbeState('transfers'),
         },
       },
       availability: {
@@ -26883,6 +27163,13 @@ window.qa = Object.assign(window.qa || {}, {
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
         api_sessions: daemonApiAvailability('api_sessions'),
         api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
+        // Probe-gated transfers sample (F1c): 'http-only' flips to
+        // 'unsupported' once the rows probe answers absent.
+        api_transfer_job_create: daemonApiAvailability('api_transfer_job_create'),
+        // Tunnel-only custody sample (F6): 'denied' vs 'unsupported' vs
+        // 'transport-down' is directly observable here — no HTTP twin
+        // ever answers for it.
+        api_credential_lease_status: daemonApiAvailability('api_credential_lease_status'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,
@@ -26961,19 +27248,25 @@ const vaultRevealedEntries = new Set();
    copying between them is an explicit user action, never implicit. */
 function vaultDaemonStoreReady() {
   if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // An empty feature list means the hello_ack hasn't landed yet: fall
-    // through and let the RPCs answer (mirrors vaultLeaseTransportReady).
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_daemon_vault_fetch');
-    }
-    return true;
-  } catch {
-    return false;
+  // daemonApi availability (transport F6): the tunnel status boolean when
+  // it has landed (false = this session's role is refused the custody
+  // gate), the hello_ack features list before that (absent = the daemon
+  // predates local vault storage), optimistic only while the handshake is
+  // still in flight — the pre-facade "let the RPCs answer" semantics.
+  return daemonApi.availability('api_daemon_vault_fetch').ok;
+}
+
+/* Why the daemon store is out of reach, for the 'unavailable' status line
+   — the honest split the conflated pre-facade copy could not make. */
+function vaultDaemonStoreUnavailableText() {
+  const reason = daemonApi.availability('api_daemon_vault_fetch').reason;
+  if (reason === 'denied') {
+    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Hosted Connect dashboards use the account vault instead.";
   }
+  if (reason === 'unsupported') {
+    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect dashboards use the account vault instead.';
+  }
+  return 'No vault store reachable yet: the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
 }
 
 function vaultBackendKind() {
@@ -27230,6 +27523,9 @@ async function vaultServerFetch() {
       vault: result?.vault || null,
     };
   }
+  // The account store lives on the Connect service, not on any daemon —
+  // deliberately raw fetch, outside the daemonApi facade (the facade
+  // speaks to daemons only; rendezvous calls stay on their own lane).
   const resp = await fetch(accessFleetHostedUrl('/api/vault'));
   if (resp.status === 401) return { authenticated: false };
   const body = await resp.json().catch(() => ({}));
@@ -28021,7 +28317,8 @@ const VAULT_OFFLINE_CHOICES = [
 const VAULT_OFFLINE_DEFAULT_MS = 24 * 60 * 60 * 1000;
 
 const vaultLeaseState = {
-  supported: null,   // null until first probe; false when the daemon lacks the RPCs / gate
+  supported: null,   // null until first verdict; false only on the daemon's own refusal
+  availability: '',  // honest cause: 'denied' | 'unsupported' | 'connected' (transport F6)
   leases: [],
   egress: [],        // active client-egress relays (the path indicator)
   expiredNote: '',
@@ -28195,40 +28492,47 @@ async function vaultOauthAccessTokenMaterial(entry, kind) {
   return vaultOauthAccessMaterial(kind, secretJson);
 }
 
+/* Availability of the lease RPC family here (transport F6, design §3.4):
+   the daemon's own word, before any RPC fires. Reasons the render paths
+   branch on — 'denied' (the status boolean says this session's role is
+   refused credentials.manage; custody methods have no runtime-ready
+   ladder, so false means exactly that), 'unsupported' (the hello_ack
+   features list omits the family — the daemon predates it),
+   'transport-down' (no verified tunnel; custody has no HTTP twin by
+   design, so no other lane can answer), 'connected' (go — optimistically
+   so while the handshake is still digesting, letting the RPCs answer
+   exactly as the pre-facade probes did). */
+function vaultLeaseAvailability() {
+  return daemonApi.availability('api_credential_lease_status');
+}
+
 function vaultLeaseTransportReady() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // Leases need the credential RPC family. A daemon that advertises its
-    // control surface but not these methods is too old — report
-    // unsupported instead of firing calls that fail one by one. An empty
-    // list means the hello_ack hasn't landed yet: fall through and let
-    // the RPCs answer.
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_credential_lease_status');
-    }
-    return true;
-  } catch {
-    return false;
-  }
+  return vaultLeaseAvailability().ok;
 }
 
-function vaultLeaseRpc(method, params = {}) {
-  return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
+/* One custody RPC. Tunnel-only by design (docs/src/credential-custody.md;
+   the transport design keeps the family off HTTP rows), which the facade
+   enforces: no fallback lane exists, so a custody mutation can never
+   replay elsewhere after an ambiguous failure, and a down tunnel rejects
+   immediately. Resolves with the result payload (the pre-facade contract
+   every call site and window.intendantVault.probeEgress keeps);
+   rejections are DaemonApiError, whose `kind` the refreshers classify
+   into availability verdicts. Per-method timeouts live in
+   dashboardControlRequestTimeoutMs — the `{ timeoutMs: 15000 }` option
+   the pre-facade call passed here was silently ignored by the request
+   verb; the custody rows of that table now carry the intent. */
+async function vaultLeaseRpc(method, params = {}) {
+  const { body } = await daemonApi.request(method, params);
+  return body;
 }
 
-/* Whether the tunneled daemon advertises local vault storage — strict
-   (feature must be listed) because this only gates an optional action. */
+/* Whether the tunneled daemon offers local vault storage to THIS session —
+   'connected' only: the daemon must have confirmed the method (status
+   boolean or features list), because this gates an optional action (the
+   sealed-copy button) that a credentials.manage-denied session or an
+   older daemon could only bounce. */
 function vaultTunnelDaemonVaultAvailable() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    const features = status.controlFeatures;
-    return Array.isArray(features) && features.includes('api_daemon_vault_publish');
-  } catch {
-    return false;
-  }
+  return daemonApi.availability('api_daemon_vault_publish').reason === 'connected';
 }
 
 /* The lease kind a vault entry fuels, or null when it cannot fuel.
@@ -28247,11 +28551,22 @@ function vaultEntryLeaseKind(entry) {
 }
 
 async function vaultRefreshLeases({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = vaultLeaseAvailability();
+  if (!avail.ok) {
+    // The daemon already answered through features/status — record the
+    // verdict without firing RPCs that can only bounce (the render paths
+    // read the same availability live, so no re-render is needed here).
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = avail.reason;
+    }
+    return;
+  }
   if (!force && Date.now() - vaultLeaseState.fetchedAt < 30_000) return;
   try {
     const result = await vaultLeaseRpc('api_credential_lease_status');
     vaultLeaseState.supported = true;
+    vaultLeaseState.availability = 'connected';
     vaultLeaseState.leases = Array.isArray(result?.leases) ? result.leases : [];
     vaultLeaseState.egress = Array.isArray(result?.egress) ? result.egress : [];
     vaultLeaseState.expiredNote = String(result?.expired_note || '');
@@ -28262,12 +28577,20 @@ async function vaultRefreshLeases({ force = false } = {}) {
     }
     vaultEgressEnsure().catch(() => {});
   } catch (err) {
-    const message = String(err?.message || err);
-    // A daemon predating the lease RPCs, or a session without the
-    // credentials.manage gate, reads as unsupported rather than broken.
-    vaultLeaseState.supported = false;
-    vaultLeaseState.lastError = message;
+    vaultLeaseState.lastError = String(err?.message || err);
     vaultLeaseState.fetchedAt = Date.now();
+    // Availability honesty (transport F6): only the daemon's own refusals
+    // are verdicts about this session or this daemon. 'denied' is the
+    // authorizer refusing the gate, 'unavailable' is a daemon without the
+    // method (races where the pre-flight was still optimistic). A timeout
+    // or a dropped channel says nothing about support — keep the last
+    // known verdict and surface the error text instead of the old
+    // conflated "cannot manage leases" reading.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
@@ -28275,20 +28598,41 @@ async function vaultRefreshLeases({ force = false } = {}) {
 }
 
 /* Custody trail: the daemon's own record of lease/relay lifecycle events,
-   fetched over the same credentials.manage-gated channel as the leases. */
-const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+   fetched over the same credentials.manage-gated channel as the leases.
+   `availability` carries the honest cause when supported goes false:
+   'denied' (role refused the gate) vs 'unsupported' (daemon predates the
+   trail) — transient lane failures flip neither. */
+const custodyTrailState = { events: [], supported: null, availability: '', fetchedAt: 0 };
 
 async function vaultRefreshCustody({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = daemonApi.availability('api_credential_custody_trail');
+  if (!avail.ok) {
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      const changed = custodyTrailState.supported !== false
+        || custodyTrailState.availability !== avail.reason;
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = avail.reason;
+      custodyTrailState.fetchedAt = Date.now();
+      if (changed) renderAccessCustodySection();
+    }
+    return;
+  }
   if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
   custodyTrailState.fetchedAt = Date.now();
   try {
     const result = await vaultLeaseRpc('api_credential_custody_trail');
     custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
     custodyTrailState.supported = true;
-  } catch {
-    // Older daemon or a session without credentials.manage.
-    custodyTrailState.supported = false;
+    custodyTrailState.availability = 'connected';
+  } catch (err) {
+    // Verdicts only from the daemon's own refusals (see
+    // vaultRefreshLeases); a timeout or dropped channel keeps whatever
+    // the last connected read established.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessCustodySection();
 }
@@ -28313,7 +28657,10 @@ function renderAccessCustodySection() {
     mount.appendChild(el);
   };
   if (custodyTrailState.supported === false) {
-    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    // The honest split (transport F6): the daemon said which it is.
+    note(custodyTrailState.availability === 'unsupported'
+      ? 'This daemon predates the custody trail — upgrade it to see lease and relay lifecycle events.'
+      : "This session can't read the custody trail — its role needs credentials.manage.");
     return;
   }
   if (!custodyTrailState.events.length) {
@@ -29029,21 +29376,32 @@ function vaultRenderFueling(card) {
   head.appendChild(title);
   card.appendChild(head);
 
-  if (!vaultLeaseTransportReady()) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = 'Connect to the daemon to fuel it — leases travel only over the verified tunnel.';
-    card.appendChild(note);
+  const fuelingNote = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    card.appendChild(el);
+  };
+  // Availability honesty (transport F6): the daemon's features/status
+  // answer BEFORE any RPC fires, so the panel names the actual cause —
+  // a session whose role is refused the gate, a daemon predating the
+  // family, or simply no tunnel yet — instead of the old conflated
+  // "cannot manage leases" catch-all. The stored verdict covers the
+  // race where a still-optimistic pre-flight let an RPC bounce.
+  const avail = vaultLeaseAvailability();
+  if (avail.reason === 'denied' || vaultLeaseState.availability === 'denied') {
+    fuelingNote("This session's role can't manage credential leases — fueling needs credentials.manage.");
+    return;
+  }
+  if (avail.reason === 'unsupported' || vaultLeaseState.availability === 'unsupported') {
+    fuelingNote('This daemon predates credential leases — upgrade it to fuel from the vault.');
+    return;
+  }
+  if (!avail.ok) {
+    fuelingNote('Connect to the daemon to fuel it — leases travel only over the verified tunnel.');
     return;
   }
   vaultRefreshLeases().catch(() => {});
-  if (vaultLeaseState.supported === false) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = `This session cannot manage credential leases: ${vaultLeaseState.lastError || 'the daemon predates leases or this role lacks credentials.manage.'}`;
-    card.appendChild(note);
-    return;
-  }
 
   if (vaultLeaseState.expiredNote) {
     const warning = document.createElement('div');
@@ -29051,7 +29409,9 @@ function vaultRenderFueling(card) {
     warning.textContent = vaultLeaseState.expiredNote;
     card.appendChild(warning);
   }
-  if (vaultLeaseState.lastError && vaultLeaseState.supported) {
+  // Transient lane failures (timeouts, channel drops) are errors, not
+  // support verdicts — show them even before the first successful probe.
+  if (vaultLeaseState.lastError && vaultLeaseState.supported !== false) {
     const error = document.createElement('div');
     error.className = 'vault-error';
     error.textContent = vaultLeaseState.lastError;
@@ -29330,7 +29690,7 @@ function renderAccessVaultSection() {
         ? 'This browser lacks the WebCrypto features the vault needs.'
         : DASHBOARD_CONNECT_MODE
           ? 'The hosted vault store is unreachable right now.'
-          : 'No vault store reachable yet: this daemon predates local vault storage, this session lacks credentials.manage, or the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
+          : vaultDaemonStoreUnavailableText();
       break;
     case 'signed-out':
       chip.textContent = 'signed out';
@@ -29512,6 +29872,7 @@ window.intendantVault = {
   voiceApiKeyGet: storageKey => voiceApiKeyGet(storageKey),
   leases: () => ({
     supported: vaultLeaseState.supported,
+    availability: vaultLeaseState.availability,
     leases: vaultLeaseState.leases.map(lease => ({ ...lease })),
     expiredNote: vaultLeaseState.expiredNote,
     lastError: vaultLeaseState.lastError,
@@ -29550,6 +29911,7 @@ window.intendantVault = {
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
   custody: () => ({
     supported: custodyTrailState.supported,
+    availability: custodyTrailState.availability,
     events: custodyTrailState.events.map(event => ({ ...event })),
   }),
   refreshCustody: () => vaultRefreshCustody({ force: true }),
@@ -29742,7 +30104,7 @@ async function orgRevocationCourier() {
       if (!resp.ok) continue;
       const body = await resp.json().catch(() => ({}));
       if (!body?.orl) continue;
-      const applied = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', body.orl);
+      const applied = await accessOrgCall('api_access_org_orl_apply', body.orl);
       if (applied?.applied?.changed) {
         console.info(`[org] carried @${handle} revocations seq ${applied.applied.seq} to this daemon (${applied.applied.revoked_grants} grants, ${applied.applied.revoked_peer_identities} peer identities revoked)`);
       }
@@ -51692,13 +52054,14 @@ function invalidateAccessOverview() {
 
 async function refreshAccessOverviewFromApi(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_overview', {}, () => authedFetch('/api/access/overview', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — tunnel first, direct HTTP per
+    // the read fallback policy; Connect mode never falls back.
+    const resp = await daemonApi.request('api_access_overview', {}, {
       signal: options.signal,
-    }), 'api_access_overview', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/overview returned ${resp.status}`);
-    const payload = await resp.json();
-    return applyAccessOverview(payload);
+    return applyAccessOverview(resp.body);
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
     if (!options.silent) {
@@ -51714,13 +52077,13 @@ let accessPendingEnrollments = [];
 
 async function refreshAccessEnrollments(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_enrollment_requests', {}, () => authedFetch('/api/access/enrollment-requests', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_access_enrollment_requests', {}, {
       signal: options.signal,
-    }), 'api_access_enrollment_requests', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/enrollment-requests returned ${resp.status}`);
-    const payload = await resp.json();
-    const requests = Array.isArray(payload?.requests) ? payload.requests : [];
+    const requests = Array.isArray(resp.body?.requests) ? resp.body.requests : [];
     const changed = JSON.stringify(requests) !== JSON.stringify(accessPendingEnrollments);
     accessPendingEnrollments = requests;
     if (changed) renderAccessAdminSummaries();
@@ -51738,12 +52101,13 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
   const payload = { fingerprint, approve };
   if (approve && roleId) payload.role_id = roleId;
   try {
-    const resp = await dashboardJsonFetch('api_access_enrollment_decide', payload, () => authedFetch('/api/access/enrollment-requests/decide', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_enrollment_decide', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — the fallback policy derives
+    // no-replay from the verb, exactly the legacy
+    // fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt
+    // is never replayed over HTTP; with no tunnel the write goes direct).
+    // IAM-mutating write: the payload shape is unchanged, no retries.
+    const resp = await daemonApi.request('api_access_enrollment_decide', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
   } catch (err) {
@@ -51763,12 +52127,13 @@ let accessConnectStatus = null;
 
 async function refreshAccessConnectStatus(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_status', {}, () => authedFetch('/api/access/connect/status', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_access_connect_status', {}, {
       signal: options.signal,
-    }), 'api_access_connect_status', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/access/connect/status returned ${resp.status}`);
-    const payload = await resp.json();
+    const payload = resp.body;
     const changed = JSON.stringify(payload) !== JSON.stringify(accessConnectStatus);
     accessConnectStatus = payload;
     if (changed) renderAccessAdminSummaries();
@@ -51781,10 +52146,13 @@ async function refreshAccessConnectStatus(options = {}) {
 }
 
 async function accessConnectFetchClaimCode() {
-  const resp = await dashboardJsonFetch('api_access_connect_claim_code', {}, () => authedFetch('/api/access/connect/claim-code', {
-    cache: 'no-store',
-  }), 'api_access_connect_claim_code', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // daemonApi (transport F4): GET twin, so the derived policy allows the
+  // direct-HTTP retry after a failed tunnel attempt (the legacy call site
+  // opted out via fallbackAfterRpcFailure:false, but a manage-gated
+  // idempotent read replays safely — the policy is data, not per-site
+  // judgment). Connect mode never falls back.
+  const resp = await daemonApi.request('api_access_connect_claim_code', {}, { cache: 'no-store' });
+  const data = resp.body;
   if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
   return data;
 }
@@ -51793,12 +52161,10 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
   const payload = { enabled };
   if (rendezvousUrl) payload.rendezvous_url = rendezvousUrl;
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_config', payload, () => authedFetch('/api/access/connect/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_connect_config', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics.
+    const resp = await daemonApi.request('api_access_connect_config', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', enabled
       ? 'Connect enabled — this daemon is registering with the rendezvous'
@@ -51813,12 +52179,9 @@ async function accessConnectSetEnabled(enabled, rendezvousUrl) {
 async function accessSetTier(tier) {
   const payload = { tier: tier || null };
   try {
-    const resp = await dashboardJsonFetch('api_access_set_tier', payload, () => authedFetch('/api/access/tier', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_set_tier', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay.
+    const resp = await daemonApi.request('api_access_set_tier', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', tier
       ? `Trust tier set: ${tier}`
@@ -51833,12 +52196,9 @@ async function accessSetTier(tier) {
 async function accessSetHostedCeiling(roleId) {
   const payload = { role_id: roleId };
   try {
-    const resp = await dashboardJsonFetch('api_access_set_hosted_ceiling', payload, () => authedFetch('/api/access/hosted-ceiling', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_set_hosted_ceiling', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay.
+    const resp = await daemonApi.request('api_access_set_hosted_ceiling', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', roleId === 'role:none'
       ? 'Hosted-origin control refused. Reach this daemon directly, through the app, or from an enrolled peer — a hosted tab can no longer change this back.'
@@ -51852,8 +52212,12 @@ async function accessSetHostedCeiling(roleId) {
 
 async function accessFleetCertRequest() {
   try {
-    const resp = await dashboardJsonFetch('api_fleet_cert_request', {}, () => Promise.reject(new Error('fleet certificate requests ride the control channel — connect to the daemon first')), 'api_fleet_cert_request', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay. The
+    // tunnel-only reject fallback died with the S6 ROW-NEW
+    // (POST /api/access/fleet-cert/request): a dashboard with no tunnel
+    // now starts the request over direct HTTP instead of erroring.
+    const resp = await daemonApi.request('api_fleet_cert_request', {});
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', 'Certificate request started — publishing DNS records and answering the Let’s Encrypt challenge (usually under a minute).');
   } catch (err) {
@@ -51872,12 +52236,11 @@ async function accessFleetCertRequest() {
 
 async function accessConnectUnclaim() {
   try {
-    const resp = await dashboardJsonFetch('api_access_connect_unclaim', {}, () => authedFetch('/api/access/connect/unclaim', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }), 'api_access_connect_unclaim', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay. The
+    // empty params ride body-less on HTTP; the unclaim handler never
+    // reads a body.
+    const resp = await daemonApi.request('api_access_connect_unclaim', {});
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     showControlToast?.('success', 'Claim released — a fresh claim phrase will mint shortly');
   } catch (err) {
@@ -51946,12 +52309,13 @@ function dashboardAccessTargetForHost(hostId) {
 
 async function refreshDashboardTargetsFromApi(options = {}) {
   try {
-    const resp = await dashboardJsonFetch('api_dashboard_targets', {}, () => authedFetch('/api/dashboard/targets', {
-      cache: 'no-store',
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_dashboard_targets', {}, {
       signal: options.signal,
-    }), 'api_dashboard_targets', { signal: options.signal });
+      cache: 'no-store',
+    });
     if (!resp.ok) throw new Error(`/api/dashboard/targets returned ${resp.status}`);
-    const payload = await resp.json();
+    const payload = resp.body;
     applyDashboardAccessTargets(payload);
     return payload;
   } catch (err) {
@@ -53337,7 +53701,10 @@ function accessAuditGrantCards() {
     const status = accessModelLabel(grant.status, 'active');
     const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
     const lifecycleBusy = accessGrantLifecycleSubmitting.has(grantId);
-    const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+    // daemonApi availability (transport F4): tunnel status boolean when
+    // connected, HTTP-twin reachability otherwise — honest in Connect
+    // mode, where a down tunnel means no lane at all.
+    const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
     const actions = [];
     if (localIamGrant && grantId) {
       if (status !== 'active') {
@@ -53587,24 +53954,22 @@ let accessGrantFanoutResults = null;
 
 async function accessApplyGrantToTarget(target, payload) {
   if (target.mode === 'self') {
-    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    return data;
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics. IAM-mutating
+    // write: payload shape unchanged, no retries.
+    const resp = await daemonApi.request('api_access_iam_upsert_user_client_grant', payload);
+    if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+    return resp.body;
   }
-  const resp = await fetch(`${target.origin}/api/access/iam/user-client-grants`, {
-    method: 'POST',
-    mode: 'cors',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  // Remote fleet daemon: the explicit remote-http target (transport F4).
+  // Naming the target names the transport — direct cross-origin HTTP to
+  // that daemon's fleet-CORS row, never a tunnel, never a fallback; the
+  // target daemon's own IAM authorizes the write (browser mTLS identity).
+  const resp = await daemonApi.request('api_access_iam_upsert_user_client_grant', payload, {
+    target: { remoteHttp: target.origin },
   });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 function renderAccessUserClientGrantForm() {
@@ -53627,8 +53992,10 @@ function renderAccessUserClientGrantForm() {
   const overview = accessOverviewModel();
   const iam = accessIamModel(overview);
   const writeApiAvailable = iam?.capabilities?.write_api_available !== false;
-  const rpcAvailable = dashboardControlTransport?.lastStatus?.api_access_iam_upsert_user_client_grant_available;
-  const canSubmit = writeApiAvailable && rpcAvailable !== false;
+  // daemonApi availability (transport F4): folds the tunnel status
+  // boolean and HTTP-twin reachability into one honest answer.
+  const canSubmit = writeApiAvailable
+    && daemonApi.availability('api_access_iam_upsert_user_client_grant').ok;
   const candidate = accessCurrentUserClientCandidate();
   mount.innerHTML = '';
 
@@ -54131,12 +54498,11 @@ async function accessUpdateGrantLifecycle(grantId, changes = {}) {
   accessGrantLifecycleSubmitting.add(id);
   renderAccessAdminSummaries();
   try {
-    const resp = await dashboardJsonFetch('api_access_iam_update_grant', payload, () => authedFetch('/api/access/iam/grants/update', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_update_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
+    // daemonApi (transport F4): POST twin — verb-derived no-replay, the
+    // legacy fallbackAfterRpcFailure:false semantics. IAM-mutating
+    // write: payload shape unchanged, no retries.
+    const resp = await daemonApi.request('api_access_iam_update_grant', payload);
+    const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
     if (data?.iam) {
       dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
@@ -55097,8 +55463,11 @@ function renderAccessTierCard() {
   if (!mount) return;
   const iam = accessIamModel(accessOverviewModel());
   const tier = accessModelLabel(iam.tier);
-  const canSetTier = dashboardControlTransport?.lastStatus?.api_access_set_tier_available !== false;
-  const canSetCeiling = dashboardControlTransport?.lastStatus?.api_access_set_hosted_ceiling_available !== false;
+  // daemonApi availability (transport F4): tunnel status boolean when
+  // connected, HTTP-twin reachability otherwise — honest in Connect
+  // mode, where a down tunnel means no lane at all.
+  const canSetTier = daemonApi.availability('api_access_set_tier').ok;
+  const canSetCeiling = daemonApi.availability('api_access_set_hosted_ceiling').ok;
 
   mount.textContent = '';
   const head = document.createElement('div');
@@ -55257,9 +55626,10 @@ function renderAccessConnectCard() {
       || !status.claim_code_available;
     if (stale) accessConnectRevealed = null;
   }
-  const canConfig = dashboardControlTransport?.lastStatus?.api_access_connect_config_available !== false;
-  const canReveal = dashboardControlTransport?.lastStatus?.api_access_connect_claim_code_available !== false;
-  const canUnclaim = dashboardControlTransport?.lastStatus?.api_access_connect_unclaim_available !== false;
+  // daemonApi availability (transport F4) — see renderAccessTierCard.
+  const canConfig = daemonApi.availability('api_access_connect_config').ok;
+  const canReveal = daemonApi.availability('api_access_connect_claim_code').ok;
+  const canUnclaim = daemonApi.availability('api_access_connect_unclaim').ok;
 
   const head = document.createElement('div');
   head.className = 'acc-section-head';
@@ -55385,7 +55755,7 @@ function renderAccessConnectCard() {
       chip.title = fleetCert.last_error || 'The last certificate request failed.';
     }
     if (chip.textContent) row.appendChild(chip);
-    const canRequest = dashboardControlTransport?.lastStatus?.api_fleet_cert_request_available !== false;
+    const canRequest = daemonApi.availability('api_fleet_cert_request').ok;
     if (fleetCert.state !== 'requesting' && fleetCert.state !== 'valid') {
       const request = document.createElement('button');
       request.type = 'button';
@@ -55525,7 +55895,7 @@ function renderAccessEnrollmentRequests() {
   if (!mount) return;
   mount.innerHTML = '';
   if (!accessPendingEnrollments.length) return;
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_enrollment_decide_available !== false;
+  const canManage = daemonApi.availability('api_access_enrollment_decide').ok;
 
   const head = document.createElement('div');
   head.className = 'acc-section-head';
@@ -55635,7 +56005,7 @@ function renderAccessPeopleGrants() {
     mount.appendChild(empty);
     return;
   }
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+  const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
   for (const principal of principals) {
     const card = document.createElement('div');
     card.className = 'acc-principal-card';
@@ -55810,15 +56180,17 @@ function renderAccessRoleCatalog() {
 }
 
 /* Advanced: trusted organizations + issuance. */
-async function accessOrgCall(method, path, payload) {
-  const resp = await dashboardJsonFetch(method, payload, () => authedFetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }), method, { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+// daemonApi (transport F4): every org call is a POST twin — the fallback
+// policy derives no-replay from the verb, exactly the legacy
+// fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt is
+// never replayed over HTTP; with no tunnel the write goes direct; Connect
+// mode never uses HTTP). The descriptor owns each method's path — the old
+// per-call-site path argument died with the tri-form. IAM-mutating
+// writes: payload shapes unchanged, zero retries.
+async function accessOrgCall(method, payload) {
+  const resp = await daemonApi.request(method, payload ?? {});
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 function renderAccessOrganizations() {
@@ -55828,7 +56200,7 @@ function renderAccessOrganizations() {
   const iam = accessIamModel(accessOverviewModel());
   const trusted = Array.isArray(iam.trusted_orgs) ? iam.trusted_orgs : [];
   const issuers = Array.isArray(iam.org_issuers) ? iam.org_issuers : [];
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_org_trust_available !== false;
+  const canManage = daemonApi.availability('api_access_org_trust').ok;
 
   const list = document.createElement('div');
   list.className = 'acc-principal-list';
@@ -55871,7 +56243,7 @@ function renderAccessOrganizations() {
         });
         if (!ok) return;
         try {
-          await accessOrgCall('api_access_org_revoke', '/api/access/orgs/revoke', { handle: org.handle });
+          await accessOrgCall('api_access_org_revoke', { handle: org.handle });
           showControlToast?.('success', `Org @${org.handle} revoked`);
         } catch (err) {
           showControlToast?.('error', err?.message || 'Org revoke failed');
@@ -55977,7 +56349,7 @@ function renderAccessOrganizations() {
       return;
     }
     try {
-      await accessOrgCall('api_access_org_trust', '/api/access/orgs/trust', {
+      await accessOrgCall('api_access_org_trust', {
         handle,
         root_key: rootKey,
         max_role: document.getElementById('access-org-trust-cap')?.value || 'role:operator',
@@ -56122,7 +56494,7 @@ function renderAccessOrganizations() {
       try {
         const issueKind = document.getElementById('access-org-issue-kind')?.value || 'client_key';
         const issueFp = document.getElementById('access-org-issue-fingerprint')?.value?.trim();
-        const data = await accessOrgCall('api_access_org_issue', '/api/access/org-grants/issue', {
+        const data = await accessOrgCall('api_access_org_issue', {
           handle: document.getElementById('access-org-issue-handle')?.value,
           client_key_fingerprint: issueKind === 'peer' ? '' : issueFp,
           peer_fingerprint: issueKind === 'peer' ? issueFp : '',
@@ -56221,7 +56593,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_revoke_member', '/api/access/org-grants/revoke-member', {
+        const data = await accessOrgCall('api_access_org_revoke_member', {
           handle: document.getElementById('access-org-orl-handle')?.value,
           ...(grantId ? { grant_id: grantId } : {}),
           ...(subject ? { subject } : {}),
@@ -56297,7 +56669,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_renew', '/api/access/org-grants/renew', doc);
+        const data = await accessOrgCall('api_access_org_renew', doc);
         renewOutput.value = JSON.stringify(data.document, null, 2);
         showControlToast?.('success', 'Document renewed — send it back to the member');
       } catch (err) {
@@ -56368,7 +56740,7 @@ function renderAccessOrganizations() {
     delegateBtn.disabled = !canManage;
     delegateBtn.addEventListener('click', async () => {
       try {
-        const data = await accessOrgCall('api_access_org_issuer_delegate', '/api/access/org-grants/issuers/delegate', {
+        const data = await accessOrgCall('api_access_org_issuer_delegate', {
           handle: document.getElementById('access-org-orl-handle')?.value || document.getElementById('access-org-issue-handle')?.value,
           issuer_key: document.getElementById('access-org-delegate-key')?.value?.trim(),
           label: document.getElementById('access-org-delegate-label')?.value?.trim(),
@@ -56443,7 +56815,7 @@ function renderAccessOrganizations() {
     initBtn.textContent = 'Create / show issuer key';
     initBtn.addEventListener('click', async () => {
       try {
-        const data = await accessOrgCall('api_access_org_issuer_init', '/api/access/org-grants/issuers/init', {
+        const data = await accessOrgCall('api_access_org_issuer_init', {
           handle: handleInput.value?.trim(),
         });
         keyOut.value = data.issuer_key || '';
@@ -56463,7 +56835,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        await accessOrgCall('api_access_org_issuer_install', '/api/access/org-grants/issuers/install', {
+        await accessOrgCall('api_access_org_issuer_install', {
           handle: handleInput.value?.trim(),
           certificate: cert,
         });
@@ -56516,7 +56888,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', orl);
+        const data = await accessOrgCall('api_access_org_orl_apply', orl);
         const applied = data.applied || {};
         showControlToast?.(
           'success',
@@ -56537,18 +56909,15 @@ function renderAccessOrganizations() {
 }
 
 /* Fetch an org's current signed revocation list from the daemon holding
-   its root key (RPC in tunnel mode, plain GET otherwise). */
+   its root key. daemonApi (transport F4): GET twin — tunnel first, then
+   the direct-HTTP retry the verb-derived policy allows (the legacy site
+   opted out, but a public idempotent read replays safely; the policy is
+   data, not per-site judgment). The descriptor lifts `handle` into the
+   row's {org_handle} capture. */
 async function accessOrgFetchOrl(handle) {
-  const resp = await dashboardJsonFetch(
-    'api_access_org_orl',
-    { handle },
-    () => authedFetch(`/api/access/orgs/${encodeURIComponent(handle || '')}/revocations`),
-    'api_access_org_orl',
-    { fallbackAfterRpcFailure: false }
-  );
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+  const resp = await daemonApi.request('api_access_org_orl', { handle });
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 /* Advanced: local IAM state card with raw links. */
@@ -65666,34 +66035,32 @@ class DashboardTransport {
     );
   }
 
+  // The two peer signal relays (transport F5). Signaling is a
+  // delivered-once mutation: the facade derives no-replay from the POST
+  // verb (§3.7 — never replayed over HTTP after a tunnel attempt that MAY
+  // have reached the daemon, the exact legacy fallbackAfterRpcFailure:false
+  // semantics; Connect mode never uses HTTP), while a dashboard with no
+  // tunnel at all still signals over direct HTTP — that pre-attempt lane
+  // is how peer tunnels bootstrap on direct/mTLS dashboards. Both return
+  // the facade envelope {ok, status, body}.
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_file_transfer_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   peerDashboardControlSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_dashboard_control_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -66239,19 +66606,22 @@ window.intendantDashboardControl = {
     return { skipped: false, threw, error, wsReplayCount };
   },
   async _debugProbePeerMutationConnectNoHttp() {
+    // Probes the path the UI actually takes (transport F5): peer add rides
+    // daemonApi.request, whose POST-derived mutation policy must throw the
+    // tunnel failure — never re-POST over HTTP, and never any HTTP in
+    // Connect mode. The synthetic rejection is injected at the protocol
+    // client, the same seam the facade's local tunnel adapter calls.
     if (
       !dashboardConnectModeEnabled() ||
-      !dashboardTransport ||
       !dashboardControlTransport ||
-      typeof dashboardTransport.jsonFetch !== 'function' ||
+      typeof daemonApi?.request !== 'function' ||
       typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         connectMode: dashboardConnectModeEnabled(),
-        hasDashboardTransport: Boolean(dashboardTransport),
+        hasDaemonApi: typeof daemonApi?.request === 'function',
         hasControlTransport: Boolean(dashboardControlTransport),
-        jsonFetchType: typeof dashboardTransport?.jsonFetch,
         requestType: typeof dashboardControlTransport?.request,
         threw: false,
         rpcAttempts: 0,
@@ -66279,14 +66649,10 @@ window.intendantDashboardControl = {
     let threw = false;
     let error = '';
     try {
-      await dashboardTransport.jsonFetch('api_peer_add', {
+      await daemonApi.request('api_peer_add', {
         url: 'https://127.0.0.1:9/.well-known/agent-card.json',
         persist: false,
-      }, () => authedFetch('/api/peers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      }), 'api_peer_add', { fallbackAfterRpcFailure: false });
+      });
     } catch (err) {
       threw = true;
       error = err?.message || String(err);
@@ -68481,6 +68847,8 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
   }
 
   async sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerDashboardControlSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -68488,8 +68856,7 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -68669,6 +69036,48 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_session_detail':
       return 15000;
+    // Peer quick controls cross the federation transport and wait for the
+    // remote daemon's ack — the generic 5 s default was sized for local
+    // reads, not a peer round trip (transport F5's deliberate
+    // normalization; the legacy HTTP lane ran signal-less). The same
+    // budget covers the dials that reach a REMOTE daemon before
+    // answering: peer add (card fetch + transport spawn), pairing
+    // join/request-access/poll (doorbell round trips), and coordinator
+    // routing (delegation ack).
+    case 'api_peer_message':
+    case 'api_peer_task':
+    case 'api_peer_approval':
+    case 'api_peer_add':
+    case 'api_peer_pairing_join':
+    case 'api_peer_pairing_request_access':
+    case 'api_peer_pairing_request_access_poll':
+    case 'api_coordinator_route':
+      return 30000;
+    // Credential custody (transport F6): the sealed vault blob rides the
+    // chunked, credit-gated response lane and can run to hundreds of KiB
+    // over a TURN link. The family's pre-facade caller asked for 15 s and
+    // was silently clamped to the 5 s default (this verb ignores
+    // options.timeoutMs) — this table is where that intent actually
+    // lives.
+    case 'api_credential_lease_grant':
+    case 'api_credential_lease_renew':
+    case 'api_credential_lease_revoke':
+    case 'api_credential_lease_status':
+    case 'api_credential_custody_trail':
+    case 'api_credential_egress_register':
+    case 'api_credential_egress_unregister':
+    case 'api_daemon_vault_fetch':
+    case 'api_daemon_vault_publish':
+    case 'api_daemon_vault_deposit_key_fetch':
+    case 'api_daemon_vault_deposit_key_publish':
+    case 'api_daemon_vault_deposits_fetch':
+    case 'api_daemon_vault_deposits_consume':
+      return 15000;
+    // The egress probe reaches beyond this daemon before answering:
+    // daemon -> the relaying browser -> the provider's API -> back. Same
+    // budget as the peer round trips above.
+    case 'api_credential_egress_probe':
+      return 30000;
     default:
       return 5000;
   }
@@ -69623,23 +70032,13 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    let data = null;
-    if (dashboardTransport?.canUseRpc()) {
-      try {
-        data = await dashboardTransport.request('api_peers');
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
-      }
-    }
-    if (!data && dashboardConnectModeEnabled()) {
-      throw new Error('Peer list is unavailable until dashboard access reconnects');
-    }
-    if (!data) {
-      const resp = await authedFetch('/api/peers');
-      if (!resp.ok) return;
-      data = await resp.json();
-    }
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy, never HTTP in Connect mode — the exact
+    // legacy tri-form this replaces. A delivered error response leaves
+    // the stale list in place, like the legacy !resp.ok return did.
+    const resp = await daemonApi.request('api_peers');
+    if (!resp.ok) return;
+    const data = resp.body || {};
     if (!data.peers || !Array.isArray(data.peers)) return;
 
     // Build the new daemon entries from the API response via the
@@ -70021,13 +70420,6 @@ function applyDaemonExpandedState(hostId, expanded) {
     btn.title = expanded ? 'Hide peer controls' : 'Show peer controls';
   }
 }
-
-// POST a message to a peer via /api/peers/{id}/message and surface
-// the result in the row's status line. The peer id is embedded in
-// the URL path verbatim — colons are valid path chars per RFC 3986
-// and the server-side parser splits on the literal `:` to recover
-// the kind prefix; URL-encoding `:` as `%3A` would break the lookup
-// because the registry keys on the un-encoded id.
 /* ── static/app/51-peer-approvals.js ── */
 // ── Per-peer pending approvals ──
 //
@@ -70116,23 +70508,22 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
     : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_approval', {
+    // Approval decisions are mutations (transport F5): the facade derives
+    // no-replay from the POST verb — never re-delivered over HTTP after a
+    // tunnel attempt that may have reached the daemon, no retries, params
+    // unchanged (peer_id lifts into the HTTP twin's path).
+    const resp = await daemonApi.request('api_peer_approval', {
       peer_id: hostId,
       request_id: approvalId,
       decision,
-    }, () => authedFetch(`/api/peers/${hostId}/approval`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: approvalId, decision }),
-    }), 'api_peer_approval', { fallbackAfterRpcFailure: false });
+    });
     if (resp.ok) {
       // Optimistic removal. The peer will eventually emit
       // `approval_resolved` over the secondary stream which would
       // also remove it; doing it here keeps the UI snappy.
       removePendingApproval(hostId, approvalId);
     } else {
-      const result = await resp.json().catch(() => ({}));
-      console.error(`approval failed for ${hostId}#${approvalId}: ${result.error || resp.status}`);
+      console.error(`approval failed for ${hostId}#${approvalId}: ${resp.body?.error || resp.status}`);
       if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
     }
   } catch (e) {
@@ -70177,23 +70568,16 @@ async function submitPeerInput(hostId, kind) {
     statusEl.className = 'daemon-msg-status';
   }
 
-  const url = kind === 'task'
-    ? `/api/peers/${hostId}/task`
-    : `/api/peers/${hostId}/message`;
-  const body = kind === 'task'
-    ? JSON.stringify({ instructions: text })
-    : JSON.stringify({ text });
   const rpcMethod = kind === 'task' ? 'api_peer_task' : 'api_peer_message';
   const rpcParams = kind === 'task'
     ? { peer_id: hostId, instructions: text }
     : { peer_id: hostId, text };
   try {
-    const resp = await dashboardTransport.jsonFetch(rpcMethod, rpcParams, () => authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    }), rpcMethod, { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Outbound peer ops are mutations (transport F5): verb-derived
+    // no-replay, no retries; peer_id lifts into the HTTP twin's path so
+    // the body keeps its legacy `{instructions}` / `{text}` shape.
+    const resp = await daemonApi.request(rpcMethod, rpcParams);
+    const result = resp.body || {};
     if (!resp.ok) {
       if (statusEl) {
         statusEl.textContent = `Failed: ${result.error || `HTTP ${resp.status}`}`;
@@ -72952,22 +73336,18 @@ class PeerDisplayConnection {
   }
 
   async _sendSignal(signal) {
-    const url = `/api/peers/${this.hostId}/webrtc`;
-    const body = {
+    // Display signaling relay (transport F5): a delivered-once mutation —
+    // the facade derives no-replay from the POST verb; peer_id lifts into
+    // the HTTP twin's path.
+    const resp = await daemonApi.request('api_peer_webrtc_signal', {
       peer_id: this.hostId,
       display_id: this.displayId,
       session_id: this.sessionId,
       signal,
-    };
-    const resp = await dashboardTransport.jsonFetch('api_peer_webrtc_signal', body, () => authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_webrtc_signal', { fallbackAfterRpcFailure: false });
+    });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
       throw new Error(
-        `webrtc signal failed (${resp.status}): ${detail.error || 'unknown'}`
+        `webrtc signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`
       );
     }
   }
@@ -73203,6 +73583,8 @@ class PeerFileTransferConnection {
   }
 
   async _sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerFileTransferSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -73210,8 +73592,7 @@ class PeerFileTransferConnection {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer file-transfer signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer file-transfer signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -73592,12 +73973,10 @@ async function createDaemonInvite() {
   btn.disabled = true;
   setDaemonPairingStatus('daemon-invite-status', 'Creating...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_invite', body, () => authedFetch('/api/peers/pairing/invite', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_invite', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Pairing mutations (transport F5): verb-derived no-replay, params
+    // unchanged — same policy for every POST in this dialog set.
+    const resp = await daemonApi.request('api_peer_pairing_invite', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-invite-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73647,12 +74026,8 @@ async function joinDaemonInvite() {
   if (btn) btn.disabled = true;
   setDaemonPairingStatus('daemon-join-status', 'Joining...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_join', body, () => authedFetch('/api/peers/pairing/join', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_join', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_join', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-join-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73698,12 +74073,8 @@ async function requestDaemonAccess() {
   if (codeEl) codeEl.textContent = '';
   setDaemonPairingStatus('daemon-request-status', 'Requesting...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access', body, () => authedFetch('/api/peers/pairing/request-access', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_access', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_request_access', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73735,12 +74106,8 @@ async function completeDaemonAccessRequest() {
     ...(labelInput && labelInput.value.trim() ? { label: labelInput.value.trim() } : {}),
   };
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access_poll', body, () => authedFetch('/api/peers/pairing/request-access/poll', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_access_poll', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_request_access_poll', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73774,8 +74141,10 @@ async function loadPeerAccessRequests() {
   if (!list) return;
   setDaemonPairingStatus('daemon-access-requests-status', 'Loading...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_requests', {}, () => authedFetch('/api/peers/pairing/requests'), 'api_peer_pairing_requests');
-    const result = await resp.json().catch(() => ({}));
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy — same for the identities read below.
+    const resp = await daemonApi.request('api_peer_pairing_requests');
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73865,16 +74234,15 @@ async function decidePeerAccessRequest(requestId, op) {
       const profileSelect = document.querySelector(`[data-access-request-profile="${CSS.escape(requestId)}"]`);
       if (profileSelect && profileSelect.value) body.profile = profileSelect.value;
     }
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_decision', {
+    // Access-request decisions are mutations (transport F5): verb-derived
+    // no-replay, params unchanged — request_id/op lift into the HTTP
+    // twin's path captures, the optional profile stays as the body.
+    const resp = await daemonApi.request('api_peer_pairing_request_decision', {
       request_id: requestId,
       op,
       ...body,
-    }, () => authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_decision', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    });
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73896,8 +74264,8 @@ async function loadPeerIdentities() {
   if (!list) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Loading...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identities', {}, () => authedFetch('/api/peers/pairing/identities'), 'api_peer_pairing_identities');
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_identities');
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -73954,12 +74322,8 @@ async function revokePeerIdentity(identity) {
   if (!value) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Revoking...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identity_revoke', { identity: value }, () => authedFetch('/api/peers/pairing/identities/revoke', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identity: value }),
-    }), 'api_peer_pairing_identity_revoke', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_identity_revoke', { identity: value });
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -74027,12 +74391,11 @@ async function addDaemon() {
   if (viaUrls.length > 0) body.via_urls = viaUrls;
   if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_add', body, () => authedFetch('/api/peers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_add', { fallbackAfterRpcFailure: false });
-    const result = await resp.json();
+    // Peer add is a mutation (transport F5): verb-derived no-replay —
+    // the hosted validator's peer-mutations self-test probes exactly this
+    // (a failed tunnel attempt must throw, never re-POST over HTTP).
+    const resp = await daemonApi.request('api_peer_add', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       const errorText = result.error || String(resp.status);
       if (/peer added for this run/i.test(errorText)) {
@@ -74069,11 +74432,9 @@ async function removeDaemon(hostId) {
   // explicit disconnect on the peer's actor (Disconnecting →
   // Disconnected state machine).
   try {
-    await dashboardTransport.jsonFetch('api_peer_remove', { peer_id: hostId }, () => authedFetch('/api/peers', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ peer_id: hostId }),
-    }), 'api_peer_remove', { fallbackAfterRpcFailure: false });
+    // DELETE twin (transport F5): the descriptor carries the leftover
+    // {peer_id} as the JSON body — the endpoint's historical shape.
+    await daemonApi.request('api_peer_remove', { peer_id: hostId });
   } catch { /* best-effort */ }
   removeDashboardAccessTarget(hostId);
   await refreshPeersFromApi();
@@ -74111,10 +74472,11 @@ async function findEligiblePeers() {
   btn.disabled = true;
   out.textContent = 'Searching…';
   out.className = 'coord-result';
-  const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_eligible', { capabilities: caps }, () => authedFetch(`/api/peers/eligible?${query}`), 'api_peer_eligible');
-    const result = await resp.json().catch(() => ({}));
+    // GET twin (transport F5): the descriptor's queryRepeat rebuilds the
+    // repeated ?capability= keys from the tunnel's capabilities array.
+    const resp = await daemonApi.request('api_peer_eligible', { capabilities: caps });
+    const result = resp.body || {};
     if (!resp.ok) {
       const msg = result.error || `HTTP ${resp.status}`;
       const hint = result.hint ? ` (${result.hint})` : '';
@@ -74178,12 +74540,12 @@ async function routeTask() {
       required_capabilities: caps,
       task: { instructions },
     };
-    const resp = await dashboardTransport.jsonFetch('api_coordinator_route', payload, () => authedFetch('/api/coordinator/route', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_coordinator_route', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Coordinator routing is a mutation (transport F5): verb-derived
+    // no-replay. The method's per-lane IAM divergence (HTTP: Task via the
+    // federation ladder; tunnel: PeerManage, documented op-override) is
+    // preserved on the rows — the facade only names the twin.
+    const resp = await daemonApi.request('api_coordinator_route', payload);
+    const result = resp.body || {};
     if (resp.ok) {
       out.className = 'coord-result ok';
       out.innerHTML =
@@ -78879,10 +79241,11 @@ function refreshFilesDownloadAvailability() {
 // DELIBERATELY not routed through daemonApi.bytes (F1b): this direct-HTTP
 // ranged reader carries fs-read edge semantics the facade's HTTP adapter
 // does not model yet — the 416 empty-file carve-out below and the strict
-// 206-vs-200 status ladder. It is only reachable when the tunnel lane is
-// unavailable (useHttpFilesystemFallback), so the facade would serve it
-// over the same HTTP twin anyway. Folding these edges into the facade's
-// bytes adapter (then deleting this) is F1c/facade-hardening work.
+// 206-vs-200 status ladder. Since F1c it is only reachable on daemons
+// that predate the /api/transfers rows (the HTTP jobs lane outranks it),
+// so it is the old-daemon legacy path; folding these edges into the
+// facade's bytes adapter (then deleting this) remains facade-hardening
+// work.
 async function dashboardFetchHttpRangeBytes(path, offset, length, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
@@ -79245,9 +79608,14 @@ function filesTransferMergeServerJob(job) {
 }
 
 async function refreshFilesTransferJobs() {
-  // api_transfer_jobs is tunnel-only until the /api/transfers rows land
-  // (S9): gate on the tunnel lane being truly connected, not http-only.
-  if (daemonApi.availability('api_transfer_jobs').reason !== 'connected') {
+  // Tunnel preferred; the GET /api/transfers row (S9) serves the list on
+  // direct-HTTP dashboards once the one-shot probe confirms this daemon
+  // has the rows (F1c) — this is also the probe's eager kick, since the
+  // Files pane refreshes jobs on open. Absent rows: legacy local-only.
+  const { reason } = daemonApi.availability('api_transfer_jobs');
+  const usable = reason === 'connected' ||
+    (reason === 'http-only' && await daemonApi.ensureHttpProbe('transfers'));
+  if (!usable) {
     renderFilesTransfers();
     return [];
   }
@@ -79539,10 +79907,23 @@ async function runFilesDownloadTransfer(transfer) {
     const peerId = String(transfer.peerId || '').trim();
     let usePeerDashboardControl = Boolean(peerId) && peerDashboardControlSignalAvailable(peerId);
     let usePeerFileTransfer = Boolean(peerId) && !usePeerDashboardControl;
-    const useDurableTransfer = !peerId && dashboardTransferDownloadAvailable();
+    const useTunnelDurableTransfer = !peerId && dashboardTransferDownloadAvailable();
     const hasArtifact = Boolean(transfer.artifact && typeof transfer.artifact === 'object');
     const fallbackMethod = String(transfer.directMethod || (!hasArtifact ? 'api_fs_read' : '')).trim();
     const canUseFallbackMethod = !peerId && Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
+    // HTTP jobs lane (F1c, task #6): path downloads ride the same durable
+    // jobs protocol over the S9 /api/transfers rows when no tunnel lane
+    // serves them, feature-detected once per page (the probe; the await
+    // only fires after every tunnel option said no). Artifact jobs stay
+    // tunnel-only by design — their creates resolve live session handles,
+    // and the HTTP create row 400s them.
+    const useHttpTransferJobs = !useTunnelDurableTransfer &&
+      !canUseFallbackMethod &&
+      !peerId &&
+      !hasArtifact &&
+      !dashboardConnectModeEnabled() &&
+      await daemonApi.ensureHttpProbe('transfers');
+    const useDurableTransfer = useTunnelDurableTransfer || useHttpTransferJobs;
     const useHttpFilesystemFallback = !useDurableTransfer &&
       !canUseFallbackMethod &&
       !peerId &&
@@ -79598,7 +79979,7 @@ async function runFilesDownloadTransfer(transfer) {
       });
     }
     if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
-      transfer.transport = 'durable-transfer';
+      transfer.transport = useHttpTransferJobs ? 'http-transfer-jobs' : 'durable-transfer';
       const payload = hasArtifact
         ? {
             kind: 'download',
@@ -79648,10 +80029,13 @@ async function runFilesDownloadTransfer(transfer) {
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
         });
       } else {
-        transfer.transport = transfer.transport || 'dashboard-control';
+        transfer.transport = transfer.transport ||
+          (useHttpTransferJobs ? 'http-transfer-jobs' : 'dashboard-control');
+        // The job handle rides `id` (the HTTP twin's `{id}` path capture;
+        // the server resolves a resume token anywhere an id goes).
         const params = useDurableTransfer
           ? {
-              id: transfer.serverJobId || undefined,
+              id: filesTransferJobHandle(transfer) || undefined,
               resume_token: transfer.resumeToken || undefined,
               offset: transfer.loaded,
               length: requested,
@@ -79814,10 +80198,11 @@ async function runFilesStagedRawHttpDownload(transfer, controller) {
   settleCompletedFilesDownload(transfer, { resumable: false });
 }
 
-// Filesystem upload over plain HTTP: the durable transfer-job RPC needs the
-// dashboard-control channel, but /api/fs/write covers the same size range
-// (its body cap is sized for UPLOAD_MAX_BYTES of base64 plus envelope), so
-// a single guarded write keeps direct-connected uploads working.
+// Filesystem upload over plain HTTP for daemons that predate the
+// /api/transfers rows (F1c probes them; absent ⇒ this legacy lane):
+// /api/fs/write covers the single-POST size range (its body cap is sized
+// for UPLOAD_MAX_BYTES of base64 plus envelope), so a guarded write keeps
+// direct-connected uploads working — capped, non-resumable.
 async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
   transfer.transport = 'http-fs-write';
   const file = await filesTransferGetUploadBlob(transfer);
@@ -79877,8 +80262,107 @@ async function filesResolveHttpUploadDestinationPath(transfer, file) {
   return raw;
 }
 
+// Client mirror of the server's TRANSFER_HTTP_CHUNK_MAX_BYTES
+// (web_gateway/routes_transfers.rs, pinned by the gateway body-cap test):
+// one POST /api/transfers/{id}/chunk body may carry at most this much, so
+// the HTTP jobs lane clamps its chunk size rather than bounce a 413.
+const FILES_TRANSFER_HTTP_CHUNK_MAX_BYTES = 32 * 1024 * 1024;
+
+// The job handle every transfer-family call addresses: the server job id
+// when known, else the resume token — the server resolves either alias
+// (transfer_store::find_job), and the HTTP twins lift it into their
+// `/api/transfers/{id}` path capture.
+function filesTransferJobHandle(transfer) {
+  return String(transfer?.serverJobId || transfer?.resumeToken || '').trim();
+}
+
+// Re-list step of the resume protocol (design §4): fetch this transfer's
+// server job over whichever lane serves api_transfer_jobs. The `id`
+// filter is additive — old tunnel daemons ignore it and answer the full
+// list; find() tolerates both. Returns null when the job is gone.
+async function filesTransferFetchServerJob(transfer, options = {}) {
+  if (!filesTransferJobHandle(transfer)) return null;
+  const result = await daemonApi.request('api_transfer_jobs', { id: filesTransferJobHandle(transfer) }, {
+    timeoutMs: 30000,
+    signal: options.signal,
+  });
+  if (!result.ok) {
+    throw new Error(result.body.error || `transfer jobs returned ${result.status || 'error'}`);
+  }
+  const jobs = Array.isArray(result.body.jobs) ? result.body.jobs : [];
+  return jobs.find(job =>
+    (transfer.serverJobId && String(job?.id || '') === String(transfer.serverJobId)) ||
+    (transfer.resumeToken && String(job?.resume_token || '') === String(transfer.resumeToken))
+  ) || null;
+}
+
+// Adopt the server's received extent as the next chunk boundary — the
+// upload half of the resume protocol. Called when a chunk outcome is
+// unknown (the lane failed mid-flight) or a delivered 409 says another
+// writer moved the extent: the re-list is the arbiter, never a guess.
+// Throws `cause` when the job cannot be re-listed (aborts pass through),
+// so the attempt settles through the normal failure path and Resume
+// re-runs the sync.
+async function filesTransferResyncUploadExtent(transfer, controller, cause) {
+  let job = null;
+  try {
+    job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
+    throw cause;
+  }
+  if (!job) throw cause;
+  filesTransferApplyServerJob(transfer, job);
+  const status = filesTransferStatusFromJob(job);
+  if (status === 'cancelled' || status === 'failed') {
+    throw new Error(job.error || `server transfer job is ${status}`);
+  }
+  transfer.loaded = Number(job.completed_bytes || 0);
+  filesTransferPersistState();
+}
+
+// Declared-checksum helper (design §4: sha256 rides create → commit, 409
+// on mismatch). crypto.subtle has no streaming digest — it takes one
+// contiguous buffer — so hash exactly the sizes the single-POST lanes
+// already deem bufferable (UPLOAD_MAX_BYTES) and let larger files upload
+// without one ("sha when available"). Any failure (insecure context,
+// memory) skips the checksum, never the upload.
+async function filesTransferComputeUploadSha256(file) {
+  try {
+    if (!(file instanceof Blob) || !file.size || file.size > UPLOAD_MAX_BYTES) return '';
+    if (!window.crypto?.subtle?.digest) return '';
+    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  } catch (_) {
+    return '';
+  }
+}
+
+// Shared settle for a committed filesystem upload: the normal commit,
+// the delivered-unknown re-list discovery ("it landed while we weren't
+// looking"), and the resumed-run already-completed path all end here.
+async function settleCommittedFilesUpload(transfer, job) {
+  const descriptor = job && typeof job === 'object' ? job : (transfer.serverJob || null);
+  if (descriptor) filesTransferApplyServerJob(transfer, descriptor);
+  transfer.loaded = transfer.totalSize;
+  transfer.descriptor = descriptor;
+  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
+  await filesTransferDeleteUploadBlob(transfer.id);
+  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+}
+
 async function runFilesFilesystemUploadTransfer(transfer, controller) {
-  if (!await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+  // Lane decision, policy-as-data: the tunnel jobs lane stays preferred
+  // whenever it is truly connected; the S9 /api/transfers rows serve the
+  // same protocol over direct HTTP once the one-shot probe confirms this
+  // daemon has them (F1c, task #6). Connect mode has no HTTP lane.
+  let lane = '';
+  if (await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+    lane = 'tunnel';
+  } else if (!dashboardConnectModeEnabled() && await daemonApi.ensureHttpProbe('transfers')) {
+    lane = 'http';
+  }
+  if (!lane) {
     if (transfer.serverJobId || transfer.resumeToken) {
       // A durable job already holds this upload's chunks server-side.
       // Rerouting to the whole-file fallback would orphan that job (no
@@ -79892,26 +80376,56 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     }
     throw new Error('Filesystem upload is unavailable until file-write access is ready');
   }
+  transfer.transport = lane === 'http' ? 'http-transfer-jobs' : 'durable-transfer';
   const file = await filesTransferGetUploadBlob(transfer);
   if (!(file instanceof Blob)) {
     throw new Error('Upload file is unavailable after reload');
   }
-  if (file.size > UPLOAD_MAX_BYTES) {
-    throw new Error(`File too large (${humanBytes(file.size)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
-  }
+  // No whole-file ceiling here (task #6): the jobs protocol IS how a
+  // >100 MiB upload rides either lane — capped chunks bound each request,
+  // and the store's own guards police totals server-side. Only the
+  // single-POST fallback lanes re-check UPLOAD_MAX_BYTES.
   transfer.totalSize = Number(file.size || 0);
   transfer.loaded = Number(transfer.loaded || 0);
   transfer.mime = transfer.mime || file.type || 'application/octet-stream';
   transfer.name = transfer.name || file.name || 'upload.bin';
+  if (transfer.serverJobId || transfer.resumeToken) {
+    // Resume protocol (design §4): the received extent is the SERVER's
+    // truth — re-list before chunking and continue from that boundary,
+    // never from local bookkeeping alone. A commit that answered into
+    // the void is discovered here too: completed ⇒ settle, never
+    // re-commit.
+    const job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+    if (job) {
+      filesTransferApplyServerJob(transfer, job);
+      if (filesTransferStatusFromJob(job) === 'completed') {
+        return settleCommittedFilesUpload(transfer, job);
+      }
+      transfer.loaded = Number(job.completed_bytes || 0);
+      filesTransferPersistState();
+    } else {
+      // The job is gone server-side (deleted, or a store the daemon
+      // dropped): restart from scratch under a fresh job rather than
+      // failing forever against a handle nothing resolves.
+      transfer.serverJob = null;
+      transfer.serverJobId = '';
+      transfer.resumeToken = '';
+      transfer.loaded = 0;
+      filesTransferPersistState();
+    }
+  }
   if (!transfer.resumeToken && !transfer.serverJobId) {
-    const created = await daemonApi.request('api_transfer_job_create', {
+    const params = {
       kind: 'upload',
       destination: transfer.destination,
       name: transfer.name,
       mime: transfer.mime,
       total_size: transfer.totalSize,
       conflict: transfer.conflictPolicy || 'fail',
-    }, {
+    };
+    const sha256 = await filesTransferComputeUploadSha256(file);
+    if (sha256) params.sha256 = sha256;
+    const created = await daemonApi.request('api_transfer_job_create', params, {
       timeoutMs: transfer.timeoutMs || 120000,
       signal: controller.signal,
     });
@@ -79921,24 +80435,61 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     filesTransferApplyServerJob(transfer, created.body.job);
     filesTransferPersistState();
   }
-  const chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
+  let chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
+  if (lane === 'http') chunkBytes = Math.min(chunkBytes, FILES_TRANSFER_HTTP_CHUNK_MAX_BYTES);
+  // Bounded re-syncs keep the runner terminating: every server round
+  // below either advances the boundary (finite file ⇒ finite loop) or
+  // spends one unit of this budget; exhaustion fails the attempt and
+  // Resume re-lists afresh. The pump's forward progress never hinges on
+  // a lucky retry.
+  let resyncBudget = 3;
   while (transfer.loaded < transfer.totalSize) {
     if (transfer.pauseRequested) throw dashboardControlAbortError('upload paused');
     if (transfer.cancelRequested) throw dashboardControlAbortError('upload cancelled');
     const offset = Number(transfer.loaded || 0);
     const end = Math.min(offset + chunkBytes, transfer.totalSize);
     const chunk = file.slice(offset, end);
-    const result = await daemonApi.upload('api_transfer_upload_chunk', {
-      id: transfer.serverJobId || undefined,
-      resume_token: transfer.resumeToken || undefined,
-      offset,
-    }, chunk, {
-      timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
-      signal: controller.signal,
-    });
+    let result;
+    try {
+      result = await daemonApi.upload('api_transfer_upload_chunk', {
+        id: filesTransferJobHandle(transfer) || undefined,
+        resume_token: transfer.resumeToken || undefined,
+        offset,
+      }, chunk, {
+        timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      // Delivered-unknown: the lane failed or timed out mid-flight, so
+      // the chunk may or may not have landed. Re-list and continue from
+      // the server's extent — the SAME offset when it never landed (a
+      // fully-duplicate append is idempotent server-side), the next one
+      // when it did. That re-list is the resume protocol, not a blind
+      // replay; delivered errors and aborts stay final.
+      if (err?.kind !== 'transport' && err?.kind !== 'timeout') throw err;
+      if (resyncBudget <= 0) throw err;
+      resyncBudget -= 1;
+      await filesTransferResyncUploadExtent(transfer, controller, err);
+      continue;
+    }
     if (!result.ok) {
+      // A delivered 409 is always an extent/state conflict (offset
+      // behind, overlap, another writer — a second tab on the same
+      // token, even a concurrent commit): the re-list is the arbiter for
+      // all of them, and the budget bounds a conflict that re-listing
+      // cannot cure. Every other delivered error is final.
+      if (result.status === 409 && resyncBudget > 0) {
+        resyncBudget -= 1;
+        await filesTransferResyncUploadExtent(
+          transfer,
+          controller,
+          new Error(result.body.error || 'upload chunk offset conflict')
+        );
+        continue;
+      }
       throw new Error(result.body.error || `upload chunk returned ${result.status || 'error'}`);
     }
+    resyncBudget = 3;
     filesTransferApplyServerJob(transfer, result.body.job);
     transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
@@ -79954,31 +80505,62 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       throw new Error('synthetic upload interruption');
     }
   }
-  const committed = await daemonApi.request('api_transfer_upload_commit', {
-    id: transfer.serverJobId || undefined,
+  if (filesTransferStatusFromJob(transfer.serverJob || {}) === 'completed') {
+    // A concurrent resume (second tab, same token) already committed
+    // while our chunks drained — commit is never re-sent at a completed
+    // job (its partial is gone; the failure would mask the success).
+    return settleCommittedFilesUpload(transfer, transfer.serverJob);
+  }
+  const commitParams = () => ({
+    id: filesTransferJobHandle(transfer) || undefined,
     resume_token: transfer.resumeToken || undefined,
-  }, {
-    timeoutMs: transfer.timeoutMs || 120000,
-    signal: controller.signal,
   });
+  let committed;
+  try {
+    committed = await daemonApi.request('api_transfer_upload_commit', commitParams(), {
+      timeoutMs: transfer.timeoutMs || 120000,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // Commit is NEVER blind-replayed: it renames the partial into place,
+    // so a second send against a committed job fails and would mask the
+    // success. A delivered-unknown outcome re-lists first — completed ⇒
+    // it landed; a job still awaiting commit proves it never arrived, so
+    // exactly one re-send is safe.
+    if (err?.kind !== 'transport' && err?.kind !== 'timeout') throw err;
+    const job = await filesTransferFetchServerJob(transfer, { signal: controller.signal });
+    if (!job) throw err;
+    if (filesTransferStatusFromJob(job) === 'completed') {
+      return settleCommittedFilesUpload(transfer, job);
+    }
+    committed = await daemonApi.request('api_transfer_upload_commit', commitParams(), {
+      timeoutMs: transfer.timeoutMs || 120000,
+      signal: controller.signal,
+    });
+  }
   if (!committed.ok) {
     throw new Error(committed.body.error || `upload commit returned ${committed.status || 'error'}`);
   }
-  filesTransferApplyServerJob(transfer, committed.body.job);
-  transfer.loaded = transfer.totalSize;
-  transfer.descriptor = committed.body.job;
-  filesTransferTransition(transfer, 'completed', { actor: 'runner', result: committed.body.job });
-  await filesTransferDeleteUploadBlob(transfer.id);
-  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+  await settleCommittedFilesUpload(transfer, committed.body.job);
 }
 
 function filesDeleteServerTransfer(transfer) {
   if (!transfer?.serverJobId && !transfer?.resumeToken) return;
-  if (daemonApi.availability('api_transfer_job_delete').reason !== 'connected') return;
-  daemonApi.request('api_transfer_job_delete', {
-    id: transfer.serverJobId || undefined,
-    resume_token: transfer.resumeToken || undefined,
-  }, { timeoutMs: 30000 }).catch(() => {});
+  // Fire-and-forget on either lane: the tunnel when connected, else the
+  // DELETE /api/transfers/{id} row once the probe confirms this daemon
+  // has it (F1c) — cancelling on a direct-HTTP dashboard must not leave
+  // a ghost job the Files tab re-merges forever.
+  const params = { id: filesTransferJobHandle(transfer) };
+  if (daemonApi.availability('api_transfer_job_delete').reason === 'connected') {
+    daemonApi.request('api_transfer_job_delete', params, { timeoutMs: 30000 }).catch(() => {});
+    return;
+  }
+  if (dashboardConnectModeEnabled()) return;
+  daemonApi.ensureHttpProbe('transfers')
+    .then(present => (present
+      ? daemonApi.request('api_transfer_job_delete', params, { timeoutMs: 30000 })
+      : null))
+    .catch(() => {});
 }
 
 async function runFilesUploadTransfer(transfer) {
@@ -79995,15 +80577,30 @@ async function runFilesUploadTransfer(transfer) {
       setFilesUploadStatus('warn', `Preparing ${transfer.name || 'upload.bin'}`);
       const persisted = await transfer.uploadBlobPersistPromise;
       transfer.uploadBlobPersistPromise = null;
-      if (!persisted) {
+      if (!persisted && !transfer.file) {
+        // Nothing to upload from: the blob never reached IndexedDB and
+        // the in-memory handle is gone (restored transfer).
         throw new Error('Browser storage is unavailable for resumable uploads');
+      }
+      if (!persisted) {
+        // Storage refused the blob (quota — likely a very large file,
+        // exactly what the jobs protocol now carries; task #6 removed
+        // the ceiling that used to mask this). Proceed from the
+        // in-memory file: pause/resume still works for the life of the
+        // tab, only resume-after-reload is lost.
+        console.warn('[files-transfer] upload blob not persisted; resume-after-reload unavailable for', transfer.id);
       }
     }
     if (!transfer.file && !(filesystemUpload && transfer.uploadBlobStored)) {
       throw new Error('missing upload file');
     }
     const initialSize = Number(transfer.file?.size || transfer.totalSize || 0);
-    if (initialSize > UPLOAD_MAX_BYTES) {
+    // Staged attachments stay a single POST capped at UPLOAD_MAX_BYTES (a
+    // product decision — design §4). Filesystem uploads carry no
+    // whole-file ceiling here: they ride the resumable jobs protocol
+    // (task #6), and only their single-POST fallback lane re-checks the
+    // cap for itself.
+    if (!filesystemUpload && initialSize > UPLOAD_MAX_BYTES) {
       throw new Error(`File too large (${humanBytes(initialSize)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
     }
     transfer.totalSize = initialSize;
@@ -89725,8 +90322,8 @@ document.getElementById('sb-dashboard-transport')?.addEventListener('click', () 
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
-// endpoint is public by design (the document is the authorization); using
-// authedFetch keeps it working identically on the trusted paths.
+// HTTP row is public by design (the document is the authorization); the
+// facade rides the tunnel when one is bound and the public row otherwise.
 document.getElementById('access-org-join-btn')?.addEventListener('click', async () => {
   const status = document.getElementById('access-org-join-status');
   const raw = document.getElementById('access-org-join-doc')?.value?.trim();
@@ -89744,7 +90341,7 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
   const stored = orgGrantStore(doc);
   if (status) status.textContent = 'Presenting…';
   try {
-    const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
+    const data = await accessOrgCall('api_access_org_present', doc);
     const summary = data.peer_identity
       ? `peer profile ${data.peer_identity.profile} for ${data.peer_identity.label} until ${new Date(Number(data.peer_identity.expires_at_unix || 0) * 1000).toLocaleString()}`
       : `${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}`;

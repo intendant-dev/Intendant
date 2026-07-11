@@ -1576,11 +1576,14 @@ verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
 the same PTY registry used by the WebSocket path, so scrollback and reconnect
 behavior stay consistent.
 
-The first streamed API on this substrate is `api_sessions_stream`, which mirrors
-the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
-`session`, `phase`, final `replace`, `done`). When the verified DataChannel is
-connected, local dashboard session hydration uses that stream and falls back to
-the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+The first streamed API on this substrate is `api_sessions_stream`, which shares
+one server-side line source with `/api/sessions/stream` (transport-unification
+S10: the neutral core's `ApiResponse::Stream`) — both lanes carry the identical
+NDJSON event sequence (`start`, partial `session`, `phase`, final `replace`,
+`done`); HTTP writes the lines verbatim, the tunnel wraps each in a
+`stream_event` frame. When the verified DataChannel is connected, local
+dashboard session hydration uses that stream and falls back to the HTTP stream
+on safe errors. Peer session lists still use direct peer HTTP.
 The local daemon identity is available as `api_agent_card`, returning the same
 Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
 remains the unauthenticated discovery surface.
@@ -1989,6 +1992,13 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/fs/write` | FilesystemWrite | own origin | ≤ 150 MiB | Write file bytes (scope-checked; sha256-guarded overwrite) |
 | POST | `/api/fs/rename` | FilesystemWrite | own origin | bounded | Move/rename a file or directory (scope-checked) |
 | POST | `/api/fs/delete` | FilesystemWrite | own origin | bounded | Delete a file or directory (scope-checked) |
+| GET | `/api/transfers` | FilesystemRead | own origin | none | List transfer jobs, newest first (`?id=` filters by job id or resume token) |
+| POST | `/api/transfers` | FilesystemWrite | own origin | bounded | Create a transfer job (kind download|upload, path/destination, name, total_size, sha256, conflict; fs-scope-checked on the target path) |
+| POST | `/api/transfers/{id}/chunk` | FilesystemWrite | own origin | streaming | Append one raw-body chunk to an upload job (`?offset=`; ≤ 32 MiB per chunk) |
+| POST | `/api/transfers/{id}/commit` | FilesystemWrite | own origin | bounded | Verify (size + declared sha256) and atomically rename a finished upload into place |
+| DELETE | `/api/transfers/{id}` | FilesystemWrite | own origin | none | Delete a transfer job (cancels partials; removes managed artifacts) |
+| POST | `/api/transfers/{id}/delete` | FilesystemWrite | own origin | none | Delete a transfer job (WKWebView POST fallback) |
+| GET | `/api/transfers/{id}/download` | FilesystemRead | own origin | none | Read download-job bytes (`?offset=&length=` or `Range` → 206; resume metadata echoed as X-Transfer-* headers, X-Content-Sha256 on full reads) |
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
@@ -2061,7 +2071,25 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
 | POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
-| any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peer registry (list/add/remove), pairing (invite/join/requests/identities), eligibility, and per-peer quick controls + signaling relays |
+| POST | `/api/peers/pairing/invite` | federation (per method/path) | own origin | bounded | Issue a peer-scoped mTLS pairing invite |
+| POST | `/api/peers/pairing/request-access` | federation (per method/path) | own origin | bounded | Start an outgoing access request against a remote daemon's doorbell |
+| POST | `/api/peers/pairing/request-access/poll` | federation (per method/path) | own origin | bounded | Poll an outgoing access request (installs the approved identity) |
+| GET | `/api/peers/pairing/requests` | federation (per method/path) | own origin | bounded | List pending/decided peer access requests |
+| GET | `/api/peers/pairing/identities` | federation (per method/path) | own origin | bounded | List approved/revoked peer identities |
+| POST | `/api/peers/pairing/identities/revoke` | federation (per method/path) | own origin | bounded | Revoke a peer identity |
+| POST | `/api/peers/pairing/requests/{code}/{decision}` | federation (per method/path) | own origin | bounded | Decide a pending access request (approve or deny) |
+| POST | `/api/peers/pairing/join` | federation (per method/path) | own origin | bounded | Import a pairing invite and register the peer |
+| GET | `/api/peers` | federation (per method/path) | own origin | bounded | List registered peers (snapshots) |
+| POST | `/api/peers` | federation (per method/path) | own origin | bounded | Add a peer by card URL (optionally persisted) |
+| DELETE | `/api/peers` | federation (per method/path) | own origin | bounded | Remove a registered peer |
+| GET | `/api/peers/eligible` | federation (per method/path) | own origin | bounded | List connected peers satisfying every ?capability= filter |
+| POST | `/api/peers/{peer_id}/message` | federation (per method/path) | own origin | bounded | Send a message to a connected peer |
+| POST | `/api/peers/{peer_id}/task` | federation (per method/path) | own origin | bounded | Delegate a task to a connected peer |
+| POST | `/api/peers/{peer_id}/approval` | federation (per method/path) | own origin | bounded | Resolve a peer-forwarded approval request |
+| POST | `/api/peers/{peer_id}/webrtc` | federation (per method/path) | own origin | bounded | Relay display WebRTC signaling to a connected peer |
+| POST | `/api/peers/{peer_id}/file-transfer-webrtc` | federation (per method/path) | own origin | bounded | Relay file-transfer WebRTC signaling to a connected peer |
+| POST | `/api/peers/{peer_id}/dashboard-control-webrtc` | federation (per method/path) | own origin | bounded | Relay dashboard-control WebRTC signaling to a connected peer |
+| any | `/api/peers[/…]` | federation (per method/path) | own origin | bounded | Peers sub-router catch-all (handler-owned JSON 404/405 for unknown subpaths and undeclared methods) |
 | POST | `/api/coordinator/route` | federation (per method/path) | own origin | bounded | Capability-based task routing through the Coordinator |
 | POST | `/mcp` | MCP token | own origin | ≤ 16 MiB | MCP Streamable HTTP endpoint (JSON-RPC requests + notifications) |
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |

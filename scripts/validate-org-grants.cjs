@@ -399,7 +399,10 @@ async function main() {
     await hosted.locator('#register').click();
     await hosted.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: START_TIMEOUT_MS });
     await hosted.locator('#claim').click();
-    await hosted.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), { timeout: START_TIMEOUT_MS });
+    // Two success copies since the first-owner bootstrap landed: a
+    // daemon-minted phrase claims AND enrolls ("…enrolled as its first
+    // owner…"); an account-route claim keeps the original copy.
+    await hosted.waitForFunction(() => /Rendezvous route claimed|enrolled as its first owner/.test(document.getElementById('claim-status').textContent), { timeout: START_TIMEOUT_MS });
 
     // Phase 5 follow-on: the passkey ceremony evaluated the PRF extension,
     // so this tab holds the fleet-encryption secret.

@@ -1401,6 +1401,8 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
   }
 
   async sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerDashboardControlSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -1408,8 +1410,7 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -1589,6 +1590,48 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_session_detail':
       return 15000;
+    // Peer quick controls cross the federation transport and wait for the
+    // remote daemon's ack — the generic 5 s default was sized for local
+    // reads, not a peer round trip (transport F5's deliberate
+    // normalization; the legacy HTTP lane ran signal-less). The same
+    // budget covers the dials that reach a REMOTE daemon before
+    // answering: peer add (card fetch + transport spawn), pairing
+    // join/request-access/poll (doorbell round trips), and coordinator
+    // routing (delegation ack).
+    case 'api_peer_message':
+    case 'api_peer_task':
+    case 'api_peer_approval':
+    case 'api_peer_add':
+    case 'api_peer_pairing_join':
+    case 'api_peer_pairing_request_access':
+    case 'api_peer_pairing_request_access_poll':
+    case 'api_coordinator_route':
+      return 30000;
+    // Credential custody (transport F6): the sealed vault blob rides the
+    // chunked, credit-gated response lane and can run to hundreds of KiB
+    // over a TURN link. The family's pre-facade caller asked for 15 s and
+    // was silently clamped to the 5 s default (this verb ignores
+    // options.timeoutMs) — this table is where that intent actually
+    // lives.
+    case 'api_credential_lease_grant':
+    case 'api_credential_lease_renew':
+    case 'api_credential_lease_revoke':
+    case 'api_credential_lease_status':
+    case 'api_credential_custody_trail':
+    case 'api_credential_egress_register':
+    case 'api_credential_egress_unregister':
+    case 'api_daemon_vault_fetch':
+    case 'api_daemon_vault_publish':
+    case 'api_daemon_vault_deposit_key_fetch':
+    case 'api_daemon_vault_deposit_key_publish':
+    case 'api_daemon_vault_deposits_fetch':
+    case 'api_daemon_vault_deposits_consume':
+      return 15000;
+    // The egress probe reaches beyond this daemon before answering:
+    // daemon -> the relaying browser -> the provider's API -> back. Same
+    // budget as the peer round trips above.
+    case 'api_credential_egress_probe':
+      return 30000;
     default:
       return 5000;
   }
@@ -2543,23 +2586,13 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    let data = null;
-    if (dashboardTransport?.canUseRpc()) {
-      try {
-        data = await dashboardTransport.request('api_peers');
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
-      }
-    }
-    if (!data && dashboardConnectModeEnabled()) {
-      throw new Error('Peer list is unavailable until dashboard access reconnects');
-    }
-    if (!data) {
-      const resp = await authedFetch('/api/peers');
-      if (!resp.ok) return;
-      data = await resp.json();
-    }
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy, never HTTP in Connect mode — the exact
+    // legacy tri-form this replaces. A delivered error response leaves
+    // the stale list in place, like the legacy !resp.ok return did.
+    const resp = await daemonApi.request('api_peers');
+    if (!resp.ok) return;
+    const data = resp.body || {};
     if (!data.peers || !Array.isArray(data.peers)) return;
 
     // Build the new daemon entries from the API response via the
@@ -2941,10 +2974,3 @@ function applyDaemonExpandedState(hostId, expanded) {
     btn.title = expanded ? 'Hide peer controls' : 'Show peer controls';
   }
 }
-
-// POST a message to a peer via /api/peers/{id}/message and surface
-// the result in the row's status line. The peer id is embedded in
-// the URL path verbatim — colons are valid path chars per RFC 3986
-// and the server-side parser splits on the literal `:` to recover
-// the kind prefix; URL-encoding `:` as `%3A` would break the lookup
-// because the registry keys on the un-encoded id.

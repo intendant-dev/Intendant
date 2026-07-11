@@ -111,6 +111,9 @@ pub(crate) fn pending_upload_session_dir(
 /// the transport edge resolves the real `intendant_home()`, tests inject
 /// a tempdir so a projectless commit never writes the machine's real
 /// global store. Project-rooted commits never read it.
+///
+/// `body` is the Streaming lane's common spool handle (S8): HTTP spools
+/// the socket, the tunnel spools upload frames — same commit either way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn current_upload_commit_response_body(
     state_root: &std::path::Path,
@@ -120,8 +123,7 @@ pub(crate) fn current_upload_commit_response_body(
     name: &str,
     mime: &str,
     requested_destination: crate::upload_store::UploadDestination,
-    tmp: tempfile::NamedTempFile,
-    size: usize,
+    body: SpooledBody,
     bus: &crate::event::EventBus,
 ) -> (&'static str, String) {
     let scope = crate::global_store::StoreScope::resolve_in(project_root, state_root);
@@ -144,10 +146,10 @@ pub(crate) fn current_upload_commit_response_body(
     };
     let destination = effective_upload_destination(requested_destination, session_log.is_some());
     match crate::upload_store::commit_upload(
-        tmp,
+        body.tmp,
         name,
         mime,
-        size as u64,
+        body.len as u64,
         destination,
         &session_dir,
         &session_id,
@@ -207,9 +209,10 @@ pub(crate) fn current_upload_delete_response_body(
 
 /// Transport-neutral core of the staged-upload commit (`POST
 /// /api/session/current/uploads` once its transport has spooled the raw
-/// body; tunnel twin `api_session_current_upload`'s upload_end leg): the
-/// shared (status, body) commit core — session-dir resolution, store
-/// commit, `UploadReady` broadcast — under the wildcard-CORS tail.
+/// body into the [`SpooledBody`] handle; tunnel twin
+/// `api_session_current_upload`'s upload_end leg): the shared
+/// (status, body) commit core — session-dir resolution, store commit,
+/// `UploadReady` broadcast — under the wildcard-CORS tail.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn current_upload_commit_api_response(
     state_root: &std::path::Path,
@@ -219,8 +222,7 @@ pub(crate) fn current_upload_commit_api_response(
     name: &str,
     mime: &str,
     requested_destination: crate::upload_store::UploadDestination,
-    tmp: tempfile::NamedTempFile,
-    size: usize,
+    body: SpooledBody,
     bus: &crate::event::EventBus,
 ) -> ApiResponse {
     let (status, body) = current_upload_commit_response_body(
@@ -231,8 +233,7 @@ pub(crate) fn current_upload_commit_api_response(
         name,
         mime,
         requested_destination,
-        tmp,
-        size,
+        body,
         bus,
     );
     session_wildcard_json_response(status_line_code(status), body)
@@ -1356,10 +1357,13 @@ impl DashboardFsReadError {
     }
 }
 
+/// An end-INCLUSIVE byte range as parsed from an HTTP `Range` header
+/// (fields widened for the transfer download's header normalization,
+/// which converts it to the store's offset/length form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DashboardByteRange {
-    start: u64,
-    end: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 pub(crate) fn dashboard_fs_content_type(path: &Path) -> String {
@@ -2693,7 +2697,7 @@ pub(crate) async fn handle_current_uploads_post_in_state_root(
                 let status = if e.contains("too large") { 413 } else { 400 };
                 session_wildcard_json_error(status, &e)
             }
-            Ok((tmp, size)) => current_upload_commit_api_response(
+            Ok(body) => current_upload_commit_api_response(
                 state_root,
                 project_root_for_changes.as_deref(),
                 session_log.as_ref(),
@@ -2701,8 +2705,7 @@ pub(crate) async fn handle_current_uploads_post_in_state_root(
                 &name,
                 &mime,
                 requested_destination,
-                tmp,
-                size,
+                body,
                 &bus,
             ),
         };

@@ -1153,22 +1153,18 @@ class PeerDisplayConnection {
   }
 
   async _sendSignal(signal) {
-    const url = `/api/peers/${this.hostId}/webrtc`;
-    const body = {
+    // Display signaling relay (transport F5): a delivered-once mutation —
+    // the facade derives no-replay from the POST verb; peer_id lifts into
+    // the HTTP twin's path.
+    const resp = await daemonApi.request('api_peer_webrtc_signal', {
       peer_id: this.hostId,
       display_id: this.displayId,
       session_id: this.sessionId,
       signal,
-    };
-    const resp = await dashboardTransport.jsonFetch('api_peer_webrtc_signal', body, () => authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_webrtc_signal', { fallbackAfterRpcFailure: false });
+    });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
       throw new Error(
-        `webrtc signal failed (${resp.status}): ${detail.error || 'unknown'}`
+        `webrtc signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`
       );
     }
   }
@@ -1404,6 +1400,8 @@ class PeerFileTransferConnection {
   }
 
   async _sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerFileTransferSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -1411,8 +1409,7 @@ class PeerFileTransferConnection {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer file-transfer signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer file-transfer signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -1793,12 +1790,10 @@ async function createDaemonInvite() {
   btn.disabled = true;
   setDaemonPairingStatus('daemon-invite-status', 'Creating...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_invite', body, () => authedFetch('/api/peers/pairing/invite', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_invite', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Pairing mutations (transport F5): verb-derived no-replay, params
+    // unchanged — same policy for every POST in this dialog set.
+    const resp = await daemonApi.request('api_peer_pairing_invite', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-invite-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -1848,12 +1843,8 @@ async function joinDaemonInvite() {
   if (btn) btn.disabled = true;
   setDaemonPairingStatus('daemon-join-status', 'Joining...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_join', body, () => authedFetch('/api/peers/pairing/join', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_join', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_join', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-join-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -1899,12 +1890,8 @@ async function requestDaemonAccess() {
   if (codeEl) codeEl.textContent = '';
   setDaemonPairingStatus('daemon-request-status', 'Requesting...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access', body, () => authedFetch('/api/peers/pairing/request-access', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_access', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_request_access', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -1936,12 +1923,8 @@ async function completeDaemonAccessRequest() {
     ...(labelInput && labelInput.value.trim() ? { label: labelInput.value.trim() } : {}),
   };
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access_poll', body, () => authedFetch('/api/peers/pairing/request-access/poll', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_access_poll', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_request_access_poll', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -1975,8 +1958,10 @@ async function loadPeerAccessRequests() {
   if (!list) return;
   setDaemonPairingStatus('daemon-access-requests-status', 'Loading...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_requests', {}, () => authedFetch('/api/peers/pairing/requests'), 'api_peer_pairing_requests');
-    const result = await resp.json().catch(() => ({}));
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy — same for the identities read below.
+    const resp = await daemonApi.request('api_peer_pairing_requests');
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -2066,16 +2051,15 @@ async function decidePeerAccessRequest(requestId, op) {
       const profileSelect = document.querySelector(`[data-access-request-profile="${CSS.escape(requestId)}"]`);
       if (profileSelect && profileSelect.value) body.profile = profileSelect.value;
     }
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_decision', {
+    // Access-request decisions are mutations (transport F5): verb-derived
+    // no-replay, params unchanged — request_id/op lift into the HTTP
+    // twin's path captures, the optional profile stays as the body.
+    const resp = await daemonApi.request('api_peer_pairing_request_decision', {
       request_id: requestId,
       op,
       ...body,
-    }, () => authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_pairing_request_decision', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    });
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -2097,8 +2081,8 @@ async function loadPeerIdentities() {
   if (!list) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Loading...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identities', {}, () => authedFetch('/api/peers/pairing/identities'), 'api_peer_pairing_identities');
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_identities');
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -2155,12 +2139,8 @@ async function revokePeerIdentity(identity) {
   if (!value) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Revoking...', '');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identity_revoke', { identity: value }, () => authedFetch('/api/peers/pairing/identities/revoke', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identity: value }),
-    }), 'api_peer_pairing_identity_revoke', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    const resp = await daemonApi.request('api_peer_pairing_identity_revoke', { identity: value });
+    const result = resp.body || {};
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
@@ -2228,12 +2208,11 @@ async function addDaemon() {
   if (viaUrls.length > 0) body.via_urls = viaUrls;
   if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_add', body, () => authedFetch('/api/peers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }), 'api_peer_add', { fallbackAfterRpcFailure: false });
-    const result = await resp.json();
+    // Peer add is a mutation (transport F5): verb-derived no-replay —
+    // the hosted validator's peer-mutations self-test probes exactly this
+    // (a failed tunnel attempt must throw, never re-POST over HTTP).
+    const resp = await daemonApi.request('api_peer_add', body);
+    const result = resp.body || {};
     if (!resp.ok) {
       const errorText = result.error || String(resp.status);
       if (/peer added for this run/i.test(errorText)) {
@@ -2270,11 +2249,9 @@ async function removeDaemon(hostId) {
   // explicit disconnect on the peer's actor (Disconnecting →
   // Disconnected state machine).
   try {
-    await dashboardTransport.jsonFetch('api_peer_remove', { peer_id: hostId }, () => authedFetch('/api/peers', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ peer_id: hostId }),
-    }), 'api_peer_remove', { fallbackAfterRpcFailure: false });
+    // DELETE twin (transport F5): the descriptor carries the leftover
+    // {peer_id} as the JSON body — the endpoint's historical shape.
+    await daemonApi.request('api_peer_remove', { peer_id: hostId });
   } catch { /* best-effort */ }
   removeDashboardAccessTarget(hostId);
   await refreshPeersFromApi();
@@ -2312,10 +2289,11 @@ async function findEligiblePeers() {
   btn.disabled = true;
   out.textContent = 'Searching…';
   out.className = 'coord-result';
-  const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
   try {
-    const resp = await dashboardTransport.jsonFetch('api_peer_eligible', { capabilities: caps }, () => authedFetch(`/api/peers/eligible?${query}`), 'api_peer_eligible');
-    const result = await resp.json().catch(() => ({}));
+    // GET twin (transport F5): the descriptor's queryRepeat rebuilds the
+    // repeated ?capability= keys from the tunnel's capabilities array.
+    const resp = await daemonApi.request('api_peer_eligible', { capabilities: caps });
+    const result = resp.body || {};
     if (!resp.ok) {
       const msg = result.error || `HTTP ${resp.status}`;
       const hint = result.hint ? ` (${result.hint})` : '';
@@ -2379,12 +2357,12 @@ async function routeTask() {
       required_capabilities: caps,
       task: { instructions },
     };
-    const resp = await dashboardTransport.jsonFetch('api_coordinator_route', payload, () => authedFetch('/api/coordinator/route', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_coordinator_route', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
+    // Coordinator routing is a mutation (transport F5): verb-derived
+    // no-replay. The method's per-lane IAM divergence (HTTP: Task via the
+    // federation ladder; tunnel: PeerManage, documented op-override) is
+    // preserved on the rows — the facade only names the twin.
+    const resp = await daemonApi.request('api_coordinator_route', payload);
+    const result = resp.body || {};
     if (resp.ok) {
       out.className = 'coord-result ok';
       out.innerHTML =

@@ -15,6 +15,15 @@
 #   4. log exactly one summary line to $LOG (rotated), and
 #   5. always exit 0, within HOOK_TIMEOUT_SECS.
 #
+# ALL of it is account-gated: run_hook refuses outright (one log line,
+# exit 0) unless `id -un` matches INTENDANT_CI_HOOK_ACCOUNT from the
+# runner's .env wiring. The payload's safety model is the account
+# boundary — reap_orphans treats every account process outside a live
+# runner tree as residue, and wipe_stale_test_home treats ~/.intendant
+# as fixture escape. Executed under any other account, those same rules
+# dismantle a real login session and delete real daemon state
+# (2026-07-10: a developer-account invocation did exactly that).
+#
 # Never touched: ~/.cache/intendant-ci (the warm external cargo target
 # caches — the fleet watchdog owns those), ~/.cargo, ~/.rustup.
 #
@@ -184,13 +193,39 @@ reap_orphans() {
     printf 'killed=%s%s' "$n" "${detail:+ [${detail#,}]}"
 }
 
-# The bounded driver: the real work runs in a child subshell so a hung
-# cleanup can be reaped by the timer — GitHub applies no timeout of its own
-# to these hooks, and a wedged started-hook would wedge the job.
+# The bounded driver: the real work runs in a child subshell, bounded by a
+# FOREGROUND one-second poll in the hook's own shell — GitHub applies no
+# timeout of its own to these hooks, and a wedged started-hook would wedge
+# the job.
+#
+# Deliberately NO background timer subshell. The first cutover shipped
+# `( sleep N; kill -TERM "$work" ) &` and it took down two canary jobs
+# (2026-07-10): macOS bash 3.2 defers a TERM sent to a subshell that is
+# waiting on an external command, so the driver's end-of-run `kill $timer`
+# didn't actually kill it — every hook run leaked a live timer holding a
+# stale $work pid. When the leaked sleep later ended (naturally, or TERM'd
+# as an orphan by the NEXT hook's reaper), the subshell fired kill -TERM at
+# a pid macOS had long since recycled INTO the then-current job — 143s
+# mid-hook, and each killed hook leaked its own timer for the next one: a
+# self-sustaining grenade chain. A foreground poll has no detached state:
+# if the hook dies, its pending kill dies with it, and the timeout KILL
+# targets a pid we have verified is still our own child in the same
+# breath.
 run_hook() {
     local phase="$1"
+    # Account gate — refuse anywhere but the dedicated CI account (see
+    # the header). The expected name comes from the runner wiring, not a
+    # hardcoded convention, so the same lib serves any fleet host; unset
+    # or mismatched means an inert janitor and a green job, never a
+    # payload run in the wrong account.
+    local account
+    account=$(id -un 2>/dev/null)
+    if [ -z "${INTENDANT_CI_HOOK_ACCOUNT:-}" ] || [ "$account" != "${INTENDANT_CI_HOOK_ACCOUNT}" ]; then
+        log_line "$phase REFUSED account=${account:-?} expected=${INTENDANT_CI_HOOK_ACCOUNT:-unset} (payload skipped)"
+        exit 0
+    fi
     rotate_log
-    local t0 result_file work timer outcome detail=""
+    local t0 result_file work outcome detail="" waited=0
     t0=$(date +%s)
     result_file=$(mktemp 2>/dev/null) || result_file=""
 
@@ -205,16 +240,23 @@ run_hook() {
         fi
     ) &
     work=$!
-    ( sleep "$HOOK_TIMEOUT_SECS"; kill -TERM "$work" 2>/dev/null ) &
-    timer=$!
 
     outcome=ok
-    wait "$work" 2>/dev/null || outcome=timeout
-    # (The reap-to-kill gap here is a theoretical PID-reuse window only when
-    # the work finishes at exactly the deadline; blast radius is a stray
-    # TERM inside our own account.)
-    kill "$timer" 2>/dev/null
-    wait "$timer" 2>/dev/null
+    while kill -0 "$work" 2>/dev/null; do
+        if [ "$waited" -ge "$HOOK_TIMEOUT_SECS" ]; then
+            outcome=timeout
+            # Parentage check closes the pid-reuse race: only KILL while
+            # the pid is still our own child (janitorial work is
+            # idempotent — no graceful TERM needed at the deadline).
+            if [ "$(ps -o ppid= -p "$work" 2>/dev/null | tr -d ' ')" = "$$" ]; then
+                kill -KILL "$work" 2>/dev/null
+            fi
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$work" 2>/dev/null
 
     if [ -n "$result_file" ]; then
         detail=$(cat "$result_file" 2>/dev/null || true)

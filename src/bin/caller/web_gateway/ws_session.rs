@@ -210,18 +210,9 @@ pub(crate) async fn ws_inbound_task(
     let mut is_active = false;
 
     // Per-connection clip accumulators for batched clip_frame messages
-    struct ClipAccumulator {
-        stream: String,
-        note: String,
-        inject: bool,
-        in_secs: f64,
-        out_secs: f64,
-        fps: u32,
-        #[allow(dead_code)]
-        expected: usize,
-        frames: Vec<(String, String)>, // (frame_id, base64_data)
-    }
-    let mut clip_accumulators: std::collections::HashMap<String, ClipAccumulator> =
+    // Per-connection accumulators, in the same clip-operation shape the
+    // tunnel's media_clip_ops map stores (web_gateway::media_store).
+    let mut clip_accumulators: std::collections::HashMap<String, DashboardMediaClipOperation> =
         std::collections::HashMap::new();
 
     // Display IDs this peer has WebRTC connections to,
@@ -715,7 +706,11 @@ pub(crate) async fn ws_inbound_task(
                         }
                     }
                     Some("video_frame") => {
-                        // Browser sends a video frame for HQ archival in the frame registry.
+                        // Browser sends a video frame for HQ archival in the
+                        // frame registry plus the recording pipeline
+                        // (auto-starts on first frame) — the same store fn
+                        // the tunnel's api_presence_video_frame commits
+                        // through (fire-and-forget: no response frame).
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
                         let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
@@ -723,40 +718,15 @@ pub(crate) async fn ws_inbound_task(
                             if let Ok(jpeg_bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(data_b64)
                             {
-                                // Register in frame registry
-                                if let Some(ref registry) = frame_registry_inbound {
-                                    let meta = presence_core::FrameMeta {
-                                        frame_id: frame_id.clone(),
-                                        stream: stream.clone(),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                        sent_to_live: true,
-                                        live_resolution: Some("768x768".to_string()),
-                                        hq_resolution: None,
-                                        note: None,
-                                    };
-                                    let mut reg = registry.write().await;
-                                    if let Err(e) = reg.register(meta, &jpeg_bytes) {
-                                        eprintln!("frame registry write failed: {}", e);
-                                    }
-                                }
-                                // Feed into recording pipeline (auto-starts on first frame)
-                                if let Some(ref rec_reg) = recording_registry_inbound {
-                                    let mut rreg = rec_reg.write().await;
-                                    if rreg.is_enabled() {
-                                        if !rreg.is_recording(&stream)
-                                            && crate::recording::is_ffmpeg_available()
-                                        {
-                                            if let Err(e) = rreg.start_stream(&stream).await {
-                                                eprintln!("camera recording start failed: {}", e);
-                                            } else {
-                                                bus_inbound.send(AppEvent::RecordingStarted {
-                                                    stream_name: stream.clone(),
-                                                });
-                                            }
-                                        }
-                                        let _ = rreg.feed_frame(&stream, &jpeg_bytes).await;
-                                    }
-                                }
+                                let _ = register_presence_video_frame(
+                                    frame_registry_inbound.clone(),
+                                    recording_registry_inbound.clone(),
+                                    &bus_inbound,
+                                    &frame_id,
+                                    &stream,
+                                    &jpeg_bytes,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -767,7 +737,8 @@ pub(crate) async fn ws_inbound_task(
                         // a pending attachment and submits it with the next task.
                         //
                         // Works regardless of presence/agent state — attachments
-                        // are independent of any running task.
+                        // are independent of any running task. Same store fn as
+                        // the tunnel's api_media_annotation_attach.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
@@ -776,34 +747,19 @@ pub(crate) async fn ws_inbound_task(
                             if let Ok(jpeg_bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(data_b64)
                             {
-                                let mut saved_path = String::new();
-                                let mut registered = false;
-                                if let Some(ref registry) = frame_registry_inbound {
-                                    let meta = presence_core::FrameMeta {
-                                        frame_id: frame_id.clone(),
-                                        stream: stream.clone(),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                        sent_to_live: false,
-                                        live_resolution: None,
-                                        hq_resolution: None,
-                                        note: if note.is_empty() {
-                                            None
-                                        } else {
-                                            Some(note.clone())
-                                        },
-                                    };
-                                    let mut reg = registry.write().await;
-                                    match reg.register(meta, &jpeg_bytes) {
-                                        Ok(path) => {
-                                            saved_path = path.display().to_string();
-                                            registered = true;
-                                        }
-                                        Err(e) => eprintln!(
-                                            "annotation_attach frame registry write failed: {}",
-                                            e
-                                        ),
-                                    }
-                                }
+                                let (saved_path, registered) = register_dashboard_media_frame(
+                                    frame_registry_inbound.clone(),
+                                    &frame_id,
+                                    &stream,
+                                    if note.is_empty() {
+                                        None
+                                    } else {
+                                        Some(note.clone())
+                                    },
+                                    &jpeg_bytes,
+                                    "annotation_attach",
+                                )
+                                .await;
                                 let _ = direct_tx_inbound.send(
                                     serde_json::json!({
                                         "t": "annotation_attached",
@@ -827,7 +783,10 @@ pub(crate) async fn ws_inbound_task(
                         }
                     }
                     Some("annotation_submit") => {
-                        // User drew annotations on a frame and submitted it with a note.
+                        // User drew annotations on a frame and submitted it
+                        // with a note — register + optional context injection
+                        // through the same store fns as the tunnel's
+                        // api_media_annotation_submit.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
@@ -837,57 +796,25 @@ pub(crate) async fn ws_inbound_task(
                             if let Ok(jpeg_bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(data_b64)
                             {
-                                // Register in frame registry
-                                let mut saved_path = String::new();
-                                if let Some(ref registry) = frame_registry_inbound {
-                                    let meta = presence_core::FrameMeta {
-                                        frame_id: frame_id.clone(),
-                                        stream: stream.clone(),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                        sent_to_live: false,
-                                        live_resolution: None,
-                                        hq_resolution: None,
-                                        note: if note.is_empty() {
-                                            None
-                                        } else {
-                                            Some(note.clone())
-                                        },
-                                    };
-                                    let mut reg = registry.write().await;
-                                    match reg.register(meta, &jpeg_bytes) {
-                                        Ok(path) => saved_path = path.display().to_string(),
-                                        Err(e) => eprintln!(
-                                            "annotation frame registry write failed: {}",
-                                            e
-                                        ),
-                                    }
-                                }
-                                // Optionally inject into agent conversation
-                                let mut injected_to_queue = false;
-                                if inject {
-                                    if let Some(ref ctx) = query_ctx_inbound {
-                                        if let Some(ref ciq) = ctx.context_injection {
-                                            if let Ok(mut q) = ciq.lock() {
-                                                let label = if note.is_empty() {
-                                                    "[User Annotation] User highlighted something on the screen.".to_string()
-                                                } else {
-                                                    format!("[User Annotation] {}", note)
-                                                };
-                                                q.push(crate::event::ContextInjection {
-                                                    text: label,
-                                                    images: vec![crate::conversation::ImageData {
-                                                        media_type: "image/jpeg".to_string(),
-                                                        data: data_b64.to_string(),
-                                                    }],
-                                                    source: crate::event::InjectionSource::User,
-                                                    target_session_id: None,
-                                                    steer_id: None,
-                                                });
-                                                injected_to_queue = true;
-                                            }
-                                        }
-                                    }
-                                }
+                                let (saved_path, _registered) = register_dashboard_media_frame(
+                                    frame_registry_inbound.clone(),
+                                    &frame_id,
+                                    &stream,
+                                    if note.is_empty() {
+                                        None
+                                    } else {
+                                        Some(note.clone())
+                                    },
+                                    &jpeg_bytes,
+                                    "annotation",
+                                )
+                                .await;
+                                let injected_to_queue = inject
+                                    && inject_annotation_context(
+                                        query_ctx_inbound.as_ref(),
+                                        &note,
+                                        data_b64.to_string(),
+                                    );
                                 // Send path back to browser. Report whether the injection
                                 // actually landed in the queue (not just whether the user
                                 // pressed Send), so the UI doesn't lie when no presence is
@@ -932,14 +859,14 @@ pub(crate) async fn ws_inbound_task(
                         let total = json["total_frames"].as_u64().unwrap_or(0) as usize;
                         clip_accumulators.insert(
                             clip_id.clone(),
-                            ClipAccumulator {
+                            DashboardMediaClipOperation {
                                 stream,
                                 note,
                                 inject,
                                 in_secs,
                                 out_secs,
                                 fps,
-                                expected: total,
+                                expected_frames: total,
                                 frames: Vec::with_capacity(total),
                             },
                         );
@@ -956,26 +883,21 @@ pub(crate) async fn ws_inbound_task(
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
-                            // Register frame in frame registry
+                            // Register frame in frame registry — the same
+                            // store fn as the tunnel's api_media_clip_frame.
                             use base64::Engine;
                             if let Ok(jpeg_bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(data_b64)
                             {
-                                if let Some(ref registry) = frame_registry_inbound {
-                                    let meta = presence_core::FrameMeta {
-                                        frame_id: frame_id.clone(),
-                                        stream: format!("clip:{}", clip_id),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                        sent_to_live: false,
-                                        live_resolution: None,
-                                        hq_resolution: None,
-                                        note: None,
-                                    };
-                                    let mut reg = registry.write().await;
-                                    if let Err(e) = reg.register(meta, &jpeg_bytes) {
-                                        eprintln!("clip frame registry write failed: {}", e);
-                                    }
-                                }
+                                let _ = register_dashboard_media_frame(
+                                    frame_registry_inbound.clone(),
+                                    &frame_id,
+                                    &format!("clip:{}", clip_id),
+                                    None,
+                                    &jpeg_bytes,
+                                    "clip",
+                                )
+                                .await;
                             }
                             // Accumulate for context injection
                             if let Some(acc) = clip_accumulators.get_mut(&clip_id) {
@@ -985,51 +907,17 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("clip_end") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
-                        let mut injected = false;
 
                         if let Some(acc) = clip_accumulators.remove(&clip_id) {
                             let frames_registered = acc.frames.len();
-                            if acc.inject {
-                                if let Some(ref ctx) = query_ctx_inbound {
-                                    if let Some(ref ciq) = ctx.context_injection {
-                                        if let Ok(mut q) = ciq.lock() {
-                                            let label = if acc.note.is_empty() {
-                                                format!(
-                                                    "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps)",
-                                                    acc.stream,
-                                                    acc.in_secs,
-                                                    acc.out_secs,
-                                                    frames_registered, acc.fps,
-                                                )
-                                            } else {
-                                                format!(
-                                                    "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps). {}",
-                                                    acc.stream,
-                                                    acc.in_secs,
-                                                    acc.out_secs,
-                                                    frames_registered, acc.fps, acc.note,
-                                                )
-                                            };
-                                            let images: Vec<crate::conversation::ImageData> = acc
-                                                .frames
-                                                .iter()
-                                                .map(|(_, b64)| crate::conversation::ImageData {
-                                                    media_type: "image/jpeg".to_string(),
-                                                    data: b64.clone(),
-                                                })
-                                                .collect();
-                                            q.push(crate::event::ContextInjection {
-                                                text: label,
-                                                images,
-                                                source: crate::event::InjectionSource::User,
-                                                target_session_id: None,
-                                                steer_id: None,
-                                            });
-                                            injected = true;
-                                        }
-                                    }
-                                }
-                            }
+                            // Optional context injection through the same
+                            // store fn as the tunnel's api_media_clip_end.
+                            let injected = acc.inject
+                                && inject_clip_context(
+                                    query_ctx_inbound.as_ref(),
+                                    &clip_id,
+                                    &acc,
+                                );
 
                             let _ = direct_tx_inbound.send(
                                 serde_json::json!({

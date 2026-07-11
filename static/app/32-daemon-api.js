@@ -7,7 +7,8 @@
 //   daemonApi.upload(method, params, source, opts)   -> {ok, status, body}   (source: Blob | Uint8Array)
 //   daemonApi.stream(method, params, opts, onEvent)  -> completion summary
 //   daemonApi.availability(method, target)           -> {ok, reason}
-//   // opts: { target?: hostId|null, signal?, timeoutMs?, retries?, fallback?: 'auto'|'never' }
+//   // opts: { target?: hostId|{remoteHttp: origin}|null, signal?,
+//   //         timeoutMs?, retries?, fallback?: 'auto'|'never' }
 //
 // `method` is always the tunnel method name; DAEMON_API_HTTP_MAP maps it to
 // the HTTP twin when the direct lane serves the call. Adapters:
@@ -18,12 +19,26 @@
 //     authenticates to a peer over HTTP);
 //   - HTTP: `authedFetch` + the descriptor table. Connect mode is policy,
 //     not an adapter: it forces `fallback:'never'` (hosted validators probe
-//     exactly this no-legacy-fallback behavior).
+//     exactly this no-legacy-fallback behavior);
+//   - remote-http (F4): `{remoteHttp: origin}` targets name a FLEET
+//     daemon's own HTTP origin — direct cross-origin fetch under the
+//     fleet-CORS rows, never a tunnel, never a fallback (design §5's F4
+//     caveat: fleet fan-out is explicit, not ambiguous).
 //
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
-// staged uploads), the F2 sessions-family reads, and the F3 settings/keys
+// staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
-// external-agents, displays); the remaining `rpcOrHttp`/`jsonFetch` call
+// external-agents, displays), the F4 access dialogs family
+// (overview/enrollment/connect/tier + IAM grant writes), the F5
+// peers/approvals/coordinator family (peer list + quick controls, the
+// pairing dialogs, the coordinator forms, and the peer WebRTC signal
+// relays), the F6 credential-custody family (vault leases, the
+// custody trail, the daemon vault store + deposit lane, client-egress
+// registration/probe — tunnel-only methods whose per-cause availability
+// the vault UI surfaces), and the F1c transfer-jobs adapter (the
+// resumable jobs protocol over the S9 /api/transfers rows, presence
+// feature-detected through the probe registry below); the remaining
+// `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
 // evaluates.
@@ -52,12 +67,31 @@
 //
 // Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots), and the
+// its NDJSON stream, search, detail, report, context snapshots), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
-// project-root, external-agents, displays). The
-// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
-// until the server-track stage that adds /api/transfers (task #6); F1 adds
-// their entries when those rows land.
+// project-root, external-agents, displays), and the F4 access family:
+// the dialogs set (overview, IAM state, enrollment reads + decide, IAM
+// grant upsert/update, the connect admin quartet, the tier pair,
+// fleet-cert request, dashboard targets) plus the org set (trust/revoke,
+// issuance, issuer key management, and the signed-org doorbell quartet —
+// present, renew, ORL read, ORL apply, whose HTTP rows are Public by
+// design: the signed document is the authorization), and the F5 peers /
+// coordinator family (the peer registry list/add/remove, eligible,
+// quick controls — message/task/approval, the three WebRTC signal
+// relays, the pairing set, and the coordinator route; their rows
+// delegate IAM to the federation ladder, S7), and the transfer-jobs
+// family (task #6 / F1c): the six /api/transfers rows (S9) twinning the
+// datachannel `api_transfer_*` methods. Unlike every other family, a
+// deployed daemon may predate those rows, so their entries carry
+// `probe: 'transfers'` — the availability derivation and the transfers
+// pump consult the one-shot GET /api/transfers probe (below) before
+// treating the HTTP lane as present (design §4: 404/405 ⇒ old daemon ⇒
+// legacy behavior + honest availability). The F6 credential-custody family
+// (api_credential_*, api_daemon_vault_*) is deliberately absent too, and
+// stays so: custody is tunnel-scoped by design — no HTTP rows exist or
+// are planned (docs/src/credential-custody.md; the transport design
+// parks custody HTTP rows as an explicit future decision), so those
+// methods ride the facade with no fallback lane at all.
 // Entry shape: verb + path template (`{name}` segments are lifted from
 // params), `alias` = capture-name -> param-key lift map (the session rows
 // capture `id` while the tunnel's canonical param is `session_id` — the
@@ -65,11 +99,17 @@
 // lifted into the query string (arrays comma-join; empty arrays stay
 // absent), `queryJson` = query keys whose array value JSON-encodes instead
 // (the search `projects` filter, which the HTTP handler serde-parses),
+// `queryRepeat` = query-key -> array-param-key map emitting one
+// `key=value` pair per element (the eligible endpoint's repeated
+// `?capability=` keys from the tunnel's `capabilities` array; empty
+// arrays stay absent),
 // `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
-// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `probe` = the twin's rows may be absent on a deployed daemon; name the
+// DAEMON_API_HTTP_PROBES entry whose result gates the http-only lane.
 // `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
@@ -80,6 +120,12 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
   api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
   api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
+  api_transfer_jobs: { verb: 'GET', path: '/api/transfers', query: ['id', 'resume_token'], probe: 'transfers' },
+  api_transfer_job_create: { verb: 'POST', path: '/api/transfers', probe: 'transfers' },
+  api_transfer_upload_chunk: { verb: 'POST', path: '/api/transfers/{id}/chunk', query: ['offset', 'resume_token'], lane: 'upload', encode: 'raw', probe: 'transfers' },
+  api_transfer_upload_commit: { verb: 'POST', path: '/api/transfers/{id}/commit', probe: 'transfers' },
+  api_transfer_job_delete: { verb: 'DELETE', path: '/api/transfers/{id}', probe: 'transfers' },
+  api_transfer_download_read: { verb: 'GET', path: '/api/transfers/{id}/download', lane: 'bytes', probe: 'transfers' },
   api_session_current_uploads: { verb: 'GET', path: '/api/session/current/uploads' },
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
@@ -105,6 +151,56 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_project_root: { verb: 'GET', path: '/api/project-root' },
   api_external_agents: { verb: 'GET', path: '/api/external-agents' },
   api_displays: { verb: 'GET', path: '/api/displays' },
+  api_access_overview: { verb: 'GET', path: '/api/access/overview' },
+  api_access_iam_state: { verb: 'GET', path: '/api/access/iam/state' },
+  api_access_enrollment_requests: { verb: 'GET', path: '/api/access/enrollment-requests' },
+  api_access_enrollment_decide: { verb: 'POST', path: '/api/access/enrollment-requests/decide' },
+  api_access_iam_upsert_user_client_grant: { verb: 'POST', path: '/api/access/iam/user-client-grants' },
+  api_access_iam_update_grant: { verb: 'POST', path: '/api/access/iam/grants/update' },
+  api_access_connect_status: { verb: 'GET', path: '/api/access/connect/status' },
+  api_access_connect_claim_code: { verb: 'GET', path: '/api/access/connect/claim-code' },
+  api_access_connect_config: { verb: 'POST', path: '/api/access/connect/config' },
+  api_access_connect_unclaim: { verb: 'POST', path: '/api/access/connect/unclaim' },
+  api_access_set_tier: { verb: 'POST', path: '/api/access/tier' },
+  api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
+  api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
+  api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
+  api_access_org_trust: { verb: 'POST', path: '/api/access/orgs/trust' },
+  api_access_org_revoke: { verb: 'POST', path: '/api/access/orgs/revoke' },
+  api_access_org_issue: { verb: 'POST', path: '/api/access/org-grants/issue' },
+  api_access_org_revoke_member: { verb: 'POST', path: '/api/access/org-grants/revoke-member' },
+  api_access_org_issuer_init: { verb: 'POST', path: '/api/access/org-grants/issuers/init' },
+  api_access_org_issuer_delegate: { verb: 'POST', path: '/api/access/org-grants/issuers/delegate' },
+  api_access_org_issuer_install: { verb: 'POST', path: '/api/access/org-grants/issuers/install' },
+  api_access_org_present: { verb: 'POST', path: '/api/access/org-grants' },
+  api_access_org_renew: { verb: 'POST', path: '/api/access/org-grants/renew' },
+  api_access_org_orl: { verb: 'GET', path: '/api/access/orgs/{org_handle}/revocations', alias: { org_handle: 'handle' } },
+  api_access_org_orl_apply: { verb: 'POST', path: '/api/access/orgs/revocations/apply' },
+  api_peers: { verb: 'GET', path: '/api/peers' },
+  api_peer_add: { verb: 'POST', path: '/api/peers' },
+  api_peer_remove: { verb: 'DELETE', path: '/api/peers' },
+  api_peer_eligible: { verb: 'GET', path: '/api/peers/eligible', queryRepeat: { capability: 'capabilities' } },
+  api_peer_message: { verb: 'POST', path: '/api/peers/{peer_id}/message' },
+  api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
+  api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
+  api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
+  api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
+  api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },
+  api_peer_pairing_invite: { verb: 'POST', path: '/api/peers/pairing/invite' },
+  api_peer_pairing_join: { verb: 'POST', path: '/api/peers/pairing/join' },
+  api_peer_pairing_request_access: { verb: 'POST', path: '/api/peers/pairing/request-access' },
+  api_peer_pairing_request_access_poll: { verb: 'POST', path: '/api/peers/pairing/request-access/poll' },
+  api_peer_pairing_requests: { verb: 'GET', path: '/api/peers/pairing/requests' },
+  api_peer_pairing_request_decision: { verb: 'POST', path: '/api/peers/pairing/requests/{code}/{decision}', alias: { code: 'request_id', decision: 'op' } },
+  api_peer_pairing_identities: { verb: 'GET', path: '/api/peers/pairing/identities' },
+  api_peer_pairing_identity_revoke: { verb: 'POST', path: '/api/peers/pairing/identities/revoke' },
+  // The coordinator twin carries the program's one live per-lane IAM
+  // divergence, preserved on purpose: the HTTP row classifies through the
+  // federation ladder as Task, while the datachannel method has always
+  // gated on PeerManage (documented op-override on the route row). The
+  // descriptor only names the twin's verb + path — it must not paper over
+  // that divergence, and the daemon-side parity pin asserts the override.
+  api_coordinator_route: { verb: 'POST', path: '/api/coordinator/route' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -282,6 +378,52 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
   if (tunnelError && !policy.replayAfterAttempt) throw tunnelError;
 }
 
+// ── HTTP row-presence probes (F1c, design §4) ─────────────────────────────
+// Most descriptor rows shipped with (or before) the facade, so map
+// presence == daemon presence. The transfer-jobs rows (task #6) landed
+// after deployed daemons existed, so their entries are `probe`-gated:
+// ONE GET probe per page load answers "does this daemon serve the rows?"
+// — 404/405 ⇒ old daemon (absent ⇒ legacy behavior + honest
+// availability); any delivered response, auth walls included, proves the
+// rows exist (the real request surfaces its own denial). A transport
+// failure leaves the state 'unknown' so a later ensure() re-probes; the
+// cached verdict feeds daemonApiAvailability below.
+const DAEMON_API_HTTP_PROBES = {
+  transfers: { path: '/api/transfers', state: 'unknown', promise: null },
+};
+
+function daemonApiHttpProbeState(name) {
+  return DAEMON_API_HTTP_PROBES[name]?.state || 'unknown';
+}
+
+// Resolve (and cache) a probe: Promise<boolean> — "the rows are present".
+// Callers that need a lane DECISION await this; sync availability reads
+// the cached state. Never called in connect mode (no HTTP lane there) —
+// the transfers pump gates on dashboardConnectModeEnabled() first.
+async function daemonApiEnsureHttpProbe(name) {
+  const probe = DAEMON_API_HTTP_PROBES[name];
+  if (!probe) return false;
+  if (probe.state !== 'unknown') return probe.state === 'present';
+  if (!probe.promise) {
+    probe.promise = (async () => {
+      try {
+        const resp = await authedFetch(probe.path, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: dashboardComposeFetchSignal(null, 15000),
+        });
+        probe.state = resp.status === 404 || resp.status === 405 ? 'absent' : 'present';
+      } catch (_) {
+        probe.state = 'unknown';
+      } finally {
+        probe.promise = null;
+      }
+      return probe.state === 'present';
+    })();
+  }
+  return probe.promise;
+}
+
 // ── HTTP adapter ──────────────────────────────────────────────────────────
 // Builds verb/path/query/body from the descriptor. `{name}` path segments
 // lift (and consume) params[name] — or params[alias[name]] when the entry
@@ -320,6 +462,19 @@ function daemonApiHttpTarget(spec, method, params) {
     }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
+  // queryRepeat twins: the tunnel method takes an array param; the HTTP
+  // twin takes one repeated `key=value` pair per element (the eligible
+  // endpoint's `?capability=` vocabulary — its server parser rejects
+  // comma-joins, so these keys never ride the `query` lift).
+  for (const [key, paramKey] of Object.entries(spec.queryRepeat || {})) {
+    const value = source[paramKey];
+    used.add(paramKey);
+    if (!Array.isArray(value)) continue;
+    for (const element of value) {
+      if (element === undefined || element === null || String(element) === '') continue;
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(element))}`);
+    }
+  }
   // rawQuery twins: the tunnel method takes one pre-encoded query-string
   // param (the managed-context handlers rebuild a request line from it);
   // the HTTP twin takes that same string as the URL query verbatim.
@@ -346,8 +501,11 @@ async function daemonApiHttpRequest(method, params, opts) {
   if (opts && opts.cache) init.cache = opts.cache;
   // Body-less POST twins stay body-less (api_worktrees_scan rides a
   // BodyPolicy::None row, and every legacy empty-payload POST call site
-  // sent no body/Content-Type either).
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // sent no body/Content-Type either). DELETE twins carry their leftover
+  // params the same way: api_peer_remove's HTTP shape has always been a
+  // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
+  // consume their params into the path and stay body-less).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -503,6 +661,81 @@ async function daemonApiHttpStream(method, params, opts, onEvent) {
   return null;
 }
 
+// ── Remote-http adapter (transport F4) ────────────────────────────────────
+// Cross-daemon fleet calls: the anchor page applies access changes to
+// OTHER daemons by direct cross-origin HTTP — the fleet-CORS rows, with
+// the browser's own identity to that origin (mTLS certificate) as the
+// authentication. This daemon's `authedFetch` bearer stays out of the
+// lane on purpose: nothing minted here carries authority there
+// (trust-architecture: authority is only ever minted by the target
+// daemon's local IAM). Naming the target names the transport — no tunnel
+// is ever attempted, no fallback is ever taken, and a delivered error is
+// final (design §5's F4 caveat: explicit remote-http, never fallback
+// ambiguity). JSON lane only: every fleet-CORS twin is a JSON verb, so
+// the bytes/upload/stream verbs refuse remote-http targets loudly.
+
+// The normalized origin for a `{remoteHttp: origin}` target: '' when the
+// target is not remote-http-shaped (null and string peer ids pass
+// through to the tunnel adapters); a throw when the shape is right but
+// the origin is not a usable absolute http(s) origin — a mis-built
+// target must fail loudly, never drift into another lane.
+function daemonApiRemoteHttpOrigin(target) {
+  if (!target || typeof target !== 'object') return '';
+  const raw = String(target.remoteHttp || '').trim();
+  let origin = '';
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'https:' || url.protocol === 'http:') origin = url.origin;
+    } catch { /* rejected below */ }
+  }
+  if (!origin) {
+    throw new TypeError(
+      `daemonApi: object targets must carry an absolute http(s) remoteHttp origin (got ${raw || 'nothing'})`
+    );
+  }
+  return origin;
+}
+
+// Fleet links cross networks the local per-method defaults (5 s for the
+// access family) were never sized for — floor the composed timeout at
+// the peer-dial default unless the caller sets one. Still never
+// signal-less (§3.6).
+function daemonApiRemoteHttpSignal(method, opts) {
+  const timeout = Number(opts && opts.timeoutMs);
+  const ms = Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : Math.max(daemonApiTimeoutMs(method, opts), 30000);
+  return dashboardComposeFetchSignal(opts && opts.signal, ms);
+}
+
+async function daemonApiRemoteHttpRequest(origin, method, params, opts) {
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (!spec) {
+    throw new DaemonApiError(
+      'unavailable', method, origin,
+      `${method} has no HTTP twin (remote-http targets are direct-HTTP only)`
+    );
+  }
+  const { url, rest } = daemonApiHttpTarget(spec, method, params);
+  const init = { method: spec.verb, mode: 'cors', signal: daemonApiRemoteHttpSignal(method, opts) };
+  // Same body rule as the local adapter: mutation verbs carry leftover
+  // params as the JSON body (no fleet-CORS DELETE twin exists today, but
+  // the adapters must agree on the descriptor's semantics).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(rest);
+  }
+  let resp;
+  try {
+    resp = await fetch(`${origin}${url}`, init);
+  } catch (err) {
+    throw daemonApiHttpError(err, method, origin);
+  }
+  const body = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, body: body ?? {} };
+}
+
 // ── Tunnel adapters ───────────────────────────────────────────────────────
 // Local and peer speak the same DashboardControlTransport protocol; the
 // peer adapter resolves (or dials) the per-host connection first. A peer
@@ -548,6 +781,8 @@ async function daemonApiTunnelBytes(transport, method, params, opts, target) {
 
 // ── The four verbs ────────────────────────────────────────────────────────
 async function daemonApiRequest(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) return daemonApiRemoteHttpRequest(remoteOrigin, method, params, opts);
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -574,6 +809,13 @@ async function daemonApiRequest(method, params = {}, opts = {}) {
 }
 
 async function daemonApiBytes(method, params = {}, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS byte twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -597,6 +839,13 @@ async function daemonApiBytes(method, params = {}, opts = {}) {
 }
 
 async function daemonApiUpload(method, params = {}, source, opts = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS upload twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -625,6 +874,13 @@ async function daemonApiUpload(method, params = {}, source, opts = {}) {
 }
 
 async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(opts.target);
+  if (remoteOrigin) {
+    throw new DaemonApiError(
+      'unavailable', method, remoteOrigin,
+      `${method}: remote-http targets serve JSON request() calls only (no fleet-CORS stream twins exist)`
+    );
+  }
   const target = opts.target || null;
   if (target) {
     const conn = await daemonApiPeerTransport(target, method);
@@ -658,7 +914,8 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
 // `<method>_available` booleans (server-derived from its method table —
 // false rolls denial and runtime-not-ready into one honest "no");
 // connect-mode policy; HTTP-map presence (a direct dashboard with no
-// tunnel still reports twinned methods as reachable). The scattered
+// tunnel still reports twinned methods as reachable), qualified by the
+// row-presence probes for `probe`-gated entries. The scattered
 // canUse*/`*Available` probes become one-line derivations over this at
 // their family flips.
 function daemonApiTunnelMethodAvailability(transport, method) {
@@ -693,6 +950,15 @@ function daemonApiTunnelMethodAvailability(transport, method) {
 }
 
 function daemonApiAvailability(method, target = null) {
+  const remoteOrigin = daemonApiRemoteHttpOrigin(target);
+  if (remoteOrigin) {
+    // A REMOTE origin's reachability is unknowable without a request;
+    // the honest answer is lane presence — the descriptor names the
+    // methods fleet daemons serve over direct HTTP.
+    return DAEMON_API_HTTP_MAP[method]
+      ? { ok: true, reason: 'http-only' }
+      : { ok: false, reason: 'never' };
+  }
   if (target) {
     const conn = peerDashboardControlConnectionsByHost.get(String(target));
     if (conn && conn.canUseRpc()) return daemonApiTunnelMethodAvailability(conn, method);
@@ -705,7 +971,18 @@ function daemonApiAvailability(method, target = null) {
   const transport = dashboardControlTransport;
   if (transport && transport.canUseRpc()) return daemonApiTunnelMethodAvailability(transport, method);
   if (dashboardConnectModeEnabled()) return { ok: false, reason: 'transport-down' };
-  if (DAEMON_API_HTTP_MAP[method]) return { ok: true, reason: 'http-only' };
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (spec) {
+    // Probe-gated twins (the transfer-jobs rows): a probed-absent daemon
+    // answers the honest 'unsupported', exactly like a tunnel daemon too
+    // old for the method. Un-probed stays optimistic — the same posture
+    // as a tunnel whose hello_ack has not landed (the request itself
+    // reports the truth), and lane DECISIONS await the probe first.
+    if (spec.probe && daemonApiHttpProbeState(spec.probe) === 'absent') {
+      return { ok: false, reason: 'unsupported' };
+    }
+    return { ok: true, reason: 'http-only' };
+  }
   return { ok: false, reason: 'transport-down' };
 }
 
@@ -735,6 +1012,8 @@ const daemonApi = Object.freeze({
   stream: daemonApiStream,
   availability: daemonApiAvailability,
   fallbackPolicy: daemonApiFallbackPolicy,
+  ensureHttpProbe: daemonApiEnsureHttpProbe,
+  httpProbeState: daemonApiHttpProbeState,
   httpMap: DAEMON_API_HTTP_MAP,
   descriptorChecksum: daemonApiDescriptorChecksum,
   Error: DaemonApiError,
@@ -769,6 +1048,7 @@ window.qa = Object.assign(window.qa || {}, {
         http: {
           connectMode: Boolean(dashboardConnectModeEnabled()),
           reachable: !dashboardConnectModeEnabled(),
+          transfersProbe: daemonApiHttpProbeState('transfers'),
         },
       },
       availability: {
@@ -777,6 +1057,13 @@ window.qa = Object.assign(window.qa || {}, {
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
         api_sessions: daemonApiAvailability('api_sessions'),
         api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
+        // Probe-gated transfers sample (F1c): 'http-only' flips to
+        // 'unsupported' once the rows probe answers absent.
+        api_transfer_job_create: daemonApiAvailability('api_transfer_job_create'),
+        // Tunnel-only custody sample (F6): 'denied' vs 'unsupported' vs
+        // 'transport-down' is directly observable here — no HTTP twin
+        // ever answers for it.
+        api_credential_lease_status: daemonApiAvailability('api_credential_lease_status'),
       },
       descriptor: {
         methods: Object.keys(DAEMON_API_HTTP_MAP).length,

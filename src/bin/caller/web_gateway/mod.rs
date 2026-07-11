@@ -34,8 +34,14 @@ pub(crate) use api_core::*;
 mod session_catalog;
 pub(crate) use session_catalog::*;
 
+mod media_store;
+pub(crate) use media_store::*;
+
 mod routes_files;
 pub(crate) use routes_files::*;
+
+mod routes_transfers;
+pub(crate) use routes_transfers::*;
 
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
@@ -311,10 +317,16 @@ fn ensure_idle(
 }
 
 
-pub(crate) async fn displays_response_body(
+/// Transport-neutral core of the displays body, given an
+/// already-enumerated display set: the OS enumeration resolves at the
+/// production edge (`displays_api_response`), so tests inject a fixture
+/// set — a real enumeration is machine state (tests-are-hermetic
+/// convention), and on a session-less CI account macOS's
+/// SCShareableContent call never completes at all.
+pub(crate) async fn displays_response_body_from(
+    displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> String {
-    let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
     // This route serves the owner's dashboards (the display picker), so
     // each entry is annotated with its live capture state via the
     // unfiltered registry view: `capture_active` plus `agent_visible`
@@ -2958,7 +2970,15 @@ mod tests {
             resp.contains("200 OK"),
             "agent card should serve unauthenticated, got: {resp}"
         );
-        assert!(!resp.contains("401"));
+        // Status line only: the card body embeds ws:// advertise URLs with
+        // the kernel-assigned test port, so scanning the whole response for
+        // "401" flaked whenever the port happened to contain it (seen live
+        // with port 40169 in a merge-group run).
+        let status_line = resp.lines().next().unwrap_or("");
+        assert!(
+            !status_line.contains("401"),
+            "agent card must not challenge for auth, got: {status_line}"
+        );
         handle.abort();
     }
 

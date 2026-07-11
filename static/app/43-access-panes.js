@@ -811,8 +811,11 @@ function renderAccessTierCard() {
   if (!mount) return;
   const iam = accessIamModel(accessOverviewModel());
   const tier = accessModelLabel(iam.tier);
-  const canSetTier = dashboardControlTransport?.lastStatus?.api_access_set_tier_available !== false;
-  const canSetCeiling = dashboardControlTransport?.lastStatus?.api_access_set_hosted_ceiling_available !== false;
+  // daemonApi availability (transport F4): tunnel status boolean when
+  // connected, HTTP-twin reachability otherwise — honest in Connect
+  // mode, where a down tunnel means no lane at all.
+  const canSetTier = daemonApi.availability('api_access_set_tier').ok;
+  const canSetCeiling = daemonApi.availability('api_access_set_hosted_ceiling').ok;
 
   mount.textContent = '';
   const head = document.createElement('div');
@@ -971,9 +974,10 @@ function renderAccessConnectCard() {
       || !status.claim_code_available;
     if (stale) accessConnectRevealed = null;
   }
-  const canConfig = dashboardControlTransport?.lastStatus?.api_access_connect_config_available !== false;
-  const canReveal = dashboardControlTransport?.lastStatus?.api_access_connect_claim_code_available !== false;
-  const canUnclaim = dashboardControlTransport?.lastStatus?.api_access_connect_unclaim_available !== false;
+  // daemonApi availability (transport F4) — see renderAccessTierCard.
+  const canConfig = daemonApi.availability('api_access_connect_config').ok;
+  const canReveal = daemonApi.availability('api_access_connect_claim_code').ok;
+  const canUnclaim = daemonApi.availability('api_access_connect_unclaim').ok;
 
   const head = document.createElement('div');
   head.className = 'acc-section-head';
@@ -1099,7 +1103,7 @@ function renderAccessConnectCard() {
       chip.title = fleetCert.last_error || 'The last certificate request failed.';
     }
     if (chip.textContent) row.appendChild(chip);
-    const canRequest = dashboardControlTransport?.lastStatus?.api_fleet_cert_request_available !== false;
+    const canRequest = daemonApi.availability('api_fleet_cert_request').ok;
     if (fleetCert.state !== 'requesting' && fleetCert.state !== 'valid') {
       const request = document.createElement('button');
       request.type = 'button';
@@ -1239,7 +1243,7 @@ function renderAccessEnrollmentRequests() {
   if (!mount) return;
   mount.innerHTML = '';
   if (!accessPendingEnrollments.length) return;
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_enrollment_decide_available !== false;
+  const canManage = daemonApi.availability('api_access_enrollment_decide').ok;
 
   const head = document.createElement('div');
   head.className = 'acc-section-head';
@@ -1349,7 +1353,7 @@ function renderAccessPeopleGrants() {
     mount.appendChild(empty);
     return;
   }
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+  const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
   for (const principal of principals) {
     const card = document.createElement('div');
     card.className = 'acc-principal-card';
@@ -1524,15 +1528,17 @@ function renderAccessRoleCatalog() {
 }
 
 /* Advanced: trusted organizations + issuance. */
-async function accessOrgCall(method, path, payload) {
-  const resp = await dashboardJsonFetch(method, payload, () => authedFetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }), method, { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+// daemonApi (transport F4): every org call is a POST twin — the fallback
+// policy derives no-replay from the verb, exactly the legacy
+// fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt is
+// never replayed over HTTP; with no tunnel the write goes direct; Connect
+// mode never uses HTTP). The descriptor owns each method's path — the old
+// per-call-site path argument died with the tri-form. IAM-mutating
+// writes: payload shapes unchanged, zero retries.
+async function accessOrgCall(method, payload) {
+  const resp = await daemonApi.request(method, payload ?? {});
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 function renderAccessOrganizations() {
@@ -1542,7 +1548,7 @@ function renderAccessOrganizations() {
   const iam = accessIamModel(accessOverviewModel());
   const trusted = Array.isArray(iam.trusted_orgs) ? iam.trusted_orgs : [];
   const issuers = Array.isArray(iam.org_issuers) ? iam.org_issuers : [];
-  const canManage = dashboardControlTransport?.lastStatus?.api_access_org_trust_available !== false;
+  const canManage = daemonApi.availability('api_access_org_trust').ok;
 
   const list = document.createElement('div');
   list.className = 'acc-principal-list';
@@ -1585,7 +1591,7 @@ function renderAccessOrganizations() {
         });
         if (!ok) return;
         try {
-          await accessOrgCall('api_access_org_revoke', '/api/access/orgs/revoke', { handle: org.handle });
+          await accessOrgCall('api_access_org_revoke', { handle: org.handle });
           showControlToast?.('success', `Org @${org.handle} revoked`);
         } catch (err) {
           showControlToast?.('error', err?.message || 'Org revoke failed');
@@ -1691,7 +1697,7 @@ function renderAccessOrganizations() {
       return;
     }
     try {
-      await accessOrgCall('api_access_org_trust', '/api/access/orgs/trust', {
+      await accessOrgCall('api_access_org_trust', {
         handle,
         root_key: rootKey,
         max_role: document.getElementById('access-org-trust-cap')?.value || 'role:operator',
@@ -1836,7 +1842,7 @@ function renderAccessOrganizations() {
       try {
         const issueKind = document.getElementById('access-org-issue-kind')?.value || 'client_key';
         const issueFp = document.getElementById('access-org-issue-fingerprint')?.value?.trim();
-        const data = await accessOrgCall('api_access_org_issue', '/api/access/org-grants/issue', {
+        const data = await accessOrgCall('api_access_org_issue', {
           handle: document.getElementById('access-org-issue-handle')?.value,
           client_key_fingerprint: issueKind === 'peer' ? '' : issueFp,
           peer_fingerprint: issueKind === 'peer' ? issueFp : '',
@@ -1935,7 +1941,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_revoke_member', '/api/access/org-grants/revoke-member', {
+        const data = await accessOrgCall('api_access_org_revoke_member', {
           handle: document.getElementById('access-org-orl-handle')?.value,
           ...(grantId ? { grant_id: grantId } : {}),
           ...(subject ? { subject } : {}),
@@ -2011,7 +2017,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_renew', '/api/access/org-grants/renew', doc);
+        const data = await accessOrgCall('api_access_org_renew', doc);
         renewOutput.value = JSON.stringify(data.document, null, 2);
         showControlToast?.('success', 'Document renewed — send it back to the member');
       } catch (err) {
@@ -2082,7 +2088,7 @@ function renderAccessOrganizations() {
     delegateBtn.disabled = !canManage;
     delegateBtn.addEventListener('click', async () => {
       try {
-        const data = await accessOrgCall('api_access_org_issuer_delegate', '/api/access/org-grants/issuers/delegate', {
+        const data = await accessOrgCall('api_access_org_issuer_delegate', {
           handle: document.getElementById('access-org-orl-handle')?.value || document.getElementById('access-org-issue-handle')?.value,
           issuer_key: document.getElementById('access-org-delegate-key')?.value?.trim(),
           label: document.getElementById('access-org-delegate-label')?.value?.trim(),
@@ -2157,7 +2163,7 @@ function renderAccessOrganizations() {
     initBtn.textContent = 'Create / show issuer key';
     initBtn.addEventListener('click', async () => {
       try {
-        const data = await accessOrgCall('api_access_org_issuer_init', '/api/access/org-grants/issuers/init', {
+        const data = await accessOrgCall('api_access_org_issuer_init', {
           handle: handleInput.value?.trim(),
         });
         keyOut.value = data.issuer_key || '';
@@ -2177,7 +2183,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        await accessOrgCall('api_access_org_issuer_install', '/api/access/org-grants/issuers/install', {
+        await accessOrgCall('api_access_org_issuer_install', {
           handle: handleInput.value?.trim(),
           certificate: cert,
         });
@@ -2230,7 +2236,7 @@ function renderAccessOrganizations() {
         return;
       }
       try {
-        const data = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', orl);
+        const data = await accessOrgCall('api_access_org_orl_apply', orl);
         const applied = data.applied || {};
         showControlToast?.(
           'success',
@@ -2251,18 +2257,15 @@ function renderAccessOrganizations() {
 }
 
 /* Fetch an org's current signed revocation list from the daemon holding
-   its root key (RPC in tunnel mode, plain GET otherwise). */
+   its root key. daemonApi (transport F4): GET twin — tunnel first, then
+   the direct-HTTP retry the verb-derived policy allows (the legacy site
+   opted out, but a public idempotent read replays safely; the policy is
+   data, not per-site judgment). The descriptor lifts `handle` into the
+   row's {org_handle} capture. */
 async function accessOrgFetchOrl(handle) {
-  const resp = await dashboardJsonFetch(
-    'api_access_org_orl',
-    { handle },
-    () => authedFetch(`/api/access/orgs/${encodeURIComponent(handle || '')}/revocations`),
-    'api_access_org_orl',
-    { fallbackAfterRpcFailure: false }
-  );
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-  return data;
+  const resp = await daemonApi.request('api_access_org_orl', { handle });
+  if (!resp.ok) throw new Error(resp.body?.error || `request failed (${resp.status})`);
+  return resp.body;
 }
 
 /* Advanced: local IAM state card with raw links. */

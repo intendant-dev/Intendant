@@ -1,0 +1,138 @@
+name: WASM drift
+
+# The committed WASM artifacts (static/wasm-web, static/wasm-station) are
+# build outputs of crates/{presence-web,station-web}: an agent that edits
+# the crates (or their shared dep presence-core) without rebuilding ships
+# a dashboard whose Rust changed but whose WASM didn't — silent drift no
+# suite can see (build.rs's staleness check is mtime-based, which a fresh
+# CI checkout defeats). This gate rebuilds both crates with the PINNED
+# wasm-pack + the PINNED toolchain and fails on any byte difference
+# against the committed artifacts.
+#
+# Required-track triggers (unfiltered — a paths-filtered required check
+# blocks queue entry); the in-job relevance skip keeps per-PR cost at
+# ~zero unless wasm inputs actually changed.
+#
+# The rebuild runs on the MAC fleet leg deliberately: wasm output is NOT
+# byte-deterministic across host triples (proven live 2026-07-11 — a
+# comment-only probe's Linux rebuild differed from the macOS-built
+# committed artifacts down to the .d.ts glue). All wasm authorship and
+# build.rs's auto-rebuilds happen on aarch64-darwin, so that is the
+# canonical artifact host, and the gate must rebuild on the same triple
+# to verify bytes. A contributor regenerating artifacts on another OS
+# will red this gate — rebuild them on macOS (or let a Mac dev box's
+# cargo build do it via build.rs).
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm-drift:
+    name: wasm-drift (${{ matrix.os }})
+    # Trust-based routing — same rule as windows.yml: trusted refs on the
+    # self-hosted fleet, fork PRs on GitHub-hosted runners.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    timeout-minutes: 30
+    # Serialize the rebuild repo-wide: both Mac listeners share the
+    # account's ~/Library/Caches/.wasm-pack, and two cold jobs
+    # cargo-installing wasm-bindgen concurrently race the final rename
+    # ("Directory not empty", seen live 2026-07-11 when a probe PR and
+    # another PR's gate ran side by side). Warm caches don't race, but
+    # every wasm-bindgen/wasm-opt version bump re-opens the cold window
+    # — queue the jobs instead (they are minutes; skips are seconds).
+    concurrency:
+      group: wasm-drift-rebuild
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            runner: [self-hosted, intendant-macos]
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # The default persisted token grants every later step push access;
+        # nothing here pushes.
+        with:
+          persist-credentials: false
+
+      # Only wasm inputs can drift the artifacts; everything else
+      # green-skips. Cargo.lock is in the list because dependency bumps
+      # (wasm-bindgen above all) change the emitted bytes.
+      - name: Detect wasm-relevant changes
+        id: relevance
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+          fi
+          git fetch --quiet --depth=1 origin "$base"
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock)
+                relevant=true; break ;;
+            esac
+          done < <(git diff --name-only "$base" HEAD)
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "wasm-relevant change detected: $relevant"
+
+      # Same external per-listener cache scheme as the other fleet jobs —
+      # the wasm target artifacts key alongside the native ones.
+      - name: External cargo target dir
+        if: runner.environment != 'github-hosted' && steps.relevance.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          key=$(rustc -V | tr ' ()' '_')
+          dir="$HOME/.cache/intendant-ci/target/${RUNNER_NAME:-listener}-${key}"
+          mkdir -p "$dir"
+          touch "$dir/.last-used"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+          echo "cargo target dir: $dir"
+
+      # The pinned wasm-pack, installed on first use per runner account
+      # (~/.cargo/bin persists on the fleet; hosted runners pay the
+      # install only when a fork PR actually touches wasm inputs).
+      - name: Install pinned wasm-pack (if missing)
+        if: steps.relevance.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          want=$(cat .wasm-pack-version)
+          have=$(wasm-pack --version 2>/dev/null | awk '{print $2}' || true)
+          if [ "$have" != "$want" ]; then
+            cargo install wasm-pack --version "$want" --locked
+          fi
+          wasm-pack --version
+
+      - name: Rebuild WASM artifacts
+        if: steps.relevance.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          (cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web)
+          (cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web)
+
+      - name: Committed artifacts must match the rebuild
+        if: steps.relevance.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          if ! git diff --exit-code -- static/wasm-web static/wasm-station; then
+            echo "::error::WASM artifacts drift from their crates — rebuild with the pinned wasm-pack (a normal cargo build does it via build.rs on a dev box, or use the manual commands in CLAUDE.md) and commit the result."
+            exit 1
+          fi
+          untracked=$(git status --porcelain -- static/wasm-web static/wasm-station | grep '^??' || true)
+          if [ -n "$untracked" ]; then
+            echo "::error::the rebuild produced files the tree does not track:"
+            echo "$untracked"
+            exit 1
+          fi

@@ -3319,28 +3319,51 @@ pub(crate) async fn handle_mc_fission(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_sessions_stream(mut stream: DemuxStream, request_line: &str) {
-    let request_line_for_stream = request_line.to_string();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-    let stream_task = tokio::task::spawn_blocking(move || {
-        stream_sessions_from_request(&request_line_for_stream, tx);
+/// Transport-neutral core of the session-list stream
+/// (`GET /api/sessions/stream`, tunnel twin `api_sessions_stream`, S10):
+/// spawn the ONE line source — quick skeleton, hydrating marker,
+/// replace, done — onto the blocking pool and hand its handle to the
+/// caller's transport writer under the historical NDJSON head (the
+/// wildcard-CORS tail is response decoration on the OwnOrigin row,
+/// exactly like `/api/sessions`).
+pub(crate) fn sessions_stream_api_response(requested_limit: Option<usize>) -> ApiResponse {
+    let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
+    let source = tokio::task::spawn_blocking(move || {
+        stream_sessions_lines(requested_limit, tx);
     });
-    let response = HttpResponse::new("200 OK")
-        .header("Content-Type", "application/x-ndjson")
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    use tokio::io::AsyncWriteExt;
-    if stream.write_all(response.as_bytes()).await.is_ok() {
-        while let Some(line) = rx.recv().await {
-            if stream.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-        }
+    sessions_stream_api_response_from(LineStream { lines, source })
+}
+
+/// The stream envelope over an already-running line source — the
+/// hermetic seam ([`sessions_stream_api_response`] is the ambient-home
+/// production entry; fixtures inject their own source).
+pub(crate) fn sessions_stream_api_response_from(stream: LineStream) -> ApiResponse {
+    ApiResponse::Stream {
+        status: 200,
+        content_type: "application/x-ndjson".to_string(),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        stream,
     }
-    let _ = stream_task.await;
-    finalize_http_stream(&mut stream).await;
+}
+
+pub(crate) async fn handle_sessions_stream(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let requested_limit = session_list_limit_from_request(request_line);
+    write_api_response(
+        stream,
+        sessions_stream_api_response(requested_limit),
+        cors,
+        fleet_origin,
+    )
+    .await;
 }
 
 /// Transport-neutral core of `GET /api/sessions/search` (tunnel twin
@@ -3517,11 +3540,25 @@ pub(crate) async fn handle_worktrees_list(
 
 /// GET /api/displays + the tunnel's `api_displays`: the OS display
 /// enumeration annotated with live capture state, under the
-/// wildcard-CORS tail (transport-unification design §2.1, S5).
+/// wildcard-CORS tail (transport-unification design §2.1, S5). The
+/// enumeration resolves HERE at the production edge; the `_from` core
+/// below takes the set as a parameter so tests inject a fixture
+/// instead of touching machine display state.
 pub(crate) async fn displays_api_response(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> ApiResponse {
-    session_wildcard_json_response(200, displays_response_body(session_registry).await)
+    let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
+    displays_api_response_from(displays, session_registry).await
+}
+
+pub(crate) async fn displays_api_response_from(
+    displays: Vec<crate::display::DisplayInfo>,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) -> ApiResponse {
+    session_wildcard_json_response(
+        200,
+        crate::web_gateway::displays_response_body_from(displays, session_registry).await,
+    )
 }
 
 pub(crate) async fn handle_displays(
@@ -6255,13 +6292,30 @@ mod tests {
     // Second S5 slice (info/displays/diagnostics), same discipline as
     // the sets above: captured before the transport-neutral conversion.
 
+    fn golden_fixture_displays() -> Vec<crate::display::DisplayInfo> {
+        vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }]
+    }
+
     #[tokio::test]
     async fn golden_displays_transcript() {
-        // The display list is an OS enumeration (machine-dependent
-        // body), so it is computed through the untouched builder with
-        // no session registry and spliced — the wildcard-CORS 200
-        // framing is the byte-exact pin.
-        let body = displays_response_body(&None).await;
+        // Injected display set (a fixture must never enumerate the
+        // machine's real displays: the body is machine-dependent, and
+        // on a session-less CI account the macOS enumeration never
+        // completes) — the wildcard-CORS 200 framing around the same
+        // `_from` core the production edge delegates to is the
+        // byte-exact pin.
+        let displays = golden_fixture_displays();
+        let body = displays_response_body_from(displays.clone(), &None).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(parsed["displays"].is_array(), "displays array: {body}");
         assert!(
@@ -6272,9 +6326,16 @@ mod tests {
             .expect("displays route declared")
             .0
             .cors;
-        let response =
-            collect_session_handler_response(|stream| handle_displays(stream, None, cors, None))
-                .await;
+        let response = collect_session_handler_response(|stream| async move {
+            write_api_response(
+                stream,
+                displays_api_response_from(displays, &None).await,
+                cors,
+                None,
+            )
+            .await
+        })
+        .await;
         assert_eq!(
             golden_transcript(&response),
             golden_session_wildcard_json_transcript("200 OK", &body)

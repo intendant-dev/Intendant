@@ -851,34 +851,32 @@ class DashboardTransport {
     );
   }
 
+  // The two peer signal relays (transport F5). Signaling is a
+  // delivered-once mutation: the facade derives no-replay from the POST
+  // verb (§3.7 — never replayed over HTTP after a tunnel attempt that MAY
+  // have reached the daemon, the exact legacy fallbackAfterRpcFailure:false
+  // semantics; Connect mode never uses HTTP), while a dashboard with no
+  // tunnel at all still signals over direct HTTP — that pre-attempt lane
+  // is how peer tunnels bootstrap on direct/mTLS dashboards. Both return
+  // the facade envelope {ok, status, body}.
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_file_transfer_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   peerDashboardControlSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_dashboard_control_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -1424,19 +1422,22 @@ window.intendantDashboardControl = {
     return { skipped: false, threw, error, wsReplayCount };
   },
   async _debugProbePeerMutationConnectNoHttp() {
+    // Probes the path the UI actually takes (transport F5): peer add rides
+    // daemonApi.request, whose POST-derived mutation policy must throw the
+    // tunnel failure — never re-POST over HTTP, and never any HTTP in
+    // Connect mode. The synthetic rejection is injected at the protocol
+    // client, the same seam the facade's local tunnel adapter calls.
     if (
       !dashboardConnectModeEnabled() ||
-      !dashboardTransport ||
       !dashboardControlTransport ||
-      typeof dashboardTransport.jsonFetch !== 'function' ||
+      typeof daemonApi?.request !== 'function' ||
       typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         connectMode: dashboardConnectModeEnabled(),
-        hasDashboardTransport: Boolean(dashboardTransport),
+        hasDaemonApi: typeof daemonApi?.request === 'function',
         hasControlTransport: Boolean(dashboardControlTransport),
-        jsonFetchType: typeof dashboardTransport?.jsonFetch,
         requestType: typeof dashboardControlTransport?.request,
         threw: false,
         rpcAttempts: 0,
@@ -1464,14 +1465,10 @@ window.intendantDashboardControl = {
     let threw = false;
     let error = '';
     try {
-      await dashboardTransport.jsonFetch('api_peer_add', {
+      await daemonApi.request('api_peer_add', {
         url: 'https://127.0.0.1:9/.well-known/agent-card.json',
         persist: false,
-      }, () => authedFetch('/api/peers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      }), 'api_peer_add', { fallbackAfterRpcFailure: false });
+      });
     } catch (err) {
       threw = true;
       error = err?.message || String(err);
