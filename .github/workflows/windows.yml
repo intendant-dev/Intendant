@@ -359,6 +359,22 @@ jobs:
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
 
+      # ── Quality gates (Linux leg; baselines zeroed 2026-07-11) ──────
+      # fmt is platform-independent, so one leg suffices and it is a
+      # hard gate. clippy is cfg-sensitive: the zero baseline was cut on
+      # macOS, so the Linux-only cfg surface is unproven — the step
+      # reports warnings without failing until its first runs prove the
+      # Linux delta is zero, then it flips to -D warnings (tracked in
+      # the CI hardening program). Both ride the required Linux context;
+      # no ruleset change.
+      - name: cargo fmt --check
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (report-only until the Linux delta is proven zero)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo clippy --workspace --locked --target ${{ matrix.target }} || true
+
       # ── Linux gate tail: keyless smokes + dashboard-boot ──────────────
       # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
       # rationale preserved in its git history): the live-fire subset of
