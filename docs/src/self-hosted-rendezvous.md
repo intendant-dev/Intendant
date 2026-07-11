@@ -311,11 +311,11 @@ they would the hosted one.
 Every name binding the service hands out is committed to an append-only
 RFC 6962-shaped Merkle log: which public key a computer had when it was
 claimed, handle creations, org revocation-list publications, verified
-badges, handle reclamations — and the served-artifact manifests
-described below. The signed tree head is public (`/api/log/sth`, ES256
-key auto-generated into the state file) along with entries, inclusion
-proofs, and consistency proofs
-(`/api/log/{entries,proof,consistency,find,artifact-manifest}`).
+badges, handle reclamations — and the served-artifact and release
+manifests described below. The signed tree head is public
+(`/api/log/sth`, ES256 key auto-generated into the state file) along
+with entries, inclusion proofs, and consistency proofs
+(`/api/log/{entries,proof,consistency,find,artifact-manifest,release-manifest}`).
 Browsers pin the tree head and verify consistency on every visit
 (Advanced → Transparency log), so rewriting history is detectable, not
 merely forbidden.
@@ -394,6 +394,53 @@ comparing clean against the logged hashes ties the served bytes to
 reviewable source. The embedded pages are deterministic functions of
 the public origin, reproducible by running `intendant-connect` locally
 with the same `--origin` and hashing what it serves.
+
+### Release transparency
+
+The same log commits **what the project releases**, closing the update
+channel's side of the story ([Trust Tiers](./trust-tiers.md)): after
+publishing to GitHub Releases, the tag-triggered release pipeline
+(`.github/workflows/release.yml`) hashes every uploaded artifact and
+submits a `release_manifest` entry — `tag`, `version`, `platforms`, and
+a name-sorted `artifacts` list of `{name, sha256, size}` (lowercase-hex
+hashes, comparable to `sha256sum` output), plus `manifest_hash`: sha256
+over the canonical byte string `intendant-release-manifest-v1\n{tag}\n`
+then `{name}\t{sha256}\t{size}\n` per artifact. Submission is
+`POST /api/log/release-manifest`, gated by a dedicated bearer token
+(`--release-token` / `INTENDANT_CONNECT_RELEASE_TOKEN`; the pipeline
+holds it as the `CONNECT_RELEASE_TOKEN` repository secret). The token
+is deliberately not the operator `daemon_token`: the CI credential can
+only ever append release manifests. With no token configured the
+endpoint answers 503; identical re-submissions dedupe; a *changed*
+manifest for an existing tag appends a new entry — republished
+artifacts become public history, never silent replacement. Reads stay
+public: `GET /api/log/release-manifest[?tag=<tag>]` returns the latest
+entry (for a tag) with its index, inclusion proof, and signed tree
+head, coherently.
+
+```bash
+intendant hosted-verify --releases              # the latest logged release
+intendant hosted-verify --releases v0.3.0       # this tag MUST be logged
+intendant hosted-verify --releases v0.3.0 --download
+```
+
+The default mode verifies the log legs exactly like the bundle check
+(tree-head signature, inclusion proof, consistency against the same
+per-host pin), then compares the logged artifact list against the
+GitHub release's asset *metadata* — names, sizes, and the sha256
+digests the API reports — without downloading multi-hundred-MB
+artifacts; assets on the release that the log never blessed are flagged
+too. `--download` upgrades to fetching every artifact and hashing it
+against the log — the strongest check. With an explicit tag, a release
+absent from the log is a failure (exit 1): an unlogged release is
+exactly what the check exists to catch. (`--repo <owner/name>` points
+self-hosted forks at their own repository, and the optional
+`CONNECT_RELEASE_URL` repository *variable* points their pipeline at
+their own rendezvous.) The macOS app's update check (launch and "Check
+for Updates…") also asks the log about the release it is offering and
+appends a "publicly committed / NOT committed / couldn't check"
+advisory line — fail-open like the bundle tripwire: a log outage never
+blocks updating, and the error is surfaced instead of swallowed.
 
 Dormant-handle reclamation is stated policy: an account with zero
 claimed daemons and no sign-in for the configured window loses its

@@ -1025,6 +1025,7 @@ mod tests {
             static_root: PathBuf::from("static"),
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
+            release_token: None,
             invite_required: false,
             open_daemon_registration: false,
             cookie_secure: true,

@@ -65,7 +65,9 @@ impl DaemonIdentity {
     }
 }
 
-#[cfg(test)]
+/// Verify an Ed25519 signature by a daemon identity key. Promoted from
+/// test-only when the doorbell caller-ID started verifying requesting
+/// daemons' signatures at runtime.
 pub fn verify_b64u(public_key_b64u: &str, payload: &[u8], signature_b64u: &str) -> bool {
     let Ok(public_key) = b64u_decode(public_key_b64u) else {
         return false;
@@ -82,7 +84,6 @@ pub fn b64u(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-#[cfg(test)]
 fn b64u_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
 }
