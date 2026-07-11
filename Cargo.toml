@@ -7,6 +7,7 @@ members = [
     "crates/intendant-platform",
     "crates/presence-core",
     "crates/presence-web",
+    "crates/rustc-governor",
     "crates/station-web",
 ]
 

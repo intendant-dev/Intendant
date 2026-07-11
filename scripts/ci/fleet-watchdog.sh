@@ -16,6 +16,9 @@
 #
 # It only ever deletes inside the configured cache roots. It never
 # touches checkouts, project worktrees, or anything it did not create.
+# Cache maintenance is idle-only: an assigned runner job owns its target
+# directory until Runner.Worker exits, even when the host is below the normal
+# disk stop floor.
 #
 # Config: /etc/intendant-ci/watchdog.conf (see watchdog.conf.example).
 set -u
@@ -127,6 +130,12 @@ prune_stale_keys() {
             [ -d "$key" ] || continue
             marker="$key.last-used"
             if [ ! -f "$marker" ] || [ -n "$(find "$marker" -mtime +"$PRUNE_DAYS" 2>/dev/null)" ]; then
+                # A job may have been assigned after main's idle check. Never
+                # race that job by deleting a cache key underneath rustc.
+                if job_running; then
+                    log "job began during cache pruning — deferring maintenance"
+                    return
+                fi
                 log "pruning stale cache key $key"
                 rm -rf "$key"
             fi
@@ -148,6 +157,12 @@ evict_until() {
             [ "$over_cap" = 0 ] && [ "$need_free" = 0 ] && break
             oldest=$(ls -1td "$root"/*/ 2>/dev/null | tail -1)
             [ -z "$oldest" ] && break
+            # Recheck immediately before deletion: an idle listener can accept
+            # a job while the watchdog is measuring a large cache root.
+            if job_running; then
+                log "job began during cache eviction — deferring maintenance"
+                return
+            fi
             log "evicting cache key $oldest (root ${used_gb}G, cap ${CAP_GB}G, free $(free_gb)G)"
             rm -rf "$oldest"
         done
@@ -165,6 +180,22 @@ main() {
         free=$(free_gb)
     fi
 
+    # An ordinary low-disk event pauses assignment but never destroys a live
+    # build. HARD_STOP_GB remains the explicit exception: stop the listeners
+    # first, then reclaim once Runner.Worker has exited. The deletion helpers
+    # recheck job_running in case shutdown is not instantaneous.
+    if job_running; then
+        if [ "$free" -lt "$HARD_STOP_GB" ]; then
+            log "free ${free}G below hard floor ${HARD_STOP_GB}G — pausing listeners (even mid-job)"
+            stop_listeners
+        else
+            if [ "$free" -lt "$STOP_GB" ]; then
+                log "free ${free}G below ${STOP_GB}G but a job is running — deferring pause and cache maintenance"
+            fi
+            return
+        fi
+    fi
+
     prune_stale_keys
     evict_until 0  # steady-state cap enforcement
 
@@ -174,7 +205,9 @@ main() {
             log "free ${free}G below hard floor ${HARD_STOP_GB}G — pausing listeners (even mid-job)"
             stop_listeners
         elif job_running; then
-            log "free ${free}G below ${STOP_GB}G but a job is running — deferring pause to next tick"
+            # A job may have arrived during steady-state cache maintenance.
+            log "free ${free}G below ${STOP_GB}G but a job is running — deferring pause and cache maintenance"
+            return
         else
             log "free ${free}G below ${STOP_GB}G — pausing listeners"
             stop_listeners

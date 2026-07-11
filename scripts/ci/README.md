@@ -30,7 +30,10 @@ merge-queue entries (seven macOS validations died at 18G free on
   `.last-used` marker. The watchdog prunes keys unused for
   `PRUNE_DAYS` (7) and evicts oldest-first over `CAP_GB` per root —
   and, under disk pressure, until free space clears the resume
-  ceiling. It deletes **only** inside the configured cache roots.
+  ceiling. Cache maintenance defers while any runner job is active and
+  rechecks immediately before each deletion, so rustc never loses its
+  target directory mid-build. It deletes **only** inside the configured
+  cache roots.
 
 ### Install
 
@@ -86,6 +89,103 @@ once, the jobs cap bounds what each validation can demand.
 Future watchdog enhancement (not yet implemented): gate listener
 resume on `memory_pressure` in addition to disk, so a swap storm
 pauses assignment the way a full disk does.
+
+The jobs cap is per-*process*; bounding what all cargo processes on the
+box can demand **together** is the governor's job — next section.
+
+## Governor: machine-wide rustc concurrency (`rustc-governor`)
+
+The jobs cap cannot stop several concurrent cargo processes (two CI
+listeners plus interactive agents) from each spawning their capped six:
+concurrent cold builds still oversubscribe RAM, and the link storm →
+swap → `kernel_task` throttle spiral follows. `crates/rustc-governor`
+adds the missing machine-wide bound: a compile-permit pool shared by
+every account on the box.
+
+### The chain
+
+```
+cargo ──[build] rustc=governor──▶ sccache client ──▶ sccache server
+                                        │  cache hit: reply from cache —
+                                        │  the "compiler" never executes
+                                        ▼  miss / non-cacheable
+                                  rustc-governor
+                                        │  acquire flock(2) permit
+                                        ▼
+                                  exec(2) real rustc   (permit rides the
+                                                        fd until exit)
+```
+
+`[build] rustc` points at the governor while `rustc-wrapper` stays
+sccache, so sccache treats the governor as *the compiler*:
+
+- **Hits never wait** — sccache answers cache hits without executing
+  the compiler at all, so warm builds feel no governor.
+- **Probes never wait** — `-vV` / `--version` / pure `--print` queries
+  (cargo fires them at every startup, sccache when identifying the
+  compiler) bypass the pool via the probe fast path. A real compile
+  that merely *carries* `--print` (e.g. `--print native-static-libs`
+  with `--emit link`) is still governed.
+- Everything else acquires one machine-wide permit, then `exec(2)`s
+  the real rustc: exit status and signal disposition are inherited by
+  construction, and the permit's flock rides the FD_CLOEXEC-cleared fd
+  until that rustc exits — any exit, including SIGKILL, releases it in
+  the kernel (crash release is structural, nothing to clean up).
+
+### Permits and the demand gate
+
+`permit_dir` holds one flock file per permit, split into per-class
+reservations — `permit-local-<i>` for interactive accounts,
+`permit-ci-<i>` for the accounts in `ci_users` — plus one demand file
+per class (`demand-local` / `demand-ci`). Holding LOCK_EX on a permit
+file IS the permit. Waiters hold LOCK_SH on their own class's demand
+file for the whole wait and poll every eligible permit at 100ms
+(never a blocking flock — it has no timeout and would bypass the gate).
+Borrowing: before touching a foreign-class permit, probe that class's
+demand file with LOCK_EX|LOCK_NB — success (released immediately)
+means no waiters, so idle capacity is never wasted; failure means the
+class has waiters and its reservation is honored. Nothing is ever
+killed or signalled; borrowed permits return naturally when their
+holder exits.
+
+### Fail-open doctrine + live kill switch
+
+A governor must never break a build. Missing or unparseable config,
+`enabled = false`, `INTENDANT_GOVERNOR=off` in the env, an unusable
+permit dir, zero configured permits — every degraded state means "run
+ungoverned", never "block". The config is re-read by every invocation
+(and once per poll tick by in-flight waiters), so
+`/usr/local/etc/intendant-governor.toml` is live: flipping
+`enabled = false` drains the governor within ~100ms, no listener
+restarts. Observability: one line per *governed* invocation in
+`<permit_dir>/governor.log` (timestamp, pid, class, permit, wait_ms;
+truncate-in-place rotation at 1MB keeping the last 256K — the hooks-log
+doctrine, because governed accounts can write the pre-created file but
+not create siblings in the root-owned dir).
+
+### Sizing, install, rollout
+
+Per box: `local_reserved + ci_reserved` = the machine-wide ceiling of
+concurrent rustc processes; the per-account jobs cap still bounds any
+single cargo underneath it. The 24GB two-listener Mac runs 1 + 2.
+Don't set a class to 0 unless it truly never compiles — its members
+would then depend entirely on borrowing.
+
+```bash
+cargo build --release -p rustc-governor
+sudo scripts/ci/install-governor-macos.sh   # binary + permit dir + conf
+```
+
+The installer never edits account cargo configs; it prints the
+`[build] rustc = ".../rustc-governor"` line to add per account.
+**Canary order: the CI account first, soak a day of green runs, then
+the operator account.** Known accepted cost: sccache hashes the
+compiler binary — the governor — into its cache keys, so enablement
+and every governor upgrade invalidate that account's sccache cache
+once (one cold rebuild, warm again after). Resizing the reservations
+upward needs the installer re-run (or a root `touch` + `chmod 0644`)
+to mint the new permit files; permit files the governor cannot open
+are simply not part of the pool, and if none are usable it fails open.
 
 ## macOS CI service account (`_intendant-ci`)
 
@@ -292,3 +392,14 @@ before-images land in `/etc/intendant-ci/migration/` for audit.
   `RUNNER_DAEMON_LABELS`, multi-account `RUNNER_USER`). Change the
   conf schema, change `migrate-runner-macos.sh` /
   `rollback-runner-macos.sh` in the same commit.
+- The governor's permit/demand file names and permissions are minted
+  by `install-governor-macos.sh` but consumed by
+  `crates/rustc-governor/src/permits.rs` (non-root accounts cannot
+  create files in the root-owned permit dir). Change the naming or the
+  file ACLs in one, change both.
+- The governor's config keys (`enabled`, `permit_dir`,
+  `local_reserved`, `ci_reserved`, `ci_users`, `real_rustc`) are
+  written by the installer's here-doc and parsed by
+  `crates/rustc-governor/src/config.rs` — a minimal TOML-subset
+  reader, so keep the conf flat `key = value` (unknown keys are
+  ignored; malformed lines make the whole file fail open).
