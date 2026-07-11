@@ -19,6 +19,14 @@ use super::*;
 use crate::global_store::StoreScope;
 use crate::transfer_store::{TransferJob, TransferKind, TransferStoreError};
 
+/// Per-request body cap for `POST /api/transfers/{id}/chunk` (design
+/// §4): bounds what one chunk may spool to memory/disk. Deliberately
+/// far under the staged-attachment cap — resumability makes small
+/// chunks cheap, and N capped chunks + commit is exactly how an
+/// over-100-MiB upload rides direct HTTP (task #6). Pinned (with the
+/// row's `Streaming` policy) by the gateway body-cap test.
+pub(crate) const TRANSFER_HTTP_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 /// The job-handle aliases every transfer method accepts, `id` first
 /// (the tunnel's historical precedence). A resume token works anywhere
 /// an id does — `transfer_store::find_job` resolves either.
@@ -134,18 +142,18 @@ pub(crate) fn classify_transfer_create(
 
 /// The upload-create params, decoded with the tunnel's historical
 /// lenient alias reads.
-fn upload_create_params(
-    params: &serde_json::Value,
-) -> Result<
-    (
-        String,
-        String,
-        String,
-        Option<u64>,
-        crate::transfer_store::TransferConflictPolicy,
-    ),
-    TransferStoreError,
-> {
+struct UploadCreateParams {
+    destination: String,
+    original_name: String,
+    mime: String,
+    total_size: Option<u64>,
+    /// Declared content hash, verified at commit (design §4; the store
+    /// normalizes/validates it).
+    sha256: Option<String>,
+    conflict_policy: crate::transfer_store::TransferConflictPolicy,
+}
+
+fn upload_create_params(params: &serde_json::Value) -> Result<UploadCreateParams, TransferStoreError> {
     let destination = string_param(
         params,
         &["destination", "destination_path", "destinationPath", "path"],
@@ -178,6 +186,7 @@ fn upload_create_params(
         ],
     )
     .map_err(|error| TransferStoreError::new(400, error))?;
+    let sha256 = optional_string_param(params, &["sha256"]);
     let conflict = optional_string_param(
         params,
         &[
@@ -194,7 +203,14 @@ fn upload_create_params(
             .ok_or_else(|| {
                 TransferStoreError::new(400, "conflict policy must be fail, rename, or overwrite")
             })?;
-    Ok((destination, original_name, mime, total_size, conflict_policy))
+    Ok(UploadCreateParams {
+        destination,
+        original_name,
+        mime,
+        total_size,
+        sha256,
+        conflict_policy,
+    })
 }
 
 /// The path a path-based create targets — the download source (its
@@ -202,9 +218,6 @@ fn upload_create_params(
 /// the caller's lane gate scope-checks at create; the job-addressed
 /// methods (chunk/commit/delete/download) act on that already-scoped
 /// destination and carry no path of their own.
-// Consumed by the S9b HTTP rows' create gate (this allow leaves with
-// them).
-#[allow(dead_code)]
 pub(crate) fn transfer_create_target_path(
     params: &serde_json::Value,
     kind: TransferKind,
@@ -241,19 +254,19 @@ pub(crate) async fn transfer_path_create_api_response(
             .await
         }
         TransferKind::Upload => {
-            let (destination, original_name, mime, total_size, conflict_policy) =
-                match upload_create_params(&params) {
-                    Ok(decoded) => decoded,
-                    Err(error) => return transfer_store_error_api_response(error),
-                };
+            let decoded = match upload_create_params(&params) {
+                Ok(decoded) => decoded,
+                Err(error) => return transfer_store_error_api_response(error),
+            };
             tokio::task::spawn_blocking(move || {
                 crate::transfer_store::create_upload_job(
                     &scope,
-                    &destination,
-                    &original_name,
-                    &mime,
-                    total_size,
-                    conflict_policy,
+                    &decoded.destination,
+                    &decoded.original_name,
+                    &decoded.mime,
+                    decoded.total_size,
+                    decoded.sha256,
+                    decoded.conflict_policy,
                 )
             })
             .await
@@ -271,9 +284,6 @@ pub(crate) async fn transfer_path_create_api_response(
 /// reads live session handles the HTTP edge deliberately lacks). Path
 /// authorization is the caller's lane gate, on
 /// [`transfer_create_target_path`].
-// Consumed by the S9b `POST /api/transfers` row (pinned by the parity
-// fixtures meanwhile; this allow leaves with the row).
-#[allow(dead_code)]
 pub(crate) async fn transfer_job_create_http_api_response(
     scope: StoreScope,
     params: serde_json::Value,
@@ -517,6 +527,312 @@ async fn resolve_transfer_range_header(
     }
 }
 
+// ── The HTTP lane: thin adapters over the cores above (S9b, the §4
+//    rows). Transport edges only — query/body/Range parsing, the
+//    transfer-family authorization mirror, store-scope resolution —
+//    every response body comes from the shared fns. ──
+
+/// The transfer family's fs gate, mirroring the tunnel's
+/// `authorize_dashboard_control_filesystem` exactly:
+///
+/// - **create** names a target path (`Some`) — scope-checked (+
+///   audited) through [`authorize_http_filesystem_access`], write-kind
+///   for both job kinds, exactly as the tunnel derives kind from the
+///   method's operation;
+/// - the **job-addressed** methods carry no path (`None`): a
+///   scope-restricted caller — a peer identity or an fs-scoped grant —
+///   is denied fail-closed with the tunnel's wording (its destination
+///   was scoped at create, but a scoped principal must never reach
+///   job-addressed reads/writes it could not have created), while
+///   unrestricted principals pass on the row's operation alone.
+fn authorize_http_transfer_access(
+    access: &HttpAccessContext,
+    identity: Option<&PeerConnectionIdentity>,
+    op: crate::peer::access_policy::PeerOperation,
+    target_path: Option<&str>,
+    bus: &EventBus,
+) -> Result<(), String> {
+    if let Some(path) = target_path {
+        return authorize_http_filesystem_access(
+            access,
+            identity,
+            op,
+            crate::peer::access_policy::FilesystemAccessKind::Write,
+            path,
+            bus,
+        );
+    }
+    let denied = "filesystem request missing path".to_string();
+    if let Some(identity) = identity {
+        audit_peer_filesystem_access(bus, identity, op, "", false, &denied);
+        return Err(denied);
+    }
+    let scoped = access
+        .iam_state
+        .as_ref()
+        .and_then(|state| crate::access::iam::fs_scope_for_principal(state, &access.principal))
+        .is_some();
+    if scoped {
+        bus.send(AppEvent::PresenceLog {
+            message: format!(
+                "[grant-fs] denied principal={} op={:?} path= detail={}",
+                access.principal.label, op, denied
+            ),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return Err(denied);
+    }
+    Ok(())
+}
+
+/// Transport edge: where transfer jobs persist for this daemon — the
+/// project store when rooted, the daemon-global fallback otherwise
+/// (`transfer_store_scope`'s HTTP twin; the cores take the result
+/// injected).
+fn http_transfer_scope(project_root: Option<&std::path::Path>) -> StoreScope {
+    StoreScope::resolve(project_root)
+}
+
+/// `GET /api/transfers` — list jobs (`?id=`/`?resume_token=` filter).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_transfer_jobs(
+    stream: DemuxStream,
+    request_line: &str,
+    project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let mut params = serde_json::Map::new();
+    for key in ["id", "resume_token"] {
+        if let Some(value) = query_param(request_line, key) {
+            params.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    let params = serde_json::Value::Object(params);
+    let response = match authorize_http_transfer_access(
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        crate::peer::access_policy::PeerOperation::FilesystemRead,
+        None,
+        &bus,
+    ) {
+        Ok(()) => {
+            transfer_jobs_api_response(http_transfer_scope(project_root.as_deref()), &params).await
+        }
+        Err(message) => transfer_error_api_response(403, message),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// `POST /api/transfers` — create a job from the JSON body (the
+/// tunnel's params shape verbatim). The target path is scope-checked
+/// here, at create, for both kinds; artifact-shaped creates are
+/// tunnel-only (divergence #24).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_transfer_job_create(
+    stream: DemuxStream,
+    body_text: String,
+    project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(params) if params.is_object() => {
+            // The scope gate sees the path the create will actually
+            // target (kind-aware aliases); a kind that fails to parse
+            // falls through pathless — fail-closed for scoped callers,
+            // the shared 400 for everyone else.
+            let target = classify_transfer_create(&params)
+                .ok()
+                .and_then(|request| match request {
+                    TransferCreateRequest::Path(kind) => {
+                        transfer_create_target_path(&params, kind)
+                    }
+                    TransferCreateRequest::Artifact(_) => None,
+                });
+            match authorize_http_transfer_access(
+                &http_access_context,
+                peer_connection_identity.as_ref(),
+                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                target.as_deref(),
+                &bus,
+            ) {
+                Ok(()) => {
+                    transfer_job_create_http_api_response(
+                        http_transfer_scope(project_root.as_deref()),
+                        params,
+                    )
+                    .await
+                }
+                Err(message) => transfer_error_api_response(403, message),
+            }
+        }
+        Ok(_) => transfer_error_api_response(400, "request body must be a JSON object"),
+        Err(e) => transfer_error_api_response(400, format!("invalid JSON: {e}")),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// `POST /api/transfers/{id}/chunk?offset=N[&resume_token=…]` — spool
+/// the raw body (S8's `SpooledBody` lane, capped at
+/// [`TRANSFER_HTTP_CHUNK_MAX_BYTES`]) and append it through the shared
+/// core. Chunk auth needs only the row's operation — the destination
+/// was path-scoped at create (the tunnel's upload-frame model).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_transfer_upload_chunk(
+    mut stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    discard: Vec<u8>,
+    job_id: String,
+    project_root: Option<std::path::PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_string(), serde_json::Value::String(job_id));
+    for key in ["offset", "resume_token"] {
+        if let Some(value) = query_param(request_line, key) {
+            params.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    let params = serde_json::Value::Object(params);
+    if header_text
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
+    {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+    }
+    let response = match stream_body_to_tempfile(
+        header_text,
+        &discard,
+        &mut stream,
+        TRANSFER_HTTP_CHUNK_MAX_BYTES,
+    )
+    .await
+    {
+        Err(e) => {
+            let status = if e.contains("too large") { 413 } else { 400 };
+            transfer_error_api_response(status, e)
+        }
+        Ok(body) => {
+            transfer_upload_chunk_api_response(
+                http_transfer_scope(project_root.as_deref()),
+                &params,
+                body,
+            )
+            .await
+        }
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// `POST /api/transfers/{id}/commit` — verify and place the finished
+/// upload. An optional JSON body may carry extra params; the path
+/// capture is the job handle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_transfer_upload_commit(
+    stream: DemuxStream,
+    body_text: String,
+    job_id: String,
+    project_root: Option<std::path::PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let params = if body_text.trim().is_empty() {
+        Ok(serde_json::Map::new())
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(serde_json::Value::Object(map)) => Ok(map),
+            Ok(_) => Err("request body must be a JSON object".to_string()),
+            Err(e) => Err(format!("invalid JSON: {e}")),
+        }
+    };
+    let response = match params {
+        Ok(mut params) => {
+            params.insert("id".to_string(), serde_json::Value::String(job_id));
+            transfer_upload_commit_api_response(
+                http_transfer_scope(project_root.as_deref()),
+                &serde_json::Value::Object(params),
+            )
+            .await
+        }
+        Err(message) => transfer_error_api_response(400, message),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// `DELETE /api/transfers/{id}` (+ the WKWebView POST
+/// `/api/transfers/{id}/delete` fallback — both shapes capture the same
+/// id and share this handler).
+pub(crate) async fn handle_transfer_job_delete(
+    stream: DemuxStream,
+    job_id: String,
+    project_root: Option<std::path::PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = transfer_job_delete_api_response(
+        http_transfer_scope(project_root.as_deref()),
+        &serde_json::json!({ "id": job_id }),
+    )
+    .await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// `GET /api/transfers/{id}/download` — ranged read: an HTTP `Range`
+/// header takes precedence (it is the protocol's range mechanism);
+/// otherwise `?offset=&length=`; otherwise the full (capped) extent.
+pub(crate) async fn handle_transfer_download_read(
+    stream: DemuxStream,
+    header_text: &str,
+    request_line: &str,
+    job_id: String,
+    project_root: Option<std::path::PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let params = serde_json::json!({ "id": job_id });
+    let range = if let Some(header) = dashboard_http_header_value(header_text, "range") {
+        Ok(ByteRange::HttpHeader(header.to_string()))
+    } else {
+        let query = serde_json::json!({
+            "offset": query_param(request_line, "offset"),
+            "length": query_param(request_line, "length"),
+        });
+        match (
+            optional_u64_param(&query, &["offset"]),
+            optional_u64_param(&query, &["length"]),
+        ) {
+            (Ok(offset), Ok(length)) => Ok(ByteRange::OffsetLength {
+                offset: offset.unwrap_or(0),
+                length,
+            }),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    };
+    let response = match range {
+        Ok(range) => {
+            transfer_download_read_api_response(
+                http_transfer_scope(project_root.as_deref()),
+                &params,
+                range,
+            )
+            .await
+        }
+        Err(message) => transfer_error_api_response(400, message),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +1014,270 @@ mod tests {
                 .await,
         );
         assert_eq!(again["deleted"], false);
+    }
+
+    /// The HTTP lane's transfer-family gate mirrors the tunnel's
+    /// `authorize_dashboard_control_filesystem` exactly: unrestricted
+    /// principals pass on the row's operation; scope-restricted callers
+    /// (fs-scoped grants, peer identities) are scope-checked on the
+    /// create target and denied fail-closed on the pathless
+    /// job-addressed rows with the tunnel's wording.
+    #[test]
+    fn transfer_authorization_mirrors_the_tunnel_fail_closed_rule() {
+        use crate::peer::access_policy::PeerOperation;
+        let bus = crate::event::EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let in_scope = dir.path().join("shared");
+        std::fs::create_dir_all(&in_scope).unwrap();
+
+        // Unrestricted (root-session) context: pathless rows and any
+        // create target pass on the operation alone.
+        let root = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "unit-test", "https",
+            ),
+            iam_state: None,
+        };
+        assert!(authorize_http_transfer_access(
+            &root,
+            None,
+            PeerOperation::FilesystemRead,
+            None,
+            &bus
+        )
+        .is_ok());
+        assert!(authorize_http_transfer_access(
+            &root,
+            None,
+            PeerOperation::FilesystemWrite,
+            Some(&in_scope.join("up.bin").to_string_lossy()),
+            &bus
+        )
+        .is_ok());
+
+        // An fs-scoped user-client grant: in-scope create passes,
+        // out-of-scope create is refused, and the pathless rows are
+        // denied fail-closed exactly as the tunnel denies them.
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("admin", "https");
+        let result = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:11".to_string()),
+                role_id: Some("role:operator".to_string()),
+                fs_write_roots: vec![in_scope.to_string_lossy().to_string()],
+                fs_read_roots: vec![in_scope.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let scoped = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal {
+                grant_id: Some(result.grant.id.clone()),
+                ..crate::access::iam::AccessPrincipal::root_dashboard_session("scoped", "https")
+            },
+            iam_state: Some(state),
+        };
+        assert!(authorize_http_transfer_access(
+            &scoped,
+            None,
+            PeerOperation::FilesystemWrite,
+            Some(&in_scope.join("up.bin").to_string_lossy()),
+            &bus
+        )
+        .is_ok());
+        assert!(authorize_http_transfer_access(
+            &scoped,
+            None,
+            PeerOperation::FilesystemWrite,
+            Some("/etc/shadow-copy"),
+            &bus
+        )
+        .is_err());
+        for op in [
+            PeerOperation::FilesystemRead,
+            PeerOperation::FilesystemWrite,
+        ] {
+            assert_eq!(
+                authorize_http_transfer_access(&scoped, None, op, None, &bus).unwrap_err(),
+                "filesystem request missing path",
+                "{op:?}"
+            );
+        }
+
+        // A peer identity is scope-restricted by construction: pathless
+        // rows are denied even under a permissive-looking policy.
+        let peer = PeerConnectionIdentity {
+            fingerprint: "aabbccdd".to_string(),
+            label: "peer".to_string(),
+            profile: "file-operator".to_string(),
+            filesystem: Default::default(),
+        };
+        assert_eq!(
+            authorize_http_transfer_access(
+                &root,
+                Some(&peer),
+                PeerOperation::FilesystemRead,
+                None,
+                &bus
+            )
+            .unwrap_err(),
+            "filesystem request missing path"
+        );
+    }
+
+    /// Raw HTTP transcripts for the rows' distinctive wire shapes
+    /// (design §8 goldens: status lines, header order, bodies): the
+    /// download row's 200/206/416 forms and the commit row's
+    /// sha-mismatch 409, rendered through the one HTTP adapter the
+    /// dispatch arms use.
+    #[tokio::test]
+    async fn golden_http_transcripts_pin_download_and_commit_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dest_dir = dir.path().join("dest");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let scope = project_scope(&project);
+        let source = dir.path().join("payload.txt");
+        std::fs::write(&source, b"hello transfer").unwrap();
+        let job =
+            crate::transfer_store::create_download_job(&scope, source.to_str().unwrap()).unwrap();
+        let params = serde_json::json!({ "id": job.id });
+        let transcript = |response: ApiResponse| {
+            String::from_utf8(crate::web_gateway::api_response_http_bytes(
+                response,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            ))
+            .unwrap()
+        };
+
+        // Full read: exact head (status line + header order) and body.
+        let full = transcript(
+            transfer_download_read_api_response(
+                scope.clone(),
+                &params,
+                ByteRange::OffsetLength {
+                    offset: 0,
+                    length: None,
+                },
+            )
+            .await,
+        );
+        let sha = fs_sha256_hex(b"hello transfer");
+        let expected_full = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 14\r\n\
+             Accept-Ranges: bytes\r\n\
+             X-Transfer-Range-Start: 0\r\n\
+             X-Transfer-Range-End: 14\r\n\
+             X-Transfer-Total-Size: 14\r\n\
+             X-Transfer-Resumable: true\r\n\
+             X-Content-Sha256: {sha}\r\n\
+             Content-Disposition: attachment; filename=\"payload.txt\"\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             \r\n\
+             hello transfer"
+        );
+        assert_eq!(full, expected_full);
+
+        // Partial read: 206 with Content-Range before the resume echoes.
+        let partial = transcript(
+            transfer_download_read_api_response(
+                scope.clone(),
+                &params,
+                ByteRange::HttpHeader("bytes=6-13".to_string()),
+            )
+            .await,
+        );
+        let expected_partial = "HTTP/1.1 206 Partial Content\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 8\r\n\
+             Accept-Ranges: bytes\r\n\
+             Content-Range: bytes 6-13/14\r\n\
+             X-Transfer-Range-Start: 6\r\n\
+             X-Transfer-Range-End: 14\r\n\
+             X-Transfer-Total-Size: 14\r\n\
+             X-Transfer-Resumable: true\r\n\
+             Content-Disposition: attachment; filename=\"payload.txt\"\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             \r\n\
+             transfer";
+        assert_eq!(partial, expected_partial);
+
+        // Unsatisfiable header: 416 with the probing Content-Range tail.
+        let unsatisfiable = transcript(
+            transfer_download_read_api_response(
+                scope.clone(),
+                &params,
+                ByteRange::HttpHeader("bytes=99-".to_string()),
+            )
+            .await,
+        );
+        let expected_416 = "HTTP/1.1 416 Range Not Satisfiable\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 51\r\n\
+             Content-Range: bytes */14\r\n\
+             Accept-Ranges: bytes\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {\"error\":\"range is not satisfiable\",\"ok\":false}";
+        // serde_json object key order is alphabetical for json! literals
+        // built in one shot; compute the length from the actual body to
+        // keep the pin honest.
+        let body = expected_416.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            unsatisfiable,
+            expected_416.replace(
+                "Content-Length: 51",
+                &format!("Content-Length: {}", body.len())
+            )
+        );
+
+        // Commit sha mismatch: the 409 wire shape end to end.
+        let upload = crate::transfer_store::create_upload_job(
+            &scope,
+            dest_dir.join("sum.bin").to_str().unwrap(),
+            "sum.bin",
+            "application/octet-stream",
+            Some(4),
+            Some("0".repeat(64)),
+            crate::transfer_store::TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let chunked = transfer_upload_chunk_api_response(
+            scope.clone(),
+            &serde_json::json!({ "id": upload.id, "offset": 0 }),
+            spooled(b"data"),
+        )
+        .await;
+        let (status, body) = json_body(&chunked);
+        assert_eq!(status, 200, "{body}");
+        let mismatch = transcript(
+            transfer_upload_commit_api_response(
+                scope.clone(),
+                &serde_json::json!({ "id": upload.id }),
+            )
+            .await,
+        );
+        assert_eq!(
+            mismatch,
+            "HTTP/1.1 409 Conflict\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 45\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {\"error\":\"upload sha256 mismatch\",\"ok\":false}"
+        );
     }
 
     #[tokio::test]

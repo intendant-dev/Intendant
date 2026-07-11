@@ -1989,6 +1989,13 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/fs/write` | FilesystemWrite | own origin | ≤ 150 MiB | Write file bytes (scope-checked; sha256-guarded overwrite) |
 | POST | `/api/fs/rename` | FilesystemWrite | own origin | bounded | Move/rename a file or directory (scope-checked) |
 | POST | `/api/fs/delete` | FilesystemWrite | own origin | bounded | Delete a file or directory (scope-checked) |
+| GET | `/api/transfers` | FilesystemRead | own origin | none | List transfer jobs, newest first (`?id=` filters by job id or resume token) |
+| POST | `/api/transfers` | FilesystemWrite | own origin | bounded | Create a transfer job (kind download|upload, path/destination, name, total_size, sha256, conflict; fs-scope-checked on the target path) |
+| POST | `/api/transfers/{id}/chunk` | FilesystemWrite | own origin | streaming | Append one raw-body chunk to an upload job (`?offset=`; ≤ 32 MiB per chunk) |
+| POST | `/api/transfers/{id}/commit` | FilesystemWrite | own origin | bounded | Verify (size + declared sha256) and atomically rename a finished upload into place |
+| DELETE | `/api/transfers/{id}` | FilesystemWrite | own origin | none | Delete a transfer job (cancels partials; removes managed artifacts) |
+| POST | `/api/transfers/{id}/delete` | FilesystemWrite | own origin | none | Delete a transfer job (WKWebView POST fallback) |
+| GET | `/api/transfers/{id}/download` | FilesystemRead | own origin | none | Read download-job bytes (`?offset=&length=` or `Range` → 206; resume metadata echoed as X-Transfer-* headers, X-Content-Sha256 on full reads) |
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
