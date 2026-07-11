@@ -54,6 +54,66 @@ impl ApiRequest {
     }
 }
 
+// ── The lenient alias-param readers (moved verbatim from
+//    dashboard_control, which re-exports them): the tunnel's historical
+//    params vocabulary, now shared by every neutral fn that parses the
+//    canonical params shape. ──
+
+pub(crate) fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
+    for name in names {
+        if let Some(value) = params.get(*name) {
+            if let Some(text) = value.as_str() {
+                return text.trim().to_string();
+            }
+            if !value.is_null() {
+                return value.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+pub(crate) fn optional_string_param(
+    params: &serde_json::Value,
+    names: &[&str],
+) -> Option<String> {
+    let value = string_param(params, names);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub(crate) fn optional_u64_param(
+    params: &serde_json::Value,
+    names: &[&str],
+) -> Result<Option<u64>, String> {
+    for name in names {
+        let Some(value) = params.get(*name) else {
+            continue;
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        if let Some(number) = value.as_u64() {
+            return Ok(Some(number));
+        }
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            return text
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| format!("invalid {name}"));
+        }
+        return Err(format!("invalid {name}"));
+    }
+    Ok(None)
+}
+
 /// A byte-range request as it arrived on its transport. Satisfiability
 /// (and the exact 416 wording) is resolved against the target's size
 /// inside the handler, exactly where today's code resolves it. The two

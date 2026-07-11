@@ -40,6 +40,9 @@ pub(crate) use media_store::*;
 mod routes_files;
 pub(crate) use routes_files::*;
 
+mod routes_transfers;
+pub(crate) use routes_transfers::*;
+
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
 

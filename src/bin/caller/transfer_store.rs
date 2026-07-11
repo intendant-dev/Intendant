@@ -723,14 +723,15 @@ pub fn commit_upload_job(
     Ok(job)
 }
 
-pub fn read_download_range(
+/// Resolve a download job's source: the job, its source path, and the
+/// on-disk size — the shared preamble of [`read_download_range`] and the
+/// HTTP lane's `Range`-header normalization (which must know the total
+/// before an end-inclusive header can become an offset/length read).
+pub fn download_source(
     scope: &StoreScope,
     id_or_token: &str,
-    offset: u64,
-    length: Option<u64>,
-    max_bytes: u64,
-) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
-    let mut job = required_job(scope, id_or_token)?;
+) -> Result<(TransferJob, PathBuf, u64), TransferStoreError> {
+    let job = required_job(scope, id_or_token)?;
     if job.kind != TransferKind::Download {
         return Err(TransferStoreError::new(
             400,
@@ -747,6 +748,17 @@ pub fn read_download_range(
         return Err(TransferStoreError::new(400, "path is not a regular file"));
     }
     let total_size = metadata.len();
+    Ok((job, path, total_size))
+}
+
+pub fn read_download_range(
+    scope: &StoreScope,
+    id_or_token: &str,
+    offset: u64,
+    length: Option<u64>,
+    max_bytes: u64,
+) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
+    let (mut job, path, total_size) = download_source(scope, id_or_token)?;
     if offset > total_size {
         return Err(TransferStoreError::new(416, "range start beyond file size"));
     }

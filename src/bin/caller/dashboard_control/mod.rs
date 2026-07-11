@@ -2094,54 +2094,10 @@ async fn active_recording_registry(
     session.recording_registry.clone()
 }
 
-fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
-    for name in names {
-        if let Some(value) = params.get(*name) {
-            if let Some(text) = value.as_str() {
-                return text.trim().to_string();
-            }
-            if !value.is_null() {
-                return value.to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
-    let value = string_param(params, names);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn optional_u64_param(params: &serde_json::Value, names: &[&str]) -> Result<Option<u64>, String> {
-    for name in names {
-        let Some(value) = params.get(*name) else {
-            continue;
-        };
-        if value.is_null() {
-            return Ok(None);
-        }
-        if let Some(number) = value.as_u64() {
-            return Ok(Some(number));
-        }
-        if let Some(text) = value.as_str() {
-            let text = text.trim();
-            if text.is_empty() {
-                return Ok(None);
-            }
-            return text
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| format!("invalid {name}"));
-        }
-        return Err(format!("invalid {name}"));
-    }
-    Ok(None)
-}
+// The lenient alias-param readers moved to the neutral api core
+// (`web_gateway::api_core`) with the S9 transfer conversion — the
+// re-export keeps every dashboard_control reference compiling.
+pub(crate) use crate::web_gateway::{optional_string_param, optional_u64_param, string_param};
 
 fn split_control_session_ids(value: &str) -> impl Iterator<Item = String> + '_ {
     value

@@ -201,7 +201,7 @@ pub(crate) async fn control_request_response(
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         }
-        "api_transfer_jobs" => api_transfer_jobs_response(id, &runtime).await,
+        "api_transfer_jobs" => api_transfer_jobs_response(id, params.as_ref(), &runtime).await,
         "api_transfer_job_create" => {
             api_transfer_job_create_response(id, params.as_ref(), &runtime).await
         }
