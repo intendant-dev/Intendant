@@ -863,6 +863,10 @@ pub(crate) fn access_request_summary_json(
         "requester_label": request.requester_label,
         "requested_profile": request.requested_profile,
         "approved_profile": request.approved_profile,
+        // Present only when the claim was signed inside a verified
+        // caller-ID (docs/src/trust-tiers.md § Where fleet metadata
+        // rides) — the store never holds an unverified tier.
+        "requester_tier": request.requester_tier,
         "source_hint": request.source_hint,
         "target_card_url": request.target_card_url,
         "created_at_unix": request.created_at_unix,

@@ -62,6 +62,14 @@ pub(crate) struct AccessRequestCreate {
     pub requester_daemon_sig_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialed_origin: Option<String>,
+    /// Cross-owner tier claim (docs/src/trust-tiers.md § Where fleet
+    /// metadata rides): the requesting daemon's own trust tier, carried
+    /// INSIDE the v2 caller-ID transcript so the claim is bound to the
+    /// verified daemon identity above. Present only when the requester
+    /// has a tier set; a claim without a verifying signature refuses the
+    /// request — it is never admitted as a bare assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +136,13 @@ pub(crate) struct StoredAccessRequest {
     /// one (failures refuse the request outright).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_daemon_id: Option<String>,
+    /// The tier the VERIFIED caller claimed for itself, from the v2
+    /// doorbell transcript. Set only when the caller-ID signature over
+    /// that claim checked out — an unverified tier claim is an assertion
+    /// dressed as evidence and is never stored or shown
+    /// (docs/src/trust-tiers.md § Where fleet metadata rides).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hint: Option<String>,
     pub target_label: String,
@@ -189,12 +204,35 @@ pub(crate) fn doorbell_transcript(
     nonce: &str,
     ts_unix_ms: i64,
 ) -> Vec<u8> {
-    let key_digest = {
-        let digest = ring::digest::digest(&ring::digest::SHA256, public_key_pem.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
-    };
+    let key_digest = doorbell_key_digest(public_key_pem);
     format!("intendant-peer-doorbell-v1\n{dialed_origin}\n{key_digest}\n{nonce}\n{ts_unix_ms}")
         .into_bytes()
+}
+
+/// Doorbell caller-ID transcript (v2): v1's fields plus the requester's
+/// own trust-tier claim as the final line (empty string when the
+/// requester has no tier set). Carrying the tier INSIDE the signed
+/// transcript is what turns "I'm disposable" from an assertion into a
+/// claim pinned to a proven daemon key — and makes stripping or
+/// rewriting the claim break the signature outright instead of quietly
+/// demoting it (docs/src/trust-tiers.md § Where fleet metadata rides).
+pub(crate) fn doorbell_transcript_v2(
+    dialed_origin: &str,
+    public_key_pem: &str,
+    nonce: &str,
+    ts_unix_ms: i64,
+    requester_tier: &str,
+) -> Vec<u8> {
+    let key_digest = doorbell_key_digest(public_key_pem);
+    format!(
+        "intendant-peer-doorbell-v2\n{dialed_origin}\n{key_digest}\n{nonce}\n{ts_unix_ms}\n{requester_tier}"
+    )
+    .into_bytes()
+}
+
+fn doorbell_key_digest(public_key_pem: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, public_key_pem.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
 }
 
 /// Doorbell clock-skew tolerance. Wider than the dashboard offer bound:
@@ -203,23 +241,39 @@ pub(crate) fn doorbell_transcript(
 /// resistance.
 const DOORBELL_MAX_SKEW_MS: i64 = 300_000;
 
+/// A doorbell caller-ID that verified: the requesting daemon's proven
+/// Ed25519 identity (base64url public key), plus the tier it claimed
+/// for itself inside the v2 transcript (`None` under the v1 and
+/// untiered-v2 transcripts — no claim was signed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedDoorbellCaller {
+    pub daemon_id: String,
+    pub tier: Option<String>,
+}
+
 /// Verify a doorbell request's caller-ID fields. Pure core:
 /// - all fields absent → `Ok(None)` (legacy caller, admitted unverified);
 /// - a valid signature whose dialed origin matches the origin this
-///   daemon received the request on → `Ok(Some(daemon_id))`;
+///   daemon received the request on → `Ok(Some(caller))`. The transcript
+///   dispatches on the tier claim: `requester_tier` present → it must
+///   name a known daemon tier AND the v2 transcript carrying it must
+///   verify; absent → the v1 transcript (a requester that predates the
+///   tier claim) or the untiered v2 transcript (a current requester
+///   with no tier set) must verify;
 /// - anything else (partial fields, bad signature, origin mismatch,
-///   stale timestamp) → `Err` — the request is refused, so a captured
-///   or tampered caller-ID can never demote itself to merely
-///   "unverified" and still ring the doorbell.
+///   stale timestamp, an unknown or unsigned tier claim) → `Err` — the
+///   request is refused, so a captured or tampered caller-ID can never
+///   demote itself to merely "unverified" and still ring the doorbell.
 pub(crate) fn verify_doorbell_caller(
     request: &AccessRequestCreate,
     received_origin: &str,
     now_unix_ms: i64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<VerifiedDoorbellCaller>, String> {
     let present = request.requester_daemon_id.is_some()
         || request.requester_daemon_sig.is_some()
         || request.requester_daemon_sig_ts.is_some()
-        || request.dialed_origin.is_some();
+        || request.dialed_origin.is_some()
+        || request.requester_tier.is_some();
     if !present {
         return Ok(None);
     }
@@ -258,11 +312,52 @@ pub(crate) fn verify_doorbell_caller(
             "caller dialed {dialed} but this daemon received the request at {received_origin}"
         ));
     }
-    let transcript = doorbell_transcript(dialed, &request.public_key_pem, &request.nonce, ts);
-    if !crate::daemon_identity::verify_b64u(daemon_id, &transcript, sig) {
+    // Tier claim (docs/src/trust-tiers.md § Where fleet metadata rides):
+    // an unknown tier string in a signed claim is a validation error —
+    // refused, never passed through. Vocabulary membership is exact: the
+    // requester signs the normalized value its own IAM stores.
+    let claimed_tier = match request.requester_tier.as_deref() {
+        None => None,
+        Some(tier) => {
+            if !crate::access::iam::DAEMON_TIERS.contains(&tier) {
+                return Err(format!(
+                    "unknown requester tier {tier:?} (expected one of: {})",
+                    crate::access::iam::DAEMON_TIERS.join(", ")
+                ));
+            }
+            Some(tier.to_string())
+        }
+    };
+    let signature_ok = match claimed_tier.as_deref() {
+        // A stated tier is only ever accepted from the v2 transcript
+        // that binds it — a v1 signature with a tier field bolted on is
+        // a claim outside what was signed, and refuses.
+        Some(tier) => {
+            let transcript =
+                doorbell_transcript_v2(dialed, &request.public_key_pem, &request.nonce, ts, tier);
+            crate::daemon_identity::verify_b64u(daemon_id, &transcript, sig)
+        }
+        // No claim: current requesters sign the untiered v2 transcript
+        // (empty tier line, field omitted); requesters that predate the
+        // tier claim signed v1. Either proves the same thing — identity
+        // with no tier stated — and stripping the tier from a v2-with-
+        // tier request matches neither, so it refuses outright.
+        None => {
+            let v2 =
+                doorbell_transcript_v2(dialed, &request.public_key_pem, &request.nonce, ts, "");
+            crate::daemon_identity::verify_b64u(daemon_id, &v2, sig) || {
+                let v1 = doorbell_transcript(dialed, &request.public_key_pem, &request.nonce, ts);
+                crate::daemon_identity::verify_b64u(daemon_id, &v1, sig)
+            }
+        }
+    };
+    if !signature_ok {
         return Err("caller id signature verification failed".into());
     }
-    Ok(Some(daemon_id.to_string()))
+    Ok(Some(VerifiedDoorbellCaller {
+        daemon_id: daemon_id.to_string(),
+        tier: claimed_tier,
+    }))
 }
 
 /// Origin comparison for the dialed-vs-received check: scheme + host +
@@ -305,10 +400,17 @@ pub(crate) fn create_pending_request(
         .unwrap_or(&target_card_url)
         .trim_end_matches('/')
         .to_string();
-    let verified_requester_daemon_id =
+    let verified_caller =
         verify_doorbell_caller(&request, &received_origin, unix_timestamp() * 1000).map_err(
             |e| CallerError::Config(format!("caller identity verification failed: {e}")),
         )?;
+    // The stored identity AND tier both come only from the verified
+    // caller — never from the raw wire fields, so a tier that arrived
+    // without a verifying v2 signature can never reach the store.
+    let (verified_requester_daemon_id, verified_requester_tier) = match verified_caller {
+        Some(caller) => (Some(caller.daemon_id), caller.tier),
+        None => (None, None),
+    };
     enforce_create_rate_limits(source_hint.as_deref(), config)?;
     prune_expired(cert_dir)?;
     enforce_pending_limits(cert_dir, source_hint.as_deref(), config)?;
@@ -360,6 +462,7 @@ pub(crate) fn create_pending_request(
         nonce: request.nonce,
         requester_card_url: request.requester_card_url,
         requester_daemon_id: verified_requester_daemon_id,
+        requester_tier: verified_requester_tier,
         source_hint,
         target_label: target_label.clone(),
         target_card_url: target_card_url.clone(),
@@ -505,6 +608,7 @@ pub(crate) async fn initiate_access_request(
         requester_daemon_sig: None,
         requester_daemon_sig_ts: None,
         dialed_origin: None,
+        requester_tier: None,
     };
     // Caller-ID: prove this daemon's identity over the doorbell. Best
     // effort — a box without a loadable identity still rings the bell,
@@ -513,12 +617,27 @@ pub(crate) async fn initiate_access_request(
         match crate::daemon_identity::DaemonIdentity::load_or_create_default() {
             Ok(identity) => {
                 let ts = unix_timestamp() * 1000;
-                let transcript =
-                    doorbell_transcript(&origin, &request.public_key_pem, &request.nonce, ts);
+                // Tier claim: this daemon's own tier — the same IAM
+                // state the access overview reads, resolved under
+                // `cert_dir` — rides INSIDE the signed v2 transcript.
+                // No tier set → the transcript's tier line is empty and
+                // the wire field is omitted.
+                let tier = crate::access::iam::load_state_for_overview(cert_dir)
+                    .state
+                    .tier
+                    .unwrap_or_default();
+                let transcript = doorbell_transcript_v2(
+                    &origin,
+                    &request.public_key_pem,
+                    &request.nonce,
+                    ts,
+                    &tier,
+                );
                 request.requester_daemon_id = Some(identity.public_key_b64u());
                 request.requester_daemon_sig = Some(identity.sign_b64u(&transcript));
                 request.requester_daemon_sig_ts = Some(ts);
                 request.dialed_origin = Some(origin);
+                request.requester_tier = (!tier.is_empty()).then_some(tier);
             }
             Err(e) => eprintln!("[peer-request] caller-id skipped (no daemon identity): {e}"),
         }
@@ -536,10 +655,11 @@ pub(crate) async fn initiate_access_request(
         .text()
         .await
         .map_err(|e| CallerError::Config(format!("read access request response: {e}")))?;
-    // A target that predates caller-ID rejects the unknown fields
-    // (`deny_unknown_fields` → 400 before any handler logic). Retry once
-    // bare and say so — the ceremony still works, the approval card just
-    // shows an unverified caller.
+    // A target that predates caller-ID (or the tier claim) rejects the
+    // unknown fields (`deny_unknown_fields` → 400 before any handler
+    // logic). Retry once bare — ALL optional caller fields stripped,
+    // tier included — and say so: the ceremony still works, the
+    // approval card just shows an unverified caller.
     if status.as_u16() == 400 && sent_caller_id {
         eprintln!(
             "[peer-request] target rejected caller-id fields (likely an older daemon) — retrying without: {text}"
@@ -548,6 +668,7 @@ pub(crate) async fn initiate_access_request(
         request.requester_daemon_sig = None;
         request.requester_daemon_sig_ts = None;
         request.dialed_origin = None;
+        request.requester_tier = None;
         sent_caller_id = false;
         resp = client
             .post(&endpoint)
@@ -1111,6 +1232,8 @@ mod tests {
         ensure_certs(dir, &names, "access-request-test", false).unwrap();
     }
 
+    /// A v1-signed caller-ID request: the shape a requester that
+    /// predates the tier claim sends (no tier field, v1 transcript).
     fn signed_create_request(
         identity: &crate::daemon_identity::DaemonIdentity,
         dialed_origin: &str,
@@ -1130,6 +1253,40 @@ mod tests {
             requester_daemon_sig: Some(identity.sign_b64u(&transcript)),
             requester_daemon_sig_ts: Some(ts),
             dialed_origin: Some(dialed_origin.to_string()),
+            requester_tier: None,
+        }
+    }
+
+    /// A v2-signed caller-ID request: the current requester shape.
+    /// `tier: None` signs the untiered v2 transcript (empty tier line)
+    /// and omits the wire field, exactly like a daemon with no tier set.
+    fn signed_create_request_v2(
+        identity: &crate::daemon_identity::DaemonIdentity,
+        dialed_origin: &str,
+        public_key_pem: &str,
+        ts: i64,
+        tier: Option<&str>,
+    ) -> AccessRequestCreate {
+        let nonce = "0123456789abcdef".to_string();
+        let transcript = doorbell_transcript_v2(
+            dialed_origin,
+            public_key_pem,
+            &nonce,
+            ts,
+            tier.unwrap_or(""),
+        );
+        AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: public_key_pem.to_string(),
+            nonce,
+            requested_profile: None,
+            requester_card_url: None,
+            requester_daemon_id: Some(identity.public_key_b64u()),
+            requester_daemon_sig: Some(identity.sign_b64u(&transcript)),
+            requester_daemon_sig_ts: Some(ts),
+            dialed_origin: Some(dialed_origin.to_string()),
+            requester_tier: tier.map(str::to_string),
         }
     }
 
@@ -1145,12 +1302,12 @@ mod tests {
         let ts = (unix_timestamp() as i64) * 1000;
         let request = signed_create_request(&identity, "https://target:8765", "PEM", ts);
 
-        // Valid: verified id comes back.
-        let verified = verify_doorbell_caller(&request, "https://target:8765", ts + 1_000).unwrap();
-        assert_eq!(
-            verified.as_deref(),
-            Some(identity.public_key_b64u().as_str())
-        );
+        // Valid: verified id comes back (v1 signed no claim, so no tier).
+        let verified = verify_doorbell_caller(&request, "https://target:8765", ts + 1_000)
+            .unwrap()
+            .expect("v1 caller-id must verify");
+        assert_eq!(verified.daemon_id, identity.public_key_b64u());
+        assert_eq!(verified.tier, None);
 
         // Origin mismatch (replay against a different daemon) refuses.
         assert!(verify_doorbell_caller(&request, "https://other:8765", ts).is_err());
@@ -1181,9 +1338,176 @@ mod tests {
         absent.requester_daemon_sig = None;
         absent.requester_daemon_sig_ts = None;
         absent.dialed_origin = None;
+        absent.requester_tier = None;
         assert!(verify_doorbell_caller(&absent, "https://target:8765", ts)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn doorbell_v2_tier_claim_binds_to_the_signature_and_vocabulary() {
+        let identity = test_identity();
+        let ts = (unix_timestamp() as i64) * 1000;
+        let origin = "https://target:8765";
+
+        // v2 with a vocabulary tier: verified, the claim comes back.
+        let request = signed_create_request_v2(&identity, origin, "PEM", ts, Some("disposable"));
+        let verified = verify_doorbell_caller(&request, origin, ts)
+            .unwrap()
+            .expect("v2 caller-id with tier must verify");
+        assert_eq!(verified.daemon_id, identity.public_key_b64u());
+        assert_eq!(verified.tier.as_deref(), Some("disposable"));
+
+        // A tampered tier (signed "disposable", claims "integrated")
+        // refuses — the claim is bound inside the signature.
+        let mut tampered = request.clone();
+        tampered.requester_tier = Some("integrated".into());
+        assert!(verify_doorbell_caller(&tampered, origin, ts).is_err());
+
+        // Stripping the tier from a v2-with-tier request refuses outright
+        // (neither the v1 nor the untiered-v2 transcript matches): a relay
+        // cannot demote a signed claim to "no claim".
+        let mut stripped = request.clone();
+        stripped.requester_tier = None;
+        assert!(verify_doorbell_caller(&stripped, origin, ts).is_err());
+
+        // The current no-tier requester shape — untiered v2 transcript,
+        // field omitted — verifies with no tier claim.
+        let untiered = signed_create_request_v2(&identity, origin, "PEM", ts, None);
+        let verified = verify_doorbell_caller(&untiered, origin, ts)
+            .unwrap()
+            .expect("untiered v2 caller-id must verify");
+        assert_eq!(verified.tier, None);
+
+        // A tier field bolted onto a v1-shaped signature refuses: the
+        // claim is outside what was signed.
+        let mut v1_plus_tier = signed_create_request(&identity, origin, "PEM", ts);
+        v1_plus_tier.requester_tier = Some("disposable".into());
+        assert!(verify_doorbell_caller(&v1_plus_tier, origin, ts).is_err());
+
+        // An unknown tier string refuses even under a valid signature —
+        // vocabulary validation, never passthrough. Same for the
+        // empty-string claim (the no-claim shape is an absent field).
+        let unknown = signed_create_request_v2(&identity, origin, "PEM", ts, Some("fortress"));
+        assert!(verify_doorbell_caller(&unknown, origin, ts).is_err());
+        let empty = signed_create_request_v2(&identity, origin, "PEM", ts, Some(""));
+        assert!(verify_doorbell_caller(&empty, origin, ts).is_err());
+
+        // A tier claim with no caller-ID at all refuses — an unverifiable
+        // claim never demotes itself to merely "unverified".
+        let mut bare = signed_create_request(&identity, origin, "PEM", ts);
+        bare.requester_daemon_id = None;
+        bare.requester_daemon_sig = None;
+        bare.requester_daemon_sig_ts = None;
+        bare.dialed_origin = None;
+        bare.requester_tier = Some("disposable".into());
+        assert!(verify_doorbell_caller(&bare, origin, ts).is_err());
+    }
+
+    #[test]
+    fn create_pending_request_stores_tier_only_from_verified_v2() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let identity = test_identity();
+        let ts = (unix_timestamp() as i64) * 1000;
+        // The received origin the caller-ID must bind derives from the
+        // card URL the request arrived on.
+        let card_url = "https://target/.well-known/agent-card.json";
+        let origin = "https://target";
+        let config = PeerAccessRequestConfig::default();
+        let source = format!(
+            "test-tier-{}-{:?}",
+            unix_timestamp(),
+            std::thread::current().id()
+        );
+
+        // Verified v2 with a tier claim: identity AND tier stored.
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = signed_create_request_v2(
+            &identity,
+            origin,
+            &key.public_key_pem,
+            ts,
+            Some("disposable"),
+        );
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            card_url.into(),
+            Some(source.clone()),
+            &config,
+        )
+        .unwrap();
+        let stored = find_request(certs.path(), &created.request_id).unwrap();
+        assert_eq!(
+            stored.requester_daemon_id.as_deref(),
+            Some(identity.public_key_b64u().as_str())
+        );
+        assert_eq!(stored.requester_tier.as_deref(), Some("disposable"));
+
+        // Verified v1 (predates the tier claim): identity stored, no tier.
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = signed_create_request(&identity, origin, &key.public_key_pem, ts);
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            card_url.into(),
+            Some(source.clone()),
+            &config,
+        )
+        .unwrap();
+        let stored = find_request(certs.path(), &created.request_id).unwrap();
+        assert_eq!(
+            stored.requester_daemon_id.as_deref(),
+            Some(identity.public_key_b64u().as_str())
+        );
+        assert_eq!(stored.requester_tier, None);
+
+        // Legacy caller (no caller-ID fields at all): admitted, nothing
+        // identity- or tier-shaped stored.
+        let key = access::certs::generate_client_key_material().unwrap();
+        let mut request = signed_create_request(&identity, origin, &key.public_key_pem, ts);
+        request.requester_daemon_id = None;
+        request.requester_daemon_sig = None;
+        request.requester_daemon_sig_ts = None;
+        request.dialed_origin = None;
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            card_url.into(),
+            Some(source.clone()),
+            &config,
+        )
+        .unwrap();
+        let stored = find_request(certs.path(), &created.request_id).unwrap();
+        assert_eq!(stored.requester_daemon_id, None);
+        assert_eq!(stored.requester_tier, None);
+
+        // A tampered tier refuses before anything is stored.
+        let key = access::certs::generate_client_key_material().unwrap();
+        let mut request = signed_create_request_v2(
+            &identity,
+            origin,
+            &key.public_key_pem,
+            ts,
+            Some("disposable"),
+        );
+        request.requester_tier = Some("integrated".into());
+        let before = read_all_requests(certs.path()).unwrap().len();
+        let err = create_pending_request(
+            certs.path(),
+            request,
+            card_url.into(),
+            Some(source),
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("caller identity verification failed"),
+            "err: {err}"
+        );
+        assert_eq!(read_all_requests(certs.path()).unwrap().len(), before);
     }
 
     #[test]
@@ -1212,6 +1536,7 @@ mod tests {
             requester_daemon_sig: None,
             requester_daemon_sig_ts: None,
             dialed_origin: None,
+            requester_tier: None,
         };
         let config = PeerAccessRequestConfig {
             enabled: false,
@@ -1259,6 +1584,7 @@ mod tests {
             requester_daemon_sig: None,
             requester_daemon_sig_ts: None,
             dialed_origin: None,
+            requester_tier: None,
         };
         let created = create_pending_request(
             certs.path(),
@@ -1294,6 +1620,7 @@ mod tests {
             requester_daemon_sig: None,
             requester_daemon_sig_ts: None,
             dialed_origin: None,
+            requester_tier: None,
         };
 
         let created = create_pending_request(
@@ -1335,6 +1662,7 @@ mod tests {
             requester_daemon_sig: None,
             requester_daemon_sig_ts: None,
             dialed_origin: None,
+            requester_tier: None,
         };
 
         let created = create_pending_request(
@@ -1373,6 +1701,7 @@ mod tests {
             requester_daemon_sig: None,
             requester_daemon_sig_ts: None,
             dialed_origin: None,
+            requester_tier: None,
         };
 
         let created = create_pending_request(
