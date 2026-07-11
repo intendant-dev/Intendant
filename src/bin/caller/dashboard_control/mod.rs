@@ -1266,6 +1266,24 @@ pub(crate) struct InboundUploadState {
     received_bytes: usize,
 }
 
+impl InboundUploadState {
+    /// The upload-frame spool as the Streaming lane's common handle
+    /// (transport-unification S8): the frame params plus the spooled
+    /// bytes, for handlers that commit the spool wholesale — the staged
+    /// upload today, the S9 transfer-chunk appends next. The media
+    /// handlers keep reading the tempfile in-memory instead (their
+    /// stores take byte slices).
+    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
+        (
+            self.params,
+            crate::web_gateway::SpooledBody {
+                tmp: self.tmp,
+                len: self.received_bytes,
+            },
+        )
+    }
+}
+
 pub(crate) struct OutboundControlQueue {
     frames: VecDeque<QueuedControlFrame>,
 }

@@ -14,12 +14,32 @@
 ///
 /// Deliberately not carried yet: the acting [`RequestAuthority`] (the
 /// pre-dispatch gates stay the enforcement point until a converted
-/// family consumes actor identity in-handler) and the raw-body spool
-/// for `Streaming` routes (the S8 upload lane).
+/// family consumes actor identity in-handler). The `Streaming`-lane
+/// raw-body spool flows as a [`SpooledBody`] argument to its neutral
+/// fns (the staged-upload commit) rather than a field here — each
+/// transport parses its own wire form (query pairs + Content-Type vs
+/// upload-frame params) at the edge; a `raw_body` field lands when the
+/// S9 transfer-chunk rows move body consumption into dispatch.
 pub(crate) struct ApiRequest {
     pub(crate) params: serde_json::Value,
     /// Byte-range request (fs read; transfer download from S9).
     pub(crate) range: Option<ByteRange>,
+}
+
+/// The `Streaming`-lane raw-body spool (design §2.1/§2.5): however the
+/// bytes arrived — HTTP spooling the socket
+/// ([`crate::web_gateway::stream_body_to_tempfile`]), the tunnel
+/// spooling `upload_start/chunk/end` frames (`InboundUploadState`) —
+/// both end in this one tempfile handle, which the neutral handler
+/// commits (atomic rename into the store). Today's consumer is the
+/// staged-upload commit; the S9 transfer-chunk rows reuse this lane
+/// for their offset-addressed appends.
+pub(crate) struct SpooledBody {
+    pub(crate) tmp: tempfile::NamedTempFile,
+    /// Spooled byte count, as counted by the transport's spooler (HTTP
+    /// asserts it equals `Content-Length`; the tunnel counts received
+    /// chunk bytes).
+    pub(crate) len: usize,
 }
 
 impl ApiRequest {
