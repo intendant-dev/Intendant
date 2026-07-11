@@ -2839,10 +2839,12 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
       continue;
     }
     if (!result.ok) {
-      // A delivered offset conflict (another writer moved the extent — a
-      // second tab resuming the same token) re-syncs and continues;
-      // every other delivered error is final.
-      if (result.status === 409 && resyncBudget > 0 && /offset|persisted/i.test(String(result.body.error || ''))) {
+      // A delivered 409 is always an extent/state conflict (offset
+      // behind, overlap, another writer — a second tab on the same
+      // token, even a concurrent commit): the re-list is the arbiter for
+      // all of them, and the budget bounds a conflict that re-listing
+      // cannot cure. Every other delivered error is final.
+      if (result.status === 409 && resyncBudget > 0) {
         resyncBudget -= 1;
         await filesTransferResyncUploadExtent(
           transfer,
@@ -2941,8 +2943,18 @@ async function runFilesUploadTransfer(transfer) {
       setFilesUploadStatus('warn', `Preparing ${transfer.name || 'upload.bin'}`);
       const persisted = await transfer.uploadBlobPersistPromise;
       transfer.uploadBlobPersistPromise = null;
-      if (!persisted) {
+      if (!persisted && !transfer.file) {
+        // Nothing to upload from: the blob never reached IndexedDB and
+        // the in-memory handle is gone (restored transfer).
         throw new Error('Browser storage is unavailable for resumable uploads');
+      }
+      if (!persisted) {
+        // Storage refused the blob (quota — likely a very large file,
+        // exactly what the jobs protocol now carries; task #6 removed
+        // the ceiling that used to mask this). Proceed from the
+        // in-memory file: pause/resume still works for the life of the
+        // tab, only resume-after-reload is lost.
+        console.warn('[files-transfer] upload blob not persisted; resume-after-reload unavailable for', transfer.id);
       }
     }
     if (!transfer.file && !(filesystemUpload && transfer.uploadBlobStored)) {
