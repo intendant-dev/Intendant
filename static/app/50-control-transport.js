@@ -1596,6 +1596,31 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_peer_pairing_request_access_poll':
     case 'api_coordinator_route':
       return 30000;
+    // Credential custody (transport F6): the sealed vault blob rides the
+    // chunked, credit-gated response lane and can run to hundreds of KiB
+    // over a TURN link. The family's pre-facade caller asked for 15 s and
+    // was silently clamped to the 5 s default (this verb ignores
+    // options.timeoutMs) — this table is where that intent actually
+    // lives.
+    case 'api_credential_lease_grant':
+    case 'api_credential_lease_renew':
+    case 'api_credential_lease_revoke':
+    case 'api_credential_lease_status':
+    case 'api_credential_custody_trail':
+    case 'api_credential_egress_register':
+    case 'api_credential_egress_unregister':
+    case 'api_daemon_vault_fetch':
+    case 'api_daemon_vault_publish':
+    case 'api_daemon_vault_deposit_key_fetch':
+    case 'api_daemon_vault_deposit_key_publish':
+    case 'api_daemon_vault_deposits_fetch':
+    case 'api_daemon_vault_deposits_consume':
+      return 15000;
+    // The egress probe reaches beyond this daemon before answering:
+    // daemon -> the relaying browser -> the provider's API -> back. Same
+    // budget as the peer round trips above.
+    case 'api_credential_egress_probe':
+      return 30000;
     default:
       return 5000;
   }
