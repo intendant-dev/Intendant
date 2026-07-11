@@ -1543,6 +1543,7 @@ mod tests {
                     read_roots: vec![],
                     write_roots: vec![dir.path().to_path_buf()],
                 },
+                attributed: None,
             };
             rt
         };
@@ -1588,6 +1589,7 @@ mod tests {
                 read_roots: vec![dir.path().to_path_buf()],
                 write_roots: vec![dir.path().to_path_buf()],
             },
+            attributed: None,
         };
         let upload = test_upload_state(
             "api_fs_write",
@@ -1645,6 +1647,7 @@ mod tests {
                 read_roots: vec![],
                 write_roots: vec![dir.path().to_path_buf()],
             },
+            attributed: None,
         };
         let mut events = rt.bus.subscribe();
 

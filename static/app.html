@@ -68401,6 +68401,17 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
     if (this.advertiseTcpViaUrl) {
       signal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
     }
+    // Delegation-lane attribution (trust-tiers § Two lanes): sign the
+    // offer with this browser's identity key so the TARGET can record
+    // who is behind the relayed channel (and refuse a spliced one).
+    // daemonId = the target we mean; the target verifies it meant it.
+    // No identity key (unsupported browser) → unattributed, admitted.
+    try {
+      const fields = await clientIdentityOfferFields(this.hostId, this.clientNonce, sdp);
+      if (fields) Object.assign(signal, fields);
+    } catch (err) {
+      console.warn(`[peer-dashboard-control ${this.hostId}] offer attribution skipped:`, err?.message || err);
+    }
     await this.sendSignal(signal, options);
     return null;
   }

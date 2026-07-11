@@ -2235,6 +2235,22 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
     if let Some(profile) = runtime.grant.profile() {
         result.insert("grant_profile".to_string(), serde_json::json!(profile));
     }
+    // Delegation-lane attribution, when the relayed offer was signed by a
+    // browser identity key: the raw material for the routing badge ("via
+    // <daemon> · <profile> · you"). Never widens authority.
+    if let crate::dashboard_control::DashboardControlGrant::Peer {
+        attributed: Some(attributed),
+        ..
+    } = &runtime.grant
+    {
+        result.insert(
+            "attributed_fingerprint".to_string(),
+            serde_json::json!(attributed.fingerprint),
+        );
+        if let Some(label) = attributed.enrolled_label.as_deref() {
+            result.insert("attributed_label".to_string(), serde_json::json!(label));
+        }
+    }
     let access_principal = runtime.grant.access_principal();
     result.insert("access_principal".to_string(), access_principal.as_value());
     // Whether ANY provider credential is usable (.env key or active lease).
@@ -2519,6 +2535,7 @@ mod tests {
                 label: "peer".into(),
                 profile: "file-operator".into(),
                 filesystem: Default::default(),
+                attributed: None,
             },
             ..runtime()
         };
@@ -2576,6 +2593,7 @@ mod tests {
                 label: "peer".into(),
                 profile: "admin".into(),
                 filesystem: Default::default(),
+                attributed: None,
             },
             ..runtime()
         };
