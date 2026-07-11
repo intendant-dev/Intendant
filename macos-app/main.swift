@@ -621,7 +621,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             guard let self = self,
                   let release = release,
                   UpdateChecker.isNewer(remote: release.tag, than: local) else { return }
-            self.presentUpdatePrompt(release: release, interactive: false)
+            // Advisory transparency-log check on the release being
+            // offered — fail-open: every outcome still shows the prompt,
+            // annotated with logged / not logged / couldn't check.
+            UpdateChecker.fetchReleaseLogStatus(tag: release.tag) { [weak self] status in
+                self?.presentUpdatePrompt(release: release, logStatus: status, interactive: false)
+            }
         }
     }
 
@@ -644,28 +649,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                 return
             }
             let local = UpdateChecker.bundledVersion()
-            if UpdateChecker.isNewer(remote: release.tag, than: local) {
-                self.presentUpdatePrompt(release: release, interactive: true)
-            } else {
-                let alert = NSAlert()
-                alert.messageText = "No update available"
-                alert.informativeText =
-                    "This app is version \(local). The latest published release is \(release.tag)."
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+            // The explicit check also reports the transparency-log
+            // advisory for the latest release, whichever branch answers.
+            UpdateChecker.fetchReleaseLogStatus(tag: release.tag) { [weak self] status in
+                guard let self = self else { return }
+                if UpdateChecker.isNewer(remote: release.tag, than: local) {
+                    self.presentUpdatePrompt(release: release, logStatus: status, interactive: true)
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = "No update available"
+                    alert.informativeText =
+                        "This app is version \(local). The latest published release is \(release.tag).\n\n"
+                        + UpdateChecker.advisoryLine(for: status, tag: release.tag)
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
             }
         }
     }
 
     /// The prompt never downloads anything: "View Release" opens the GitHub
     /// release page in the default browser and the user takes it from there.
-    func presentUpdatePrompt(release: UpdateChecker.Release, interactive: Bool) {
+    /// `logStatus` rides along as an advisory line — whether the offered
+    /// release is committed to the public transparency log (never gates
+    /// the prompt; docs/src/self-hosted-rendezvous.md, "Release
+    /// transparency").
+    func presentUpdatePrompt(
+        release: UpdateChecker.Release,
+        logStatus: UpdateChecker.ReleaseLogStatus,
+        interactive: Bool
+    ) {
         let alert = NSAlert()
         alert.messageText = "Intendant \(release.tag) is available"
         alert.informativeText =
             "This app is version \(UpdateChecker.bundledVersion()). "
             + "Updating is manual: View Release opens the GitHub release page in your browser — "
-            + "nothing is downloaded or installed automatically."
+            + "nothing is downloaded or installed automatically.\n\n"
+            + UpdateChecker.advisoryLine(for: logStatus, tag: release.tag)
         alert.addButton(withTitle: "View Release")
         alert.addButton(withTitle: "Not Now")
         let handle: (NSApplication.ModalResponse) -> Void = { response in
