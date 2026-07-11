@@ -1145,6 +1145,39 @@ function dashboardTargetFeatureChips(hostId, context = '') {
   return chips;
 }
 
+/* The two-lane badge (docs/src/trust-tiers.md § Two lanes): the ONE
+   thing a user must understand about any fleet surface — whose
+   authority the pane is spending on the target.
+   - user lane:        { lane:'user',  text:'you · <role>' }
+   - delegation lane:  { lane:'via',   text:'via <daemon> · <profile>'
+                         (+ ' · you' when this browser's signed offer
+                         was attributed by the target) }
+   - warn: true only for the one case the doctrine warns about —
+     reaching an INTEGRATED machine through the delegation lane. */
+function dashboardLaneBadge(hostId) {
+  const target = dashboardTargetDescriptor(hostId);
+  if (target.local) {
+    const role = String(target.accessRole || '').trim() || 'root';
+    return { lane: 'user', text: `you · ${role}`, warn: false };
+  }
+  const conn = peerDashboardControlConnectionsByHost.get(String(hostId || '').trim());
+  const status = conn?.lastStatus || {};
+  const profile = String(status.grant_profile || target.profile || '').trim() || 'peer';
+  const viaLabel = String(selfHostLabel || 'this daemon').trim();
+  const attributed = Boolean(status.attributed_fingerprint);
+  const record = accessFleetTargets().find(t =>
+    String(t.host_id || t.id || '').trim() === String(hostId || '').trim());
+  const warn = String(record?.tier || '').trim() === 'integrated';
+  return {
+    lane: 'via',
+    text: `via ${viaLabel} · ${profile}${attributed ? ' · you' : ''}`,
+    warn,
+    title: warn
+      ? 'This machine is marked integrated — its owner should be reached as themselves (direct tab or app), not through another daemon\u2019s grant.'
+      : `Acting through ${viaLabel}\u2019s peer grant (profile: ${profile})${attributed ? ' — your identity key is attributed on the target' : ''}.`,
+  };
+}
+
 function dashboardTargetSummary(hostId, context = '') {
   const target = dashboardTargetDescriptor(hostId);
   const local = target.local;
@@ -1160,13 +1193,14 @@ function dashboardTargetSummary(hostId, context = '') {
     return {
       state: transport.kind === 'err' ? 'err' : (connected ? 'ok' : 'checking'),
       name: target.displayName,
-      kind: target.routeType,
+      kind: dashboardLaneBadge(hostId).text,
       detail,
       chips: dashboardTargetFeatureChips('', context),
       title: transport.title || detail,
     };
   }
 
+  const laneBadge = dashboardLaneBadge(hostId);
   const peerId = target.hostId;
   const peer = target.peer;
   if (!peer) {
@@ -1194,7 +1228,9 @@ function dashboardTargetSummary(hostId, context = '') {
   return {
     state: online ? (conn?.canUseRpc?.() ? 'ok' : 'checking') : 'err',
     name: dashboardTargetLabel(peerId),
-    kind: target.routeType,
+    kind: laneBadge.text,
+    kindWarn: laneBadge.warn,
+    kindTitle: laneBadge.title || '',
     detail: `${target.accessDomain}: ${access} · ${via}`,
     chips: dashboardTargetFeatureChips(peerId, context),
     title: online
@@ -1222,8 +1258,9 @@ function renderDashboardTargetSummary(elementId, hostId, context = '') {
   name.className = 'target-summary-name';
   name.textContent = summary.name || 'Target';
   const kind = document.createElement('span');
-  kind.className = 'target-summary-kind';
+  kind.className = `target-summary-kind${summary.kindWarn ? ' lane-warn' : ''}`;
   kind.textContent = summary.kind || '';
+  if (summary.kindTitle) kind.title = summary.kindTitle;
   row.append(name, kind);
   const detail = document.createElement('div');
   detail.className = 'target-summary-detail';
