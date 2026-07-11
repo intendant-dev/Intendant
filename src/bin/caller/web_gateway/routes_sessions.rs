@@ -3324,28 +3324,51 @@ pub(crate) async fn handle_mc_fission(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_sessions_stream(mut stream: DemuxStream, request_line: &str) {
-    let request_line_for_stream = request_line.to_string();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-    let stream_task = tokio::task::spawn_blocking(move || {
-        stream_sessions_from_request(&request_line_for_stream, tx);
+/// Transport-neutral core of the session-list stream
+/// (`GET /api/sessions/stream`, tunnel twin `api_sessions_stream`, S10):
+/// spawn the ONE line source — quick skeleton, hydrating marker,
+/// replace, done — onto the blocking pool and hand its handle to the
+/// caller's transport writer under the historical NDJSON head (the
+/// wildcard-CORS tail is response decoration on the OwnOrigin row,
+/// exactly like `/api/sessions`).
+pub(crate) fn sessions_stream_api_response(requested_limit: Option<usize>) -> ApiResponse {
+    let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
+    let source = tokio::task::spawn_blocking(move || {
+        stream_sessions_lines(requested_limit, tx);
     });
-    let response = HttpResponse::new("200 OK")
-        .header("Content-Type", "application/x-ndjson")
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    use tokio::io::AsyncWriteExt;
-    if stream.write_all(response.as_bytes()).await.is_ok() {
-        while let Some(line) = rx.recv().await {
-            if stream.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-        }
+    sessions_stream_api_response_from(LineStream { lines, source })
+}
+
+/// The stream envelope over an already-running line source — the
+/// hermetic seam ([`sessions_stream_api_response`] is the ambient-home
+/// production entry; fixtures inject their own source).
+pub(crate) fn sessions_stream_api_response_from(stream: LineStream) -> ApiResponse {
+    ApiResponse::Stream {
+        status: 200,
+        content_type: "application/x-ndjson".to_string(),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        stream,
     }
-    let _ = stream_task.await;
-    finalize_http_stream(&mut stream).await;
+}
+
+pub(crate) async fn handle_sessions_stream(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let requested_limit = session_list_limit_from_request(request_line);
+    write_api_response(
+        stream,
+        sessions_stream_api_response(requested_limit),
+        cors,
+        fleet_origin,
+    )
+    .await;
 }
 
 /// Transport-neutral core of `GET /api/sessions/search` (tunnel twin

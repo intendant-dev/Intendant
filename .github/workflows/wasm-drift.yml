@@ -12,6 +12,16 @@ name: WASM drift
 # Required-track triggers (unfiltered — a paths-filtered required check
 # blocks queue entry); the in-job relevance skip keeps per-PR cost at
 # ~zero unless wasm inputs actually changed.
+#
+# The rebuild runs on the MAC fleet leg deliberately: wasm output is NOT
+# byte-deterministic across host triples (proven live 2026-07-11 — a
+# comment-only probe's Linux rebuild differed from the macOS-built
+# committed artifacts down to the .d.ts glue). All wasm authorship and
+# build.rs's auto-rebuilds happen on aarch64-darwin, so that is the
+# canonical artifact host, and the gate must rebuild on the same triple
+# to verify bytes. A contributor regenerating artifacts on another OS
+# will red this gate — rebuild them on macOS (or let a Mac dev box's
+# cargo build do it via build.rs).
 on:
   pull_request:
     branches: [main]
@@ -26,16 +36,26 @@ concurrency:
 
 jobs:
   wasm-drift:
-    name: wasm-drift (ubuntu-latest)
+    name: wasm-drift (${{ matrix.os }})
     # Trust-based routing — same rule as windows.yml: trusted refs on the
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     timeout-minutes: 30
+    # Serialize the rebuild repo-wide: both Mac listeners share the
+    # account's ~/Library/Caches/.wasm-pack, and two cold jobs
+    # cargo-installing wasm-bindgen concurrently race the final rename
+    # ("Directory not empty", seen live 2026-07-11 when a probe PR and
+    # another PR's gate ran side by side). Warm caches don't race, but
+    # every wasm-bindgen/wasm-opt version bump re-opens the cold window
+    # — queue the jobs instead (they are minutes; skips are seconds).
+    concurrency:
+      group: wasm-drift-rebuild
+      cancel-in-progress: false
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            runner: [self-hosted, intendant-linux]
+          - os: macos-latest
+            runner: [self-hosted, intendant-macos]
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

@@ -787,7 +787,13 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::SessionsStream => {
-                return handle_sessions_stream(stream, request_line).await;
+                return handle_sessions_stream(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsSearch => {
                 return handle_sessions_search(
@@ -1536,17 +1542,59 @@ pub(crate) fn api_response_http_bytes(
             }
             http
         }
+        // A line stream cannot be buffered — `write_api_response` owns
+        // that lane before delegating here. Reaching this arm is a
+        // wiring bug; fail closed with the canonical 500.
+        ApiResponse::Stream { .. } => {
+            debug_assert!(
+                false,
+                "ApiResponse::Stream reached the buffered HTTP renderer"
+            );
+            HttpResponse::json(
+                status_reason(500),
+                serde_json::json!({ "error": "stream response on the buffered lane" }).to_string(),
+            )
+        }
     };
-    let http = match cors {
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
+}
+
+/// The row-declared CORS posture, applied to a rendered response — one
+/// place for both the buffered renderer and the Stream-lane head.
+fn apply_cors_posture(
+    http: HttpResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> HttpResponse {
+    match cors {
         crate::gateway_routes::CorsPosture::OwnOrigin => http,
         crate::gateway_routes::CorsPosture::Public => http.public_cors(),
         crate::gateway_routes::CorsPosture::FleetAllowlist => http.fleet_cors(fleet_origin),
-    };
-    http.into_bytes()
+    }
+}
+
+/// Head of a Stream-lane response: status line + Content-Type + the
+/// carried header tail under the row's CORS posture. Deliberately no
+/// Content-Length — the body is EOF-delimited (`Connection: close`)
+/// NDJSON lines the writer appends as they arrive.
+pub(crate) fn stream_response_http_head(
+    status: u16,
+    content_type: &str,
+    headers: Vec<(&'static str, String)>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> Vec<u8> {
+    let mut http = HttpResponse::new(status_reason(status)).header("Content-Type", content_type);
+    for (name, value) in headers {
+        http = http.header(name, value);
+    }
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
 }
 
 /// Write an [`ApiResponse`] to the HTTP lane and finalize the stream —
-/// the whole tail of a converted handler shim.
+/// the whole tail of a converted handler shim. The Stream lane writes
+/// its head then pumps the shared line source until it drains (or the
+/// client hangs up); buffered lanes render in one piece.
 pub(crate) async fn write_api_response(
     mut stream: DemuxStream,
     response: ApiResponse,
@@ -1554,8 +1602,38 @@ pub(crate) async fn write_api_response(
     fleet_origin: Option<&str>,
 ) {
     use tokio::io::AsyncWriteExt;
-    let bytes = api_response_http_bytes(response, cors, fleet_origin);
-    let _ = stream.write_all(&bytes).await;
+    match response {
+        ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream: line_stream,
+        } => {
+            let head =
+                stream_response_http_head(status, &content_type, headers, cors, fleet_origin);
+            let LineStream {
+                lines: mut line_rx,
+                source,
+            } = line_stream;
+            if stream.write_all(&head).await.is_ok() {
+                while let Some(line) = line_rx.recv().await {
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // Hang up before joining: after an early exit above (client
+            // gone) the source may still be sending into the channel;
+            // dropping the receiver fails those sends so the producer
+            // finishes instead of deadlocking the join.
+            drop(line_rx);
+            let _ = source.await;
+        }
+        buffered => {
+            let bytes = api_response_http_bytes(buffered, cors, fleet_origin);
+            let _ = stream.write_all(&bytes).await;
+        }
+    }
     finalize_http_stream(&mut stream).await;
 }
 
@@ -1634,5 +1712,51 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
         assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    // ── S10 golden: the sessions-stream NDJSON head (design §8) ──
+    // Captured from the hand-rolled `handle_sessions_stream` header
+    // block before the Stream-lane conversion: no Content-Length, no
+    // Transfer-Encoding — the response is EOF-delimited
+    // (`Connection: close`), with the wildcard-CORS tail the sessions
+    // family bakes into its responses (the row's posture is OwnOrigin;
+    // the header is response decoration, exactly like `/api/sessions`).
+
+    /// The historical head, byte for byte.
+    pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/x-ndjson\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n";
+
+    #[tokio::test]
+    async fn golden_sessions_stream_http_head_is_pinned() {
+        // The Stream-lane head the neutral core declares, rendered under
+        // the row's declared posture, byte-identical to the retired
+        // hand-rolled header block.
+        let (_line_tx, lines) = tokio::sync::mpsc::channel::<String>(1);
+        let crate::web_gateway::ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream,
+        } = crate::web_gateway::sessions_stream_api_response_from(crate::web_gateway::LineStream {
+            lines,
+            source: tokio::spawn(async {}),
+        })
+        else {
+            panic!("sessions stream core must answer on the Stream lane");
+        };
+        drop(stream);
+        let row_cors = crate::gateway_routes::match_route("GET", "/api/sessions/stream")
+            .expect("sessions stream route declared")
+            .0
+            .cors;
+        let head = stream_response_http_head(status, &content_type, headers, row_cors, None);
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            SESSIONS_STREAM_HEAD_GOLDEN
+        );
     }
 }

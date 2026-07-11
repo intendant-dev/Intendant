@@ -2349,15 +2349,44 @@ pub(crate) fn send_session_stream_rows(
     true
 }
 
-pub(crate) fn stream_sessions_from_request(
-    request_line: &str,
+/// The session-list stream's ONE line source (transport-unification
+/// S10): quick skeleton rows, the hydrating phase marker, the
+/// cache-hydrated replace, done — pushed as complete NDJSON lines into
+/// `tx`. Both transports spawn exactly this function (via
+/// `sessions_stream_api_response`) and own only their writers. This
+/// production entry resolves the ambient home and hydrates through the
+/// process-wide session-list caches; the parity fixture injects a temp
+/// store and the direct scan through `stream_sessions_lines_from_home`.
+pub(crate) fn stream_sessions_lines(
+    requested_limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<String>,
 ) {
-    let requested_limit = session_list_limit_from_request(request_line);
+    stream_sessions_lines_from_home(
+        &crate::platform::home_dir(),
+        requested_limit,
+        || {
+            requested_limit
+                .map(cached_list_sessions_with_limit)
+                .unwrap_or_else(cached_list_sessions)
+        },
+        tx,
+    )
+}
+
+/// Root-injected body of [`stream_sessions_lines`] (hermetic-test
+/// convention: the quick phase scans `home`; the replace phase's
+/// hydrated list body comes from `hydrated_body` — the response caches
+/// in production, a direct `list_sessions_from_home_with_limit` scan in
+/// fixtures).
+pub(crate) fn stream_sessions_lines_from_home(
+    home: &Path,
+    requested_limit: Option<usize>,
+    hydrated_body: impl FnOnce() -> String,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
     let quick_limit = requested_limit
         .unwrap_or(SESSION_LIST_LIMIT)
         .min(SESSION_LIST_STREAM_QUICK_LIMIT);
-    let home = crate::platform::home_dir();
     if !send_session_stream_event(
         &tx,
         serde_json::json!({
@@ -2371,14 +2400,14 @@ pub(crate) fn stream_sessions_from_request(
 
     let mut quick_rows = Vec::new();
     quick_rows.extend(list_intendant_skeleton_sessions_with_limit(
-        &home,
+        home,
         quick_limit,
     ));
     quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
-        &home,
+        home,
         quick_limit,
     ));
-    merge_quick_session_rows_with_wrapper_index(&home, &mut quick_rows);
+    merge_quick_session_rows_with_wrapper_index(home, &mut quick_rows);
     sort_sessions_newest_first(&mut quick_rows);
     truncate_sessions_preserving_sources_to(&mut quick_rows, quick_limit);
     if !send_session_stream_rows(&tx, quick_rows, true) {
@@ -2394,9 +2423,7 @@ pub(crate) fn stream_sessions_from_request(
         return;
     }
 
-    let body = requested_limit
-        .map(cached_list_sessions_with_limit)
-        .unwrap_or_else(cached_list_sessions);
+    let body = hydrated_body();
     let rows = serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap_or_default();
     let _ = send_session_stream_event(
         &tx,

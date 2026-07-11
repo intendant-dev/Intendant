@@ -975,6 +975,7 @@ mod tests {
                     sdp: "v=0\r\nm=video".into(),
                     advertise_tcp_via_url: None,
                     client_nonce: None,
+                    client_key: Default::default(),
                 },
             })
             .await

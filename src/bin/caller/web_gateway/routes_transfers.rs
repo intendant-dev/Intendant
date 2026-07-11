@@ -859,7 +859,9 @@ mod tests {
                 };
                 (*status, serde_json::from_str(&text).unwrap())
             }
-            ApiResponse::Bytes { .. } => panic!("expected a JSON response"),
+            ApiResponse::Bytes { .. } | ApiResponse::Stream { .. } => {
+                panic!("expected a JSON response")
+            }
         }
     }
 
@@ -887,6 +889,7 @@ mod tests {
                     JsonBody::Value(value) => value.to_string(),
                 }
             ),
+            ApiResponse::Stream { .. } => panic!("expected a bytes response, got a stream"),
         }
     }
 
@@ -1432,7 +1435,9 @@ mod tests {
                     Some("bytes */14")
                 );
             }
-            ApiResponse::Bytes { .. } => panic!("expected the 416 JSON shape"),
+            ApiResponse::Bytes { .. } | ApiResponse::Stream { .. } => {
+                panic!("expected the 416 JSON shape")
+            }
         }
 
         // Unknown job on the header form resolves before parsing.

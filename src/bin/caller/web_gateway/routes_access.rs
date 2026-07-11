@@ -2411,6 +2411,9 @@ pub(crate) fn dashboard_control_grant_for_client(
             label: identity.label.clone(),
             profile: identity.profile.clone(),
             filesystem: identity.filesystem.clone(),
+            // The mTLS entrance carries no signed-offer fields today;
+            // attribution rides the relayed-signaling path.
+            attributed: None,
         });
     }
     if let Some(fingerprint) = tls_client_cert_fingerprint {
@@ -3464,6 +3467,7 @@ mod tests {
             label: "peer".to_string(),
             profile: "viewer".to_string(),
             filesystem: Default::default(),
+            attributed: None,
         };
         let peer_identity = PeerConnectionIdentity {
             fingerprint: "fp".to_string(),

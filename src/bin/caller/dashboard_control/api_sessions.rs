@@ -349,22 +349,41 @@ pub(crate) async fn control_request_response(
     }
 }
 
+/// The tunnel's `api_sessions_stream` twin (S10): the transport edge
+/// parses its own limit vocabulary, the S10 neutral core spawns the ONE
+/// line source both lanes share, and the `stream_*` framer below is
+/// this lane's writer.
 pub(crate) async fn stream_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
     task_tx: mpsc::Sender<ControlTaskResponse>,
     cancel: CancellationToken,
 ) {
-    let request_line = sessions_stream_request_line(params);
-    let (line_tx, line_rx) = mpsc::channel::<String>(64);
-    let stream_task = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::stream_sessions_from_request(&request_line, line_tx);
-    });
+    let requested_limit = sessions_stream_requested_limit(params);
+    let crate::web_gateway::ApiResponse::Stream { stream, .. } =
+        crate::web_gateway::sessions_stream_api_response(requested_limit)
+    else {
+        // The sessions-stream core always answers on the Stream lane; a
+        // buffered response reaching this framer is a wiring bug.
+        let _ = task_tx
+            .send(ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "stream_end",
+                    "id": id,
+                    "ok": false,
+                    "error": "session stream returned a buffered response",
+                }),
+                byte_stream: None,
+                done: true,
+            })
+            .await;
+        return;
+    };
     stream_json_lines_response(
         id,
         "api_sessions_stream".to_string(),
-        line_rx,
-        stream_task,
+        stream,
         task_tx,
         cancel,
     )
@@ -374,11 +393,14 @@ pub(crate) async fn stream_sessions_response(
 pub(crate) async fn stream_json_lines_response(
     id: String,
     method: String,
-    mut line_rx: mpsc::Receiver<String>,
-    stream_task: tokio::task::JoinHandle<()>,
+    stream: crate::web_gateway::LineStream,
     task_tx: mpsc::Sender<ControlTaskResponse>,
     cancel: CancellationToken,
 ) {
+    let crate::web_gateway::LineStream {
+        lines: mut line_rx,
+        source: stream_task,
+    } = stream;
     if cancel.is_cancelled() {
         return;
     }
@@ -480,36 +502,39 @@ pub(crate) async fn stream_json_lines_response(
     }
 }
 
-pub(crate) fn sessions_stream_request_line(params: Option<&serde_json::Value>) -> String {
-    let Some(params) = params else {
-        return "GET /api/sessions/stream HTTP/1.1".to_string();
-    };
-    let Some(limit_value) = params.get("limit") else {
-        return "GET /api/sessions/stream HTTP/1.1".to_string();
-    };
+/// The tunnel's sessions-stream limit vocabulary, parsed at this
+/// transport's edge into the neutral core's `Option<usize>` (`None` =
+/// unlimited). Byte-for-byte the semantics of the retired
+/// params→request-line synthesis composed with the HTTP lane's
+/// `session_list_limit_from_request` (the equivalence pins live in the
+/// tests): absent `limit` and the "all"/"full" escapes are unlimited;
+/// invalid shapes (zero, negatives, floats, non-numeric strings, other
+/// JSON types — including the historical `"unlimited"` quirk, which
+/// only the HTTP query vocabulary accepts) collapse to
+/// `CONTROL_DEFAULT_SESSION_LIMIT`; everything is capped at the HTTP
+/// lane's `SESSION_LIST_LIMIT`.
+pub(crate) fn sessions_stream_requested_limit(params: Option<&serde_json::Value>) -> Option<usize> {
+    let limit_value = params?.get("limit")?;
     let limit = match limit_value {
         serde_json::Value::String(value) => {
             let value = value.trim();
             if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("full") {
-                "all".to_string()
-            } else {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|limit| *limit > 0)
-                    .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
-                    .to_string()
+                return None;
             }
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
         }
         serde_json::Value::Number(value) => value
             .as_u64()
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0)
-            .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
-            .to_string(),
-        _ => CONTROL_DEFAULT_SESSION_LIMIT.to_string(),
+            .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT),
+        _ => CONTROL_DEFAULT_SESSION_LIMIT,
     };
-    format!("GET /api/sessions/stream?limit={limit} HTTP/1.1")
+    Some(limit.min(crate::web_gateway::SESSION_LIST_LIMIT))
 }
 
 pub(crate) fn cancelled_control_response(id: String, existed: bool) -> serde_json::Value {
@@ -1565,8 +1590,10 @@ mod tests {
         stream_json_lines_response(
             "stream1".to_string(),
             "api_sessions_stream".to_string(),
-            line_rx,
-            stream_task,
+            crate::web_gateway::LineStream {
+                lines: line_rx,
+                source: stream_task,
+            },
             task_tx,
             CancellationToken::new(),
         )
@@ -1593,6 +1620,27 @@ mod tests {
         assert_eq!(frames[4].frame["ok"], true);
         assert_eq!(frames[4].frame["result"]["events"], 3);
         assert!(frames[4].done);
+
+        // S10 goldens: the exact frame objects (serde_json's sorted-key
+        // serialization), so the framer's wire shapes — method echo,
+        // seq/chunk_id pairing, the events tally — are pinned byte for
+        // byte across the Stream-lane unification.
+        assert_eq!(
+            frames[0].frame.to_string(),
+            r#"{"id":"stream1","method":"api_sessions_stream","t":"stream_start"}"#
+        );
+        assert_eq!(
+            frames[1].frame.to_string(),
+            r#"{"chunk_id":"stream1:0","event":{"limit":1,"quick_limit":1,"type":"start"},"id":"stream1","seq":0,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[2].frame.to_string(),
+            r#"{"chunk_id":"stream1:1","event":{"partial":true,"session":{"session_id":"s1"},"type":"session"},"id":"stream1","seq":1,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[4].frame.to_string(),
+            r#"{"id":"stream1","ok":true,"result":{"events":3},"t":"stream_end"}"#
+        );
     }
 
     #[test]
@@ -1639,18 +1687,6 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({}))),
-            "GET /api/sessions/stream HTTP/1.1"
-        );
-        assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({"limit": "all"}))),
-            "GET /api/sessions/stream?limit=all HTTP/1.1"
-        );
-        assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({"limit": 25}))),
-            "GET /api/sessions/stream?limit=25 HTTP/1.1"
-        );
-        assert_eq!(
             control_project_filter(&serde_json::json!({"projects": ["a", " b "]})),
             vec!["a".to_string(), "b".to_string()]
         );
@@ -1667,6 +1703,70 @@ mod tests {
                 &serde_json::json!({"capabilities": ["display", "custom:gpu"]})
             ),
             "capability=display&capability=custom:gpu"
+        );
+    }
+
+    /// S10 equivalence pins: `sessions_stream_requested_limit` must
+    /// reproduce, input for input, the retired composition of the
+    /// params→request-line synthesizer with the HTTP lane's
+    /// `session_list_limit_from_request` — including the historical
+    /// asymmetries ("unlimited" is an HTTP-query escape only; zero,
+    /// negatives, floats, and non-numeric shapes collapse to the
+    /// control default; the HTTP list cap applies last).
+    #[test]
+    fn sessions_stream_limit_vocabulary_is_pinned() {
+        let parse = |params: serde_json::Value| sessions_stream_requested_limit(Some(&params));
+        assert_eq!(sessions_stream_requested_limit(None), None);
+        assert_eq!(parse(serde_json::json!({})), None);
+        assert_eq!(parse(serde_json::json!({ "limit": "all" })), None);
+        assert_eq!(parse(serde_json::json!({ "limit": "full" })), None);
+        assert_eq!(parse(serde_json::json!({ "limit": " ALL " })), None);
+        // The HTTP query vocabulary's third escape does NOT exist on the
+        // tunnel — it has always collapsed to the control default.
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "unlimited" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(parse(serde_json::json!({ "limit": "25" })), Some(25));
+        assert_eq!(parse(serde_json::json!({ "limit": " 42 " })), Some(42));
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "0" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "nope" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(parse(serde_json::json!({ "limit": 25 })), Some(25));
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 0 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": -3 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 2.5 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": null })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": true })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        // Oversized asks clamp to the HTTP lane's list cap, exactly as
+        // the synthesized query did.
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 9_999_999 })),
+            Some(crate::web_gateway::SESSION_LIST_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "9999999" })),
+            Some(crate::web_gateway::SESSION_LIST_LIMIT)
         );
     }
 
@@ -2368,7 +2468,8 @@ mod tests {
                 let crate::web_gateway::BytesPayload::InMemory(payload) = bytes;
                 (payload.clone(), meta.clone())
             }
-            crate::web_gateway::ApiResponse::Json { .. } => panic!("raw read must be bytes"),
+            crate::web_gateway::ApiResponse::Json { .. }
+            | crate::web_gateway::ApiResponse::Stream { .. } => panic!("raw read must be bytes"),
         };
         assert_eq!(http_bytes, payload);
         let raw = api_session_current_upload_raw_task_response(
@@ -2407,5 +2508,200 @@ mod tests {
         assert_eq!(raw.frame["result"]["_httpStatus"], 404);
         assert_eq!(raw.frame["result"]["ok"], false);
         assert_eq!(raw.frame["result"]["error"], "upload not found");
+    }
+
+    // ── S10 parity fixture: the sessions-stream Stream lane ──
+
+    /// Seed a minimal on-disk session the catalog scanners list. The
+    /// recency key is the transcript's mtime at second resolution
+    /// (`session_activity_mtime_secs`), so each seed gets a distinct,
+    /// idx-ordered mtime for a deterministic newest-first order.
+    fn seed_stream_session(logs_dir: &std::path::Path, idx: usize) {
+        let session_id = format!("stream-parity-{idx}");
+        let log_dir = logs_dir.join(&session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "created_at": format!("2026-07-01T10:0{idx}:00Z"),
+                "task": format!("stream parity task {idx}"),
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript = log_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({
+                "ts": format!("2026-07-01T10:0{idx}:00Z"),
+                "event": "session_start"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mtime =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000 + idx as u64 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// A [`crate::web_gateway::LineStream`] replaying a captured line
+    /// sequence — the writers-only half of the parity fixture.
+    fn replay_line_stream(lines: Vec<String>) -> crate::web_gateway::LineStream {
+        let (tx, rx) = mpsc::channel::<String>(64);
+        let source = tokio::spawn(async move {
+            for line in lines {
+                if tx.send(line).await.is_err() {
+                    return;
+                }
+            }
+        });
+        crate::web_gateway::LineStream { lines: rx, source }
+    }
+
+    /// Same params ⇒ same event-line sequence on both lanes (design §8,
+    /// S10). The line SOURCE is shared by construction — both transports
+    /// spawn `stream_sessions_lines` through the one neutral core — so
+    /// the fixture runs it once, hermetically (injected temp store +
+    /// direct hydration scan), pins the NDJSON line shapes, then proves
+    /// each lane's WRITER carries the identical sequence: the HTTP body
+    /// under the pinned head is the lines verbatim, and the tunnel's
+    /// `stream_event` frames wrap the same events in the same order.
+    #[tokio::test]
+    async fn parity_sessions_stream_event_lines_match_across_lanes() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        for idx in 0..3 {
+            seed_stream_session(&logs_dir, idx);
+        }
+        let requested_limit = Some(2usize);
+
+        // One hermetic run of the shared source.
+        let lines = {
+            let (tx, mut rx) = mpsc::channel::<String>(64);
+            let source_home = home.path().to_path_buf();
+            let hydrate_home = source_home.clone();
+            let source = tokio::task::spawn_blocking(move || {
+                crate::web_gateway::stream_sessions_lines_from_home(
+                    &source_home,
+                    requested_limit,
+                    move || {
+                        crate::web_gateway::list_sessions_from_home_with_limit(
+                            &hydrate_home,
+                            requested_limit,
+                        )
+                    },
+                    tx,
+                );
+            });
+            let mut lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                lines.push(line);
+            }
+            source.await.unwrap();
+            lines
+        };
+
+        // The line shapes: start → 2 newest-first partial session rows →
+        // hydrating marker → replace (hydrated pair) → done, each a
+        // complete `\n`-terminated NDJSON line.
+        assert!(lines.iter().all(|line| line.ends_with('\n')), "{lines:?}");
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line.trim()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 6, "{events:?}");
+        assert_eq!(
+            events[0].to_string(),
+            r#"{"limit":2,"quick_limit":2,"type":"start"}"#
+        );
+        assert_eq!(events[1]["type"], "session");
+        assert_eq!(events[1]["partial"], true);
+        assert_eq!(events[1]["session"]["session_id"], "stream-parity-2");
+        assert_eq!(events[2]["session"]["session_id"], "stream-parity-1");
+        assert_eq!(
+            events[3].to_string(),
+            r#"{"phase":"hydrating","type":"phase"}"#
+        );
+        assert_eq!(events[4]["type"], "replace");
+        let replaced = events[4]["sessions"].as_array().unwrap();
+        assert_eq!(replaced.len(), 2, "{events:?}");
+        assert_eq!(replaced[0]["session_id"], "stream-parity-2");
+        assert_eq!(events[5].to_string(), r#"{"type":"done"}"#);
+
+        // HTTP lane: the real writer over an in-memory stream — the
+        // pinned head, then the captured lines byte for byte.
+        let response = crate::web_gateway::sessions_stream_api_response_from(replay_line_stream(
+            lines.clone(),
+        ));
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        crate::web_gateway::write_api_response(
+            Box::pin(server),
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        let mut raw = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            client.read_to_end(&mut raw).await.unwrap();
+        }
+        let text = String::from_utf8(raw).unwrap();
+        let head_end = text.find("\r\n\r\n").expect("head/body split") + 4;
+        assert_eq!(
+            &text[..head_end],
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-ndjson\r\n\
+             Cache-Control: no-cache\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        assert_eq!(&text[head_end..], lines.concat());
+
+        // Tunnel lane: the framer over the same sequence — one
+        // stream_event per line, events byte-identical to the HTTP
+        // lane's parsed lines, under the lifecycle frames.
+        let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
+        stream_json_lines_response(
+            "stream-parity".to_string(),
+            "api_sessions_stream".to_string(),
+            replay_line_stream(lines.clone()),
+            task_tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let mut frames = Vec::new();
+        while let Some(task) = task_rx.recv().await {
+            let done = task.done;
+            frames.push(task);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(frames.len(), lines.len() + 2, "start + events + end");
+        assert_eq!(frames[0].frame["t"], "stream_start");
+        for (idx, line) in lines.iter().enumerate() {
+            let frame = &frames[idx + 1].frame;
+            assert_eq!(frame["t"], "stream_event");
+            assert_eq!(frame["seq"], idx as u64);
+            let http_event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(
+                frame["event"].to_string(),
+                http_event.to_string(),
+                "lane divergence at event {idx}"
+            );
+        }
+        let end = &frames[lines.len() + 1].frame;
+        assert_eq!(end["t"], "stream_end");
+        assert_eq!(end["ok"], true);
+        assert_eq!(end["result"]["events"], lines.len() as u64);
     }
 }

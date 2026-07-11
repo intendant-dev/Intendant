@@ -298,6 +298,15 @@ pub enum WebRtcSignal {
         advertise_tcp_via_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_nonce: Option<String>,
+        /// Browser identity-key attribution over the delegation lane
+        /// (docs/src/trust-tiers.md § Two lanes): the same signed-offer
+        /// fields the user-lane signaling paths carry, flattened so the
+        /// wire shape matches them. All-`None` (absent on the wire) from
+        /// dashboards that predate the field; the target treats absent
+        /// as unattributed and a present-but-invalid signature as a
+        /// splice attempt (offer refused).
+        #[serde(default, flatten)]
+        client_key: crate::access::client_key::ClientKeyOfferFields,
     },
     /// Peer-side SDP answer in response to an offer.
     Answer {
@@ -1003,6 +1012,7 @@ mod tests {
             sdp: "v=0\r\n".into(),
             advertise_tcp_via_url: Some("ws://localhost:8766/ws".into()),
             client_nonce: None,
+            client_key: Default::default(),
         };
         let json = serde_json::to_string(&sig).unwrap();
         assert!(
@@ -1033,6 +1043,7 @@ mod tests {
             sdp: "v=0\r\n".into(),
             advertise_tcp_via_url: None,
             client_nonce: None,
+            client_key: Default::default(),
         };
         let json = serde_json::to_string(&sig).unwrap();
         assert!(

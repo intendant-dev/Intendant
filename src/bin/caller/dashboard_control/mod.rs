@@ -244,9 +244,9 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // api_session_frame_asset), api_session_delete, and the worktrees
     // quartet live as tunnel columns on their route rows (S4b), and so
     // does the whole current-session family — history/rollback/redo/
-    // prune, changes, agent-output, uploads list/raw/delete, and the
-    // upload-frame-only api_session_current_upload (S4c).
-    method("api_sessions_stream", PeerOperation::SessionInspect),
+    // prune, changes, agent-output, uploads list/raw/delete, the
+    // upload-frame-only api_session_current_upload (S4c), and the
+    // Stream-lane api_sessions_stream (S10).
     method("api_session_control_msg", PeerOperation::SessionManage),
     // The api_fs_* methods live as tunnel columns on their route rows
     // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
@@ -447,7 +447,29 @@ pub enum DashboardControlGrant {
         label: String,
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+        /// Delegation-lane attribution (docs/src/trust-tiers.md § Two
+        /// lanes): the browser identity key that signed the relayed
+        /// offer, when one did. Attribution never widens authority —
+        /// the peer profile above remains the ceiling — it gives the
+        /// audit trail and the UI badge a human identity beside the
+        /// daemon principal.
+        attributed: Option<PeerAttribution>,
     },
+}
+
+/// The verified human identity behind a delegation-lane connection.
+#[derive(Clone, Debug)]
+pub struct PeerAttribution {
+    /// base64url(sha256(raw P-256 point)) — the IAM binding value.
+    pub fingerprint: String,
+    /// The raw public key, retained for display/audit.
+    #[allow(dead_code)] // recorded for the delegation-lane audit surface; not read yet
+    pub public_key_b64u: String,
+    /// The label of the enrolled user/client principal this key matches
+    /// in the TARGET's local IAM, when it matches one. `None` = a valid
+    /// signature from a key this daemon has never enrolled (attribution
+    /// is still recorded; the audit shows the fingerprint).
+    pub enrolled_label: Option<String>,
 }
 
 impl DashboardControlGrant {
@@ -733,6 +755,17 @@ impl DashboardDisplayAuthorityBridge {
 }
 
 impl DashboardControlRegistry {
+    /// This daemon's own agent-card id — the target-id expectation for
+    /// delegation-lane attribution (the browser signs the id it dialed;
+    /// we verify it meant us).
+    pub fn local_card_id(&self) -> String {
+        self.agent_card
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
@@ -2408,6 +2441,7 @@ mod tests {
             label: "peer-root".into(),
             profile: "peer-root".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
 
         let status = test_control_frame_response(
@@ -2508,6 +2542,7 @@ mod tests {
             label: "peer-operator".into(),
             profile: "peer-operator".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
         let denied = test_control_frame_response(
             r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
@@ -3120,7 +3155,7 @@ mod tests {
             // override (the ladder classifies the HTTP leaf as Task).
             ("api_coordinator_route", Row, Some(Op::PeerManage)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
-            ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
             ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
@@ -3386,10 +3421,13 @@ mod tests {
         // signed-org doorbell quartet), and the F5 peers/coordinator
         // family (registry list/add/remove, eligible, the quick
         // controls — message/task/approval, the three signal relays,
-        // the pairing set, and the coordinator route). The `api_transfer_*`
-        // methods join when their HTTP rows land (task #6, /api/transfers);
-        // adding or dropping an entry updates this list in the same change,
-        // deliberately. The F6 credential-custody family (api_credential_*,
+        // the pairing set, and the coordinator route), plus the
+        // `api_transfer_*` sextet riding the S9 /api/transfers rows
+        // (task #6 / F1c — the SPA feature-detects the rows with one
+        // GET probe before using the lane, so old daemons keep honest
+        // availability); adding or dropping an entry updates this list
+        // in the same change, deliberately. The F6 credential-custody
+        // family (api_credential_*,
         // api_daemon_vault_*) is deliberately NOT here and stays out:
         // custody is tunnel-scoped by design with no HTTP rows planned
         // (docs/src/credential-custody.md; the transport design parks
@@ -3404,6 +3442,12 @@ mod tests {
             "api_fs_write",
             "api_fs_rename",
             "api_fs_delete",
+            "api_transfer_jobs",
+            "api_transfer_job_create",
+            "api_transfer_upload_chunk",
+            "api_transfer_upload_commit",
+            "api_transfer_job_delete",
+            "api_transfer_download_read",
             "api_session_current_uploads",
             "api_session_current_upload",
             "api_session_current_upload_raw",
@@ -4068,6 +4112,7 @@ mod tests {
                     read_roots: vec![],
                     write_roots: vec![dir.path().to_path_buf()],
                 },
+                attributed: None,
             };
             rt
         };

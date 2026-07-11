@@ -1137,7 +1137,8 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::None,
         RouteHandlerId::SessionsStream,
         "NDJSON stream of the session list",
-    ),
+    )
+    .with_tunnel(tunnel_method("api_sessions_stream")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions/search"),

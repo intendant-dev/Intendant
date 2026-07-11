@@ -1406,6 +1406,71 @@ async fn transfer_jobs_round_trip_over_direct_http() {
     assert_eq!(fallback["deleted"], true, "{fallback}");
 }
 
+/// The Stream lane over direct HTTP (transport-unification S10):
+/// `GET /api/sessions/stream` answers the NDJSON head (EOF-delimited,
+/// `application/x-ndjson`) and the shared line source's lifecycle —
+/// start, the hydrating phase marker, the replace payload, done — as
+/// parseable one-object lines, against the real daemon binary.
+#[tokio::test]
+async fn sessions_stream_serves_ndjson_over_direct_http() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{port}/api/sessions/stream?limit=50"
+        ))
+        .send()
+        .await
+        .expect("stream response");
+    assert_eq!(response.status().as_u16(), 200, "{}", daemon.log_tail());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+    // EOF-delimited: no Content-Length on the streamed head.
+    assert!(response.headers().get("content-length").is_none());
+
+    let body = response.text().await.expect("stream body");
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("one JSON object per NDJSON line"))
+        .collect();
+    assert!(events.len() >= 3, "{body}");
+    assert_eq!(events.first().unwrap()["type"], "start", "{body}");
+    assert_eq!(events.first().unwrap()["limit"], 50, "{body}");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "phase" && event["phase"] == "hydrating"),
+        "{body}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "replace" && event["sessions"].is_array()),
+        "{body}"
+    );
+    assert_eq!(events.last().unwrap()["type"], "done", "{body}");
+}
+
 /// The display-request rail end to end: a caller rings the user-display
 /// doorbell (`ctl display request` → the `request_user_display` tool), a
 /// dashboard surface (here: a raw `/ws` client) receives the dedicated

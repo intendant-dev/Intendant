@@ -1478,6 +1478,46 @@ pub(crate) async fn handle_peer_file_transfer_signal(
 /// and future dashboard RPC. The federation transport authenticates the primary
 /// daemon; the resulting DataChannel runtime then enforces that primary's
 /// approved peer profile and filesystem roots per frame/method.
+/// Resolve delegation-lane attribution for a relayed dashboard-control
+/// offer (docs/src/trust-tiers.md § Two lanes). Pure core — the caller
+/// (the transport edge) resolves the ambient IAM state and the daemon's
+/// own card id:
+/// - fields absent → `Ok(None)`: an unattributed connection from a
+///   dashboard that predates the field (admitted; the peer profile is
+///   the ceiling either way).
+/// - valid signature → `Ok(Some(_))`, with the enrolled principal's
+///   label when the key matches one in the target's local IAM.
+/// - present-but-invalid (bad signature, stale timestamp, wrong target
+///   id, spliced SDP/nonce) → `Err`: the caller refuses the offer, so a
+///   relay cannot tamper with an attributable handshake and keep it
+///   alive as merely unattributed.
+pub(crate) fn resolve_peer_offer_attribution(
+    fields: &crate::access::client_key::ClientKeyOfferFields,
+    local_card_id: &str,
+    client_nonce: &str,
+    sdp: &str,
+    now_unix_ms: i64,
+    iam_state: Option<&crate::access::iam::LocalIamState>,
+) -> Result<Option<crate::dashboard_control::PeerAttribution>, String> {
+    let verified = match fields.verify(local_card_id, client_nonce, sdp, now_unix_ms)? {
+        Some(verified) => verified,
+        None => return Ok(None),
+    };
+    let enrolled_label = iam_state.and_then(|state| {
+        crate::access::iam::principal_for_client_key(
+            state,
+            &verified.fingerprint,
+            "peer-dashboard-control",
+        )
+        .map(|principal| principal.label)
+    });
+    Ok(Some(crate::dashboard_control::PeerAttribution {
+        fingerprint: verified.fingerprint,
+        public_key_b64u: verified.public_key_b64u,
+        enrolled_label,
+    }))
+}
+
 pub(crate) async fn handle_peer_dashboard_control_signal(
     session_id: String,
     signal: crate::peer::WebRtcSignal,
@@ -1507,6 +1547,7 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             sdp,
             advertise_tcp_via_url,
             client_nonce,
+            client_key,
         } => {
             let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
                 Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
@@ -1535,11 +1576,62 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                 });
                 return;
             };
+            // Delegation-lane attribution (docs/src/trust-tiers.md § Two
+            // lanes). The transport edge resolves the ambient IAM state;
+            // the resolution itself is the testable core below.
+            let iam_state = {
+                let cert_dir = crate::access::backend::select_backend().cert_dir();
+                crate::access::iam::load_state(&cert_dir).ok()
+            };
+            let attributed = match resolve_peer_offer_attribution(
+                &client_key,
+                registry.local_card_id().as_str(),
+                client_nonce.as_deref().unwrap_or(""),
+                &sdp,
+                crate::access::client_key::now_unix_ms(),
+                iam_state.as_ref(),
+            ) {
+                Ok(attributed) => attributed,
+                Err(reason) => {
+                    // Present-but-invalid signature: a relay tampering
+                    // with the handshake looks exactly like this — refuse
+                    // the offer rather than admit an unattributable
+                    // channel that claimed to be attributable.
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing dashboard-control offer: client-key attribution failed (session={session_id}): {reason}"
+                        ),
+                        turn: None,
+                    });
+                    return;
+                }
+            };
+            if let Some(attributed) = attributed.as_ref() {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "info".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dashboard-control offer attributed to {} (key {}…, via peer {}, session={session_id})",
+                        attributed
+                            .enrolled_label
+                            .as_deref()
+                            .unwrap_or("unenrolled key"),
+                        &attributed.fingerprint[..attributed.fingerprint.len().min(12)],
+                        identity.label,
+                    ),
+                    turn: None,
+                });
+            }
             let grant = crate::dashboard_control::DashboardControlGrant::Peer {
                 fingerprint: identity.fingerprint,
                 label: identity.label,
                 profile: identity.profile,
                 filesystem: identity.filesystem,
+                attributed,
             };
             match registry
                 .answer_offer_with_session_id_grant_and_tcp(
@@ -2386,6 +2478,123 @@ pub(crate) fn is_public_peer_access_request_path(request_line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn iam_state_with_enrolled_key(fingerprint: &str) -> crate::access::iam::LocalIamState {
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:client:tablet".to_string(),
+            kind: "browser_certificate".to_string(),
+            label: "Living-room tablet".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "client_key",
+                "fingerprint": fingerprint,
+            })],
+            notes: None,
+            created_at_unix_ms: Some(1),
+        });
+        // The lookup binds a principal only through an active grant.
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:client:tablet".to_string(),
+            principal_id: "principal:client:tablet".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:operator".to_string(),
+            policy_id: String::new(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: String::new(),
+            created_at_unix_ms: Some(1),
+            revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
+            issued_via: None,
+            fs_scope: None,
+        });
+        state
+    }
+
+    #[test]
+    fn peer_offer_attribution_absent_fields_admit_unattributed() {
+        let attributed = resolve_peer_offer_attribution(
+            &Default::default(),
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            1_700_000_000_000,
+            None,
+        )
+        .expect("absent fields are not an error");
+        assert!(attributed.is_none());
+    }
+
+    #[test]
+    fn peer_offer_attribution_binds_valid_signature_and_enrollment() {
+        use crate::access::client_key::test_support::{generate_key, sign};
+        let key = generate_key();
+        let ts = 1_700_000_000_000;
+        let fields = crate::access::client_key::ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign(&key, "daemon-b", "nonce-1", "v=0 sdp", ts)),
+            client_key_ts: Some(ts),
+            ..Default::default()
+        };
+        // Unenrolled key: attributed, no label.
+        let attributed = resolve_peer_offer_attribution(
+            &fields,
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            ts + 500,
+            None,
+        )
+        .expect("valid signature verifies")
+        .expect("attribution present");
+        assert!(attributed.enrolled_label.is_none());
+        assert!(!attributed.fingerprint.is_empty());
+        // Enrolled key: the principal's label rides along.
+        let state = iam_state_with_enrolled_key(&attributed.fingerprint);
+        let enrolled = resolve_peer_offer_attribution(
+            &fields,
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            ts + 500,
+            Some(&state),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            enrolled.enrolled_label.as_deref(),
+            Some("Living-room tablet")
+        );
+    }
+
+    #[test]
+    fn peer_offer_attribution_refuses_spliced_or_misdirected_offers() {
+        use crate::access::client_key::test_support::{generate_key, sign};
+        let key = generate_key();
+        let ts = 1_700_000_000_000;
+        let fields = crate::access::client_key::ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign(&key, "daemon-b", "nonce-1", "v=0 sdp", ts)),
+            client_key_ts: Some(ts),
+            ..Default::default()
+        };
+        // A relay swapping the SDP (splice), the nonce, or forwarding the
+        // signed offer to a different target must all fail closed.
+        for (card, nonce, sdp) in [
+            ("daemon-b", "nonce-1", "v=0 TAMPERED"),
+            ("daemon-b", "nonce-2", "v=0 sdp"),
+            ("daemon-c", "nonce-1", "v=0 sdp"),
+        ] {
+            assert!(
+                resolve_peer_offer_attribution(&fields, card, nonce, sdp, ts + 500, None).is_err(),
+                "must refuse: card={card} nonce={nonce} sdp={sdp}"
+            );
+        }
+    }
 
     #[test]
     fn public_peer_access_request_path_is_narrow() {
