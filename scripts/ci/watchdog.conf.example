@@ -18,6 +18,15 @@ CACHE_ROOTS=""
 PRUNE_DAYS=7      # drop cache keys with no run this long
 CAP_GB=50         # total per cache root (2 listeners x 25G budget)
 
+# Memory-pressure assignment gate (see README "fleet-watchdog"): pauses
+# NEW job assignment on sustained pressure; cannot constrain builds
+# already running (the rustc governor bounds those). Hysteresis is in
+# consecutive watchdog ticks (5 min each).
+#MEM_PRESSURE_LEVEL=4   # macOS kern.memorystatus_vm_pressure_level: 2=warning, 4=critical
+#MEM_PSI_PAUSE=40       # Linux /proc/pressure/memory `some avg10` percentage
+#MEM_PAUSE_TICKS=2      # consecutive pressured ticks before pausing
+#MEM_RESUME_TICKS=2     # consecutive normal ticks before resuming
+
 VOLUME="/"
 STATE_DIR="/var/db/intendant-ci"        # /var/lib/intendant-ci on Linux
 LOG="/var/log/intendant-ci-watchdog.log"
