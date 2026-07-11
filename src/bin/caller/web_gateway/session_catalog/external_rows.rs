@@ -688,6 +688,17 @@ pub(crate) fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<se
 pub(crate) async fn recordings_list_response_body(
     recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
 ) -> String {
+    recordings_list_response_body_in_daemon_dir(
+        recording_registry,
+        &crate::debug::daemon_recordings_dir(),
+    )
+    .await
+}
+
+pub(crate) async fn recordings_list_response_body_in_daemon_dir(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+    daemon_dir: &Path,
+) -> String {
     let mut all_entries = Vec::new();
 
     if let Some(rec_reg) = recording_registry {
@@ -714,8 +725,7 @@ pub(crate) async fn recordings_list_response_body(
         }
     }
 
-    let daemon_dir = crate::debug::daemon_recordings_dir();
-    for entry in list_recording_streams(&daemon_dir) {
+    for entry in list_recording_streams(daemon_dir) {
         all_entries.push(entry);
     }
 
@@ -1062,6 +1072,169 @@ pub(crate) fn read_frame_asset_file_range(
     Ok((bytes, total_size, end))
 }
 
+// ── Live (daemon-scoped) recordings + HQ-frame byte lanes
+// (transport-unification S8). The legacy non-API `/recordings*` and
+// `/frames/{id}` chain arms and the tunnel residue methods
+// (`api_recordings`, `api_recording_asset`) share these fns: one store
+// resolution (registry segments with the daemon-recordings-dir CSV
+// fallback, session-dir-first file candidates), rendered per lane — the
+// chain's historical full-body shapes here as [`ApiResponse`]s, the
+// tunnel's ranged byte-stream carriage in
+// `dashboard_control::api_media`. The `_in_daemon_dir` variants are the
+// hermetic cores (tests inject a tempdir); the ambient wrappers resolve
+// `crate::debug::daemon_recordings_dir()` once at the transport edge.
+
+/// The historical `text/plain` error tail the `/recordings*` and
+/// `/frames/*` chain arms answer with (`Connection: close`, nothing
+/// else). Byte lane so the content type survives the render.
+pub(crate) fn live_media_text_plain_api_response(status: u16, body: &str) -> ApiResponse {
+    ApiResponse::Bytes {
+        status,
+        content_type: "text/plain".to_string(),
+        headers: vec![("Connection", "close".to_string())],
+        bytes: BytesPayload::InMemory(body.as_bytes().to_vec()),
+        meta: serde_json::Value::Null,
+    }
+}
+
+/// `GET /recordings` (chain) / tunnel `api_recordings`: every stream the
+/// live registry knows plus the daemon-scoped store, under the
+/// historical `no-cache` json tail.
+pub(crate) async fn recordings_list_api_response(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+) -> ApiResponse {
+    recordings_list_api_response_in_daemon_dir(
+        recording_registry,
+        &crate::debug::daemon_recordings_dir(),
+    )
+    .await
+}
+
+pub(crate) async fn recordings_list_api_response_in_daemon_dir(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+    daemon_dir: &Path,
+) -> ApiResponse {
+    let body = recordings_list_response_body_in_daemon_dir(recording_registry, daemon_dir).await;
+    ApiResponse::json(200, JsonBody::PreSerialized(body))
+}
+
+/// Live-registry recording-asset resolution shared by both lanes: the
+/// registry's segments with the daemon-dir CSV fallback when the stream
+/// has none, then the dir-pair candidates (session recordings dir first,
+/// daemon dir second) through the one asset vocabulary
+/// ([`resolve_recording_asset_from_dir_pair`]).
+pub(crate) async fn resolve_live_recording_asset_in_daemon_dir(
+    registry: Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
+    daemon_dir: &Path,
+    stream_name: &str,
+    asset: &str,
+) -> Result<RecordingAsset, (u16, serde_json::Value)> {
+    let (session_dir, mut segments) = {
+        let reg = registry.read().await;
+        (reg.session_dir().to_path_buf(), reg.segments(stream_name))
+    };
+    if segments.is_empty() {
+        let stream_dir = daemon_dir.join(stream_name);
+        segments =
+            crate::recording::parse_segment_csv_pub(&stream_dir.join("segments.csv"), &stream_dir);
+    }
+    resolve_recording_asset_from_dir_pair(
+        Some(session_dir.join("recordings").join(stream_name)),
+        Some(daemon_dir.join(stream_name)),
+        segments,
+        asset,
+    )
+}
+
+/// `GET /recordings/{stream}/{asset}` (chain): the historical full-body
+/// shapes over the shared live resolution. `path_part` arrives verbatim
+/// from the request line (historically including any query string, which
+/// then fails the asset vocabulary — pinned by the goldens):
+/// segments listing json and the HLS playlist under `no-cache`, segment
+/// files under `public, max-age=3600`, and the `text/plain` error trio
+/// (`Recording not available` / `Not found` / `Invalid filename` /
+/// `Segment not found`).
+pub(crate) async fn live_recordings_path_api_response(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+    daemon_dir: &Path,
+    path_part: &str,
+) -> ApiResponse {
+    let Some(registry) = recording_registry else {
+        return live_media_text_plain_api_response(404, "Recording not available");
+    };
+    let parts: Vec<&str> = path_part.split('/').collect();
+    if parts.len() != 2 {
+        return live_media_text_plain_api_response(404, "Not found");
+    }
+    let (stream_name, asset) = (parts[0], parts[1]);
+    match resolve_live_recording_asset_in_daemon_dir(registry, daemon_dir, stream_name, asset).await
+    {
+        // Segments listing + HLS playlist: in-memory renders under the
+        // historical no-cache tail (content type from the vocabulary).
+        Ok(RecordingAsset::Bytes {
+            bytes,
+            content_type,
+            filename: _,
+        }) => ApiResponse::Bytes {
+            status: 200,
+            content_type: content_type.to_string(),
+            headers: vec![
+                ("Cache-Control", "no-cache".to_string()),
+                ("Connection", "close".to_string()),
+            ],
+            bytes: BytesPayload::InMemory(bytes),
+            meta: serde_json::Value::Null,
+        },
+        // Segment file: full read under the historical cacheable tail; a
+        // vanished-underfoot file keeps the historical 404 wording.
+        Ok(RecordingAsset::File {
+            path,
+            content_type,
+            filename: _,
+        }) => match tokio::fs::read(&path).await {
+            Ok(data) => ApiResponse::Bytes {
+                status: 200,
+                content_type: content_type.to_string(),
+                headers: vec![
+                    ("Cache-Control", "public, max-age=3600".to_string()),
+                    ("Connection", "close".to_string()),
+                ],
+                bytes: BytesPayload::InMemory(data),
+                meta: serde_json::Value::Null,
+            },
+            Err(_) => live_media_text_plain_api_response(404, "Segment not found"),
+        },
+        // The shared vocabulary's json errors map onto the chain's
+        // historical text/plain wordings: 400 = the asset name failed the
+        // vocabulary ("Invalid filename"), anything else = not found in
+        // either dir ("Segment not found").
+        Err((400, _)) => live_media_text_plain_api_response(400, "Invalid filename"),
+        Err((status, _)) => live_media_text_plain_api_response(status, "Segment not found"),
+    }
+}
+
+/// `GET /frames/{frame_id}` (chain): one HQ frame from the live frame
+/// registry under the historical immutable-cache tail; the registry read
+/// stays at the transport edge (async lock), this renders its result.
+pub(crate) fn frame_hq_api_response(jpeg: Option<Vec<u8>>) -> ApiResponse {
+    match jpeg {
+        Some(data) => ApiResponse::Bytes {
+            status: 200,
+            content_type: "image/jpeg".to_string(),
+            headers: vec![
+                (
+                    "Cache-Control",
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+                ("Connection", "close".to_string()),
+            ],
+            bytes: BytesPayload::InMemory(data),
+            meta: serde_json::Value::Null,
+        },
+        None => live_media_text_plain_api_response(404, "Frame not found"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,6 +1269,297 @@ mod tests {
                 "seg_00001.mp4\n",
                 "#EXT-X-ENDLIST\n",
             )
+        );
+    }
+
+    // ── S8 goldens: the legacy `/recordings*` + `/frames/*` chain wire
+    // bytes. Expected framing is hand-written from the historical inline
+    // chain arms (`http_dispatch.rs`) so the S8 re-plumb onto the neutral
+    // fns above can be proven byte-identical (design §6 S8, risk R1);
+    // store-dependent bodies come from store-layer fns the conversion
+    // does not touch, over injected tempdirs — the ambient
+    // `daemon_recordings_dir()` is never read.
+
+    fn golden_live_transcript(response: ApiResponse) -> String {
+        String::from_utf8_lossy(&crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        ))
+        .into_owned()
+    }
+
+    fn golden_live_registry(
+        session_dir: &Path,
+    ) -> Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>> {
+        Arc::new(tokio::sync::RwLock::new(
+            crate::recording::RecordingRegistry::new(
+                session_dir,
+                crate::project::RecordingConfig::default(),
+            ),
+        ))
+    }
+
+    /// One playable stream under `<root>/<stream>`: a csv row plus the
+    /// on-disk segment (`list_recording_streams` skips streams without
+    /// playable bytes).
+    fn golden_seed_stream(root: &Path, stream: &str, filename: &str, bytes: &[u8]) {
+        let stream_dir = root.join(stream);
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        std::fs::write(stream_dir.join(filename), bytes).unwrap();
+        std::fs::write(
+            stream_dir.join("segments.csv"),
+            format!("{filename},0.0,2.0\n"),
+        )
+        .unwrap();
+    }
+
+    fn golden_live_text_plain_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn golden_live_recordings_list_transcript() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let daemon_dir = tempfile::tempdir().unwrap();
+        golden_seed_stream(
+            &session_dir.path().join("recordings"),
+            "screen",
+            "seg_00001.mp4",
+            b"live session segment bytes",
+        );
+        golden_seed_stream(daemon_dir.path(), "daemon0", "seg_00001.mp4", b"daemon segment");
+        let registry = golden_live_registry(session_dir.path());
+
+        // The framing pin: the body is the untouched store listing
+        // (registry streams first, then the daemon-scoped store).
+        let body = recordings_list_response_body_in_daemon_dir(
+            Some(registry.clone()),
+            daemon_dir.path(),
+        )
+        .await;
+        assert!(body.contains("\"stream_name\":\"daemon0\""), "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.as_array().map(|entries| entries.len()), Some(2));
+
+        let transcript = golden_live_transcript(
+            recordings_list_api_response_in_daemon_dir(Some(registry), daemon_dir.path()).await,
+        );
+        assert_eq!(
+            transcript,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        );
+
+        // No live registry: the daemon-scoped store still lists.
+        let body =
+            recordings_list_response_body_in_daemon_dir(None, daemon_dir.path()).await;
+        let transcript = golden_live_transcript(
+            recordings_list_api_response_in_daemon_dir(None, daemon_dir.path()).await,
+        );
+        assert!(transcript.ends_with(&body), "{transcript}");
+        assert!(transcript.starts_with("HTTP/1.1 200 OK\r\n"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn golden_live_recording_segments_and_playlist_transcripts() {
+        // Registry with no segments for the stream: the daemon-dir csv
+        // fallback resolves (the historical chain's fallback branch).
+        let session_dir = tempfile::tempdir().unwrap();
+        let daemon_dir = tempfile::tempdir().unwrap();
+        golden_seed_stream(daemon_dir.path(), "display_0", "seg_00001.mp4", b"daemon bytes");
+        let registry = golden_live_registry(session_dir.path());
+
+        let expected_body = serde_json::to_string(&vec![serde_json::json!({
+            "filename": "seg_00001.mp4",
+            "start_secs": 0.0,
+            "end_secs": 2.0,
+        })])
+        .unwrap();
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(
+                Some(registry.clone()),
+                daemon_dir.path(),
+                "display_0/segments",
+            )
+            .await,
+        );
+        assert_eq!(
+            transcript,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_body}",
+                expected_body.len()
+            )
+        );
+
+        // HLS playlist over the same segments (store-layer body).
+        let segments = crate::recording::parse_segment_csv_pub(
+            &daemon_dir.path().join("display_0").join("segments.csv"),
+            &daemon_dir.path().join("display_0"),
+        );
+        let expected_playlist = recording_playlist_m3u8(&segments);
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(
+                Some(registry),
+                daemon_dir.path(),
+                "display_0/playlist.m3u8",
+            )
+            .await,
+        );
+        assert_eq!(
+            transcript,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_playlist}",
+                expected_playlist.len()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_live_recording_segment_file_transcripts() {
+        // The session recordings dir wins over the daemon dir when both
+        // hold the filename (the historical candidate order), and the
+        // `.ts` leaf serves under `video/mp2t`.
+        let session_dir = tempfile::tempdir().unwrap();
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let session_bytes = b"session segment bytes".to_vec();
+        golden_seed_stream(
+            &session_dir.path().join("recordings"),
+            "display_0",
+            "seg_00001.mp4",
+            &session_bytes,
+        );
+        golden_seed_stream(daemon_dir.path(), "display_0", "seg_00001.mp4", b"daemon copy");
+        std::fs::write(
+            daemon_dir.path().join("display_0").join("seg_00002.ts"),
+            b"transport stream bytes",
+        )
+        .unwrap();
+        let registry = golden_live_registry(session_dir.path());
+
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(
+                Some(registry.clone()),
+                daemon_dir.path(),
+                "display_0/seg_00001.mp4",
+            )
+            .await,
+        );
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            session_bytes.len()
+        );
+        expected.push_str(&String::from_utf8(session_bytes).unwrap());
+        assert_eq!(transcript, expected);
+
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(
+                Some(registry),
+                daemon_dir.path(),
+                "display_0/seg_00002.ts",
+            )
+            .await,
+        );
+        assert!(
+            transcript.starts_with(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 22\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n"
+            ),
+            "{transcript}"
+        );
+        assert!(transcript.ends_with("transport stream bytes"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn golden_live_recording_error_transcripts() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let registry = golden_live_registry(session_dir.path());
+
+        // No registry wired: everything under /recordings/ answers 404.
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(None, daemon_dir.path(), "display_0/segments")
+                .await,
+        );
+        assert_eq!(
+            transcript,
+            golden_live_text_plain_transcript("404 Not Found", "Recording not available")
+        );
+
+        // Path shapes other than {stream}/{asset} answer 404.
+        for path_part in ["display_0", "a/b/c"] {
+            let transcript = golden_live_transcript(
+                live_recordings_path_api_response(
+                    Some(registry.clone()),
+                    daemon_dir.path(),
+                    path_part,
+                )
+                .await,
+            );
+            assert_eq!(
+                transcript,
+                golden_live_text_plain_transcript("404 Not Found", "Not found"),
+                "{path_part}"
+            );
+        }
+
+        // Asset names outside the vocabulary answer 400 — including the
+        // historical query-string rider (never split off the request
+        // line) and traversal shapes.
+        for path_part in [
+            "display_0/evil.mp4",
+            "display_0/seg_00001.mp4?t=5",
+            "display_0/..",
+        ] {
+            let transcript = golden_live_transcript(
+                live_recordings_path_api_response(
+                    Some(registry.clone()),
+                    daemon_dir.path(),
+                    path_part,
+                )
+                .await,
+            );
+            assert_eq!(
+                transcript,
+                golden_live_text_plain_transcript("400 Bad Request", "Invalid filename"),
+                "{path_part}"
+            );
+        }
+
+        // A valid name that exists in neither dir answers 404.
+        let transcript = golden_live_transcript(
+            live_recordings_path_api_response(
+                Some(registry),
+                daemon_dir.path(),
+                "display_0/seg_09999.mp4",
+            )
+            .await,
+        );
+        assert_eq!(
+            transcript,
+            golden_live_text_plain_transcript("404 Not Found", "Segment not found")
+        );
+    }
+
+    #[test]
+    fn golden_frame_hq_transcripts() {
+        let jpeg = b"hq frame jpeg bytes".to_vec();
+        let transcript = golden_live_transcript(frame_hq_api_response(Some(jpeg.clone())));
+        let mut expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n",
+            jpeg.len()
+        );
+        expected.push_str(&String::from_utf8(jpeg).unwrap());
+        assert_eq!(transcript, expected);
+
+        let transcript = golden_live_transcript(frame_hq_api_response(None));
+        assert_eq!(
+            transcript,
+            golden_live_text_plain_transcript("404 Not Found", "Frame not found")
         );
     }
 
