@@ -32,10 +32,12 @@
 // (overview/enrollment/connect/tier + IAM grant writes), the F5
 // peers/approvals/coordinator family (peer list + quick controls, the
 // pairing dialogs, the coordinator forms, and the peer WebRTC signal
-// relays), and the F6 credential-custody family (vault leases, the
+// relays), the F6 credential-custody family (vault leases, the
 // custody trail, the daemon vault store + deposit lane, client-egress
 // registration/probe — tunnel-only methods whose per-cause availability
-// the vault UI surfaces); the remaining
+// the vault UI surfaces), and the F1c transfer-jobs adapter (the
+// resumable jobs protocol over the S9 /api/transfers rows, presence
+// feature-detected through the probe registry below); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -77,10 +79,14 @@
 // coordinator family (the peer registry list/add/remove, eligible,
 // quick controls — message/task/approval, the three WebRTC signal
 // relays, the pairing set, and the coordinator route; their rows
-// delegate IAM to the federation ladder, S7). The
-// `api_transfer_*` methods are deliberately absent: they have no HTTP rows
-// until the server-track stage that adds /api/transfers (task #6); F1 adds
-// their entries when those rows land. The F6 credential-custody family
+// delegate IAM to the federation ladder, S7), and the transfer-jobs
+// family (task #6 / F1c): the six /api/transfers rows (S9) twinning the
+// datachannel `api_transfer_*` methods. Unlike every other family, a
+// deployed daemon may predate those rows, so their entries carry
+// `probe: 'transfers'` — the availability derivation and the transfers
+// pump consult the one-shot GET /api/transfers probe (below) before
+// treating the HTTP lane as present (design §4: 404/405 ⇒ old daemon ⇒
+// legacy behavior + honest availability). The F6 credential-custody family
 // (api_credential_*, api_daemon_vault_*) is deliberately absent too, and
 // stays so: custody is tunnel-scoped by design — no HTTP rows exist or
 // are planned (docs/src/credential-custody.md; the transport design
@@ -101,7 +107,9 @@
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
-// the HTTP twin takes verbatim (the managed-context tunnel contract).
+// the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `probe` = the twin's rows may be absent on a deployed daemon; name the
+// DAEMON_API_HTTP_PROBES entry whose result gates the http-only lane.
 // `mutation` is DERIVED from the verb (POST/DELETE), never
 // stored — that derivation is the fallback policy (§3.7).
 const DAEMON_API_HTTP_MAP = Object.freeze({
@@ -112,6 +120,12 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
   api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
   api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
+  api_transfer_jobs: { verb: 'GET', path: '/api/transfers', query: ['id', 'resume_token'], probe: 'transfers' },
+  api_transfer_job_create: { verb: 'POST', path: '/api/transfers', probe: 'transfers' },
+  api_transfer_upload_chunk: { verb: 'POST', path: '/api/transfers/{id}/chunk', query: ['offset', 'resume_token'], lane: 'upload', encode: 'raw', probe: 'transfers' },
+  api_transfer_upload_commit: { verb: 'POST', path: '/api/transfers/{id}/commit', probe: 'transfers' },
+  api_transfer_job_delete: { verb: 'DELETE', path: '/api/transfers/{id}', probe: 'transfers' },
+  api_transfer_download_read: { verb: 'GET', path: '/api/transfers/{id}/download', lane: 'bytes', probe: 'transfers' },
   api_session_current_uploads: { verb: 'GET', path: '/api/session/current/uploads' },
   api_session_current_upload: { verb: 'POST', path: '/api/session/current/uploads', query: ['name', 'destination'], lane: 'upload', encode: 'raw' },
   api_session_current_upload_raw: { verb: 'GET', path: '/api/session/current/uploads/{id}/raw', lane: 'bytes' },
@@ -362,6 +376,52 @@ function daemonApiEnsureHttpFallback(method, opts, tunnelError) {
     );
   }
   if (tunnelError && !policy.replayAfterAttempt) throw tunnelError;
+}
+
+// ── HTTP row-presence probes (F1c, design §4) ─────────────────────────────
+// Most descriptor rows shipped with (or before) the facade, so map
+// presence == daemon presence. The transfer-jobs rows (task #6) landed
+// after deployed daemons existed, so their entries are `probe`-gated:
+// ONE GET probe per page load answers "does this daemon serve the rows?"
+// — 404/405 ⇒ old daemon (absent ⇒ legacy behavior + honest
+// availability); any delivered response, auth walls included, proves the
+// rows exist (the real request surfaces its own denial). A transport
+// failure leaves the state 'unknown' so a later ensure() re-probes; the
+// cached verdict feeds daemonApiAvailability below.
+const DAEMON_API_HTTP_PROBES = {
+  transfers: { path: '/api/transfers', state: 'unknown', promise: null },
+};
+
+function daemonApiHttpProbeState(name) {
+  return DAEMON_API_HTTP_PROBES[name]?.state || 'unknown';
+}
+
+// Resolve (and cache) a probe: Promise<boolean> — "the rows are present".
+// Callers that need a lane DECISION await this; sync availability reads
+// the cached state. Never called in connect mode (no HTTP lane there) —
+// the transfers pump gates on dashboardConnectModeEnabled() first.
+async function daemonApiEnsureHttpProbe(name) {
+  const probe = DAEMON_API_HTTP_PROBES[name];
+  if (!probe) return false;
+  if (probe.state !== 'unknown') return probe.state === 'present';
+  if (!probe.promise) {
+    probe.promise = (async () => {
+      try {
+        const resp = await authedFetch(probe.path, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: dashboardComposeFetchSignal(null, 15000),
+        });
+        probe.state = resp.status === 404 || resp.status === 405 ? 'absent' : 'present';
+      } catch (_) {
+        probe.state = 'unknown';
+      } finally {
+        probe.promise = null;
+      }
+      return probe.state === 'present';
+    })();
+  }
+  return probe.promise;
 }
 
 // ── HTTP adapter ──────────────────────────────────────────────────────────
@@ -854,7 +914,8 @@ async function daemonApiStream(method, params = {}, opts = {}, onEvent = {}) {
 // `<method>_available` booleans (server-derived from its method table —
 // false rolls denial and runtime-not-ready into one honest "no");
 // connect-mode policy; HTTP-map presence (a direct dashboard with no
-// tunnel still reports twinned methods as reachable). The scattered
+// tunnel still reports twinned methods as reachable), qualified by the
+// row-presence probes for `probe`-gated entries. The scattered
 // canUse*/`*Available` probes become one-line derivations over this at
 // their family flips.
 function daemonApiTunnelMethodAvailability(transport, method) {
@@ -910,7 +971,18 @@ function daemonApiAvailability(method, target = null) {
   const transport = dashboardControlTransport;
   if (transport && transport.canUseRpc()) return daemonApiTunnelMethodAvailability(transport, method);
   if (dashboardConnectModeEnabled()) return { ok: false, reason: 'transport-down' };
-  if (DAEMON_API_HTTP_MAP[method]) return { ok: true, reason: 'http-only' };
+  const spec = DAEMON_API_HTTP_MAP[method];
+  if (spec) {
+    // Probe-gated twins (the transfer-jobs rows): a probed-absent daemon
+    // answers the honest 'unsupported', exactly like a tunnel daemon too
+    // old for the method. Un-probed stays optimistic — the same posture
+    // as a tunnel whose hello_ack has not landed (the request itself
+    // reports the truth), and lane DECISIONS await the probe first.
+    if (spec.probe && daemonApiHttpProbeState(spec.probe) === 'absent') {
+      return { ok: false, reason: 'unsupported' };
+    }
+    return { ok: true, reason: 'http-only' };
+  }
   return { ok: false, reason: 'transport-down' };
 }
 
@@ -940,6 +1012,8 @@ const daemonApi = Object.freeze({
   stream: daemonApiStream,
   availability: daemonApiAvailability,
   fallbackPolicy: daemonApiFallbackPolicy,
+  ensureHttpProbe: daemonApiEnsureHttpProbe,
+  httpProbeState: daemonApiHttpProbeState,
   httpMap: DAEMON_API_HTTP_MAP,
   descriptorChecksum: daemonApiDescriptorChecksum,
   Error: DaemonApiError,
@@ -974,6 +1048,7 @@ window.qa = Object.assign(window.qa || {}, {
         http: {
           connectMode: Boolean(dashboardConnectModeEnabled()),
           reachable: !dashboardConnectModeEnabled(),
+          transfersProbe: daemonApiHttpProbeState('transfers'),
         },
       },
       availability: {
@@ -982,6 +1057,9 @@ window.qa = Object.assign(window.qa || {}, {
         api_session_current_upload: daemonApiAvailability('api_session_current_upload'),
         api_sessions: daemonApiAvailability('api_sessions'),
         api_sessions_stream: daemonApiAvailability('api_sessions_stream'),
+        // Probe-gated transfers sample (F1c): 'http-only' flips to
+        // 'unsupported' once the rows probe answers absent.
+        api_transfer_job_create: daemonApiAvailability('api_transfer_job_create'),
         // Tunnel-only custody sample (F6): 'denied' vs 'unsupported' vs
         // 'transport-down' is directly observable here — no HTTP twin
         // ever answers for it.
