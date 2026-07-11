@@ -1422,19 +1422,22 @@ window.intendantDashboardControl = {
     return { skipped: false, threw, error, wsReplayCount };
   },
   async _debugProbePeerMutationConnectNoHttp() {
+    // Probes the path the UI actually takes (transport F5): peer add rides
+    // daemonApi.request, whose POST-derived mutation policy must throw the
+    // tunnel failure — never re-POST over HTTP, and never any HTTP in
+    // Connect mode. The synthetic rejection is injected at the protocol
+    // client, the same seam the facade's local tunnel adapter calls.
     if (
       !dashboardConnectModeEnabled() ||
-      !dashboardTransport ||
       !dashboardControlTransport ||
-      typeof dashboardTransport.jsonFetch !== 'function' ||
+      typeof daemonApi?.request !== 'function' ||
       typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         connectMode: dashboardConnectModeEnabled(),
-        hasDashboardTransport: Boolean(dashboardTransport),
+        hasDaemonApi: typeof daemonApi?.request === 'function',
         hasControlTransport: Boolean(dashboardControlTransport),
-        jsonFetchType: typeof dashboardTransport?.jsonFetch,
         requestType: typeof dashboardControlTransport?.request,
         threw: false,
         rpcAttempts: 0,
@@ -1462,14 +1465,10 @@ window.intendantDashboardControl = {
     let threw = false;
     let error = '';
     try {
-      await dashboardTransport.jsonFetch('api_peer_add', {
+      await daemonApi.request('api_peer_add', {
         url: 'https://127.0.0.1:9/.well-known/agent-card.json',
         persist: false,
-      }, () => authedFetch('/api/peers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      }), 'api_peer_add', { fallbackAfterRpcFailure: false });
+      });
     } catch (err) {
       threw = true;
       error = err?.message || String(err);
