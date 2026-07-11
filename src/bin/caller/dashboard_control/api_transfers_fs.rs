@@ -16,45 +16,10 @@ pub(crate) fn transfer_store_scope(runtime: &ControlRuntime) -> crate::global_st
     )
 }
 
-pub(crate) fn transfer_http_error_response(
-    id: String,
-    status: u16,
-    error: impl Into<String>,
-    label: &str,
-) -> serde_json::Value {
-    http_body_response(
-        id,
-        status,
-        serde_json::json!({
-            "ok": false,
-            "error": error.into(),
-        })
-        .to_string(),
-        label,
-    )
-}
-
-pub(crate) fn transfer_store_error_response(
-    id: String,
-    error: crate::transfer_store::TransferStoreError,
-    label: &str,
-) -> serde_json::Value {
-    transfer_http_error_response(id, error.status, error.message, label)
-}
-
-pub(crate) fn transfer_id_param(params: &serde_json::Value) -> String {
-    string_param(
-        params,
-        &[
-            "id",
-            "job_id",
-            "jobId",
-            "resume_token",
-            "resumeToken",
-            "token",
-        ],
-    )
-}
+// The job-handle alias reader moved to the neutral transfer core
+// (`web_gateway::routes_transfers`) with the S9 conversion; the
+// re-export keeps existing references compiling.
+pub(crate) use crate::web_gateway::transfer_id_param;
 
 pub(crate) fn transfer_store_task_error(
     error: tokio::task::JoinError,
@@ -72,103 +37,6 @@ pub(crate) fn transfer_json_error_message(body: &serde_json::Value) -> String {
 
 pub(crate) fn transfer_artifact_type(artifact: &serde_json::Value) -> String {
     string_param(artifact, &["type", "kind", "source_kind", "sourceKind"]).to_ascii_lowercase()
-}
-
-pub(crate) async fn transfer_create_download_job_from_params(
-    home: &std::path::Path,
-    scope: crate::global_store::StoreScope,
-    params: serde_json::Value,
-    runtime: &ControlRuntime,
-) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
-    if let Some(artifact) = params
-        .get("artifact")
-        .filter(|value| value.is_object())
-        .cloned()
-    {
-        return transfer_create_artifact_download_job(home, scope, artifact, runtime).await;
-    }
-    let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
-    if path.is_empty() {
-        return Err(crate::transfer_store::TransferStoreError::new(
-            400,
-            "missing path",
-        ));
-    }
-    tokio::task::spawn_blocking(move || crate::transfer_store::create_download_job(&scope, &path))
-        .await
-        .map_err(|e| transfer_store_task_error(e, "transfer create"))?
-}
-
-pub(crate) async fn transfer_create_upload_job_from_params(
-    scope: crate::global_store::StoreScope,
-    params: serde_json::Value,
-) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
-    let destination = string_param(
-        &params,
-        &["destination", "destination_path", "destinationPath", "path"],
-    );
-    if destination.is_empty() {
-        return Err(crate::transfer_store::TransferStoreError::new(
-            400,
-            "missing destination",
-        ));
-    }
-    let original_name = optional_string_param(
-        &params,
-        &[
-            "name",
-            "filename",
-            "file_name",
-            "fileName",
-            "original_name",
-            "originalName",
-        ],
-    )
-    .unwrap_or_else(|| "upload.bin".to_string());
-    let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-    let total_size = optional_u64_param(
-        &params,
-        &[
-            "total_size",
-            "totalSize",
-            "total_bytes",
-            "totalBytes",
-            "size",
-        ],
-    )
-    .map_err(|error| crate::transfer_store::TransferStoreError::new(400, error))?;
-    let conflict = optional_string_param(
-        &params,
-        &[
-            "conflict",
-            "conflict_policy",
-            "conflictPolicy",
-            "if_exists",
-            "ifExists",
-        ],
-    )
-    .unwrap_or_else(|| "fail".to_string());
-    let conflict_policy =
-        crate::transfer_store::TransferConflictPolicy::from_str(&conflict.to_ascii_lowercase())
-            .ok_or_else(|| {
-                crate::transfer_store::TransferStoreError::new(
-                    400,
-                    "conflict policy must be fail, rename, or overwrite",
-                )
-            })?;
-    tokio::task::spawn_blocking(move || {
-        crate::transfer_store::create_upload_job(
-            &scope,
-            &destination,
-            &original_name,
-            &mime,
-            total_size,
-            conflict_policy,
-        )
-    })
-    .await
-    .map_err(|e| transfer_store_task_error(e, "transfer create"))?
 }
 
 pub(crate) async fn transfer_create_artifact_download_job(
@@ -462,30 +330,14 @@ pub(crate) async fn transfer_create_session_frame_download_job(
 
 pub(crate) async fn api_transfer_jobs_response(
     id: String,
+    params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
-    let result =
-        tokio::task::spawn_blocking(move || crate::transfer_store::list_jobs(&scope)).await;
-    let jobs = match result {
-        Ok(jobs) => jobs,
-        Err(e) => {
-            return serde_json::json!({
-                "t": "response",
-                "id": id,
-                "ok": false,
-                "error": format!("transfer jobs task failed: {e}"),
-            });
-        }
-    };
-    http_body_response(
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    frame_api_response(
         id,
-        200,
-        serde_json::json!({
-            "ok": true,
-            "jobs": jobs,
-        })
-        .to_string(),
+        crate::web_gateway::transfer_jobs_api_response(scope, &params).await,
         "transfer jobs",
     )
 }
@@ -509,39 +361,22 @@ pub(crate) async fn api_transfer_job_create_response_from_home(
 ) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let kind = string_param(&params, &["kind", "type"]);
-    let kind = match crate::transfer_store::TransferKind::from_str(&kind.to_ascii_lowercase()) {
-        Some(kind) => kind,
-        None => {
-            return transfer_http_error_response(
-                id,
-                400,
-                "transfer kind must be download or upload",
-                "transfer create",
-            );
+    let response = match crate::web_gateway::classify_transfer_create(&params) {
+        Err(response) => response,
+        Ok(crate::web_gateway::TransferCreateRequest::Artifact(artifact)) => {
+            // The runtime-coupled arm: artifact resolution reads live
+            // session handles (report builders, staged uploads, the
+            // recording registry) — the transport edge HTTP
+            // deliberately lacks (divergence #24).
+            crate::web_gateway::transfer_job_result_api_response(
+                transfer_create_artifact_download_job(home, scope, artifact, runtime).await,
+            )
+        }
+        Ok(crate::web_gateway::TransferCreateRequest::Path(kind)) => {
+            crate::web_gateway::transfer_path_create_api_response(scope, params, kind).await
         }
     };
-    let result = match kind {
-        crate::transfer_store::TransferKind::Download => {
-            transfer_create_download_job_from_params(home, scope, params, runtime).await
-        }
-        crate::transfer_store::TransferKind::Upload => {
-            transfer_create_upload_job_from_params(scope, params).await
-        }
-    };
-    match result {
-        Ok(job) => http_body_response(
-            id,
-            200,
-            serde_json::json!({
-                "ok": true,
-                "job": job,
-            })
-            .to_string(),
-            "transfer create",
-        ),
-        Err(error) => transfer_store_error_response(id, error, "transfer create"),
-    }
+    frame_api_response(id, response, "transfer create")
 }
 
 pub(crate) async fn api_transfer_job_delete_response(
@@ -551,32 +386,11 @@ pub(crate) async fn api_transfer_job_delete_response(
 ) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let job_id = transfer_id_param(&params);
-    if job_id.is_empty() {
-        return transfer_http_error_response(id, 400, "missing id", "transfer delete");
-    }
-    let result =
-        tokio::task::spawn_blocking(move || crate::transfer_store::delete_job(&scope, &job_id))
-            .await;
-    match result {
-        Ok(Ok(deleted)) => http_body_response(
-            id,
-            200,
-            serde_json::json!({
-                "ok": true,
-                "deleted": deleted,
-            })
-            .to_string(),
-            "transfer delete",
-        ),
-        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer delete"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("transfer delete task failed: {e}"),
-        }),
-    }
+    frame_api_response(
+        id,
+        crate::web_gateway::transfer_job_delete_api_response(scope, &params).await,
+        "transfer delete",
+    )
 }
 
 pub(crate) async fn api_transfer_upload_commit_response(
@@ -586,87 +400,30 @@ pub(crate) async fn api_transfer_upload_commit_response(
 ) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let job_id = transfer_id_param(&params);
-    if job_id.is_empty() {
-        return transfer_http_error_response(id, 400, "missing id", "transfer upload commit");
-    }
-    let result = tokio::task::spawn_blocking(move || {
-        crate::transfer_store::commit_upload_job(&scope, &job_id)
-    })
-    .await;
-    match result {
-        Ok(Ok(job)) => http_body_response(
-            id,
-            200,
-            serde_json::json!({
-                "ok": true,
-                "job": job,
-            })
-            .to_string(),
-            "transfer upload commit",
-        ),
-        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer upload commit"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("transfer upload commit task failed: {e}"),
-        }),
-    }
+    frame_api_response(
+        id,
+        crate::web_gateway::transfer_upload_commit_api_response(scope, &params).await,
+        "transfer upload commit",
+    )
 }
 
+/// Terminal leg of a transfer chunk upload: the bytes arrived via
+/// `upload_start`/`upload_chunk` frames (op-level authority checked at
+/// `upload_start`; the destination was path-scoped at job create), and
+/// the spool rides the same [`crate::web_gateway::SpooledBody`] handle
+/// the HTTP chunk row streams into.
 pub(crate) async fn api_transfer_upload_chunk_task_response(
     id: String,
     upload: InboundUploadState,
     runtime: ControlRuntime,
 ) -> ControlTaskResponse {
     let scope = transfer_store_scope(&runtime);
-    let job_id = transfer_id_param(&upload.params);
-    if job_id.is_empty() {
-        return ControlTaskResponse {
-            id: id.clone(),
-            frame: transfer_http_error_response(id, 400, "missing id", "transfer upload chunk"),
-            byte_stream: None,
-            done: true,
-        };
-    }
-    let offset = match optional_u64_param(&upload.params, &["offset", "start"]) {
-        Ok(value) => value.unwrap_or(0),
-        Err(error) => {
-            return ControlTaskResponse {
-                id: id.clone(),
-                frame: transfer_http_error_response(id, 400, error, "transfer upload chunk"),
-                byte_stream: None,
-                done: true,
-            };
-        }
-    };
-    let chunk_len = upload.received_bytes as u64;
-    let result = tokio::task::spawn_blocking(move || {
-        crate::transfer_store::append_upload_tempfile(
-            &scope, &job_id, offset, upload.tmp, chunk_len,
-        )
-    })
-    .await;
-    let frame = match result {
-        Ok(Ok(job)) => http_body_response(
-            id.clone(),
-            200,
-            serde_json::json!({
-                "ok": true,
-                "job": job,
-            })
-            .to_string(),
-            "transfer upload chunk",
-        ),
-        Ok(Err(error)) => transfer_store_error_response(id.clone(), error, "transfer upload chunk"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("transfer upload chunk task failed: {e}"),
-        }),
-    };
+    let (params, body) = upload.into_spooled_body();
+    let frame = frame_api_response(
+        id.clone(),
+        crate::web_gateway::transfer_upload_chunk_api_response(scope, &params, body).await,
+        "transfer upload chunk",
+    );
     ControlTaskResponse {
         id,
         frame,
@@ -682,101 +439,38 @@ pub(crate) async fn api_transfer_download_read_task_response(
 ) -> ControlTaskResponse {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
-    let job_id = transfer_id_param(&params);
-    if job_id.is_empty() {
-        return transfer_download_error_task_response(id, 400, "missing id");
-    }
+    // Transport-owned range normalization: the tunnel's offset/length
+    // param aliases become the neutral request's ByteRange, exactly as
+    // the fs read wrapper normalizes (design §2.1).
     let offset = match optional_u64_param(&params, &["offset", "start"]) {
         Ok(value) => value.unwrap_or(0),
-        Err(error) => return transfer_download_error_task_response(id, 400, error),
+        Err(error) => {
+            return frame_api_task_response(
+                id,
+                crate::web_gateway::transfer_error_api_response(400, error),
+                "transfer-download",
+                "transfer download",
+            );
+        }
     };
     let length = match optional_u64_param(&params, &["length", "limit"]) {
         Ok(value) => value,
-        Err(error) => return transfer_download_error_task_response(id, 400, error),
+        Err(error) => {
+            return frame_api_task_response(
+                id,
+                crate::web_gateway::transfer_error_api_response(400, error),
+                "transfer-download",
+                "transfer download",
+            );
+        }
     };
-    let result = tokio::task::spawn_blocking(move || {
-        crate::transfer_store::read_download_range(
-            &scope,
-            &job_id,
-            offset,
-            length,
-            crate::web_gateway::UPLOAD_MAX_BYTES as u64,
-        )
-    })
+    let response = crate::web_gateway::transfer_download_read_api_response(
+        scope,
+        &params,
+        crate::web_gateway::ByteRange::OffsetLength { offset, length },
+    )
     .await;
-    let (job, bytes, end) = match result {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            return transfer_download_error_task_response(id, error.status, error.message);
-        }
-        Err(e) => {
-            return ControlTaskResponse {
-                id: id.clone(),
-                frame: serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": format!("transfer download task failed: {e}"),
-                }),
-                byte_stream: None,
-                done: true,
-            };
-        }
-    };
-    let content_type = job
-        .mime
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-    let filename = job.filename.clone();
-    let total_size = job.total_size.unwrap_or(bytes.len() as u64);
-    let size = bytes.len();
-    let source_path = job
-        .source_path
-        .as_ref()
-        .map(|path| path.to_string_lossy().to_string());
-    let job_value = serde_json::to_value(&job).unwrap_or_else(|_| serde_json::json!({}));
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: serde_json::Value::Null,
-        byte_stream: Some(ControlByteStream {
-            id: id.clone(),
-            stream_id: format!("{id}:transfer-download"),
-            content_type: content_type.clone(),
-            filename: filename.clone(),
-            bytes,
-            result: serde_json::json!({
-                "ok": true,
-                "id": job.id,
-                "resume_token": job.resume_token,
-                "path": source_path,
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-                "total_size": total_size,
-                "offset": offset,
-                "range_start": offset,
-                "range_end": end,
-                "resumable": true,
-                "completed_bytes": job.completed_bytes,
-                "status": job.status,
-                "job": job_value,
-            }),
-        }),
-        done: true,
-    }
-}
-
-pub(crate) fn transfer_download_error_task_response(
-    id: String,
-    status: u16,
-    error: impl Into<String>,
-) -> ControlTaskResponse {
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: transfer_http_error_response(id, status, error, "transfer download"),
-        byte_stream: None,
-        done: true,
-    }
+    frame_api_task_response(id, response, "transfer-download", "transfer download")
 }
 
 /// Build the neutral [`crate::web_gateway::ApiRequest`] for a tunnel
@@ -2263,7 +1957,7 @@ mod tests {
     #[tokio::test]
     async fn golden_transfer_jobs_list_frames() {
         let (_dir, rt, source) = download_rig();
-        let empty = api_transfer_jobs_response("g-list-empty".to_string(), &rt).await;
+        let empty = api_transfer_jobs_response("g-list-empty".to_string(), None, &rt).await;
         assert_eq!(
             empty,
             serde_json::json!({
@@ -2281,7 +1975,7 @@ mod tests {
 
         let create = create_download_job_frame(&rt, &source).await;
         let job_id = create["result"]["job"]["id"].as_str().unwrap();
-        let mut listed = api_transfer_jobs_response("g-list".to_string(), &rt).await;
+        let mut listed = api_transfer_jobs_response("g-list".to_string(), None, &rt).await;
         assert_eq!(listed["t"], "response");
         assert_eq!(listed["ok"], true);
         assert_eq!(listed["result"]["_httpStatus"], 200);
@@ -2748,5 +2442,359 @@ mod tests {
                 },
             })
         );
+    }
+
+    // ── Transfer-family parity (S9a): the tunnel and the neutral cores'
+    //    HTTP rendering serve the same bodies ──
+    //
+    // Same discipline as the fs sets above (envelope differences #1/#2
+    // apply verbatim). The family-specific differences, continuing the
+    // enumeration:
+    //
+    //  24. Artifact-shaped download creates are tunnel-only: their
+    //      resolution reads live session handles (report builders,
+    //      staged uploads, the recording registry) through the
+    //      ControlRuntime, which the HTTP edge deliberately lacks — the
+    //      HTTP create composition answers 400 for `artifact` bodies;
+    //      every path-based create is fully neutral.
+    //  25. The formerly bare-frame tunnel join-error arms (unreachable
+    //      in practice) converge on the neutral fns' enveloped 500s —
+    //      the same convergence the fs quartet settled (#10).
+    //  26. Range addressing is transport-owned (fs #4 restated for
+    //      jobs): HTTP's end-inclusive `Range` header normalizes
+    //      against the source size before the shared store read, and
+    //      its parse failures answer 416 with the probing
+    //      `Content-Range: bytes */N` tail; the offset/length form
+    //      keeps its body-only, store-worded 416/413 shapes on both
+    //      lanes.
+    //  27. Download reads are capped at UPLOAD_MAX_BYTES per request on
+    //      BOTH forms — an unranged GET of a bigger job answers the
+    //      store's 413; the jobs protocol's answer to big payloads is
+    //      ranging (resumability makes small reads cheap), not one
+    //      giant read.
+    //
+    // Additive, not a divergence: both lanes now honor a job-handle
+    // param on the jobs list (`?id=` on HTTP); tunnel callers
+    // historically pass no params and the no-param golden is unchanged.
+
+    /// Twin stores for mutation parity: identical params against
+    /// identical fresh state per leg, volatile fields normalized.
+    struct ParityRig {
+        _dir: tempfile::TempDir,
+        rt: ControlRuntime,
+        scope: crate::global_store::StoreScope,
+        dest: std::path::PathBuf,
+    }
+
+    fn parity_rigs() -> (ParityRig, ParityRig) {
+        let rig = || {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let dest_dir = dir.path().join("dest");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            let mut rt = runtime();
+            rt.project_root = Some(project.clone());
+            ParityRig {
+                _dir: dir,
+                rt,
+                scope: crate::global_store::StoreScope::Project(project),
+                dest: dest_dir.join("parity.bin"),
+            }
+        };
+        (rig(), rig())
+    }
+
+    /// Normalize one transfer body for cross-lane comparison: job
+    /// volatiles out, absolute paths asserted-and-dropped.
+    fn normalize_transfer_body(body: &mut serde_json::Value) {
+        if body.get("job").is_some_and(|job| job.is_object()) {
+            normalize_job(&mut body["job"]);
+            for key in ["temp_path", "destination_path", "final_path", "source_path"] {
+                if body["job"].get(key).is_some_and(|value| value.is_string()) {
+                    take_abs_path(&mut body["job"], key);
+                }
+            }
+        }
+    }
+
+    fn spooled_body(bytes: &[u8]) -> crate::web_gateway::SpooledBody {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        crate::web_gateway::SpooledBody {
+            tmp,
+            len: bytes.len(),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_transfer_create_errors_share_bodies_across_lanes() {
+        let (http, tunnel) = parity_rigs();
+        for params in [
+            serde_json::json!({ "kind": "sideways" }),
+            serde_json::json!({ "kind": "download" }),
+            serde_json::json!({ "kind": "upload" }),
+            serde_json::json!({ "kind": "upload", "destination": "/tmp/x", "conflict": "merge" }),
+            serde_json::json!({ "kind": "upload", "destination": "/tmp/x", "total_size": "many" }),
+        ] {
+            let (status, _headers, body) = http_parts(
+                crate::web_gateway::transfer_job_create_http_api_response(
+                    http.scope.clone(),
+                    params.clone(),
+                )
+                .await,
+            );
+            let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let frame = api_transfer_job_create_response(
+                "parity-create".to_string(),
+                Some(&params),
+                &tunnel.rt,
+            )
+            .await;
+            assert_eq!(tunnel_result_body(&frame, status), http_body, "{params}");
+        }
+
+        // Divergence #24: the artifact shape reaches the tunnel's
+        // runtime-coupled resolver but answers the tunnel-only 400 on
+        // the HTTP composition.
+        let artifact_params = serde_json::json!({
+            "kind": "download",
+            "artifact": { "type": "unheard-of" },
+        });
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_job_create_http_api_response(
+                http.scope.clone(),
+                artifact_params.clone(),
+            )
+            .await,
+        );
+        assert_eq!(status, 400);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            http_body["error"],
+            "artifact transfers require the dashboard tunnel"
+        );
+        let frame = api_transfer_job_create_response(
+            "parity-artifact".to_string(),
+            Some(&artifact_params),
+            &tunnel.rt,
+        )
+        .await;
+        assert_eq!(
+            tunnel_result_body(&frame, 400)["error"],
+            "unsupported transfer artifact type: unheard-of"
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_transfer_lifecycle_serves_the_same_bodies_on_both_transports() {
+        let (http, tunnel) = parity_rigs();
+        let create_params = |dest: &std::path::Path| {
+            serde_json::json!({
+                "kind": "upload",
+                "destination": dest.to_string_lossy(),
+                "name": "parity.bin",
+                "mime": "application/octet-stream",
+                "total_size": 11,
+            })
+        };
+
+        // Create.
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_job_create_http_api_response(
+                http.scope.clone(),
+                create_params(&http.dest),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let mut http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let http_job_id = http_body["job"]["id"].as_str().unwrap().to_string();
+        let frame = api_transfer_job_create_response(
+            "parity-lc-create".to_string(),
+            Some(&create_params(&tunnel.dest)),
+            &tunnel.rt,
+        )
+        .await;
+        let mut tunnel_body = tunnel_result_body(&frame, 200);
+        let tunnel_job_id = tunnel_body["job"]["id"].as_str().unwrap().to_string();
+        normalize_transfer_body(&mut http_body);
+        normalize_transfer_body(&mut tunnel_body);
+        assert_eq!(tunnel_body, http_body);
+
+        // Chunk at 0 — the same spooled-body handle either transport
+        // fills — then commit; same bodies at every step.
+        let chunk = |job_id: &str| serde_json::json!({ "id": job_id, "offset": 0 });
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_upload_chunk_api_response(
+                http.scope.clone(),
+                &chunk(&http_job_id),
+                spooled_body(b"hello world"),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let mut http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tunnel_frame = api_transfer_upload_chunk_task_response(
+            "parity-lc-chunk".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                chunk(&tunnel_job_id),
+                b"hello world",
+            ),
+            tunnel.rt.clone(),
+        )
+        .await;
+        let mut tunnel_body = tunnel_result_body(&tunnel_frame.frame, 200);
+        normalize_transfer_body(&mut http_body);
+        normalize_transfer_body(&mut tunnel_body);
+        assert_eq!(tunnel_body, http_body);
+        assert_eq!(http_body["job"]["status"], "ready");
+
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_upload_commit_api_response(
+                http.scope.clone(),
+                &serde_json::json!({ "id": http_job_id }),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let mut http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let frame = api_transfer_upload_commit_response(
+            "parity-lc-commit".to_string(),
+            Some(&serde_json::json!({ "id": tunnel_job_id })),
+            &tunnel.rt,
+        )
+        .await;
+        let mut tunnel_body = tunnel_result_body(&frame, 200);
+        normalize_transfer_body(&mut http_body);
+        normalize_transfer_body(&mut tunnel_body);
+        assert_eq!(tunnel_body, http_body);
+        assert_eq!(std::fs::read(&http.dest).unwrap(), b"hello world");
+        assert_eq!(std::fs::read(&tunnel.dest).unwrap(), b"hello world");
+
+        // List (filtered to the one job by handle) and delete.
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_jobs_api_response(
+                http.scope.clone(),
+                &serde_json::json!({ "id": http_job_id }),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let mut http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let frame = api_transfer_jobs_response(
+            "parity-lc-list".to_string(),
+            Some(&serde_json::json!({ "id": tunnel_job_id })),
+            &tunnel.rt,
+        )
+        .await;
+        let mut tunnel_body = tunnel_result_body(&frame, 200);
+        for body in [&mut http_body, &mut tunnel_body] {
+            let jobs = body["jobs"].as_array_mut().unwrap();
+            assert_eq!(jobs.len(), 1);
+            normalize_job(&mut jobs[0]);
+            take_abs_path(&mut jobs[0], "destination_path");
+            take_abs_path(&mut jobs[0], "final_path");
+        }
+        assert_eq!(tunnel_body, http_body);
+
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_job_delete_api_response(
+                http.scope.clone(),
+                &serde_json::json!({ "id": http_job_id }),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let frame = api_transfer_job_delete_response(
+            "parity-lc-delete".to_string(),
+            Some(&serde_json::json!({ "id": tunnel_job_id })),
+            &tunnel.rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 200), http_body);
+        assert_eq!(http_body["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn parity_transfer_download_read_meta_matches_http_headers() {
+        let (_dir, rt, source) = download_rig();
+        let create = create_download_job_frame(&rt, &source).await;
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let scope = transfer_store_scope(&rt);
+
+        // HTTP leg first; the same range re-read lands on identical
+        // job bookkeeping, so the tunnel leg compares clean.
+        let (status, headers, body) = http_parts(
+            crate::web_gateway::transfer_download_read_api_response(
+                scope.clone(),
+                &serde_json::json!({ "id": job_id }),
+                crate::web_gateway::ByteRange::OffsetLength {
+                    offset: 6,
+                    length: Some(8),
+                },
+            )
+            .await,
+        );
+        assert_eq!(status, 206);
+        assert_eq!(
+            header_value(&headers, "Content-Range"),
+            Some("bytes 6-13/14")
+        );
+
+        let read = api_transfer_download_read_task_response(
+            "parity-dl".to_string(),
+            Some(&serde_json::json!({ "id": job_id, "offset": 6, "length": 8 })),
+            &rt,
+        )
+        .await;
+        let stream = read.byte_stream.expect("tunnel byte stream");
+        assert_eq!(stream.bytes, body);
+        assert_eq!(
+            Some(stream.content_type.as_str()),
+            header_value(&headers, "Content-Type")
+        );
+        // The resume meta the tunnel carries as byte_stream_end.result
+        // is what HTTP echoes as X-Transfer-* headers (design §4).
+        for (meta_key, header_name) in [
+            ("range_start", "X-Transfer-Range-Start"),
+            ("range_end", "X-Transfer-Range-End"),
+            ("total_size", "X-Transfer-Total-Size"),
+            ("resumable", "X-Transfer-Resumable"),
+        ] {
+            assert_eq!(
+                Some(stream.result[meta_key].to_string().as_str()),
+                header_value(&headers, header_name),
+                "{meta_key}"
+            );
+        }
+        assert_eq!(header_value(&headers, "X-Content-Sha256"), None);
+
+        // Error parity on the shared offset/length form (#26's
+        // both-lanes half): same store wording under each envelope.
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_download_read_api_response(
+                scope.clone(),
+                &serde_json::json!({ "id": job_id }),
+                crate::web_gateway::ByteRange::OffsetLength {
+                    offset: 99,
+                    length: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(status, 416);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let read = api_transfer_download_read_task_response(
+            "parity-dl-416".to_string(),
+            Some(&serde_json::json!({ "id": job_id, "offset": 99 })),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&read.frame, 416), http_body);
     }
 }

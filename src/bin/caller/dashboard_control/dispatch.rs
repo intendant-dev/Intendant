@@ -3057,7 +3057,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let list = api_transfer_jobs_response("transfer-list".to_string(), &rt).await;
+        let list = api_transfer_jobs_response("transfer-list".to_string(), None, &rt).await;
         assert_eq!(list["result"]["jobs"].as_array().unwrap().len(), 1);
         assert_eq!(list["result"]["jobs"][0]["id"], job_id);
 

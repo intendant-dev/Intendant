@@ -1357,10 +1357,13 @@ impl DashboardFsReadError {
     }
 }
 
+/// An end-INCLUSIVE byte range as parsed from an HTTP `Range` header
+/// (fields widened for the transfer download's header normalization,
+/// which converts it to the store's offset/length form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DashboardByteRange {
-    start: u64,
-    end: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 pub(crate) fn dashboard_fs_content_type(path: &Path) -> String {
