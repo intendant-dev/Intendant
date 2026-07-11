@@ -3069,6 +3069,11 @@ mod tests {
         std::fs::write(&source, b"durable download fixture").unwrap();
 
         let mut rt = runtime();
+        // Transfer availability must not require a project root: the store
+        // falls back to the daemon-global scope (Wave 1F), and the HTTP rows
+        // serve projectless — both lanes advertise alike.
+        let projectless = status_response_frame("transfer-status-projectless".to_string(), &rt);
+        assert_eq!(projectless["result"]["api_transfer_jobs_available"], true);
         rt.project_root = Some(project.clone());
 
         let status = status_response_frame("transfer-status".to_string(), &rt);

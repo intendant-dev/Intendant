@@ -364,7 +364,10 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
             runtime.project_root.is_some()
         }
         "api_mcp_tool_call" => runtime.mcp_server.is_some(),
-        method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
+        // api_transfer_* deliberately has no project_root gate: the store
+        // resolves through StoreScope (daemon-global fallback on projectless
+        // daemons), and the S9 HTTP rows already serve projectless — the
+        // old gate made the tunnel lane lie about the same store.
         method if method.starts_with("api_display_input_authority_") => {
             runtime.display_authority.is_some()
         }
@@ -2690,20 +2693,23 @@ mod tests {
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
-        assert_eq!(status["result"]["api_transfer_jobs_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_create_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_delete_available"], false);
+        // Projectless runtime: transfers stay available — the store resolves
+        // through the daemon-global StoreScope fallback, matching the S9
+        // HTTP rows (the old project_root gate made the tunnel lane lie).
+        assert_eq!(status["result"]["api_transfer_jobs_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_create_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_delete_available"], true);
         assert_eq!(
             status["result"]["api_transfer_download_read_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_chunk_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_commit_available"],
-            false
+            true
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
