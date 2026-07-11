@@ -346,9 +346,12 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
                 | Task
                 | Approval
         ),
-        // Credential leases stay out of the peer lane entirely in v1: a
-        // peer daemon never fuels or drains another daemon's credentials,
-        // matching the org peer-cap philosophy for access.manage.
+        // Lane rule, not a v1 deferral (docs/src/trust-tiers.md § Two
+        // lanes): access administration and credential custody are
+        // user-lane-only. No peer profile — AdminPeer included — may
+        // exercise them, because both must be attributable to an
+        // identified person the target itself admitted, and a peer
+        // connection's principal is a daemon.
         AdminPeer => !matches!(op, AccessManage | CredentialsManage),
     }
 }

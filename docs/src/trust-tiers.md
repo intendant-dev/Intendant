@@ -310,6 +310,68 @@ the owner's memory. All four are **shipped**:
    design: a crt.sh outage stamps `ct_last_error` rather than blocking
    renewal.
 
+## Two lanes: whose authority a pane spends
+
+"Browser→daemon vs peer-to-peer" conflates two axes. The *transport* —
+who carries the bytes — genuinely mixes: a peer-routed terminal is
+signaled through the daemon you're logged into but its data plane is a
+direct browser↔target datachannel, while a hosted tab's tunnel is
+rendezvous-signaled yet equally direct. The axis that carries trust
+weight is the **principal**: whose authority the *target* daemon
+enforces and audits. Every fleet surface sits in one of two lanes:
+
+- **The user lane** — the target binds *you*: a direct tab, the hosted
+  tunnel to a claimed daemon, the native app. Your identity key (or
+  certificate, or account) is the principal; your role and the
+  provenance ceilings apply; the audit names you.
+- **The delegation lane** — the target binds *a daemon*: the peer-routed
+  panes (terminal, files, folded sessions, displays) are admitted under
+  the intermediary's peer grant (`DashboardControlGrant::Peer` — its
+  fingerprint, its profile). You are invisible to the target: it cannot
+  distinguish you clicking from the intermediary's agent acting, and its
+  audit names the daemon. Spending the intermediary's peer grants is an
+  operation *on the intermediary*, gated by your grant *there*.
+
+Neither lane is the degenerate case of the other, and they deliberately
+do not merge. The user lane is for **owner control** — reaching machines
+that know you. The delegation lane is for **orchestration and downward
+reach** — an integrated anchor conducting its disposables, or seeing a
+box that has granted your daemon (not you) access. The
+grants-flow-down discipline is what keeps the delegation lane safe: a
+hosted tab on your anchor can spend the anchor's peer grants, which is
+acceptable *because* those grants only reach down the tier gradient.
+
+Lane rules, stated once:
+
+1. **User-lane-only capabilities.** A target's Access administration
+   (`access.manage`) and everything credential custody touches
+   (`credentials.manage` — leases, vault blobs, the deposit lane) are
+   never reachable through the delegation lane: no peer profile grants
+   these operations, `role:admin-peer` included (the profile matrix in
+   `access/access_policy.rs` enforces it). This is doctrine, not a v1
+   deferral: authority over who may reach a machine, and over the
+   secrets it spends, must always be exercised by an identified person
+   the target itself admitted — a laundered principal is exactly the
+   wrong identity to record for either.
+2. **Lane switches are trust events.** Every pane states whose authority
+   it is spending as a badge — *you · admin* versus *via dell‑206 ·
+   operator* — and a route change that changes the principal is shown,
+   never silent. The product bar: one fleet list, each machine wearing
+   that badge, "as you" preferred wherever the target knows you, the
+   delegation fallback visible, and a warning reserved for one case —
+   reaching an **integrated** machine indirectly. If a surface requires
+   the user to understand more than the badge, the surface is wrong.
+3. **Attribution is the tracked mechanism.** The delegation lane's
+   honest gap is that the target cannot name the human behind the
+   intermediary. One primitive closes it and two other gaps at once:
+   the browser (or requesting daemon) proving its identity key over a
+   relayed, channel-bound exchange — giving peer-routed connections an
+   *attributed-to* identity beside their *admitted-under* profile,
+   giving the pairing doorbell a verifiable caller ID (the prerequisite
+   named below), and unlocking cross-owner tier comparison. Displays
+   already prototype the split locally: viewing rides the peer grant,
+   input requires a user-granted authority.
+
 ## Where fleet metadata rides
 
 Fleet facts have three possible carriers, and each datum lands where its
