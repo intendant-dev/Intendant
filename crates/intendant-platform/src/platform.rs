@@ -26,12 +26,13 @@ pub fn ensure_tool_paths() {
 
         // Directories that hold user-installed CLIs but are commonly absent
         // from PATH in non-login launch contexts. Order = search priority.
-        let mut candidates: Vec<PathBuf> = vec![home_dir().join(".local/bin")];
-        #[cfg(target_os = "macos")]
-        {
-            candidates.push(PathBuf::from("/opt/homebrew/bin"));
-            candidates.push(PathBuf::from("/usr/local/bin"));
-        }
+        let candidates: Vec<PathBuf> = vec![
+            home_dir().join(".local/bin"),
+            #[cfg(target_os = "macos")]
+            PathBuf::from("/opt/homebrew/bin"),
+            #[cfg(target_os = "macos")]
+            PathBuf::from("/usr/local/bin"),
+        ];
 
         let current = std::env::var_os("PATH").unwrap_or_default();
         let additions: Vec<PathBuf> = candidates
