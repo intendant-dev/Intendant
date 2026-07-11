@@ -12,6 +12,16 @@ name: WASM drift
 # Required-track triggers (unfiltered — a paths-filtered required check
 # blocks queue entry); the in-job relevance skip keeps per-PR cost at
 # ~zero unless wasm inputs actually changed.
+#
+# The rebuild runs on the MAC fleet leg deliberately: wasm output is NOT
+# byte-deterministic across host triples (proven live 2026-07-11 — a
+# comment-only probe's Linux rebuild differed from the macOS-built
+# committed artifacts down to the .d.ts glue). All wasm authorship and
+# build.rs's auto-rebuilds happen on aarch64-darwin, so that is the
+# canonical artifact host, and the gate must rebuild on the same triple
+# to verify bytes. A contributor regenerating artifacts on another OS
+# will red this gate — rebuild them on macOS (or let a Mac dev box's
+# cargo build do it via build.rs).
 on:
   pull_request:
     branches: [main]
@@ -34,8 +44,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            runner: [self-hosted, intendant-linux]
+          - os: macos-latest
+            runner: [self-hosted, intendant-macos]
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
