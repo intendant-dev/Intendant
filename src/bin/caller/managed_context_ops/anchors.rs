@@ -1343,7 +1343,10 @@ pub(crate) fn context_rewind_estimated_tokens(value: &serde_json::Value) -> u64 
     std::cmp::max(1, chars.div_ceil(4) as u64)
 }
 
-pub(crate) fn context_rewind_anchor_has_recovery_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
+pub(crate) fn context_rewind_anchor_has_recovery_headroom(
+    used_tokens: u64,
+    rewind_only_limit: u64,
+) -> bool {
     used_tokens < rewind_only_limit
         && rewind_only_limit.saturating_sub(used_tokens)
             >= CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS
@@ -1512,7 +1515,9 @@ pub(crate) fn context_rewind_anchor_matches_query(
 /// so a status poll can never be the last "eligible" rewind candidate (the
 /// 2026-06-12 bench dead-end: a density handoff whose only returned row was a
 /// `get_status` anchor the handoff itself disallowed).
-pub(crate) fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+pub(crate) fn context_rewind_anchor_is_management_tool(
+    anchor: &ContextRewindAnchorCatalogEntry,
+) -> bool {
     anchor.names.iter().any(|name| {
         matches!(
             name.as_str(),
@@ -1534,7 +1539,9 @@ pub(crate) fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnc
 }
 
 /// True when `anchor` is a `list_rewind_anchors` (or legacy alias) call.
-pub(crate) fn context_rewind_anchor_is_listing_call(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+pub(crate) fn context_rewind_anchor_is_listing_call(
+    anchor: &ContextRewindAnchorCatalogEntry,
+) -> bool {
     anchor.names.iter().any(|name| {
         matches!(
             name.as_str(),
@@ -1548,7 +1555,9 @@ pub(crate) fn context_rewind_anchor_is_listing_call(anchor: &ContextRewindAnchor
 /// under rewind-only/density gating management tools are the only items the
 /// model can append. Includes the in-flight listing call when the backend has
 /// already persisted it.
-pub(crate) fn context_rewind_trailing_listing_calls(anchors: &[ContextRewindAnchorCatalogEntry]) -> usize {
+pub(crate) fn context_rewind_trailing_listing_calls(
+    anchors: &[ContextRewindAnchorCatalogEntry],
+) -> usize {
     anchors
         .iter()
         .rev()
@@ -1557,7 +1566,9 @@ pub(crate) fn context_rewind_trailing_listing_calls(anchors: &[ContextRewindAnch
         .count()
 }
 
-pub(crate) fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value) -> bool {
+pub(crate) fn response_item_is_managed_context_recovery_kickstart(
+    item: &serde_json::Value,
+) -> bool {
     if item.get("type").and_then(|value| value.as_str()) != Some("message") {
         return false;
     }
@@ -1702,7 +1713,9 @@ pub(crate) fn response_item_content_text(item: &serde_json::Value) -> impl Itera
         })
 }
 
-pub(crate) fn response_item_managed_context_rewind_primer_text(item: &serde_json::Value) -> Option<String> {
+pub(crate) fn response_item_managed_context_rewind_primer_text(
+    item: &serde_json::Value,
+) -> Option<String> {
     if item.get("type").and_then(|value| value.as_str()) != Some("message") {
         return None;
     }

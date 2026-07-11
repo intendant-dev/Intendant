@@ -98,6 +98,18 @@
 .acc-chip.acc-tier-integrated { border-color: color-mix(in srgb, var(--peach) 35%, transparent); color: var(--peach); }
 .acc-chip.acc-tier-disposable::before { background: var(--overlay1); }
 .acc-chip.acc-tier-disposable { color: var(--subtext0); }
+/* Two-lane badges (trust-tiers § Two lanes): whose authority a pane
+   spends. 'you · role' stays quiet; 'via daemon · profile' is visibly
+   other; the warn variant marks the one doctrine alarm — an integrated
+   machine reached through the delegation lane. */
+.acc-badge.lane-user { color: var(--subtext0); }
+.acc-badge.lane-via { border-color: color-mix(in srgb, var(--mauve) 35%, transparent); color: var(--mauve); }
+.acc-badge.lane-via.lane-warn,
+.target-summary-kind.lane-warn {
+  border-color: color-mix(in srgb, var(--peach) 55%, transparent);
+  color: var(--peach);
+  font-weight: 600;
+}
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {

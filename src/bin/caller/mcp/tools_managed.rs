@@ -134,7 +134,10 @@ impl IntendantServer {
     #[tool(
         description = "Schedule a Codex context rewind to an exact item/tool-call anchor. Use it for routine noise-triggered hygiene — pruning genuinely noisy/unexpectedly large recent output at any pressure including ok, crystallizing its durable facts in the primer itself — and for managed-context recovery/density handoff guidance, rewind-only context pressure, or a watch-pressure density decision; do not use during ordinary startup/search work when nothing noisy happened. Call list_rewind_anchors once, choose one returned item_id, and rewind in the same turn; call inspect_rewind_anchor only when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
-    pub(crate) async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
+    pub(crate) async fn rewind_context(
+        &self,
+        Parameters(params): Parameters<RewindContextParams>,
+    ) -> String {
         let reason = params.reason.trim();
         if reason.is_empty() {
             return "rewind_context requires a non-empty reason".to_string();
@@ -303,7 +306,10 @@ impl IntendantServer {
     #[tool(
         description = "Recover a prior context rewind record. mode=\"inspect\" reports the saved pre-rewind rollout path. mode=\"restore\" restores the active Codex thread in place. mode=\"fork\"/\"backout\" creates a new Codex thread that inherits the lineage prompt-cache key when using the patched managed Codex binary."
     )]
-    pub(crate) async fn rewind_backout(&self, Parameters(params): Parameters<RewindBackoutParams>) -> String {
+    pub(crate) async fn rewind_backout(
+        &self,
+        Parameters(params): Parameters<RewindBackoutParams>,
+    ) -> String {
         let record_id = params.record_id.trim();
         if record_id.is_empty() {
             return "rewind_backout requires a non-empty record_id".to_string();
@@ -464,7 +470,10 @@ impl IntendantServer {
     #[tool(
         description = "Fork this Codex thread into 1-4 full-context sibling branches that run in parallel as real sessions. Each branch needs a self-contained charter (objective + optional owned write_scope); branches fork from the last completed turn and do not see the current turn. Branches with a write_scope get an isolated git worktree by default. Returns group_id, branch session ids, and worktree paths; track progress via get_status fission_ledger."
     )]
-    pub(crate) async fn fission_spawn(&self, Parameters(params): Parameters<FissionSpawnParams>) -> String {
+    pub(crate) async fn fission_spawn(
+        &self,
+        Parameters(params): Parameters<FissionSpawnParams>,
+    ) -> String {
         if params.branches.is_empty() || params.branches.len() > FISSION_SPAWN_MAX_BRANCHES {
             return format!(
                 "fission_spawn requires between 1 and {FISSION_SPAWN_MAX_BRANCHES} branches; got {}",
@@ -1008,9 +1017,11 @@ impl IntendantServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::tests::{
+        spawn_codex_thread_action_result, test_state, test_state_with_log_dir,
+    };
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
-    use crate::mcp::tests::{spawn_codex_thread_action_result, test_state, test_state_with_log_dir};
 
     /// Like [`spawn_codex_thread_action_result`], but returns the dispatched
     /// thread-action params so tests can assert the exact wire shape.

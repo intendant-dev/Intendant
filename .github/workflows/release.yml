@@ -25,6 +25,21 @@ name: macOS app release
 # rather than silently shipping a less-signed artifact. Provisioning ceremony
 # (exporting the p12, minting the notary key): docs/src/getting-started.md,
 # "Signed releases".
+#
+# Release transparency (docs/src/self-hosted-rendezvous.md, "Release
+# transparency"): after publishing, tag builds commit the released
+# artifacts' hashes to the rendezvous's public transparency log. One more
+# repo secret, exactly:
+#
+#   CONNECT_RELEASE_TOKEN    bearer token the rendezvous was started with
+#                            (--release-token / INTENDANT_CONNECT_RELEASE_TOKEN
+#                            on intendant-connect) — authorizes ONLY
+#                            release-manifest submission, nothing else
+#
+# When the secret is absent (forks, dry runs) the submission step logs
+# that it is skipping and no-ops. The optional CONNECT_RELEASE_URL repo
+# *variable* points self-hosted forks at their own rendezvous (default
+# https://intendant.dev).
 
 on:
   push:
@@ -249,6 +264,60 @@ jobs:
               --title "Intendant $tag" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
+
+      # Commit what was just published to the public transparency log:
+      # sha256 + size of every artifact uploaded to the GitHub release,
+      # POSTed as a release_manifest (docs/src/self-hosted-rendezvous.md,
+      # "Release transparency"). `intendant hosted-verify --releases`
+      # checks the two sides against each other out of band. Runs AFTER
+      # the publish step so the log commits exactly the uploaded bytes;
+      # if submission fails, the run goes red so the operator notices a
+      # published-but-unlogged release. Skips with a clear line when the
+      # CONNECT_RELEASE_TOKEN repo secret is not configured.
+      - name: Submit release manifest to the transparency log
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          CONNECT_RELEASE_TOKEN: ${{ secrets.CONNECT_RELEASE_TOKEN }}
+          CONNECT_RELEASE_URL: ${{ vars.CONNECT_RELEASE_URL || 'https://intendant.dev' }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CONNECT_RELEASE_TOKEN" ]; then
+            echo "CONNECT_RELEASE_TOKEN is not configured — skipping transparency-log submission (expected on forks and dry runs)."
+            exit 0
+          fi
+          manifest="$RUNNER_TEMP/release-manifest.json"
+          python3 - "$RELEASE_TAG" dist/* > "$manifest" <<'PY'
+          import hashlib, json, os, sys
+          tag, *paths = sys.argv[1:]
+          artifacts = []
+          for path in sorted(paths, key=os.path.basename):
+              digest = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1 << 20), b""):
+                      digest.update(chunk)
+              artifacts.append({
+                  "name": os.path.basename(path),
+                  "sha256": digest.hexdigest(),
+                  "size": os.path.getsize(path),
+              })
+          print(json.dumps({
+              "tag": tag,
+              "version": tag.removeprefix("v"),
+              "platforms": ["macos-arm64"],
+              "artifacts": artifacts,
+          }, indent=2))
+          PY
+          echo "release manifest for $RELEASE_TAG:"
+          cat "$manifest"
+          curl -sS --fail-with-body -X POST \
+            "$CONNECT_RELEASE_URL/api/log/release-manifest" \
+            -H "Authorization: Bearer $CONNECT_RELEASE_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$manifest"
+          echo
+          echo "release manifest committed to $CONNECT_RELEASE_URL/api/log/release-manifest"
 
       # Manual dispatch has no tag to hang a release on; keep the artifact
       # on the workflow run instead.

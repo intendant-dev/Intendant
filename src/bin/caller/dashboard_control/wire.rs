@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     mut rtc: RTCPeerConnection<I>,
     sockets: Vec<Arc<UdpSocket>>,
@@ -360,6 +361,7 @@ pub(crate) fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
@@ -701,7 +703,10 @@ pub(crate) fn byte_stream_frame_text_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn byte_stream_frame_texts(byte_stream: ControlByteStream, chunk_bytes: usize) -> Vec<String> {
+pub(crate) fn byte_stream_frame_texts(
+    byte_stream: ControlByteStream,
+    chunk_bytes: usize,
+) -> Vec<String> {
     match byte_stream_frame_text_parts(byte_stream, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
@@ -853,7 +858,10 @@ pub(crate) fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     }
 }
 
-pub(crate) fn dashboard_control_error_response(id: String, message: impl Into<String>) -> serde_json::Value {
+pub(crate) fn dashboard_control_error_response(
+    id: String,
+    message: impl Into<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "t": "response",
         "id": id,

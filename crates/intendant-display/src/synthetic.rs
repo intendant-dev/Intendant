@@ -211,8 +211,7 @@ impl DisplayBackend for SyntheticBackend {
 
         let (tx, rx) = mpsc::channel::<Frame>(4);
         let shutdown = Arc::clone(&self.shutdown);
-        let interval =
-            std::time::Duration::from_millis(1000 / u64::from(fps.clamp(1, MAX_FPS)));
+        let interval = std::time::Duration::from_millis(1000 / u64::from(fps.clamp(1, MAX_FPS)));
 
         // The producer owns `tx` (the channel's only sender): thread exit IS
         // channel close, and `stop_capture`'s join therefore implies the
@@ -284,7 +283,10 @@ mod tests {
         let displays = enumerate_displays();
         assert_eq!(displays.len(), 1);
         let d = &displays[0];
-        assert_eq!((d.id, d.width, d.height, d.is_primary), (0, WIDTH, HEIGHT, true));
+        assert_eq!(
+            (d.id, d.width, d.height, d.is_primary),
+            (0, WIDTH, HEIGHT, true)
+        );
         assert_eq!(d.kind, DisplayInfoKind::Display);
     }
 
@@ -295,7 +297,10 @@ mod tests {
         let a2 = synthetic_frame(&base, 7);
         let b = synthetic_frame(&base, 8);
         assert_eq!(a1.data, a2.data, "same index must produce identical bytes");
-        assert_ne!(a1.data, b.data, "distinct indices must differ (counter strip)");
+        assert_ne!(
+            a1.data, b.data,
+            "distinct indices must differ (counter strip)"
+        );
         assert_eq!((a1.width, a1.height), (WIDTH, HEIGHT));
         assert_eq!(a1.stride, WIDTH * 4);
         assert_eq!(a1.data.len(), (WIDTH * HEIGHT * 4) as usize);

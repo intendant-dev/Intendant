@@ -191,13 +191,17 @@ pub(crate) fn is_codex_injected_user_text_for_main(text: &str) -> bool {
     crate::web_gateway::is_injected_external_user_text(text)
 }
 
-pub(crate) fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
+pub(crate) fn codex_user_turn_state_from_history(
+    session_id: &str,
+) -> Option<UserTurnRevisionState> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
     let path = find_codex_session_file_for_main(&home, session_id)?;
     codex_user_turn_state_from_history_file(&path)
 }
 
-pub(crate) fn codex_user_turn_state_from_history_file(path: &Path) -> Option<UserTurnRevisionState> {
+pub(crate) fn codex_user_turn_state_from_history_file(
+    path: &Path,
+) -> Option<UserTurnRevisionState> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut saw_user_message_event = false;
     let mut event_state = UserTurnRevisionState::default();
@@ -228,14 +232,13 @@ pub(crate) fn codex_user_turn_state_from_history_file(path: &Path) -> Option<Use
                     _ => {}
                 }
             }
-            "response_item" => {
+            "response_item"
                 if obj
                     .get("payload")
                     .and_then(codex_payload_user_text)
-                    .is_some()
-                {
-                    fallback_state.record_next_turn();
-                }
+                    .is_some() =>
+            {
+                fallback_state.record_next_turn();
             }
             _ => {}
         }

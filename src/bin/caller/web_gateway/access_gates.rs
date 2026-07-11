@@ -111,7 +111,6 @@ pub(crate) fn is_federation_path(request_line: &str) -> bool {
         || path_is_or_under(path, "/api/worktrees")
 }
 
-
 pub(crate) fn dashboard_http_operation(
     req_method: &str,
     req_path: &str,
@@ -143,7 +142,6 @@ pub(crate) fn http_access_forbidden_response(
     )
 }
 
-
 pub(crate) fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
     let Some(path) = request_line.split_whitespace().nth(1) else {
         return false;
@@ -158,7 +156,6 @@ pub(crate) fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
             | "/connect/dashboard/close"
     )
 }
-
 
 pub(crate) fn peer_identity_allows_ws_control(
     identity: Option<&PeerConnectionIdentity>,
@@ -212,7 +209,9 @@ pub(crate) fn peer_identity_allows_ws_control(
 /// and the `dashboard_control_*` signaling frames (the tunnel they establish
 /// enforces this very grant per-frame itself, and scoped clients must be
 /// able to reach their allowed surface through it).
-pub(crate) fn ws_frame_operation(frame_type: &str) -> Option<crate::peer::access_policy::PeerOperation> {
+pub(crate) fn ws_frame_operation(
+    frame_type: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
     use crate::peer::access_policy::PeerOperation;
     match frame_type {
         // Same frame names as the dashboard-control tunnel table. Floor
@@ -369,7 +368,6 @@ pub(crate) fn ws_grant_allows_control(
     });
     false
 }
-
 
 /// Verify a WebSocket upgrade request carries the expected bearer
 /// token. Browser WebSocket clients cannot natively set custom
@@ -678,7 +676,10 @@ mod tests {
         // Methods a route does not declare are not routes and carry no
         // operation (the retired hand classifier used to gate some of
         // these method-blind; dispatch never served them).
-        assert_eq!(dashboard_http_operation("GET", "/api/worktrees/inspect"), None);
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/worktrees/inspect"),
+            None
+        );
         assert_eq!(
             dashboard_http_operation("PUT", "/api/session/current/history"),
             None
@@ -697,7 +698,10 @@ mod tests {
             dashboard_http_operation("GET", "/api/peer-pairing/requests/req1"),
             None
         );
-        assert_eq!(dashboard_http_operation("POST", "/api/access/org-grants"), None);
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/access/org-grants"),
+            None
+        );
         assert_eq!(
             dashboard_http_operation("POST", "/api/access/orgs/revocations/apply"),
             None
@@ -732,7 +736,6 @@ mod tests {
     // -----------------------------------------------------------------
     // /ws bearer enforcement (slice 2d)
     // -----------------------------------------------------------------
-
 
     #[test]
     fn ws_frame_operation_mirrors_dashboard_control_tables() {

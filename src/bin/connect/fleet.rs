@@ -587,7 +587,10 @@ newer revision. */
 
 pub(crate) const MAX_VAULT_BLOB_BYTES: usize = 128 * 1024;
 
-pub(crate) fn validate_vault_blob(revision: u64, vault: &serde_json::Value) -> Result<(), ApiError> {
+pub(crate) fn validate_vault_blob(
+    revision: u64,
+    vault: &serde_json::Value,
+) -> Result<(), ApiError> {
     if serde_json::to_string(vault)
         .map(|s| s.len())
         .unwrap_or(usize::MAX)
@@ -1022,6 +1025,7 @@ mod tests {
             static_root: PathBuf::from("static"),
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
+            release_token: None,
             invite_required: false,
             open_daemon_registration: false,
             cookie_secure: true,

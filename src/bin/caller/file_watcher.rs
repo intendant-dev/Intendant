@@ -144,6 +144,10 @@ pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
 
 type FileFingerprint = (u64, Option<u128>);
 
+/// `(restorable, display_mirror)` maps from a snapshot object scan: relative
+/// path → object hash.
+type SnapshotObjectMaps = (HashMap<String, String>, HashMap<String, String>);
+
 #[derive(Debug, Clone)]
 pub(crate) struct TextFileSnapshot {
     pub bytes: Vec<u8>,
@@ -1019,9 +1023,7 @@ impl FileWatcher {
     /// Supported text files under the size cap are written to `objects/{hash}`
     /// and appear in both maps; inspected non-restorable files appear only in
     /// the display mirror. Ignored and oversized files are skipped.
-    fn scan_and_store_objects(
-        &self,
-    ) -> Result<(HashMap<String, String>, HashMap<String, String>), CallerError> {
+    fn scan_and_store_objects(&self) -> Result<SnapshotObjectMaps, CallerError> {
         let mut out: HashMap<String, String> = HashMap::new();
         let mut all: HashMap<String, String> = HashMap::new();
         let objects_dir = self.snapshot_dir.join("objects");

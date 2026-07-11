@@ -974,7 +974,7 @@ pub fn materialize_org_peer_grant(
 #[serde(untagged)]
 pub enum PresentedOrgGrant {
     Human(Box<MaterializedOrgGrant>),
-    Peer(MaterializedOrgPeerGrant),
+    Peer(Box<MaterializedOrgPeerGrant>),
 }
 
 impl PresentedOrgGrant {
@@ -1018,7 +1018,11 @@ pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
     push(&mut ids, &host_label);
     push(
         &mut ids,
-        intendant_core::peer_id::PeerId::new(intendant_core::peer_id::PeerKind::Intendant, &host_label).as_str(),
+        intendant_core::peer_id::PeerId::new(
+            intendant_core::peer_id::PeerKind::Intendant,
+            &host_label,
+        )
+        .as_str(),
     );
     ids
 }
@@ -1049,7 +1053,7 @@ pub fn present_org_grant_state(
     let daemon_ids = org_target_daemon_ids(extra_daemon_ids);
     if doc.subject.is_peer() {
         materialize_org_peer_grant(state, cert_dir, &doc, &daemon_ids, now_unix_ms)
-            .map(PresentedOrgGrant::Peer)
+            .map(|outcome| PresentedOrgGrant::Peer(Box::new(outcome)))
             .map_err(|e| e.to_string())
     } else {
         materialize_org_grant(state, &doc, &daemon_ids, now_unix_ms)

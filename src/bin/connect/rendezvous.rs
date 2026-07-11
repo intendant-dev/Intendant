@@ -403,8 +403,11 @@ pub(crate) async fn daemon_register(
                         record.claim_code_daemon_minted = false;
                         record.claim_code_created_unix_ms = None;
                     }
-                    *claim_code =
-                        Some(ensure_claim_code(claim_codes, record, &active_claim_hashes)?);
+                    *claim_code = Some(ensure_claim_code(
+                        claim_codes,
+                        record,
+                        &active_claim_hashes,
+                    )?);
                 }
             }
             Ok(())
@@ -575,7 +578,11 @@ pub(crate) fn sweep_stale_unclaimed_daemons(store: &mut Store, now: u64) -> Vec<
     removed
 }
 
-pub(crate) fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
+pub(crate) fn active_claim_code_hashes(
+    store: &Store,
+    except_daemon_id: &str,
+    now: u64,
+) -> HashSet<String> {
     store
         .daemons
         .iter()
@@ -750,7 +757,11 @@ pub(crate) async fn pop_event(state: &AppState, daemon_id: &str) -> Option<Rende
     event
 }
 
-pub(crate) async fn record_active_dashboard_session(state: &AppState, daemon_id: &str, session_id: &str) {
+pub(crate) async fn record_active_dashboard_session(
+    state: &AppState,
+    daemon_id: &str,
+    session_id: &str,
+) {
     let now = now_unix_ms();
     let mut sessions = state.active_sessions.lock().await;
     sessions.retain(|_, session| {
@@ -1452,6 +1463,7 @@ pub(crate) async fn verified_daemon_request(
 
 /// The DNS wrapper over [`verified_daemon_request`]: additionally requires
 /// the fleet zone to be enabled.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn dns_request_daemon(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1463,7 +1475,9 @@ async fn dns_request_daemon(
     issued_at_unix_ms: u64,
 ) -> ApiResult<DaemonRecord> {
     if state.dns_zone.is_none() {
-        return Err(ApiError::not_found("fleet dns is not enabled on this rendezvous"));
+        return Err(ApiError::not_found(
+            "fleet dns is not enabled on this rendezvous",
+        ));
     }
     verified_daemon_request(
         state,
@@ -1647,7 +1661,11 @@ pub(crate) async fn dns_acme_challenge(
     })))
 }
 
-pub(crate) fn verify_ed25519_b64u(public_key_b64u: &str, payload: &[u8], signature_b64u: &str) -> bool {
+pub(crate) fn verify_ed25519_b64u(
+    public_key_b64u: &str,
+    payload: &[u8],
+    signature_b64u: &str,
+) -> bool {
     let Ok(public_key) = b64u_decode(public_key_b64u) else {
         return false;
     };
@@ -1887,7 +1905,11 @@ pub(crate) async fn require_owned_daemon(
         .ok_or_else(|| ApiError::not_found("daemon not found"))
 }
 
-pub(crate) async fn ensure_owned_daemon(state: &AppState, user_id: Uuid, daemon_id: &str) -> ApiResult<()> {
+pub(crate) async fn ensure_owned_daemon(
+    state: &AppState,
+    user_id: Uuid,
+    daemon_id: &str,
+) -> ApiResult<()> {
     let daemon_id = daemon_id.trim();
     let store = state.store.lock().await;
     let daemon = store
@@ -2022,7 +2044,10 @@ mod tests {
             "fe80::1",
             "not-an-ip",
         ] {
-            assert!(publishable_address(refused).is_err(), "{refused} should be refused");
+            assert!(
+                publishable_address(refused).is_err(),
+                "{refused} should be refused"
+            );
         }
     }
 

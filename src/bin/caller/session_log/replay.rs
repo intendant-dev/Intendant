@@ -38,7 +38,11 @@ pub(crate) fn read_event_file_span(
     }
 }
 
-pub(crate) fn read_model_response_content(entry: &serde_json::Value, log_dir: &Path, message: &str) -> String {
+pub(crate) fn read_model_response_content(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    message: &str,
+) -> String {
     let data = entry.get("data");
     let has_span = data
         .and_then(|d| d.get("model_offset"))

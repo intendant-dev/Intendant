@@ -197,7 +197,9 @@ pub(crate) fn log_verify_consistency(
     fr == *old_root && sr == *new_root && sn == 0
 }
 
-pub(crate) fn load_or_create_log_keypair(store: &mut Store) -> Result<ring::signature::EcdsaKeyPair, String> {
+pub(crate) fn load_or_create_log_keypair(
+    store: &mut Store,
+) -> Result<ring::signature::EcdsaKeyPair, String> {
     let rng = ring::rand::SystemRandom::new();
     if store.log_private_pk8_b64.is_none() {
         let document = ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -260,7 +262,10 @@ pub(crate) fn signed_tree_head(state: &AppState, store: &Store) -> serde_json::V
     sth
 }
 
-pub(crate) async fn log_sth(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub(crate) async fn log_sth(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
     Ok(orl_cors(
@@ -468,7 +473,10 @@ pub(crate) struct ArtifactRecord {
 }
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|byte| format!("{byte:02x}")).collect()
+    sha256(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The routes served from compiled-in bytes, rendered exactly as this
@@ -479,7 +487,10 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> {
     let origin = config.public_origin.as_str();
     let mut artifacts = vec![
-        ("/".to_string(), sha256_hex(landing_ui_html(origin).as_bytes())),
+        (
+            "/".to_string(),
+            sha256_hex(landing_ui_html(origin).as_bytes()),
+        ),
         (
             "/connect".to_string(),
             sha256_hex(connect_page_html(origin).as_bytes()),
@@ -683,6 +694,389 @@ pub(crate) async fn log_artifact_manifest(
         .enumerate()
         .rev()
         .find(|(_, entry)| entry.kind == ARTIFACT_MANIFEST_KIND);
+    let Some((index, entry)) = found else {
+        return Ok(orl_cors(
+            Json(json!({ "ok": true, "found": false })).into_response(),
+        ));
+    };
+    let leaves = log_leaves(&store);
+    let proof: Vec<String> = log_inclusion_proof(index, &leaves)
+        .iter()
+        .map(|hash| b64u(hash))
+        .collect();
+    Ok(orl_cors(
+        Json(json!({
+            "ok": true,
+            "found": true,
+            "index": index,
+            "kind": entry.kind,
+            "unix_ms": entry.unix_ms,
+            "leaf_json": entry.leaf_json,
+            "proof": proof,
+            "sth": signed_tree_head_fields(&state, &store),
+        }))
+        .into_response(),
+    ))
+}
+
+// ── Release transparency: app release artifacts, committed ──
+//
+// The `artifact_manifest` entries above commit what the service SERVES;
+// these commit what the project RELEASES (trust-tiers.md's "update
+// channel" thread). The tag-triggered release pipeline
+// (.github/workflows/release.yml) hashes every artifact it published to
+// the GitHub release and submits a `release_manifest` here, gated by a
+// dedicated bearer token (`--release-token` /
+// INTENDANT_CONNECT_RELEASE_TOKEN — deliberately not the operator
+// `daemon_token`, so the CI secret can only ever append release
+// manifests). Reads and proofs are public like every other log
+// endpoint; `intendant hosted-verify --releases` is the out-of-band
+// monitor, and the macOS app's update check surfaces logged/not-logged
+// as an advisory. Strictly additive: one more entry kind in a tree
+// that only ever grows.
+
+pub(crate) const RELEASE_MANIFEST_KIND: &str = "release_manifest";
+
+/// Serialized-body cap for a submitted release manifest (the ORL
+/// bulletin's bound; a release names a handful of artifacts).
+pub(crate) const MAX_RELEASE_MANIFEST_BYTES: usize = 64 * 1024;
+const RELEASE_TAG_MAX: usize = 100;
+const RELEASE_ARTIFACT_LIMIT: usize = 256;
+const RELEASE_ARTIFACT_NAME_MAX: usize = 200;
+const RELEASE_PLATFORM_LIMIT: usize = 32;
+
+/// One released artifact: the GitHub release asset's file name, the
+/// lowercase-hex sha256 of its exact bytes, and its size in bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReleaseArtifactRecord {
+    pub name: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Canonical release-manifest hash: sha256 (lowercase hex) over
+///
+/// ```text
+/// intendant-release-manifest-v1\n
+/// {tag}\n
+/// {name}\t{sha256}\t{size}\n      (per artifact, sorted by name, byte order)
+/// ```
+///
+/// The artifact-manifest discipline: independent of JSON serialization
+/// so external monitors can recompute it from any faithful copy.
+/// REPLICATED in `bin/caller/hosted_verify.rs`; golden tests twin the
+/// two implementations.
+pub(crate) fn release_manifest_hash_hex(tag: &str, artifacts: &[ReleaseArtifactRecord]) -> String {
+    let mut canonical = String::from("intendant-release-manifest-v1\n");
+    canonical.push_str(tag);
+    canonical.push('\n');
+    for artifact in artifacts {
+        canonical.push_str(&artifact.name);
+        canonical.push('\t');
+        canonical.push_str(&artifact.sha256);
+        canonical.push('\t');
+        canonical.push_str(&artifact.size.to_string());
+        canonical.push('\n');
+    }
+    sha256_hex(canonical.as_bytes())
+}
+
+/// Bearer gate for release-manifest submission. Mirrors
+/// `require_admin_auth`'s stance: an unset token must not mean an open
+/// submission endpoint, so unconfigured → 503, wrong/missing → 401.
+/// Pure over the configured value so tests need no `AppState`.
+pub(crate) fn check_release_token(configured: Option<&str>, headers: &HeaderMap) -> ApiResult<()> {
+    let Some(token) = configured.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "release submission requires the service to be started with --release-token",
+        ));
+    };
+    let expected = format!("Bearer {token}");
+    if headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        == Some(expected.as_str())
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(
+            "missing or invalid release bearer token",
+        ))
+    }
+}
+
+/// A validated, canonicalized (name-sorted) release manifest as it will
+/// be committed to the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedReleaseManifest {
+    pub tag: String,
+    pub version: String,
+    pub platforms: Vec<String>,
+    /// Sorted by name — the canonical order the hash covers.
+    pub artifacts: Vec<ReleaseArtifactRecord>,
+    pub manifest_hash: String,
+}
+
+/// Tags, versions, platform labels, and artifact names share one strict
+/// vocabulary: ASCII alphanumerics plus `. _ - +`, no leading `-`/`.`.
+/// Every value the pipeline actually submits fits; nothing that could
+/// smuggle a path, header, or control character does.
+fn valid_release_component(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && !value.starts_with(['-', '.'])
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// Shape-validate a submitted release manifest and canonicalize it
+/// (artifacts name-sorted, manifest hash computed). Every rejection is
+/// a message suitable for a 400 body.
+pub(crate) fn validate_release_manifest(
+    body: &serde_json::Value,
+) -> Result<ValidatedReleaseManifest, String> {
+    let tag = body
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !valid_release_component(&tag, RELEASE_TAG_MAX) {
+        return Err(
+            "tag must be 1-100 chars of [A-Za-z0-9._+-], not starting with '-' or '.'".to_string(),
+        );
+    }
+    let version = body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !valid_release_component(&version, RELEASE_TAG_MAX) {
+        return Err("version must be 1-100 chars of [A-Za-z0-9._+-]".to_string());
+    }
+    let platforms: Vec<String> = body
+        .get("platforms")
+        .and_then(|v| v.as_array())
+        .ok_or("platforms must be an array of target labels")?
+        .iter()
+        .map(|entry| {
+            let platform = entry.as_str().unwrap_or("").trim().to_string();
+            if valid_release_component(&platform, RELEASE_TAG_MAX) {
+                Ok(platform)
+            } else {
+                Err(format!("invalid platform label {entry}"))
+            }
+        })
+        .collect::<Result<_, String>>()?;
+    if platforms.is_empty() || platforms.len() > RELEASE_PLATFORM_LIMIT {
+        return Err(format!(
+            "platforms must name 1-{RELEASE_PLATFORM_LIMIT} targets"
+        ));
+    }
+    let mut artifacts: Vec<ReleaseArtifactRecord> =
+        body.get("artifacts")
+            .and_then(|v| v.as_array())
+            .ok_or("artifacts must be an array")?
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !valid_release_component(&name, RELEASE_ARTIFACT_NAME_MAX) {
+                    return Err(format!("invalid artifact name {:?}", name));
+                }
+                let sha256 = entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !valid_sha256_hex(&sha256) {
+                    return Err(format!(
+                        "artifact {name}: sha256 must be 64 lowercase hex chars"
+                    ));
+                }
+                let size = entry.get("size").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    format!("artifact {name}: size must be a non-negative integer")
+                })?;
+                Ok(ReleaseArtifactRecord { name, sha256, size })
+            })
+            .collect::<Result<_, String>>()?;
+    if artifacts.is_empty() || artifacts.len() > RELEASE_ARTIFACT_LIMIT {
+        return Err(format!(
+            "artifacts must list 1-{RELEASE_ARTIFACT_LIMIT} files"
+        ));
+    }
+    artifacts.sort_by(|a, b| a.name.cmp(&b.name));
+    if artifacts
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err("artifact names must be unique".to_string());
+    }
+    let manifest_hash = release_manifest_hash_hex(&tag, &artifacts);
+    Ok(ValidatedReleaseManifest {
+        tag,
+        version,
+        platforms,
+        artifacts,
+        manifest_hash,
+    })
+}
+
+/// Where a submission landed: a fresh log entry, or the index of the
+/// identical one already there (re-runs of the pipeline are idempotent).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseRecordOutcome {
+    Logged { index: usize },
+    Duplicate { index: usize },
+}
+
+/// Append a `release_manifest` entry unless the latest entry for this
+/// tag already carries the same manifest hash. A CHANGED manifest for a
+/// tag is deliberately appended, not rejected: republished artifacts are
+/// exactly the history the log exists to evidence. The caller persists.
+pub(crate) fn record_release_manifest(
+    store: &mut Store,
+    manifest: &ValidatedReleaseManifest,
+) -> ReleaseRecordOutcome {
+    let existing = store
+        .log_entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| {
+            entry.kind == RELEASE_MANIFEST_KIND
+                && serde_json::from_str::<serde_json::Value>(&entry.leaf_json)
+                    .ok()
+                    .and_then(|leaf| leaf.get("tag").and_then(|t| t.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(manifest.tag.as_str())
+        });
+    if let Some((index, entry)) = existing {
+        let same_hash = serde_json::from_str::<serde_json::Value>(&entry.leaf_json)
+            .ok()
+            .and_then(|leaf| {
+                leaf.get("manifest_hash")
+                    .and_then(|h| h.as_str())
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(manifest.manifest_hash.as_str());
+        if same_hash {
+            return ReleaseRecordOutcome::Duplicate { index };
+        }
+    }
+    append_log_entry(
+        store,
+        RELEASE_MANIFEST_KIND,
+        json!({
+            "tag": manifest.tag,
+            "version": manifest.version,
+            "platforms": manifest.platforms,
+            "manifest_hash": manifest.manifest_hash,
+            "artifacts": manifest.artifacts,
+        }),
+    );
+    ReleaseRecordOutcome::Logged {
+        index: store.log_entries.len() - 1,
+    }
+}
+
+/// `POST /api/log/release-manifest` — the release pipeline commits what
+/// it published. Token-authed (`check_release_token`), shape-validated,
+/// size-bounded; the log stays public to READ.
+pub(crate) async fn release_manifest_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "release_submit", 30, 60_000).await?;
+    check_release_token(state.config.release_token.as_deref(), &headers)?;
+    if serde_json::to_string(&body)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > MAX_RELEASE_MANIFEST_BYTES
+    {
+        return Err(ApiError::bad_request("release manifest is too large"));
+    }
+    let manifest = validate_release_manifest(&body).map_err(ApiError::bad_request)?;
+    let mut store = state.store.lock().await;
+    let (logged, index) = match record_release_manifest(&mut store, &manifest) {
+        ReleaseRecordOutcome::Logged { index } => (true, index),
+        ReleaseRecordOutcome::Duplicate { index } => (false, index),
+    };
+    if logged {
+        persist_locked(&state, &store)?;
+        eprintln!(
+            "[connect] release manifest logged: {} ({} artifacts, {})",
+            manifest.tag,
+            manifest.artifacts.len(),
+            &manifest.manifest_hash[..12.min(manifest.manifest_hash.len())],
+        );
+    }
+    Ok(orl_cors(
+        Json(json!({
+            "ok": true,
+            "logged": logged,
+            "index": index,
+            "tag": manifest.tag,
+            "manifest_hash": manifest.manifest_hash,
+            "size": store.log_entries.len(),
+        }))
+        .into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReleaseManifestQuery {
+    #[serde(default)]
+    tag: String,
+}
+
+/// `GET /api/log/release-manifest[?tag=<tag>]` — the latest release
+/// manifest (for a tag, or overall) with everything an out-of-band
+/// monitor needs in one response: the exact leaf bytes, its index, an
+/// inclusion proof, and the signed tree head — all under one store lock
+/// so they cohere (the `log_artifact_manifest` shape).
+pub(crate) async fn log_release_manifest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ReleaseManifestQuery>,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
+    let tag = query.tag.trim();
+    let store = state.store.lock().await;
+    let found = store
+        .log_entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| {
+            if entry.kind != RELEASE_MANIFEST_KIND {
+                return false;
+            }
+            if tag.is_empty() {
+                return true;
+            }
+            serde_json::from_str::<serde_json::Value>(&entry.leaf_json)
+                .ok()
+                .and_then(|leaf| leaf.get("tag").and_then(|t| t.as_str()).map(str::to_string))
+                .as_deref()
+                == Some(tag)
+        });
     let Some((index, entry)) = found else {
         return Ok(orl_cors(
             Json(json!({ "ok": true, "found": false })).into_response(),
@@ -987,6 +1381,7 @@ mod tests {
             static_root: static_root.to_path_buf(),
             data_file: static_root.join("state.json"),
             daemon_token: None,
+            release_token: None,
             cookie_secure: true,
             invite_required: false,
             open_daemon_registration: false,
@@ -1060,7 +1455,10 @@ mod tests {
         }
         let app = manifest.iter().find(|a| a.path == "/app.html").unwrap();
         assert_eq!(app.sha256, sha256_hex(b"hello"));
-        let kernel = manifest.iter().find(|a| a.path == "/vault-kernel.js").unwrap();
+        let kernel = manifest
+            .iter()
+            .find(|a| a.path == "/vault-kernel.js")
+            .unwrap();
         assert_eq!(kernel.sha256, sha256_hex(b"kernel"));
         // Deterministic: two computations agree (the pages embed only
         // the origin, never a timestamp or nonce).
@@ -1071,7 +1469,10 @@ mod tests {
         // The embedded route wins a path collision with the static root.
         std::fs::write(dir.path().join("logo.svg"), b"not the logo").unwrap();
         let with_collision = served_artifact_manifest(&config);
-        let logo = with_collision.iter().find(|a| a.path == "/logo.svg").unwrap();
+        let logo = with_collision
+            .iter()
+            .find(|a| a.path == "/logo.svg")
+            .unwrap();
         assert_eq!(logo.sha256, sha256_hex(LOGO_SVG.as_bytes()));
     }
 
@@ -1104,7 +1505,10 @@ mod tests {
             .find(|(_, e)| e.kind == ARTIFACT_MANIFEST_KIND)
             .unwrap();
         let leaf: serde_json::Value = serde_json::from_str(&entry.leaf_json).unwrap();
-        assert_eq!(leaf.get("kind").and_then(|v| v.as_str()), Some(ARTIFACT_MANIFEST_KIND));
+        assert_eq!(
+            leaf.get("kind").and_then(|v| v.as_str()),
+            Some(ARTIFACT_MANIFEST_KIND)
+        );
         assert!(leaf.get("unix_ms").and_then(|v| v.as_u64()).is_some());
         assert_eq!(
             leaf.get("bundle_version").and_then(|v| v.as_str()),
@@ -1122,7 +1526,11 @@ mod tests {
             "manifest_hash must recompute from the carried list"
         );
         assert_eq!(
-            artifacts.iter().find(|a| a.path == "/app.html").unwrap().sha256,
+            artifacts
+                .iter()
+                .find(|a| a.path == "/app.html")
+                .unwrap()
+                .sha256,
             sha256_hex(b"bundle-v2")
         );
 
@@ -1136,6 +1544,237 @@ mod tests {
             &proof,
             &root,
         ));
+    }
+
+    fn release_fixture() -> ValidatedReleaseManifest {
+        validate_release_manifest(&json!({
+            "tag": "v1.2.3",
+            "version": "1.2.3",
+            "platforms": ["macos-arm64"],
+            "artifacts": [
+                { "name": "Intendant-v1.2.3.zip", "sha256": sha256_hex(b"app zip"), "size": 5 },
+                { "name": "Intendant-v1.2.3.zip.sha256", "sha256": sha256_hex(b"hash file"), "size": 3 },
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// Golden release-manifest hash — TWINNED byte-for-byte in
+    /// `bin/caller/hosted_verify.rs` (the verifier replicates the
+    /// canonicalization; change both together).
+    #[test]
+    fn release_manifest_hash_is_canonical_and_pinned() {
+        let artifacts = vec![
+            ReleaseArtifactRecord {
+                name: "Intendant-v1.2.3.zip".to_string(),
+                sha256: sha256_hex(b"hello"),
+                size: 5,
+            },
+            ReleaseArtifactRecord {
+                name: "Intendant-v1.2.3.zip.sha256".to_string(),
+                sha256: sha256_hex(b"world"),
+                size: 99,
+            },
+        ];
+        assert_eq!(
+            release_manifest_hash_hex("v1.2.3", &artifacts),
+            "050b3579a283790ed739544295c4120ab5457a557fefc72ed374847e8af83030"
+        );
+        // Order-, tag-, and size-sensitive by design.
+        let reversed = vec![artifacts[1].clone(), artifacts[0].clone()];
+        assert_ne!(
+            release_manifest_hash_hex("v1.2.3", &reversed),
+            release_manifest_hash_hex("v1.2.3", &artifacts)
+        );
+        assert_ne!(
+            release_manifest_hash_hex("v1.2.4", &artifacts),
+            release_manifest_hash_hex("v1.2.3", &artifacts)
+        );
+        let mut resized = artifacts.clone();
+        resized[0].size = 6;
+        assert_ne!(
+            release_manifest_hash_hex("v1.2.3", &resized),
+            release_manifest_hash_hex("v1.2.3", &artifacts)
+        );
+    }
+
+    #[test]
+    fn release_manifest_validation_canonicalizes_and_rejects_bad_shapes() {
+        let manifest = release_fixture();
+        assert_eq!(manifest.tag, "v1.2.3");
+        assert_eq!(manifest.version, "1.2.3");
+        assert_eq!(manifest.platforms, vec!["macos-arm64".to_string()]);
+        // Artifacts come out name-sorted and the hash covers that order.
+        assert_eq!(manifest.artifacts[0].name, "Intendant-v1.2.3.zip");
+        assert_eq!(
+            manifest.manifest_hash,
+            release_manifest_hash_hex(&manifest.tag, &manifest.artifacts)
+        );
+
+        let base = json!({
+            "tag": "v1.2.3",
+            "version": "1.2.3",
+            "platforms": ["macos-arm64"],
+            "artifacts": [{ "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 }],
+        });
+        let mutate = |key: &str, value: serde_json::Value| {
+            let mut body = base.clone();
+            body[key] = value;
+            body
+        };
+        assert!(validate_release_manifest(&base).is_ok());
+        for bad in [
+            mutate("tag", json!("")),
+            mutate("tag", json!("-rc1")),
+            mutate("tag", json!("v1/../etc")),
+            mutate("tag", json!("v".repeat(101))),
+            mutate("version", json!("")),
+            mutate("platforms", json!([])),
+            mutate("platforms", json!(["ok", "bad platform!"])),
+            mutate("platforms", json!("macos")),
+            mutate("artifacts", json!([])),
+            mutate("artifacts", json!("nope")),
+            mutate(
+                "artifacts",
+                json!([{ "name": "a.zip", "sha256": "abc", "size": 1 }]),
+            ),
+            mutate(
+                "artifacts",
+                json!([{ "name": "a.zip", "sha256": sha256_hex(b"x").to_uppercase(), "size": 1 }]),
+            ),
+            mutate(
+                "artifacts",
+                json!([{ "name": "../evil.zip", "sha256": sha256_hex(b"x"), "size": 1 }]),
+            ),
+            mutate(
+                "artifacts",
+                json!([{ "name": "a.zip", "sha256": sha256_hex(b"x") }]),
+            ),
+            mutate(
+                "artifacts",
+                json!([
+                    { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                    { "name": "a.zip", "sha256": sha256_hex(b"y"), "size": 2 },
+                ]),
+            ),
+        ] {
+            assert!(
+                validate_release_manifest(&bad).is_err(),
+                "must reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_manifest_entries_append_dedupe_and_prove() {
+        let mut store = Store::default();
+        append_log_entry(&mut store, "daemon_claimed", json!({ "daemon_id": "d1" }));
+        let manifest = release_fixture();
+
+        // First submission appends…
+        assert_eq!(
+            record_release_manifest(&mut store, &manifest),
+            ReleaseRecordOutcome::Logged { index: 1 }
+        );
+        // …an identical re-run dedupes to the same index…
+        assert_eq!(
+            record_release_manifest(&mut store, &manifest),
+            ReleaseRecordOutcome::Duplicate { index: 1 }
+        );
+        assert_eq!(store.log_entries.len(), 2);
+        // …a different tag appends…
+        let mut next = manifest.clone();
+        next.tag = "v1.2.4".to_string();
+        next.manifest_hash = release_manifest_hash_hex(&next.tag, &next.artifacts);
+        assert_eq!(
+            record_release_manifest(&mut store, &next),
+            ReleaseRecordOutcome::Logged { index: 2 }
+        );
+        // …and republished artifacts under an EXISTING tag append too
+        // (history, not replacement).
+        let mut republished = manifest.clone();
+        republished.artifacts[0].sha256 = sha256_hex(b"rebuilt zip");
+        republished.manifest_hash =
+            release_manifest_hash_hex(&republished.tag, &republished.artifacts);
+        assert_eq!(
+            record_release_manifest(&mut store, &republished),
+            ReleaseRecordOutcome::Logged { index: 3 }
+        );
+        // The republished entry is now the latest for that tag.
+        assert_eq!(
+            record_release_manifest(&mut store, &republished),
+            ReleaseRecordOutcome::Duplicate { index: 3 }
+        );
+
+        // Round-trip the entry: the leaf carries the list, the manifest
+        // hash recomputes from it, and the inclusion proof verifies.
+        let entry = &store.log_entries[1];
+        assert_eq!(entry.kind, RELEASE_MANIFEST_KIND);
+        let leaf: serde_json::Value = serde_json::from_str(&entry.leaf_json).unwrap();
+        assert_eq!(
+            leaf.get("kind").and_then(|v| v.as_str()),
+            Some(RELEASE_MANIFEST_KIND)
+        );
+        assert!(leaf.get("unix_ms").and_then(|v| v.as_u64()).is_some());
+        assert_eq!(leaf.get("tag").and_then(|v| v.as_str()), Some("v1.2.3"));
+        assert_eq!(leaf.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
+        assert_eq!(
+            leaf.get("platforms")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        let artifacts: Vec<ReleaseArtifactRecord> =
+            serde_json::from_value(leaf.get("artifacts").cloned().unwrap()).unwrap();
+        assert_eq!(
+            leaf.get("manifest_hash").and_then(|v| v.as_str()),
+            Some(release_manifest_hash_hex("v1.2.3", &artifacts).as_str()),
+            "manifest_hash must recompute from the carried list"
+        );
+
+        let leaves = log_leaves(&store);
+        let proof = log_inclusion_proof(1, &leaves);
+        let root = log_tree_root(&leaves);
+        assert!(log_verify_inclusion(
+            &log_leaf_hash(&entry.leaf_json),
+            1,
+            leaves.len(),
+            &proof,
+            &root,
+        ));
+    }
+
+    #[test]
+    fn release_token_gate_rejects_missing_and_wrong_tokens() {
+        let with_auth = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            headers
+        };
+        // No token configured: submissions are OFF (503), even with a
+        // guessed header — an unset token must not mean an open endpoint.
+        let err = check_release_token(None, &with_auth(Some("Bearer anything"))).unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        let err = check_release_token(Some("  "), &with_auth(None)).unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        // Configured: missing and wrong bearers are 401.
+        let err = check_release_token(Some("s3cret"), &with_auth(None)).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        let err = check_release_token(Some("s3cret"), &with_auth(Some("Bearer nope"))).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        let err = check_release_token(Some("s3cret"), &with_auth(Some("s3cret"))).unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "bare token without Bearer"
+        );
+        // The right bearer passes.
+        assert!(check_release_token(Some("s3cret"), &with_auth(Some("Bearer s3cret"))).is_ok());
     }
 
     #[test]

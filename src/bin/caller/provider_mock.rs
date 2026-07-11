@@ -110,9 +110,8 @@ impl MockProvider {
                 "PROVIDER=mock requires {MOCK_SCRIPT_ENV}=<path to script JSON>"
             ))
         })?;
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            CallerError::Config(format!("mock script {path} is unreadable: {e}"))
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| CallerError::Config(format!("mock script {path} is unreadable: {e}")))?;
         Self::from_json(&raw)
     }
 
@@ -125,10 +124,7 @@ impl MockProvider {
             ));
         }
         Ok(Self {
-            model: script
-                .model
-                .clone()
-                .unwrap_or_else(|| "mock-1".to_string()),
+            model: script.model.clone().unwrap_or_else(|| "mock-1".to_string()),
             script,
             cursor: Mutex::new(None),
         })
@@ -214,7 +210,11 @@ impl ChatProvider for MockProvider {
         // later requests read half) so cache-vitals plumbing runs keyless.
         let prompt_tokens = (transcript.len() as u64 / 4).max(1);
         let completion_tokens = (step.content.len() as u64 / 4).max(1);
-        let cached_tokens = if step_index == 0 { 0 } else { prompt_tokens / 2 };
+        let cached_tokens = if step_index == 0 {
+            0
+        } else {
+            prompt_tokens / 2
+        };
         let rate_limit_windows = step
             .limit_used_pct
             .map(|used_pct| {
@@ -310,8 +310,10 @@ mod tests {
     #[tokio::test]
     async fn serves_fallback_profile_steps_in_order() {
         let provider = two_profile_script();
-        let mut conversation = vec![message("system", "you are an agent"),
-            message("user", "do the thing")];
+        let mut conversation = vec![
+            message("system", "you are an agent"),
+            message("user", "do the thing"),
+        ];
 
         let first = provider.chat(&conversation).await.expect("step one");
         assert_eq!(first.content, "step one");
@@ -333,7 +335,10 @@ mod tests {
     #[tokio::test]
     async fn matching_profile_wins_over_fallback() {
         let provider = two_profile_script();
-        let conversation = [message("system", "sub-agent"), message("user", "CHILD-TASK: go")];
+        let conversation = [
+            message("system", "sub-agent"),
+            message("user", "CHILD-TASK: go"),
+        ];
         let response = provider.chat(&conversation).await.expect("child step");
         assert_eq!(response.content, "child answer");
         assert_eq!(response.tool_calls[0].name, "submit_result");

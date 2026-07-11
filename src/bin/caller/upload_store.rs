@@ -247,6 +247,7 @@ pub(crate) fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<
 /// with a size cap already applied (so we don't need to reread + measure
 /// here). The tempfile is moved (rename-if-possible, otherwise copy+delete)
 /// into the target directory under a unique name.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn commit_upload(
     temp_file: tempfile::NamedTempFile,
     original_name: &str,
@@ -367,7 +368,7 @@ pub fn list_uploads(session_dir: &Path, scope: &StoreScope) -> Vec<UploadDescrip
             }
         }
     }
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
     out
 }
 

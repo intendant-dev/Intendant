@@ -30,7 +30,6 @@ pub fn build_config(
 // /api/peers helpers
 // ---------------------------------------------------------------------------
 
-
 /// Resolve the list of WebSocket URLs to advertise in the Agent
 /// Card for this daemon, in preference order.
 ///

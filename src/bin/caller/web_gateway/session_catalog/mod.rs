@@ -1273,6 +1273,7 @@ pub(crate) fn worktree_hint_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn push_agent_observed_worktree_hint(
     hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
     home: &Path,
@@ -1784,10 +1785,8 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         ));
                     }
                 }
-                "round_complete" => {
-                    if status != "interrupted" {
-                        status = "idle".to_string();
-                    }
+                "round_complete" if status != "interrupted" => {
+                    status = "idle".to_string();
                 }
                 _ => {}
             }
@@ -2156,7 +2155,7 @@ pub(crate) fn list_intendant_skeleton_sessions_with_limit(
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
-    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
     dirs.truncate(limit);
     dirs.into_iter()
         .filter_map(|(dir, _)| {
@@ -2263,7 +2262,7 @@ pub(crate) fn list_sessions_from_home_impl(
         })
         .collect::<Vec<_>>();
     if let Some(cap) = row_cap {
-        dirs.sort_by(|a, b| b.1.cmp(&a.1));
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
         let scan_limit = cap
             .saturating_add(SESSION_SOURCE_FLOOR * 3)
             .clamp(cap, SESSION_LIST_LIMIT);
@@ -2882,7 +2881,11 @@ mod tests {
     #[test]
     fn intendant_row_preview_collects_prose_and_respects_slots() {
         let home = tempfile::tempdir().unwrap();
-        let log_dir = home.path().join(".intendant").join("logs").join("preview-1");
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("preview-1");
         std::fs::create_dir_all(&log_dir).unwrap();
         std::fs::write(
             log_dir.join("session_meta.json"),

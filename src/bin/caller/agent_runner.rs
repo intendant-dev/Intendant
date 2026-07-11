@@ -126,7 +126,14 @@ pub async fn run_agent(
             .await;
         }
     }
-    run_agent_inner(json_input, log_dir, Some(workdir), None, user_display_granted).await
+    run_agent_inner(
+        json_input,
+        log_dir,
+        Some(workdir),
+        None,
+        user_display_granted,
+    )
+    .await
 }
 
 /// Run the agent with optional Landlock sandbox configuration.
@@ -137,7 +144,14 @@ pub async fn run_agent_sandboxed(
     sandbox: &crate::sandbox::SandboxConfig,
     user_display_granted: bool,
 ) -> Result<AgentOutput, CallerError> {
-    run_agent_inner(json_input, log_dir, None, Some(sandbox), user_display_granted).await
+    run_agent_inner(
+        json_input,
+        log_dir,
+        None,
+        Some(sandbox),
+        user_display_granted,
+    )
+    .await
 }
 
 async fn run_agent_inner(

@@ -156,7 +156,11 @@ pub fn list_payloads_in(
 /// be called from code that feeds the result back to an agent.
 #[allow(dead_code)]
 pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, CallerError> {
-    read_payload_in(&crate::platform::intendant_home(), live_audio_id, payload_id)
+    read_payload_in(
+        &crate::platform::intendant_home(),
+        live_audio_id,
+        payload_id,
+    )
 }
 
 /// Explicit-state-root variant of [`read_payload`] (the testable seam).
@@ -167,7 +171,8 @@ pub fn read_payload_in(
     payload_id: &str,
 ) -> Result<String, CallerError> {
     validate_quarantine_id("payload_id", payload_id)?;
-    let file_path = quarantine_dir_in(state_root, live_audio_id)?.join(format!("{}.json", payload_id));
+    let file_path =
+        quarantine_dir_in(state_root, live_audio_id)?.join(format!("{}.json", payload_id));
     let data = std::fs::read_to_string(&file_path)?;
     let parsed: serde_json::Value = serde_json::from_str(&data)?;
     Ok(parsed["content"].as_str().unwrap_or("").to_string())
@@ -371,9 +376,13 @@ mod tests {
         assert!(!p1.summary.contains("rm -rf"));
 
         // String overflow
-        let p2 =
-            store_payload_in(state.path(), live_id, "string_overflow", "a".repeat(10000).as_str())
-                .unwrap();
+        let p2 = store_payload_in(
+            state.path(),
+            live_id,
+            "string_overflow",
+            "a".repeat(10000).as_str(),
+        )
+        .unwrap();
         assert_eq!(p2.summary, "string field exceeded max length");
 
         // Unknown type

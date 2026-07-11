@@ -367,7 +367,7 @@ pub(crate) async fn apply_chained_context_rewind_resume_turns(
                 ..
             } => {
                 emit_context_rewind_resume_round_complete(resume, message, turns_in_round);
-                request = next_request;
+                request = *next_request;
             }
             other => return Ok(Some(other)),
         }
@@ -421,6 +421,7 @@ pub(crate) fn claim_active_side_turn_completion(
         .unwrap_or(true)
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn start_external_side_followup_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     config: &DrainConfig<'_>,

@@ -190,7 +190,9 @@ pub(crate) fn load_or_create_vapid_keypair(
     .map_err(|_| "stored VAPID key is invalid".to_string())
 }
 
-pub(crate) async fn push_vapid_public_key(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub(crate) async fn push_vapid_public_key(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
     use ring::signature::KeyPair as _;
     Json(json!({
         "ok": true,
@@ -524,7 +526,8 @@ pub(crate) async fn daemon_notify(
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| daemon.daemon_id.clone());
     let session_label = clean_fleet_text(&body.session_label, FLEET_LABEL_MAX);
-    let push_payload = attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
+    let push_payload =
+        attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
     let mut sent = 0;
     let mut dead = Vec::new();
     for subscription in &subscriptions {
@@ -920,7 +923,12 @@ mod tests {
         // the agent's reason text never rides the push.
         let display = attention_push_payload("display_request", "workshop", "s-1", "daemon-1");
         let display_keys: Vec<&str> = {
-            let mut keys: Vec<&str> = display.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            let mut keys: Vec<&str> = display
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
             keys.sort_unstable();
             keys
         };

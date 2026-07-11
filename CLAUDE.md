@@ -65,9 +65,11 @@ cargo nextest run --bins  # same tests, much faster: one process per test
 cargo clippy              # lint
 ```
 
-**WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails (use the pinned version):
-`cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web` or
-`cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web`.
+**WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails: `bash scripts/build-wasm.sh`
+(the canonical builder — it carries the registry-path remap that makes
+artifact bytes account-independent; the CI drift gate rebuilds through the
+same script, and build.rs mirrors its flags). **Regenerate wasm artifacts on
+macOS only** — output is not byte-deterministic across host triples.
 
 Common invocations (full flag reference in `docs/src/getting-started.md`):
 

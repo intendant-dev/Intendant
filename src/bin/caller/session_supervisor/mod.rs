@@ -16,13 +16,13 @@ use super::*;
 
 mod launch;
 pub(crate) use launch::*;
-mod sub_agents;
 mod routing;
+mod sub_agents;
 pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
-mod registry;
 mod dispatch;
+mod registry;
 
 #[derive(Clone)]
 pub struct SessionSupervisorConfig {
@@ -53,8 +53,7 @@ pub struct SessionSupervisorConfig {
     /// sessions construct their ChatProvider from this factory instead of
     /// `provider::select_provider()` (which needs API keys). None in
     /// production; tests use it to run the loop against a mock provider.
-    pub provider_factory:
-        Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
+    pub provider_factory: Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
     /// Injection point for the persisted-session home: resume/attach
     /// resolution (wrapper logs, the wrapper index, persisted launch
     /// configs) reads from here. None in production (the real home); tests
@@ -787,5 +786,4 @@ mod tests {
         assert!(!state.mark_restart_requested("codex:thread"));
         assert!(state.mark_restart_requested("codex:other-thread"));
     }
-
 }

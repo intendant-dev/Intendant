@@ -59,6 +59,7 @@ impl SessionLog {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) fn steer_event(
         &mut self,
         event: &str,
@@ -738,7 +739,11 @@ impl SessionLog {
                 display_id,
                 width,
                 height,
-                if agent_visible { "" } else { " [private user view]" }
+                if agent_visible {
+                    ""
+                } else {
+                    " [private user view]"
+                }
             )),
             data: Some(serde_json::json!({
                 "display_id": display_id,
@@ -931,7 +936,6 @@ impl SessionLog {
             file2: None,
         });
     }
-
 
     /// Log presence layer log message.
     pub fn presence_log(&mut self, message: &str, level: Option<&str>) {
@@ -1183,6 +1187,7 @@ impl SessionLog {
 
     /// Log a parsed raw model-context snapshot for dashboard inspection.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn context_snapshot(
         &mut self,
         source: &str,
@@ -1213,6 +1218,7 @@ impl SessionLog {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn context_snapshot_for_session(
         &mut self,
         session_id: Option<&str>,
@@ -1299,6 +1305,7 @@ impl SessionLog {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn model_response_for_session(
         &mut self,
         session_id: Option<&str>,
