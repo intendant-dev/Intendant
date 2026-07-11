@@ -35,9 +35,13 @@
 // relays), the F6 credential-custody family (vault leases, the
 // custody trail, the daemon vault store + deposit lane, client-egress
 // registration/probe — tunnel-only methods whose per-cause availability
-// the vault UI surfaces), and the F1c transfer-jobs adapter (the
+// the vault UI surfaces), the F1c transfer-jobs adapter (the
 // resumable jobs protocol over the S9 /api/transfers rows, presence
-// feature-detected through the probe registry below); the remaining
+// feature-detected through the probe registry below), and the F7
+// control-msg dispatchers (api_control_msg, api_session_control_msg,
+// api_dashboard_action_msg — WS-twin residue: their HTTP-era twin is the
+// /ws intent stream, so the facade serves the tunnel leg only and the
+// call sites keep their own /ws fallback); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade

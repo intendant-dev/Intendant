@@ -1179,15 +1179,32 @@ function dispatchControlMsg(payload) {
     dispatchDashboardActionMsg(payload);
     return;
   }
+  // Transport F7: the RPC leg rides the daemonApi facade. api_control_msg
+  // is WS-twin residue (no HTTP row exists by design — its HTTP-era twin
+  // is the /ws intent stream below), so the facade can never take an HTTP
+  // lane for it; the availability derivation replaces the hand-rolled
+  // canUseRpc + status-boolean probe (the status boolean once landed, the
+  // hello_ack features list before that — denied and too-old daemons fall
+  // through to /ws exactly as the strict boolean did). A tunnel attempt is
+  // final either way: never replayed over /ws (the hosted validators probe
+  // exactly this).
   if (
     action &&
     DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_control_msg_available === true
+    daemonApi.availability('api_control_msg').ok
   ) {
-    dashboardTransport.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (resp.ok) return;
+        // A delivered refusal (the daemon's action allowlist said no —
+        // drift the SPA/daemon parity pins make near-impossible) is a
+        // delivered response: surface it instead of the pre-facade silent
+        // swallow, and still never replay it.
+        console.warn(`[dashboard-control] ${action} ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', resp.body?.error || 'Dashboard control request failed');
+        }
+      })
       .catch(err => {
         console.warn(`[dashboard-control] ${action} ControlMsg RPC failed; not replaying over /ws`, err);
         if (typeof showControlToast === 'function') {

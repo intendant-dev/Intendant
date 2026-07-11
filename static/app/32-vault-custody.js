@@ -2967,14 +2967,27 @@ function dispatchSessionControlMsg(payload, options = {}) {
     return false;
   };
   if (!DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_session_control_msg_available === true
-  ) {
-    dashboardTransport.request('api_session_control_msg', { message: payload }, {
+  // Transport F7: the RPC leg rides the daemonApi facade. WS-twin residue
+  // method (no HTTP row by design — the /ws intent stream below is the
+  // twin), so no HTTP lane exists for it; the availability derivation
+  // replaces the hand-rolled canUseRpc + status-boolean probe, and denied
+  // or too-old daemons fall through to /ws exactly as the strict boolean
+  // did. A tunnel attempt is final: never replayed over /ws.
+  if (daemonApi.availability('api_session_control_msg').ok) {
+    daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      // Delivered refusals (allowlist drift the parity pins make
+      // near-impossible) surface instead of silently resolving; still no
+      // /ws replay — the response was delivered.
+      const err = new Error(resp.body?.error || 'Dashboard control request failed');
+      console.warn(`[dashboard-control] ${action} session ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} session ControlMsg RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {
@@ -3002,14 +3015,21 @@ function dispatchDashboardActionMsg(payload, options = {}) {
     return false;
   };
   if (!DASHBOARD_ACTION_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_dashboard_action_msg_available === true
-  ) {
-    dashboardTransport.request('api_dashboard_action_msg', { message: payload }, {
+  // Transport F7: same facade + WS-twin residue shape as
+  // dispatchSessionControlMsg above — no HTTP lane, availability-derived
+  // routing, tunnel attempts never replayed over /ws.
+  if (daemonApi.availability('api_dashboard_action_msg').ok) {
+    daemonApi.request('api_dashboard_action_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      const err = new Error(resp.body?.error || 'Dashboard action failed');
+      console.warn(`[dashboard-control] ${action} dashboard action RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} dashboard action RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {

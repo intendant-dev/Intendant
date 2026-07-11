@@ -3463,7 +3463,12 @@ mod tests {
         // (docs/src/credential-custody.md; the transport design parks
         // custody rows as an explicit future decision), so its facade
         // calls run with no fallback lane — absence below is the contract,
-        // not a gap.
+        // not a gap. The F7 control-msg trio (api_control_msg,
+        // api_session_control_msg, api_dashboard_action_msg) is likewise
+        // deliberately absent: WS-twin residue whose HTTP-era twin is the
+        // /ws intent stream, not a route (transport design §2.7) — the
+        // facade serves the tunnel leg only and the dispatchers keep
+        // their own /ws fallback.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
