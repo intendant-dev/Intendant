@@ -851,34 +851,32 @@ class DashboardTransport {
     );
   }
 
+  // The two peer signal relays (transport F5). Signaling is a
+  // delivered-once mutation: the facade derives no-replay from the POST
+  // verb (§3.7 — never replayed over HTTP after a tunnel attempt that MAY
+  // have reached the daemon, the exact legacy fallbackAfterRpcFailure:false
+  // semantics; Connect mode never uses HTTP), while a dashboard with no
+  // tunnel at all still signals over direct HTTP — that pre-attempt lane
+  // is how peer tunnels bootstrap on direct/mTLS dashboards. Both return
+  // the facade envelope {ok, status, body}.
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_file_transfer_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   peerDashboardControlSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_dashboard_control_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {

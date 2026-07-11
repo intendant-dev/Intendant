@@ -28,8 +28,11 @@
 // STATUS: consumed by the F1 family (files IDE fs calls, transfers pump,
 // staged uploads), the F2 sessions-family reads, the F3 settings/keys
 // family (settings GET/POST, api-keys save, key-status, project-root,
-// external-agents, displays), and the F4 access dialogs family
-// (overview/enrollment/connect/tier + IAM grant writes); the remaining
+// external-agents, displays), the F4 access dialogs family
+// (overview/enrollment/connect/tier + IAM grant writes), and the F5
+// peers/approvals/coordinator family (peer list + quick controls, the
+// pairing dialogs, the coordinator forms, and the peer WebRTC signal
+// relays); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -67,7 +70,11 @@
 // fleet-cert request, dashboard targets) plus the org set (trust/revoke,
 // issuance, issuer key management, and the signed-org doorbell quartet —
 // present, renew, ORL read, ORL apply, whose HTTP rows are Public by
-// design: the signed document is the authorization). The
+// design: the signed document is the authorization), and the F5 peers /
+// coordinator family (the peer registry list/add/remove, eligible,
+// quick controls — message/task/approval, the three WebRTC signal
+// relays, the pairing set, and the coordinator route; their rows
+// delegate IAM to the federation ladder, S7). The
 // `api_transfer_*` methods are deliberately absent: they have no HTTP rows
 // until the server-track stage that adds /api/transfers (task #6); F1 adds
 // their entries when those rows land.
@@ -78,6 +85,10 @@
 // lifted into the query string (arrays comma-join; empty arrays stay
 // absent), `queryJson` = query keys whose array value JSON-encodes instead
 // (the search `projects` filter, which the HTTP handler serde-parses),
+// `queryRepeat` = query-key -> array-param-key map emitting one
+// `key=value` pair per element (the eligible endpoint's repeated
+// `?capability=` keys from the tunnel's `capabilities` array; empty
+// arrays stay absent),
 // `lane` = non-JSON response/request lane ('bytes' | 'upload' | 'stream'),
 // `encode` = upload
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
@@ -143,6 +154,31 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_access_org_renew: { verb: 'POST', path: '/api/access/org-grants/renew' },
   api_access_org_orl: { verb: 'GET', path: '/api/access/orgs/{org_handle}/revocations', alias: { org_handle: 'handle' } },
   api_access_org_orl_apply: { verb: 'POST', path: '/api/access/orgs/revocations/apply' },
+  api_peers: { verb: 'GET', path: '/api/peers' },
+  api_peer_add: { verb: 'POST', path: '/api/peers' },
+  api_peer_remove: { verb: 'DELETE', path: '/api/peers' },
+  api_peer_eligible: { verb: 'GET', path: '/api/peers/eligible', queryRepeat: { capability: 'capabilities' } },
+  api_peer_message: { verb: 'POST', path: '/api/peers/{peer_id}/message' },
+  api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
+  api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
+  api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
+  api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
+  api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },
+  api_peer_pairing_invite: { verb: 'POST', path: '/api/peers/pairing/invite' },
+  api_peer_pairing_join: { verb: 'POST', path: '/api/peers/pairing/join' },
+  api_peer_pairing_request_access: { verb: 'POST', path: '/api/peers/pairing/request-access' },
+  api_peer_pairing_request_access_poll: { verb: 'POST', path: '/api/peers/pairing/request-access/poll' },
+  api_peer_pairing_requests: { verb: 'GET', path: '/api/peers/pairing/requests' },
+  api_peer_pairing_request_decision: { verb: 'POST', path: '/api/peers/pairing/requests/{code}/{decision}', alias: { code: 'request_id', decision: 'op' } },
+  api_peer_pairing_identities: { verb: 'GET', path: '/api/peers/pairing/identities' },
+  api_peer_pairing_identity_revoke: { verb: 'POST', path: '/api/peers/pairing/identities/revoke' },
+  // The coordinator twin carries the program's one live per-lane IAM
+  // divergence, preserved on purpose: the HTTP row classifies through the
+  // federation ladder as Task, while the datachannel method has always
+  // gated on PeerManage (documented op-override on the route row). The
+  // descriptor only names the twin's verb + path — it must not paper over
+  // that divergence, and the daemon-side parity pin asserts the override.
+  api_coordinator_route: { verb: 'POST', path: '/api/coordinator/route' },
 });
 
 // ── Uniform error shape (§3.5) ────────────────────────────────────────────
@@ -358,6 +394,19 @@ function daemonApiHttpTarget(spec, method, params) {
     }
     query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
+  // queryRepeat twins: the tunnel method takes an array param; the HTTP
+  // twin takes one repeated `key=value` pair per element (the eligible
+  // endpoint's `?capability=` vocabulary — its server parser rejects
+  // comma-joins, so these keys never ride the `query` lift).
+  for (const [key, paramKey] of Object.entries(spec.queryRepeat || {})) {
+    const value = source[paramKey];
+    used.add(paramKey);
+    if (!Array.isArray(value)) continue;
+    for (const element of value) {
+      if (element === undefined || element === null || String(element) === '') continue;
+      query.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(element))}`);
+    }
+  }
   // rawQuery twins: the tunnel method takes one pre-encoded query-string
   // param (the managed-context handlers rebuild a request line from it);
   // the HTTP twin takes that same string as the URL query verbatim.
@@ -384,8 +433,11 @@ async function daemonApiHttpRequest(method, params, opts) {
   if (opts && opts.cache) init.cache = opts.cache;
   // Body-less POST twins stay body-less (api_worktrees_scan rides a
   // BodyPolicy::None row, and every legacy empty-payload POST call site
-  // sent no body/Content-Type either).
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // sent no body/Content-Type either). DELETE twins carry their leftover
+  // params the same way: api_peer_remove's HTTP shape has always been a
+  // DELETE with a `{peer_id}` JSON body (path-captured DELETE twins
+  // consume their params into the path and stay body-less).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }
@@ -599,7 +651,10 @@ async function daemonApiRemoteHttpRequest(origin, method, params, opts) {
   }
   const { url, rest } = daemonApiHttpTarget(spec, method, params);
   const init = { method: spec.verb, mode: 'cors', signal: daemonApiRemoteHttpSignal(method, opts) };
-  if (spec.verb === 'POST' && Object.keys(rest).length > 0) {
+  // Same body rule as the local adapter: mutation verbs carry leftover
+  // params as the JSON body (no fleet-CORS DELETE twin exists today, but
+  // the adapters must agree on the descriptor's semantics).
+  if ((spec.verb === 'POST' || spec.verb === 'DELETE') && Object.keys(rest).length > 0) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(rest);
   }

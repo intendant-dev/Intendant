@@ -3420,7 +3420,9 @@ mod tests {
     /// declared route whose verb is declared exactly (never via `Any`);
     /// the row's IAM operation equals the tunnel method's (the signed-org
     /// doorbell rows are Public on HTTP by design and instead pin their
-    /// documented tunnel op-override); and the path
+    /// documented tunnel op-override; the peers/coordinator federation
+    /// rows pin the row's own derivation — ladder on the canonical leaf,
+    /// or the coordinator's documented override); and the path
     /// template restates the row's declared pattern (captures by name).
     /// Plus the exact coverage set, so entries appear and disappear
     /// deliberately. When the route table grows its `tunnel:` column
@@ -3480,7 +3482,10 @@ mod tests {
         // + decide, IAM grant upsert/update, the connect admin quartet,
         // the tier pair, fleet-cert request, dashboard targets) plus the
         // org set (trust/revoke, issuance, issuer keys, and the
-        // signed-org doorbell quartet). The `api_transfer_*`
+        // signed-org doorbell quartet), and the F5 peers/coordinator
+        // family (registry list/add/remove, eligible, the quick
+        // controls — message/task/approval, the three signal relays,
+        // the pairing set, and the coordinator route). The `api_transfer_*`
         // methods join when their HTTP rows land (task #6, /api/transfers);
         // adding or dropping an entry updates this list in the same change,
         // deliberately.
@@ -3542,6 +3547,25 @@ mod tests {
             "api_access_org_renew",
             "api_access_org_orl",
             "api_access_org_orl_apply",
+            "api_peers",
+            "api_peer_add",
+            "api_peer_remove",
+            "api_peer_eligible",
+            "api_peer_message",
+            "api_peer_task",
+            "api_peer_approval",
+            "api_peer_webrtc_signal",
+            "api_peer_file_transfer_signal",
+            "api_peer_dashboard_control_signal",
+            "api_peer_pairing_invite",
+            "api_peer_pairing_join",
+            "api_peer_pairing_request_access",
+            "api_peer_pairing_request_access_poll",
+            "api_peer_pairing_requests",
+            "api_peer_pairing_request_decision",
+            "api_peer_pairing_identities",
+            "api_peer_pairing_identity_revoke",
+            "api_coordinator_route",
         ]
         .into_iter()
         .collect();
@@ -3621,6 +3645,37 @@ mod tests {
                     assert_eq!(
                         override_op, tunnel_op,
                         "{method_name}: tunnel op {tunnel_op:?} != declared override {override_op:?}"
+                    );
+                }
+                // The peers/coordinator family rows delegate HTTP authz to
+                // the federation ladder (F5). Their tunnel op derives from
+                // the row itself — `Route::tunnel_operation` applies the
+                // same ladder to the row's canonical leaf, or the
+                // documented override (api_coordinator_route: the ladder
+                // classifies the HTTP leaf as Task while the tunnel method
+                // has always gated on PeerManage — a preserved per-lane
+                // divergence the descriptor must not paper over). Require
+                // the resolved row to carry THIS method's tunnel column
+                // and its derivation to equal the effective tunnel
+                // operation.
+                RouteAuthz::PeerFederation => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: federation descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved federation row carries a different tunnel method"
+                    );
+                    let derived = route.tunnel_operation().unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: federation twinned rows must derive \
+                             a fail-closed tunnel operation"
+                        )
+                    });
+                    assert_eq!(
+                        derived, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != row derivation {derived:?}"
                     );
                 }
                 _ => panic!("{method_name}: twinned rows must be Operation-gated"),
