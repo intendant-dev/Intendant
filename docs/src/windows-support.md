@@ -250,10 +250,10 @@ implementations of the cross-platform process and network helpers:
   `ProcessCommandLineInformation` class, falling back to
   `QueryFullProcessImageNameW` (executable path only) when the full command line
   is unavailable.
-- **Routable local addresses** — the **`if-addrs`** crate (wrapping
-  `GetAdaptersAddresses`) backs `access::routable_local_addrs`, which feeds the
-  web-gateway advertise URLs and WebRTC ICE host-candidate gathering. The Unix
-  path keeps its direct `getifaddrs(3)` walk.
+- **Routable local addresses** — the safe cross-platform **`if-addrs`** crate
+  backs `intendant_core::net::routable_local_addrs`, which feeds the web-gateway
+  advertise URLs and WebRTC ICE host-candidate gathering. On Windows the crate
+  wraps `GetAdaptersAddresses`.
 
 ## Known Limitations
 
