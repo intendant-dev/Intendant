@@ -109,8 +109,10 @@ else
     # with no -password argument (verified live on Darwin 25.4). It is
     # inert while the record has no AuthenticationAuthority, but a later
     # tool could add one — delete the hash so password auth has nothing to
-    # verify against, ever.
-    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
+    # verify against, ever. NB: deletes take the BARE attribute name; the
+    # dsAttrTypeNative: prefix (which reads print) makes the delete a
+    # silent no-op.
+    dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
 fi
 
 CI_GROUP="$(id -gn "$CI_ACCOUNT")"
@@ -309,12 +311,19 @@ fi
 
 # Password material: check the hash data itself, not just the authority
 # list — sysadminctl mints ShadowHashData unasked. Idempotent runs
-# converge (delete) rather than warn.
-if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
-    dscl . -delete "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null || true
+# converge (delete) rather than warn. dscl -read exits 0 for an existing
+# RECORD whether or not the queried key exists (absent keys print "No
+# such key"), so presence must be parsed from the output — anchored,
+# because the No-such-key line also contains the attribute name.
+shadow_present() {
+    dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData 2>/dev/null \
+        | grep -q '^dsAttrTypeNative:ShadowHashData:'
+}
+if shadow_present; then
+    dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
 fi
 auth_auth="$(dscl . -read "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true)"
-if dscl . -read "/Users/$CI_ACCOUNT" dsAttrTypeNative:ShadowHashData >/dev/null 2>&1; then
+if shadow_present; then
     echo "FAIL: $CI_ACCOUNT still has ShadowHashData after delete" >&2
     fail=1
 elif echo "$auth_auth" | grep -q "ShadowHash"; then
