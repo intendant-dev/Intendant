@@ -2369,11 +2369,14 @@ fn fs_read_offset_length_api_response(
     }
 }
 
+/// A ranged file read: `(bytes, total_size, end_offset, display_path)`.
+type DashboardFsFileRange = (Vec<u8>, u64, u64, PathBuf);
+
 pub(crate) fn read_dashboard_fs_file_range(
     path: &Path,
     offset: u64,
     length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64, PathBuf), (u16, serde_json::Value)> {
+) -> Result<DashboardFsFileRange, (u16, serde_json::Value)> {
     use std::io::{Read as _, Seek as _};
     let metadata = std::fs::metadata(path).map_err(|e| {
         (

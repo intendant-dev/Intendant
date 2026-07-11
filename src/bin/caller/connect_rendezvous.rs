@@ -1059,6 +1059,7 @@ async fn poll_next(
         .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn handle_event(
     client: &Client,
     base_url: &Url,
@@ -1782,6 +1783,7 @@ same resolution + signing discipline as request_unclaim. */
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 
+#[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(
     daemon_id: &str,
     daemon_public_key: &str,
@@ -1793,6 +1795,7 @@ fn dns_publish_signing_payload(
     )
 }
 
+#[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_acme_signing_payload(
     daemon_id: &str,
     daemon_public_key: &str,

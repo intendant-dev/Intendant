@@ -1463,6 +1463,7 @@ pub(crate) async fn verified_daemon_request(
 
 /// The DNS wrapper over [`verified_daemon_request`]: additionally requires
 /// the fleet zone to be enabled.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 async fn dns_request_daemon(
     state: &Arc<AppState>,
     headers: &HeaderMap,

@@ -170,9 +170,9 @@ struct CcShared {
     /// `GoalUpdated`/`GoalCleared` rails (window chip, log persistence, and
     /// replay all come for free from the Codex-built plumbing).
     goal: StdMutex<GoalEngine>,
-    /// Fresh tokens spent by this process — uncached input + cache creation
-    /// + output, accumulated per result. The goal-budget currency: cache
-    /// reads are excluded so a budget measures real work, not re-reads.
+    /// Fresh tokens spent by this process — uncached input + cache creation +
+    /// output, accumulated per result. The goal-budget currency: cache reads
+    /// are excluded so a budget measures real work, not re-reads.
     cumulative_fresh_tokens: AtomicU64,
     /// True while a turn runs (user message written, result pending). Goal
     /// notices are written mid-turn (absorbed by the running turn) instead

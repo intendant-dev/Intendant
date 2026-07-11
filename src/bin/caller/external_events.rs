@@ -48,6 +48,7 @@ pub(crate) async fn interrupt_turn_bounded(
 /// forwards it to the external agent via `ExternalAgent::interrupt_turn()`.
 /// Backends that don't support interruption return a typed error we log and
 /// continue waiting for — the caller can escalate to `shutdown()` if needed.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -85,6 +86,7 @@ pub(crate) async fn drain_external_agent_events(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events_with_prefetched(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,

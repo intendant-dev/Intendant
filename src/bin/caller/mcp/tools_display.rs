@@ -495,6 +495,7 @@ impl IntendantServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn emit_shared_view(
         &self,
         session_id: Option<&str>,

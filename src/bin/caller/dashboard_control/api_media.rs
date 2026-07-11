@@ -651,9 +651,12 @@ pub(crate) async fn api_session_recording_asset_task_response_from_home(
     recording_asset_task_response(id, stream_name, asset, offset, length, resolved).await
 }
 
+/// Parsed recording-asset request: `(stream_name, asset, offset, length)`.
+type RecordingAssetParams = (String, String, u64, Option<u64>);
+
 pub(crate) fn recording_asset_request_params(
     params: &serde_json::Value,
-) -> Result<(String, String, u64, Option<u64>), (u16, serde_json::Value)> {
+) -> Result<RecordingAssetParams, (u16, serde_json::Value)> {
     let Some(stream_name) = optional_string_param(params, &["stream_name", "streamName", "stream"])
     else {
         return Err((

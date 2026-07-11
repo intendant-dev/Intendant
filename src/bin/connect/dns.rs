@@ -299,14 +299,12 @@ impl FleetZone {
                             ));
                         }
                     }
-                    RecordType::ANY => {
-                        if answer.name_exists {
-                            answer.records.push(Record::from_rdata(
-                                qname.clone(),
-                                RECORD_TTL,
-                                RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
-                            ));
-                        }
+                    RecordType::ANY if answer.name_exists => {
+                        answer.records.push(Record::from_rdata(
+                            qname.clone(),
+                            RECORD_TTL,
+                            RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
+                        ));
                     }
                     _ => {}
                 }

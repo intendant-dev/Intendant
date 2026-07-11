@@ -224,6 +224,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn route_edit_user_message(
         &self,
         session_id: Option<String>,
@@ -758,6 +759,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn restart_session(
         &self,
         source: String,

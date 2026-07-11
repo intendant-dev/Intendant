@@ -630,23 +630,24 @@ fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
             Some(path) => checked.push(format!("{} (loaded at startup)", path.display())),
             None => checked.push("no .env found from the startup directory upward".to_string()),
         }
-        for entry in [&report.project_env, &report.global_env] {
-            if let Some((path, loaded)) = entry {
-                // Skip duplicates: the walk-up and the project root often
-                // resolve to the same file.
-                if report.cwd_env.as_deref() == Some(path.as_path()) {
-                    continue;
-                }
-                checked.push(format!(
-                    "{} ({})",
-                    path.display(),
-                    if *loaded {
-                        "loaded at startup"
-                    } else {
-                        "missing"
-                    }
-                ));
+        for (path, loaded) in [&report.project_env, &report.global_env]
+            .into_iter()
+            .flatten()
+        {
+            // Skip duplicates: the walk-up and the project root often
+            // resolve to the same file.
+            if report.cwd_env.as_deref() == Some(path.as_path()) {
+                continue;
             }
+            checked.push(format!(
+                "{} ({})",
+                path.display(),
+                if *loaded {
+                    "loaded at startup"
+                } else {
+                    "missing"
+                }
+            ));
         }
     }
     if let Some(path) = &project_keys.env_path {

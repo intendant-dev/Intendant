@@ -187,7 +187,9 @@ pub struct UserQuestion {
 /// also the designed attach point for future audible/voice escalation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum NotificationUrgency {
+    #[default]
     Info,
     Attention,
     Urgent,
@@ -214,12 +216,6 @@ impl NotificationUrgency {
                 "unknown urgency '{other}'; expected info, attention, or urgent"
             )),
         }
-    }
-}
-
-impl Default for NotificationUrgency {
-    fn default() -> Self {
-        NotificationUrgency::Info
     }
 }
 

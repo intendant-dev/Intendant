@@ -1113,6 +1113,12 @@ pub struct AppState {
     pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -2261,7 +2267,7 @@ impl AppState {
                     None,
                     "system",
                 ));
-                if !self.known_displays.iter().any(|&id| id == display_id) {
+                if !self.known_displays.contains(&display_id) {
                     self.known_displays.push(display_id);
                 }
                 cmds.push(UiCommand::AddDisplay {
@@ -2915,6 +2921,7 @@ impl AppState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     fn add_log_with_metadata(
         &mut self,
         level: &str,

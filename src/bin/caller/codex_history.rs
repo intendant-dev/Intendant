@@ -232,14 +232,13 @@ pub(crate) fn codex_user_turn_state_from_history_file(
                     _ => {}
                 }
             }
-            "response_item" => {
+            "response_item"
                 if obj
                     .get("payload")
                     .and_then(codex_payload_user_text)
-                    .is_some()
-                {
-                    fallback_state.record_next_turn();
-                }
+                    .is_some() =>
+            {
+                fallback_state.record_next_turn();
             }
             _ => {}
         }

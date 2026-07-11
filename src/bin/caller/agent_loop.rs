@@ -776,6 +776,7 @@ pub(crate) async fn handle_peer_tool_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,

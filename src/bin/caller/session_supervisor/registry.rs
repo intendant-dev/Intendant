@@ -191,6 +191,7 @@ impl SessionSupervisor {
         state.clear_external_attach_requested(keys);
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn register_session(
         &self,
         session_id: String,

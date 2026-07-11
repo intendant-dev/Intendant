@@ -132,6 +132,7 @@ pub fn verify_client_key_offer(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn verify_client_key_offer_v2(
     client_key_b64u: &str,
     signature_b64u: &str,

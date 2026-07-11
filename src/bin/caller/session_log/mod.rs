@@ -615,6 +615,7 @@ impl SessionLog {
     }
 
     /// Log a CU turn with structured data.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn cu_turn(
         &mut self,
         turn: usize,

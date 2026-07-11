@@ -15,6 +15,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn start_new_session(
         &self,
         task: String,
@@ -414,6 +415,7 @@ impl SessionSupervisor {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn resume_session(
         &self,
         source: String,
@@ -818,7 +820,7 @@ impl SessionSupervisor {
             UserAttachments::from_items(resolved_attachments),
             None,
             Some(resume_token.clone()),
-            (external_backend.is_some() && !force_new).then(|| resume_token),
+            (external_backend.is_some() && !force_new).then_some(resume_token),
             false,
             None,
             codex_service_tier,
@@ -860,6 +862,7 @@ impl SessionSupervisor {
 }
 
 impl SessionSupervisor {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_agent_session(
         &self,
         session_id: String,
@@ -1142,6 +1145,7 @@ impl SessionSupervisor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_cu_task(
         &self,
         session_id: &str,
@@ -1206,7 +1210,7 @@ impl SessionSupervisor {
                         level: None,
                         turn: None,
                     });
-                    Ok(stats)
+                    Ok(*stats)
                 }
                 Ok(CuTaskResult::Escalate { task }) => {
                     bus.send(AppEvent::PresenceLog {

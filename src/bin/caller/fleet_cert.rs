@@ -28,6 +28,7 @@ use std::sync::{Mutex, OnceLock};
 /// The daemon's fleet label: `d-<hex(sha256(daemon_id))[..20]>` —
 /// REPLICATES `bin/connect/dns.rs::daemon_label` (the two binaries never
 /// link each other); the golden test below twins the service's.
+#[cfg(test)]
 pub fn daemon_fleet_label(daemon_id: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     let id = daemon_id.trim();
@@ -311,7 +312,6 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             .await
             .map_err(|e| format!("acme challenge ready: {e}"))?;
     }
-    drop(authorizations);
 
     let status = order
         .poll_ready(&instant_acme::RetryPolicy::default())
@@ -466,7 +466,7 @@ fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
 fn foreign_entries(logged: Vec<CtEntry>, own_serials: &[String]) -> Vec<CtEntry> {
     logged
         .into_iter()
-        .filter(|entry| !own_serials.iter().any(|own| *own == entry.serial_hex))
+        .filter(|entry| !own_serials.contains(&entry.serial_hex))
         .collect()
 }
 

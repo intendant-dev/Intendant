@@ -70,6 +70,7 @@ pub(crate) fn usage_snapshot_from_context_snapshot_event(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn apply_context_snapshot_usage_to_mcp_state(
     s: &mut McpAppState,
     session_id: Option<&str>,

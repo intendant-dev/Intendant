@@ -642,7 +642,7 @@ pub(crate) async fn run_with_presence(
                                         match apply_chained_context_rewind_resume_turns(
                                             agent,
                                             thread,
-                                            request,
+                                            *request,
                                             &mut resume,
                                         )
                                         .await

@@ -201,6 +201,7 @@ pub(crate) fn apply_session_model_and_reprice(session: &mut serde_json::Value, m
     apply_session_usage(session, session_usage_from_json(session), Some(model));
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn external_session_json(
     source: &str,
     label: &str,

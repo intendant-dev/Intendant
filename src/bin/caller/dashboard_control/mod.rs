@@ -668,13 +668,20 @@ impl DashboardPresenceBridge {
     }
 }
 
+/// Callback signatures for [`DashboardDisplayAuthorityBridge`]: each takes the
+/// dashboard client id (and a display id / id list) and returns event JSON.
+type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
+type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
+
 #[derive(Clone)]
 pub struct DashboardDisplayAuthorityBridge {
-    snapshot: Arc<dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync>,
-    state_frame: Arc<dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync>,
-    request: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    release: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    input_authorized: Arc<dyn Fn(&str, u32) -> bool + Send + Sync>,
+    snapshot: Arc<AuthoritySnapshotFn>,
+    state_frame: Arc<AuthorityStateFrameFn>,
+    request: Arc<AuthorityEventsFn>,
+    release: Arc<AuthorityEventsFn>,
+    input_authorized: Arc<AuthorityInputAuthorizedFn>,
     cleanup: Arc<dyn Fn(&str) + Send + Sync>,
     subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
 }
@@ -730,6 +737,7 @@ impl DashboardDisplayAuthorityBridge {
 }
 
 impl DashboardControlRegistry {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
@@ -995,6 +1003,7 @@ pub struct DashboardControlPeer {
 }
 
 impl DashboardControlPeer {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     async fn answer_offer(
         session_id: String,
         offer_sdp: String,

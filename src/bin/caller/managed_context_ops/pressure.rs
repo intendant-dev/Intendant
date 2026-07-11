@@ -1013,13 +1013,10 @@ pub(crate) const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
 
 pub(crate) fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
-    loop {
-        let Some(inner) = current
-            .strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
-            .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
-        else {
-            break;
-        };
+    while let Some(inner) = current
+        .strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+        .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
+    {
         let Some((_, user_followup)) =
             inner.split_once(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
         else {

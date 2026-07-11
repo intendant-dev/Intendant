@@ -30,9 +30,10 @@ impl SessionSupervisor {
                 worktree,
                 worktree_branch,
             } => {
-                let worktree_request = worktree.unwrap_or(false).then(|| SessionWorktreeRequest {
-                    branch: worktree_branch,
-                });
+                let worktree_request =
+                    worktree.unwrap_or(false).then_some(SessionWorktreeRequest {
+                        branch: worktree_branch,
+                    });
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {

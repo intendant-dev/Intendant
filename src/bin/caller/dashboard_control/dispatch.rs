@@ -147,6 +147,7 @@ pub(crate) fn frame_api_task_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,

@@ -654,6 +654,7 @@ pub(crate) fn codex_context_trace_dir(
 ///
 /// Returns the agent, thread handle, and event receiver. The caller owns the
 /// agent lifetime and is responsible for sending messages and draining events.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn create_external_agent(
     backend: &external_agent::AgentBackend,
     project: &Project,
@@ -883,7 +884,7 @@ pub(crate) enum DrainOutcome {
     /// waits until the backend reports the turn complete, then returns this so
     /// the caller can apply the rollback while the thread is idle.
     ContextRewindRequested {
-        request: ExternalContextRewindRequest,
+        request: Box<ExternalContextRewindRequest>,
         message: Option<String>,
         turns_in_round: usize,
         turn_stop_status: ManagedContextRewindTurnStopStatus,

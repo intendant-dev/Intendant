@@ -74,6 +74,7 @@ pub(crate) use intendant_core::net::{
     rebind_dead_tcp_listener, should_continue_after_accept_error, FATAL_ACCEPT_REBIND_THRESHOLD,
 };
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn spawn_web_gateway(
     listener: TcpListener,
     bus: EventBus,

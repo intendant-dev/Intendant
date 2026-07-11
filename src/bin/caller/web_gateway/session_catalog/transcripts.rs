@@ -305,6 +305,7 @@ pub(crate) fn codex_removed_turn_ids_for_user_turns(
     removed.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
     user_turn_revisions: &mut ReplayUserTurnRevisionState,
@@ -1215,7 +1216,7 @@ pub(crate) fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBu
             Some((mtime, path))
         })
         .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
     dirs.truncate(limit);
     dirs.into_iter().map(|(_, path)| path).collect()
 }

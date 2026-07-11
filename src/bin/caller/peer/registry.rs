@@ -63,6 +63,7 @@ pub const REGISTRY_BROADCAST_CAPACITY: usize = 64;
 /// so the browser handler treats each event as "replace the row" or
 /// "remove the row" without reasoning about which fields changed.
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)] // the Peer* names deliberately mirror their 1:1 OutboundEvent wire twins
 pub enum RegistryEvent {
     /// A peer was just added to the registry. The snapshot captures
     /// the peer's state at registration time (typically `Initializing`
@@ -299,6 +300,7 @@ impl PeerRegistry {
 
     /// Same as [`PeerRegistry::add_peer_with_credentials_and_client_identity`],
     /// with an optional operator display-label override.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub async fn add_peer_with_credentials_and_client_identity_and_label(
         &self,
         card_url: &str,

@@ -1670,6 +1670,7 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn handle_federated_webrtc_signal(
     display_id: u32,
     session_id: String,

@@ -430,7 +430,7 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
 ) -> DrainOutcome {
     if let Some(request) = request {
         return DrainOutcome::ContextRewindRequested {
-            request,
+            request: Box::new(request),
             message,
             turns_in_round,
             turn_stop_status,

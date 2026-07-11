@@ -7,6 +7,7 @@ use super::*;
 
 /// Runs on a background tokio task, reading JSONL from the Codex process
 /// stdout and dispatching events / resolving pending requests.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn reader_task(
     stdout: tokio::process::ChildStdout,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
