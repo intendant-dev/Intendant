@@ -414,7 +414,28 @@ pub enum DashboardControlGrant {
         label: String,
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+        /// Delegation-lane attribution (docs/src/trust-tiers.md § Two
+        /// lanes): the browser identity key that signed the relayed
+        /// offer, when one did. Attribution never widens authority —
+        /// the peer profile above remains the ceiling — it gives the
+        /// audit trail and the UI badge a human identity beside the
+        /// daemon principal.
+        attributed: Option<PeerAttribution>,
     },
+}
+
+/// The verified human identity behind a delegation-lane connection.
+#[derive(Clone, Debug)]
+pub struct PeerAttribution {
+    /// base64url(sha256(raw P-256 point)) — the IAM binding value.
+    pub fingerprint: String,
+    /// The raw public key, retained for display/audit.
+    pub public_key_b64u: String,
+    /// The label of the enrolled user/client principal this key matches
+    /// in the TARGET's local IAM, when it matches one. `None` = a valid
+    /// signature from a key this daemon has never enrolled (attribution
+    /// is still recorded; the audit shows the fingerprint).
+    pub enrolled_label: Option<String>,
 }
 
 impl DashboardControlGrant {
@@ -693,6 +714,17 @@ impl DashboardDisplayAuthorityBridge {
 }
 
 impl DashboardControlRegistry {
+    /// This daemon's own agent-card id — the target-id expectation for
+    /// delegation-lane attribution (the browser signs the id it dialed;
+    /// we verify it meant us).
+    pub fn local_card_id(&self) -> String {
+        self.agent_card
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
@@ -2366,6 +2398,7 @@ mod tests {
             label: "peer-root".into(),
             profile: "peer-root".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
 
         let status = test_control_frame_response(
@@ -2466,6 +2499,7 @@ mod tests {
             label: "peer-operator".into(),
             profile: "peer-operator".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
         let denied = test_control_frame_response(
             r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
@@ -4140,6 +4174,7 @@ mod tests {
                     read_roots: vec![],
                     write_roots: vec![dir.path().to_path_buf()],
                 },
+                attributed: None,
             };
             rt
         };
