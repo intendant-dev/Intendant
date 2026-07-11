@@ -254,7 +254,10 @@ async function main() {
     await page.locator('#register').click();
     await page.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: START_TIMEOUT_MS });
     await page.locator('#claim').click();
-    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), { timeout: START_TIMEOUT_MS });
+    // Two success copies since the first-owner bootstrap landed: a
+    // daemon-minted phrase claims AND enrolls ("…enrolled as its first
+    // owner…"); an account-route claim keeps the original copy.
+    await page.waitForFunction(() => /Rendezvous route claimed|enrolled as its first owner/.test(document.getElementById('claim-status').textContent), { timeout: START_TIMEOUT_MS });
     const me = await page.evaluate(async () => fetch('/api/me').then(r => r.json()));
     writeOperatorIamGrant(daemonHome, me.user || me);
     console.log('PASS lease-claim account registered, daemon claimed, operator grant seeded');
@@ -601,7 +604,9 @@ async function main() {
     // the same flag must not duplicate grants or grow the audit log.
     const ownerHome = path.join(tmp, 'owner-home');
     fs.mkdirSync(ownerHome, { recursive: true });
-    const ownerFp = 'E2E_Owner_Key-Fingerprint';
+    // Must satisfy the daemon's shape check (exactly 43 base64url chars —
+    // startup rejects garbage --owner values since d36f57fe).
+    const ownerFp = 'E2E-Owner-Key-Fingerprint-000000000000000AA';
     // Offset past the org-validator port block (8898/8899).
     const ownerPort = options.daemonPort + 11;
     const ownerIamPath = path.join(ownerHome, '.intendant', 'access-certs', 'iam.json');

@@ -405,7 +405,10 @@ async function main() {
     });
 
     await click(page, '#claim');
-    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), {
+    // Two success copies since the first-owner bootstrap landed: a
+    // daemon-minted phrase claims AND enrolls ("…enrolled as its first
+    // owner…"); an account-route claim keeps the original copy.
+    await page.waitForFunction(() => /Rendezvous route claimed|enrolled as its first owner/.test(document.getElementById('claim-status').textContent), {
       timeout: START_TIMEOUT_MS,
     });
 
