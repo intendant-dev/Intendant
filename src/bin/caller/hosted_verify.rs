@@ -650,7 +650,7 @@ async fn verify_logged_entry(
                     url.set_query(Some(&format!("old={old_size}&new={}", sth.size)));
                     url
                 })?;
-            let consistency = fetch_json(&client, url).await.map_err(Unavailable)?;
+            let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
             let consistency_proof: Vec<[u8; 32]> = consistency
                 .get("proof")
                 .and_then(|v| v.as_array())
