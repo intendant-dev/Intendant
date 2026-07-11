@@ -36,11 +36,21 @@ concurrency:
 
 jobs:
   wasm-drift:
-    name: wasm-drift (ubuntu-latest)
+    name: wasm-drift (${{ matrix.os }})
     # Trust-based routing — same rule as windows.yml: trusted refs on the
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     timeout-minutes: 30
+    # Serialize the rebuild repo-wide: both Mac listeners share the
+    # account's ~/Library/Caches/.wasm-pack, and two cold jobs
+    # cargo-installing wasm-bindgen concurrently race the final rename
+    # ("Directory not empty", seen live 2026-07-11 when a probe PR and
+    # another PR's gate ran side by side). Warm caches don't race, but
+    # every wasm-bindgen/wasm-opt version bump re-opens the cold window
+    # — queue the jobs instead (they are minutes; skips are seconds).
+    concurrency:
+      group: wasm-drift-rebuild
+      cancel-in-progress: false
     strategy:
       matrix:
         include:
