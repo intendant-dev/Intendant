@@ -685,16 +685,6 @@ pub(crate) fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<se
     entries
 }
 
-pub(crate) async fn recordings_list_response_body(
-    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
-) -> String {
-    recordings_list_response_body_in_daemon_dir(
-        recording_registry,
-        &crate::debug::daemon_recordings_dir(),
-    )
-    .await
-}
-
 pub(crate) async fn recordings_list_response_body_in_daemon_dir(
     recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
     daemon_dir: &Path,

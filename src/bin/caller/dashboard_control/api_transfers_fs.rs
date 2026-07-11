@@ -348,7 +348,15 @@ pub(crate) async fn transfer_create_recording_asset_download_job(
                 "recording registry unavailable",
             ));
         };
-        resolve_live_recording_asset(registry, &stream_name, &asset).await
+        // Transport edge: resolve the real daemon recordings dir here
+        // (the shared core takes it injected since S8).
+        resolve_live_recording_asset_in_daemon_dir(
+            registry,
+            &crate::debug::daemon_recordings_dir(),
+            &stream_name,
+            &asset,
+        )
+        .await
     }
     .map_err(|(status, body)| {
         crate::transfer_store::TransferStoreError::new(status, transfer_json_error_message(&body))

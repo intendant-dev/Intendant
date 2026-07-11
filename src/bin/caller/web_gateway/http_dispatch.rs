@@ -1156,7 +1156,8 @@ pub(crate) async fn serve_http_request(
     } else if req_path.starts_with("/frames/") {
         // Serve HQ frame images from the frame registry.
         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
-        use tokio::io::AsyncWriteExt;
+        // The registry read stays at this edge; the response shapes are
+        // the neutral fn's (goldens pin the historical wire bytes).
         let frame_id = request_line
             .split("/frames/")
             .nth(1)
@@ -1168,22 +1169,13 @@ pub(crate) async fn serve_http_request(
         } else {
             None
         };
-        if let Some(jpeg_data) = data {
-            let header = HttpResponse::new("200 OK")
-                .header("Content-Type", "image/jpeg")
-                .header("Content-Length", jpeg_data.len().to_string())
-                .header("Cache-Control", "public, max-age=31536000, immutable")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&jpeg_data).await;
-        } else {
-            let body = "Frame not found";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+        return write_api_response(
+            stream,
+            frame_hq_api_response(data),
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_method == "POST" && req_path == "/session" {
         let result = mint_session_token(&session_provider, &session_model).await;
         let (status, body) = match result {
@@ -1199,148 +1191,40 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_path.starts_with("/recordings/") {
-        // Serve recording data: segment files and metadata.
-        use tokio::io::AsyncWriteExt;
+        // Serve recording data: segment files and metadata. Path routing
+        // (verbatim post-"/recordings/" token, historically including any
+        // query string) stays at this edge; resolution and the response
+        // shapes are the neutral fn's, shared with the tunnel's
+        // api_recording_asset (goldens pin the historical wire bytes).
         let path_part = request_line
             .split("/recordings/")
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("");
-        let parts: Vec<&str> = path_part.split('/').collect();
-
-        if let Some(ref rec_reg) = recording_registry {
-            let reg = rec_reg.read().await;
-
-            if parts.len() == 2 && parts[1] == "segments" {
-                // GET /recordings/{stream}/segments — check session then daemon dir
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    // Fallback to daemon recordings dir
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let json: Vec<serde_json::Value> = segments
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "filename": s.filename,
-                            "start_secs": s.start_secs,
-                            "end_secs": s.end_secs,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
-                let response = HttpResponse::with_content("200 OK", "application/json", body)
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
-                // GET /recordings/{stream}/playlist.m3u8 — HLS playlist
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let m3u8 = recording_playlist_m3u8(&segments);
-                let response =
-                    HttpResponse::with_content("200 OK", "application/vnd.apple.mpegurl", m3u8)
-                        .header("Cache-Control", "no-cache")
-                        .header("Connection", "close")
-                        .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 {
-                // GET /recordings/{stream}/{filename} — serve segment file
-                let stream_name = parts[0];
-                let filename = parts[1];
-                // Validate filename to prevent path traversal
-                let valid = filename.starts_with("seg_")
-                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-                    && filename.len() < 30
-                    && !filename.contains("..");
-                if valid {
-                    // Check session dir first, then daemon dir
-                    let session_path = reg
-                        .session_dir()
-                        .join("recordings")
-                        .join(stream_name)
-                        .join(filename);
-                    let daemon_path = crate::debug::daemon_recordings_dir()
-                        .join(stream_name)
-                        .join(filename);
-                    let seg_path = if session_path.exists() {
-                        session_path
-                    } else {
-                        daemon_path
-                    };
-                    let content_type = if filename.ends_with(".ts") {
-                        "video/mp2t"
-                    } else {
-                        "video/mp4"
-                    };
-                    match tokio::fs::read(&seg_path).await {
-                        Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", content_type)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(&data).await;
-                        }
-                        Err(_) => {
-                            let body = "Segment not found";
-                            let response =
-                                HttpResponse::with_content("404 Not Found", "text/plain", body)
-                                    .header("Connection", "close")
-                                    .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                    }
-                } else {
-                    let body = "Invalid filename";
-                    let response =
-                        HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                            .header("Connection", "close")
-                            .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            } else {
-                let body = "Not found";
-                let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        } else {
-            let body = "Recording not available";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+        let response = live_recordings_path_api_response(
+            recording_registry.clone(),
+            &crate::debug::daemon_recordings_dir(),
+            path_part,
+        )
+        .await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/recordings" {
-        // GET /recordings — list all streams (session + daemon-scoped)
-        use tokio::io::AsyncWriteExt;
-
-        let body = recordings_list_response_body(recording_registry.clone()).await;
-        let response = HttpResponse::with_content("200 OK", "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "close")
-            .into_string();
-        let _ = stream.write_all(response.as_bytes()).await;
+        // GET /recordings — list all streams (session + daemon-scoped),
+        // through the neutral fn the tunnel's api_recordings shares.
+        let response = recordings_list_api_response(recording_registry.clone()).await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/debug" {
         // Debug endpoint: returns agent state + voice connection info
         let state = query_ctx.as_ref().map(|ctx| {

@@ -5,16 +5,16 @@
 use super::*;
 
 // The recording/frame asset content core — the RecordingAsset vocabulary,
-// its resolvers, safety predicates, and range readers — moved verbatim to
-// web_gateway::session_catalog (transport-unification S4b): both lanes
-// resolve assets through one core; this module keeps the tunnel's ranged
-// byte-stream carriage.
+// its resolvers (including the live-registry resolution the legacy
+// /recordings* chain shares since S8), safety predicates, and range
+// readers — moved verbatim to web_gateway::session_catalog
+// (transport-unification S4b/S8): both lanes resolve assets through one
+// core; this module keeps the tunnel's ranged byte-stream carriage.
 pub(crate) use crate::web_gateway::{
     read_frame_asset_file_range, read_recording_asset_bytes_range,
     read_recording_asset_file_range, recording_asset_name_is_safe,
-    recording_stream_name_is_safe, resolve_recording_asset_from_dir_pair,
-    resolve_session_recording_asset, session_frame_filename_is_safe,
-    RecordingAsset,
+    recording_stream_name_is_safe, resolve_live_recording_asset_in_daemon_dir,
+    resolve_session_recording_asset, session_frame_filename_is_safe, RecordingAsset,
 };
 
 pub(crate) fn media_http_response(id: String, status: u16, body: serde_json::Value) -> serde_json::Value {
@@ -638,10 +638,28 @@ pub(crate) async fn api_media_clip_cancel_response(
 }
 
 pub(crate) async fn api_recordings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    // Transport edge: resolve the real daemon recordings dir once; the
+    // parity fixture drives the `_in_daemon_dir` variant with an
+    // injected tempdir.
+    api_recordings_response_in_daemon_dir(id, runtime, &crate::debug::daemon_recordings_dir())
+        .await
+}
+
+pub(crate) async fn api_recordings_response_in_daemon_dir(
+    id: String,
+    runtime: &ControlRuntime,
+    daemon_dir: &std::path::Path,
+) -> serde_json::Value {
     let recording_registry = active_recording_registry(runtime).await;
-    json_body_response(
+    // Body-only framing (this method predates the injected-status
+    // envelope); the neutral fn always answers 200 with the listing.
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::recordings_list_response_body(recording_registry).await,
+        crate::web_gateway::recordings_list_api_response_in_daemon_dir(
+            recording_registry,
+            daemon_dir,
+        )
+        .await,
         "recordings",
     )
 }
@@ -674,6 +692,24 @@ pub(crate) async fn api_recording_asset_task_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> ControlTaskResponse {
+    // Transport edge: resolve the real daemon recordings dir once; the
+    // parity fixture drives the `_in_daemon_dir` variant with an
+    // injected tempdir.
+    api_recording_asset_task_response_in_daemon_dir(
+        id,
+        params,
+        runtime,
+        &crate::debug::daemon_recordings_dir(),
+    )
+    .await
+}
+
+pub(crate) async fn api_recording_asset_task_response_in_daemon_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    daemon_dir: &std::path::Path,
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let (stream_name, asset, offset, length) = match recording_asset_request_params(&params) {
         Ok(params) => params,
@@ -688,7 +724,9 @@ pub(crate) async fn api_recording_asset_task_response(
             serde_json::json!({ "ok": false, "error": "recording registry unavailable" }),
         );
     };
-    let resolved = resolve_live_recording_asset(registry, &stream_name, &asset).await;
+    let resolved =
+        resolve_live_recording_asset_in_daemon_dir(registry, daemon_dir, &stream_name, &asset)
+            .await;
     recording_asset_task_response(id, stream_name, asset, offset, length, resolved).await
 }
 
@@ -765,28 +803,6 @@ pub(crate) fn recording_asset_request_params(
     let length = optional_u64_param(params, &["length", "limit"])
         .map_err(|error| (400, serde_json::json!({ "ok": false, "error": error })))?;
     Ok((stream_name, asset, offset, length))
-}
-
-pub(crate) async fn resolve_live_recording_asset(
-    registry: Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
-    stream_name: &str,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    let (session_dir, mut segments) = {
-        let reg = registry.read().await;
-        (reg.session_dir().to_path_buf(), reg.segments(stream_name))
-    };
-    if segments.is_empty() {
-        let stream_dir = crate::debug::daemon_recordings_dir().join(stream_name);
-        segments =
-            crate::recording::parse_segment_csv_pub(&stream_dir.join("segments.csv"), &stream_dir);
-    }
-    resolve_recording_asset_from_dir_pair(
-        Some(session_dir.join("recordings").join(stream_name)),
-        Some(crate::debug::daemon_recordings_dir().join(stream_name)),
-        segments,
-        asset,
-    )
 }
 
 pub(crate) async fn recording_asset_task_response(
@@ -1151,6 +1167,137 @@ mod tests {
         }
     }
 
+    // ── S8 parity: the LIVE (daemon-scoped) recordings lanes — the
+    // legacy /recordings* chain shapes and the tunnel residue resolve
+    // through one core over the same injected dirs (no ambient
+    // daemon_recordings_dir read on either lane).
+
+    /// A registry over a temp session dir holding one recorded stream
+    /// ("screen"), plus an injected daemon recordings dir holding
+    /// another ("daemon0") — segments csv + playable bytes each.
+    fn parity_live_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
+    ) {
+        let session_dir = tempfile::tempdir().expect("temp session dir");
+        let daemon_dir = tempfile::tempdir().expect("temp daemon dir");
+        for (root, stream, bytes) in [
+            (
+                session_dir.path().join("recordings"),
+                "screen",
+                &b"live session segment bytes"[..],
+            ),
+            (
+                daemon_dir.path().to_path_buf(),
+                "daemon0",
+                &b"daemon-scoped segment bytes"[..],
+            ),
+        ] {
+            let stream_dir = root.join(stream);
+            std::fs::create_dir_all(&stream_dir).unwrap();
+            std::fs::write(stream_dir.join("seg_00001.mp4"), bytes).unwrap();
+            std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        }
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::recording::RecordingRegistry::new(
+                session_dir.path(),
+                crate::project::RecordingConfig::default(),
+            ),
+        ));
+        (session_dir, daemon_dir, registry)
+    }
+
+    #[tokio::test]
+    async fn parity_live_recordings_list_shares_bodies_across_lanes() {
+        let (_session_dir, daemon_dir, registry) = parity_live_fixture();
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.recording_registry = Some(registry.clone());
+        }
+
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::recordings_list_api_response_in_daemon_dir(
+                Some(registry),
+                daemon_dir.path(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body.as_array().map(|entries| entries.len()),
+            Some(2),
+            "{http_body}"
+        );
+
+        let frame = api_recordings_response_in_daemon_dir(
+            "parity-live-list".to_string(),
+            &rt,
+            daemon_dir.path(),
+        )
+        .await;
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // Body-only framing over a json ARRAY — no status injection.
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_live_recording_assets_share_bytes_across_lanes() {
+        let (_session_dir, daemon_dir, registry) = parity_live_fixture();
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.recording_registry = Some(registry.clone());
+        }
+
+        // "screen" resolves through the registry's session dir; "daemon0"
+        // exercises the daemon-dir csv fallback — on both lanes.
+        for stream_name in ["screen", "daemon0"] {
+            for asset in ["segments", "playlist.m3u8", "seg_00001.mp4"] {
+                let response = crate::web_gateway::live_recordings_path_api_response(
+                    Some(registry.clone()),
+                    daemon_dir.path(),
+                    &format!("{stream_name}/{asset}"),
+                )
+                .await;
+                let (http_bytes, http_ct) = match response {
+                    crate::web_gateway::ApiResponse::Bytes {
+                        status: 200,
+                        bytes: crate::web_gateway::BytesPayload::InMemory(payload),
+                        content_type,
+                        ..
+                    } => (payload, content_type),
+                    other => panic!(
+                        "{stream_name}/{asset} must ride the bytes lane 200: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                };
+
+                let task = api_recording_asset_task_response_in_daemon_dir(
+                    format!("parity-live-{stream_name}-{asset}"),
+                    Some(&serde_json::json!({
+                        "stream_name": stream_name,
+                        "asset": asset,
+                    })),
+                    &rt,
+                    daemon_dir.path(),
+                )
+                .await;
+                let stream = task.byte_stream.expect("tunnel byte stream");
+                assert_eq!(stream.bytes, http_bytes, "{stream_name}/{asset}");
+                assert_eq!(stream.content_type, http_ct, "{stream_name}/{asset}");
+                assert_eq!(stream.result["ok"], true, "{stream_name}/{asset}");
+                assert_eq!(
+                    stream.result["total_size"],
+                    http_bytes.len(),
+                    "{stream_name}/{asset}"
+                );
+            }
+        }
+    }
+
     use crate::dashboard_control::tests::{runtime, test_upload_state};
 
     #[tokio::test]
@@ -1261,7 +1408,12 @@ mod tests {
     async fn recording_rpcs_preserve_shapes_and_status() {
         let rt = runtime();
 
-        let recordings = api_recordings_response("rec1".to_string(), &rt).await;
+        // Injected daemon dir (hermetic — the ambient variant would scan
+        // the machine's real ~/.intendant/recordings).
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let recordings =
+            api_recordings_response_in_daemon_dir("rec1".to_string(), &rt, daemon_dir.path())
+                .await;
         assert_eq!(recordings["t"], "response");
         assert_eq!(recordings["ok"], true);
         assert!(recordings["result"].as_array().is_some());
