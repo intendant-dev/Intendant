@@ -873,6 +873,103 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 mod tests {
     use super::*;
 
+    /// The frozen realtime-frame IAM contract: every frame kind either
+    /// per-frame gate explicitly maps today, on both transports, pinned
+    /// byte-for-byte BEFORE the `FRAME_LANES` unification so the table
+    /// rewrite is provably a pure re-plumbing. Columns: frame kind, the
+    /// operation `web_gateway::ws_frame_operation` answers (the direct
+    /// `/ws` session), the operation
+    /// `dashboard_control::dashboard_control_frame_operation` answers
+    /// (the datachannel tunnel). `None` = the frame carries no blanket
+    /// authority on that lane (off-lane kinds, no-authority dispatch
+    /// machinery, and unknown kinds all answer `None` — per-frame gating
+    /// here fails open by design; handlers own the stateful checks).
+    ///
+    /// Changing ANY cell is an IAM change: make it deliberately, with the
+    /// grant model in view — never to satisfy a refactor.
+    #[test]
+    fn realtime_frame_operation_golden_mapping_is_frozen() {
+        use PeerOperation::*;
+        #[rustfmt::skip]
+        const GOLDEN: &[(&str, Option<PeerOperation>, Option<PeerOperation>)] = &[
+            // frame kind                      /ws lane              tunnel lane
+            // -- carried on both lanes, same floor operation --
+            ("terminal_open",                  Some(TerminalView),   Some(TerminalView)),
+            ("terminal_input",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_resize",                Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_close",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_share",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("display_input",                  Some(DisplayInput),   Some(DisplayInput)),
+            // -- /ws only: display signaling + diagnostics marker --
+            ("set_diagnostics_visual_marker",  Some(DisplayInput),   None),
+            ("display_offer",                  Some(DisplayView),    None),
+            ("display_ice",                    Some(DisplayView),    None),
+            // -- /ws only: legacy web-TUI lane (handlers gutted with the
+            //    TUI, 84afe9d8; the gate rows survive verbatim — dropping
+            //    the kinds is an owner decision, not refactor fallout) --
+            ("key",                            Some(RuntimeControl), None),
+            ("resize",                         Some(RuntimeControl), None),
+            ("term_subscribe",                 Some(RuntimeControl), None),
+            ("term_unsubscribe",               Some(RuntimeControl), None),
+            // -- /ws only: live voice/media presence machinery --
+            ("presence_connect",               Some(RuntimeControl), None),
+            ("presence_disconnect",            Some(RuntimeControl), None),
+            ("make_active",                    Some(RuntimeControl), None),
+            ("user_audio",                     Some(RuntimeControl), None),
+            ("video_frame",                    Some(RuntimeControl), None),
+            ("voice_log",                      Some(RuntimeControl), None),
+            ("voice_diagnostic",               Some(RuntimeControl), None),
+            ("presence_checkpoint",            Some(RuntimeControl), None),
+            ("live_usage_update",              Some(RuntimeControl), None),
+            ("annotation_attach",              Some(RuntimeControl), None),
+            ("annotation_submit",              Some(RuntimeControl), None),
+            ("clip_start",                     Some(RuntimeControl), None),
+            ("clip_frame",                     Some(RuntimeControl), None),
+            ("clip_end",                       Some(RuntimeControl), None),
+            // -- /ws only: presence tool dispatch --
+            ("tool_request",                   Some(Message),        None),
+            ("async_query",                    Some(Message),        None),
+            // -- /ws only: tunnel-establishment signaling stays open (the
+            //    tunnel enforces this very grant per-frame itself) --
+            ("dashboard_control_offer",        None,                 None),
+            ("dashboard_control_ice",          None,                 None),
+            ("dashboard_control_close",        None,                 None),
+            // -- tunnel only: the presence wrapper envelope --
+            ("presence_frame",                 None,                 Some(Message)),
+            // -- tunnel only: upload frames are authorized by the method
+            //    they deliver, never by a blanket grant --
+            ("upload_start",                   None,                 None),
+            ("upload_chunk",                   None,                 None),
+            ("upload_end",                     None,                 None),
+            // -- tunnel only: client-egress relay answers --
+            ("egress_response",                None,                 Some(CredentialsManage)),
+            ("egress_chunk",                   None,                 Some(CredentialsManage)),
+            ("egress_end",                     None,                 Some(CredentialsManage)),
+            ("egress_error",                   None,                 Some(CredentialsManage)),
+            // -- no-authority dispatch machinery + unknown kinds --
+            ("ping",                           None,                 None),
+            ("hello",                          None,                 None),
+            ("request",                        None,                 None),
+            ("response",                       None,                 None),
+            ("cancel",                         None,                 None),
+            ("credit",                         None,                 None),
+            ("event",                          None,                 None),
+            ("no_such_frame_kind",             None,                 None),
+        ];
+        for (frame, ws_expected, tunnel_expected) in GOLDEN {
+            assert_eq!(
+                crate::web_gateway::ws_frame_operation(frame),
+                *ws_expected,
+                "/ws frame {frame:?} drifted from the golden mapping",
+            );
+            assert_eq!(
+                crate::dashboard_control::dashboard_control_frame_operation(frame),
+                *tunnel_expected,
+                "tunnel frame {frame:?} drifted from the golden mapping",
+            );
+        }
+    }
+
     /// Pins the least-privilege pairing default (owner decision,
     /// 2026-07-08): an unlabeled pairing views displays and never holds
     /// input. Widening this default back to an input-capable profile is a

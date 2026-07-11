@@ -1536,7 +1536,9 @@ fn runtime_operation_decision(
     runtime.grant.access_decision(op)
 }
 
-fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
+pub(crate) fn dashboard_control_frame_operation(
+    t: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
     use crate::peer::access_policy::PeerOperation;
     match t {
         "display_input" => Some(PeerOperation::DisplayInput),
