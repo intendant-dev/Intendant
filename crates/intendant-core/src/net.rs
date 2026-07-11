@@ -1,9 +1,7 @@
-//! Shared network vocabulary: local interface probes (unix walks
-//! `getifaddrs(3)` via libc; Windows goes through the `if-addrs`
-//! crate), the daemon's canonical gateway port, and the TCP-listener
-//! accept-failure policy + rebind helper shared by the web gateway,
-//! the control socket, and the enrollment cert server. No dependency
-//! on any daemon subsystem.
+//! Shared network vocabulary: safe cross-platform local interface probes,
+//! the daemon's canonical gateway port, and the TCP-listener accept-failure
+//! policy + rebind helper shared by the web gateway, the control socket, and
+//! the enrollment cert server. No dependency on any daemon subsystem.
 
 use tokio::net::TcpListener;
 
@@ -27,84 +25,50 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8765;
 /// Excludes IPv6 link-local (fe80::/10), IPv4 loopback when
 /// `!include_loopback`, and unspecified addresses (0.0.0.0 / ::) which
 /// aren't real bind targets.
-///
-/// Implementation walks `getifaddrs(3)` directly via libc — same crate
-/// the codebase already depends on for other unix interop.
 pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+    filtered_interface_addrs(
+        include_loopback,
+        interfaces
+            .into_iter()
+            .map(|interface| (interface.ip(), interface.is_link_local())),
+    )
+}
+
+/// Apply the platform's historical interface-address filters while retaining
+/// the OS enumeration order (and any duplicate entries). Callers rely on that
+/// order when they perform a stable IPv4-before-IPv6 sort.
+fn filtered_interface_addrs(
+    include_loopback: bool,
+    interfaces: impl IntoIterator<Item = (std::net::IpAddr, bool)>,
+) -> Vec<std::net::IpAddr> {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let mut out: Vec<IpAddr> = Vec::new();
+    let mut out = Vec::new();
     if include_loopback {
         out.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
-    #[cfg(unix)]
-    {
-        use std::ffi::CStr;
-        unsafe {
-            let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-            if libc::getifaddrs(&mut ifap) == 0 && !ifap.is_null() {
-                let mut cur = ifap;
-                while !cur.is_null() {
-                    let ifa = &*cur;
-                    if !ifa.ifa_addr.is_null() {
-                        let family = (*ifa.ifa_addr).sa_family as i32;
-                        let _name = if ifa.ifa_name.is_null() {
-                            String::new()
-                        } else {
-                            CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned()
-                        };
-                        if family == libc::AF_INET {
-                            let sin = ifa.ifa_addr as *const libc::sockaddr_in;
-                            let octets = (*sin).sin_addr.s_addr.to_ne_bytes();
-                            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-                            if !ip.is_loopback() && !ip.is_unspecified() {
-                                out.push(IpAddr::V4(ip));
-                            }
-                        } else if family == libc::AF_INET6 {
-                            let sin6 = ifa.ifa_addr as *const libc::sockaddr_in6;
-                            let segs = (*sin6).sin6_addr.s6_addr;
-                            let ip = std::net::Ipv6Addr::from(segs);
-                            if !ip.is_loopback() && !ip.is_unspecified() && !is_link_local_v6(&ip) {
-                                out.push(IpAddr::V6(ip));
-                            }
-                        }
-                    }
-                    cur = (*cur).ifa_next;
-                }
-                libc::freeifaddrs(ifap);
-            }
+    for (ip, interface_is_link_local) in interfaces {
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
         }
-    }
 
-    // Windows has no `getifaddrs(3)`; the OS API is `GetAdaptersAddresses`.
-    // Rather than hand-roll that FFI walk we use the `if-addrs` crate, which
-    // wraps it and yields the same per-interface address list. The filtering
-    // mirrors the unix arm: drop loopback (unless requested), link-local
-    // (IPv6 fe80::/10 and IPv4 169.254/16 — neither is a useful advertised
-    // endpoint), and unspecified addresses. Enumeration order is preserved so
-    // the caller's later stable sort keeps a multi-NIC host's primary NIC
-    // first, matching the unix behaviour.
-    #[cfg(windows)]
-    {
-        if let Ok(ifaces) = if_addrs::get_if_addrs() {
-            for iface in ifaces {
-                if iface.is_link_local() {
-                    continue;
-                }
-                let ip = iface.ip();
-                if ip.is_unspecified() {
-                    continue;
-                }
-                if ip.is_loopback() {
-                    // Loopback is added once up-front (as 127.0.0.1) when
-                    // requested; skip the per-interface loopback entries so
-                    // we don't emit duplicates or ::1 alongside it.
-                    continue;
-                }
-                out.push(ip);
-            }
+        // Preserve the existing platform behavior: Unix historically filtered
+        // IPv6 fe80::/10 but retained IPv4 169.254/16, while the Windows
+        // if-addrs path filtered every address the crate marks link-local.
+        #[cfg(unix)]
+        if matches!(ip, IpAddr::V6(ip) if is_link_local_v6(&ip)) {
+            continue;
         }
+        #[cfg(windows)]
+        if interface_is_link_local {
+            continue;
+        }
+        #[cfg(unix)]
+        let _ = interface_is_link_local;
+
+        out.push(ip);
     }
 
     out
@@ -187,7 +151,58 @@ pub fn rebind_dead_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn interface_filter_preserves_encounter_order_and_duplicates() {
+        let first = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let second = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        let interfaces = [
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), false),
+            (first, false),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), false),
+            (second, false),
+            (first, false),
+        ];
+
+        assert_eq!(
+            filtered_interface_addrs(true, interfaces),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST), first, second, first]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_filter_preserves_historical_link_local_behavior() {
+        let ipv4_link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let ipv6_link_local = IpAddr::V6(Ipv6Addr::new(0xfea0, 0, 0, 0, 0, 0, 0, 1));
+
+        assert_eq!(
+            filtered_interface_addrs(
+                false,
+                [
+                    (ipv4_link_local, true),
+                    // `if-addrs` currently marks only fe80::/16 link-local;
+                    // our historical Unix filter covers the full fe80::/10.
+                    (ipv6_link_local, false),
+                ],
+            ),
+            vec![ipv4_link_local]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_filter_uses_if_addrs_link_local_classification() {
+        let ipv4_link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let regular = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        assert_eq!(
+            filtered_interface_addrs(false, [(ipv4_link_local, true), (regular, false)]),
+            vec![regular]
+        );
+    }
 
     #[test]
     fn accept_error_classifier_keeps_listener_alive_for_transient_errors() {

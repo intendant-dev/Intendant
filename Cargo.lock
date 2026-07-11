@@ -2624,7 +2624,6 @@ dependencies = [
  "futures-util",
  "hickory-server",
  "html2text",
- "if-addrs",
  "image",
  "instant-acme",
  "intendant-core",
@@ -2682,7 +2681,6 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "if-addrs",
- "libc",
  "presence-core",
  "reqwest",
  "serde",

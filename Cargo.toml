@@ -231,12 +231,6 @@ windows = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Environment",
 ] }
-# Cross-platform network-interface enumeration. On Windows it wraps
-# GetAdaptersAddresses; this backs `lan::routable_local_addrs`, which feeds
-# the web-gateway advertise URLs and WebRTC ICE host-candidate gathering.
-# The unix path keeps its existing direct `getifaddrs(3)` walk via libc.
-if-addrs = "0.15"
-
 [build-dependencies]
 # build.rs assembles static/app.html from the static/app/ fragments before
 # every compile, so `include_str!` embeds an artifact that matches the
