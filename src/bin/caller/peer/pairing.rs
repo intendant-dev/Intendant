@@ -426,8 +426,12 @@ fn cmd_requests() -> Result<(), CallerError> {
         return Ok(());
     }
     for request in requests {
+        let caller = match request.requester_daemon_id.as_deref() {
+            Some(id) => format!("caller={}… (verified)", &id[..id.len().min(12)]),
+            None => "caller=unverified".to_string(),
+        };
         println!(
-            "{}  {:?}  {}  profile={}  expires={}",
+            "{}  {:?}  {}  profile={}  {}  expires={}",
             request.code,
             request.status,
             request.requester_label,
@@ -435,6 +439,7 @@ fn cmd_requests() -> Result<(), CallerError> {
                 .requested_profile
                 .as_deref()
                 .unwrap_or(crate::peer::access_policy::DEFAULT_PROFILE),
+            caller,
             request.expires_at_unix
         );
     }
