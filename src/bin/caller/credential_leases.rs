@@ -820,12 +820,42 @@ mod tests {
     fn regrant_replaces_and_unknown_kinds_are_refused() {
         let _guard = lock();
         reset();
-        grant("api_key:openai", "a", "first", None, "root", "local", None, None).unwrap();
-        let outcome = grant("api_key:openai", "b", "second", None, "root", "local", None, None).unwrap();
+        grant(
+            "api_key:openai",
+            "a",
+            "first",
+            None,
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
+        let outcome = grant(
+            "api_key:openai",
+            "b",
+            "second",
+            None,
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(outcome.replaced);
         assert_eq!(leased_secret("api_key:openai").as_deref(), Some("second"));
 
-        assert!(grant("api_key:mystery", "x", "y", None, "root", "local", None, None).is_err());
+        assert!(grant(
+            "api_key:mystery",
+            "x",
+            "y",
+            None,
+            "root",
+            "local",
+            None,
+            None
+        )
+        .is_err());
         assert!(grant("api_key:gemini", "x", "", None, "root", "local", None, None).is_err());
         reset();
     }

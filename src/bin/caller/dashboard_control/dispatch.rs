@@ -187,6 +187,7 @@ pub(crate) fn frame_api_task_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,
@@ -488,9 +489,7 @@ pub(crate) fn control_frame_response(
                             "published_unix_ms": key.published_unix_ms,
                         }),
                         Ok(None) => serde_json::json!({ "present": false }),
-                        Err(error) => {
-                            return Some(dashboard_control_error_response(id, error))
-                        }
+                        Err(error) => return Some(dashboard_control_error_response(id, error)),
                     };
                     Some(serde_json::json!({
                         "t": "response",
@@ -531,24 +530,22 @@ pub(crate) fn control_frame_response(
                         },
                     )
                 }
-                "api_daemon_vault_deposits_fetch" => {
-                    Some(
-                        match crate::vault_deposits::list_deposits_in(
-                            &crate::vault_deposits::deposits_dir(),
-                        ) {
-                            Ok(deposits) => serde_json::json!({
-                                "t": "response",
-                                "id": id,
-                                "ok": true,
-                                "result": {
-                                    "deposits": serde_json::to_value(&deposits)
-                                        .unwrap_or(serde_json::Value::Null),
-                                },
-                            }),
-                            Err(error) => dashboard_control_error_response(id, error),
-                        },
-                    )
-                }
+                "api_daemon_vault_deposits_fetch" => Some(
+                    match crate::vault_deposits::list_deposits_in(
+                        &crate::vault_deposits::deposits_dir(),
+                    ) {
+                        Ok(deposits) => serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": {
+                                "deposits": serde_json::to_value(&deposits)
+                                    .unwrap_or(serde_json::Value::Null),
+                            },
+                        }),
+                        Err(error) => dashboard_control_error_response(id, error),
+                    },
+                ),
                 "api_daemon_vault_deposits_consume" => {
                     let ids: Vec<String> = params
                         .as_ref()
@@ -773,9 +770,7 @@ pub(crate) fn control_frame_response(
                     let cert_dir = crate::access::backend::select_backend().cert_dir();
                     Some(frame_api_ok_error_response(
                         id,
-                        crate::web_gateway::access_org_manage_api_response(
-                            &cert_dir, leaf, params,
-                        ),
+                        crate::web_gateway::access_org_manage_api_response(&cert_dir, leaf, params),
                         "org manage",
                     ))
                 }
@@ -802,9 +797,7 @@ pub(crate) fn control_frame_response(
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
                         "api_access_org_orl_apply" => {
-                            crate::web_gateway::access_org_orl_apply_api_response(
-                                &cert_dir, params,
-                            )
+                            crate::web_gateway::access_org_orl_apply_api_response(&cert_dir, params)
                         }
                         "api_access_org_renew" => {
                             crate::web_gateway::access_org_renew_api_response(&cert_dir, params)
@@ -1536,7 +1529,10 @@ pub(crate) fn control_presence_frame(
     }
 }
 
-pub(crate) async fn handle_dashboard_presence_frame(frame: serde_json::Value, runtime: ControlRuntime) {
+pub(crate) async fn handle_dashboard_presence_frame(
+    frame: serde_json::Value,
+    runtime: ControlRuntime,
+) {
     let frame_type = frame
         .get("t")
         .and_then(|value| value.as_str())
@@ -1557,7 +1553,10 @@ pub(crate) async fn handle_dashboard_presence_frame(frame: serde_json::Value, ru
     }
 }
 
-pub(crate) fn dashboard_control_emit_browser_event(runtime: &ControlRuntime, payload: serde_json::Value) {
+pub(crate) fn dashboard_control_emit_browser_event(
+    runtime: &ControlRuntime,
+    payload: serde_json::Value,
+) {
     if let Some(tx) = &runtime.control_frames_tx {
         let _ = tx.send(serde_json::json!({
             "t": "event",
@@ -1797,7 +1796,10 @@ pub(crate) async fn dashboard_voice_log(frame: serde_json::Value, runtime: Contr
     });
 }
 
-pub(crate) async fn dashboard_presence_checkpoint(frame: serde_json::Value, runtime: ControlRuntime) {
+pub(crate) async fn dashboard_presence_checkpoint(
+    frame: serde_json::Value,
+    runtime: ControlRuntime,
+) {
     let summary = frame
         .get("summary")
         .and_then(|value| value.as_str())
@@ -2247,7 +2249,10 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
         "created_unix_ms".to_string(),
         serde_json::json!(runtime.created_unix_ms),
     );
-    result.insert("features".to_string(), serde_json::json!(control_features()));
+    result.insert(
+        "features".to_string(),
+        serde_json::json!(control_features()),
+    );
     result.insert(
         "transport".to_string(),
         serde_json::json!("webrtc-datachannel"),

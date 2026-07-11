@@ -834,6 +834,7 @@ fn enrich_worktree(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn safety_text(
     is_main: bool,
     active_sessions: usize,

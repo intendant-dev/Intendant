@@ -73,10 +73,7 @@ pub(crate) fn string_param(params: &serde_json::Value, names: &[&str]) -> String
     String::new()
 }
 
-pub(crate) fn optional_string_param(
-    params: &serde_json::Value,
-    names: &[&str],
-) -> Option<String> {
+pub(crate) fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
     let value = string_param(params, names);
     if value.is_empty() {
         None
@@ -294,7 +291,8 @@ mod tests {
     fn request_authority_root_principal_allows_filesystem_read() {
         let authority = RequestAuthority {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
-                "unit-test", "https",
+                "unit-test",
+                "https",
             ),
             iam_state: None,
         };

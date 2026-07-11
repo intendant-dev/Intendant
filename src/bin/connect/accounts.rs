@@ -16,7 +16,11 @@ pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn session_cookie(config: &ServiceConfig, token: &str, max_age_seconds: u64) -> HeaderValue {
+pub(crate) fn session_cookie(
+    config: &ServiceConfig,
+    token: &str,
+    max_age_seconds: u64,
+) -> HeaderValue {
     let mut cookie =
         format!("{COOKIE_NAME}={token}; Max-Age={max_age_seconds}; Path=/; HttpOnly; SameSite=Lax");
     if config.cookie_secure {
@@ -33,7 +37,10 @@ pub(crate) fn clear_session_cookie(config: &ServiceConfig) -> HeaderValue {
     HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-pub(crate) async fn optional_user(state: &Arc<AppState>, headers: &HeaderMap) -> Option<UserRecord> {
+pub(crate) async fn optional_user(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Option<UserRecord> {
     let token = cookie_value(headers, COOKIE_NAME)?;
     let now = now_unix_ms();
     let user_id = {
@@ -49,7 +56,10 @@ pub(crate) async fn optional_user(state: &Arc<AppState>, headers: &HeaderMap) ->
     store.users.iter().find(|u| u.id == user_id).cloned()
 }
 
-pub(crate) async fn require_user(state: &Arc<AppState>, headers: &HeaderMap) -> ApiResult<UserRecord> {
+pub(crate) async fn require_user(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> ApiResult<UserRecord> {
     optional_user(state, headers)
         .await
         .ok_or_else(|| ApiError::unauthorized("sign in required"))
@@ -91,7 +101,12 @@ pub(crate) fn attestation_claim_string(config: &ServiceConfig, handle: &str) -> 
     format!("intendant-handle={handle}@{host}")
 }
 
-pub(crate) fn upsert_attestation(user: &mut UserRecord, kind: &str, subject: String, proof: String) {
+pub(crate) fn upsert_attestation(
+    user: &mut UserRecord,
+    kind: &str,
+    subject: String,
+    proof: String,
+) {
     user.attestations
         .retain(|a| !(a.kind == kind && a.subject == subject));
     user.attestations.push(AttestationRecord {
@@ -582,7 +597,10 @@ pub(crate) fn log_json(event: &str, detail: serde_json::Value) {
     );
 }
 
-pub(crate) async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub(crate) async fn api_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let Some(user) = optional_user(&state, &headers).await else {
         return Ok(Json(json!({
             "authenticated": false,
@@ -610,7 +628,10 @@ pub(crate) async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMa
     .into_response())
 }
 
-pub(crate) async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub(crate) async fn api_logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     require_csrf(&state, &headers).await?;
     if let Some(token) = cookie_value(&headers, COOKIE_NAME) {
         state.sessions.lock().await.remove(&token);

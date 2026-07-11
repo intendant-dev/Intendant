@@ -717,9 +717,7 @@ pub fn daemon_connect_config_path() -> PathBuf {
 pub fn load_daemon_connect_config_in(path: &Path) -> Result<ConnectConfig, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConnectConfig::default())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ConnectConfig::default()),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     let file: DaemonConnectFile =
@@ -742,8 +740,7 @@ pub fn save_daemon_connect_config_in(path: &Path, config: &ConnectConfig) -> Res
     let text =
         toml::to_string_pretty(&file).map_err(|e| format!("serialize connect config: {e}"))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -1505,13 +1502,21 @@ mod tests {
         let pills = read("crates/station-web/src/hud/panels.rs");
         for mode in CLAUDE_PERMISSION_MODES {
             for (name, hay, needle) in [
-                ("static/app/20-shell.html", &shell, format!("value=\"{mode}\"")),
+                (
+                    "static/app/20-shell.html",
+                    &shell,
+                    format!("value=\"{mode}\""),
+                ),
                 (
                     "static/app/21-access-dialogs.html",
                     &dialogs,
                     format!("value=\"{mode}\""),
                 ),
-                ("static/app/34-station-panes.js", &panes, format!("'{mode}'")),
+                (
+                    "static/app/34-station-panes.js",
+                    &panes,
+                    format!("'{mode}'"),
+                ),
                 (
                     "crates/station-web/src/hud/panels.rs",
                     &pills,

@@ -302,7 +302,7 @@ impl PeerActor {
                 maybe_cmd = self.commands_rx.recv() => {
                     match maybe_cmd {
                         Some(PeerCommand::Send { op, responder }) => {
-                            let result = self.transport.send(op).await;
+                            let result = self.transport.send(*op).await;
                             let _ = responder.send(result);
                         }
                         Some(PeerCommand::Disconnect) => {

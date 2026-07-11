@@ -18,7 +18,12 @@ pub(crate) struct TlsFailureLogEntry {
 
 pub(crate) type TlsFailureLogState = Arc<Mutex<HashMap<String, TlsFailureLogEntry>>>;
 
-pub(crate) fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &str, kind: &str, detail: &str) {
+pub(crate) fn log_tls_failure_rate_limited(
+    state: &TlsFailureLogState,
+    peer: &str,
+    kind: &str,
+    detail: &str,
+) {
     let now = std::time::Instant::now();
     let key = format!("{kind}|{peer}|{detail}");
     let mut map = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -69,6 +74,7 @@ pub(crate) use intendant_core::net::{
     rebind_dead_tcp_listener, should_continue_after_accept_error, FATAL_ACCEPT_REBIND_THRESHOLD,
 };
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn spawn_web_gateway(
     listener: TcpListener,
     bus: EventBus,
@@ -840,8 +846,7 @@ pub fn spawn_web_gateway(
     // INTENDANT_APP_HTML_PATH (dev override): read once at spawn; when
     // set, every dashboard request re-reads that path instead of serving
     // the embedded `app_html` above.
-    let app_html_override: Option<Arc<std::path::Path>> =
-        app_html_override_path().map(Arc::from);
+    let app_html_override: Option<Arc<std::path::Path>> = app_html_override_path().map(Arc::from);
     if let Some(path) = &app_html_override {
         eprintln!(
             "[web_gateway] INTENDANT_APP_HTML_PATH: serving the dashboard from {} \
@@ -1161,10 +1166,11 @@ pub fn spawn_web_gateway(
                     );
                     let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
                                 http:// / ws://.\n";
-                    let response = HttpResponse::with_content("426 Upgrade Required", "text/plain", body)
-                        .header("Upgrade", "TLS/1.2")
-                        .header("Connection", "close")
-                        .into_string();
+                    let response =
+                        HttpResponse::with_content("426 Upgrade Required", "text/plain", body)
+                            .header("Upgrade", "TLS/1.2")
+                            .header("Connection", "close")
+                            .into_string();
                     let _ = raw_stream.write_all(response.as_bytes()).await;
                     let _ = raw_stream.shutdown().await;
                     return;
@@ -1250,10 +1256,14 @@ pub fn spawn_web_gateway(
                             403 => "Forbidden",
                             _ => "Error",
                         };
-                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-                            .header("Cache-Control", "no-cache")
-                            .header("Connection", "close")
-                            .into_string();
+                        let response = HttpResponse::with_content(
+                            format!("{} {}", status, reason),
+                            "application/json",
+                            body,
+                        )
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -1285,10 +1295,14 @@ pub fn spawn_web_gateway(
                             "error": "mTLS client certificate required"
                         })
                         .to_string();
-                        let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
-                            .header("Cache-Control", "no-cache")
-                            .header("Connection", "close")
-                            .into_string();
+                        let response = HttpResponse::with_content(
+                            "401 Unauthorized",
+                            "application/json",
+                            body,
+                        )
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -1306,10 +1320,14 @@ pub fn spawn_web_gateway(
                             401 => "Unauthorized",
                             _ => "Error",
                         };
-                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-                            .header("WWW-Authenticate", "Bearer")
-                            .header("Connection", "close")
-                            .into_string();
+                        let response = HttpResponse::with_content(
+                            format!("{} {}", status, reason),
+                            "application/json",
+                            body,
+                        )
+                        .header("WWW-Authenticate", "Bearer")
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         // Flush + cleanly shut down before the task returns and
                         // drops the stream. On the TLS path rustls buffers the
@@ -1796,10 +1814,10 @@ pub fn spawn_web_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OutboundEvent;
-    use tokio::io::AsyncWriteExt;
     use crate::test_support::TEST_ENV_LOCK;
-    use crate::web_gateway::tests::{EnvVarGuard, next_ws_json_matching};
+    use crate::types::OutboundEvent;
+    use crate::web_gateway::tests::{next_ws_json_matching, EnvVarGuard};
+    use tokio::io::AsyncWriteExt;
 
     async fn next_ws_json_type<S>(ws_rx: &mut S, ty: &str) -> serde_json::Value
     where

@@ -1793,9 +1793,9 @@ impl WireEventUpcaster {
                 s.relationship = relationship.clone();
                 s.ephemeral = *ephemeral;
             })),
-            OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
-                self.sessions.update(session_id, |s| s.goal = goal.clone()),
-            ),
+            OutboundEvent::SessionGoal { session_id, goal } => {
+                session_updated_events(self.sessions.update(session_id, |s| s.goal = goal.clone()))
+            }
             OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
                 self.sessions
                     .update(session_id, |s| s.vitals = Some(vitals.clone())),
@@ -1812,9 +1812,9 @@ impl WireEventUpcaster {
                 }
             })),
             OutboundEvent::TurnStarted { session_id, .. }
-            | OutboundEvent::AgentStarted { session_id, .. } => session_updated_events(
-                self.sessions.phase(session_id.as_deref(), "working"),
-            ),
+            | OutboundEvent::AgentStarted { session_id, .. } => {
+                session_updated_events(self.sessions.phase(session_id.as_deref(), "working"))
+            }
             OutboundEvent::DoneSignal { session_id, .. }
             | OutboundEvent::TaskComplete { session_id, .. } => {
                 session_updated_events(self.sessions.phase(session_id.as_deref(), "done"))
@@ -1833,11 +1833,9 @@ impl WireEventUpcaster {
                 }
                 None => vec![],
             },
-            OutboundEvent::ApprovalRequired {
-                session_id, id, ..
-            } => session_updated_events(
-                self.sessions.approval_requested(*id, session_id.as_deref()),
-            ),
+            OutboundEvent::ApprovalRequired { session_id, id, .. } => {
+                session_updated_events(self.sessions.approval_requested(*id, session_id.as_deref()))
+            }
             OutboundEvent::ApprovalResolved { id, .. } => {
                 session_updated_events(self.sessions.approval_resolved(*id))
             }
@@ -4611,10 +4609,7 @@ mod tests {
             PeerEvent::SessionUpdated { session } => Some(session.clone()),
             _ => None,
         });
-        assert_eq!(
-            updated.expect("TurnStarted folds phase").phase,
-            "working"
-        );
+        assert_eq!(updated.expect("TurnStarted folds phase").phase, "working");
 
         // Same-phase repeat (AgentStarted while already working) must
         // not re-emit.

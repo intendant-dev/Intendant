@@ -25,15 +25,15 @@ mod dashboard_control;
 mod debug;
 mod diagnostics;
 mod display_requests;
-pub(crate) use intendant_display as display;
 pub(crate) use intendant_core::error;
+pub(crate) use intendant_display as display;
 mod event;
 mod external_agent;
 mod external_wrapper_index;
 mod file_watcher;
-mod fleet_cert;
 mod fission_ledger;
 mod fission_lifecycle;
+mod fleet_cert;
 pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
@@ -65,8 +65,8 @@ mod session_log;
 mod session_names;
 mod session_supervisor;
 mod session_vitals;
-mod usage_rail;
 mod setup;
+mod usage_rail;
 pub(crate) use intendant_core::skills;
 mod sub_agent;
 mod task_dispatch;
@@ -350,7 +350,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
-    println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to");
+    println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to (--releases: app release artifacts)");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
     println!("    service               Install, remove, inspect, or run the boot service");
@@ -976,9 +976,9 @@ fn batch_is_all_ask_human(json_str: &str) -> bool {
         .and_then(|v| v.as_array())
         .map(|commands| {
             !commands.is_empty()
-                && commands.iter().all(|cmd| {
-                    cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman")
-                })
+                && commands
+                    .iter()
+                    .all(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
         })
         .unwrap_or(false)
 }
@@ -2686,7 +2686,6 @@ Also: {"source": "bare"}"#;
             ),
         }
     }
-
 }
 
 /// Set up a fresh conversation with project context, memory, and skills (without a task).
@@ -3316,8 +3315,7 @@ async fn main() -> Result<(), CallerError> {
     // invocations keep cwd-as-project — correct for `intendant "task"`
     // inside a repo.
     let projectless_daemon = web_daemon_requested && !project_has_marker;
-    let daemon_project_root: Option<PathBuf> =
-        (!projectless_daemon).then(|| project.root.clone());
+    let daemon_project_root: Option<PathBuf> = (!projectless_daemon).then(|| project.root.clone());
     if projectless_daemon {
         eprintln!(
             "Projectless daemon: {} has no project marker (.git or intendant.toml) — \

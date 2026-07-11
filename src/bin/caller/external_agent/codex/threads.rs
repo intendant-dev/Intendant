@@ -118,7 +118,10 @@ impl CodexAgent {
         }
     }
 
-    pub(crate) async fn compact_thread(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+    pub(crate) async fn compact_thread(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
         let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let _ = self
@@ -288,7 +291,9 @@ impl CodexAgent {
         }
     }
 
-    pub(crate) async fn effective_managed_context_developer_instructions(&mut self) -> Option<String> {
+    pub(crate) async fn effective_managed_context_developer_instructions(
+        &mut self,
+    ) -> Option<String> {
         if !self.managed_context {
             return None;
         }
@@ -523,7 +528,10 @@ impl CodexAgent {
         Ok("Codex memory reset".to_string())
     }
 
-    pub(crate) async fn set_thread_name(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+    pub(crate) async fn set_thread_name(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
         let thread_id = self.thread_id_for_action(params).await?;
         let name = params
             .get("name")
@@ -620,7 +628,10 @@ impl CodexAgent {
         Ok(format_goal_response("goal updated", &response))
     }
 
-    pub(crate) async fn get_goal(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+    pub(crate) async fn get_goal(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
         let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let response = self
@@ -630,7 +641,10 @@ impl CodexAgent {
         Ok(format_goal_response("current goal", &response))
     }
 
-    pub(crate) async fn clear_goal(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
+    pub(crate) async fn clear_goal(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<String, CallerError> {
         let thread_id = self.thread_id_for_action(params).await?;
         let params = serde_json::json!({ "threadId": thread_id });
         let response = self
@@ -764,7 +778,9 @@ pub(crate) fn side_developer_instructions(existing_instructions: Option<&str>) -
     }
 }
 
-pub(crate) fn managed_context_developer_instructions(existing_instructions: Option<&str>) -> String {
+pub(crate) fn managed_context_developer_instructions(
+    existing_instructions: Option<&str>,
+) -> String {
     match existing_instructions {
         Some(existing_instructions) if !existing_instructions.trim().is_empty() => {
             format!("{existing_instructions}\n\n{MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS}")
@@ -898,7 +914,10 @@ pub(crate) fn side_boundary_prompt_item() -> serde_json::Value {
     })
 }
 
-pub(crate) fn effective_approval_policy_for_sandbox<'a>(sandbox: &str, approval_policy: &'a str) -> &'a str {
+pub(crate) fn effective_approval_policy_for_sandbox<'a>(
+    sandbox: &str,
+    approval_policy: &'a str,
+) -> &'a str {
     if sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
         CODEX_NEVER_APPROVAL_POLICY
     } else {
@@ -1004,7 +1023,9 @@ pub(crate) fn format_goal(goal: &serde_json::Value) -> Option<String> {
     Some(format!("{} ({})", objective, details.join(", ")))
 }
 
-pub(crate) fn session_goal_from_value(goal: &serde_json::Value) -> Option<crate::types::SessionGoal> {
+pub(crate) fn session_goal_from_value(
+    goal: &serde_json::Value,
+) -> Option<crate::types::SessionGoal> {
     let objective = goal_objective(goal)?.to_string();
 
     Some(crate::types::SessionGoal {
@@ -1054,7 +1075,7 @@ pub(crate) fn format_duration_short(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_agent::codex::tests::{test_agent};
+    use crate::external_agent::codex::tests::test_agent;
 
     #[tokio::test]
     async fn codex_rollout_token_usage_seed_reads_latest_non_null_info() {

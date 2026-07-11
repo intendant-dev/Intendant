@@ -583,7 +583,9 @@ mod tests {
         );
 
         // Spawn-time state is verified — release the child and let it run.
-        release_gate.send(true).expect("child loop holds a receiver");
+        release_gate
+            .send(true)
+            .expect("child loop holds a receiver");
 
         // The completion resolves through the registry exactly like a
         // model-spawned child's (mock research child ends text-only; the
@@ -607,9 +609,10 @@ mod tests {
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
         {
             let mut state = supervisor.state.lock().await;
-            state
-                .sessions
-                .insert("codex-parent".to_string(), managed_session("codex-parent", "codex"));
+            state.sessions.insert(
+                "codex-parent".to_string(),
+                managed_session("codex-parent", "codex"),
+            );
             let mut deep = managed_session("deep-parent", "intendant");
             deep.depth = MAX_SUB_AGENT_DEPTH;
             state.sessions.insert("deep-parent".to_string(), deep);

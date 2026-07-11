@@ -96,7 +96,7 @@ pub enum ConnectionState {
 /// module — callers use [`PeerHandle`] methods which wrap these.
 pub(crate) enum PeerCommand {
     Send {
-        op: PeerOp,
+        op: Box<PeerOp>,
         responder: oneshot::Sender<Result<PeerOpAck, PeerError>>,
     },
     Disconnect,
@@ -477,7 +477,10 @@ impl PeerHandle {
         let (tx, rx) = oneshot::channel();
         self.inner
             .commands
-            .send(PeerCommand::Send { op, responder: tx })
+            .send(PeerCommand::Send {
+                op: Box::new(op),
+                responder: tx,
+            })
             .await
             .map_err(|_| PeerError::NotConnected)?;
         rx.await.map_err(|_| PeerError::NotConnected)?

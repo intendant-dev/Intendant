@@ -180,10 +180,8 @@ pub(crate) fn mcp_context_from_request_line(
             "managed_context" => {
                 managed_context = Some(crate::project::codex_managed_context_enabled(value));
             }
-            "tool_profile" | "tools" | "toolset" | "toolsets" => {
-                if !value.trim().is_empty() {
-                    tool_profile = Some(percent_decode_query_value(value));
-                }
+            "tool_profile" | "tools" | "toolset" | "toolsets" if !value.trim().is_empty() => {
+                tool_profile = Some(percent_decode_query_value(value));
             }
             _ => {}
         }

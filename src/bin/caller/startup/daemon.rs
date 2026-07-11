@@ -187,8 +187,7 @@ pub(crate) async fn run_daemon(
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     // Covers supervisor-spawned native children too.
-    let _usage_rail =
-        crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
+    let _usage_rail = crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
 
     let startup_bus = bus.clone();
     let supervisor_handle =

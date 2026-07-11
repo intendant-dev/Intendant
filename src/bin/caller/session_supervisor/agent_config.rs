@@ -1075,9 +1075,8 @@ mod tests {
             ..Default::default()
         };
         // The claude configure path: fields normalize into pins.
-        let config = crate::session_config::from_wire_fields(
-            overrides.as_wire_fields("claude-code"),
-        );
+        let config =
+            crate::session_config::from_wire_fields(overrides.as_wire_fields("claude-code"));
         assert_eq!(config.agent_command.as_deref(), Some("/tmp/claude"));
         assert_eq!(config.claude_model.as_deref(), Some("sonnet"));
         assert_eq!(config.claude_permission_mode.as_deref(), Some("plan"));
@@ -1087,9 +1086,7 @@ mod tests {
         );
         assert_eq!(config.claude_effort.as_deref(), Some("high"));
         // The same overrides against a codex session never leak claude pins.
-        let cross = crate::session_config::from_wire_fields(
-            overrides.as_wire_fields("codex"),
-        );
+        let cross = crate::session_config::from_wire_fields(overrides.as_wire_fields("codex"));
         assert!(cross.claude_model.is_none());
         assert!(cross.claude_permission_mode.is_none());
         assert!(cross.claude_allowed_tools.is_none());

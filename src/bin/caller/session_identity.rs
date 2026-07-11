@@ -268,7 +268,9 @@ mod tests {
         let sole = scan_session_log(&identity_line("other", "codex", "id-a"), "sess-1", None);
         assert!(sole.latest_matching.is_none());
         assert_eq!(
-            sole.matching_or_unique().expect("unique").backend_session_id,
+            sole.matching_or_unique()
+                .expect("unique")
+                .backend_session_id,
             "id-a"
         );
 
@@ -286,7 +288,11 @@ mod tests {
     fn wrapper_matching_covers_prefix_and_canonical_forms() {
         assert!(wrapper_matches(Some("sess-1"), "sess-1", None));
         assert!(wrapper_matches(Some("sess-1-full-name"), "sess-1", None));
-        assert!(wrapper_matches(Some("canonical"), "sess-1", Some("canonical")));
+        assert!(wrapper_matches(
+            Some("canonical"),
+            "sess-1",
+            Some("canonical")
+        ));
         assert!(wrapper_matches(
             Some("anything"),
             "sess-1",

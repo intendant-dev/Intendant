@@ -371,9 +371,11 @@ impl IntendantServer {
                 continue;
             };
             match msg {
-                ControlMsg::AnswerQuestion { id: answer_id, answers, .. }
-                    if answer_id == id =>
-                {
+                ControlMsg::AnswerQuestion {
+                    id: answer_id,
+                    answers,
+                    ..
+                } if answer_id == id => {
                     guard.resolve("answer");
                     return Ok(ask_result(
                         "answered",
@@ -657,7 +659,10 @@ mod tests {
         let result = ask.await.expect("join").expect("ask_user result");
         assert_eq!(result["status"], "answered", "{result}");
         assert_eq!(result["answer"], "blue, or cerulean if available");
-        assert_eq!(result["answers"]["Which color?"], "blue, or cerulean if available");
+        assert_eq!(
+            result["answers"]["Which color?"],
+            "blue, or cerulean if available"
+        );
         assert_eq!(result["session_id"], "sess-ask");
         assert!(!ask_user_question_pending(id));
 
@@ -970,9 +975,7 @@ mod tests {
         });
         let id = loop {
             match next_event(&mut rx, "UserQuestionRequired").await {
-                AppEvent::UserQuestionRequired {
-                    session_id, id, ..
-                } => {
+                AppEvent::UserQuestionRequired { session_id, id, .. } => {
                     assert_eq!(session_id.as_deref(), Some("url-sess"));
                     break id;
                 }

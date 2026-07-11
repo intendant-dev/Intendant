@@ -3,8 +3,8 @@
 //! queued steers into follow-up messages.
 
 use crate::error::CallerError;
-use crate::{event_targets_session_or_alias, slog, DrainConfig};
 use crate::event::{self, AppEvent, EventBus};
+use crate::{event_targets_session_or_alias, slog, DrainConfig};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +75,10 @@ pub(crate) fn steer_id_has_been_handled(
     !id.trim().is_empty() && handled_steer_ids.contains(id)
 }
 
-pub(crate) fn mark_steer_id_handled(handled_steer_ids: &mut std::collections::HashSet<String>, id: &str) {
+pub(crate) fn mark_steer_id_handled(
+    handled_steer_ids: &mut std::collections::HashSet<String>,
+    id: &str,
+) {
     if !id.trim().is_empty() {
         handled_steer_ids.insert(id.to_string());
     }

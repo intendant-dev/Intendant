@@ -905,16 +905,11 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessOrgRevocations => {
-                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors)
-                    .await;
+                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors).await;
             }
             RouteHandlerId::AccessOrgApplyRenew => {
                 return handle_access_org_apply_renew(
-                    stream,
-                    route_body,
-                    req_path,
-                    cert_dir,
-                    route.cors,
+                    stream, route_body, req_path, cert_dir, route.cors,
                 )
                 .await;
             }
@@ -1541,8 +1536,7 @@ pub(crate) fn api_response_http_bytes(
             meta: _,
         } => {
             let BytesPayload::InMemory(payload) = bytes;
-            let mut http =
-                HttpResponse::with_content(status_reason(status), content_type, payload);
+            let mut http = HttpResponse::with_content(status_reason(status), content_type, payload);
             for (name, value) in headers {
                 http = http.header(name, value);
             }
@@ -1552,11 +1546,13 @@ pub(crate) fn api_response_http_bytes(
         // that lane before delegating here. Reaching this arm is a
         // wiring bug; fail closed with the canonical 500.
         ApiResponse::Stream { .. } => {
-            debug_assert!(false, "ApiResponse::Stream reached the buffered HTTP renderer");
+            debug_assert!(
+                false,
+                "ApiResponse::Stream reached the buffered HTTP renderer"
+            );
             HttpResponse::json(
                 status_reason(500),
-                serde_json::json!({ "error": "stream response on the buffered lane" })
-                    .to_string(),
+                serde_json::json!({ "error": "stream response on the buffered lane" }).to_string(),
             )
         }
     };
@@ -1613,7 +1609,8 @@ pub(crate) async fn write_api_response(
             headers,
             stream: line_stream,
         } => {
-            let head = stream_response_http_head(status, &content_type, headers, cors, fleet_origin);
+            let head =
+                stream_response_http_head(status, &content_type, headers, cors, fleet_origin);
             let LineStream {
                 lines: mut line_rx,
                 source,
@@ -1757,6 +1754,9 @@ mod tests {
             .0
             .cors;
         let head = stream_response_http_head(status, &content_type, headers, row_cors, None);
-        assert_eq!(String::from_utf8(head).unwrap(), SESSIONS_STREAM_HEAD_GOLDEN);
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            SESSIONS_STREAM_HEAD_GOLDEN
+        );
     }
 }
