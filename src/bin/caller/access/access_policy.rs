@@ -369,8 +369,8 @@ pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
 /// tunnel's WebRTC signaling relay is a transport door, not a single
 /// operation: it opens for an identity that can use at least one of these,
 /// and every method/frame inside is then authorized individually against
-/// the same identity (`dashboard_control_method_operation` /
-/// `dashboard_control_frame_operation` and their `/ws` twins). Presence-
+/// the same identity (`authorize_dashboard_control_method` and the
+/// [`FRAME_LANES`] per-frame gates on both transports). Presence-
 /// and stats-only profiles have nothing reachable inside, so the door
 /// stays shut for them.
 pub const DASHBOARD_CONTROL_TUNNEL_OPERATIONS: &[PeerOperation] = &[
@@ -386,6 +386,395 @@ pub fn profile_allows_dashboard_control_tunnel(profile: &str) -> bool {
     DASHBOARD_CONTROL_TUNNEL_OPERATIONS
         .iter()
         .any(|op| profile_allows_operation(profile, *op))
+}
+
+/// A realtime transport that carries typed frames: the direct `/ws`
+/// WebSocket session or the dashboard-control datachannel tunnel.
+///
+/// The request/response API surface is declared once in
+/// `gateway_routes::ROUTES` (+ the tunnel residue table); realtime frames
+/// stay bespoke per lane — connection-scoped state machines on
+/// latency-sensitive paths (transport design §2.6) — but their IAM mapping
+/// is declared once, in [`FRAME_LANES`], and both lanes' per-frame gates
+/// ([`crate::web_gateway::ws_frame_operation`] and
+/// `dashboard_control::dashboard_control_frame_operation`) are lookups into
+/// it: parity by construction, where hand-kept "Parity:" comments used to
+/// carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLane {
+    /// The direct `/ws` WebSocket session (`web_gateway/ws_session.rs`).
+    Ws,
+    /// The dashboard-control datachannel tunnel (`dashboard_control/`).
+    Tunnel,
+}
+
+/// One realtime frame kind: the floor operation it exercises and the lanes
+/// that carry it.
+pub struct FrameLaneSpec {
+    /// Wire frame type — the frame's `t` tag.
+    pub frame: &'static str,
+    /// Floor operation the frame exercises on the lanes that carry it.
+    /// `None` = the frame carries no blanket authority of its own; `note`
+    /// says why. Floor means floor: handlers still enforce whatever
+    /// stateful checks apply (session visibility, connection binding,
+    /// shell.spawn on fresh terminal_open, …).
+    pub op: Option<PeerOperation>,
+    /// Carried on the direct `/ws` session.
+    pub ws: bool,
+    /// Carried on the dashboard-control tunnel.
+    pub tunnel: bool,
+    /// Why the row is shaped this way — op rationale, `None` reason, or
+    /// single-lane reason. Mandatory; an invariant test pins it non-empty.
+    pub note: &'static str,
+}
+
+/// The single declaration of realtime-frame IAM: every frame kind either
+/// lane's per-frame gate maps, the operation it requires, and which lanes
+/// carry it. A kind absent here (or carried only on the other lane)
+/// answers `None` — no blanket authority, matching the pre-table
+/// behavior: per-frame gating fails open by design for dispatch machinery
+/// and replies, whose authority (if any) is enforced elsewhere (the
+/// method table for `request`, per-delivered-method auth for uploads,
+/// stateful checks in handlers).
+///
+/// Changing a row is an IAM change. The frozen golden test
+/// (`realtime_frame_operation_golden_mapping_is_frozen`) pins the full
+/// mapping on both lanes — update it deliberately, with the grant model
+/// in view, never to satisfy a refactor.
+pub const FRAME_LANES: &[FrameLaneSpec] = &[
+    // ---- carried on both lanes, same floor operation ----
+    FrameLaneSpec {
+        frame: "terminal_open",
+        op: Some(PeerOperation::TerminalView),
+        ws: true,
+        tunnel: true,
+        note: "attach/replay is the floor; opening a session that does not exist yet \
+               additionally requires shell.spawn, enforced statefully in the handlers",
+    },
+    FrameLaneSpec {
+        frame: "terminal_input",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "keystrokes into a visible shell session (session visibility enforced in handlers)",
+    },
+    FrameLaneSpec {
+        frame: "terminal_resize",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "resize mutates the PTY like input does",
+    },
+    FrameLaneSpec {
+        frame: "terminal_close",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "closing a session mutates it",
+    },
+    FrameLaneSpec {
+        frame: "terminal_share",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "sharing re-scopes a session's audience — a mutation, not a view",
+    },
+    FrameLaneSpec {
+        frame: "display_input",
+        op: Some(PeerOperation::DisplayInput),
+        ws: true,
+        tunnel: true,
+        note: "pointer/keyboard injection into a display",
+    },
+    // ---- /ws only: display signaling + diagnostics marker ----
+    FrameLaneSpec {
+        frame: "set_diagnostics_visual_marker",
+        op: Some(PeerOperation::DisplayInput),
+        ws: true,
+        tunnel: false,
+        note: "twin of api_diagnostics_visual_freshness: the marker is stamped pre-encoder \
+               and lands in every viewer's stream — display mutation, not viewing",
+    },
+    FrameLaneSpec {
+        frame: "display_offer",
+        op: Some(PeerOperation::DisplayView),
+        ws: true,
+        tunnel: false,
+        note: "display WebRTC signaling; tunnel twins are the api_display_bootstrap / \
+               api_display_webrtc_signal methods, not frames",
+    },
+    FrameLaneSpec {
+        frame: "display_ice",
+        op: Some(PeerOperation::DisplayView),
+        ws: true,
+        tunnel: false,
+        note: "ICE leg of display_offer",
+    },
+    // ---- /ws only: legacy web-TUI lane (dead, preserved verbatim) ----
+    // The embedded web TUI's frame handlers were removed when the TUI was
+    // gutted (84afe9d8); nothing consumes these kinds on /ws anymore, and
+    // no tunnel twin ever existed. The gate rows survive verbatim because
+    // dropping a frame kind changes observable behavior for scoped
+    // clients (denial frame vs silence) — an owner decision, not
+    // refactor fallout.
+    FrameLaneSpec {
+        frame: "key",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "legacy web-TUI keystroke into the daemon's own runtime (handlers gone; see above)",
+    },
+    FrameLaneSpec {
+        frame: "resize",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "legacy web-TUI terminal resize (handlers gone; see above)",
+    },
+    FrameLaneSpec {
+        frame: "term_subscribe",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "legacy web-TUI output subscription (handlers gone; see above)",
+    },
+    FrameLaneSpec {
+        frame: "term_unsubscribe",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "legacy web-TUI output unsubscription (handlers gone; see above)",
+    },
+    // ---- /ws only: live voice/media presence machinery ----
+    // The tunnel carries this family wrapped in a single presence_frame
+    // envelope (its own row below); /ws speaks the kinds raw. Method-lane
+    // twins: api_voice_session, api_presence_video_frame,
+    // api_media_annotation_*, api_media_clip_*.
+    FrameLaneSpec {
+        frame: "presence_connect",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "joins the live voice/presence session driving the daemon's runtime",
+    },
+    FrameLaneSpec {
+        frame: "presence_disconnect",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "leaves the live presence session",
+    },
+    FrameLaneSpec {
+        frame: "make_active",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "claims the active presence slot (voice handover)",
+    },
+    FrameLaneSpec {
+        frame: "user_audio",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "microphone PCM into transcription + the live session",
+    },
+    FrameLaneSpec {
+        frame: "video_frame",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "camera/screen frame into the live session (twin: api_presence_video_frame)",
+    },
+    FrameLaneSpec {
+        frame: "voice_log",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "browser-side voice transcript/log entry into the session record",
+    },
+    FrameLaneSpec {
+        frame: "voice_diagnostic",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "voice-pipeline diagnostics into the session record",
+    },
+    FrameLaneSpec {
+        frame: "presence_checkpoint",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "checkpoints presence conversation state",
+    },
+    FrameLaneSpec {
+        frame: "live_usage_update",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "browser-metered live-API usage folded into daemon accounting",
+    },
+    FrameLaneSpec {
+        frame: "annotation_attach",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "attaches an annotation image to the worker turn (twin: api_media_annotation_attach)",
+    },
+    FrameLaneSpec {
+        frame: "annotation_submit",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "submits the annotation composition (twin: api_media_annotation_submit)",
+    },
+    FrameLaneSpec {
+        frame: "clip_start",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "starts a media clip capture (twin: api_media_clip_start)",
+    },
+    FrameLaneSpec {
+        frame: "clip_frame",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "appends a clip frame (twin: api_media_clip_frame)",
+    },
+    FrameLaneSpec {
+        frame: "clip_end",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "finalizes the clip (twin: api_media_clip_end)",
+    },
+    // ---- /ws only: presence tool dispatch ----
+    FrameLaneSpec {
+        frame: "tool_request",
+        op: Some(PeerOperation::Message),
+        ws: true,
+        tunnel: false,
+        note: "presence tool dispatch is messaging into the worker (parity: api_mcp_tool_call)",
+    },
+    FrameLaneSpec {
+        frame: "async_query",
+        op: Some(PeerOperation::Message),
+        ws: true,
+        tunnel: false,
+        note: "async presence query — same messaging lane as tool_request",
+    },
+    // ---- /ws only: tunnel-establishment signaling, deliberately open ----
+    FrameLaneSpec {
+        frame: "dashboard_control_offer",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "establishing the tunnel carries no authority: the tunnel enforces this very \
+               grant per-frame itself, and scoped clients must be able to reach their \
+               allowed surface through it",
+    },
+    FrameLaneSpec {
+        frame: "dashboard_control_ice",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "ICE leg of dashboard_control_offer — same open-by-design rationale",
+    },
+    FrameLaneSpec {
+        frame: "dashboard_control_close",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "tearing the tunnel down needs no more authority than opening it",
+    },
+    // ---- tunnel only ----
+    FrameLaneSpec {
+        frame: "presence_frame",
+        op: Some(PeerOperation::Message),
+        ws: false,
+        tunnel: true,
+        note: "the tunnel's envelope for the presence family /ws speaks raw (rows above); \
+               gated as messaging into the presence layer",
+    },
+    FrameLaneSpec {
+        frame: "upload_start",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "upload frames carry no blanket authority: upload_start is authorized by the \
+               operation of the method it delivers (a media annotation is runtime control, \
+               a transfer chunk is a filesystem write, …) inside control_upload_start_frame",
+    },
+    FrameLaneSpec {
+        frame: "upload_chunk",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "acts only on an entry an authorized upload_start created on this connection",
+    },
+    FrameLaneSpec {
+        frame: "upload_end",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "same connection-bound rationale as upload_chunk; delivery re-authorizes as \
+               the method",
+    },
+    FrameLaneSpec {
+        frame: "egress_response",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "client-egress relay answers: only a session that could have registered as a \
+               relay (credentials.manage) may answer, and the handler additionally binds \
+               each frame to the request's own registering session",
+    },
+    FrameLaneSpec {
+        frame: "egress_chunk",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "streamed continuation of egress_response — same gate",
+    },
+    FrameLaneSpec {
+        frame: "egress_end",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "stream terminator — same gate",
+    },
+    FrameLaneSpec {
+        frame: "egress_error",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "error terminator — same gate",
+    },
+    // ---- both lanes: liveness ----
+    FrameLaneSpec {
+        frame: "ping",
+        op: None,
+        ws: true,
+        tunnel: true,
+        note: "liveness probe; no authority",
+    },
+];
+
+/// Map a typed realtime frame to the `PeerOperation` it exercises on the
+/// given lane — the single lookup behind both lanes' per-frame gates.
+/// `None` means the frame carries no blanket authority there (no row, an
+/// op-less row, or a row the lane does not carry).
+pub fn frame_operation(lane: FrameLane, frame_type: &str) -> Option<PeerOperation> {
+    FRAME_LANES
+        .iter()
+        .find(|spec| {
+            spec.frame == frame_type
+                && match lane {
+                    FrameLane::Ws => spec.ws,
+                    FrameLane::Tunnel => spec.tunnel,
+                }
+        })
+        .and_then(|spec| spec.op)
 }
 
 pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
@@ -873,10 +1262,40 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 mod tests {
     use super::*;
 
+    /// Structural invariants of [`FRAME_LANES`]: one row per frame kind
+    /// (the lookup takes the first match, so a duplicate would shadow),
+    /// every row carried on at least one lane, and every row annotated —
+    /// the notes are the documentation the old per-arm "Parity:" comments
+    /// used to carry.
+    #[test]
+    fn frame_lanes_rows_are_unique_lane_marked_and_annotated() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in FRAME_LANES {
+            assert!(
+                seen.insert(spec.frame),
+                "duplicate FRAME_LANES row for {:?}",
+                spec.frame
+            );
+            assert!(
+                spec.ws || spec.tunnel,
+                "FRAME_LANES row {:?} is carried on no lane",
+                spec.frame
+            );
+            assert!(
+                !spec.note.trim().is_empty(),
+                "FRAME_LANES row {:?} is missing its note",
+                spec.frame
+            );
+        }
+    }
+
     /// The frozen realtime-frame IAM contract: every frame kind either
-    /// per-frame gate explicitly maps today, on both transports, pinned
-    /// byte-for-byte BEFORE the `FRAME_LANES` unification so the table
-    /// rewrite is provably a pure re-plumbing. Columns: frame kind, the
+    /// per-frame gate explicitly maps, on both transports. The fixture
+    /// was committed byte-for-byte BEFORE the `FRAME_LANES` unification
+    /// (its history proves the table rewrite re-plumbed without
+    /// re-gating) and stays frozen after it: with both gates reading one
+    /// table, this pin is what makes silent re-gating impossible on
+    /// either lane. Columns: frame kind, the
     /// operation `web_gateway::ws_frame_operation` answers (the direct
     /// `/ws` session), the operation
     /// `dashboard_control::dashboard_control_frame_operation` answers

@@ -202,59 +202,18 @@ pub(crate) fn peer_identity_allows_ws_control(
 }
 
 /// Map a typed `/ws` frame to the `PeerOperation` it exercises — the
-/// direct-WebSocket mirror of `dashboard_control_frame_operation` and
-/// the `CONTROL_ONLY_METHODS` table (dashboard_control/mod.rs), so the same
-/// IAM grant answers the same way whichever transport a client speaks.
-/// `None` means the frame carries no authority of its own: replies, pings,
-/// and the `dashboard_control_*` signaling frames (the tunnel they establish
-/// enforces this very grant per-frame itself, and scoped clients must be
-/// able to reach their allowed surface through it).
+/// `/ws` lookup into the shared [`access_policy::FRAME_LANES`] declaration
+/// (the tunnel's `dashboard_control_frame_operation` reads the same table),
+/// so the same IAM grant answers the same way whichever transport a client
+/// speaks — parity by construction. `None` means the frame carries no
+/// blanket authority of its own here; each table row's `note` says why.
 pub(crate) fn ws_frame_operation(
     frame_type: &str,
 ) -> Option<crate::peer::access_policy::PeerOperation> {
-    use crate::peer::access_policy::PeerOperation;
-    match frame_type {
-        // Same frame names as the dashboard-control tunnel table. Floor
-        // operations: terminal_open may additionally require shell.spawn
-        // (when the session doesn't exist yet) and every terminal frame is
-        // scoped to sessions the actor can see — both enforced statefully
-        // in the frame handlers.
-        "terminal_open" => Some(PeerOperation::TerminalView),
-        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
-            Some(PeerOperation::TerminalWrite)
-        }
-        "display_input" => Some(PeerOperation::DisplayInput),
-        // Parity: api_diagnostics_visual_freshness → DisplayInput. The
-        // marker is stamped pre-encoder and lands in every viewer's stream,
-        // so it is display mutation, not viewing.
-        "set_diagnostics_visual_marker" => Some(PeerOperation::DisplayInput),
-        // Parity: api_display_bootstrap / api_display_webrtc_signal.
-        "display_offer" | "display_ice" => Some(PeerOperation::DisplayView),
-        // The embedded web TUI drives the daemon's own runtime — the direct
-        // twins of the tunnel's tui_* frames.
-        "key" | "resize" | "term_subscribe" | "term_unsubscribe" => {
-            Some(PeerOperation::RuntimeControl)
-        }
-        // Live voice/media session machinery. Parity: api_voice_session,
-        // api_presence_video_frame, api_media_annotation_*, api_media_clip_*.
-        "presence_connect"
-        | "presence_disconnect"
-        | "make_active"
-        | "user_audio"
-        | "video_frame"
-        | "voice_log"
-        | "voice_diagnostic"
-        | "presence_checkpoint"
-        | "live_usage_update"
-        | "annotation_attach"
-        | "annotation_submit"
-        | "clip_start"
-        | "clip_frame"
-        | "clip_end" => Some(PeerOperation::RuntimeControl),
-        // Presence tool dispatch. Parity: api_mcp_tool_call → Message.
-        "tool_request" | "async_query" => Some(PeerOperation::Message),
-        _ => None,
-    }
+    crate::peer::access_policy::frame_operation(
+        crate::peer::access_policy::FrameLane::Ws,
+        frame_type,
+    )
 }
 
 /// Per-frame IAM gate for the direct `/ws` path. Returns `true` when the
@@ -737,64 +696,10 @@ mod tests {
     // /ws bearer enforcement (slice 2d)
     // -----------------------------------------------------------------
 
-    #[test]
-    fn ws_frame_operation_mirrors_dashboard_control_tables() {
-        use crate::peer::access_policy::PeerOperation;
-        assert_eq!(
-            ws_frame_operation("terminal_open"),
-            Some(PeerOperation::TerminalView)
-        );
-        assert_eq!(
-            ws_frame_operation("terminal_input"),
-            Some(PeerOperation::TerminalWrite)
-        );
-        assert_eq!(
-            ws_frame_operation("terminal_share"),
-            Some(PeerOperation::TerminalWrite)
-        );
-        assert_eq!(
-            ws_frame_operation("display_input"),
-            Some(PeerOperation::DisplayInput)
-        );
-        assert_eq!(
-            ws_frame_operation("set_diagnostics_visual_marker"),
-            Some(PeerOperation::DisplayInput)
-        );
-        assert_eq!(
-            ws_frame_operation("display_offer"),
-            Some(PeerOperation::DisplayView)
-        );
-        assert_eq!(
-            ws_frame_operation("key"),
-            Some(PeerOperation::RuntimeControl)
-        );
-        assert_eq!(
-            ws_frame_operation("term_subscribe"),
-            Some(PeerOperation::RuntimeControl)
-        );
-        assert_eq!(
-            ws_frame_operation("presence_connect"),
-            Some(PeerOperation::RuntimeControl)
-        );
-        assert_eq!(
-            ws_frame_operation("user_audio"),
-            Some(PeerOperation::RuntimeControl)
-        );
-        assert_eq!(
-            ws_frame_operation("tool_request"),
-            Some(PeerOperation::Message)
-        );
-        assert_eq!(
-            ws_frame_operation("async_query"),
-            Some(PeerOperation::Message)
-        );
-        // Tunnel signaling stays open: the tunnel enforces the same grant
-        // per-frame itself, and scoped clients must be able to establish it.
-        assert_eq!(ws_frame_operation("dashboard_control_offer"), None);
-        assert_eq!(ws_frame_operation("dashboard_control_ice"), None);
-        assert_eq!(ws_frame_operation("dashboard_control_close"), None);
-        assert_eq!(ws_frame_operation("ping"), None);
-    }
+    // The old ws_frame_operation mirror test lived here; the mapping is
+    // now declared once in `access_policy::FRAME_LANES` and frozen — both
+    // lanes, every kind — by `realtime_frame_operation_golden_mapping_is_frozen`
+    // (access/access_policy.rs).
 
     #[test]
     fn verify_bearer_for_ws_passes_when_no_token_configured() {
