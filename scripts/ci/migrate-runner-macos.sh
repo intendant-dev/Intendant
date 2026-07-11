@@ -234,6 +234,13 @@ set_env_kv "$DEST/.env" ACTIONS_RUNNER_HOOK_JOB_COMPLETED "$LIB_DIR/hooks/job-co
 # `id -un` matches this — the reaper/wipe rules are only safe inside the
 # dedicated CI account.
 set_env_kv "$DEST/.env" INTENDANT_CI_HOOK_ACCOUNT "$CI_ACCOUNT"
+# sccache: every job process must agree with the account's supervised
+# server (setup-ci-account-macos.sh) — cargo's [env] port does not reach
+# every in-job sccache invocation (2026-07-10: the rustc version probe
+# missed it and wedged every job on this listener), so the port/dir ride
+# the job env explicitly.
+set_env_kv "$DEST/.env" SCCACHE_SERVER_PORT "4227"
+set_env_kv "$DEST/.env" SCCACHE_DIR "$CI_HOME/.cache/sccache"
 chown "$CI_ACCOUNT:$CI_GROUP" "$DEST/.env"
 echo "wired job hooks into .env"
 

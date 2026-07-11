@@ -233,6 +233,58 @@ else
     fi
 fi
 
+# ---- supervised sccache server (one per account, shared by listeners) ----
+# Never rely on in-job server spawning: the cargo [env] port above does
+# not reach every in-job sccache invocation (the rustc version probe
+# failed on the default port, 2026-07-10), and a client racing a dying
+# or job-reaped server reads a truncated response header ("failed to
+# fill whole buffer" — cargo exit 101 within seconds). One
+# launchd-supervised FOREGROUND server owns the account's port instead
+# (SCCACHE_NO_DAEMON: a forked server dies with its launchd process
+# group); job clients only ever connect. The per-listener .env mirrors
+# the port/dir into job env (migrate-runner-macos.sh).
+if [ -n "$sccache_bin" ]; then
+    SCCACHE_LABEL="com.intendant.ci.sccache"
+    SCCACHE_PLIST="/Library/LaunchDaemons/$SCCACHE_LABEL.plist"
+    cat > "$SCCACHE_PLIST.tmp" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SCCACHE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$sccache_bin</string>
+  </array>
+  <key>UserName</key><string>$CI_ACCOUNT</string>
+  <key>GroupName</key><string>$CI_GROUP</string>
+  <key>WorkingDirectory</key><string>$CI_HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$CI_HOME</string>
+    <key>SCCACHE_START_SERVER</key><string>1</string>
+    <key>SCCACHE_NO_DAEMON</key><string>1</string>
+    <key>SCCACHE_SERVER_PORT</key><string>4227</string>
+    <key>SCCACHE_DIR</key><string>$CI_HOME/.cache/sccache</string>
+    <key>SCCACHE_IDLE_TIMEOUT</key><string>0</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$CI_HOME/Library/Logs/sccache-server.log</string>
+  <key>StandardErrorPath</key><string>$CI_HOME/Library/Logs/sccache-server.log</string>
+</dict>
+</plist>
+PLIST_EOF
+    mv "$SCCACHE_PLIST.tmp" "$SCCACHE_PLIST"
+    chown root:wheel "$SCCACHE_PLIST"
+    chmod 0644 "$SCCACHE_PLIST"
+    # Idempotent re-run: bootout the old instance first (brief server
+    # blip; this script is a maintenance operation, not a hot path).
+    launchctl bootout "system/$SCCACHE_LABEL" 2>/dev/null || true
+    launchctl bootstrap system "$SCCACHE_PLIST"
+    echo "bootstrapped $SCCACHE_LABEL ($sccache_bin, port 4227, foreground under launchd)"
+fi
+
 echo "== wasm-pack"
 # Same convention as scripts/setup-macos.sh: cargo install pinned by the
 # repo's .wasm-pack-version (build.rs skips WASM rebuilds under any other
