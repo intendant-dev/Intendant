@@ -514,7 +514,7 @@ function publicBootstrapHtml() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames'] });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -581,12 +581,6 @@ function publicBootstrapHtml() {
       if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
         try {
           window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
-        } catch (_) {}
-        return;
-      }
-      if (msg.t === 'tui_term' || msg.t === 'tui_error') {
-        try {
-          window.dispatchEvent(new CustomEvent('intendant-dashboard-tui-frame', { detail: msg }));
         } catch (_) {}
         return;
       }
@@ -990,11 +984,6 @@ function publicBootstrapHtml() {
       this.sendFrame(frame);
       return true;
     },
-    tuiFrame(frame) {
-      if (!this.canUseRpc()) return false;
-      this.sendFrame(frame);
-      return true;
-    },
     stream(method, params = {}, options = {}, onEvent = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
@@ -1102,7 +1091,6 @@ function publicBootstrapHtml() {
         byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
         uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
         terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
-        tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
         presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
         presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
         presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
@@ -1940,65 +1928,6 @@ async function main() {
           window.removeEventListener('intendant-dashboard-terminal-frame', handler);
         }
       };
-      const tui = async () => {
-        const connectionId = `dashboard-tui-rendezvous-${Date.now()}`;
-        const frames = [];
-        const handler = event => frames.push(event.detail || {});
-        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
-          const started = Date.now();
-          const tick = () => {
-            const found = frames.find(predicate);
-            if (found) {
-              resolve(found);
-              return;
-            }
-            if (Date.now() - started > 60000) {
-              reject(new Error(`tui ${label} timed out`));
-              return;
-            }
-            setTimeout(tick, 25);
-          };
-          tick();
-        });
-        window.addEventListener('intendant-dashboard-tui-frame', handler);
-        try {
-          ctl.tuiFrame({
-            t: 'tui_subscribe',
-            connection_id: connectionId,
-            cols: 80,
-            rows: 24,
-          });
-          const frame = await waitFor(item => (
-            item.t === 'tui_term' &&
-            item.connection_id === connectionId &&
-            Boolean(item.base64 || item.d)
-          ), 'term frame');
-          ctl.tuiFrame({
-            t: 'tui_key',
-            connection_id: connectionId,
-            key: 'Tab',
-            ctrl: false,
-            alt: false,
-            shift: false,
-          });
-          ctl.tuiFrame({
-            t: 'tui_unsubscribe',
-            connection_id: connectionId,
-          });
-          ctl.tuiFrame({
-            t: 'tui_close',
-            connection_id: connectionId,
-          });
-          const data = String(frame.base64 || frame.d || '');
-          return {
-            subscribed: true,
-            connectionId,
-            frameBytes: atob(data).length,
-          };
-        } finally {
-          window.removeEventListener('intendant-dashboard-tui-frame', handler);
-        }
-      };
       const status = await ctl.request('status');
       const uploaded = await upload();
       return {
@@ -2061,7 +1990,6 @@ async function main() {
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         peerPairing: await peerPairing(),
         terminal: await terminal(),
-        tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -2633,12 +2561,6 @@ async function main() {
     ), { force: true });
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
-    if (result.status.tui_frames_available) {
-      assert.strictEqual(result.tui?.subscribed, true);
-      assert(Number(result.tui?.frameBytes || 0) > 0, 'TUI frame did not contain bytes');
-    } else {
-      assert.strictEqual(result.tui?.skipped, true);
-    }
     assert.strictEqual(
       result.status.api_session_current_history_available,
       true,
@@ -2941,7 +2863,6 @@ async function main() {
         byteStreamsAvailable: result.status.byte_streams_available,
         uploadFramesAvailable: result.status.upload_frames_available,
         terminalFramesAvailable: result.status.terminal_frames_available,
-        tuiFramesAvailable: result.status.tui_frames_available,
         apiSessionCurrentUploadsAvailable: result.status.api_session_current_uploads_available,
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
@@ -2979,7 +2900,6 @@ async function main() {
         recordingFallbackSkipped: Boolean(result.recordingFallbackPlayback.skipped),
         diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
         terminalOutputBytes: result.terminal.outputBytes,
-        tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,
@@ -3119,7 +3039,6 @@ async function main() {
       const mediaConnectNoLegacy = await ctl._debugProbeMediaConnectNoLegacy();
       const diagnosticsConnectNoHttp = await ctl._debugProbeDiagnosticsConnectNoHttp();
       const displaySignalConnectNoLegacy = await ctl._debugProbeDisplaySignalConnectNoLegacy();
-      const tuiConnectNoLegacy = ctl._debugProbeTuiConnectNoLegacy();
       const presenceMediaConnectNoLegacy = await ctl._debugProbePresenceMediaConnectNoLegacy();
       const presenceServerSenderConnectNoLegacy = await ctl._debugProbePresenceServerSenderConnectNoLegacy();
       const tunneledPresenceServerCallback = await ctl._debugProbeTunneledPresenceServerCallback();
@@ -3136,7 +3055,6 @@ async function main() {
         mediaConnectNoLegacy,
         diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy,
-        tuiConnectNoLegacy,
         presenceMediaConnectNoLegacy,
         presenceServerSenderConnectNoLegacy,
         tunneledPresenceServerCallback,
@@ -3278,31 +3196,6 @@ async function main() {
       `real SPA Connect display signaling attempted HTTP fallback: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
     );
     assert.strictEqual(
-      appResult.tuiConnectNoLegacy.skipped,
-      false,
-      `real SPA could not exercise Connect TUI no-legacy path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
-    );
-    assert.strictEqual(
-      appResult.tuiConnectNoLegacy.keyReplayCount,
-      0,
-      `real SPA Connect TUI key replayed through legacy app path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
-    );
-    assert.strictEqual(
-      appResult.tuiConnectNoLegacy.resizeReplayCount,
-      0,
-      `real SPA Connect TUI resize replayed through legacy app path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
-    );
-    assert.strictEqual(
-      appResult.tuiConnectNoLegacy.wsReplayCount,
-      0,
-      `real SPA Connect TUI subscription replayed over /ws: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
-    );
-    assert.strictEqual(
-      appResult.tuiConnectNoLegacy.subscriptionSent,
-      false,
-      `real SPA Connect TUI subscription claimed legacy transport success: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
-    );
-    assert.strictEqual(
       appResult.presenceMediaConnectNoLegacy.skipped,
       false,
       `real SPA could not exercise Connect presence/media no-legacy path: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
@@ -3400,7 +3293,6 @@ async function main() {
         mediaConnectNoLegacy: appResult.mediaConnectNoLegacy,
         diagnosticsConnectNoHttp: appResult.diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy: appResult.displaySignalConnectNoLegacy,
-        tuiConnectNoLegacy: appResult.tuiConnectNoLegacy,
         presenceMediaConnectNoLegacy: appResult.presenceMediaConnectNoLegacy,
         presenceServerSenderConnectNoLegacy: appResult.presenceServerSenderConnectNoLegacy,
         tunneledPresenceServerCallback: appResult.tunneledPresenceServerCallback,
