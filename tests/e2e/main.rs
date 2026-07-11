@@ -1189,6 +1189,223 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     .await;
 }
 
+/// Task #6 end to end, against the real binaries: a resumable upload
+/// rides direct HTTP as job create → capped raw chunks → commit,
+/// survives a "client restart" (re-list by handle, resume at the
+/// received extent, wrong-offset refusal), verifies the declared
+/// sha256 at commit, and the finished file rides back out over the
+/// download row — full read with `X-Content-Sha256`, then a `Range`
+/// request answering 206 with the `X-Transfer-*` resume echoes. Both
+/// delete shapes (native DELETE + the WKWebView POST fallback) tear the
+/// jobs down.
+#[tokio::test]
+async fn transfer_jobs_round_trip_over_direct_http() {
+    use sha2::Digest as _;
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Two uneven chunks force a mid-file resume boundary.
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let (head, tail_bytes) = payload.split_at(180_000);
+    let sha256 = {
+        let digest = sha2::Sha256::digest(&payload);
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let dest = daemon.rig.project.path().join("received").join("big.bin");
+    std::fs::create_dir_all(dest.parent().expect("dest parent")).expect("mk dest dir");
+
+    // Create the upload job (declared size + checksum).
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/transfers"))
+        .json(&serde_json::json!({
+            "kind": "upload",
+            "destination": dest.to_string_lossy(),
+            "name": "big.bin",
+            "total_size": payload.len(),
+            "sha256": sha256,
+        }))
+        .send()
+        .await
+        .expect("create upload job")
+        .json()
+        .await
+        .expect("create body");
+    assert_eq!(created["ok"], true, "{created}");
+    let job_id = created["job"]["id"].as_str().expect("job id").to_string();
+    let resume_token = created["job"]["resume_token"]
+        .as_str()
+        .expect("resume token")
+        .to_string();
+    assert_eq!(created["job"]["completed_bytes"], 0, "{created}");
+
+    // First chunk.
+    let first = client
+        .post(format!("{base}/api/transfers/{job_id}/chunk?offset=0"))
+        .body(head.to_vec())
+        .send()
+        .await
+        .expect("first chunk");
+    assert_eq!(first.status().as_u16(), 200);
+    let first: serde_json::Value = first.json().await.expect("first chunk body");
+    assert_eq!(first["job"]["status"], "running", "{first}");
+    assert_eq!(first["job"]["completed_bytes"], head.len(), "{first}");
+
+    // "Client restart": re-list by handle and read the received extent.
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/transfers?id={job_id}"))
+        .send()
+        .await
+        .expect("list jobs")
+        .json()
+        .await
+        .expect("list body");
+    let jobs = listed["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "{listed}");
+    let boundary = jobs[0]["completed_bytes"].as_u64().expect("extent") as usize;
+    assert_eq!(boundary, head.len(), "{listed}");
+
+    // A wrong-offset chunk that overlaps the persisted extent without
+    // being covered by it is refused — the resume contract (a fully
+    // covered duplicate would be answered idempotently instead).
+    let conflict = client
+        .post(format!(
+            "{base}/api/transfers/{job_id}/chunk?offset={}",
+            boundary - 1
+        ))
+        .body(tail_bytes.to_vec())
+        .send()
+        .await
+        .expect("conflicting chunk");
+    assert_eq!(conflict.status().as_u16(), 409);
+
+    // Resume at the boundary, addressing the job by resume token.
+    let second = client
+        .post(format!(
+            "{base}/api/transfers/{resume_token}/chunk?offset={boundary}"
+        ))
+        .body(tail_bytes.to_vec())
+        .send()
+        .await
+        .expect("second chunk");
+    assert_eq!(second.status().as_u16(), 200);
+    let second: serde_json::Value = second.json().await.expect("second chunk body");
+    assert_eq!(second["job"]["status"], "ready", "{second}");
+
+    // Commit verifies size + sha256 and renames into place.
+    let committed = client
+        .post(format!("{base}/api/transfers/{job_id}/commit"))
+        .send()
+        .await
+        .expect("commit");
+    assert_eq!(committed.status().as_u16(), 200);
+    let committed: serde_json::Value = committed.json().await.expect("commit body");
+    assert_eq!(committed["job"]["status"], "completed", "{committed}");
+    assert_eq!(std::fs::read(&dest).expect("committed file"), payload);
+
+    // Round-trip back out: a download job over the same lane.
+    let download: serde_json::Value = client
+        .post(format!("{base}/api/transfers"))
+        .json(&serde_json::json!({
+            "kind": "download",
+            "path": dest.to_string_lossy(),
+        }))
+        .send()
+        .await
+        .expect("create download job")
+        .json()
+        .await
+        .expect("download job body");
+    assert_eq!(download["ok"], true, "{download}");
+    let download_id = download["job"]["id"].as_str().expect("dl id").to_string();
+
+    // Full read: 200 with the content hash + resume echoes.
+    let full = client
+        .get(format!("{base}/api/transfers/{download_id}/download"))
+        .send()
+        .await
+        .expect("full download");
+    assert_eq!(full.status().as_u16(), 200);
+    assert_eq!(
+        full.headers()
+            .get("X-Content-Sha256")
+            .and_then(|value| value.to_str().ok()),
+        Some(sha256.as_str())
+    );
+    assert_eq!(
+        full.headers()
+            .get("X-Transfer-Total-Size")
+            .and_then(|value| value.to_str().ok()),
+        Some(payload.len().to_string().as_str())
+    );
+    assert_eq!(full.bytes().await.expect("full body").as_ref(), payload);
+
+    // Ranged read: standard 206/Content-Range plus the end-exclusive
+    // X-Transfer resume echoes.
+    let ranged = client
+        .get(format!("{base}/api/transfers/{download_id}/download"))
+        .header("Range", "bytes=100-199")
+        .send()
+        .await
+        .expect("ranged download");
+    assert_eq!(ranged.status().as_u16(), 206);
+    assert_eq!(
+        ranged
+            .headers()
+            .get("Content-Range")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes 100-199/{}", payload.len()).as_str())
+    );
+    assert_eq!(
+        ranged
+            .headers()
+            .get("X-Transfer-Range-End")
+            .and_then(|value| value.to_str().ok()),
+        Some("200")
+    );
+    assert_eq!(
+        ranged.bytes().await.expect("ranged body").as_ref(),
+        &payload[100..200]
+    );
+
+    // Teardown over both delete shapes.
+    let deleted: serde_json::Value = client
+        .delete(format!("{base}/api/transfers/{job_id}"))
+        .send()
+        .await
+        .expect("native delete")
+        .json()
+        .await
+        .expect("delete body");
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    let fallback: serde_json::Value = client
+        .post(format!("{base}/api/transfers/{download_id}/delete"))
+        .send()
+        .await
+        .expect("fallback delete")
+        .json()
+        .await
+        .expect("fallback delete body");
+    assert_eq!(fallback["deleted"], true, "{fallback}");
+}
+
 /// The display-request rail end to end: a caller rings the user-display
 /// doorbell (`ctl display request` → the `request_user_display` tool), a
 /// dashboard surface (here: a raw `/ws` client) receives the dedicated

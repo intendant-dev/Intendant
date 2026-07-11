@@ -354,10 +354,10 @@ GitHub Actions on PR to `main` and — for the required checks — on every
 `merge_group`. The required-check workflows run **unfiltered on `pull_request`
 and `merge_group`**: GitHub only lets a PR enter the merge queue after its own
 required checks pass, so a paths-skipped required check blocks queue entry
-(and on the group side wedges the entry at "Expected"). The heavy workflows
-(`windows.yml`, `smokes.yml`) have **no push trigger at all** — a push-to-main
-run would revalidate the identical tree the merge group just validated, and
-the external per-listener build caches stay warm from the constant PR + group
+(and on the group side wedges the entry at "Expected"). The heavy workflow
+(`windows.yml`) has **no push trigger at all** — a push-to-main run would
+revalidate the identical tree the merge group just validated, and the
+external per-listener build caches stay warm from the constant PR + group
 flow. The remaining push triggers (repo-integrity, app.html, audit, docs
 deploy) are cheap and paths-filtered.
 
@@ -379,9 +379,9 @@ kit (`_intendant-ci`: hidden role account, LaunchDaemon listeners, job hooks)
 is cut over — and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
-- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile with debuginfo off, sharing the runner's warm tree with the test job; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). PR + merge group only — no push trigger. **Required check.**
+- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Linux leg is the **whole Linux gate**: after unit tests + e2e it runs the keyless smokes (session-vitals, native-goal, peer-sessions — real binaries under the mock provider) and the dashboard-boot probe (SPA booted in headless Chromium over CDP; promoted from advisory on its 40/40 soak) as tail steps reusing the same checkout and warm tree — these were smokes.yml's jobs until 2026-07-11. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Jobs are bounded by `timeout-minutes: 60` (no per-test timeout exists under plain `cargo test`, so a single hung test otherwise holds a queue slot indefinitely). Headless-safe: needs no display or API keys. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
+- **`wasm-drift.yml`** — the committed `static/wasm-*` artifacts ↔ their crates: rebuilds both WASM crates with the pinned wasm-pack + pinned toolchain and fails on any byte difference (build.rs's mtime staleness check is blind in a fresh checkout, so drift otherwise ships silently). In-job relevance skip: only wasm inputs (the two crates, `presence-core`, the artifacts, `Cargo.lock`, the pins) trigger the rebuild — everything else green-skips. **Required check.**
 - **`agents-md-sync.yml`** — repo integrity: CLAUDE.md ↔ AGENTS.md byte-parity + actionlint over the workflow files (fleet runner labels are declared in `.github/actionlint.yaml`; shellcheck/pyflakes passes await their own baseline pass). **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
 - **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages on push to `main`.

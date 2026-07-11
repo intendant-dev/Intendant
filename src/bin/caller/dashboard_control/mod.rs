@@ -248,19 +248,15 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // upload-frame-only api_session_current_upload (S4c).
     method("api_sessions_stream", PeerOperation::SessionInspect),
     method("api_session_control_msg", PeerOperation::SessionManage),
-    method("api_transfer_jobs", PeerOperation::FilesystemRead),
-    method("api_transfer_download_read", PeerOperation::FilesystemRead),
     // The api_fs_* methods live as tunnel columns on their route rows
     // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
-    // ops derive from the rows instead of entries here. The api_transfer_*
-    // methods join them when their HTTP rows land (design §4, task #6).
-    method("api_transfer_job_create", PeerOperation::FilesystemWrite),
-    method("api_transfer_job_delete", PeerOperation::FilesystemWrite),
-    // Transfer chunks arrive only as upload frames; their destination was
-    // path-scoped when the transfer job was created, so the chunk itself
-    // only needs the write operation (`authorize_dashboard_control_upload`).
-    uploadable("api_transfer_upload_chunk", PeerOperation::FilesystemWrite),
-    method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
+    // ops derive from the rows instead of entries here — and the
+    // api_transfer_* family joined them with its /api/transfers rows
+    // (S9, design §4, task #6). Tunnel-side transfer chunks still arrive
+    // only as upload frames: their destination was path-scoped when the
+    // job was created, so the chunk needs only the write operation
+    // (`authorize_dashboard_control_upload`), which now derives from the
+    // chunk row like everything else.
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
     // api_displays and api_diagnostics_visual_freshness live as tunnel
@@ -3166,35 +3162,18 @@ mod tests {
             ("api_worktrees_remove", Row, Some(Op::SessionManage)),
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
             ("api_session_current_upload", Row, Some(Op::SessionManage)),
-            ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_download_read",
-                Residue,
-                Some(Op::FilesystemRead),
-            ),
+            // The transfer family flipped Residue → Row with its
+            // /api/transfers rows (S9, task #6): ops now derive from
+            // the rows, same classes as always.
+            ("api_transfer_jobs", Row, Some(Op::FilesystemRead)),
+            ("api_transfer_download_read", Row, Some(Op::FilesystemRead)),
             ("api_fs_stat", Row, Some(Op::FilesystemRead)),
             ("api_fs_list", Row, Some(Op::FilesystemRead)),
             ("api_fs_read", Row, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_job_create",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_job_delete",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_chunk",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_commit",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
+            ("api_transfer_job_create", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_job_delete", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_chunk", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_commit", Row, Some(Op::FilesystemWrite)),
             ("api_fs_mkdir", Row, Some(Op::FilesystemWrite)),
             ("api_fs_write", Row, Some(Op::FilesystemWrite)),
             ("api_fs_rename", Row, Some(Op::FilesystemWrite)),

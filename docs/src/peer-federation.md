@@ -110,6 +110,15 @@ ahead of auto-detected URLs; auto-detected entries are always appended as
 fallbacks. The merged list also seeds the **primary-relay TCP fallback** for
 cross-machine display (see below).
 
+> **Whose authority do peer-routed panes spend?** The intermediary
+> daemon's peer grant — never yours. The dashboard surfaces that reach a
+> peer through this machinery (terminal, files, folded sessions,
+> displays) run in the **delegation lane**: the target admits them under
+> `DashboardControlGrant::Peer` and its audit names the daemon, not the
+> person. Access administration and credential custody are user-lane-only
+> by doctrine. The lane model, its rules, and the tracked attribution
+> primitive live in [Trust Tiers → Two lanes](./trust-tiers.md#two-lanes-whose-authority-a-pane-spends).
+
 ## The Peer Actor / Registry / Coordinator Model
 
 ```

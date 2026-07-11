@@ -379,7 +379,7 @@ pub(crate) async fn serve_http_request(
         }
     }
 
-    if let Some((route, _route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
+    if let Some((route, route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
     {
         // Table-dispatched routes: every /api/* and /mcp route is
         // declared once in gateway_routes::ROUTES (which the IAM
@@ -426,6 +426,14 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // The transfer rows' `{id}` capture (both delete shapes capture
+        // exactly the id — the literal segments don't capture).
+        let transfer_job_id = || {
+            route_captures
+                .first()
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        };
         match route.handler {
             RouteHandlerId::FsWrite => {
                 return handle_fs_write(
@@ -434,6 +442,78 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobs => {
+                return handle_transfer_jobs(
+                    stream,
+                    request_line,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobCreate => {
+                return handle_transfer_job_create(
+                    stream,
+                    route_body,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadChunk => {
+                return handle_transfer_upload_chunk(
+                    stream,
+                    header_text,
+                    request_line,
+                    discard,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadCommit => {
+                return handle_transfer_upload_commit(
+                    stream,
+                    route_body,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobDelete => {
+                return handle_transfer_job_delete(
+                    stream,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferDownloadRead => {
+                return handle_transfer_download_read(
+                    stream,
+                    header_text,
+                    request_line,
+                    transfer_job_id(),
+                    project_root_for_changes,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

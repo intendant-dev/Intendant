@@ -204,6 +204,15 @@ pub(crate) enum RouteHandlerId {
     FsWrite,
     FsRename,
     FsDelete,
+    TransferJobs,
+    TransferJobCreate,
+    TransferUploadChunk,
+    TransferUploadCommit,
+    /// Shared by the native DELETE row and the WKWebView POST
+    /// `/delete`-suffix fallback (the session-delete two-shape pattern;
+    /// both shapes capture the same `{id}`).
+    TransferJobDelete,
+    TransferDownloadRead,
     SessionCurrentChanges,
     CurrentHistory,
     CurrentRollback,
@@ -620,6 +629,93 @@ pub(crate) static ROUTES: &[Route] = &[
         "Delete a file or directory (scope-checked)",
     )
     .with_tunnel(tunnel_method("api_fs_delete")),
+    // ── Transfer jobs (design §4, task #6): the resumable jobs protocol
+    //    — create / capped chunk appends / commit / ranged download —
+    //    over direct HTTP, twinning the datachannel api_transfer_*
+    //    methods onto the same neutral cores. Create scope-checks its
+    //    target path (both kinds); the job-addressed rows carry no path
+    //    and act on the destination that check already fixed.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/transfers"),
+        PeerOperation::FilesystemRead,
+        BodyPolicy::None,
+        RouteHandlerId::TransferJobs,
+        "List transfer jobs, newest first (`?id=` filters by job id or resume token)",
+    )
+    .with_tunnel(tunnel_method("api_transfer_jobs")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/transfers"),
+        PeerOperation::FilesystemWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::TransferJobCreate,
+        "Create a transfer job (kind download|upload, path/destination, name, \
+         total_size, sha256, conflict; fs-scope-checked on the target path)",
+    )
+    .with_tunnel(tunnel_method("api_transfer_job_create")),
+    // The chunk row streams its raw body into the same SpooledBody spool
+    // the tunnel's upload frames fill, capped per request at
+    // TRANSFER_HTTP_CHUNK_MAX_BYTES (resumability makes small chunks
+    // cheap). The tunnel twin may also (and in practice only does)
+    // arrive as upload frames.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/transfers",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("chunk")],
+        ),
+        PeerOperation::FilesystemWrite,
+        BodyPolicy::Streaming,
+        RouteHandlerId::TransferUploadChunk,
+        "Append one raw-body chunk to an upload job (`?offset=`; \u{2264} 32 MiB per chunk)",
+    )
+    .with_tunnel(tunnel_uploadable("api_transfer_upload_chunk")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/transfers",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("commit")],
+        ),
+        PeerOperation::FilesystemWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::TransferUploadCommit,
+        "Verify (size + declared sha256) and atomically rename a finished upload into place",
+    )
+    .with_tunnel(tunnel_method("api_transfer_upload_commit")),
+    op_route(
+        RouteMethod::Delete,
+        PathPattern::Segments("/api/transfers", &[SegmentSpec::Capture("id")]),
+        PeerOperation::FilesystemWrite,
+        BodyPolicy::None,
+        RouteHandlerId::TransferJobDelete,
+        "Delete a transfer job (cancels partials; removes managed artifacts)",
+    )
+    .with_tunnel(tunnel_method("api_transfer_job_delete")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/transfers",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("delete")],
+        ),
+        PeerOperation::FilesystemWrite,
+        BodyPolicy::None,
+        RouteHandlerId::TransferJobDelete,
+        "Delete a transfer job (WKWebView POST fallback)",
+    ),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/transfers",
+            &[SegmentSpec::Capture("id"), SegmentSpec::Literal("download")],
+        ),
+        PeerOperation::FilesystemRead,
+        BodyPolicy::None,
+        RouteHandlerId::TransferDownloadRead,
+        "Read download-job bytes (`?offset=&length=` or `Range` \u{2192} 206; \
+         resume metadata echoed as X-Transfer-* headers, X-Content-Sha256 on full reads)",
+    )
+    .with_tunnel(tunnel_method("api_transfer_download_read")),
     // ── Current-session routes (exact/subtree rows precede the generic
     //    session sub-router rows below).
     op_route(
@@ -2100,6 +2196,7 @@ mod tests {
         // must be contiguous so the sharing is visible in the table.
         let shared: &[RouteHandlerId] = &[
             RouteHandlerId::CurrentUploadsGet,
+            RouteHandlerId::TransferJobDelete,
             RouteHandlerId::SessionDelete,
             RouteHandlerId::SessionSubRouter,
             RouteHandlerId::AccessIamGrants,
@@ -2255,9 +2352,35 @@ mod tests {
             policy("POST", crate::peer::access_request::PUBLIC_REQUEST_PATH),
             BodyPolicy::Streaming
         );
+        // The transfer-chunk row spools its raw body under the handler's
+        // pinned per-chunk cap (the row is Streaming; the constant pin
+        // guards the value the handler enforces).
+        assert_eq!(
+            policy("POST", "/api/transfers/j1/chunk"),
+            BodyPolicy::Streaming
+        );
+        assert_eq!(
+            crate::web_gateway::TRANSFER_HTTP_CHUNK_MAX_BYTES,
+            32 * 1024 * 1024,
+            "the transfer chunk cap is a designed constant (design §4): \
+             it bounds per-request memory/disk while resumability keeps \
+             small chunks cheap — change it deliberately, with the docs",
+        );
         // Everything else that takes a body rides the shared default cap.
         assert_eq!(policy("POST", "/api/settings"), BodyPolicy::Default);
         assert_eq!(policy("POST", "/api/peers"), BodyPolicy::Default);
+        assert_eq!(policy("POST", "/api/transfers"), BodyPolicy::Default);
+        assert_eq!(
+            policy("POST", "/api/transfers/j1/commit"),
+            BodyPolicy::Default
+        );
+        assert_eq!(policy("GET", "/api/transfers"), BodyPolicy::None);
+        assert_eq!(
+            policy("GET", "/api/transfers/j1/download"),
+            BodyPolicy::None
+        );
+        assert_eq!(policy("DELETE", "/api/transfers/j1"), BodyPolicy::None);
+        assert_eq!(policy("POST", "/api/transfers/j1/delete"), BodyPolicy::None);
     }
 
     #[test]
@@ -2419,6 +2542,57 @@ mod tests {
                 }
             }
         }
+        // The transfer rows classify exactly per design §4: reads
+        // FilesystemRead, every mutation FilesystemWrite — the same
+        // classes their datachannel twins have always declared.
+        for (method, path, op) in [
+            ("GET", "/api/transfers", PeerOperation::FilesystemRead),
+            (
+                "GET",
+                "/api/transfers/j1/download",
+                PeerOperation::FilesystemRead,
+            ),
+            ("POST", "/api/transfers", PeerOperation::FilesystemWrite),
+            (
+                "POST",
+                "/api/transfers/j1/chunk",
+                PeerOperation::FilesystemWrite,
+            ),
+            (
+                "POST",
+                "/api/transfers/j1/commit",
+                PeerOperation::FilesystemWrite,
+            ),
+            (
+                "DELETE",
+                "/api/transfers/j1",
+                PeerOperation::FilesystemWrite,
+            ),
+            (
+                "POST",
+                "/api/transfers/j1/delete",
+                PeerOperation::FilesystemWrite,
+            ),
+        ] {
+            match classify(method, path) {
+                TableClassification::Matched(matched) => {
+                    assert_eq!(matched, Some(op), "{method} {path} must classify {op:?}")
+                }
+                TableClassification::NoMatch => {
+                    panic!("{method} {path} must classify via table")
+                }
+            }
+        }
+        // Undeclared methods on the family stay unrouted (405 at
+        // dispatch), not silently served.
+        assert!(matches!(
+            classify("PUT", "/api/transfers"),
+            TableClassification::NoMatch
+        ));
+        assert!(matches!(
+            classify("GET", "/api/transfers/j1/chunk"),
+            TableClassification::NoMatch
+        ));
     }
 
     #[test]
