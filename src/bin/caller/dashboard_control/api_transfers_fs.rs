@@ -2054,4 +2054,699 @@ mod tests {
         assert_eq!(commit["result"]["job"]["status"], "completed");
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
     }
+
+    // ── S9 goldens: the tunnel transfer wire shapes ──
+    //
+    // Captured against the pre-conversion handlers and kept green through
+    // the neutral-core delegation (transport-unification design §8: goldens
+    // first, byte-identical after). Every frame below is pinned WHOLE —
+    // envelope, injected `_httpStatus`/`_httpOk` metadata, and the full
+    // 21-key serialized `TransferJob` object — with only the genuinely
+    // volatile fields (uuids, unix times, tempdir-rooted paths) asserted
+    // for shape and then normalized out.
+
+    /// Remove `key` from a JSON object, panicking when absent — the
+    /// golden's way of saying "this field exists; its value is volatile".
+    fn take_field(value: &mut serde_json::Value, key: &str) -> serde_json::Value {
+        let display = value.to_string();
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("not an object: {display}"))
+            .remove(key)
+            .unwrap_or_else(|| panic!("missing {key}: {display}"))
+    }
+
+    fn take_uuid(value: &mut serde_json::Value, key: &str) -> String {
+        let taken = take_field(value, key);
+        let text = taken.as_str().unwrap_or_else(|| panic!("{key}: {taken}"));
+        assert_eq!(text.len(), 36, "{key} must be a uuid: {text}");
+        text.to_string()
+    }
+
+    fn take_unix_time(value: &mut serde_json::Value, key: &str) {
+        let taken = take_field(value, key);
+        assert!(
+            taken.as_u64().is_some_and(|t| t > 0),
+            "{key} must be a unix time: {taken}"
+        );
+    }
+
+    fn take_abs_path(value: &mut serde_json::Value, key: &str) -> String {
+        let taken = take_field(value, key);
+        let text = taken.as_str().unwrap_or_else(|| panic!("{key}: {taken}"));
+        assert!(
+            std::path::Path::new(text).is_absolute(),
+            "{key} must be absolute: {text}"
+        );
+        text.to_string()
+    }
+
+    /// Normalize a serialized `TransferJob`'s volatile fields (id,
+    /// resume_token, created/updated times) in place, returning
+    /// (id, resume_token). The caller then pins the remaining object
+    /// exactly, including every `null`-serialized Option.
+    fn normalize_job(job: &mut serde_json::Value) -> (String, String) {
+        let id = take_uuid(job, "id");
+        let token = take_uuid(job, "resume_token");
+        take_unix_time(job, "created_at");
+        take_unix_time(job, "updated_at");
+        (id, token)
+    }
+
+    /// A download-kind transfer rig: project-rooted runtime plus a
+    /// 14-byte source fixture.
+    fn download_rig() -> (tempfile::TempDir, ControlRuntime, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = dir.path().join("fixture.txt");
+        std::fs::write(&source, b"hello transfer").unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+        (dir, rt, source)
+    }
+
+    async fn create_download_job_frame(rt: &ControlRuntime, source: &std::path::Path) -> serde_json::Value {
+        api_transfer_job_create_response(
+            "g-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "path": source.to_string_lossy(),
+            })),
+            rt,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_job_create_download_frame() {
+        let (_dir, rt, source) = download_rig();
+        let mut frame = create_download_job_frame(&rt, &source).await;
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["id"], "g-create");
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].take();
+        let (_, _) = normalize_job(&mut result["job"]);
+        let source_path = take_abs_path(&mut result["job"], "source_path");
+        // Canonicalized at create (symlinked tempdirs resolve).
+        assert_eq!(
+            source_path,
+            std::fs::canonicalize(&source).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "_httpOk": true,
+                "_httpStatus": 200,
+                "ok": true,
+                "job": {
+                    "kind": "download",
+                    "status": "queued",
+                    "source_kind": "filesystem",
+                    "source_label": null,
+                    "artifact": null,
+                    "managed_source": false,
+                    "destination_path": null,
+                    "final_path": null,
+                    "temp_path": null,
+                    "original_name": "fixture.txt",
+                    "filename": "fixture.txt",
+                    "mime": "text/plain; charset=utf-8",
+                    "total_size": 14,
+                    "completed_bytes": 0,
+                    "error": null,
+                    "conflict_policy": "fail",
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_job_create_error_frames() {
+        let (_dir, rt, _source) = download_rig();
+        let bad_kind = api_transfer_job_create_response(
+            "g-kind".to_string(),
+            Some(&serde_json::json!({ "kind": "sideways" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            bad_kind,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-kind",
+                "ok": true,
+                "result": {
+                    "_httpOk": false,
+                    "_httpStatus": 400,
+                    "ok": false,
+                    "error": "transfer kind must be download or upload",
+                },
+            })
+        );
+        let missing_path = api_transfer_job_create_response(
+            "g-path".to_string(),
+            Some(&serde_json::json!({ "kind": "download" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            missing_path,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-path",
+                "ok": true,
+                "result": {
+                    "_httpOk": false,
+                    "_httpStatus": 400,
+                    "ok": false,
+                    "error": "missing path",
+                },
+            })
+        );
+        let missing_destination = api_transfer_job_create_response(
+            "g-dest".to_string(),
+            Some(&serde_json::json!({ "kind": "upload" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            missing_destination["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 400,
+                "ok": false,
+                "error": "missing destination",
+            })
+        );
+        let bad_conflict = api_transfer_job_create_response(
+            "g-conflict".to_string(),
+            Some(&serde_json::json!({
+                "kind": "upload",
+                "destination": "/tmp/wherever",
+                "conflict": "merge",
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            bad_conflict["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 400,
+                "ok": false,
+                "error": "conflict policy must be fail, rename, or overwrite",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_jobs_list_frames() {
+        let (_dir, rt, source) = download_rig();
+        let empty = api_transfer_jobs_response("g-list-empty".to_string(), &rt).await;
+        assert_eq!(
+            empty,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-list-empty",
+                "ok": true,
+                "result": {
+                    "_httpOk": true,
+                    "_httpStatus": 200,
+                    "ok": true,
+                    "jobs": [],
+                },
+            })
+        );
+
+        let create = create_download_job_frame(&rt, &source).await;
+        let job_id = create["result"]["job"]["id"].as_str().unwrap();
+        let mut listed = api_transfer_jobs_response("g-list".to_string(), &rt).await;
+        assert_eq!(listed["t"], "response");
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["result"]["_httpStatus"], 200);
+        assert_eq!(listed["result"]["ok"], true);
+        let jobs = listed["result"]["jobs"].as_array_mut().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let (listed_id, _) = normalize_job(&mut jobs[0]);
+        assert_eq!(listed_id, job_id);
+        take_abs_path(&mut jobs[0], "source_path");
+        assert_eq!(jobs[0]["kind"], "download");
+        assert_eq!(jobs[0]["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_upload_chunk_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dest_dir = dir.path().join("dest");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+
+        let create = api_transfer_job_create_response(
+            "g-up-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "upload",
+                "destination": dest_dir.join("out.txt").to_string_lossy(),
+                "name": "out.txt",
+                "mime": "text/plain",
+                "total_size": 11,
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["t"], "response");
+        assert_eq!(create["ok"], true);
+        let mut result = create["result"].clone();
+        let (job_id, _) = normalize_job(&mut result["job"]);
+        let temp_path = take_abs_path(&mut result["job"], "temp_path");
+        assert!(temp_path.contains(".intendant-upload-"), "{temp_path}");
+        let destination_path = take_abs_path(&mut result["job"], "destination_path");
+        assert!(destination_path.ends_with("out.txt"), "{destination_path}");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "_httpOk": true,
+                "_httpStatus": 200,
+                "ok": true,
+                "job": {
+                    "kind": "upload",
+                    "status": "queued",
+                    "source_path": null,
+                    "source_kind": null,
+                    "source_label": null,
+                    "artifact": null,
+                    "managed_source": false,
+                    "final_path": null,
+                    "original_name": "out.txt",
+                    "filename": "out.txt",
+                    "mime": "text/plain",
+                    "total_size": 11,
+                    "completed_bytes": 0,
+                    "error": null,
+                    "conflict_policy": "fail",
+                },
+            })
+        );
+
+        // Missing id: refused before any store work, task-response shaped.
+        let missing = api_transfer_upload_chunk_task_response(
+            "g-chunk-noid".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "offset": 0 }),
+                b"hello ",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(missing.id, "g-chunk-noid");
+        assert!(missing.done);
+        assert!(missing.byte_stream.is_none());
+        assert_eq!(
+            missing.frame,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-chunk-noid",
+                "ok": true,
+                "result": {
+                    "_httpOk": false,
+                    "_httpStatus": 400,
+                    "ok": false,
+                    "error": "missing id",
+                },
+            })
+        );
+
+        // First chunk lands; the whole job object rides the frame.
+        let first = api_transfer_upload_chunk_task_response(
+            "g-chunk-1".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": job_id, "offset": 0 }),
+                b"hello ",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert!(first.done);
+        assert!(first.byte_stream.is_none());
+        let mut frame = first.frame.clone();
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["id"], "g-chunk-1");
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].take();
+        normalize_job(&mut result["job"]);
+        take_abs_path(&mut result["job"], "temp_path");
+        take_abs_path(&mut result["job"], "destination_path");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "_httpOk": true,
+                "_httpStatus": 200,
+                "ok": true,
+                "job": {
+                    "kind": "upload",
+                    "status": "running",
+                    "source_path": null,
+                    "source_kind": null,
+                    "source_label": null,
+                    "artifact": null,
+                    "managed_source": false,
+                    "final_path": null,
+                    "original_name": "out.txt",
+                    "filename": "out.txt",
+                    "mime": "text/plain",
+                    "total_size": 11,
+                    "completed_bytes": 6,
+                    "error": null,
+                    "conflict_policy": "fail",
+                },
+            })
+        );
+
+        // A stale offset (not the persisted boundary, not fully covered)
+        // is refused with the store's 409.
+        let stale = api_transfer_upload_chunk_task_response(
+            "g-chunk-stale".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": job_id, "offset": 3 }),
+                b"hello ",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(
+            stale.frame["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 409,
+                "ok": false,
+                "error": "upload chunk overlaps already persisted bytes",
+            })
+        );
+
+        // A chunk past the declared total is refused with 413.
+        let oversize = api_transfer_upload_chunk_task_response(
+            "g-chunk-oversize".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": job_id, "offset": 6 }),
+                b"world!!",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(
+            oversize.frame["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 413,
+                "ok": false,
+                "error": "upload chunk exceeds declared total size",
+            })
+        );
+
+        // Premature commit: the partial is short of the declared total.
+        let premature = api_transfer_upload_commit_response(
+            "g-commit-early".to_string(),
+            Some(&serde_json::json!({ "id": job_id })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            premature["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 409,
+                "ok": false,
+                "error": "upload is not complete enough to commit",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_commit_and_delete_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dest_dir = dir.path().join("dest");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+
+        let missing_commit = api_transfer_upload_commit_response(
+            "g-commit-noid".to_string(),
+            None,
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            missing_commit,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-commit-noid",
+                "ok": true,
+                "result": {
+                    "_httpOk": false,
+                    "_httpStatus": 400,
+                    "ok": false,
+                    "error": "missing id",
+                },
+            })
+        );
+
+        let create = api_transfer_job_create_response(
+            "g-cd-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "upload",
+                "destination": dest_dir.join("done.txt").to_string_lossy(),
+                "name": "done.txt",
+                "total_size": 4,
+            })),
+            &rt,
+        )
+        .await;
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let chunk = api_transfer_upload_chunk_task_response(
+            "g-cd-chunk".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": job_id, "offset": 0 }),
+                b"data",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(chunk.frame["result"]["job"]["status"], "ready");
+
+        let commit = api_transfer_upload_commit_response(
+            "g-cd-commit".to_string(),
+            Some(&serde_json::json!({ "id": job_id })),
+            &rt,
+        )
+        .await;
+        assert_eq!(commit["t"], "response");
+        assert_eq!(commit["id"], "g-cd-commit");
+        assert_eq!(commit["ok"], true);
+        let mut result = commit["result"].clone();
+        normalize_job(&mut result["job"]);
+        let final_path = take_abs_path(&mut result["job"], "final_path");
+        assert!(final_path.ends_with("done.txt"), "{final_path}");
+        take_abs_path(&mut result["job"], "destination_path");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "_httpOk": true,
+                "_httpStatus": 200,
+                "ok": true,
+                "job": {
+                    "kind": "upload",
+                    "status": "completed",
+                    "source_path": null,
+                    "source_kind": null,
+                    "source_label": null,
+                    "artifact": null,
+                    "managed_source": false,
+                    "temp_path": null,
+                    "original_name": "done.txt",
+                    "filename": "done.txt",
+                    "mime": "application/octet-stream",
+                    "total_size": 4,
+                    "completed_bytes": 4,
+                    "error": null,
+                    "conflict_policy": "fail",
+                },
+            })
+        );
+
+        // Delete: missing id, then the real job (true), then a vanished
+        // id (false — still 200-shaped).
+        let missing_delete =
+            api_transfer_job_delete_response("g-del-noid".to_string(), None, &rt).await;
+        assert_eq!(
+            missing_delete["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 400,
+                "ok": false,
+                "error": "missing id",
+            })
+        );
+        let deleted = api_transfer_job_delete_response(
+            "g-del".to_string(),
+            Some(&serde_json::json!({ "id": job_id })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            deleted,
+            serde_json::json!({
+                "t": "response",
+                "id": "g-del",
+                "ok": true,
+                "result": {
+                    "_httpOk": true,
+                    "_httpStatus": 200,
+                    "ok": true,
+                    "deleted": true,
+                },
+            })
+        );
+        let vanished = api_transfer_job_delete_response(
+            "g-del-again".to_string(),
+            Some(&serde_json::json!({ "id": job_id })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            vanished["result"],
+            serde_json::json!({
+                "_httpOk": true,
+                "_httpStatus": 200,
+                "ok": true,
+                "deleted": false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_transfer_download_read_frames() {
+        let (_dir, rt, source) = download_rig();
+        let create = create_download_job_frame(&rt, &source).await;
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let resume_token = create["result"]["job"]["resume_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Missing id / unknown job / range-beyond errors keep the plain
+        // response envelope (no byte stream).
+        let missing =
+            api_transfer_download_read_task_response("g-dl-noid".to_string(), None, &rt).await;
+        assert!(missing.byte_stream.is_none());
+        assert_eq!(
+            missing.frame["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 400,
+                "ok": false,
+                "error": "missing id",
+            })
+        );
+        let unknown = api_transfer_download_read_task_response(
+            "g-dl-unknown".to_string(),
+            Some(&serde_json::json!({ "id": "00000000-0000-0000-0000-000000000000" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            unknown.frame["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 404,
+                "ok": false,
+                "error": "transfer job not found",
+            })
+        );
+        let beyond = api_transfer_download_read_task_response(
+            "g-dl-beyond".to_string(),
+            Some(&serde_json::json!({ "id": job_id, "offset": 15 })),
+            &rt,
+        )
+        .await;
+        assert_eq!(
+            beyond.frame["result"],
+            serde_json::json!({
+                "_httpOk": false,
+                "_httpStatus": 416,
+                "ok": false,
+                "error": "range start beyond file size",
+            })
+        );
+
+        // Ranged read: byte-stream lane; the result sidecar carries the
+        // resume metadata plus the whole updated job object.
+        let ranged = api_transfer_download_read_task_response(
+            "g-dl-range".to_string(),
+            Some(&serde_json::json!({
+                "resume_token": resume_token,
+                "offset": 6,
+                "length": 8,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(ranged.done);
+        assert!(ranged.frame.is_null());
+        let stream = ranged.byte_stream.expect("byte stream");
+        assert_eq!(stream.id, "g-dl-range");
+        assert_eq!(stream.stream_id, "g-dl-range:transfer-download");
+        assert_eq!(stream.content_type, "text/plain; charset=utf-8");
+        assert_eq!(stream.filename.as_deref(), Some("fixture.txt"));
+        assert_eq!(stream.bytes, b"transfer");
+        let mut result = stream.result.clone();
+        take_abs_path(&mut result, "path");
+        normalize_job(&mut result["job"]);
+        take_abs_path(&mut result["job"], "source_path");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "ok": true,
+                "id": job_id,
+                "resume_token": resume_token,
+                "filename": "fixture.txt",
+                "content_type": "text/plain; charset=utf-8",
+                "size": 8,
+                "total_size": 14,
+                "offset": 6,
+                "range_start": 6,
+                "range_end": 14,
+                "resumable": true,
+                "completed_bytes": 14,
+                "status": "completed",
+                "job": {
+                    "kind": "download",
+                    "status": "completed",
+                    "source_kind": "filesystem",
+                    "source_label": null,
+                    "artifact": null,
+                    "managed_source": false,
+                    "destination_path": null,
+                    "final_path": null,
+                    "temp_path": null,
+                    "original_name": "fixture.txt",
+                    "filename": "fixture.txt",
+                    "mime": "text/plain; charset=utf-8",
+                    "total_size": 14,
+                    "completed_bytes": 14,
+                    "error": null,
+                    "conflict_policy": "fail",
+                },
+            })
+        );
+    }
 }
