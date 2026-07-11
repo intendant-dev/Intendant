@@ -73,9 +73,9 @@ static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// sync in the others. It is the union of two declaration sources, resolved
 /// rows-first: tunnel columns on `gateway_routes::ROUTES` rows (twinned
 /// methods, whose IAM operation derives from the route row — transport-
-/// unification design §2.2) and the residue `CONTROL_METHODS` below (methods
-/// whose family has not yet ported, plus tunnel-only methods with no HTTP
-/// twin). The `tunnel_method_partition_is_pinned` differential test freezes
+/// unification design §2.2) and the residue `CONTROL_ONLY_METHODS` below
+/// (tunnel-only methods with no HTTP twin). The
+/// `tunnel_method_partition_is_pinned` differential test freezes
 /// which methods live on which side. Composite rollup booleans the SPA also
 /// reads (peer mutations, managed context, …) stay hand-written next to the
 /// derived block in `status_response_frame`.
@@ -122,15 +122,19 @@ const fn uploadable(name: &'static str, op: PeerOperation) -> ControlMethodSpec 
     }
 }
 
-/// The residue half of the tunnel method table: methods not (yet) declared
-/// as a `tunnel:` column on a `gateway_routes::ROUTES` row. Do NOT add a
-/// method here if its HTTP twin has a route row — declare it on the row
-/// (`Route::with_tunnel`) so its IAM operation derives from the shared
-/// declaration; this list is for tunnel-only methods and families the
-/// migration has not reached. Never read directly outside this module's
-/// union plumbing and pins — consume `all_control_methods()` /
-/// `control_method_spec()`.
-const CONTROL_METHODS: &[ControlMethodSpec] = &[
+/// The residue half of the tunnel method table: methods with no HTTP twin
+/// — transport/handshake, credential custody (tunnel-scoped by design),
+/// connection-scoped signaling/authority RPCs whose HTTP-era twin is the
+/// `/ws` socket, `ControlMsg` intent lanes, media/clip upload lanes, and
+/// the bootstrap/replay reads (the tunnel-only set the transport-
+/// unification program's S11 removal stage left behind; `/session`,
+/// `/recordings*`, and custody HTTP rows stay parked future decisions —
+/// design §2.7). Do NOT add a method here if its HTTP twin has a route
+/// row — declare it on the row (`Route::with_tunnel`) so its IAM
+/// operation derives from the shared declaration. Never read directly
+/// outside this module's union plumbing and pins — consume
+/// `all_control_methods()` / `control_method_spec()`.
+const CONTROL_ONLY_METHODS: &[ControlMethodSpec] = &[
     ControlMethodSpec {
         name: "ping",
         op: None,
@@ -308,7 +312,7 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
 
 /// The effective method table: route-row tunnel specs first (in ROUTES
 /// declaration order, with the IAM operation derived from each row —
-/// `Route::tunnel_operation`), then the residue `CONTROL_METHODS`.
+/// `Route::tunnel_operation`), then the residue `CONTROL_ONLY_METHODS`.
 /// Materialized once; every consumer sees the same union. Resolution is
 /// deterministic — rows win — so even the (unlandable, pin-tested) state
 /// of a method declared on both sides cannot flap between operations. A
@@ -330,7 +334,7 @@ fn all_control_methods() -> &'static [ControlMethodSpec] {
                 })
             })
             .collect();
-        methods.extend_from_slice(CONTROL_METHODS);
+        methods.extend_from_slice(CONTROL_ONLY_METHODS);
         methods
     })
 }
@@ -358,7 +362,7 @@ const CONTROL_WIRE_FEATURES: &[&str] = &[
 ];
 
 /// The advertised `features` list: every advertised method in the
-/// effective table (route-row tunnel specs ∪ the `CONTROL_METHODS`
+/// effective table (route-row tunnel specs ∪ the `CONTROL_ONLY_METHODS`
 /// residue) plus the wire features. Consumers membership-test — order
 /// carries no meaning.
 fn control_features() -> &'static [&'static str] {
@@ -1618,7 +1622,7 @@ fn authorize_dashboard_control_method(
     params: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     // Fail closed: a method must be declared — as a route row's tunnel
-    // column or a residue `CONTROL_METHODS` entry — to be callable at
+    // column or a residue `CONTROL_ONLY_METHODS` entry — to be callable at
     // all; a dispatch arm added without a declaration is denied here
     // instead of shipping ungated.
     let Some(spec) = control_method_spec(method) else {
@@ -1712,7 +1716,7 @@ fn authorize_dashboard_control_upload(
     method: &str,
 ) -> Result<(), String> {
     // Fail closed twice over: the method must be declared upload-deliverable
-    // (route-row tunnel column or residue `CONTROL_METHODS` entry), and
+    // (route-row tunnel column or residue `CONTROL_ONLY_METHODS` entry), and
     // upload methods are always operation-gated.
     let Some(op) = control_method_spec(method)
         .filter(|spec| spec.upload)
@@ -2915,7 +2919,7 @@ mod tests {
     }
 
     /// The operation a method's declaration carries (route-row tunnel
-    /// column or residue `CONTROL_METHODS` entry — the effective table).
+    /// column or residue `CONTROL_ONLY_METHODS` entry — the effective table).
     fn method_operation(method: &str) -> Option<crate::peer::access_policy::PeerOperation> {
         control_method_spec(method).and_then(|spec| spec.op)
     }
@@ -2957,7 +2961,7 @@ mod tests {
     #[test]
     fn control_method_table_is_coherent() {
         // Coherence holds over the effective union (route-row tunnel
-        // specs ∪ the CONTROL_METHODS residue): a name declared on both
+        // specs ∪ the CONTROL_ONLY_METHODS residue): a name declared on both
         // sides is a duplicate here just like two residue rows were.
         let mut seen = HashSet::new();
         for spec in all_control_methods() {
@@ -2985,15 +2989,18 @@ mod tests {
     /// R2/R4): the complete tunnel-method partition — every wire method
     /// name, the declaration source that carries it (`Row` = a `tunnel:`
     /// column on a `gateway_routes::ROUTES` row, `Residue` = a
-    /// `CONTROL_METHODS` entry), and the IAM operation gating it —
+    /// `CONTROL_ONLY_METHODS` entry), and the IAM operation gating it —
     /// frozen as a literal table. Re-gating a method (operation change
     /// on either side), losing one (gone from both sources), duplicating
     /// one (declared on both), or moving one between sources fails here
     /// until this table is updated in the same change, deliberately.
-    /// Permanent program infrastructure: the migration stages move
-    /// families from `Residue` to `Row` by flipping tags here alongside
-    /// their declarations, and the removal stage shrinks the residue to
-    /// the tunnel-only set — the union below never changes by accident.
+    /// Permanent program infrastructure, and the S11 flip's union-
+    /// equality proof: the assertions below check the live union against
+    /// the frozen partition in BOTH directions (every pinned name lives
+    /// with the pinned source and operation; every live name is pinned),
+    /// so the full name × operation union is provably unchanged by the
+    /// dispatch flip — the residue below is the final tunnel-only set,
+    /// and the union never changes by accident.
     #[test]
     fn tunnel_method_partition_is_pinned() {
         use crate::peer::access_policy::PeerOperation as Op;
@@ -3307,11 +3314,11 @@ mod tests {
                 spec.name
             );
         }
-        for spec in CONTROL_METHODS {
+        for spec in CONTROL_ONLY_METHODS {
             assert!(
                 live.insert(spec.name, (Residue, spec.op)).is_none(),
                 "{} is declared BOTH as a route-row tunnel column and in \
-                 CONTROL_METHODS — remove the residue entry",
+                 CONTROL_ONLY_METHODS — remove the residue entry",
                 spec.name
             );
         }
@@ -3357,7 +3364,7 @@ mod tests {
     /// against the table — same pattern as
     /// `spa_action_msg_rpc_set_mirrors_dashboard_action_allowlist`
     /// (api_control.rs). Four facts per entry: the tunnel twin exists in
-    /// `CONTROL_METHODS`; the verb + instantiated path resolve to a
+    /// `CONTROL_ONLY_METHODS`; the verb + instantiated path resolve to a
     /// declared route whose verb is declared exactly (never via `Any`);
     /// the row's IAM operation equals the tunnel method's (the signed-org
     /// doorbell rows are Public on HTTP by design and instead pin their
@@ -3544,7 +3551,7 @@ mod tests {
 
         for (method_name, (verb, template)) in &entries {
             let spec = control_method_spec(method_name).unwrap_or_else(|| {
-                panic!("{method_name}: descriptor entry has no CONTROL_METHODS row")
+                panic!("{method_name}: descriptor entry has no CONTROL_ONLY_METHODS row")
             });
             let tunnel_op = spec
                 .op

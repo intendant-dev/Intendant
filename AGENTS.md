@@ -166,7 +166,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - **Derive, don't mirror.** Daemon truth a frontend needs — permission
   catalogs, feature lists, availability booleans, option vocabularies — is
   declared once and derived everywhere else (exemplar: the tunnel method
-  table — `gateway_routes::ROUTES` tunnel columns ∪ the `CONTROL_METHODS`
+  table — `gateway_routes::ROUTES` tunnel columns ∪ the `CONTROL_ONLY_METHODS`
   residue in `dashboard_control/mod.rs` — drives the authorizer, the
   `features` list, and the per-method availability booleans). When a static
   frontend fallback copy is unavoidable (app.html's IAM catalog, the
@@ -183,7 +183,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   request-body policy (dispatch reads and caps the body before the handler
   runs). A route's dashboard-control (datachannel) twin is declared on the
   same row: tunnel-twinned methods get the row's `tunnel:` column
-  (`TunnelSpec`) — never a `CONTROL_METHODS` entry; that table is the residue
+  (`TunnelSpec`) — never a `CONTROL_ONLY_METHODS` entry; that table is the residue
   for tunnel-only methods, and the tunnel derives each twinned method's IAM
   operation from its row. Unit tests enforce the table invariants, pin the
   docs chapter, pin every route-specific body cap, and freeze the tunnel
