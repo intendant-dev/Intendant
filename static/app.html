@@ -26141,9 +26141,13 @@ async function accessFleetRefreshProvenance() {
 // relays), the F6 credential-custody family (vault leases, the
 // custody trail, the daemon vault store + deposit lane, client-egress
 // registration/probe — tunnel-only methods whose per-cause availability
-// the vault UI surfaces), and the F1c transfer-jobs adapter (the
+// the vault UI surfaces), the F1c transfer-jobs adapter (the
 // resumable jobs protocol over the S9 /api/transfers rows, presence
-// feature-detected through the probe registry below); the remaining
+// feature-detected through the probe registry below), and the F7
+// control-msg dispatchers (api_control_msg, api_session_control_msg,
+// api_dashboard_action_msg — WS-twin residue: their HTTP-era twin is the
+// /ws intent stream, so the facade serves the tunnel leg only and the
+// call sites keep their own /ws fallback); the remaining
 // `rpcOrHttp`/`jsonFetch` call
 // sites move onto these verbs family by family per the design's frontend
 // track. The boot smoke's window.qa.daemonApi() probe asserts the facade
@@ -30148,14 +30152,27 @@ function dispatchSessionControlMsg(payload, options = {}) {
     return false;
   };
   if (!DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_session_control_msg_available === true
-  ) {
-    dashboardTransport.request('api_session_control_msg', { message: payload }, {
+  // Transport F7: the RPC leg rides the daemonApi facade. WS-twin residue
+  // method (no HTTP row by design — the /ws intent stream below is the
+  // twin), so no HTTP lane exists for it; the availability derivation
+  // replaces the hand-rolled canUseRpc + status-boolean probe, and denied
+  // or too-old daemons fall through to /ws exactly as the strict boolean
+  // did. A tunnel attempt is final: never replayed over /ws.
+  if (daemonApi.availability('api_session_control_msg').ok) {
+    daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      // Delivered refusals (allowlist drift the parity pins make
+      // near-impossible) surface instead of silently resolving; still no
+      // /ws replay — the response was delivered.
+      const err = new Error(resp.body?.error || 'Dashboard control request failed');
+      console.warn(`[dashboard-control] ${action} session ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} session ControlMsg RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {
@@ -30183,14 +30200,21 @@ function dispatchDashboardActionMsg(payload, options = {}) {
     return false;
   };
   if (!DASHBOARD_ACTION_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_dashboard_action_msg_available === true
-  ) {
-    dashboardTransport.request('api_dashboard_action_msg', { message: payload }, {
+  // Transport F7: same facade + WS-twin residue shape as
+  // dispatchSessionControlMsg above — no HTTP lane, availability-derived
+  // routing, tunnel attempts never replayed over /ws.
+  if (daemonApi.availability('api_dashboard_action_msg').ok) {
+    daemonApi.request('api_dashboard_action_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      const err = new Error(resp.body?.error || 'Dashboard action failed');
+      console.warn(`[dashboard-control] ${action} dashboard action RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} dashboard action RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {
@@ -39750,15 +39774,32 @@ function dispatchControlMsg(payload) {
     dispatchDashboardActionMsg(payload);
     return;
   }
+  // Transport F7: the RPC leg rides the daemonApi facade. api_control_msg
+  // is WS-twin residue (no HTTP row exists by design — its HTTP-era twin
+  // is the /ws intent stream below), so the facade can never take an HTTP
+  // lane for it; the availability derivation replaces the hand-rolled
+  // canUseRpc + status-boolean probe (the status boolean once landed, the
+  // hello_ack features list before that — denied and too-old daemons fall
+  // through to /ws exactly as the strict boolean did). A tunnel attempt is
+  // final either way: never replayed over /ws (the hosted validators probe
+  // exactly this).
   if (
     action &&
     DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_control_msg_available === true
+    daemonApi.availability('api_control_msg').ok
   ) {
-    dashboardTransport.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (resp.ok) return;
+        // A delivered refusal (the daemon's action allowlist said no —
+        // drift the SPA/daemon parity pins make near-impossible) is a
+        // delivered response: surface it instead of the pre-facade silent
+        // swallow, and still never replay it.
+        console.warn(`[dashboard-control] ${action} ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', resp.body?.error || 'Dashboard control request failed');
+        }
+      })
       .catch(err => {
         console.warn(`[dashboard-control] ${action} ControlMsg RPC failed; not replaying over /ws`, err);
         if (typeof showControlToast === 'function') {
@@ -57337,14 +57378,23 @@ function dashboardControlServerSender(message) {
     return true;
   }
   if (message.action) {
-    if (!dashboardTransport || !dashboardTransport.canUseRpc || !dashboardTransport.canUseRpc()) {
+    // Transport F7: voice actions ride the facade's request verb. This is
+    // a Connect-only path (guarded at the top of this function) and
+    // api_control_msg is WS-twin residue, so the tunnel is the only lane —
+    // the availability derivation also folds in the daemon's own word
+    // (denied session / too-old daemon) instead of firing RPCs that can
+    // only bounce.
+    if (!daemonApi.availability('api_control_msg').ok) {
       dashboardWarnPresenceOnce(
         'control_action',
         '[dashboard-control] voice action unavailable until dashboard access reconnects'
       );
       return false;
     }
-    dashboardTransport.request('api_control_msg', { message }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (!resp.ok) console.warn('[dashboard-control] voice action RPC refused', resp.body?.error || resp.status);
+      })
       .catch(err => console.warn('[dashboard-control] voice action RPC failed', err));
     return true;
   }
@@ -66422,22 +66472,26 @@ window.intendantDashboardControl = {
     };
   },
   async _debugProbeControlNoReplay() {
+    // Injects at the protocol client — the same seam the daemonApi facade's
+    // local tunnel adapter calls (transport F7; the same pattern as
+    // _debugProbePeerMutationConnectNoHttp), so the probe exercises the
+    // path dispatchControlMsg actually takes.
     if (
       typeof dispatchControlMsg !== 'function' ||
-      !dashboardTransport ||
-      typeof dashboardTransport.request !== 'function'
+      !dashboardControlTransport ||
+      typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         dispatchType: typeof dispatchControlMsg,
-        hasDashboardTransport: Boolean(dashboardTransport),
-        requestType: typeof dashboardTransport?.request,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        requestType: typeof dashboardControlTransport?.request,
         rpcAttempts: 0,
         wsReplayCount: 0,
         rpcFailureWarnings: 0,
       };
     }
-    const previousRequest = dashboardTransport.request;
+    const previousRequest = dashboardControlTransport.request;
     const previousWarn = console.warn;
     const previousApp = app;
     const previousSend = app && typeof app.send_server_action === 'function'
@@ -66463,7 +66517,7 @@ window.intendantDashboardControl = {
       }
       return previousWarn.apply(this, args);
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') {
         rpcAttempts += 1;
         return Promise.reject(new Error('synthetic api_control_msg failure'));
@@ -66475,7 +66529,7 @@ window.intendantDashboardControl = {
       await new Promise(resolve => setTimeout(resolve, 50));
       return { skipped: false, rpcAttempts, wsReplayCount, rpcFailureWarnings };
     } finally {
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
       console.warn = previousWarn;
       if (previousApp && previousSend) {
         previousApp.send_server_action = previousSend;
@@ -67206,7 +67260,10 @@ window.intendantDashboardControl = {
     }
     const previousStatus = dashboardControlTransport.lastStatus;
     const previousPresenceFrame = dashboardTransport.presenceFrame;
-    const previousRequest = dashboardTransport.request;
+    // The action leg rides the daemonApi facade (transport F7), whose
+    // local tunnel adapter calls the protocol client directly — inject
+    // there, not at the DashboardTransport wrapper.
+    const previousRequest = dashboardControlTransport.request;
     let presenceFrameCount = 0;
     let actionRpcCount = 0;
     dashboardControlTransport.lastStatus = {
@@ -67221,7 +67278,7 @@ window.intendantDashboardControl = {
       }
       return true;
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') actionRpcCount += 1;
       return Promise.resolve({ ok: true, _httpOk: true });
     };
@@ -67233,7 +67290,7 @@ window.intendantDashboardControl = {
     } finally {
       dashboardControlTransport.lastStatus = previousStatus;
       dashboardTransport.presenceFrame = previousPresenceFrame;
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
     }
     return {
       skipped: false,
@@ -69078,6 +69135,16 @@ function dashboardControlRequestTimeoutMs(method) {
     // budget as the peer round trips above.
     case 'api_credential_egress_probe':
       return 30000;
+    // The control-msg trio (transport F7): interrupts, session lifecycle,
+    // and dashboard actions dispatched while a busy daemon is mid-turn.
+    // The pre-facade call sites asked for 10-15 s and were silently
+    // clamped to the 5 s default (this verb ignores options.timeoutMs) —
+    // the table row is where that intent actually lives.
+    case 'api_control_msg':
+      return 10000;
+    case 'api_session_control_msg':
+    case 'api_dashboard_action_msg':
+      return 15000;
     default:
       return 5000;
   }

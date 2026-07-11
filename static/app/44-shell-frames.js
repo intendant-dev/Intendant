@@ -248,14 +248,23 @@ function dashboardControlServerSender(message) {
     return true;
   }
   if (message.action) {
-    if (!dashboardTransport || !dashboardTransport.canUseRpc || !dashboardTransport.canUseRpc()) {
+    // Transport F7: voice actions ride the facade's request verb. This is
+    // a Connect-only path (guarded at the top of this function) and
+    // api_control_msg is WS-twin residue, so the tunnel is the only lane —
+    // the availability derivation also folds in the daemon's own word
+    // (denied session / too-old daemon) instead of firing RPCs that can
+    // only bounce.
+    if (!daemonApi.availability('api_control_msg').ok) {
       dashboardWarnPresenceOnce(
         'control_action',
         '[dashboard-control] voice action unavailable until dashboard access reconnects'
       );
       return false;
     }
-    dashboardTransport.request('api_control_msg', { message }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (!resp.ok) console.warn('[dashboard-control] voice action RPC refused', resp.body?.error || resp.status);
+      })
       .catch(err => console.warn('[dashboard-control] voice action RPC failed', err));
     return true;
   }

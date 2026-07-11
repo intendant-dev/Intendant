@@ -1632,6 +1632,16 @@ function dashboardControlRequestTimeoutMs(method) {
     // budget as the peer round trips above.
     case 'api_credential_egress_probe':
       return 30000;
+    // The control-msg trio (transport F7): interrupts, session lifecycle,
+    // and dashboard actions dispatched while a busy daemon is mid-turn.
+    // The pre-facade call sites asked for 10-15 s and were silently
+    // clamped to the 5 s default (this verb ignores options.timeoutMs) —
+    // the table row is where that intent actually lives.
+    case 'api_control_msg':
+      return 10000;
+    case 'api_session_control_msg':
+    case 'api_dashboard_action_msg':
+      return 15000;
     default:
       return 5000;
   }

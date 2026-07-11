@@ -1238,22 +1238,26 @@ window.intendantDashboardControl = {
     };
   },
   async _debugProbeControlNoReplay() {
+    // Injects at the protocol client — the same seam the daemonApi facade's
+    // local tunnel adapter calls (transport F7; the same pattern as
+    // _debugProbePeerMutationConnectNoHttp), so the probe exercises the
+    // path dispatchControlMsg actually takes.
     if (
       typeof dispatchControlMsg !== 'function' ||
-      !dashboardTransport ||
-      typeof dashboardTransport.request !== 'function'
+      !dashboardControlTransport ||
+      typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         dispatchType: typeof dispatchControlMsg,
-        hasDashboardTransport: Boolean(dashboardTransport),
-        requestType: typeof dashboardTransport?.request,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        requestType: typeof dashboardControlTransport?.request,
         rpcAttempts: 0,
         wsReplayCount: 0,
         rpcFailureWarnings: 0,
       };
     }
-    const previousRequest = dashboardTransport.request;
+    const previousRequest = dashboardControlTransport.request;
     const previousWarn = console.warn;
     const previousApp = app;
     const previousSend = app && typeof app.send_server_action === 'function'
@@ -1279,7 +1283,7 @@ window.intendantDashboardControl = {
       }
       return previousWarn.apply(this, args);
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') {
         rpcAttempts += 1;
         return Promise.reject(new Error('synthetic api_control_msg failure'));
@@ -1291,7 +1295,7 @@ window.intendantDashboardControl = {
       await new Promise(resolve => setTimeout(resolve, 50));
       return { skipped: false, rpcAttempts, wsReplayCount, rpcFailureWarnings };
     } finally {
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
       console.warn = previousWarn;
       if (previousApp && previousSend) {
         previousApp.send_server_action = previousSend;
@@ -2022,7 +2026,10 @@ window.intendantDashboardControl = {
     }
     const previousStatus = dashboardControlTransport.lastStatus;
     const previousPresenceFrame = dashboardTransport.presenceFrame;
-    const previousRequest = dashboardTransport.request;
+    // The action leg rides the daemonApi facade (transport F7), whose
+    // local tunnel adapter calls the protocol client directly — inject
+    // there, not at the DashboardTransport wrapper.
+    const previousRequest = dashboardControlTransport.request;
     let presenceFrameCount = 0;
     let actionRpcCount = 0;
     dashboardControlTransport.lastStatus = {
@@ -2037,7 +2044,7 @@ window.intendantDashboardControl = {
       }
       return true;
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') actionRpcCount += 1;
       return Promise.resolve({ ok: true, _httpOk: true });
     };
@@ -2049,7 +2056,7 @@ window.intendantDashboardControl = {
     } finally {
       dashboardControlTransport.lastStatus = previousStatus;
       dashboardTransport.presenceFrame = previousPresenceFrame;
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
     }
     return {
       skipped: false,
