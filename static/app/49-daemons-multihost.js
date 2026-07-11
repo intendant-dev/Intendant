@@ -896,7 +896,17 @@ class DashboardTransport {
     return dashboardControlTransport.stream(method, params, options, onEvent);
   }
 
+  // ── F8a warn-logging shims ────────────────────────────────────────────
+  // rpcOrHttp / jsonFetch (and the free-function dashboardJsonFetch that
+  // delegates here) have ZERO in-repo callers after the F8a flip — every
+  // product call site rides the daemonApi facade. The legacy bodies are
+  // kept verbatim (same signature, same tunnel-then-fallback semantics)
+  // for one soak week so a call path the census missed still WORKS while
+  // dashboardTransportShimRecord (32-daemon-api.js) warns once per
+  // caller and counts every hit for window.qa.transportShimHits(). F8b
+  // deletes both shims plus responseFromPayload below after a clean soak.
   async rpcOrHttp(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('rpcOrHttp', label);
     if (this.canUseRpc()) {
       try {
         return await dashboardControlTransport.request(
@@ -917,6 +927,7 @@ class DashboardTransport {
   }
 
   async jsonFetch(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('jsonFetch', label);
     if (this.canUseRpc()) {
       try {
         const payload = await dashboardControlTransport.request(
@@ -938,6 +949,9 @@ class DashboardTransport {
     return fallback();
   }
 
+  // The fake-Response builder the jsonFetch shim resolves with — its only
+  // remaining consumer. Deleted with the shims at F8b (the facade's
+  // envelope normalizer, daemonApiEnvelopeFromPayload, is the live twin).
   responseFromPayload(payload) {
     const rawStatus = Number(payload?._httpStatus);
     const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599

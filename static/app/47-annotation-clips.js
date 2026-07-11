@@ -439,10 +439,10 @@ function pendingAttachmentUploadId(att) {
 function deletePendingUploadRecord(uploadId) {
   const id = String(uploadId || '').trim();
   if (!id) return;
-  const url = `/api/session/current/uploads/${encodeURIComponent(id)}`;
-  dashboardJsonFetch('api_session_current_upload_delete', { id }, () => (
-    fetch(url, { method: 'DELETE' })
-  ), 'api_session_current_upload_delete', { fallbackAfterRpcFailure: false })
+  // Transport F8a: facade DELETE twin — the verb-derived no-replay policy
+  // is the legacy fallbackAfterRpcFailure:false semantics. The descriptor
+  // row captures `upload_id` (the tunnel handler accepts both names).
+  daemonApi.request('api_session_current_upload_delete', { upload_id: id })
     .then(resp => {
       if (!resp.ok && resp.status !== 404) {
         console.warn(`[upload] Delete failed (${id}): ${resp.status}`);

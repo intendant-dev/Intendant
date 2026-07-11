@@ -972,12 +972,31 @@ document.getElementById('recording-stream-select').addEventListener('change', (e
   if (e.target.value) switchRecordingStream(e.target.value);
 });
 
+// Transport F8a (media residue): api_recordings is a tunnel-only method —
+// no HTTP row exists (CONTROL_ONLY_METHODS residue), so the facade serves
+// the tunnel leg and this call site keeps its own legacy /recordings lane
+// for tunnel-down dashboards (never in Connect mode), exactly like the
+// F7 WS-twin residue dispatchers keep their /ws fallback.
+async function fetchRecordingsListPayload() {
+  if (daemonApi.availability('api_recordings').ok) {
+    try {
+      return (await daemonApi.request('api_recordings', {}, { fallback: 'never' })).body;
+    } catch (err) {
+      if (err?.kind === 'abort' || dashboardConnectModeEnabled()) throw err;
+      console.warn('[dashboard-control] api_recordings RPC failed, falling back to HTTP', err);
+    }
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_recordings');
+  }
+  const resp = await fetch('/recordings');
+  return resp.json();
+}
+
 // Reconcile replay UI with the backend. Historical log replay can mention a
 // recording that has since been deleted, so the disk/API list is authoritative.
 async function reconcileRecordingStreams() {
   try {
-    const resp = await dashboardJsonFetch('api_recordings', {}, () => fetch('/recordings'), 'api_recordings');
-    const streams = await resp.json();
+    const streams = await fetchRecordingsListPayload();
     const liveNames = new Set();
     for (const s of streams) {
       if (s.stream_name) liveNames.add(s.stream_name);

@@ -1765,6 +1765,12 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   return data;
 }
 
+// daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
+// POST-shaped read (the body carries output ids; nothing is written), so
+// the verb-derived policy never replays an attempted send. Callers keep
+// the payload-with-error contract this helper always had — errors surface
+// as data.error, never as throws for delivered responses (the same shape
+// fetchSessionDetailPayload pins above).
 async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -1773,31 +1779,18 @@ async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
     ? options.ids.map(id => String(id || '').trim()).filter(Boolean)
     : [];
   if (!ids.length) throw new Error('missing output ids');
-  const params = { session_id: sid, source, ids };
-  return dashboardTransport.rpcOrHttp('api_session_agent_output', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    const fetchOptions = {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids }),
-    };
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}/agent-output?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    data._httpOk = resp.ok;
-    return data;
-  }, 'api_session_agent_output', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_agent_output', {
+    session_id: sid,
+    source,
+    ids,
+  }, { signal: options.signal, cache: options.cache });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
 async function fetchSessionsSearchPayload(options = {}) {

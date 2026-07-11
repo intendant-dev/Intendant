@@ -47,11 +47,15 @@
 // display_input are the twins) and the visual-freshness diagnostics
 // sink (twinned — the one rawBody entry below). Realtime display frames
 // (display_input events, media channels) are NOT facade calls and never
-// will be; the remaining
-// `rpcOrHttp`/`jsonFetch` call
-// sites move onto these verbs family by family per the design's frontend
-// track. The boot smoke's window.qa.daemonApi() probe asserts the facade
-// evaluates.
+// will be. The F8a flip finished the migration: the last product call
+// sites (session delete/recordings/agent-output, the current-session
+// rounds family, the media/voice/mcp residue trio) ride the facade, and
+// the legacy helpers (`rpcOrHttp`/`jsonFetch` on DashboardTransport,
+// `dashboardJsonFetch`) are warn-logging shims — every hit records
+// through dashboardTransportShimRecord below and window.qa
+// .transportShimHits() answers the soak verdict; F8b deletes the shims
+// after a clean soak week. The boot smoke's window.qa.daemonApi() probe
+// asserts the facade evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -77,7 +81,10 @@
 //
 // Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots), the
+// its NDJSON stream, search, detail, report, context snapshots) plus the
+// F8a sessions stragglers (recordings list, agent output by id and for
+// the current session, session delete, and the current-session rounds
+// family — changes, history, rollback, redo, prune), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
 // project-root, external-agents, displays), and the F4 access family:
 // the dialogs set (overview, IAM state, enrollment reads + decide, IAM
@@ -123,6 +130,10 @@
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
 // the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `pathSuffix` = the named param is an OPTIONAL file path appended under
+// the base path (the changes row's Under pattern; empty keeps the bare
+// base = the list shape — the tunnel twin carries the same value as a
+// plain param and rebuilds the sub-path server-side),
 // `rawBody` = the named string param is the raw REQUEST BODY the HTTP
 // twin takes verbatim, sent as `rawBodyType` (the visual-freshness
 // NDJSON sink: the tunnel carries the transcript as a `body` param, the
@@ -157,6 +168,15 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
   api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
   api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
+  api_session_recordings: { verb: 'GET', path: '/api/session/{id}/recordings', alias: { id: 'session_id' } },
+  api_session_agent_output: { verb: 'POST', path: '/api/session/{id}/agent-output', alias: { id: 'session_id' }, query: ['source'] },
+  api_session_delete: { verb: 'DELETE', path: '/api/session/{id}/{target}', alias: { id: 'session_id' } },
+  api_session_current_changes: { verb: 'GET', path: '/api/session/current/changes', pathSuffix: 'path', rawQuery: 'query' },
+  api_session_current_history: { verb: 'GET', path: '/api/session/current/history' },
+  api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
+  api_session_current_redo: { verb: 'POST', path: '/api/session/current/redo' },
+  api_session_current_prune: { verb: 'POST', path: '/api/session/current/prune' },
+  api_session_current_agent_output: { verb: 'POST', path: '/api/session/current/agent-output' },
   api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
   api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
   api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
@@ -451,10 +471,21 @@ async function daemonApiEnsureHttpProbe(name) {
 // lift (and consume) params[name] — or params[alias[name]] when the entry
 // declares a capture alias; `query` keys lift into the query
 // string; for JSON POSTs the remaining params become the body verbatim.
+
+// pathSuffix values address files. Absolute paths (POSIX '/', Windows
+// drive prefix) encode as ONE percent-encoded segment — the leading '/'
+// must ride as %2F or the server's slash-trimming eats it; relative
+// paths keep '/' separators, encoding each segment (the legacy
+// encodeChangePath contract, owned by the adapter since the F8a flip).
+function daemonApiEncodePathSuffix(value) {
+  const raw = String(value);
+  if (raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw)) return encodeURIComponent(raw);
+  return raw.split('/').map(encodeURIComponent).join('/');
+}
 function daemonApiHttpTarget(spec, method, params) {
   const source = params && typeof params === 'object' ? params : {};
   const used = new Set();
-  const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
+  let path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
     const paramKey = (spec.alias && spec.alias[key]) || key;
     const value = source[paramKey];
     if (value === undefined || value === null || String(value) === '') {
@@ -463,6 +494,16 @@ function daemonApiHttpTarget(spec, method, params) {
     used.add(paramKey);
     return encodeURIComponent(String(value));
   });
+  // pathSuffix twins: the named param is an optional file path appended
+  // under the base route; empty keeps the bare base (the changes list
+  // shape vs the one-file diff shape).
+  if (spec.pathSuffix) {
+    const raw = source[spec.pathSuffix];
+    used.add(spec.pathSuffix);
+    if (raw !== undefined && raw !== null && String(raw) !== '') {
+      path += `/${daemonApiEncodePathSuffix(raw)}`;
+    }
+  }
   const query = [];
   for (const key of spec.query || []) {
     const value = source[key];
@@ -1057,12 +1098,52 @@ const daemonApi = Object.freeze({
   Error: DaemonApiError,
 });
 
+// ── Legacy-transport shim instrumentation (F8a flip) ─────────────────────
+// The three legacy helpers (`rpcOrHttp`/`jsonFetch` on DashboardTransport,
+// `dashboardJsonFetch`) have zero in-repo product callers after the flip;
+// they survive one soak week as warn-logging shims so any path the caller
+// census missed surfaces in live dashboards instead of silently riding
+// legacy semantics. Every shim invocation records here: one console.warn
+// per distinct `helper:label` key (no spam loops — a polling caller warns
+// once), every hit counts. `window.qa.transportShimHits()` is the soak
+// verdict the validators and the F8b removal session query — an all-zero
+// readback (total: 0) is the green light to delete the shims, the
+// fake-Response builder (responseFromPayload), and the canUse* quartet.
+// A dashboardJsonFetch call that delegates to DashboardTransport.jsonFetch
+// records under BOTH helper names by design: the label names the missed
+// method either way, and the pair tells the census which lane it rode.
+const dashboardTransportShimState = {
+  total: 0,
+  byCaller: Object.create(null),
+  warned: new Set(),
+};
+
+function dashboardTransportShimRecord(helper, label) {
+  const key = `${helper}:${String(label || '(unlabeled)')}`;
+  dashboardTransportShimState.total += 1;
+  dashboardTransportShimState.byCaller[key] =
+    (dashboardTransportShimState.byCaller[key] || 0) + 1;
+  if (dashboardTransportShimState.warned.has(key)) return;
+  dashboardTransportShimState.warned.add(key);
+  // The first non-shim stack line names the concrete call site for the
+  // census; captured only on the first hit per key, so it stays cheap.
+  const stack = (new Error().stack || '').split('\n').slice(2, 4).join(' | ');
+  console.warn(
+    `[transport-shim] legacy ${helper}('${String(label || '')}') still has a live caller — `
+    + `migrate it to daemonApi (transport F8a; the shim is deleted at F8b). ${stack}`
+  );
+}
+
 // QA readback (window.qa convention): adapter states, an availability
 // sample across the three lanes, and the descriptor checksum. Cheap and
 // side-effect-free — availability() only reads connection state. The boot
 // smoke asserts this probe exists and answers; nothing else consumes the
-// facade in F0.
+// facade in F0. transportShimHits is the F8a soak counter (see above).
 window.qa = Object.assign(window.qa || {}, {
+  transportShimHits: () => ({
+    total: dashboardTransportShimState.total,
+    byCaller: { ...dashboardTransportShimState.byCaller },
+  }),
   daemonApi: () => {
     const transport = dashboardControlTransport;
     const peers = [];

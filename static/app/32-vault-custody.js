@@ -2946,7 +2946,14 @@ function dashboardConnectMutationUnavailable(action, label = 'Dashboard control 
   return false;
 }
 
+// F8a warn-logging shim: zero in-repo callers after the flip — every
+// product call site rides the daemonApi facade. The legacy body stays
+// verbatim for the soak week (delegation double-records under
+// 'dashboardJsonFetch' and 'jsonFetch' by design — the label names the
+// missed method either way); window.qa.transportShimHits() is the soak
+// verdict, and F8b deletes this with the DashboardTransport shims.
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
+  dashboardTransportShimRecord('dashboardJsonFetch', label);
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
     return dashboardTransport.jsonFetch(method, params, fallback, label, options);
   }

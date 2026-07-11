@@ -314,10 +314,25 @@ async function connectVoice() {
     // OpenAI: fetch ephemeral client secret from server (uses OPENAI_API_KEY server-side)
     showVoiceStatus('Requesting session token...');
     try {
-      const resp = await dashboardJsonFetch('api_voice_session', {}, () => (
-        fetch('/session', { method: 'POST' })
-      ), 'api_voice_session');
-      const data = await resp.json();
+      // Transport F8a (voice residue): api_voice_session is tunnel-only —
+      // no HTTP row exists (CONTROL_ONLY_METHODS residue), so the facade
+      // serves the tunnel leg and this call site keeps its own legacy
+      // /session lane for tunnel-down dashboards (never in Connect mode).
+      let data;
+      if (daemonApi.availability('api_voice_session').ok) {
+        try {
+          data = (await daemonApi.request('api_voice_session', {}, { fallback: 'never' })).body;
+        } catch (err) {
+          if (dashboardConnectModeEnabled()) throw err;
+          console.warn('[dashboard-control] api_voice_session RPC failed, falling back to HTTP', err);
+        }
+      } else if (dashboardConnectModeEnabled()) {
+        throw new Error('dashboard Connect RPC is not available for api_voice_session');
+      }
+      if (data === undefined) {
+        const resp = await fetch('/session', { method: 'POST' });
+        data = await resp.json();
+      }
       if (data.error) { showVoiceStatus('Token error: ' + data.error, true); return; }
       token = data.client_secret?.value || data.client_secret;
       if (!token) { showVoiceStatus('No client_secret in response', true); return; }

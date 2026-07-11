@@ -26153,11 +26153,15 @@ async function accessFleetRefreshProvenance() {
 // display_input are the twins) and the visual-freshness diagnostics
 // sink (twinned — the one rawBody entry below). Realtime display frames
 // (display_input events, media channels) are NOT facade calls and never
-// will be; the remaining
-// `rpcOrHttp`/`jsonFetch` call
-// sites move onto these verbs family by family per the design's frontend
-// track. The boot smoke's window.qa.daemonApi() probe asserts the facade
-// evaluates.
+// will be. The F8a flip finished the migration: the last product call
+// sites (session delete/recordings/agent-output, the current-session
+// rounds family, the media/voice/mcp residue trio) ride the facade, and
+// the legacy helpers (`rpcOrHttp`/`jsonFetch` on DashboardTransport,
+// `dashboardJsonFetch`) are warn-logging shims — every hit records
+// through dashboardTransportShimRecord below and window.qa
+// .transportShimHits() answers the soak verdict; F8b deletes the shims
+// after a clean soak week. The boot smoke's window.qa.daemonApi() probe
+// asserts the facade evaluates.
 //
 // Fragment placement: this file must evaluate BEFORE every consumer
 // fragment's eval-time code (manifest order is program order — the
@@ -26183,7 +26187,10 @@ async function accessFleetRefreshProvenance() {
 //
 // Coverage: the F1 family (filesystem + staged uploads), the F2
 // sessions-family reads (managed-context, worktrees, the session list and
-// its NDJSON stream, search, detail, report, context snapshots), the
+// its NDJSON stream, search, detail, report, context snapshots) plus the
+// F8a sessions stragglers (recordings list, agent output by id and for
+// the current session, session delete, and the current-session rounds
+// family — changes, history, rollback, redo, prune), the
 // F3 settings/keys family (settings GET/POST, api-keys save, key-status,
 // project-root, external-agents, displays), and the F4 access family:
 // the dialogs set (overview, IAM state, enrollment reads + decide, IAM
@@ -26229,6 +26236,10 @@ async function accessFleetRefreshProvenance() {
 // body encoding ('raw' streamed body | 'json-b64' JSON envelope with
 // content_b64), `rawQuery` = the named param is a pre-encoded query STRING
 // the HTTP twin takes verbatim (the managed-context tunnel contract),
+// `pathSuffix` = the named param is an OPTIONAL file path appended under
+// the base path (the changes row's Under pattern; empty keeps the bare
+// base = the list shape — the tunnel twin carries the same value as a
+// plain param and rebuilds the sub-path server-side),
 // `rawBody` = the named string param is the raw REQUEST BODY the HTTP
 // twin takes verbatim, sent as `rawBodyType` (the visual-freshness
 // NDJSON sink: the tunnel carries the transcript as a `body` param, the
@@ -26263,6 +26274,15 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
   api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
   api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
+  api_session_recordings: { verb: 'GET', path: '/api/session/{id}/recordings', alias: { id: 'session_id' } },
+  api_session_agent_output: { verb: 'POST', path: '/api/session/{id}/agent-output', alias: { id: 'session_id' }, query: ['source'] },
+  api_session_delete: { verb: 'DELETE', path: '/api/session/{id}/{target}', alias: { id: 'session_id' } },
+  api_session_current_changes: { verb: 'GET', path: '/api/session/current/changes', pathSuffix: 'path', rawQuery: 'query' },
+  api_session_current_history: { verb: 'GET', path: '/api/session/current/history' },
+  api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
+  api_session_current_redo: { verb: 'POST', path: '/api/session/current/redo' },
+  api_session_current_prune: { verb: 'POST', path: '/api/session/current/prune' },
+  api_session_current_agent_output: { verb: 'POST', path: '/api/session/current/agent-output' },
   api_managed_context_records: { verb: 'GET', path: '/api/managed-context/records', rawQuery: 'query' },
   api_managed_context_anchors: { verb: 'GET', path: '/api/managed-context/anchors', rawQuery: 'query' },
   api_managed_context_fission: { verb: 'GET', path: '/api/managed-context/fission', rawQuery: 'query' },
@@ -26557,10 +26577,21 @@ async function daemonApiEnsureHttpProbe(name) {
 // lift (and consume) params[name] — or params[alias[name]] when the entry
 // declares a capture alias; `query` keys lift into the query
 // string; for JSON POSTs the remaining params become the body verbatim.
+
+// pathSuffix values address files. Absolute paths (POSIX '/', Windows
+// drive prefix) encode as ONE percent-encoded segment — the leading '/'
+// must ride as %2F or the server's slash-trimming eats it; relative
+// paths keep '/' separators, encoding each segment (the legacy
+// encodeChangePath contract, owned by the adapter since the F8a flip).
+function daemonApiEncodePathSuffix(value) {
+  const raw = String(value);
+  if (raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw)) return encodeURIComponent(raw);
+  return raw.split('/').map(encodeURIComponent).join('/');
+}
 function daemonApiHttpTarget(spec, method, params) {
   const source = params && typeof params === 'object' ? params : {};
   const used = new Set();
-  const path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
+  let path = spec.path.replace(/\{([A-Za-z0-9_]+)\}/g, (match, key) => {
     const paramKey = (spec.alias && spec.alias[key]) || key;
     const value = source[paramKey];
     if (value === undefined || value === null || String(value) === '') {
@@ -26569,6 +26600,16 @@ function daemonApiHttpTarget(spec, method, params) {
     used.add(paramKey);
     return encodeURIComponent(String(value));
   });
+  // pathSuffix twins: the named param is an optional file path appended
+  // under the base route; empty keeps the bare base (the changes list
+  // shape vs the one-file diff shape).
+  if (spec.pathSuffix) {
+    const raw = source[spec.pathSuffix];
+    used.add(spec.pathSuffix);
+    if (raw !== undefined && raw !== null && String(raw) !== '') {
+      path += `/${daemonApiEncodePathSuffix(raw)}`;
+    }
+  }
   const query = [];
   for (const key of spec.query || []) {
     const value = source[key];
@@ -27163,12 +27204,52 @@ const daemonApi = Object.freeze({
   Error: DaemonApiError,
 });
 
+// ── Legacy-transport shim instrumentation (F8a flip) ─────────────────────
+// The three legacy helpers (`rpcOrHttp`/`jsonFetch` on DashboardTransport,
+// `dashboardJsonFetch`) have zero in-repo product callers after the flip;
+// they survive one soak week as warn-logging shims so any path the caller
+// census missed surfaces in live dashboards instead of silently riding
+// legacy semantics. Every shim invocation records here: one console.warn
+// per distinct `helper:label` key (no spam loops — a polling caller warns
+// once), every hit counts. `window.qa.transportShimHits()` is the soak
+// verdict the validators and the F8b removal session query — an all-zero
+// readback (total: 0) is the green light to delete the shims, the
+// fake-Response builder (responseFromPayload), and the canUse* quartet.
+// A dashboardJsonFetch call that delegates to DashboardTransport.jsonFetch
+// records under BOTH helper names by design: the label names the missed
+// method either way, and the pair tells the census which lane it rode.
+const dashboardTransportShimState = {
+  total: 0,
+  byCaller: Object.create(null),
+  warned: new Set(),
+};
+
+function dashboardTransportShimRecord(helper, label) {
+  const key = `${helper}:${String(label || '(unlabeled)')}`;
+  dashboardTransportShimState.total += 1;
+  dashboardTransportShimState.byCaller[key] =
+    (dashboardTransportShimState.byCaller[key] || 0) + 1;
+  if (dashboardTransportShimState.warned.has(key)) return;
+  dashboardTransportShimState.warned.add(key);
+  // The first non-shim stack line names the concrete call site for the
+  // census; captured only on the first hit per key, so it stays cheap.
+  const stack = (new Error().stack || '').split('\n').slice(2, 4).join(' | ');
+  console.warn(
+    `[transport-shim] legacy ${helper}('${String(label || '')}') still has a live caller — `
+    + `migrate it to daemonApi (transport F8a; the shim is deleted at F8b). ${stack}`
+  );
+}
+
 // QA readback (window.qa convention): adapter states, an availability
 // sample across the three lanes, and the descriptor checksum. Cheap and
 // side-effect-free — availability() only reads connection state. The boot
 // smoke asserts this probe exists and answers; nothing else consumes the
-// facade in F0.
+// facade in F0. transportShimHits is the F8a soak counter (see above).
 window.qa = Object.assign(window.qa || {}, {
+  transportShimHits: () => ({
+    total: dashboardTransportShimState.total,
+    byCaller: { ...dashboardTransportShimState.byCaller },
+  }),
   daemonApi: () => {
     const transport = dashboardControlTransport;
     const peers = [];
@@ -30168,7 +30249,14 @@ function dashboardConnectMutationUnavailable(action, label = 'Dashboard control 
   return false;
 }
 
+// F8a warn-logging shim: zero in-repo callers after the flip — every
+// product call site rides the daemonApi facade. The legacy body stays
+// verbatim for the soak week (delegation double-records under
+// 'dashboardJsonFetch' and 'jsonFetch' by design — the label names the
+// missed method either way); window.qa.transportShimHits() is the soak
+// verdict, and F8b deletes this with the DashboardTransport shims.
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
+  dashboardTransportShimRecord('dashboardJsonFetch', label);
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
     return dashboardTransport.jsonFetch(method, params, fallback, label, options);
   }
@@ -37791,10 +37879,25 @@ async function connectVoice() {
     // OpenAI: fetch ephemeral client secret from server (uses OPENAI_API_KEY server-side)
     showVoiceStatus('Requesting session token...');
     try {
-      const resp = await dashboardJsonFetch('api_voice_session', {}, () => (
-        fetch('/session', { method: 'POST' })
-      ), 'api_voice_session');
-      const data = await resp.json();
+      // Transport F8a (voice residue): api_voice_session is tunnel-only —
+      // no HTTP row exists (CONTROL_ONLY_METHODS residue), so the facade
+      // serves the tunnel leg and this call site keeps its own legacy
+      // /session lane for tunnel-down dashboards (never in Connect mode).
+      let data;
+      if (daemonApi.availability('api_voice_session').ok) {
+        try {
+          data = (await daemonApi.request('api_voice_session', {}, { fallback: 'never' })).body;
+        } catch (err) {
+          if (dashboardConnectModeEnabled()) throw err;
+          console.warn('[dashboard-control] api_voice_session RPC failed, falling back to HTTP', err);
+        }
+      } else if (dashboardConnectModeEnabled()) {
+        throw new Error('dashboard Connect RPC is not available for api_voice_session');
+      }
+      if (data === undefined) {
+        const resp = await fetch('/session', { method: 'POST' });
+        data = await resp.json();
+      }
       if (data.error) { showVoiceStatus('Token error: ' + data.error, true); return; }
       token = data.client_secret?.value || data.client_secret;
       if (!token) { showVoiceStatus('No client_secret in response', true); return; }
@@ -39036,15 +39139,13 @@ function renderChangesDiffHeader(path, info, stateText = '') {
     + (resolvedMeta ? `<span class="changes-diff-meta">${escapeHtml(resolvedMeta)}</span>` : '');
 }
 
-function encodeChangePath(path) {
-  if (isAbsolutePath(path)) return encodeURIComponent(path);
-  return String(path).split('/').map(part => encodeURIComponent(part)).join('/');
-}
-
+// Unwrap a facade envelope from fetchChangesResponse: delivered errors
+// surface as data.error (the endpoint's structured shape) or the HTTP
+// status; the list shape is a bare array and passes through untouched.
 async function parseChangesResponse(resp) {
-  const data = await resp.json().catch(() => ({}));
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok || data.error) {
-    throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+    throw new Error(data.error || `HTTP ${resp.status}`);
   }
   return data;
 }
@@ -39090,12 +39191,6 @@ function currentChangesTargetQuery() {
   return params.toString();
 }
 
-function changesRequestUrl(path = '') {
-  const suffix = path ? `/${encodeChangePath(path)}` : '';
-  const query = currentChangesTargetQuery();
-  return `/api/session/current/changes${suffix}${query ? `?${query}` : ''}`;
-}
-
 function changesRequestParams(path = '') {
   return {
     path: String(path || ''),
@@ -39103,10 +39198,13 @@ function changesRequestParams(path = '') {
   };
 }
 
+// Transport F8a: the changes reads ride the daemonApi facade — tunnel
+// first, HTTP twin per the GET fallback policy. The descriptor's
+// pathSuffix entry rebuilds the /changes/{path} sub-path on the HTTP
+// lane (the legacy encodeChangePath/changesRequestUrl builders retired
+// onto it); resolves with the facade envelope for parseChangesResponse.
 function fetchChangesResponse(path = '') {
-  return dashboardJsonFetch('api_session_current_changes', changesRequestParams(path), () => (
-    fetch(changesRequestUrl(path))
-  ), 'api_session_current_changes');
+  return daemonApi.request('api_session_current_changes', changesRequestParams(path));
 }
 
 function showChangesTargetMismatch(message) {
@@ -39254,7 +39352,8 @@ async function refreshHistory() {
     return;
   }
   try {
-    const r = await dashboardJsonFetch('api_session_current_history', {}, () => fetch('/api/session/current/history'), 'api_session_current_history');
+    // Transport F8a: facade GET twin (tunnel first, HTTP fallback).
+    const r = await daemonApi.request('api_session_current_history', {});
     if (!r.ok) {
       // Older sessions or sessions without history support return 404.
       // Hide the timeline rather than showing a confusing error.
@@ -39263,7 +39362,7 @@ async function refreshHistory() {
       if (wrap) wrap.style.display = 'none';
       return;
     }
-    historyCache = await r.json();
+    historyCache = r.body;
     renderTimeline();
   } catch (e) {
     // Network error — stay silent; the WS event for the next mutation
@@ -39532,23 +39631,13 @@ async function confirmRollback() {
       revert_files: revertFiles,
       revert_conversation: revertConv,
     };
-    const resp = await dashboardJsonFetch('api_session_current_rollback', payload, () => fetch('/api/session/current/rollback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_session_current_rollback', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin — the verb-derived no-replay policy
+    // is the legacy fallbackAfterRpcFailure:false semantics.
+    const resp = await daemonApi.request('api_session_current_rollback', payload);
     if (!resp.ok) {
       // Prefer the structured {error} shape the server already uses for
-      // this endpoint; fall back to raw text for unexpected error bodies.
-      let errMsg = resp.statusText;
-      try {
-        const j = await resp.clone().json();
-        if (j && j.error) errMsg = j.error;
-      } catch (_) {
-        const t = await resp.text().catch(() => '');
-        if (t) errMsg = t;
-      }
-      showControlToast('error', `Rollback failed: ${errMsg}`);
+      // this endpoint; fall back to the status for unexpected bodies.
+      showControlToast('error', `Rollback failed: ${resp.body?.error || `HTTP ${resp.status}`}`);
     }
     // Success: backend emits `rolled_back` / `conversation_rolled_back`
     // events, the WASM layer raises HistoryChanged, and the UI refreshes.
@@ -39560,10 +39649,10 @@ window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
-    const r = await dashboardJsonFetch('api_session_current_redo', {}, () => fetch('/api/session/current/redo', { method: 'POST' }), 'api_session_current_redo', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_redo', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Redo failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Redo failed: ${r.body?.error || `HTTP ${r.status}`}`);
     }
   } catch (e) {
     showControlToast('error', `Redo error: ${e.message || e}`);
@@ -39580,15 +39669,15 @@ async function doPrune() {
   });
   if (!ok) return;
   try {
-    const r = await dashboardJsonFetch('api_session_current_prune', {}, () => fetch('/api/session/current/prune', { method: 'POST' }), 'api_session_current_prune', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_prune', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Prune failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Prune failed: ${r.body?.error || `HTTP ${r.status}`}`);
       return;
     }
     // History event will redraw; the console line is a belt-and-suspenders
     // confirmation so curious users can verify the server response shape.
-    const data = await r.json().catch(() => ({}));
+    const data = (r.body && typeof r.body === 'object') ? r.body : {};
     if (typeof data.bytes_freed === 'number') {
       const mb = (data.bytes_freed / 1024 / 1024).toFixed(1);
       console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);
@@ -41470,24 +41559,44 @@ function managedContextSplitLines(id) {
 async function managedContextMcpToolForSession(sessionId, name, args = {}) {
   if (!sessionId) throw new Error('Select a Codex session first.');
   const rpcId = managedContextRpcSeq++;
-  const body = {
-    jsonrpc: '2.0',
-    id: rpcId,
-    method: 'tools/call',
-    params: { name, arguments: args },
-  };
-  const resp = await dashboardJsonFetch('api_mcp_tool_call', {
-    mcp_id: rpcId,
-    session_id: sessionId,
-    name,
-    arguments: args,
-  }, () => authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  }), 'api_mcp_tool_call', { fallbackAfterRpcFailure: false });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error?.message || `MCP HTTP ${resp.status}`);
+  // Transport F8a (mcp residue): api_mcp_tool_call is tunnel-only — no
+  // HTTP row exists (CONTROL_ONLY_METHODS residue; the /mcp endpoint is
+  // the MCP server's own gate, not a route twin), so the facade serves
+  // the tunnel leg. A tunnel attempt is FINAL (the legacy
+  // fallbackAfterRpcFailure:false semantics — a tool call is a mutation
+  // and must never replay); only a dashboard with no tunnel at all takes
+  // this site's legacy /mcp lane (never in Connect mode).
+  let ok;
+  let status;
+  let payload;
+  if (daemonApi.availability('api_mcp_tool_call').ok) {
+    const r = await daemonApi.request('api_mcp_tool_call', {
+      mcp_id: rpcId,
+      session_id: sessionId,
+      name,
+      arguments: args,
+    }, { fallback: 'never' });
+    ok = r.ok;
+    status = r.status;
+    payload = (r.body && typeof r.body === 'object') ? r.body : {};
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_mcp_tool_call');
+  } else {
+    const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: rpcId,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    });
+    ok = resp.ok;
+    status = resp.status;
+    payload = await resp.json().catch(() => ({}));
+  }
+  if (!ok) throw new Error(payload.error?.message || `MCP HTTP ${status}`);
   if (payload.error) throw new Error(payload.error.message || 'MCP tool failed');
   const result = payload.result || {};
   const text = Array.isArray(result.content)
@@ -50400,13 +50509,11 @@ async function loadCommandOutputIntoBody(group, body) {
     return;
   }
   const payload = { ids: group.outputIds };
-  const resp = await dashboardJsonFetch('api_session_current_agent_output', payload, () => authedFetch('/api/session/current/agent-output', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  }), 'api_session_current_agent_output');
-  const json = await resp.json();
-  if (!resp.ok) throw new Error(json.error || resp.statusText || `HTTP ${resp.status}`);
+  // Transport F8a: facade POST-shaped read — tunnel first, the HTTP twin
+  // serves a dashboard with no tunnel (no replay after an attempt).
+  const resp = await daemonApi.request('api_session_current_agent_output', payload);
+  const json = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+  if (!resp.ok) throw new Error(json.error || `HTTP ${resp.status}`);
   body.innerHTML = '';
   for (const out of (json.outputs || [])) {
     const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
@@ -60968,12 +61075,31 @@ document.getElementById('recording-stream-select').addEventListener('change', (e
   if (e.target.value) switchRecordingStream(e.target.value);
 });
 
+// Transport F8a (media residue): api_recordings is a tunnel-only method —
+// no HTTP row exists (CONTROL_ONLY_METHODS residue), so the facade serves
+// the tunnel leg and this call site keeps its own legacy /recordings lane
+// for tunnel-down dashboards (never in Connect mode), exactly like the
+// F7 WS-twin residue dispatchers keep their /ws fallback.
+async function fetchRecordingsListPayload() {
+  if (daemonApi.availability('api_recordings').ok) {
+    try {
+      return (await daemonApi.request('api_recordings', {}, { fallback: 'never' })).body;
+    } catch (err) {
+      if (err?.kind === 'abort' || dashboardConnectModeEnabled()) throw err;
+      console.warn('[dashboard-control] api_recordings RPC failed, falling back to HTTP', err);
+    }
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_recordings');
+  }
+  const resp = await fetch('/recordings');
+  return resp.json();
+}
+
 // Reconcile replay UI with the backend. Historical log replay can mention a
 // recording that has since been deleted, so the disk/API list is authoritative.
 async function reconcileRecordingStreams() {
   try {
-    const resp = await dashboardJsonFetch('api_recordings', {}, () => fetch('/recordings'), 'api_recordings');
-    const streams = await resp.json();
+    const streams = await fetchRecordingsListPayload();
     const liveNames = new Set();
     for (const s of streams) {
       if (s.stream_name) liveNames.add(s.stream_name);
@@ -61432,10 +61558,10 @@ function pendingAttachmentUploadId(att) {
 function deletePendingUploadRecord(uploadId) {
   const id = String(uploadId || '').trim();
   if (!id) return;
-  const url = `/api/session/current/uploads/${encodeURIComponent(id)}`;
-  dashboardJsonFetch('api_session_current_upload_delete', { id }, () => (
-    fetch(url, { method: 'DELETE' })
-  ), 'api_session_current_upload_delete', { fallbackAfterRpcFailure: false })
+  // Transport F8a: facade DELETE twin — the verb-derived no-replay policy
+  // is the legacy fallbackAfterRpcFailure:false semantics. The descriptor
+  // row captures `upload_id` (the tunnel handler accepts both names).
+  daemonApi.request('api_session_current_upload_delete', { upload_id: id })
     .then(resp => {
       if (!resp.ok && resp.status !== 404) {
         console.warn(`[upload] Delete failed (${id}): ${resp.status}`);
@@ -66167,7 +66293,17 @@ class DashboardTransport {
     return dashboardControlTransport.stream(method, params, options, onEvent);
   }
 
+  // ── F8a warn-logging shims ────────────────────────────────────────────
+  // rpcOrHttp / jsonFetch (and the free-function dashboardJsonFetch that
+  // delegates here) have ZERO in-repo callers after the F8a flip — every
+  // product call site rides the daemonApi facade. The legacy bodies are
+  // kept verbatim (same signature, same tunnel-then-fallback semantics)
+  // for one soak week so a call path the census missed still WORKS while
+  // dashboardTransportShimRecord (32-daemon-api.js) warns once per
+  // caller and counts every hit for window.qa.transportShimHits(). F8b
+  // deletes both shims plus responseFromPayload below after a clean soak.
   async rpcOrHttp(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('rpcOrHttp', label);
     if (this.canUseRpc()) {
       try {
         return await dashboardControlTransport.request(
@@ -66188,6 +66324,7 @@ class DashboardTransport {
   }
 
   async jsonFetch(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('jsonFetch', label);
     if (this.canUseRpc()) {
       try {
         const payload = await dashboardControlTransport.request(
@@ -66209,6 +66346,9 @@ class DashboardTransport {
     return fallback();
   }
 
+  // The fake-Response builder the jsonFetch shim resolves with — its only
+  // remaining consumer. Deleted with the shims at F8b (the facade's
+  // envelope normalizer, daemonApiEnvelopeFromPayload, is the live twin).
   responseFromPayload(payload) {
     const rawStatus = Number(payload?._httpStatus);
     const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599
@@ -69321,6 +69461,12 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   return data;
 }
 
+// daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
+// POST-shaped read (the body carries output ids; nothing is written), so
+// the verb-derived policy never replays an attempted send. Callers keep
+// the payload-with-error contract this helper always had — errors surface
+// as data.error, never as throws for delivered responses (the same shape
+// fetchSessionDetailPayload pins above).
 async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -69329,31 +69475,18 @@ async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
     ? options.ids.map(id => String(id || '').trim()).filter(Boolean)
     : [];
   if (!ids.length) throw new Error('missing output ids');
-  const params = { session_id: sid, source, ids };
-  return dashboardTransport.rpcOrHttp('api_session_agent_output', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    const fetchOptions = {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids }),
-    };
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}/agent-output?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    data._httpOk = resp.ok;
-    return data;
-  }, 'api_session_agent_output', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_agent_output', {
+    session_id: sid,
+    source,
+    ids,
+  }, { signal: options.signal, cache: options.cache });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
 async function fetchSessionsSearchPayload(options = {}) {
@@ -78703,10 +78836,10 @@ function setNewSessionCreateVisible(visible) {
 
 async function fetchProjectPathStatus(path) {
   const target = path || '';
-  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
-    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
-  ), 'api_fs_stat');
-  const data = await resp.json().catch(() => ({}));
+  // Transport F8a: facade GET twin (tunnel first, HTTP fallback) — the
+  // same api_fs_stat lane the Files IDE rides (F1).
+  const resp = await daemonApi.request('api_fs_stat', { path: target });
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok) throw new Error(data.error || `Path check failed (${resp.status})`);
   return data;
 }
@@ -78800,14 +78933,10 @@ async function ensureNewSessionProjectDirectory(projectRoot) {
   }
 
   setNewSessionProjectStatus('warn', 'Creating directory on this host...');
-  const resp = await dashboardJsonFetch('api_fs_mkdir', { path: projectRoot }, () => (
-    authedFetch('/api/fs/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectRoot }),
-    })
-  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
-  const data = await resp.json().catch(() => ({}));
+  // Transport F8a: facade POST twin — the verb-derived no-replay policy
+  // is the legacy fallbackAfterRpcFailure:false semantics.
+  const resp = await daemonApi.request('api_fs_mkdir', { path: projectRoot });
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok) {
     setNewSessionProjectStatus('error', data.error || `Create failed (${resp.status})`);
     return null;
@@ -88163,9 +88292,6 @@ function deleteSessionData(sessionId, target, label) {
 async function confirmSessionDeleteModal() {
   if (!sessionDeletePending) return;
   const { sessionId, target, label } = sessionDeletePending;
-  const url = target === 'session'
-    ? `/api/session/${sessionId}/delete`
-    : `/api/session/${sessionId}/delete/${target}`;
 
   const confirmBtn = document.getElementById('session-delete-confirm');
   if (confirmBtn) {
@@ -88175,11 +88301,14 @@ async function confirmSessionDeleteModal() {
   showSessionDeleteStatus('Deleting...');
 
   try {
-    const resp = await dashboardJsonFetch('api_session_delete', { session_id: sessionId, target }, () => (
-      fetch(url, { method: 'POST' })
-    ), 'api_session_delete', { fallbackAfterRpcFailure: false });
-    const result = await resp.json().catch(() => ({}));
-    if (!resp.ok || !result.ok) throw new Error(result.error || resp.statusText || 'unknown');
+    // Transport F8a: facade DELETE twin (/api/session/{id}/{target};
+    // target 'session' deletes the whole session, a data kind deletes
+    // that kind) — the verb-derived no-replay policy is the legacy
+    // fallbackAfterRpcFailure:false semantics. The endpoint answers 200
+    // with an {ok, error} body, so the body is the real verdict.
+    const resp = await daemonApi.request('api_session_delete', { session_id: sessionId, target });
+    const result = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+    if (!resp.ok || !result.ok) throw new Error(result.error || `HTTP ${resp.status}`);
     if (target === 'session') {
       _cachedSessions = _cachedSessions.filter(s => s.session_id !== sessionId);
     } else {
@@ -88506,10 +88635,10 @@ async function loadSessionRecordings(sessionId) {
 
   let streams;
   try {
-    const resp = await dashboardJsonFetch('api_session_recordings', { session_id: sessionId }, () => (
-      fetch(`/api/session/${encodeURIComponent(sessionId)}/recordings`)
-    ), 'api_session_recordings');
-    streams = await resp.json();
+    // Transport F8a: facade GET twin (tunnel first, HTTP fallback); the
+    // listing is a bare array, so the Array check below is the verdict.
+    const resp = await daemonApi.request('api_session_recordings', { session_id: sessionId });
+    streams = resp.body;
   } catch { return; }
   if (!Array.isArray(streams) || streams.length === 0) return;
 

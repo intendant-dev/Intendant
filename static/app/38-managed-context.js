@@ -547,24 +547,44 @@ function managedContextSplitLines(id) {
 async function managedContextMcpToolForSession(sessionId, name, args = {}) {
   if (!sessionId) throw new Error('Select a Codex session first.');
   const rpcId = managedContextRpcSeq++;
-  const body = {
-    jsonrpc: '2.0',
-    id: rpcId,
-    method: 'tools/call',
-    params: { name, arguments: args },
-  };
-  const resp = await dashboardJsonFetch('api_mcp_tool_call', {
-    mcp_id: rpcId,
-    session_id: sessionId,
-    name,
-    arguments: args,
-  }, () => authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  }), 'api_mcp_tool_call', { fallbackAfterRpcFailure: false });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error?.message || `MCP HTTP ${resp.status}`);
+  // Transport F8a (mcp residue): api_mcp_tool_call is tunnel-only — no
+  // HTTP row exists (CONTROL_ONLY_METHODS residue; the /mcp endpoint is
+  // the MCP server's own gate, not a route twin), so the facade serves
+  // the tunnel leg. A tunnel attempt is FINAL (the legacy
+  // fallbackAfterRpcFailure:false semantics — a tool call is a mutation
+  // and must never replay); only a dashboard with no tunnel at all takes
+  // this site's legacy /mcp lane (never in Connect mode).
+  let ok;
+  let status;
+  let payload;
+  if (daemonApi.availability('api_mcp_tool_call').ok) {
+    const r = await daemonApi.request('api_mcp_tool_call', {
+      mcp_id: rpcId,
+      session_id: sessionId,
+      name,
+      arguments: args,
+    }, { fallback: 'never' });
+    ok = r.ok;
+    status = r.status;
+    payload = (r.body && typeof r.body === 'object') ? r.body : {};
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_mcp_tool_call');
+  } else {
+    const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: rpcId,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    });
+    ok = resp.ok;
+    status = resp.status;
+    payload = await resp.json().catch(() => ({}));
+  }
+  if (!ok) throw new Error(payload.error?.message || `MCP HTTP ${status}`);
   if (payload.error) throw new Error(payload.error.message || 'MCP tool failed');
   const result = payload.result || {};
   const text = Array.isArray(result.content)
