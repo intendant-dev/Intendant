@@ -1492,6 +1492,39 @@ pub(crate) async fn run_agent_loop(
                     serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
                 match spec_result {
                     Ok(mut spec) => {
+                        // Always-consent gate: `LiveAudioSpawn` is policy-pinned
+                        // to "ask at every autonomy level", and runtime-command
+                        // classification never sees controller-side tools —
+                        // enforce it here, before any audio side effect (bridge
+                        // creation, default-device switch).
+                        let consent_preview = live_audio::spawn_consent_preview(&spec);
+                        let category = autonomy::ActionCategory::LiveAudioSpawn.to_string();
+                        slog(&session_log, |l| {
+                            l.approval(&category, &consent_preview, "waiting")
+                        });
+                        let consent = live_audio::request_spawn_consent(
+                            live_audio::SpawnConsentRequest {
+                                bus,
+                                approval_registry: Some(approval_registry),
+                                json_approval,
+                                no_approver: headless && json_approval.is_none(),
+                                session_id: local_session_id.clone(),
+                                preview: consent_preview.clone(),
+                            },
+                            live_audio::SPAWN_CONSENT_WAIT,
+                        )
+                        .await;
+                        if let Err(denied) = consent {
+                            slog(&session_log, |l| {
+                                l.approval(&category, &consent_preview, "denied")
+                            });
+                            conversation.add_tool_result(call_id, "spawn_live_audio", &denied);
+                            continue;
+                        }
+                        slog(&session_log, |l| {
+                            l.approval(&category, &consent_preview, "approved")
+                        });
+
                         let system_prompt = prompts::build_live_audio_prompt(
                             &spec.playbook,
                             &spec.response_schema,

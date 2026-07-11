@@ -1060,6 +1060,13 @@ impl SessionSupervisor {
         if crate::mcp::ask_user_question_pending(approval_id) {
             return;
         }
+        // A live-audio consent prompt is likewise armed by its own gate
+        // waiter (crate::live_audio), which observes the same ControlCommand
+        // on the bus, resolves, and emits ApprovalResolved — a native-path
+        // prompt also has a registry responder, but the waiter owns it.
+        if crate::live_audio::spawn_consent_pending(approval_id) {
+            return;
+        }
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Approval response dropped: no active managed session");
             return;

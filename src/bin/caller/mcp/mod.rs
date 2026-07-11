@@ -583,8 +583,10 @@ impl IntendantServer {
                 Ok(text_tool_result(self.read_frame(params).await))
             }
             "spawn_live_audio" => {
-                let params = parse_params::<SpawnLiveAudioParams>(args)?;
-                Ok(text_tool_result(self.spawn_live_audio(params).await))
+                let Parameters(params) = parse_params::<SpawnLiveAudioParams>(args)?;
+                Ok(text_tool_result(
+                    self.spawn_live_audio_for_session(params, session_id).await,
+                ))
             }
             "list_peers" => Ok(text_tool_result(self.list_peers().await)),
             "peer_send_message" => {
