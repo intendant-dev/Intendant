@@ -3499,7 +3499,13 @@ mod tests {
         // the pairing set, and the coordinator route). The `api_transfer_*`
         // methods join when their HTTP rows land (task #6, /api/transfers);
         // adding or dropping an entry updates this list in the same change,
-        // deliberately.
+        // deliberately. The F6 credential-custody family (api_credential_*,
+        // api_daemon_vault_*) is deliberately NOT here and stays out:
+        // custody is tunnel-scoped by design with no HTTP rows planned
+        // (docs/src/credential-custody.md; the transport design parks
+        // custody rows as an explicit future decision), so its facade
+        // calls run with no fallback lane — absence below is the contract,
+        // not a gap.
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",

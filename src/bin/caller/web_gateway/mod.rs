@@ -2967,7 +2967,15 @@ mod tests {
             resp.contains("200 OK"),
             "agent card should serve unauthenticated, got: {resp}"
         );
-        assert!(!resp.contains("401"));
+        // Status line only: the card body embeds ws:// advertise URLs with
+        // the kernel-assigned test port, so scanning the whole response for
+        // "401" flaked whenever the port happened to contain it (seen live
+        // with port 40169 in a merge-group run).
+        let status_line = resp.lines().next().unwrap_or("");
+        assert!(
+            !status_line.contains("401"),
+            "agent card must not challenge for auth, got: {status_line}"
+        );
         handle.abort();
     }
 
