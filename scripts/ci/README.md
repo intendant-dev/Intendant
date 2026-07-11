@@ -86,9 +86,16 @@ listeners. Pair it with the merge queue's build concurrency (ruleset;
 2 as of 2026-07-10): the queue bounds how many entries validate at
 once, the jobs cap bounds what each validation can demand.
 
-Future watchdog enhancement (not yet implemented): gate listener
-resume on `memory_pressure` in addition to disk, so a swap storm
-pauses assignment the way a full disk does.
+The watchdog also gates assignment on **memory pressure** (macOS
+`kern.memorystatus_vm_pressure_level`, Linux PSI `some avg10`):
+sustained pressure (`MEM_PAUSE_TICKS` consecutive ticks) pauses the
+listeners, sustained normal resumes them — with the disk and memory
+pauses tracked as separate markers, so listeners return only when BOTH
+clear. It never pauses mid-job on memory alone and it cannot constrain
+builds already running: bounding running compiles is the governor's
+job (next section); this is purely a new-assignment circuit breaker.
+Probes fail open — a box whose pressure interface is unreadable keeps
+assigning rather than wedging.
 
 The jobs cap is per-*process*; bounding what all cargo processes on the
 box can demand **together** is the governor's job — next section.
