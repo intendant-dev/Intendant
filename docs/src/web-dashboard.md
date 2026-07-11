@@ -1576,11 +1576,14 @@ verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
 the same PTY registry used by the WebSocket path, so scrollback and reconnect
 behavior stay consistent.
 
-The first streamed API on this substrate is `api_sessions_stream`, which mirrors
-the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
-`session`, `phase`, final `replace`, `done`). When the verified DataChannel is
-connected, local dashboard session hydration uses that stream and falls back to
-the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+The first streamed API on this substrate is `api_sessions_stream`, which shares
+one server-side line source with `/api/sessions/stream` (transport-unification
+S10: the neutral core's `ApiResponse::Stream`) — both lanes carry the identical
+NDJSON event sequence (`start`, partial `session`, `phase`, final `replace`,
+`done`); HTTP writes the lines verbatim, the tunnel wraps each in a
+`stream_event` frame. When the verified DataChannel is connected, local
+dashboard session hydration uses that stream and falls back to the HTTP stream
+on safe errors. Peer session lists still use direct peer HTTP.
 The local daemon identity is available as `api_agent_card`, returning the same
 Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
 remains the unauthenticated discovery surface.
