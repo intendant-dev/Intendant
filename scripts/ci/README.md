@@ -30,7 +30,10 @@ merge-queue entries (seven macOS validations died at 18G free on
   `.last-used` marker. The watchdog prunes keys unused for
   `PRUNE_DAYS` (7) and evicts oldest-first over `CAP_GB` per root —
   and, under disk pressure, until free space clears the resume
-  ceiling. It deletes **only** inside the configured cache roots.
+  ceiling. Cache maintenance defers while any runner job is active and
+  rechecks immediately before each deletion, so rustc never loses its
+  target directory mid-build. It deletes **only** inside the configured
+  cache roots.
 
 ### Install
 
