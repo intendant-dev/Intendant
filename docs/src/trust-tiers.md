@@ -242,8 +242,14 @@ stated non-goal:
 - **Lookalike names.** `d-<hash>` labels are deliberately opaque, which
   also means humans cannot eyeball them; a phished lookalike with its own
   valid certificate raises no CT alarm on *your* name, because it is not
-  your name. The mitigation is navigational: reach fleet names from the
-  fleet strip, bookmarks, or the app — never by retyping.
+  your name. Two mitigations now, one navigational and one nominal:
+  reach fleet names from the fleet strip, bookmarks, or the app — never
+  by retyping — and give machines **petnames**: the owner's name for a
+  daemon, signed into the fleet record (payload v5) and keyed to the
+  record's identity, shown first everywhere with the self-reported label
+  demoted to a muted secondary. A lookalike arrives *nameless* — no
+  store, phisher, or self-chosen label can dress it in a name you
+  assigned.
 - **The browser itself.** Every rung assumes the browser and OS are
   honest; an extension with page access reads all tiers alike. Outside
   Intendant's reach — stated so the ladder is not mistaken for covering
@@ -273,7 +279,11 @@ the owner's memory. All four are **shipped**:
    on an integrated machine, the peer pairing-approval card warns that
    approving grants a peer authority *here* (the upward-grant alarm), and
    hosted-route device enrollments get an integrated-tier warning chip
-   beside the existing hosted-route one. Same-account cross-daemon
+   beside the existing hosted-route one. When a verified doorbell caller
+   states its own tier ([Where fleet metadata
+   rides](#where-fleet-metadata-rides)), the alarm sharpens: a disposable
+   machine asking for authority on an integrated one is named as exactly
+   that. Same-account cross-daemon
    visibility ships via the signed fleet record — each fleet card carries
    its daemon's tier chip, offline daemons included (the carrier
    reasoning is [Where fleet metadata rides](#where-fleet-metadata-rides)).
@@ -402,10 +412,12 @@ Two deliberate absences, so their reasons don't get re-litigated:
   label is a target beacon — it tells an attacker which box is worth the
   effort — and as a self-assertion it cannot serve the upward-grant
   guard as evidence anyway.
-- **The pairing doorbell carries no tier claim.** A cross-owner requester
-  asserting "I'm disposable" is unverifiable exactly when it matters;
-  showing it on the approval card would dress an assertion as evidence.
-  Cross-owner tier comparison waits for an authenticated daemon-identity
-  linkage in the doorbell (the requester proving which daemon key it is,
-  so a claim could at least be pinned to an identity) — a prerequisite,
-  not a plumbing gap.
+- **The doorbell's tier claim rides only inside the verified caller-ID.**
+  The authenticated daemon-identity linkage that cross-owner comparison
+  waited for now exists: a requester states its tier inside the caller-ID
+  transcript (the v2 doorbell line), so the claim is pinned to a proven
+  daemon key before it is ever stored or shown on the approval card. The
+  absence that remains is deliberate: legacy and unverified callers show
+  no tier, because a bare "I'm disposable" is an assertion dressed as
+  evidence — and even the signed claim is only the requester's word about
+  itself, evidence of who says it, not of its truth.

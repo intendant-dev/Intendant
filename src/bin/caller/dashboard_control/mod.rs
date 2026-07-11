@@ -1536,34 +1536,16 @@ fn runtime_operation_decision(
     runtime.grant.access_decision(op)
 }
 
-fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
-    use crate::peer::access_policy::PeerOperation;
-    match t {
-        "display_input" => Some(PeerOperation::DisplayInput),
-        // Floor operations: terminal_open may additionally require
-        // shell.spawn (when the session doesn't exist yet) and every
-        // terminal frame is scoped to sessions the actor can see — both
-        // enforced statefully in the frame handlers.
-        "terminal_open" => Some(PeerOperation::TerminalView),
-        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
-            Some(PeerOperation::TerminalWrite)
-        }
-        "presence_frame" => Some(PeerOperation::Message),
-        // Upload frames carry no blanket authority: upload_start is
-        // authorized by the operation of the method it delivers (a media
-        // annotation is runtime control, a transfer chunk is a filesystem
-        // write, …) inside control_upload_start_frame, and chunk/end only
-        // act on an entry an authorized start created on this connection.
-        "upload_start" | "upload_chunk" | "upload_end" => None,
-        // Client-egress response frames: only a session that could have
-        // registered as a relay (credentials.manage) may answer, and the
-        // handler additionally binds each frame to the request's own
-        // registering session.
-        "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
-            Some(PeerOperation::CredentialsManage)
-        }
-        _ => None,
-    }
+/// Map a typed tunnel frame to the `PeerOperation` it exercises — the
+/// datachannel lookup into the shared `access_policy::FRAME_LANES`
+/// declaration (`web_gateway::ws_frame_operation` reads the same table),
+/// so the same IAM grant answers the same way whichever transport a client
+/// speaks — parity by construction. `None` means the frame carries no
+/// blanket authority of its own here; each table row's `note` says why.
+pub(crate) fn dashboard_control_frame_operation(
+    t: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
+    crate::peer::access_policy::frame_operation(crate::peer::access_policy::FrameLane::Tunnel, t)
 }
 
 /// Paths a filesystem method touches, for scope checks and the audit trail.

@@ -999,6 +999,20 @@ html {
   color: var(--peach);
   font-weight: 600;
 }
+/* Petnames (trust-tiers § lookalike names): the muted self-label beside
+   an owner-named machine, and the inline rename affordance. */
+.acc-fleet-selflabel { color: var(--overlay1); font-size: 10.5px; white-space: nowrap; }
+.acc-fleet-rename {
+  background: none; border: none; color: var(--overlay1);
+  font-size: 11px; cursor: pointer; padding: 0 2px; line-height: 1;
+}
+.acc-fleet-rename:hover { color: var(--text); }
+.acc-fleet-rename-input {
+  background: color-mix(in srgb, var(--surface0) 55%, transparent);
+  border: 1px solid var(--glass-hairline-bright); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 1px 6px; min-width: 0;
+  width: 12ch;
+}
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {
@@ -25900,12 +25914,16 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   // v4 folds the enc line in unconditionally (may be empty) and appends
   // the daemon's owner-set trust tier, so a store cannot relabel an
   // integrated box as disposable without breaking the signature.
+  // v5 appends the owner's PETNAME for the daemon — the name the owner
+  // chose, bound to this record's identity, so a lookalike daemon can
+  // never wear a familiar name the store or a phisher picked.
   const enc = version >= 3 ? String(record.enc_fields || '') : '';
   const blank = version >= 3 && enc;
   const lines = [
-    version >= 4 ? 'intendant-fleet-record-v4'
-      : version >= 3 ? 'intendant-fleet-record-v3'
-        : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
+    version >= 5 ? 'intendant-fleet-record-v5'
+      : version >= 4 ? 'intendant-fleet-record-v4'
+        : version >= 3 ? 'intendant-fleet-record-v3'
+          : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
     blank ? '' : String(record.url || ''),
@@ -25918,6 +25936,7 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
   if (version >= 3) lines.push(enc);
   if (version >= 4) lines.push(String(record.tier || ''));
+  if (version >= 5) lines.push(String(record.petname || ''));
   lines.push(String(signedAt));
   return new TextEncoder().encode(lines.join('\n'));
 }
@@ -26032,10 +26051,12 @@ async function accessFleetSignRecord(record) {
   const signedAt = Date.now();
   try {
     // Sign at the lowest version that covers the record's fields: a
-    // tier-less record keeps its v2/v3 shape, so a hosted store that
-    // predates the tier field (and would strip it) only downgrades
-    // tier-carrying records to 'unverified', not the whole fleet.
-    const version = String(record.tier || '').trim() ? 4 : (record.enc_fields ? 3 : 2);
+    // record without newer fields keeps its older shape, so a hosted
+    // store that predates a field (and would strip it) only downgrades
+    // the records that carry it, not the whole fleet.
+    const version = String(record.petname || '').trim() ? 5
+      : String(record.tier || '').trim() ? 4
+        : (record.enc_fields ? 3 : 2);
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
@@ -26071,7 +26092,7 @@ async function accessFleetVerifyRecord(record) {
       ['verify']
     );
     let valid = false;
-    for (const version of record.enc_fields ? [4, 3, 2, 1] : [4, 2, 1]) {
+    for (const version of record.enc_fields ? [5, 4, 3, 2, 1] : [5, 4, 2, 1]) {
       valid = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,
@@ -51857,6 +51878,9 @@ function normalizeDashboardAccessTarget(target) {
     // payload and carried in the signed v4 fleet record (never on the
     // public agent card — docs/src/trust-tiers.md § metadata carriers).
     tier: String(target.tier || '').trim(),
+    // Owner-chosen petname (signed v5 record line): the name the OWNER
+    // gave this identity — a lookalike daemon never inherits it.
+    petname: String(target.petname || '').trim(),
     connected: target.connected !== false,
     capabilities,
   };
@@ -52519,8 +52543,43 @@ function dashboardTargetIsLocal(hostId) {
 
 function dashboardTargetLabel(hostId) {
   if (dashboardTargetIsLocal(hostId)) return selfHostLabel || 'This daemon';
-  const peer = daemons.find(d => d.host_id === String(hostId || '').trim());
-  return peer?.label || String(hostId || '').trim();
+  const id = String(hostId || '').trim();
+  const peer = daemons.find(d => d.host_id === id);
+  // Petname first (owner-chosen, identity-bound); the self-reported
+  // label only names machines the owner hasn't named.
+  const record = accessFleetTargets().find(t =>
+    String(t.host_id || t.id || '').trim() === id);
+  const petname = String(record?.petname || '').trim();
+  if (petname) return petname;
+  return peer?.label || id;
+}
+
+/* The owner's petname for a fleet target, '' when unnamed. */
+function accessTargetPetname(target) {
+  return String(target?.petname || '').trim();
+}
+
+/* Set (or clear, with '') the owner's petname for a fleet target and
+   persist it: the record re-signs as payload v5 on the next hosted
+   push, so the name is bound to this identity — a lookalike never
+   inherits it. */
+function accessFleetSetPetname(hostId, petname) {
+  const id = String(hostId || '').trim();
+  if (!id) return false;
+  const cleaned = String(petname || '').trim().slice(0, 120);
+  const targets = accessFleetRead().targets || [];
+  let changed = false;
+  for (const target of targets) {
+    const key = String(target.host_id || target.id || '').trim();
+    if (key !== id) continue;
+    if (String(target.petname || '') === cleaned) break;
+    target.petname = cleaned;
+    target.updated_unix_ms = Date.now();
+    changed = true;
+    break;
+  }
+  if (changed) accessFleetWrite(targets);
+  return changed;
 }
 
 function dashboardAccessRoleLabel(roleId) {
@@ -54994,6 +55053,7 @@ function accessTargetProvenanceChip(target) {
    ids only appear as the subtitle, never as the headline. */
 function accessTargetDisplayName(target, descriptor) {
   const candidates = [
+    accessTargetPetname(target),
     descriptor?.displayName,
     target?.label,
   ];
@@ -55447,6 +55507,52 @@ function renderAccessFleetStrip() {
     name.className = 'acc-fleet-name';
     name.textContent = accessTargetDisplayName(target, descriptor);
     top.append(dot, name);
+    // Petnamed machines keep their self-reported label visible as a
+    // muted secondary — the owner's name never hides what the box calls
+    // itself.
+    const petname = accessTargetPetname(target);
+    if (petname && target.label && petname !== String(target.label).trim()) {
+      const selfLabel = document.createElement('span');
+      selfLabel.className = 'acc-fleet-selflabel';
+      selfLabel.textContent = `· ${target.label}`;
+      top.appendChild(selfLabel);
+    }
+    // Inline rename (✎): the owner's name for this identity, signed
+    // into the v5 fleet record (trust-tiers § lookalike names).
+    if (!target.local && !descriptor.local) {
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.className = 'acc-fleet-rename';
+      rename.textContent = '\u270e';
+      rename.title = petname
+        ? `Rename "${petname}" — your name for this machine, bound to its identity`
+        : 'Name this machine — your name, bound to its identity (a lookalike never inherits it)';
+      rename.addEventListener('click', event => {
+        event.stopPropagation();
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'acc-fleet-rename-input';
+        input.value = petname;
+        input.placeholder = String(target.label || 'name this machine');
+        input.maxLength = 120;
+        const commit = () => {
+          accessFleetSetPetname(target.host_id || target.id, input.value);
+          renderAccessFleetStrip();
+          renderDashboardTargetSummaries();
+        };
+        input.addEventListener('keydown', ev => {
+          if (ev.key === 'Enter') commit();
+          if (ev.key === 'Escape') renderAccessFleetStrip();
+          ev.stopPropagation();
+        });
+        input.addEventListener('blur', commit);
+        input.addEventListener('click', ev => ev.stopPropagation());
+        name.replaceWith(input);
+        input.focus();
+        input.select();
+      });
+      top.appendChild(rename);
+    }
     if (target.local || descriptor.local) {
       const self = document.createElement('span');
       self.className = 'acc-fleet-self';
@@ -74454,6 +74560,28 @@ function renderPeerAccessRequests(requests) {
     const pending = status === 'pending';
     const requestedProfile = req.approved_profile || req.requested_profile || 'read-only-display';
     const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
+    // Cross-owner tier claim (docs/src/trust-tiers.md § Where fleet
+    // metadata rides): the daemon stores requester_tier only when the
+    // claim was signed inside a verified caller-ID, so presence here
+    // already means "pinned to a proven daemon key". Unverified and
+    // legacy callers carry no claim and render exactly as before.
+    const requesterTier = String(req.requester_tier || '').trim();
+    // First-contact naming cue (trust-tiers § lookalike names): a
+    // VERIFIED caller key that matches a fleet record you have petnamed
+    // is a machine you know — say so by your name for it. A verified
+    // key with no petname is honest first contact: no name on file.
+    const callerId = String(req.requester_daemon_id || '').trim();
+    let callerLine = '';
+    if (callerId) {
+      const named = (typeof accessFleetTargets === 'function' ? accessFleetTargets() : [])
+        .find(t => String(t.connect_daemon_id || '').trim() === callerId && String(t.petname || '').trim());
+      callerLine = named
+        ? `caller: your “${escapeHtml(String(named.petname).trim())}” (verified key)`
+        : `caller: verified key ${escapeHtml(callerId.slice(0, 12))}… — no machine you’ve named`;
+    }
+    // THE upward-grant alarm case: a self-declared disposable machine
+    // asking for authority on this integrated one.
+    const upwardAlarm = pending && integratedTier && requesterTier === 'disposable';
     return `
       <div class="daemon-access-request-card">
         <div class="daemon-access-request-head">
@@ -74462,7 +74590,11 @@ function renderPeerAccessRequests(requests) {
         </div>
         <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - ${roleLabel} ${escapeHtml(role.label)}</div>
         <div class="daemon-access-request-meta daemon-role-summary">${escapeHtml(role.summary)}</div>
-        ${pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : ''}
+        ${callerLine ? `<div class="daemon-access-request-meta" title="The requesting daemon proved this identity key over the doorbell. A petname means it matches a machine YOU named; ‘no machine you’ve named’ means first contact — a lookalike never inherits a familiar name.">${callerLine}</div>` : ''}
+        ${requesterTier ? `<div class="daemon-access-request-meta" title="Stated by the requesting daemon inside its verified caller-ID signature — stored and shown only because the signature checked out.">requester says: ${escapeHtml(requesterTier)}</div>` : ''}
+        ${upwardAlarm
+          ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. Approving would hand a disposable box authority on this integrated one — the tier bridge the doctrine warns about.">⚠ Upward grant: this is a disposable machine asking for authority on an integrated one. Approving bridges your tiers.</div>'
+          : (pending && integratedTier ? '<div class="daemon-access-request-meta daemon-access-request-warn" title="Grants flow toward disposable machines, never up. If that daemon is lower-trust than this one, approving bridges your tiers — see the Trust tier card in Access.">⚠ Integrated-tier machine: approving grants a peer daemon authority here. Make sure trust flows downward.</div>' : '')}
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
         ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
