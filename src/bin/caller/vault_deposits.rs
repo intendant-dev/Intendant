@@ -108,8 +108,7 @@ pub fn save_deposit_key_in(path: &Path, key: &DepositKey) -> Result<(), String> 
     }
     let text = serde_json::to_string_pretty(key).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -242,8 +241,9 @@ pub fn list_deposits_in(dir: &Path) -> Result<Vec<DepositRecord>, String> {
         }
         match std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
-            .and_then(|text| serde_json::from_str::<DepositRecord>(&text).map_err(|e| e.to_string()))
-        {
+            .and_then(|text| {
+                serde_json::from_str::<DepositRecord>(&text).map_err(|e| e.to_string())
+            }) {
             Ok(record) => records.push(record),
             Err(e) => eprintln!("[vault-deposits] skipping {}: {e}", path.display()),
         }

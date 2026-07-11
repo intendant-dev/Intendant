@@ -157,11 +157,26 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
     // see which providers are fueled. Raw egress_* relay frames are a
     // separate wire family and deliberately not methods here.
-    method("api_credential_lease_grant", PeerOperation::CredentialsManage),
-    method("api_credential_lease_renew", PeerOperation::CredentialsManage),
-    method("api_credential_lease_revoke", PeerOperation::CredentialsManage),
-    method("api_credential_lease_status", PeerOperation::CredentialsManage),
-    method("api_credential_custody_trail", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_lease_grant",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_renew",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_revoke",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_status",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_custody_trail",
+        PeerOperation::CredentialsManage,
+    ),
     // Daemon-local vault blob storage (the local-vault half of custody):
     // blind E2E ciphertext the daemon can neither read nor forge, so a
     // direct dashboard has a vault home without any Connect service in
@@ -173,10 +188,22 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // publishes the vault's deposit public key here and folds queued
     // deposits into the blob on unlock. All ciphertext/public material —
     // the daemon can neither read deposits nor mint vault entries.
-    method("api_daemon_vault_deposit_key_fetch", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposit_key_publish", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposits_fetch", PeerOperation::CredentialsManage),
-    method("api_daemon_vault_deposits_consume", PeerOperation::CredentialsManage),
+    method(
+        "api_daemon_vault_deposit_key_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposit_key_publish",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_consume",
+        PeerOperation::CredentialsManage,
+    ),
     method(
         "api_credential_egress_register",
         PeerOperation::CredentialsManage,
@@ -185,7 +212,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_credential_egress_unregister",
         PeerOperation::CredentialsManage,
     ),
-    method("api_credential_egress_probe", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_egress_probe",
+        PeerOperation::CredentialsManage,
+    ),
     // The IAM grant mutations (upsert/update), enrollment decide, and
     // the seven org-manage methods live as tunnel columns on their route
     // rows — their IAM operations derive from the rows (S6).
@@ -260,7 +290,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_media_clip_cancel", PeerOperation::RuntimeControl),
     method("api_recordings", PeerOperation::RuntimeControl),
     method("api_recording_asset", PeerOperation::RuntimeControl),
-    method("api_browser_workspace_snapshot", PeerOperation::SessionInspect),
+    method(
+        "api_browser_workspace_snapshot",
+        PeerOperation::SessionInspect,
+    ),
     method("api_state_snapshot", PeerOperation::SessionInspect),
     method("api_session_log_replay", PeerOperation::SessionInspect),
     method(
@@ -364,7 +397,10 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
             runtime.project_root.is_some()
         }
         "api_mcp_tool_call" => runtime.mcp_server.is_some(),
-        method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
+        // api_transfer_* deliberately has no project_root gate: the store
+        // resolves through StoreScope (daemon-global fallback on projectless
+        // daemons), and the S9 HTTP rows already serve projectless — the
+        // old gate made the tunnel lane lie about the same store.
         method if method.starts_with("api_display_input_authority_") => {
             runtime.display_authority.is_some()
         }
@@ -414,7 +450,29 @@ pub enum DashboardControlGrant {
         label: String,
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+        /// Delegation-lane attribution (docs/src/trust-tiers.md § Two
+        /// lanes): the browser identity key that signed the relayed
+        /// offer, when one did. Attribution never widens authority —
+        /// the peer profile above remains the ceiling — it gives the
+        /// audit trail and the UI badge a human identity beside the
+        /// daemon principal.
+        attributed: Option<PeerAttribution>,
     },
+}
+
+/// The verified human identity behind a delegation-lane connection.
+#[derive(Clone, Debug)]
+pub struct PeerAttribution {
+    /// base64url(sha256(raw P-256 point)) — the IAM binding value.
+    pub fingerprint: String,
+    /// The raw public key, retained for display/audit.
+    #[allow(dead_code)] // recorded for the delegation-lane audit surface; not read yet
+    pub public_key_b64u: String,
+    /// The label of the enrolled user/client principal this key matches
+    /// in the TARGET's local IAM, when it matches one. `None` = a valid
+    /// signature from a key this daemon has never enrolled (attribution
+    /// is still recorded; the audit shows the fingerprint).
+    pub enrolled_label: Option<String>,
 }
 
 impl DashboardControlGrant {
@@ -631,13 +689,20 @@ impl DashboardPresenceBridge {
     }
 }
 
+/// Callback signatures for [`DashboardDisplayAuthorityBridge`]: each takes the
+/// dashboard client id (and a display id / id list) and returns event JSON.
+type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
+type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
+
 #[derive(Clone)]
 pub struct DashboardDisplayAuthorityBridge {
-    snapshot: Arc<dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync>,
-    state_frame: Arc<dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync>,
-    request: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    release: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    input_authorized: Arc<dyn Fn(&str, u32) -> bool + Send + Sync>,
+    snapshot: Arc<AuthoritySnapshotFn>,
+    state_frame: Arc<AuthorityStateFrameFn>,
+    request: Arc<AuthorityEventsFn>,
+    release: Arc<AuthorityEventsFn>,
+    input_authorized: Arc<AuthorityInputAuthorizedFn>,
     cleanup: Arc<dyn Fn(&str) + Send + Sync>,
     subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
 }
@@ -693,6 +758,18 @@ impl DashboardDisplayAuthorityBridge {
 }
 
 impl DashboardControlRegistry {
+    /// This daemon's own agent-card id — the target-id expectation for
+    /// delegation-lane attribution (the browser signs the id it dialed;
+    /// we verify it meant us).
+    pub fn local_card_id(&self) -> String {
+        self.agent_card
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
@@ -958,6 +1035,7 @@ pub struct DashboardControlPeer {
 }
 
 impl DashboardControlPeer {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     async fn answer_offer(
         session_id: String,
         offer_sdp: String,
@@ -2366,6 +2444,7 @@ mod tests {
             label: "peer-root".into(),
             profile: "peer-root".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
 
         let status = test_control_frame_response(
@@ -2466,6 +2545,7 @@ mod tests {
             label: "peer-operator".into(),
             profile: "peer-operator".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
         };
         let denied = test_control_frame_response(
             r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
@@ -2690,20 +2770,23 @@ mod tests {
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
-        assert_eq!(status["result"]["api_transfer_jobs_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_create_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_delete_available"], false);
+        // Projectless runtime: transfers stay available — the store resolves
+        // through the daemon-global StoreScope fallback, matching the S9
+        // HTTP rows (the old project_root gate made the tunnel lane lie).
+        assert_eq!(status["result"]["api_transfer_jobs_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_create_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_delete_available"], true);
         assert_eq!(
             status["result"]["api_transfer_download_read_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_chunk_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_commit_available"],
-            false
+            true
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
@@ -2940,28 +3023,12 @@ mod tests {
                 Some(Op::AccessInspect),
             ),
             ("api_dashboard_targets", Row, Some(Op::AccessInspect)),
-            (
-                "api_access_connect_status",
-                Row,
-                Some(Op::AccessInspect),
-            ),
-            (
-                "api_access_connect_claim_code",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_connect_status", Row, Some(Op::AccessInspect)),
+            ("api_access_connect_claim_code", Row, Some(Op::AccessManage)),
             ("api_access_connect_config", Row, Some(Op::AccessManage)),
-            (
-                "api_access_connect_unclaim",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_connect_unclaim", Row, Some(Op::AccessManage)),
             ("api_access_set_tier", Row, Some(Op::AccessManage)),
-            (
-                "api_access_set_hosted_ceiling",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_set_hosted_ceiling", Row, Some(Op::AccessManage)),
             ("api_fleet_cert_request", Row, Some(Op::AccessManage)),
             (
                 "api_credential_lease_grant",
@@ -3038,39 +3105,19 @@ mod tests {
                 Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_iam_update_grant",
-                Row,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_enrollment_decide",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_iam_update_grant", Row, Some(Op::AccessManage)),
+            ("api_access_enrollment_decide", Row, Some(Op::AccessManage)),
             ("api_access_org_trust", Row, Some(Op::AccessManage)),
             ("api_access_org_revoke", Row, Some(Op::AccessManage)),
             ("api_access_org_issue", Row, Some(Op::AccessManage)),
-            (
-                "api_access_org_revoke_member",
-                Row,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_org_issuer_init",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_org_revoke_member", Row, Some(Op::AccessManage)),
+            ("api_access_org_issuer_init", Row, Some(Op::AccessManage)),
             (
                 "api_access_org_issuer_delegate",
                 Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_org_issuer_install",
-                Row,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_org_issuer_install", Row, Some(Op::AccessManage)),
             ("api_access_org_present", Row, Some(Op::AccessInspect)),
             ("api_access_org_orl", Row, Some(Op::AccessInspect)),
             ("api_access_org_renew", Row, Some(Op::AccessInspect)),
@@ -3081,11 +3128,7 @@ mod tests {
             // row's canonical leaf, asserted per method by
             // gateway_routes::peers_family_tunnel_ops_assert_against_the_federation_ladder.
             ("api_peer_pairing_requests", Row, Some(Op::AccessInspect)),
-            (
-                "api_peer_pairing_identities",
-                Row,
-                Some(Op::AccessInspect),
-            ),
+            ("api_peer_pairing_identities", Row, Some(Op::AccessInspect)),
             (
                 "api_peer_pairing_request_decision",
                 Row,
@@ -3101,22 +3144,14 @@ mod tests {
             ("api_peer_eligible", Row, Some(Op::PeerInspect)),
             ("api_peer_webrtc_signal", Row, Some(Op::PeerUse)),
             ("api_peer_file_transfer_signal", Row, Some(Op::PeerUse)),
-            (
-                "api_peer_dashboard_control_signal",
-                Row,
-                Some(Op::PeerUse),
-            ),
+            ("api_peer_dashboard_control_signal", Row, Some(Op::PeerUse)),
             ("api_peer_message", Row, Some(Op::PeerUse)),
             ("api_peer_task", Row, Some(Op::PeerUse)),
             ("api_peer_approval", Row, Some(Op::PeerUse)),
             ("api_peer_add", Row, Some(Op::PeerManage)),
             ("api_peer_remove", Row, Some(Op::PeerManage)),
             ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
-            (
-                "api_peer_pairing_request_access",
-                Row,
-                Some(Op::PeerManage),
-            ),
+            ("api_peer_pairing_request_access", Row, Some(Op::PeerManage)),
             (
                 "api_peer_pairing_request_access_poll",
                 Row,
@@ -3137,41 +3172,17 @@ mod tests {
             ),
             ("api_sessions_search", Row, Some(Op::SessionInspect)),
             ("api_session_recordings", Row, Some(Op::SessionInspect)),
-            (
-                "api_session_recording_asset",
-                Row,
-                Some(Op::SessionInspect),
-            ),
+            ("api_session_recording_asset", Row, Some(Op::SessionInspect)),
             ("api_session_frame_asset", Row, Some(Op::SessionInspect)),
             ("api_worktrees", Row, Some(Op::SessionInspect)),
             ("api_worktrees_inspect", Row, Some(Op::SessionInspect)),
             ("api_session_delete", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_history",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_rollback",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_history", Row, Some(Op::SessionManage)),
+            ("api_session_current_rollback", Row, Some(Op::SessionManage)),
             ("api_session_current_redo", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_prune",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_changes",
-                Row,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_uploads",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_prune", Row, Some(Op::SessionManage)),
+            ("api_session_current_changes", Row, Some(Op::SessionManage)),
+            ("api_session_current_uploads", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload_raw",
                 Row,
@@ -3191,43 +3202,19 @@ mod tests {
             ("api_worktrees_scan", Row, Some(Op::SessionManage)),
             ("api_worktrees_remove", Row, Some(Op::SessionManage)),
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_upload",
-                Row,
-                Some(Op::SessionManage),
-            ),
+            ("api_session_current_upload", Row, Some(Op::SessionManage)),
             // The transfer family flipped Residue → Row with its
             // /api/transfers rows (S9, task #6): ops now derive from
             // the rows, same classes as always.
             ("api_transfer_jobs", Row, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_download_read",
-                Row,
-                Some(Op::FilesystemRead),
-            ),
+            ("api_transfer_download_read", Row, Some(Op::FilesystemRead)),
             ("api_fs_stat", Row, Some(Op::FilesystemRead)),
             ("api_fs_list", Row, Some(Op::FilesystemRead)),
             ("api_fs_read", Row, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_job_create",
-                Row,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_job_delete",
-                Row,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_chunk",
-                Row,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_commit",
-                Row,
-                Some(Op::FilesystemWrite),
-            ),
+            ("api_transfer_job_create", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_job_delete", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_chunk", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_commit", Row, Some(Op::FilesystemWrite)),
             ("api_fs_mkdir", Row, Some(Op::FilesystemWrite)),
             ("api_fs_write", Row, Some(Op::FilesystemWrite)),
             ("api_fs_rename", Row, Some(Op::FilesystemWrite)),
@@ -3298,21 +3285,9 @@ mod tests {
                 Some(Op::SessionInspect),
             ),
             ("api_dashboard_bootstrap", Residue, Some(Op::SessionInspect)),
-            (
-                "api_managed_context_records",
-                Row,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_anchors",
-                Row,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_fission",
-                Row,
-                Some(Op::SessionInspect),
-            ),
+            ("api_managed_context_records", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_anchors", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_fission", Row, Some(Op::SessionInspect)),
             ("api_external_agents", Row, Some(Op::SessionInspect)),
         ];
 
@@ -3407,7 +3382,9 @@ mod tests {
             .expect("DAEMON_API_HTTP_MAP not found in app.html")
             + start.len();
         let rest = &app[from..];
-        let to = rest.find("});").expect("DAEMON_API_HTTP_MAP is unterminated");
+        let to = rest
+            .find("});")
+            .expect("DAEMON_API_HTTP_MAP is unterminated");
 
         // One `name: { verb: '…', path: '…', … },` entry per line — the
         // fragment documents that contract next to the literal.
@@ -3417,8 +3394,7 @@ mod tests {
             let rest = &entry[at..];
             Some(rest[..rest.find('\'')?].to_string())
         }
-        let mut entries: std::collections::BTreeMap<String, (String, String)> =
-            Default::default();
+        let mut entries: std::collections::BTreeMap<String, (String, String)> = Default::default();
         for line in rest[..to].lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
@@ -3563,8 +3539,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let actual: std::collections::BTreeSet<&str> =
-            entries.keys().map(String::as_str).collect();
+        let actual: std::collections::BTreeSet<&str> = entries.keys().map(String::as_str).collect();
         assert_eq!(actual, expected, "DAEMON_API_HTTP_MAP coverage drifted");
 
         for (method_name, (verb, template)) in &entries {
@@ -3679,7 +3654,10 @@ mod tests {
             // happen to resolve through it.
             match route.pattern {
                 PathPattern::Exact(base) => {
-                    assert_eq!(template, base, "{method_name}: template != exact route path")
+                    assert_eq!(
+                        template, base,
+                        "{method_name}: template != exact route path"
+                    )
                 }
                 PathPattern::Under(base) => assert!(
                     template == base || template.starts_with(&format!("{base}/")),
@@ -4153,6 +4131,7 @@ mod tests {
                     read_roots: vec![],
                     write_roots: vec![dir.path().to_path_buf()],
                 },
+                attributed: None,
             };
             rt
         };
@@ -4475,5 +4454,4 @@ mod tests {
         );
         assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
     }
-
 }

@@ -108,7 +108,8 @@ pub struct McpAppState {
     /// Managed-context capability latched per Intendant/backend session id.
     pub session_codex_managed_context: std::collections::HashMap<String, bool>,
     /// Bidirectional aliases between Intendant wrapper ids and backend thread ids.
-    pub(crate) session_aliases: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(crate) session_aliases:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Latest backend usage sample by Intendant/backend session id.
     pub(crate) session_usage: std::collections::HashMap<String, frontend::ModelUsageSnapshot>,
     /// Latest observed phase by Intendant/backend session id.
@@ -122,7 +123,8 @@ pub struct McpAppState {
     pub(crate) pending_rewind_pressure_checks: std::collections::HashMap<String, String>,
     /// Last successful rewinds that did not reduce backend-reported pressure
     /// below the gate, keyed by Intendant/backend session id.
-    pub(crate) insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
+    pub(crate) insufficient_rewind_notices:
+        std::collections::HashMap<String, InsufficientRewindNotice>,
     /// Successful managed-context rewinds that satisfied the current density
     /// handoff/follow-up requirement until the round completes or pressure
     /// reaches rewind-only, keyed by Intendant/backend session id.
@@ -360,7 +362,10 @@ impl McpAppState {
         }
     }
 
-    pub(crate) fn usage_snapshot_for(&self, session_id: Option<&str>) -> crate::frontend::UsageSnapshot {
+    pub(crate) fn usage_snapshot_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> crate::frontend::UsageSnapshot {
         let mut usage = self.usage_snapshot();
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
             if let Some(main) = self.session_usage_for_id(id) {
@@ -446,7 +451,10 @@ impl McpAppState {
         out
     }
 
-    pub(crate) fn session_usage_for_id(&self, session_id: &str) -> Option<&frontend::ModelUsageSnapshot> {
+    pub(crate) fn session_usage_for_id(
+        &self,
+        session_id: &str,
+    ) -> Option<&frontend::ModelUsageSnapshot> {
         for related in self.session_related_ids(session_id) {
             if let Some(usage) = self.session_usage.get(&related) {
                 return Some(usage);
@@ -734,7 +742,10 @@ impl McpAppState {
         }
     }
 
-    pub(crate) fn remove_pending_rewind_pressure_check_for_key(&mut self, key: &str) -> Option<String> {
+    pub(crate) fn remove_pending_rewind_pressure_check_for_key(
+        &mut self,
+        key: &str,
+    ) -> Option<String> {
         let mut record_id = None;
         for related in self.rewind_related_keys(key) {
             if let Some(found) = self.pending_rewind_pressure_checks.remove(&related) {
@@ -876,7 +887,10 @@ impl McpAppState {
         }
     }
 
-    pub(crate) fn pending_rewind_pressure_check_for(&self, session_id: Option<&str>) -> Option<&String> {
+    pub(crate) fn pending_rewind_pressure_check_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<&String> {
         let key = self.rewind_session_key(session_id)?;
         self.rewind_related_keys(&key)
             .into_iter()
@@ -1349,7 +1363,7 @@ pub(crate) fn parse_verbosity(s: &str) -> Option<Verbosity> {
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
-    use crate::mcp::tests::{test_state};
+    use crate::mcp::tests::test_state;
 
     #[test]
     fn managed_ok_context_pressure_allows_noise_triggered_pruning() {

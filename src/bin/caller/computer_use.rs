@@ -2957,8 +2957,12 @@ mod tests {
         assert!(!results[0].success);
         assert_eq!(
             results[0].error.as_deref(),
-            Some(no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession, true))
-                .as_deref(),
+            Some(no_session_message(
+                DisplayBackend::Wayland,
+                &DisplayTarget::UserSession,
+                true
+            ))
+            .as_deref(),
             "private view at 0 must be unreachable even for an allowed caller"
         );
 

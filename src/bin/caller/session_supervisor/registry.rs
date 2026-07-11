@@ -113,7 +113,10 @@ impl SessionSupervisor {
         }
     }
 
-    pub(crate) async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
+    pub(crate) async fn resolve_target_session_id(
+        &self,
+        session_id: Option<String>,
+    ) -> Option<String> {
         let state = self.state.lock().await;
         let requested = session_id.or_else(|| state.active_session_id.clone())?;
         Some(state.resolve_session_id(&requested).unwrap_or(requested))
@@ -124,7 +127,10 @@ impl SessionSupervisor {
         state.session_is_managed(session_id)
     }
 
-    pub(crate) async fn resolve_persisted_external_managed_id(&self, session_id: &str) -> Option<String> {
+    pub(crate) async fn resolve_persisted_external_managed_id(
+        &self,
+        session_id: &str,
+    ) -> Option<String> {
         let (source, backend_session_id) =
             persisted_external_identity_for_session_in_home(&self.logs_home(), session_id)?;
         let state = self.state.lock().await;
@@ -185,6 +191,7 @@ impl SessionSupervisor {
         state.clear_external_attach_requested(keys);
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn register_session(
         &self,
         session_id: String,

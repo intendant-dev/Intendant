@@ -288,4 +288,3 @@ pub fn log_level_to_str(level: &LogLevel) -> &'static str {
         LogLevel::Debug => "debug",
     }
 }
-

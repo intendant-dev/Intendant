@@ -1525,9 +1525,9 @@ pub(crate) async fn handle_control_command_mcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::tests::test_state_with_log_dir;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
-    use crate::mcp::tests::{test_state_with_log_dir};
 
     #[tokio::test]
     async fn control_schedule_restart_rejects_missing_actions() {

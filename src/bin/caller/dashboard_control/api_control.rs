@@ -6,7 +6,10 @@
 
 use super::*;
 
-pub(crate) async fn api_settings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_settings_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let runtime_settings = {
         let session = runtime.shared_session.read().await;
         session.runtime_settings.clone()
@@ -22,7 +25,10 @@ pub(crate) async fn api_settings_response(id: String, runtime: &ControlRuntime) 
     )
 }
 
-pub(crate) async fn api_displays_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_displays_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let session_registry = {
         let session = runtime.shared_session.read().await;
         session.session_registry.clone()
@@ -34,7 +40,10 @@ pub(crate) async fn api_displays_response(id: String, runtime: &ControlRuntime) 
     )
 }
 
-pub(crate) async fn api_voice_session_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_voice_session_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let provider = runtime
         .config
         .get("provider")
@@ -69,7 +78,10 @@ pub(crate) async fn api_browser_workspace_snapshot_response(id: String) -> serde
     })
 }
 
-pub(crate) async fn api_state_snapshot_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_state_snapshot_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let (daemon_session_id, query_ctx, session_log) = {
         let session = runtime.shared_session.read().await;
         (
@@ -208,7 +220,10 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     })
 }
 
-pub(crate) async fn api_display_bootstrap_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_display_bootstrap_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let mut frames = display_ready_bootstrap_frames(runtime).await;
     frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
@@ -488,7 +503,9 @@ pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
         .unwrap_or(0)
 }
 
-pub(crate) async fn display_authority_snapshot_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+pub(crate) async fn display_authority_snapshot_frames(
+    runtime: &ControlRuntime,
+) -> Vec<serde_json::Value> {
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return Vec::new();
     };
@@ -512,7 +529,9 @@ pub(crate) fn display_bootstrap_omitted(runtime: &ControlRuntime) -> Vec<&'stati
     }
 }
 
-pub(crate) async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+pub(crate) async fn display_ready_bootstrap_frames(
+    runtime: &ControlRuntime,
+) -> Vec<serde_json::Value> {
     let display_ids = active_display_ids(runtime).await;
     let session_registry = {
         let session = runtime.shared_session.read().await;
@@ -641,7 +660,10 @@ pub(crate) async fn active_replay_log_dir(runtime: &ControlRuntime) -> Option<Pa
         })
 }
 
-pub(crate) async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_worktrees_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     frame_api_json_body_response(
         id,
         crate::web_gateway::worktrees_list_api_response(&runtime.worktree_inventory_cache),
@@ -675,7 +697,10 @@ pub(crate) async fn api_worktrees_inspect_response(
     }
 }
 
-pub(crate) async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_worktrees_scan_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let project_root = runtime.project_root.clone();
     let cache = runtime.worktree_inventory_cache.clone();
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -1198,7 +1223,11 @@ pub(crate) fn dashboard_control_msg_from_params(
     })
 }
 
-pub(crate) fn dispatch_dashboard_control_msg(bus: &crate::event::EventBus, ctrl: ControlMsg, scope: &str) {
+pub(crate) fn dispatch_dashboard_control_msg(
+    bus: &crate::event::EventBus,
+    ctrl: ControlMsg,
+    scope: &str,
+) {
     let action = dashboard_control_msg_action(&ctrl);
     bus.send(AppEvent::PresenceLog {
         message: format!("[dashboard-control:{scope}] ControlMsg: {action}"),
@@ -1829,7 +1858,10 @@ mod tests {
             .and_then(|line| line.split_whitespace().next())
             .and_then(|code| code.parse::<u16>().ok())
             .expect("status line");
-        (status, serde_json::from_slice(&bytes[split + 4..]).expect("json body"))
+        (
+            status,
+            serde_json::from_slice(&bytes[split + 4..]).expect("json body"),
+        )
     }
 
     #[tokio::test]
@@ -2136,13 +2168,12 @@ mod tests {
         // Tempdir roots: the success body rides both lanes and each
         // lane's save lands in its own injected root.
         let http_dir = tempfile::tempdir().expect("temp http root");
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::settings_post_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::settings_post_api_response(
                 &body_text,
                 Some(http_dir.path()),
                 &rt.bus,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         assert_eq!(http_body, serde_json::json!({"ok": true}));
         assert!(http_dir.path().join("intendant.toml").exists());
@@ -2168,18 +2199,14 @@ mod tests {
         // carries _httpOk true.
         let payload = serde_json::json!({"keys": {"NOT_A_KNOWN_KEY": "x"}});
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::api_keys_save_api_response(
-                None,
-                &params_body_text(Some(&payload)),
-            ),
+            crate::web_gateway::api_keys_save_api_response(None, &params_body_text(Some(&payload))),
         );
         assert_eq!(status, 200);
         assert_eq!(
             http_body,
             serde_json::json!({"error": "Unknown key: NOT_A_KNOWN_KEY"})
         );
-        let frame =
-            api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
+        let frame = api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
         let mut result = frame["result"].clone();
         let map = result.as_object_mut().expect("result object");
         assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
@@ -2482,20 +2509,18 @@ mod tests {
     #[tokio::test]
     async fn parity_access_tier_settings_shares_the_core_across_lanes() {
         let tmp = tempfile::tempdir().expect("temp cert dir");
-        let actor =
-            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
 
         // Validation error: the shared core's wording surfaces as the
         // HTTP `{"error"}` body and the tunnel's frame-level error
         // (difference #10) — no store touched.
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_tier_settings_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
                 false,
                 serde_json::json!({"tier": 123}),
                 &actor,
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         assert_eq!(
             http_body,
@@ -2518,14 +2543,13 @@ mod tests {
         // through the one core (the `iam` overview metadata carries
         // store fingerprints, so equality is asserted on the mutation's
         // own fields).
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_tier_settings_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
                 false,
                 serde_json::json!({"tier": "disposable"}),
                 &actor,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         assert_eq!(http_body["tier"], "disposable");
         let frame = frame_api_ok_error_response(
@@ -2540,7 +2564,10 @@ mod tests {
         );
         assert_eq!(frame["ok"], true);
         assert_eq!(frame["result"]["tier"], "disposable");
-        assert_eq!(frame["result"]["schema_version"], http_body["schema_version"]);
+        assert_eq!(
+            frame["result"]["schema_version"],
+            http_body["schema_version"]
+        );
 
         // Hosted ceiling validation on both lanes.
         let frame = frame_api_ok_error_response(
@@ -2585,10 +2612,8 @@ mod tests {
         let mut rt = runtime();
         rt.project_root = Some(dir.path().to_path_buf());
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_connect_unclaim_api_response(
-                Some(dir.path().to_path_buf()),
-            )
-            .await,
+            crate::web_gateway::access_connect_unclaim_api_response(Some(dir.path().to_path_buf()))
+                .await,
         );
         assert_eq!(status, 400);
         assert_eq!(
@@ -2619,8 +2644,7 @@ mod tests {
     #[tokio::test]
     async fn parity_iam_grant_mutations_share_cores_over_an_injected_cert_dir() {
         let tmp = tempfile::tempdir().expect("temp cert dir");
-        let actor =
-            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
 
         // Upsert success: same body from the one core on both lanes
         // (fresh store per lane call is NOT possible — the second call
@@ -2658,17 +2682,19 @@ mod tests {
             .is_some_and(|map| !map.contains_key("_httpStatus")));
         // Second upsert of the same fingerprint updates in place.
         assert_eq!(frame["result"]["created_grant"], serde_json::json!(false));
-        assert_eq!(frame["result"]["schema_version"], http_body["schema_version"]);
+        assert_eq!(
+            frame["result"]["schema_version"],
+            http_body["schema_version"]
+        );
 
         // Update decode error: deterministic serde wording as the HTTP
         // {"error"} body and the tunnel frame-level error.
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_iam_update_grant_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_iam_update_grant_api_response(
                 tmp.path(),
                 serde_json::json!({}),
                 &actor,
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = frame_api_ok_error_response(
             "parity-iam-update".to_string(),
@@ -2686,11 +2712,7 @@ mod tests {
         // both lanes before any store access.
         let decide = || serde_json::json!({ "fingerprint": "PA:R1:EN", "approve": true });
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_enrollment_decide_api_response(
-                tmp.path(),
-                decide(),
-                &actor,
-            ),
+            crate::web_gateway::access_enrollment_decide_api_response(tmp.path(), decide(), &actor),
         );
         assert_eq!(status, 400);
         assert_eq!(
@@ -2699,15 +2721,14 @@ mod tests {
         );
         let frame = frame_api_ok_error_response(
             "parity-enroll-decide".to_string(),
-            crate::web_gateway::access_enrollment_decide_api_response(
-                tmp.path(),
-                decide(),
-                &actor,
-            ),
+            crate::web_gateway::access_enrollment_decide_api_response(tmp.path(), decide(), &actor),
             "enrollment decide",
         );
         assert_eq!(frame["ok"], false);
-        assert_eq!(frame["error"], "no pending enrollment for fingerprint PA:R1:EN");
+        assert_eq!(
+            frame["error"],
+            "no pending enrollment for fingerprint PA:R1:EN"
+        );
     }
 
     #[tokio::test]
@@ -2743,19 +2764,21 @@ mod tests {
                 "{method} vs {path}"
             );
         }
-        assert_eq!(OrgManageLeaf::from_control_method("api_access_org_present"), None);
+        assert_eq!(
+            OrgManageLeaf::from_control_method("api_access_org_present"),
+            None
+        );
 
         // Issue without keys: the deterministic error body on both lanes
         // from the one fan-out (the signing successes need real org keys
         // and stay smoke-covered — validate-org-grants).
         let params = || serde_json::json!({ "handle": "parity-org" });
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_org_manage_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_manage_api_response(
                 tmp.path(),
                 OrgManageLeaf::Issue,
                 params(),
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = frame_api_ok_error_response(
             "parity-org-issue".to_string(),
@@ -2772,13 +2795,12 @@ mod tests {
         // Issuer init: both lanes create/read the deputy key under the
         // injected store — the SAME key once created, so the bodies are
         // equal across the two calls.
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_org_manage_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_manage_api_response(
                 tmp.path(),
                 OrgManageLeaf::IssuerInit,
                 params(),
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         let frame = frame_api_ok_error_response(
             "parity-org-issuer-init".to_string(),
@@ -2820,13 +2842,12 @@ mod tests {
         // (the verify successes need real signed documents — smoke-
         // covered by validate-org-grants).
         let card = serde_json::json!({});
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_org_present_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_present_api_response(
                 tmp.path(),
                 serde_json::json!({}),
                 &card,
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = frame_api_ok_error_response(
             "parity-org-present".to_string(),
@@ -2855,12 +2876,11 @@ mod tests {
         assert_eq!(frame["error"], http_body["error"]);
 
         // Apply + renew decode errors: one core wording per leaf.
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::access_org_orl_apply_api_response(
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_orl_apply_api_response(
                 tmp.path(),
                 serde_json::json!({}),
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = frame_api_ok_error_response(
             "parity-org-orl-apply".to_string(),
@@ -2957,8 +2977,7 @@ mod tests {
         // and stay smoke-covered by the peer validators).
         let registry = empty_peer_registry();
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::coordinator_route_api_response("POST", "{}", Some(&registry))
-                .await,
+            crate::web_gateway::coordinator_route_api_response("POST", "{}", Some(&registry)).await,
         );
         assert_eq!(status, 400);
 
@@ -2999,8 +3018,7 @@ mod tests {
         assert_eq!(http_body["error"], "peer registry not configured");
 
         let rt = runtime();
-        let frame =
-            api_peer_add_response("parity-no-registry".to_string(), None, &rt).await;
+        let frame = api_peer_add_response("parity-no-registry".to_string(), None, &rt).await;
         assert_eq!(frame["ok"], false);
         assert_eq!(frame["error"], "peer registry unavailable");
     }
@@ -3149,8 +3167,8 @@ mod tests {
         assert_eq!(result, http_body);
     }
 
+    use crate::dashboard_control::tests::runtime;
     use crate::*;
-    use crate::dashboard_control::tests::{runtime};
 
     /// The SPA mirrors the action-message allowlist as
     /// `DASHBOARD_ACTION_MSG_RPC_ACTIONS` (static/app/31-init-identity-fleet.js)
@@ -3567,7 +3585,7 @@ mod tests {
         assert_eq!(written, ndjson);
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn api_dashboard_action_msg_applies_diagnostics_visual_marker_to_display_registry() {
         let rt = runtime();
         let registry = Arc::new(tokio::sync::RwLock::new(

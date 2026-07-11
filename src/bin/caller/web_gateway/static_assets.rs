@@ -600,7 +600,11 @@ mod tests {
         let app_html_path = dir.path().join("app.html");
         // No sibling yet: fall back to the embedded kernel.
         assert!(vault_kernel_override_response("GET", "", "", &app_html_path).is_none());
-        std::fs::write(dir.path().join("vault-kernel.js"), b"self.onmessage=null;\n").unwrap();
+        std::fs::write(
+            dir.path().join("vault-kernel.js"),
+            b"self.onmessage=null;\n",
+        )
+        .unwrap();
         let resp = vault_kernel_override_response("GET", "", "", &app_html_path)
             .expect("sibling kernel must be served");
         let text = String::from_utf8_lossy(&resp);

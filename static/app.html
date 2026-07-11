@@ -987,6 +987,18 @@ html {
 .acc-chip.acc-tier-integrated { border-color: color-mix(in srgb, var(--peach) 35%, transparent); color: var(--peach); }
 .acc-chip.acc-tier-disposable::before { background: var(--overlay1); }
 .acc-chip.acc-tier-disposable { color: var(--subtext0); }
+/* Two-lane badges (trust-tiers § Two lanes): whose authority a pane
+   spends. 'you · role' stays quiet; 'via daemon · profile' is visibly
+   other; the warn variant marks the one doctrine alarm — an integrated
+   machine reached through the delegation lane. */
+.acc-badge.lane-user { color: var(--subtext0); }
+.acc-badge.lane-via { border-color: color-mix(in srgb, var(--mauve) 35%, transparent); color: var(--mauve); }
+.acc-badge.lane-via.lane-warn,
+.target-summary-kind.lane-warn {
+  border-color: color-mix(in srgb, var(--peach) 55%, transparent);
+  color: var(--peach);
+  font-weight: 600;
+}
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {
@@ -52618,6 +52630,39 @@ function dashboardTargetFeatureChips(hostId, context = '') {
   return chips;
 }
 
+/* The two-lane badge (docs/src/trust-tiers.md § Two lanes): the ONE
+   thing a user must understand about any fleet surface — whose
+   authority the pane is spending on the target.
+   - user lane:        { lane:'user',  text:'you · <role>' }
+   - delegation lane:  { lane:'via',   text:'via <daemon> · <profile>'
+                         (+ ' · you' when this browser's signed offer
+                         was attributed by the target) }
+   - warn: true only for the one case the doctrine warns about —
+     reaching an INTEGRATED machine through the delegation lane. */
+function dashboardLaneBadge(hostId) {
+  const target = dashboardTargetDescriptor(hostId);
+  if (target.local) {
+    const role = String(target.accessRole || '').trim() || 'root';
+    return { lane: 'user', text: `you · ${role}`, warn: false };
+  }
+  const conn = peerDashboardControlConnectionsByHost.get(String(hostId || '').trim());
+  const status = conn?.lastStatus || {};
+  const profile = String(status.grant_profile || target.profile || '').trim() || 'peer';
+  const viaLabel = String(selfHostLabel || 'this daemon').trim();
+  const attributed = Boolean(status.attributed_fingerprint);
+  const record = accessFleetTargets().find(t =>
+    String(t.host_id || t.id || '').trim() === String(hostId || '').trim());
+  const warn = String(record?.tier || '').trim() === 'integrated';
+  return {
+    lane: 'via',
+    text: `via ${viaLabel} · ${profile}${attributed ? ' · you' : ''}`,
+    warn,
+    title: warn
+      ? 'This machine is marked integrated — its owner should be reached as themselves (direct tab or app), not through another daemon\u2019s grant.'
+      : `Acting through ${viaLabel}\u2019s peer grant (profile: ${profile})${attributed ? ' — your identity key is attributed on the target' : ''}.`,
+  };
+}
+
 function dashboardTargetSummary(hostId, context = '') {
   const target = dashboardTargetDescriptor(hostId);
   const local = target.local;
@@ -52633,13 +52678,14 @@ function dashboardTargetSummary(hostId, context = '') {
     return {
       state: transport.kind === 'err' ? 'err' : (connected ? 'ok' : 'checking'),
       name: target.displayName,
-      kind: target.routeType,
+      kind: dashboardLaneBadge(hostId).text,
       detail,
       chips: dashboardTargetFeatureChips('', context),
       title: transport.title || detail,
     };
   }
 
+  const laneBadge = dashboardLaneBadge(hostId);
   const peerId = target.hostId;
   const peer = target.peer;
   if (!peer) {
@@ -52667,7 +52713,9 @@ function dashboardTargetSummary(hostId, context = '') {
   return {
     state: online ? (conn?.canUseRpc?.() ? 'ok' : 'checking') : 'err',
     name: dashboardTargetLabel(peerId),
-    kind: target.routeType,
+    kind: laneBadge.text,
+    kindWarn: laneBadge.warn,
+    kindTitle: laneBadge.title || '',
     detail: `${target.accessDomain}: ${access} · ${via}`,
     chips: dashboardTargetFeatureChips(peerId, context),
     title: online
@@ -52695,8 +52743,9 @@ function renderDashboardTargetSummary(elementId, hostId, context = '') {
   name.className = 'target-summary-name';
   name.textContent = summary.name || 'Target';
   const kind = document.createElement('span');
-  kind.className = 'target-summary-kind';
+  kind.className = `target-summary-kind${summary.kindWarn ? ' lane-warn' : ''}`;
   kind.textContent = summary.kind || '';
+  if (summary.kindTitle) kind.title = summary.kindTitle;
   row.append(name, kind);
   const detail = document.createElement('div');
   detail.className = 'target-summary-detail';
@@ -55301,10 +55350,17 @@ function renderAccessFleetStrip() {
     meta.className = 'acc-fleet-meta';
     const route = accessRouteInfoForTarget(target, descriptor, rememberedOnly);
     meta.appendChild(accessRouteChip(route.kind, route.label));
-    const roleLabel = target.effective_role_label || descriptor.accessRole || '';
-    if (roleLabel) {
-      const roleId = /peer/i.test(roleLabel) ? 'role:peer-profile' : (/root/i.test(roleLabel) ? 'role:root' : '');
-      meta.appendChild(accessRoleBadge(roleId, roleLabel));
+    // The two-lane badge is the one authority statement every fleet
+    // card wears (trust-tiers § Two lanes): 'you · <role>' or
+    // 'via <daemon> · <profile>', warning only when an integrated
+    // machine is reached through the delegation lane.
+    {
+      const lane = dashboardLaneBadge(target.local ? '' : String(target.host_id || target.id || '').trim());
+      const badge = document.createElement('span');
+      badge.className = `acc-badge lane-${lane.lane}${lane.warn ? ' lane-warn' : ''}`;
+      badge.textContent = lane.text;
+      if (lane.title) badge.title = lane.title;
+      meta.appendChild(badge);
     }
     const provenanceChip = accessTargetProvenanceChip(target);
     if (provenanceChip) meta.appendChild(provenanceChip);
@@ -68876,6 +68932,17 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
     };
     if (this.advertiseTcpViaUrl) {
       signal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
+    }
+    // Delegation-lane attribution (trust-tiers § Two lanes): sign the
+    // offer with this browser's identity key so the TARGET can record
+    // who is behind the relayed channel (and refuse a spliced one).
+    // daemonId = the target we mean; the target verifies it meant it.
+    // No identity key (unsupported browser) → unattributed, admitted.
+    try {
+      const fields = await clientIdentityOfferFields(this.hostId, this.clientNonce, sdp);
+      if (fields) Object.assign(signal, fields);
+    } catch (err) {
+      console.warn(`[peer-dashboard-control ${this.hostId}] offer attribution skipped:`, err?.message || err);
     }
     await this.sendSignal(signal, options);
     return null;

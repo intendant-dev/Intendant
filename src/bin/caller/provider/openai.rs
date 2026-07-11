@@ -59,7 +59,9 @@ pub(crate) fn openai_function_call_output(call_id: &str, output: &str) -> serde_
 }
 
 /// Parse an OpenAI computer_call action into a CuAction.
-pub(crate) fn parse_openai_cu_action(action: &serde_json::Value) -> Option<crate::computer_use::CuAction> {
+pub(crate) fn parse_openai_cu_action(
+    action: &serde_json::Value,
+) -> Option<crate::computer_use::CuAction> {
     use crate::computer_use::*;
 
     let action_type = action.get("type")?.as_str()?;
@@ -966,7 +968,7 @@ pub(crate) fn build_openai_request_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::tests::{tool_msg_with_images};
+    use crate::provider::tests::tool_msg_with_images;
 
     #[test]
     fn openai_provider_name() {

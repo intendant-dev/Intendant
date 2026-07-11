@@ -1090,17 +1090,16 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
                 );
             }
         }
-        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(cid)) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(cid))
             if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
-                && state.tile_delta_backpressure.on_buffered_amount_low()
-            {
-                let stats = state.tile_delta_backpressure.stats();
-                eprintln!(
-                    "[display/webrtc] tile-deltas backpressure low: \
+                && state.tile_delta_backpressure.on_buffered_amount_low() =>
+        {
+            let stats = state.tile_delta_backpressure.stats();
+            eprintln!(
+                "[display/webrtc] tile-deltas backpressure low: \
                      resuming supersedable deltas (sent={} dropped={})",
-                    stats.sent_frames, stats.dropped_frames
-                );
-            }
+                stats.sent_frames, stats.dropped_frames
+            );
         }
         _ => {}
     }

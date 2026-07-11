@@ -290,10 +290,8 @@ impl AgentStateSnapshot {
                     .unwrap_or("")
                     .to_string();
                 if let Some(options) = first.and_then(|q| q["options"].as_array()) {
-                    let labels: Vec<&str> = options
-                        .iter()
-                        .filter_map(|o| o["label"].as_str())
-                        .collect();
+                    let labels: Vec<&str> =
+                        options.iter().filter_map(|o| o["label"].as_str()).collect();
                     if !labels.is_empty() {
                         question.push_str(&format!(" ({})", labels.join(" / ")));
                     }

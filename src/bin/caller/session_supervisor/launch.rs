@@ -15,6 +15,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn start_new_session(
         &self,
         task: String,
@@ -414,6 +415,7 @@ impl SessionSupervisor {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn resume_session(
         &self,
         source: String,
@@ -818,7 +820,7 @@ impl SessionSupervisor {
             UserAttachments::from_items(resolved_attachments),
             None,
             Some(resume_token.clone()),
-            (external_backend.is_some() && !force_new).then(|| resume_token),
+            (external_backend.is_some() && !force_new).then_some(resume_token),
             false,
             None,
             codex_service_tier,
@@ -860,6 +862,7 @@ impl SessionSupervisor {
 }
 
 impl SessionSupervisor {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_agent_session(
         &self,
         session_id: String,
@@ -952,8 +955,7 @@ impl SessionSupervisor {
                         // the last layer (whitelisted key names only — see
                         // provider::ProjectEnvKeys).
                         provider::select_provider_for_project(Some(&project.root))
-                    })
-                {
+                    }) {
                     Ok(provider) => provider,
                     Err(e) => {
                         supervisor
@@ -978,9 +980,7 @@ impl SessionSupervisor {
                 let native = NativeSessionConfig {
                     role: match sub_agent_wiring.as_ref() {
                         Some(w) => w.role.clone(),
-                        None if use_direct => {
-                            sub_agent::SubAgentRole::Custom("direct".to_string())
-                        }
+                        None if use_direct => sub_agent::SubAgentRole::Custom("direct".to_string()),
                         None => sub_agent::SubAgentRole::Orchestrator,
                     },
                     system_prompt_override: sub_agent_wiring
@@ -1058,9 +1058,7 @@ impl SessionSupervisor {
                         let (brief, _) = parse_brief(&full);
                         let status = match stats.terminal_outcome.as_deref() {
                             None | Some("completed") => sub_agent::SubAgentStatus::Completed,
-                            Some(outcome) => {
-                                sub_agent::SubAgentStatus::Failed(outcome.to_string())
-                            }
+                            Some(outcome) => sub_agent::SubAgentStatus::Failed(outcome.to_string()),
                         };
                         sub_agent::SubAgentResult {
                             id: w.child_name.clone(),
@@ -1147,6 +1145,7 @@ impl SessionSupervisor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_cu_task(
         &self,
         session_id: &str,
@@ -1185,12 +1184,7 @@ impl SessionSupervisor {
             });
             // Grant state from the autonomy guard (the single source of
             // truth), read when the CU task is dispatched.
-            let user_display_granted = supervisor
-                .config
-                .autonomy
-                .read()
-                .await
-                .user_display_granted;
+            let user_display_granted = supervisor.config.autonomy.read().await.user_display_granted;
             let cu_target = display_target
                 .as_deref()
                 .map(|s| parse_display_target_str(s, user_display_granted));
@@ -1216,7 +1210,7 @@ impl SessionSupervisor {
                         level: None,
                         turn: None,
                     });
-                    Ok(stats)
+                    Ok(*stats)
                 }
                 Ok(CuTaskResult::Escalate { task }) => {
                     bus.send(AppEvent::PresenceLog {
@@ -1399,7 +1393,11 @@ pub(crate) fn native_session_meta_project_root(session_id: &str) -> Option<PathB
     meta.project_root.map(PathBuf::from)
 }
 
-pub(crate) fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: bool) -> PathBuf {
+pub(crate) fn external_resume_log_dir_in_home(
+    home: &Path,
+    session_id: &str,
+    force_new: bool,
+) -> PathBuf {
     if !force_new {
         if let Some(dir) = session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
             return dir;
@@ -1481,8 +1479,10 @@ pub(crate) fn persisted_external_identity_for_session_in_home(
     // the wrapper index instead (`effective_external_resume_token_in_home`).
     let identity =
         crate::session_identity::scan_session_dir(&log_dir, session_id)?.latest_matching?;
-    if !external_agent::source_session_id_is_canonical(&identity.source, &identity.backend_session_id)
-    {
+    if !external_agent::source_session_id_is_canonical(
+        &identity.source,
+        &identity.backend_session_id,
+    ) {
         return None;
     }
     Some((identity.source, identity.backend_session_id))
@@ -1534,7 +1534,11 @@ pub(crate) fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-pub(crate) fn external_attach_dedupe_keys(source: &str, session_id: &str, resume_token: &str) -> Vec<String> {
+pub(crate) fn external_attach_dedupe_keys(
+    source: &str,
+    session_id: &str,
+    resume_token: &str,
+) -> Vec<String> {
     let source = source.trim().to_lowercase();
     if source.is_empty() {
         return Vec::new();
@@ -1553,7 +1557,9 @@ pub(crate) fn external_attach_dedupe_keys(source: &str, session_id: &str, resume
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_supervisor::tests::{managed_session, test_supervisor, test_supervisor_with_mock_provider};
+    use crate::session_supervisor::tests::{
+        managed_session, test_supervisor, test_supervisor_with_mock_provider,
+    };
 
     fn write_external_wrapper_identity(
         home: &Path,
@@ -1743,11 +1749,9 @@ mod tests {
     #[test]
     fn project_root_override_with_explicit_root_works_without_default() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_project_root_override(
-            Some(dir.path().to_string_lossy().to_string()),
-            None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_project_root_override(Some(dir.path().to_string_lossy().to_string()), None)
+                .unwrap();
         assert_eq!(resolved, dir.path().canonicalize().unwrap());
     }
 

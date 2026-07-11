@@ -116,7 +116,9 @@ pub(crate) enum DisplayRequestOutcome {
     DeniedForSession,
     /// The request evaporated without a user decision (requesting session
     /// ended).
-    Cancelled { reason: String },
+    Cancelled {
+        reason: String,
+    },
 }
 
 impl DisplayRequestOutcome {
@@ -403,7 +405,12 @@ impl DisplayRequestRegistry {
     /// The blocked tool's wait window elapsed. Removes the entry (if a
     /// resolution didn't win the race) and arms the deny cooldown —
     /// a timeout is a decline by absence.
-    pub(crate) fn timeout_pending(&self, session_key: &str, id: u64, now_unix_ms: u64) -> TimeoutOutcome {
+    pub(crate) fn timeout_pending(
+        &self,
+        session_key: &str,
+        id: u64,
+        now_unix_ms: u64,
+    ) -> TimeoutOutcome {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let matches = inner
             .pending
@@ -425,7 +432,11 @@ impl DisplayRequestRegistry {
     /// a newer arrangement.
     pub(crate) fn take_grant_if_current(&self, token: u64) -> Option<u32> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.active_grant.as_ref().is_some_and(|g| g.token == token) {
+        if inner
+            .active_grant
+            .as_ref()
+            .is_some_and(|g| g.token == token)
+        {
             return inner.active_grant.take().map(|g| g.display_id);
         }
         None
@@ -600,7 +611,14 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), DisplayRequestOutcome::Denied);
 
         // Inside the cooldown window: refused without a new popup.
-        match registry.raise("sess-b", DisplayRequestAccess::View, "again", 120, true, NOW + 1000) {
+        match registry.raise(
+            "sess-b",
+            DisplayRequestAccess::View,
+            "again",
+            120,
+            true,
+            NOW + 1000,
+        ) {
             RaiseOutcome::Cooldown { retry_after_secs } => {
                 assert!(retry_after_secs > 0);
                 assert!(retry_after_secs <= DISPLAY_REQUEST_DENY_COOLDOWN_SECS);
@@ -609,7 +627,14 @@ mod tests {
         }
         // Past the window: a new request raises again.
         let after = NOW + DISPLAY_REQUEST_DENY_COOLDOWN_SECS * 1000 + 1;
-        match registry.raise("sess-b", DisplayRequestAccess::View, "again", 120, true, after) {
+        match registry.raise(
+            "sess-b",
+            DisplayRequestAccess::View,
+            "again",
+            120,
+            true,
+            after,
+        ) {
             RaiseOutcome::Raised { .. } => {}
             _ => panic!("expected Raised after cooldown"),
         }
@@ -634,18 +659,39 @@ mod tests {
         );
         // Every later request is insta-refused server-side.
         assert!(matches!(
-            registry.raise("sess-c", DisplayRequestAccess::View, "x", 120, true, NOW + 1),
+            registry.raise(
+                "sess-c",
+                DisplayRequestAccess::View,
+                "x",
+                120,
+                true,
+                NOW + 1
+            ),
             RaiseOutcome::Suppressed
         ));
         // Other sessions are unaffected.
         assert!(matches!(
-            registry.raise("sess-d", DisplayRequestAccess::View, "x", 120, true, NOW + 1),
+            registry.raise(
+                "sess-d",
+                DisplayRequestAccess::View,
+                "x",
+                120,
+                true,
+                NOW + 1
+            ),
             RaiseOutcome::Raised { .. }
         ));
         // Session end clears the suppression.
         registry.on_session_ended("sess-c");
         assert!(matches!(
-            registry.raise("sess-c", DisplayRequestAccess::View, "x", 120, true, NOW + 2),
+            registry.raise(
+                "sess-c",
+                DisplayRequestAccess::View,
+                "x",
+                120,
+                true,
+                NOW + 2
+            ),
             RaiseOutcome::Raised { .. }
         ));
     }
@@ -685,7 +731,14 @@ mod tests {
         );
         // Timeout armed the cooldown.
         assert!(matches!(
-            registry.raise("sess-f", DisplayRequestAccess::View, "x", 120, true, NOW + 121_000),
+            registry.raise(
+                "sess-f",
+                DisplayRequestAccess::View,
+                "x",
+                120,
+                true,
+                NOW + 121_000
+            ),
             RaiseOutcome::Cooldown { .. }
         ));
         // A resolution can no longer land on the timed-out id.

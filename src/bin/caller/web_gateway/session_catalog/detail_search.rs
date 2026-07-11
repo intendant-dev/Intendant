@@ -671,7 +671,7 @@ pub(crate) fn search_session_log_file(
     let reader = std::io::BufReader::new(file);
     let candidates = reader
         .lines()
-        .filter_map(Result::ok)
+        .map_while(Result::ok)
         .filter_map(|line| session_log_search_candidate_from_line(&line));
     Some(search_session_log_candidates(
         candidates,

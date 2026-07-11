@@ -75,7 +75,6 @@ pub(crate) use ws_session::*;
 mod http_dispatch;
 pub(crate) use http_dispatch::*;
 
-
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
 /// stable identity within a display session.
@@ -163,7 +162,6 @@ pub struct WebQueryCtx {
     pub context_injection: Option<crate::event::ContextInjectionQueue>,
 }
 
-
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceDebugState {
@@ -249,14 +247,12 @@ impl Default for WebGatewayConfig {
     }
 }
 
-
 // Deliberately no Access-Control-Allow-Origin here: API responses are
 // same-origin by default. Cross-origin readability is opt-in — the fleet
 // Access APIs echo allowlisted origins (`HttpResponse::fleet_cors`) and the
 // public bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
 // any website read cert-authenticated responses through a visitor's
 // browser (see docs/src/trust-architecture.md).
-
 
 // ── Persistent session-list index ──
 // The per-session caches below already carry exact invalidation
@@ -276,25 +272,20 @@ impl Default for WebGatewayConfig {
 // source path no longer exists are pruned during the preload sweep —
 // deleted sessions otherwise accumulate dead index files forever.
 
-
 // Stale-while-revalidate: within the TTL a cached list is fresh; past it
 // (up to the stale ceiling) the cached body is served IMMEDIATELY and one
 // background refresh is kicked, so an interactive dashboard never blocks
 // on a rescan. Only a very stale (or absent) entry rebuilds inline.
 
-
 // ---------------------------------------------------------------------------
 // Per-round file snapshot history endpoints
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // File upload endpoints
 // ---------------------------------------------------------------------------
 
-
 // Same-origin by default (the canonical json tail carries no CORS header).
-
 
 /// Check whether it is safe to mutate the project tree (rollback/redo) right
 /// now. Returns `Ok(())` if idle, or an `(status_code, body_json)` pair to
@@ -315,7 +306,6 @@ fn ensure_idle(
     }
     Ok(())
 }
-
 
 /// Transport-neutral core of the displays body, given an
 /// already-enumerated display set: the OS enumeration resolves at the
@@ -433,7 +423,6 @@ async fn handle_diagnostics_visual_freshness(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,8 +449,10 @@ mod tests {
         }
     }
 
-
-    pub(crate) async fn next_ws_json_matching<S, F>(ws_rx: &mut S, mut matches: F) -> serde_json::Value
+    pub(crate) async fn next_ws_json_matching<S, F>(
+        ws_rx: &mut S,
+        mut matches: F,
+    ) -> serde_json::Value
     where
         S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
@@ -498,9 +489,7 @@ mod tests {
     // in production), so the fixtures never touch the live store.
 
     /// Run one stream-consuming handler and collect every byte it wrote.
-    async fn collect_gateway_handler_response<Fut>(
-        run: impl FnOnce(DemuxStream) -> Fut,
-    ) -> Vec<u8>
+    async fn collect_gateway_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
     where
         Fut: std::future::Future<Output = ()>,
     {
@@ -601,7 +590,6 @@ mod tests {
             golden_diagnostics_transcript("200 OK", r#"{"ok":true,"written":0}"#)
         );
     }
-
 
     #[test]
     fn list_sessions_joins_external_context_from_debug_thread_log() {
@@ -774,7 +762,6 @@ mod tests {
             Some("/tmp/codex-managed")
         );
     }
-
 
     #[test]
     fn list_codex_sessions_exposes_usage_limited_goal() {
@@ -997,7 +984,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn external_codex_detail_limit_keeps_usage_limited_goal() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1088,7 +1074,6 @@ mod tests {
                 && entry.pointer("/data/goal/status").and_then(|v| v.as_str())
                     == Some("usageLimited")));
     }
-
 
     #[test]
     fn list_codex_sessions_exposes_thread_name_separately_from_task() {
@@ -1329,7 +1314,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn list_codex_sessions_parses_large_prefix_and_daily_usage() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1432,7 +1416,6 @@ mod tests {
         assert_eq!(by_day.get("2026-05-17"), Some(&100));
         assert_eq!(by_day.get("2026-05-18"), Some(&150));
     }
-
 
     #[test]
     fn codex_transcript_imports_function_call_output() {
@@ -1541,7 +1524,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn external_activity_replay_uses_compact_session_transcript() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1635,10 +1617,6 @@ mod tests {
         }));
     }
 
-
-
-
-
     #[test]
     fn test_web_gateway_config_default() {
         let config = WebGatewayConfig::default();
@@ -1654,7 +1632,6 @@ mod tests {
         assert!(json.contains("\"provider\":\"gemini\""));
         assert!(json.contains("\"input_sample_rate\":16000"));
     }
-
 
     #[test]
     fn session_detail_limit_keeps_latest_goal_per_nested_session_id() {
@@ -1759,7 +1736,6 @@ mod tests {
         assert!(oversized_summary.len() < WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 16);
     }
 
-
     #[test]
     fn external_activity_replay_uses_wrapper_index_for_multiple_codex_attaches() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1850,7 +1826,6 @@ mod tests {
         assert_eq!(row["intendant_wrappers"].as_array().map(Vec::len), Some(2));
     }
 
-
     // ---- /api/peers endpoint tests ----
 
     /// Spawn a test gateway with the given peer registry option and
@@ -1939,7 +1914,6 @@ mod tests {
 
         handle.abort();
     }
-
 
     #[tokio::test]
     async fn test_api_origin_gate_refuses_foreign_pages() {
@@ -2066,7 +2040,6 @@ mod tests {
 
         handle.abort();
     }
-
 
     /// End-to-end exercise of the static-asset arms through a real
     /// gateway socket: exact-path routing (the `/api/...?path=<asset>`
@@ -2419,8 +2392,6 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-
-
     /// Routes served by the legacy dispatch chain (the non-API surface:
     /// connect bootstrap, recordings, frames, debug, config, static/SPA)
     /// must never match the table — a route is served by exactly one of
@@ -2453,7 +2424,6 @@ mod tests {
             );
         }
     }
-
 
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
@@ -2561,7 +2531,6 @@ mod tests {
 
         handle.abort();
     }
-
 
     /// Real /ws upgrade through `spawn_test_gateway_with_auth`:
     /// connecting without a token gets a plain HTTP 401 *before* the
@@ -2994,8 +2963,6 @@ mod tests {
         assert!(resp.contains("peer registry not configured"));
         handle.abort();
     }
-
-
 
     /// `GET /api/peers` on a registry with no peers returns
     /// `{"peers":[]}`. Baseline for the list endpoint shape.
@@ -3619,6 +3586,4 @@ mod tests {
             },
         );
     }
-
-
 }

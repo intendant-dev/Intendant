@@ -284,9 +284,9 @@ impl CurrentUploadRawError {
             CurrentUploadRawError::RangeBeyondSize { .. } => {
                 "range start beyond upload size".to_string()
             }
-            CurrentUploadRawError::RangeTooLarge { requested } => format!(
-                "range too large: {requested} bytes (cap is {UPLOAD_MAX_BYTES})"
-            ),
+            CurrentUploadRawError::RangeTooLarge { requested } => {
+                format!("range too large: {requested} bytes (cap is {UPLOAD_MAX_BYTES})")
+            }
             CurrentUploadRawError::RangeUnrepresentable => {
                 "range too large for this platform".to_string()
             }
@@ -316,10 +316,9 @@ pub(crate) fn current_upload_raw_api_response(
     };
     let (bytes, offset, requested, total_size) = match range {
         None => {
-            let bytes =
-                std::fs::read(&descriptor.path).map_err(|e| CurrentUploadRawError::Io {
-                    message: format!("read upload: {e}"),
-                })?;
+            let bytes = std::fs::read(&descriptor.path).map_err(|e| CurrentUploadRawError::Io {
+                message: format!("read upload: {e}"),
+            })?;
             let total_size = bytes.len() as u64;
             (bytes, 0u64, total_size, total_size)
         }
@@ -2370,11 +2369,14 @@ fn fs_read_offset_length_api_response(
     }
 }
 
+/// A ranged file read: `(bytes, total_size, end_offset, display_path)`.
+type DashboardFsFileRange = (Vec<u8>, u64, u64, PathBuf);
+
 pub(crate) fn read_dashboard_fs_file_range(
     path: &Path,
     offset: u64,
     length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64, PathBuf), (u16, serde_json::Value)> {
+) -> Result<DashboardFsFileRange, (u16, serde_json::Value)> {
     use std::io::{Read as _, Seek as _};
     let metadata = std::fs::metadata(path).map_err(|e| {
         (
@@ -2505,19 +2507,18 @@ pub(crate) async fn handle_fs_mkdir(
 /// `api_fs_rename`; the tunnel lane delegates here in S2). Both paths'
 /// authorization is the caller's lane gate.
 pub(crate) async fn fs_rename_api_response(from: String, to: String) -> ApiResponse {
-    let (status, body) =
-        tokio::task::spawn_blocking(move || apply_dashboard_fs_rename(&from, &to))
-            .await
-            .unwrap_or_else(|e| {
-                (
-                    "500 Internal Server Error".to_string(),
-                    serde_json::json!({
-                        "error": format!(
-                            "filesystem rename task failed: {e}"
-                        )
-                    }),
-                )
-            });
+    let (status, body) = tokio::task::spawn_blocking(move || apply_dashboard_fs_rename(&from, &to))
+        .await
+        .unwrap_or_else(|e| {
+            (
+                "500 Internal Server Error".to_string(),
+                serde_json::json!({
+                    "error": format!(
+                        "filesystem rename task failed: {e}"
+                    )
+                }),
+            )
+        });
     ApiResponse::json(
         status_line_u16(&status),
         JsonBody::PreSerialized(body.to_string()),
@@ -3339,20 +3340,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         let request_line = format!("GET /api/fs/stat?path={path} HTTP/1.1");
-        let response =
-            collect_handler_response(|stream| {
+        let response = collect_handler_response(|stream| {
             handle_fs_stat(stream, &request_line, fs_route_cors("/api/fs/stat"), None)
         })
         .await;
         let body = serde_json::to_string(&inspect_dashboard_fs_path(&path).unwrap()).unwrap();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
     }
 
     #[tokio::test]
     async fn golden_fs_stat_error_transcript() {
         let request_line = "GET /api/fs/stat?path=relative/notes.txt HTTP/1.1";
-        let response =
-            collect_handler_response(|stream| {
+        let response = collect_handler_response(|stream| {
             handle_fs_stat(stream, request_line, fs_route_cors("/api/fs/stat"), None)
         })
         .await;
@@ -3370,13 +3372,15 @@ mod tests {
         std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
-        let response =
-            collect_handler_response(|stream| {
+        let response = collect_handler_response(|stream| {
             handle_fs_list(stream, &request_line, fs_route_cors("/api/fs/list"), None)
         })
         .await;
         let body = list_dashboard_fs_dir(&path).unwrap().to_string();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
     }
 
     #[tokio::test]
@@ -3386,8 +3390,7 @@ mod tests {
         std::fs::write(&file, b"not a directory").unwrap();
         let path = file.to_string_lossy().into_owned();
         let request_line = format!("GET /api/fs/list?path={path} HTTP/1.1");
-        let response =
-            collect_handler_response(|stream| {
+        let response = collect_handler_response(|stream| {
             handle_fs_list(stream, &request_line, fs_route_cors("/api/fs/list"), None)
         })
         .await;
@@ -3532,8 +3535,7 @@ mod tests {
     async fn golden_fs_mkdir_created_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("new-dir");
-        let body_text =
-            serde_json::json!({ "path": target.to_string_lossy() }).to_string();
+        let body_text = serde_json::json!({ "path": target.to_string_lossy() }).to_string();
         let response = collect_handler_response(|stream| {
             handle_fs_mkdir(
                 stream,
@@ -3555,7 +3557,10 @@ mod tests {
             "path": display.to_string_lossy().to_string()
         })
         .to_string();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
     }
 
     #[tokio::test]
@@ -3694,7 +3699,10 @@ mod tests {
             "modified_ms": modified_ms,
         })
         .to_string();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
         assert_eq!(std::fs::read(&resolved).unwrap(), content.as_bytes());
     }
 
@@ -3839,7 +3847,10 @@ mod tests {
             "renamed": true,
         })
         .to_string();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
         assert!(resolved_to.exists() && !from.exists());
     }
 
@@ -3906,7 +3917,10 @@ mod tests {
             "dir": false,
         })
         .to_string();
-        assert_eq!(transcript(&response), golden_json_transcript("200 OK", &body));
+        assert_eq!(
+            transcript(&response),
+            golden_json_transcript("200 OK", &body)
+        );
         assert!(!target.exists());
     }
 
@@ -3993,7 +4007,12 @@ mod tests {
         .await;
         let text = String::from_utf8_lossy(&response);
         let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
-        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(
+            head.starts_with(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            ),
+            "{text}"
+        );
         assert!(text.contains(upload_golden_tail()), "{head}");
         let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
         assert_eq!(descriptor["name"], "golden.txt");
@@ -4037,7 +4056,12 @@ mod tests {
         .await;
         let text = String::from_utf8_lossy(&response);
         let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
-        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "), "{text}");
+        assert!(
+            head.starts_with(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            ),
+            "{text}"
+        );
         assert!(text.contains(upload_golden_tail()), "{head}");
         let descriptor: serde_json::Value = serde_json::from_str(resp_body).unwrap();
         let store_root = crate::global_store::global_store_root_in(state.path());
@@ -4116,5 +4140,4 @@ mod tests {
         );
         assert_eq!(String::from_utf8_lossy(&response), expected);
     }
-
 }

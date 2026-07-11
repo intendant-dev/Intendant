@@ -639,13 +639,9 @@ impl ChatProvider for AnthropicProvider {
                             }
                             "message_start" => {
                                 if let Some(msg) = event.get("message") {
-                                    if let Some(parsed) = msg
-                                        .get("usage")
-                                        .cloned()
-                                        .and_then(|u| {
-                                            serde_json::from_value::<AnthropicUsage>(u).ok()
-                                        })
-                                    {
+                                    if let Some(parsed) = msg.get("usage").cloned().and_then(|u| {
+                                        serde_json::from_value::<AnthropicUsage>(u).ok()
+                                    }) {
                                         // Prompt-side counters only; output
                                         // arrives later via message_delta.
                                         let prompt_side = parsed.to_token_usage();
@@ -682,7 +678,9 @@ impl ChatProvider for AnthropicProvider {
 
 /// Build Anthropic API messages from our message format (shared between streaming and non-streaming).
 /// Parse an Anthropic computer tool_use input into a CuAction.
-pub(crate) fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<crate::computer_use::CuAction> {
+pub(crate) fn parse_anthropic_cu_action(
+    input: &serde_json::Value,
+) -> Option<crate::computer_use::CuAction> {
     use crate::computer_use::*;
 
     let action = input.get("action")?.as_str()?;
@@ -835,7 +833,9 @@ pub(crate) fn anthropic_duration_ms(input: &serde_json::Value, default_ms: u64) 
     }
 }
 
-pub(crate) fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Value, Vec<AnthropicMessage>) {
+pub(crate) fn build_anthropic_messages(
+    messages: &[Message],
+) -> (serde_json::Value, Vec<AnthropicMessage>) {
     let system_text = messages
         .iter()
         .find(|m| m.role == "system")
@@ -947,7 +947,7 @@ pub(crate) fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::tests::{tool_msg_with_images};
+    use crate::provider::tests::tool_msg_with_images;
 
     #[test]
     fn anthropic_provider_name() {
@@ -1195,7 +1195,10 @@ mod tests {
             ephemeral_5m_input_tokens: 8,
             ephemeral_1h_input_tokens: 0,
         };
-        assert_eq!(anthropic_cache_ttl_seconds(8, Some(&five_minute)), Some(300));
+        assert_eq!(
+            anthropic_cache_ttl_seconds(8, Some(&five_minute)),
+            Some(300)
+        );
     }
 
     #[test]

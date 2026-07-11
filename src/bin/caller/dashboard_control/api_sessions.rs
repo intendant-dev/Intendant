@@ -155,8 +155,7 @@ pub(crate) async fn api_access_connect_unclaim_response(
 ) -> serde_json::Value {
     frame_api_ok_error_response(
         id,
-        crate::web_gateway::access_connect_unclaim_api_response(runtime.project_root.clone())
-            .await,
+        crate::web_gateway::access_connect_unclaim_api_response(runtime.project_root.clone()).await,
         "connect unclaim",
     )
 }
@@ -175,9 +174,7 @@ pub(crate) async fn control_request_response(
         "api_credential_egress_probe" => {
             api_credential_egress_probe_response(id, params.as_ref()).await
         }
-        "api_access_connect_unclaim" => {
-            api_access_connect_unclaim_response(id, &runtime).await
-        }
+        "api_access_connect_unclaim" => api_access_connect_unclaim_response(id, &runtime).await,
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
         "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
@@ -516,9 +513,7 @@ pub(crate) async fn stream_json_lines_response(
 /// only the HTTP query vocabulary accepts) collapse to
 /// `CONTROL_DEFAULT_SESSION_LIMIT`; everything is capped at the HTTP
 /// lane's `SESSION_LIST_LIMIT`.
-pub(crate) fn sessions_stream_requested_limit(
-    params: Option<&serde_json::Value>,
-) -> Option<usize> {
+pub(crate) fn sessions_stream_requested_limit(params: Option<&serde_json::Value>) -> Option<usize> {
     let limit_value = params?.get("limit")?;
     let limit = match limit_value {
         serde_json::Value::String(value) => {
@@ -853,10 +848,8 @@ pub(crate) async fn api_session_current_uploads_response(
             );
         }
     };
-    let scope = crate::global_store::StoreScope::resolve_in(
-        project_root.as_deref(),
-        &runtime.state_root,
-    );
+    let scope =
+        crate::global_store::StoreScope::resolve_in(project_root.as_deref(), &runtime.state_root);
     let session_dir =
         session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&scope));
     let result = tokio::task::spawn_blocking(move || {
@@ -1033,7 +1026,12 @@ pub(crate) async fn api_session_agent_output_response_from_home(
     let body_text = params_body_text(Some(&params));
     let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_agent_output_api_response(&home, &body_text, &session_id, &source)
+        crate::web_gateway::session_agent_output_api_response(
+            &home,
+            &body_text,
+            &session_id,
+            &source,
+        )
     })
     .await;
     match result {
@@ -1897,14 +1895,13 @@ mod tests {
         let (home, session_id, _log_dir) = parity_session_fixture("parity-list");
 
         // ids filter, plain view.
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::sessions_list_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::sessions_list_api_response(
                 home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 false,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         let frame = api_sessions_response_from_home(
             "parity-list".to_string(),
@@ -1918,21 +1915,24 @@ mod tests {
         // The injected store holds exactly the fixture session — assert
         // the whole row set, not mere membership.
         let rows = tunnel_body.as_array().unwrap();
-        assert_eq!(rows.len(), 1, "temp store must list only the fixture: {tunnel_body}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "temp store must list only the fixture: {tunnel_body}"
+        );
         assert_eq!(rows[0]["session_id"], session_id);
     }
 
     #[tokio::test]
     async fn parity_sessions_list_usage_view_serves_the_same_projection() {
         let (home, session_id, _log_dir) = parity_session_fixture("parity-usage");
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::sessions_list_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::sessions_list_api_response(
                 home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 true,
-            ),
-        );
+            ));
         let frame = api_sessions_response_from_home(
             "parity-usage".to_string(),
             Some(&serde_json::json!({ "ids": [session_id], "view": "usage" })),
@@ -1980,15 +1980,14 @@ mod tests {
     #[tokio::test]
     async fn parity_session_detail_serves_the_same_body_on_both_transports() {
         let (home, session_id, _log_dir) = parity_session_fixture("parity-detail");
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_detail_api_response(
                 home.path(),
                 &session_id,
                 "intendant",
                 Some(5),
                 None,
-            ),
-        );
+            ));
         let frame = api_session_detail_response_from_home(
             "parity-detail".to_string(),
             Some(&serde_json::json!({ "session_id": session_id, "limit": 5 })),
@@ -2007,15 +2006,14 @@ mod tests {
         // tunnel lane exercises the full public adapter here; the temp
         // home on the HTTP lane is never read.)
         let home = tempfile::tempdir().unwrap();
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_detail_api_response(
                 home.path(),
                 "..",
                 "intendant",
                 None,
                 None,
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = api_session_detail_response(
             "parity-detail-invalid".to_string(),
@@ -2029,14 +2027,13 @@ mod tests {
     async fn parity_session_agent_output_serves_the_same_body_with_status_metadata() {
         let (home, session_id, _log_dir) = parity_session_fixture("parity-output");
         let ids_body = r#"{"ids":["parity-out-1","parity-missing"]}"#;
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_agent_output_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_agent_output_api_response(
                 home.path(),
                 ids_body,
                 &session_id,
                 "intendant",
-            ),
-        );
+            ));
         // The tunnel serializes its whole params object as the body; the
         // chunk fetch only reads `ids`.
         let frame = api_session_agent_output_response_from_home(
@@ -2053,14 +2050,13 @@ mod tests {
 
         // Missing-ids: same 400 body under each envelope (decode error
         // before any store access — the public adapter stays under test).
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_agent_output_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_agent_output_api_response(
                 home.path(),
                 "{}",
                 "abc123",
                 "intendant",
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = api_session_agent_output_response(
             "parity-output-missing-ids".to_string(),
@@ -2126,9 +2122,13 @@ mod tests {
         let (home, session_id, log_dir) = parity_session_fixture("parity-report");
         std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
 
-        let report =
-            crate::web_gateway::session_report_zip_for_request(home.path(), &session_id, None, None)
-                .unwrap_or_else(|_| panic!("fixture report must build"));
+        let report = crate::web_gateway::session_report_zip_for_request(
+            home.path(),
+            &session_id,
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("fixture report must build"));
         let response = crate::web_gateway::session_report_api_response(report);
         let (http_bytes, http_meta) = match &response {
             crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
@@ -2175,8 +2175,8 @@ mod tests {
         // Missing selector: 400 on both lanes (before any store access,
         // so the tunnel lane exercises the full public adapter).
         let home = tempfile::tempdir().unwrap();
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_context_snapshot_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_context_snapshot_api_response(
                 home.path(),
                 "abc123",
                 "intendant",
@@ -2184,8 +2184,7 @@ mod tests {
                 None,
                 None,
                 None,
-            ),
-        );
+            ));
         assert_eq!(status, 400);
         let frame = api_session_context_snapshot_response(
             "parity-snapshot".to_string(),
@@ -2265,9 +2264,8 @@ mod tests {
         assert_eq!(tunnel_result_body(&frame, 503), http_body);
 
         let frame = api_session_current_redo_response("parity-redo".to_string(), &rt).await;
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::current_redo_api_response(None, None).await,
-        );
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_redo_api_response(None, None).await);
         assert_eq!(status, 503);
         assert_eq!(tunnel_result_body(&frame, 503), http_body);
 
@@ -2285,14 +2283,13 @@ mod tests {
         // (difference #5); both lanes then run the one neutral fn.
         let rt = runtime();
         let home = tempfile::tempdir().unwrap();
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_current_changes_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_current_changes_api_response(
                 "GET /api/session/current/changes HTTP/1.1",
                 None,
                 None,
                 home.path(),
-            ),
-        );
+            ));
         assert_eq!(status, 503);
         let frame =
             api_session_current_changes_response("parity-changes".to_string(), None, &rt).await;
@@ -2314,13 +2311,12 @@ mod tests {
         // neither lane runs the fallback sweep (the tunnel adapter's
         // edge-resolved home is never read; the HTTP lane's temp home
         // pins the same).
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::current_agent_output_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_agent_output_api_response(
                 home.path(),
                 r#"{"ids":["parity-out-1"]}"#,
                 &log_dir,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         assert_eq!(http_body["outputs"][0]["output_id"], "parity-out-1");
         let frame = api_session_current_agent_output_response(
@@ -2371,14 +2367,13 @@ mod tests {
 
         // Idempotent delete of a missing id: 200 {"ok":true} on both
         // lanes (canonical tail on HTTP — difference #2).
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::current_upload_delete_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_upload_delete_api_response(
                 Some(project.path()),
                 None,
                 "parity-nope",
                 &rt.bus,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         let frame = api_session_current_upload_delete_response(
             "parity-upload-delete".to_string(),
@@ -2430,8 +2425,8 @@ mod tests {
         // shape (ids/paths are store-generated per commit).
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&payload).unwrap();
-        let (status, http_descriptor) = http_status_and_body(
-            crate::web_gateway::current_upload_commit_api_response(
+        let (status, http_descriptor) =
+            http_status_and_body(crate::web_gateway::current_upload_commit_api_response(
                 &rt.state_root,
                 Some(project.path()),
                 None,
@@ -2444,12 +2439,19 @@ mod tests {
                     len: payload.len(),
                 },
                 &rt.bus,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
         assert_eq!(
-            tunnel_descriptor.as_object().unwrap().keys().collect::<Vec<_>>(),
-            http_descriptor.as_object().unwrap().keys().collect::<Vec<_>>(),
+            tunnel_descriptor
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            http_descriptor
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
         );
 
         // Raw read of the tunnel-committed upload: identical bytes on
@@ -2458,13 +2460,9 @@ mod tests {
         // per-lane decorations (differences #2/#3).
         let scope = crate::global_store::StoreScope::resolve(Some(project.path()));
         let pending = crate::web_gateway::pending_upload_session_dir(&scope);
-        let http_raw = crate::web_gateway::current_upload_raw_api_response(
-            &upload_id,
-            None,
-            &pending,
-            &scope,
-        )
-        .unwrap_or_else(|_| panic!("http raw read"));
+        let http_raw =
+            crate::web_gateway::current_upload_raw_api_response(&upload_id, None, &pending, &scope)
+                .unwrap_or_else(|_| panic!("http raw read"));
         let (http_bytes, http_meta) = match &http_raw {
             crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
                 let crate::web_gateway::BytesPayload::InMemory(payload) = bytes;
@@ -2542,8 +2540,8 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let mtime = std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_780_000_000 + idx as u64 * 60);
+        let mtime =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000 + idx as u64 * 60);
         std::fs::File::options()
             .write(true)
             .open(&transcript)
@@ -2563,10 +2561,7 @@ mod tests {
                 }
             }
         });
-        crate::web_gateway::LineStream {
-            lines: rx,
-            source,
-        }
+        crate::web_gateway::LineStream { lines: rx, source }
     }
 
     /// Same params ⇒ same event-line sequence on both lanes (design §8,

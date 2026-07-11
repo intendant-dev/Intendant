@@ -153,7 +153,9 @@ struct UploadCreateParams {
     conflict_policy: crate::transfer_store::TransferConflictPolicy,
 }
 
-fn upload_create_params(params: &serde_json::Value) -> Result<UploadCreateParams, TransferStoreError> {
+fn upload_create_params(
+    params: &serde_json::Value,
+) -> Result<UploadCreateParams, TransferStoreError> {
     let destination = string_param(
         params,
         &["destination", "destination_path", "destinationPath", "path"],
@@ -223,10 +225,9 @@ pub(crate) fn transfer_create_target_path(
     kind: TransferKind,
 ) -> Option<String> {
     match kind {
-        TransferKind::Download => optional_string_param(
-            params,
-            &["path", "source_path", "sourcePath", "source"],
-        ),
+        TransferKind::Download => {
+            optional_string_param(params, &["path", "source_path", "sourcePath", "source"])
+        }
         TransferKind::Upload => optional_string_param(
             params,
             &["destination", "destination_path", "destinationPath", "path"],
@@ -290,10 +291,9 @@ pub(crate) async fn transfer_job_create_http_api_response(
 ) -> ApiResponse {
     match classify_transfer_create(&params) {
         Err(response) => response,
-        Ok(TransferCreateRequest::Artifact(_)) => transfer_error_api_response(
-            400,
-            "artifact transfers require the dashboard tunnel",
-        ),
+        Ok(TransferCreateRequest::Artifact(_)) => {
+            transfer_error_api_response(400, "artifact transfers require the dashboard tunnel")
+        }
         Ok(TransferCreateRequest::Path(kind)) => {
             transfer_path_create_api_response(scope, params, kind).await
         }
@@ -652,9 +652,7 @@ pub(crate) async fn handle_transfer_job_create(
             let target = classify_transfer_create(&params)
                 .ok()
                 .and_then(|request| match request {
-                    TransferCreateRequest::Path(kind) => {
-                        transfer_create_target_path(&params, kind)
-                    }
+                    TransferCreateRequest::Path(kind) => transfer_create_target_path(&params, kind),
                     TransferCreateRequest::Artifact(_) => None,
                 });
             match authorize_http_transfer_access(
@@ -869,7 +867,13 @@ mod tests {
 
     fn bytes_parts(
         response: ApiResponse,
-    ) -> (u16, String, Vec<(&'static str, String)>, Vec<u8>, serde_json::Value) {
+    ) -> (
+        u16,
+        String,
+        Vec<(&'static str, String)>,
+        Vec<u8>,
+        serde_json::Value,
+    ) {
         match response {
             ApiResponse::Bytes {
                 status,
@@ -950,7 +954,10 @@ mod tests {
             .await,
         );
         assert_eq!(status, 409);
-        assert_eq!(premature["error"], "upload is not complete enough to commit");
+        assert_eq!(
+            premature["error"],
+            "upload is not complete enough to commit"
+        );
 
         // The client vanished and came back: re-list (filtered by the
         // resume token) and read the received extent off the job.
@@ -977,7 +984,10 @@ mod tests {
             .await,
         );
         assert_eq!(status, 409);
-        assert_eq!(stale["error"], "upload chunk overlaps already persisted bytes");
+        assert_eq!(
+            stale["error"],
+            "upload chunk overlaps already persisted bytes"
+        );
 
         let (status, second) = json_body(
             &transfer_upload_chunk_api_response(
@@ -1037,7 +1047,8 @@ mod tests {
         // create target pass on the operation alone.
         let root = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
-                "unit-test", "https",
+                "unit-test",
+                "https",
             ),
             iam_state: None,
         };
@@ -1062,8 +1073,7 @@ mod tests {
         // out-of-scope create is refused, and the pathless rows are
         // denied fail-closed exactly as the tunnel denies them.
         let mut state = crate::access::iam::LocalIamState::default();
-        let actor =
-            crate::access::iam::AccessPrincipal::root_dashboard_session("admin", "https");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("admin", "https");
         let result = crate::access::iam::upsert_user_client_grant(
             &mut state,
             crate::access::iam::UserClientGrantUpsertRequest {
@@ -1293,16 +1303,10 @@ mod tests {
         let source_b = dir.path().join("b.txt");
         std::fs::write(&source_a, b"aaa").unwrap();
         std::fs::write(&source_b, b"bbb").unwrap();
-        let job_a = crate::transfer_store::create_download_job(
-            &scope,
-            source_a.to_str().unwrap(),
-        )
-        .unwrap();
-        let job_b = crate::transfer_store::create_download_job(
-            &scope,
-            source_b.to_str().unwrap(),
-        )
-        .unwrap();
+        let job_a =
+            crate::transfer_store::create_download_job(&scope, source_a.to_str().unwrap()).unwrap();
+        let job_b =
+            crate::transfer_store::create_download_job(&scope, source_b.to_str().unwrap()).unwrap();
 
         let (_, all) =
             json_body(&transfer_jobs_api_response(scope.clone(), &serde_json::json!({})).await);
@@ -1310,7 +1314,10 @@ mod tests {
 
         for (params, expect) in [
             (serde_json::json!({ "id": job_a.id }), &job_a),
-            (serde_json::json!({ "resume_token": job_b.resume_token }), &job_b),
+            (
+                serde_json::json!({ "resume_token": job_b.resume_token }),
+                &job_b,
+            ),
         ] {
             let (status, filtered) =
                 json_body(&transfer_jobs_api_response(scope.clone(), &params).await);
@@ -1417,8 +1424,7 @@ mod tests {
                 headers,
             } => {
                 assert_eq!(status, 416);
-                let body: serde_json::Value =
-                    serde_json::from_str(&body.into_string()).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&body.into_string()).unwrap();
                 assert_eq!(body["error"], "Range must use bytes");
                 assert_eq!(body["ok"], false);
                 assert_eq!(

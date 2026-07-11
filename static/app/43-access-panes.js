@@ -620,10 +620,17 @@ function renderAccessFleetStrip() {
     meta.className = 'acc-fleet-meta';
     const route = accessRouteInfoForTarget(target, descriptor, rememberedOnly);
     meta.appendChild(accessRouteChip(route.kind, route.label));
-    const roleLabel = target.effective_role_label || descriptor.accessRole || '';
-    if (roleLabel) {
-      const roleId = /peer/i.test(roleLabel) ? 'role:peer-profile' : (/root/i.test(roleLabel) ? 'role:root' : '');
-      meta.appendChild(accessRoleBadge(roleId, roleLabel));
+    // The two-lane badge is the one authority statement every fleet
+    // card wears (trust-tiers § Two lanes): 'you · <role>' or
+    // 'via <daemon> · <profile>', warning only when an integrated
+    // machine is reached through the delegation lane.
+    {
+      const lane = dashboardLaneBadge(target.local ? '' : String(target.host_id || target.id || '').trim());
+      const badge = document.createElement('span');
+      badge.className = `acc-badge lane-${lane.lane}${lane.warn ? ' lane-warn' : ''}`;
+      badge.textContent = lane.text;
+      if (lane.title) badge.title = lane.title;
+      meta.appendChild(badge);
     }
     const provenanceChip = accessTargetProvenanceChip(target);
     if (provenanceChip) meta.appendChild(provenanceChip);

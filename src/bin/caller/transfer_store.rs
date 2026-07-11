@@ -1173,8 +1173,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&dest_dir).unwrap();
         let payload = b"hello world";
-        let good_hash =
-            crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(payload));
+        let good_hash = crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(payload));
 
         // Malformed declarations refuse at create.
         let err = create_upload_job(
@@ -1224,9 +1223,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(good.sha256.as_deref(), Some(good_hash.as_str()));
-        let good =
-            append_upload_tempfile(&scope(&project), &good.id, 0, write_chunk(payload), 11)
-                .unwrap();
+        let good = append_upload_tempfile(&scope(&project), &good.id, 0, write_chunk(payload), 11)
+            .unwrap();
         let committed = commit_upload_job(&scope(&project), &good.id).unwrap();
         assert_eq!(committed.status, TransferStatus::Completed);
         assert_eq!(fs::read(dest_dir.join("good.bin")).unwrap(), payload);

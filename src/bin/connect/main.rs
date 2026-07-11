@@ -219,6 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/log/artifact-manifest",
             get(log_artifact_manifest).options(orl_preflight),
         )
+        .route(
+            "/api/log/release-manifest",
+            get(log_release_manifest)
+                .post(release_manifest_submit)
+                .options(orl_preflight),
+        )
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
@@ -273,6 +279,12 @@ struct ServiceConfig {
     static_root: PathBuf,
     data_file: PathBuf,
     daemon_token: Option<String>,
+    /// Bearer token for release-manifest submissions (the release
+    /// pipeline's credential). Deliberately separate from the operator
+    /// `daemon_token`: a CI secret that can only append release
+    /// manifests to the public log must not double as the admin key.
+    /// Unset = the submission endpoint answers 503 (reads stay public).
+    release_token: Option<String>,
     cookie_secure: bool,
     /// Refuse new-account registration without a valid invite code.
     /// Off by default so self-hosted instances stay zero-friction; the
@@ -324,6 +336,10 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut release_token = std::env::var("INTENDANT_CONNECT_RELEASE_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let mut open_daemon_registration = std::env::var("INTENDANT_CONNECT_OPEN_REGISTRATION")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false);
@@ -335,16 +351,15 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let mut dns_listen: Option<SocketAddr> = match std::env::var("INTENDANT_CONNECT_DNS_LISTEN")
-        {
-            Ok(value) if !value.trim().is_empty() => Some(
-                value
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}"))?,
-            ),
-            _ => None,
-        };
+        let mut dns_listen: Option<SocketAddr> =
+            match std::env::var("INTENDANT_CONNECT_DNS_LISTEN") {
+                Ok(value) if !value.trim().is_empty() => {
+                    Some(value.trim().parse().map_err(|e| {
+                        format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}")
+                    })?)
+                }
+                _ => None,
+            };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -370,6 +385,9 @@ impl ServiceConfig {
                 }
                 "--daemon-token" => {
                     daemon_token = Some(args.next().ok_or("--daemon-token requires a token")?);
+                }
+                "--release-token" => {
+                    release_token = Some(args.next().ok_or("--release-token requires a token")?);
                 }
                 "--invite-required" => {
                     invite_required = true;
@@ -432,6 +450,7 @@ impl ServiceConfig {
             static_root,
             data_file,
             daemon_token,
+            release_token,
             invite_required,
             open_daemon_registration,
             cookie_secure,
@@ -448,6 +467,7 @@ fn print_help() {
          \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
               INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
+              INTENDANT_CONNECT_RELEASE_TOKEN (--release-token: gates POST /api/log/release-manifest),\n\
               INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION,\n\
               INTENDANT_CONNECT_DNS_ZONE, INTENDANT_CONNECT_DNS_NS_NAME, INTENDANT_CONNECT_DNS_LISTEN\n\
               (--dns-zone fleet.example.com --dns-ns-name ns-fleet.example.com --dns-listen 0.0.0.0:53\n\
@@ -1249,5 +1269,4 @@ mod tests {
         assert_eq!(hours.len(), PRESENCE_HOURS_KEPT);
         assert_eq!(*hours.last().unwrap(), 209);
     }
-
 }

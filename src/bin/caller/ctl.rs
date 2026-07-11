@@ -327,8 +327,12 @@ fn load_user_peers(path: &Path) -> Result<Vec<crate::project::PeerConfig>, Strin
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read user-level peers file {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "failed to read user-level peers file {}: {e}",
+            path.display()
+        )
+    })?;
     #[derive(serde::Deserialize)]
     struct UserPeersFile {
         #[serde(default, rename = "peer")]
@@ -2714,9 +2718,9 @@ mod tests {
         assert!(err.contains("unknown urgency"), "{err}");
         let err = notify_args(&args(&["--title", "x"])).unwrap_err();
         assert!(err.contains("requires notification text"), "{err}");
-        let err = notify_args(&args(&[&"x".repeat(
-            crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES + 1,
-        )]))
+        let err = notify_args(&args(&[
+            &"x".repeat(crate::mcp::NOTIFY_USER_MAX_TEXT_BYTES + 1)
+        ]))
         .unwrap_err();
         assert!(err.contains("max"), "{err}");
     }
@@ -3313,11 +3317,9 @@ label = "twin"
     fn load_user_peers_missing_file_is_empty_and_invalid_file_is_loud() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("peers.toml");
-        assert!(
-            load_user_peers(&path)
-                .expect("missing file means no user-level peers")
-                .is_empty()
-        );
+        assert!(load_user_peers(&path)
+            .expect("missing file means no user-level peers")
+            .is_empty());
         std::fs::write(&path, "not [ valid toml").expect("write corrupt file");
         let err = load_user_peers(&path).expect_err("corrupt file errors");
         assert!(

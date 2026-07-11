@@ -118,14 +118,21 @@ pub fn verify_client_key_offer(
     now_unix_ms: i64,
 ) -> Result<VerifiedClientKey, String> {
     let payload = client_key_offer_payload(daemon_id, client_nonce, sdp, ts_unix_ms);
-    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
-        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
-            fingerprint,
-            public_key_b64u,
-            attested_account: None,
-        })
+    verify_signed_offer(
+        client_key_b64u,
+        signature_b64u,
+        ts_unix_ms,
+        now_unix_ms,
+        &payload,
+    )
+    .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+        fingerprint,
+        public_key_b64u,
+        attested_account: None,
+    })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn verify_client_key_offer_v2(
     client_key_b64u: &str,
     signature_b64u: &str,
@@ -145,12 +152,18 @@ pub fn verify_client_key_offer_v2(
         account_user_id,
         account_name,
     );
-    verify_signed_offer(client_key_b64u, signature_b64u, ts_unix_ms, now_unix_ms, &payload)
-        .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
-            fingerprint,
-            public_key_b64u,
-            attested_account: Some((account_user_id.to_string(), account_name.to_string())),
-        })
+    verify_signed_offer(
+        client_key_b64u,
+        signature_b64u,
+        ts_unix_ms,
+        now_unix_ms,
+        &payload,
+    )
+    .map(|(fingerprint, public_key_b64u)| VerifiedClientKey {
+        fingerprint,
+        public_key_b64u,
+        attested_account: Some((account_user_id.to_string(), account_name.to_string())),
+    })
 }
 
 /// Shared key/signature/timestamp mechanics for every payload version.
@@ -190,25 +203,57 @@ fn verify_signed_offer(
     Ok((client_key_fingerprint(&key), b64u(&key)))
 }
 
+/// Signing helpers for tests that need a real browser-shaped identity key
+/// (peer-route attribution, doorbell caller-ID). Lives outside `mod tests`
+/// so sibling modules' test code can reuse it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+
+    pub(crate) struct TestKey {
+        pub(crate) pair: EcdsaKeyPair,
+        pub(crate) raw_point_b64u: String,
+    }
+
+    pub(crate) fn generate_key() -> TestKey {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let raw_point_b64u = b64u(pair.public_key().as_ref());
+        TestKey {
+            pair,
+            raw_point_b64u,
+        }
+    }
+
+    pub(crate) fn sign(key: &TestKey, daemon_id: &str, nonce: &str, sdp: &str, ts: i64) -> String {
+        let rng = ring::rand::SystemRandom::new();
+        let payload = client_key_offer_payload(daemon_id, nonce, sdp, ts);
+        b64u(key.pair.sign(&rng, &payload).unwrap().as_ref())
+    }
+}
+
 /// Optional client-key fields as they appear in offer payloads, shared by the
 /// rendezvous path and the daemon-local signaling path.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClientKeyOfferFields {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_sig: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_ts: Option<i64>,
     /// Which offer payload the signature covers. Absent/empty = v1
     /// (browsers that predate the field always signed v1).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_proto: Option<String>,
     /// Browser-claimed account identity — only meaningful under a v2
     /// signature, which covers these exact strings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_account_user_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_account_name: Option<String>,
 }
 
@@ -270,9 +315,7 @@ impl ClientKeyOfferFields {
         match proto {
             CLIENT_KEY_OFFER_PROTOCOL => {
                 if account_user_id.is_some() || account_name.is_some() {
-                    return Err(
-                        "client key account fields require a v2-signed offer".to_string()
-                    );
+                    return Err("client key account fields require a v2-signed offer".to_string());
                 }
                 verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms)
                     .map(Some)
@@ -322,30 +365,7 @@ mod tests {
         assert!(!is_client_key_fingerprint(&format!("{fp}=")));
         assert!(!is_client_key_fingerprint(&format!("{}+", &fp[..42])));
     }
-    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-
-    struct TestKey {
-        pair: EcdsaKeyPair,
-        raw_point_b64u: String,
-    }
-
-    fn generate_key() -> TestKey {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
-            .unwrap();
-        let raw_point_b64u = b64u(pair.public_key().as_ref());
-        TestKey {
-            pair,
-            raw_point_b64u,
-        }
-    }
-
-    fn sign(key: &TestKey, daemon_id: &str, nonce: &str, sdp: &str, ts: i64) -> String {
-        let rng = ring::rand::SystemRandom::new();
-        let payload = client_key_offer_payload(daemon_id, nonce, sdp, ts);
-        b64u(key.pair.sign(&rng, &payload).unwrap().as_ref())
-    }
+    pub(crate) use super::test_support::{generate_key, sign, TestKey};
 
     #[test]
     fn verifies_a_valid_signed_offer() {
@@ -512,7 +532,9 @@ mod tests {
             client_key_account_user_id: Some("mallory-user".to_string()),
             ..fields.clone()
         };
-        assert!(swapped.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+        assert!(swapped
+            .verify("daemon-a", "nonce-1", "v=0 sdp", ts)
+            .is_err());
 
         // Account fields glued onto a v1-signed offer are rejected: nothing
         // may ride outside the signature.
@@ -531,6 +553,8 @@ mod tests {
             client_key_proto: Some("intendant-client-key-offer-v9".to_string()),
             ..fields
         };
-        assert!(unknown.verify("daemon-a", "nonce-1", "v=0 sdp", ts).is_err());
+        assert!(unknown
+            .verify("daemon-a", "nonce-1", "v=0 sdp", ts)
+            .is_err());
     }
 }

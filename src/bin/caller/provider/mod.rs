@@ -530,9 +530,7 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
 pub fn select_provider_for_project(
     project_root: Option<&std::path::Path>,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
-    let keys = project_root
-        .map(ProjectEnvKeys::load)
-        .unwrap_or_default();
+    let keys = project_root.map(ProjectEnvKeys::load).unwrap_or_default();
     select_provider_with_project_keys(&keys)
 }
 
@@ -623,9 +621,8 @@ fn select_provider_with_project_keys(
 /// session" is the fix, not editing .env. The opening sentence is stable:
 /// automation greps stderr for it.
 fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
-    let mut text = String::from(
-        "No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.",
-    );
+    let mut text =
+        String::from("No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.");
     let mut checked: Vec<String> =
         vec!["credential leases and browser relays (none active)".to_string()];
     if let Some(report) = ENV_SEARCH.get() {
@@ -633,19 +630,24 @@ fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
             Some(path) => checked.push(format!("{} (loaded at startup)", path.display())),
             None => checked.push("no .env found from the startup directory upward".to_string()),
         }
-        for entry in [&report.project_env, &report.global_env] {
-            if let Some((path, loaded)) = entry {
-                // Skip duplicates: the walk-up and the project root often
-                // resolve to the same file.
-                if report.cwd_env.as_deref() == Some(path.as_path()) {
-                    continue;
-                }
-                checked.push(format!(
-                    "{} ({})",
-                    path.display(),
-                    if *loaded { "loaded at startup" } else { "missing" }
-                ));
+        for (path, loaded) in [&report.project_env, &report.global_env]
+            .into_iter()
+            .flatten()
+        {
+            // Skip duplicates: the walk-up and the project root often
+            // resolve to the same file.
+            if report.cwd_env.as_deref() == Some(path.as_path()) {
+                continue;
             }
+            checked.push(format!(
+                "{} ({})",
+                path.display(),
+                if *loaded {
+                    "loaded at startup"
+                } else {
+                    "missing"
+                }
+            ));
         }
     }
     if let Some(path) = &project_keys.env_path {
@@ -1595,5 +1597,4 @@ mod tests {
             ..Default::default()
         }
     }
-
 }
