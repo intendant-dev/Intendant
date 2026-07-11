@@ -157,6 +157,7 @@ function accessTargetProvenanceChip(target) {
    ids only appear as the subtitle, never as the headline. */
 function accessTargetDisplayName(target, descriptor) {
   const candidates = [
+    accessTargetPetname(target),
     descriptor?.displayName,
     target?.label,
   ];
@@ -610,6 +611,52 @@ function renderAccessFleetStrip() {
     name.className = 'acc-fleet-name';
     name.textContent = accessTargetDisplayName(target, descriptor);
     top.append(dot, name);
+    // Petnamed machines keep their self-reported label visible as a
+    // muted secondary — the owner's name never hides what the box calls
+    // itself.
+    const petname = accessTargetPetname(target);
+    if (petname && target.label && petname !== String(target.label).trim()) {
+      const selfLabel = document.createElement('span');
+      selfLabel.className = 'acc-fleet-selflabel';
+      selfLabel.textContent = `· ${target.label}`;
+      top.appendChild(selfLabel);
+    }
+    // Inline rename (✎): the owner's name for this identity, signed
+    // into the v5 fleet record (trust-tiers § lookalike names).
+    if (!target.local && !descriptor.local) {
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.className = 'acc-fleet-rename';
+      rename.textContent = '\u270e';
+      rename.title = petname
+        ? `Rename "${petname}" — your name for this machine, bound to its identity`
+        : 'Name this machine — your name, bound to its identity (a lookalike never inherits it)';
+      rename.addEventListener('click', event => {
+        event.stopPropagation();
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'acc-fleet-rename-input';
+        input.value = petname;
+        input.placeholder = String(target.label || 'name this machine');
+        input.maxLength = 120;
+        const commit = () => {
+          accessFleetSetPetname(target.host_id || target.id, input.value);
+          renderAccessFleetStrip();
+          renderDashboardTargetSummaries();
+        };
+        input.addEventListener('keydown', ev => {
+          if (ev.key === 'Enter') commit();
+          if (ev.key === 'Escape') renderAccessFleetStrip();
+          ev.stopPropagation();
+        });
+        input.addEventListener('blur', commit);
+        input.addEventListener('click', ev => ev.stopPropagation());
+        name.replaceWith(input);
+        input.focus();
+        input.select();
+      });
+      top.appendChild(rename);
+    }
     if (target.local || descriptor.local) {
       const self = document.createElement('span');
       self.className = 'acc-fleet-self';

@@ -267,6 +267,9 @@ function normalizeDashboardAccessTarget(target) {
     // payload and carried in the signed v4 fleet record (never on the
     // public agent card — docs/src/trust-tiers.md § metadata carriers).
     tier: String(target.tier || '').trim(),
+    // Owner-chosen petname (signed v5 record line): the name the OWNER
+    // gave this identity — a lookalike daemon never inherits it.
+    petname: String(target.petname || '').trim(),
     connected: target.connected !== false,
     capabilities,
   };
@@ -929,8 +932,43 @@ function dashboardTargetIsLocal(hostId) {
 
 function dashboardTargetLabel(hostId) {
   if (dashboardTargetIsLocal(hostId)) return selfHostLabel || 'This daemon';
-  const peer = daemons.find(d => d.host_id === String(hostId || '').trim());
-  return peer?.label || String(hostId || '').trim();
+  const id = String(hostId || '').trim();
+  const peer = daemons.find(d => d.host_id === id);
+  // Petname first (owner-chosen, identity-bound); the self-reported
+  // label only names machines the owner hasn't named.
+  const record = accessFleetTargets().find(t =>
+    String(t.host_id || t.id || '').trim() === id);
+  const petname = String(record?.petname || '').trim();
+  if (petname) return petname;
+  return peer?.label || id;
+}
+
+/* The owner's petname for a fleet target, '' when unnamed. */
+function accessTargetPetname(target) {
+  return String(target?.petname || '').trim();
+}
+
+/* Set (or clear, with '') the owner's petname for a fleet target and
+   persist it: the record re-signs as payload v5 on the next hosted
+   push, so the name is bound to this identity — a lookalike never
+   inherits it. */
+function accessFleetSetPetname(hostId, petname) {
+  const id = String(hostId || '').trim();
+  if (!id) return false;
+  const cleaned = String(petname || '').trim().slice(0, 120);
+  const targets = accessFleetRead().targets || [];
+  let changed = false;
+  for (const target of targets) {
+    const key = String(target.host_id || target.id || '').trim();
+    if (key !== id) continue;
+    if (String(target.petname || '') === cleaned) break;
+    target.petname = cleaned;
+    target.updated_unix_ms = Date.now();
+    changed = true;
+    break;
+  }
+  if (changed) accessFleetWrite(targets);
+  return changed;
 }
 
 function dashboardAccessRoleLabel(roleId) {

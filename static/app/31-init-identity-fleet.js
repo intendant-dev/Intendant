@@ -941,12 +941,16 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   // v4 folds the enc line in unconditionally (may be empty) and appends
   // the daemon's owner-set trust tier, so a store cannot relabel an
   // integrated box as disposable without breaking the signature.
+  // v5 appends the owner's PETNAME for the daemon — the name the owner
+  // chose, bound to this record's identity, so a lookalike daemon can
+  // never wear a familiar name the store or a phisher picked.
   const enc = version >= 3 ? String(record.enc_fields || '') : '';
   const blank = version >= 3 && enc;
   const lines = [
-    version >= 4 ? 'intendant-fleet-record-v4'
-      : version >= 3 ? 'intendant-fleet-record-v3'
-        : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
+    version >= 5 ? 'intendant-fleet-record-v5'
+      : version >= 4 ? 'intendant-fleet-record-v4'
+        : version >= 3 ? 'intendant-fleet-record-v3'
+          : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
     blank ? '' : String(record.url || ''),
@@ -959,6 +963,7 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
   if (version >= 3) lines.push(enc);
   if (version >= 4) lines.push(String(record.tier || ''));
+  if (version >= 5) lines.push(String(record.petname || ''));
   lines.push(String(signedAt));
   return new TextEncoder().encode(lines.join('\n'));
 }
@@ -1073,10 +1078,12 @@ async function accessFleetSignRecord(record) {
   const signedAt = Date.now();
   try {
     // Sign at the lowest version that covers the record's fields: a
-    // tier-less record keeps its v2/v3 shape, so a hosted store that
-    // predates the tier field (and would strip it) only downgrades
-    // tier-carrying records to 'unverified', not the whole fleet.
-    const version = String(record.tier || '').trim() ? 4 : (record.enc_fields ? 3 : 2);
+    // record without newer fields keeps its older shape, so a hosted
+    // store that predates a field (and would strip it) only downgrades
+    // the records that carry it, not the whole fleet.
+    const version = String(record.petname || '').trim() ? 5
+      : String(record.tier || '').trim() ? 4
+        : (record.enc_fields ? 3 : 2);
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
@@ -1112,7 +1119,7 @@ async function accessFleetVerifyRecord(record) {
       ['verify']
     );
     let valid = false;
-    for (const version of record.enc_fields ? [4, 3, 2, 1] : [4, 2, 1]) {
+    for (const version of record.enc_fields ? [5, 4, 3, 2, 1] : [5, 4, 2, 1]) {
       valid = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,

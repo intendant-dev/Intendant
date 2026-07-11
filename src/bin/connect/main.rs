@@ -853,6 +853,10 @@ struct FleetTargetRecord {
     // it — clients verify it under the record signature.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     tier: String,
+    // Owner-chosen petname (signed v5 line): the anti-lookalike name.
+    // Same relay-blind discipline.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    petname: String,
     #[serde(default)]
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1180,6 +1184,7 @@ fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
         "connect_signaling_base": target.connect_signaling_base,
         "enc_fields": target.enc_fields,
         "tier": target.tier,
+        "petname": target.petname,
         "origin": target.origin,
         "connect_daemon_id": target.connect_daemon_id,
         "capabilities": target.capabilities,

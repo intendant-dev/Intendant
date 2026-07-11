@@ -110,6 +110,20 @@
   color: var(--peach);
   font-weight: 600;
 }
+/* Petnames (trust-tiers § lookalike names): the muted self-label beside
+   an owner-named machine, and the inline rename affordance. */
+.acc-fleet-selflabel { color: var(--overlay1); font-size: 10.5px; white-space: nowrap; }
+.acc-fleet-rename {
+  background: none; border: none; color: var(--overlay1);
+  font-size: 11px; cursor: pointer; padding: 0 2px; line-height: 1;
+}
+.acc-fleet-rename:hover { color: var(--text); }
+.acc-fleet-rename-input {
+  background: color-mix(in srgb, var(--surface0) 55%, transparent);
+  border: 1px solid var(--glass-hairline-bright); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 1px 6px; min-width: 0;
+  width: 12ch;
+}
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {

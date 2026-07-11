@@ -88,6 +88,8 @@ pub(crate) struct FleetTargetInput {
     #[serde(default)]
     tier: String,
     #[serde(default)]
+    petname: String,
+    #[serde(default)]
     origin: String,
     #[serde(default, alias = "connectDaemonId")]
     connect_daemon_id: String,
@@ -350,9 +352,10 @@ pub(crate) fn normalize_fleet_target_input(
         browser_tcp_via_url: clean_fleet_url(&input.browser_tcp_via_url),
         connect_signaling_base: clean_fleet_url(&input.connect_signaling_base),
         enc_fields: clean_fleet_text(&input.enc_fields, FLEET_ENC_MAX),
-        // Signed v4 payload line — relayed verbatim-but-bounded like the
-        // signature fields; the store never interprets the tier.
+        // Signed v4/v5 payload lines — relayed verbatim-but-bounded like
+        // the signature fields; the store interprets neither.
         tier: clean_fleet_token(&input.tier, FLEET_TEXT_MAX),
+        petname: clean_fleet_text(&input.petname, FLEET_LABEL_MAX),
         origin: clean_fleet_url(&input.origin),
         connect_daemon_id: if connect_daemon_id.is_empty() {
             None
@@ -753,6 +756,7 @@ mod tests {
                 host_id: "daemon-1".to_string(),
                 label: "Anchor box".to_string(),
                 tier: "integrated".to_string(),
+                petname: "Muffin".to_string(),
                 record_key: "PubKeyB64u".to_string(),
                 record_sig: "SigB64u".to_string(),
                 record_signed_at_unix_ms: 1_700_000_000_000,
@@ -769,11 +773,13 @@ mod tests {
         assert_eq!(record.record_sig, "SigB64u");
         assert_eq!(record.record_signed_at_unix_ms, 1_700_000_000_000);
         assert_eq!(record.tier, "integrated");
+        assert_eq!(record.petname, "Muffin");
         let view = fleet_target_view(&record);
         assert_eq!(view["record_key"], "PubKeyB64u");
         assert_eq!(view["record_sig"], "SigB64u");
         assert_eq!(view["record_signed_at_unix_ms"], 1_700_000_000_000u64);
         assert_eq!(view["tier"], "integrated");
+        assert_eq!(view["petname"], "Muffin");
 
         // Future timestamps clamp to the sync time instead of trusting the
         // client clock.
@@ -857,6 +863,7 @@ mod tests {
                 connect_signaling_base: String::new(),
                 enc_fields: String::new(),
                 tier: String::new(),
+                petname: String::new(),
                 origin: "https://intendant.dev".to_string(),
                 connect_daemon_id: " daemon ".to_string(),
                 record_key: String::new(),
@@ -934,6 +941,7 @@ mod tests {
                     connect_signaling_base: String::new(),
                     enc_fields: String::new(),
                     tier: String::new(),
+                    petname: String::new(),
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
@@ -966,6 +974,7 @@ mod tests {
                     connect_signaling_base: String::new(),
                     enc_fields: String::new(),
                     tier: String::new(),
+                    petname: String::new(),
                     origin: "https://connect.intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
@@ -998,6 +1007,7 @@ mod tests {
                     connect_signaling_base: String::new(),
                     enc_fields: String::new(),
                     tier: String::new(),
+                    petname: String::new(),
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: None,
                     capabilities: Vec::new(),
