@@ -410,16 +410,21 @@ fn waiter_acquires_promptly_after_release() {
     );
 }
 
-/// (e) Crash release: SIGKILL a permit holder — the flock evaporates with
-/// the process and the permit is immediately acquirable.
+/// (e) Crash release: SIGKILL the GOVERNOR — the permit holder — and the
+/// flock evaporates with it: the permit is immediately acquirable even
+/// though the governed child is still running (it never held the fd;
+/// FD_CLOEXEC stays set). The orphaned child finishing its compile
+/// momentarily ungoverned is the documented crash semantics — SIGKILL
+/// cannot be forwarded. The fixture reports its pid so the test can reap
+/// the orphan it deliberately creates.
 #[test]
-fn sigkilled_holder_releases_its_permit() {
+fn sigkilled_governor_releases_its_permit() {
     let rig = Rig::new();
     let ready = rig.root.join("ready");
     let script = rig.script(
         "hold.sh",
         &format!(
-            "echo ready >> {}\nwhile :; do sleep 0.05; done",
+            "echo $$ >> {}\nwhile :; do sleep 0.05; done",
             ready.display()
         ),
     );
@@ -427,7 +432,16 @@ fn sigkilled_holder_releases_its_permit() {
     let permit = rig.permit("permit-local-0");
 
     let mut child = spawn_governor(&config, &script, &[], &[]);
-    wait_for(|| ready.exists(), GENEROUS, "holder to start");
+    // The fixture's pid line (`$$` + newline) doubles as the ready signal.
+    wait_for(
+        || {
+            std::fs::read_to_string(&ready)
+                .map(|s| s.ends_with('\n'))
+                .unwrap_or(false)
+        },
+        GENEROUS,
+        "holder to start",
+    );
     assert!(is_exclusively_locked(&permit));
     child.kill().unwrap();
     child.wait().unwrap();
@@ -436,6 +450,19 @@ fn sigkilled_holder_releases_its_permit() {
         GENEROUS,
         "permit release after SIGKILL",
     );
+
+    // Reap the orphaned fixture (still looping — crash semantics) so the
+    // test leaks no process.
+    let orphan: libc::pid_t = std::fs::read_to_string(&ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("fixture wrote its pid");
+    // SAFETY: the pid was reported by the fixture this test (transitively)
+    // spawned; kill(2) takes only the pid and signal number.
+    unsafe {
+        libc::kill(orphan, libc::SIGKILL);
+    }
 
     // And a fresh governed invocation can take it end to end.
     let marker = rig.root.join("marker");
@@ -446,11 +473,16 @@ fn sigkilled_holder_releases_its_permit() {
     assert!(marker.exists());
 }
 
-/// (f) The flock survives exec(2): once the exec'd fixture is running (it
-/// wrote `ready`), the permit must still be held — FD_CLOEXEC was cleared —
-/// and it frees when that fixture exits.
+/// (f) Parent-held permit: while the governed child runs, the permit is
+/// held — by the governor itself, which stays alive as the child's
+/// parent (the fd keeps FD_CLOEXEC, so the child never holds it) — and
+/// it frees when the chain exits. The exec-era ancestor of this test
+/// (`permit_lock_survives_exec`) pinned the opposite fd story — the
+/// flock riding a FD_CLOEXEC-cleared fd through exec(2) — which is the
+/// design that leaked permits into daemonized sccache servers (see
+/// tests/sccache_chain.rs).
 #[test]
-fn permit_lock_survives_exec() {
+fn permit_held_while_child_runs_and_freed_on_exit() {
     let rig = Rig::new();
     let ready = rig.root.join("ready");
     let stop = rig.root.join("stop");
@@ -466,12 +498,12 @@ fn permit_lock_survives_exec() {
     let permit = rig.permit("permit-local-0");
 
     let mut child = spawn_governor(&config, &script, &[], &[]);
-    wait_for(|| ready.exists(), GENEROUS, "exec'd fixture to start");
-    // The shell fixture is the post-exec process image; the lock must have
-    // ridden through the exec.
+    wait_for(|| ready.exists(), GENEROUS, "governed fixture to start");
+    // The fixture (the governor's child) is running: the waiting governor
+    // parent must be holding the permit.
     assert!(
         is_exclusively_locked(&permit),
-        "permit lock did not survive exec (FD_CLOEXEC not cleared?)"
+        "permit not held while the governed child runs"
     );
     std::fs::write(&stop, b"").unwrap();
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
@@ -482,7 +514,7 @@ fn permit_lock_survives_exec() {
     );
 }
 
-/// (g) Exit status propagates through the exec.
+/// (g) Exit status propagates through the governor's wait.
 #[test]
 fn exit_status_propagates() {
     let rig = Rig::new();
@@ -493,28 +525,51 @@ fn exit_status_propagates() {
     assert_eq!(status.code(), Some(42));
 }
 
-/// (g) Signal disposition propagates: after the exec, the spawned pid IS
-/// the governed program — SIGTERM to it is reflected in the wait status.
+/// (g) Signal forwarding + disposition: SIGTERM to the governor is
+/// forwarded to the governed child (the governor is the permit-holding
+/// parent, so a signal aimed at the wrapper pid must reach the real
+/// work), and once the child dies of it the governor re-raises the same
+/// signal on itself — cargo observes the identical signal death the old
+/// exec design produced by construction. The tick stream proves the
+/// child really died of the forwarded signal: a governor that died alone
+/// would orphan the fixture, still ticking. (The fixture self-bounds at
+/// ~30s so a regression can't leak an infinite loop.)
 #[test]
-fn signal_disposition_propagates() {
+fn sigterm_forwards_to_child_and_signal_death_propagates() {
     let rig = Rig::new();
-    let ready = rig.root.join("ready");
+    let ticks = rig.root.join("ticks");
     let script = rig.script(
-        "hold.sh",
+        "tick.sh",
         &format!(
-            "echo ready >> {}\nwhile :; do sleep 0.05; done",
-            ready.display()
+            "i=0\nwhile [ $i -lt 600 ]; do echo tick >> {}; i=$((i+1)); sleep 0.05; done",
+            ticks.display()
         ),
     );
     let config = rig.config("gov.toml", 1, 0, false, true);
     let mut child = spawn_governor(&config, &script, &[], &[]);
-    wait_for(|| ready.exists(), GENEROUS, "fixture to start");
+    wait_for(|| ticks.exists(), GENEROUS, "fixture to start ticking");
     // SAFETY: pid was spawned by this test and not yet reaped; kill(2)
     // takes only the pid and signal number.
     let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(rc, 0);
     let status = wait_deadline(&mut child, GENEROUS).unwrap();
     assert_eq!(status.signal(), Some(libc::SIGTERM));
+    // The child must be dead too: its tick stream stops growing. (Settle
+    // beat first, then a window several fixture periods long.)
+    std::thread::sleep(Duration::from_millis(200));
+    let after_settle = std::fs::metadata(&ticks).unwrap().len();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::metadata(&ticks).unwrap().len(),
+        after_settle,
+        "tick file still growing: the governed child survived the forwarded SIGTERM"
+    );
+    // And the permit came back with the governor's exit.
+    wait_for(
+        || !is_exclusively_locked(&rig.permit("permit-local-0")),
+        GENEROUS,
+        "permit release after signal death",
+    );
 }
 
 /// (h) Probe fast path: version and pure --print invocations complete while
@@ -589,11 +644,12 @@ fn kill_switch_flips_live() {
 // ------------------------------------------------ wrapper chain shape ----
 
 /// Governed chain shape: with `wrap_with` configured, a governed
-/// invocation acquires its permit and execs `wrap_with <real> <args…>` —
-/// argv order is the sccache client contract (argv[1] = the compiler,
-/// the rest its args, exactly as cargo handed them to the governor).
+/// invocation acquires its permit, then spawns `wrap_with <real>
+/// <args…>` and waits — argv order is the sccache client contract
+/// (argv[1] = the compiler, the rest its args, exactly as cargo handed
+/// them to the governor).
 #[test]
-fn governed_invocation_execs_wrap_chain() {
+fn governed_invocation_runs_wrap_chain() {
     let rig = Rig::new();
     let real_marker = rig.root.join("real");
     let wrap_marker = rig.root.join("wrap");
@@ -698,10 +754,11 @@ fn fail_open_paths_still_exec_wrap_chain() {
 }
 
 /// `wrap_with` pointing at a path that doesn't exist must not break the
-/// build: the wrap exec fails, and the governor falls back to running the
-/// compiler directly — still governed (the permit was already held).
+/// build: the wrap spawn fails, and the governor falls back to running
+/// the compiler directly — still governed (the permit was already held,
+/// and stays parent-held for the fallback child too).
 #[test]
-fn missing_wrap_with_falls_back_to_direct_exec() {
+fn missing_wrap_with_falls_back_to_direct_run() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let real = rig.script("rustc.sh", &format!("echo real >> {}", marker.display()));
@@ -723,11 +780,11 @@ fn missing_wrap_with_falls_back_to_direct_exec() {
     );
 }
 
-/// `wrap_with` pointing back at the governor binary would exec an
+/// `wrap_with` pointing back at the governor binary would run an
 /// identical invocation forever. It is config-file state, so it fails
 /// OPEN: the chain front is ignored and the compiler runs directly.
 #[test]
-fn wrap_with_pointing_at_governor_falls_back_to_direct_exec() {
+fn wrap_with_pointing_at_governor_falls_back_to_direct_run() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let real = rig.script("rustc.sh", &format!("echo real >> {}", marker.display()));

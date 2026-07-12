@@ -1,13 +1,17 @@
-//! Thin flock(2)/fcntl(2) wrappers. The crate's `unsafe` lives here and in
-//! `permits::current_username`, each block wrapping exactly one libc call
-//! (repo convention: minimal, `// SAFETY:`-commented islands).
+//! Thin flock(2) wrappers. The crate's `unsafe` lives here, in
+//! `permits::current_username`, and in `main.rs`'s signal
+//! forwarding/re-raise — minimal, `// SAFETY:`-commented islands (repo
+//! convention).
 //!
-//! flock, not fcntl locks, on purpose: flock locks belong to the open file
-//! description, survive exec(2) (once FD_CLOEXEC is cleared), are inherited
-//! by nothing else we spawn (we spawn nothing), and evaporate when the
-//! holder dies — which is the entire crash-release story. Mode is
-//! irrelevant to flock, so read-only opens of the root-owned 0644 permit
-//! files lock fine for every account.
+//! flock, not fcntl locks, on purpose: flock locks belong to the open
+//! file description and evaporate when the holder dies — the entire
+//! crash-release story. The permit-holding fd is never passed to a
+//! child: it keeps std's O_CLOEXEC, and the governor holds it as the
+//! spawned chain's PARENT (an inherited fd in a long-lived child — the
+//! sccache server the client daemonizes on demand — kept permits locked
+//! for hours in production, 2026-07-12). Mode is irrelevant to flock, so
+//! read-only opens of the root-owned 0644 permit files lock fine for
+//! every account.
 
 use std::fs::File;
 use std::io;
@@ -46,25 +50,6 @@ pub(crate) fn unlock(file: &File) {
     let _ = flock_op(file, libc::LOCK_UN);
 }
 
-/// Rust's std opens every file O_CLOEXEC; a permit's flock must survive the
-/// exec into the governed chain — the sccache client, or the real rustc
-/// when `wrap_with` is unset (the flock IS the permit). Load-bearing —
-/// covered by the `permit_lock_survives_exec` acceptance test.
-pub(crate) fn clear_cloexec(file: &File) -> io::Result<()> {
-    // SAFETY: the fd is owned by `file` and stays open across both calls;
-    // F_GETFD moves no memory.
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above; F_SETFD only updates the fd's flag word.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,19 +79,19 @@ mod tests {
         assert!(try_lock_exclusive(&prober));
     }
 
+    /// The permit fd must stay invisible to children: std's O_CLOEXEC is
+    /// load-bearing for the parent-held permit design (nothing in this
+    /// crate may clear it — a cleared fd inherited by the daemonized
+    /// sccache server is exactly the 2026-07-12 permit leak).
     #[test]
-    fn clear_cloexec_clears_the_flag() {
+    fn std_opens_files_cloexec() {
         let dir = tempfile::tempdir().unwrap();
         let f = File::create(dir.path().join("fd")).unwrap();
         // SAFETY: `f` owns an open fd; F_GETFD moves no memory.
-        let before = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
         assert!(
-            before >= 0 && (before & libc::FD_CLOEXEC) != 0,
-            "std opens O_CLOEXEC"
+            flags >= 0 && (flags & libc::FD_CLOEXEC) != 0,
+            "std must open files O_CLOEXEC"
         );
-        clear_cloexec(&f).unwrap();
-        // SAFETY: as above.
-        let after = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
-        assert!(after >= 0 && (after & libc::FD_CLOEXEC) == 0);
     }
 }
