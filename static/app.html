@@ -8346,6 +8346,56 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Message-search hit row (flagged quick-search message lane). */
+.session-card .sc-msg-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--green);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-msg-hit-count,
+.session-card .sc-msg-hit-role {
+  flex: 0 0 auto;
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-msg-hit-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--overlay1);
+}
+.session-card .sc-msg-hit .ui-chip { flex: 0 0 auto; }
+.session-card .sc-msg-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Highlights are server-anchored byte ranges rendered as <mark>. */
+.session-card .sc-msg-hit-text mark {
+  background: color-mix(in srgb, var(--yellow) 32%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+/* Stub card for message hits outside the loaded metadata corpus. */
+.session-card.sc-msg-stub { opacity: 0.92; }
+/* Message-lane status line under the hydration status (flag-gated). */
+.sessions-msg-search-status {
+  font-size: 12px;
+  color: var(--subtext0);
+  margin: 2px 0 6px;
+}
+.sessions-msg-search-status.error { color: var(--red); }
 .session-card .sc-meta {
   display: flex;
   gap: 11px;
@@ -16672,6 +16722,26 @@ html.ui-v2 #tab-sessions .session-card .sc-preview-hit {
   font-size: 12px;
 }
 html.ui-v2 #tab-sessions .session-card .sc-preview-hit-role { color: var(--violet); }
+/* Message-search hit row (flagged quick-search message lane). */
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit {
+  border-left: 2px solid var(--green);
+  border-radius: 0 8px 8px 0;
+  background: rgba(var(--green-rgb), .08);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-count,
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-role { color: var(--green); }
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-time { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-text mark {
+  background: rgba(var(--amber-rgb), .3);
+  color: inherit;
+}
+html.ui-v2 #tab-sessions .sessions-msg-search-status {
+  font-size: 12px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-msg-search-status.error { color: var(--red); }
 
 /* Meta row — mono microtext per the reference card's third line. */
 html.ui-v2 #tab-sessions .session-card .sc-meta {
@@ -22102,6 +22172,15 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                     <span>Show</span>
                   </label>
                 </div>
+                <!-- Message-search superseded toggle: hidden unless the
+                     ?message_search=on flag is on (57-sessions-message-search.js). -->
+                <div class="sessions-control sessions-toggle-field hidden" id="sessions-msg-superseded-field">
+                  <span>Superseded</span>
+                  <label class="sessions-toggle sessions-superseded-toggle" title="Include message matches superseded by rewinds and restores (they stay badged)">
+                    <input type="checkbox" id="sessions-include-superseded" checked>
+                    <span>Include</span>
+                  </label>
+                </div>
                 <label class="sessions-sort">
                   <span>Sort</span>
                   <select id="sort-sessions">
@@ -22121,6 +22200,8 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
             </div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
             <div class="sessions-hydration-status hidden" id="sessions-hydration-status" aria-live="polite"></div>
+            <!-- Message-search lane status (flagged; 57-sessions-message-search.js). -->
+            <div class="sessions-msg-search-status hidden" id="sessions-msg-search-status" aria-live="polite"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
             </div>
@@ -25125,6 +25206,34 @@ let _sessionDeepSearch = {
   truncatedFiles: 0,
   results: new Map(),
 };
+// Quick-search message lane (feature flag: ?message_search=on): state of
+// the last /api/sessions/message-search request, unioned into the Recent
+// list under the metadata lane. Declared up here with the other sessions
+// module state (deep-link TDZ, above); the lane's code lives in
+// 57-sessions-message-search.js and the render touchpoints in
+// 57-sessions-replay.js.
+let _msgSearchFlagMemo = null;
+let _sessionMsgSearchToken = 0;
+let _sessionMsgSearchAbort = null;
+let _sessionMsgSearchTimer = null;
+let _sessionMsgSearch = {
+  sig: '',            // request signature the current state answers
+  query: '',          // raw query text of that request
+  queryLower: '',     // lowercased twin (the metadata lane compares lowercased)
+  active: false,      // results applied and live
+  loading: false,     // request in flight (or scheduled retry)
+  state: '',          // server coverage state: ready | building | partial
+  partialReason: null,
+  error: '',
+  unavailable: '',    // non-empty: honest "cannot serve here" note
+  hits: new Map(),    // `${source}:${session_id}` → response session entry
+  extrasHint: 0,      // apply-time count of hits with no row in _cachedSessions
+                      // (status-line hint; render-side stubs re-derive
+                      // membership per pass from `hits`)
+  moreAvailable: false, // server returned a cursor (further pages exist)
+  windowDays: 0,
+  seq: 0,             // bumps on every visible change; render keys include it
+};
 let _sessionsHydrationHideTimer = null;
 let _sessionsHydrationState = {
   active: false,
@@ -25544,6 +25653,8 @@ const SESSIONS_FILTER_PROJECT_KEY = 'intendant_sessions_filter_project';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
 const SESSIONS_SHOW_SUBAGENTS_KEY = 'intendant_sessions_show_subagents';
+// Message-lane superseded toggle (flagged; 57-sessions-message-search.js).
+const SESSIONS_MSG_SUPERSEDED_KEY = 'intendant_sessions_msg_superseded';
 const SESSIONS_DEEP_FILTER_PROJECT_KEY = 'intendant_sessions_deep_filter_project';
 const SESSIONS_DEEP_FILTER_SOURCE_KEY = 'intendant_sessions_deep_filter_source';
 const SESSIONS_DEEP_FILTER_STATUS_KEY = 'intendant_sessions_deep_filter_status';
@@ -85205,6 +85316,9 @@ function setSessionsHost(hostId) {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   renderSessionsHostStrip();
   loadSessions({ force: true });
+  // Message lane (flagged): the tunnel twin serves the selected peer's own
+  // index, so a host switch re-keys the search. No-op with the flag off.
+  scheduleSessionMessageSearch();
 }
 
 // Whole-card action while browsing a peer: hand off to the peer's own
@@ -85782,6 +85896,10 @@ function _refilterSessions() {
 // Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
+  // Message lane (flagged; 57-sessions-message-search.js): every
+  // search/filter change funnels through here, so the lane re-keys or
+  // clears BEFORE the re-render below. No-op with the flag off.
+  scheduleSessionMessageSearch();
   _refilterSessions();
 }
 
@@ -86886,6 +87004,9 @@ function sessionsListOptionsKey(options, currentSessionId) {
     !!options.hideSubagents,
     currentSessionId,
     sessionsViewingPeer() ? currentSessionsHostId() : '',
+    // Message lane (flagged): seq bumps on every visible lane change, so
+    // arriving/clearing results re-key the pass. Constant 0 when inactive.
+    options.mode === 'recent' ? _sessionMsgSearch.seq : 0,
   ]);
 }
 
@@ -86913,9 +87034,14 @@ function collectSessionsListMatches(sessions, options, ctx) {
   const sourceFilter = options.sourceFilter || [];
   const statusFilter = options.statusFilter || [];
   const matched = [];
+  // Message lane: corpus membership decides which hits become stub rows —
+  // evaluated per pass (a hit session can enter the corpus mid-hydration,
+  // and its stub must yield to the real row, filters included).
+  const msgKnown = ctx.msgSearch ? new Set() : null;
   let hiddenSubagentCount = 0;
   for (const [, s] of decorated) {
     const source = normalizeAgentId(s.source || '') || 'intendant';
+    if (msgKnown && s.session_id) msgKnown.add(sessionLogSearchKey(source, s.session_id));
     const shortId = (s.session_id || '').substring(0, 8);
     const isCurrent = !!(ctx.currentSessionId && s.session_id && s.session_id.startsWith(ctx.currentSessionId));
 
@@ -86930,14 +87056,32 @@ function collectSessionsListMatches(sessions, options, ctx) {
     if (!sessionMatchesProjectFilter(s, projectFilter)) continue;
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
-    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent)) continue;
+    // Union with the message lane (flagged): a row whose messages match
+    // stays visible even when the metadata haystack misses the query.
+    const msgHit = ctx.msgSearch ? sessionMessageSearchHitFor(source, s.session_id) : null;
+    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent) && !msgHit) continue;
     const logHit = ctx.deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
     if (ctx.deepSearchActive && !logHit) continue;
     if (ctx.hideSubagents && sessionRelationshipKindForRow(s) === 'subagent') {
       hiddenSubagentCount += 1;
       continue;
     }
-    matched.push({ s, source, shortId, isCurrent, displayStatus, logHit });
+    matched.push({ s, source, shortId, isCurrent, displayStatus, logHit, msgHit });
+  }
+  // Message-lane stubs: hits whose sessions are absent from the loaded
+  // metadata corpus (mid-hydration, capped peer lists). Only the filters we
+  // can honestly evaluate apply — source rides the response; project and
+  // status are unknown for these rows, so any active project/status filter
+  // hides them rather than guessing.
+  if (ctx.msgSearch) {
+    const projectActive = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
+    if (!projectActive && statusFilter.length === 0) {
+      for (const entry of sessionMessageSearchHits().values()) {
+        if (msgKnown.has(entry.key)) continue;
+        if (!sessionMatchesSourceFilter(entry.source, sourceFilter)) continue;
+        matched.push(sessionMessageSearchStubMatch(entry));
+      }
+    }
   }
   return { matched, hiddenSubagentCount };
 }
@@ -87007,6 +87151,9 @@ function sessionCardDerived(m, ctx) {
 }
 
 function sessionCardSig(m, derived, ctx) {
+  // Message-lane hit (flagged): the whole entry is card content (count,
+  // best snippet, ranges, badges), so sign all of it. Empty when inactive.
+  const msgHitSig = m.msgHit ? JSON.stringify(m.msgHit) : '';
   const childSig = derived.lineageChildren.map(child => {
     const childId = sessionLineageIds(child)[0] || child.session_id || '';
     return `${sessionRelationshipKindForRow(child)}\u001e${childId}\u001e${sessionLineageDisplayLabel(child, childId)}`;
@@ -87021,7 +87168,7 @@ function sessionCardSig(m, derived, ctx) {
     m.displayStatus, m.isCurrent, m.source, ctx.viewingPeer,
     derived.relationshipKind, derived.configSource, derived.backendSource,
     derived.hasExternalBackend, derived.nickname, derived.parentId,
-    derived.parentLabel, childSig, hitSig, previewHitSig,
+    derived.parentLabel, childSig, hitSig, previewHitSig, msgHitSig,
   ]);
 }
 
@@ -87038,6 +87185,9 @@ function refreshSessionCardRelativeLabel(card) {
 }
 
 function sessionCardFor(m, ctx, st, nextCards) {
+  // Message-lane stub rows (sessions the index knows but the loaded
+  // metadata corpus does not) render their own compact card.
+  if (m.msgStub) return sessionMessageSearchStubCardFor(m, ctx, st, nextCards);
   const key = sessionListRowKey(m.s);
   const derived = sessionCardDerived(m, ctx);
   const sig = sessionCardSig(m, derived, ctx);
@@ -87142,6 +87292,9 @@ function renderSessionsList(sessions, el, options = {}) {
   const ctx = {
     deepSearchOnly,
     deepSearchActive: deepSearchOnly && _sessionDeepSearch.active,
+    // Message lane (flagged): live only when the applied results answer
+    // exactly the query this pass renders (display-layer stale rejection).
+    msgSearch: !deepSearchOnly && sessionMessageSearchActiveFor(options.query || ''),
     hideSubagents: !!options.hideSubagents,
     viewingPeer: sessionsViewingPeer(),
     currentSessionId,
@@ -87418,6 +87571,13 @@ function buildSessionCard(m, derived, ctx) {
     hitText.title = firstSnippet.content || '';
     hitEl.appendChild(hitText);
     card.appendChild(hitEl);
+  }
+
+  // Message-search hit (flagged quick-search message lane): the most
+  // recent matching message with server-anchored highlights and
+  // superseded/truncated/subagent badges.
+  if (m.msgHit) {
+    card.appendChild(buildSessionMessageHitBlock(m.msgHit));
   }
 
   // Quick-search hit inside the conversation preview: one quiet snippet
@@ -89921,6 +90081,650 @@ function loadNewerSessionDetailRows(view) {
   return true;
 }
 
+/* ── static/app/57-sessions-message-search.js ── */
+// ── Quick-search message lane (feature flag: ?message_search=on) ─────────
+// Unions full-text message hits from the rolling message index
+// (`/api/sessions/message-search`, tunnel twin `api_sessions_message_search`)
+// into the Recent list's quick search, UNDER the existing metadata lane:
+// the metadata lane stays immediate and untouched; once the query reaches
+// two characters this lane debounces ~225 ms, aborts any in-flight request,
+// and rejects stale responses by token. Hits attach to their session cards
+// (role, timestamp, best snippet with server-anchored highlights,
+// superseded/truncated/subagent badges); hits whose sessions are missing
+// from the loaded metadata corpus render as compact stub cards.
+//
+// Flag OFF = inert: scheduleSessionMessageSearch() returns before touching
+// anything, the toolbar toggle and status line stay hidden, and the render
+// pipeline sees `active:false` everywhere — behavior is identical to a
+// build without this fragment. Flag precedent: Station's world panes
+// (`?station_panes=on`, crates/station-web/src/util.rs); once C1's route
+// row lands, the daemon-side `api_sessions_message_search_available`
+// status boolean (derived from the tunnel method table) is what the
+// availability precheck below consults — no hand-mirrored capability flag.
+//
+// Transport note (deliberate seam): this lane calls
+// `daemonApi.request('api_sessions_message_search', …)` WITHOUT a
+// DAEMON_API_HTTP_MAP descriptor row, so it is tunnel-only for now. The
+// daemon-side parity test (`daemon_api_http_map_mirrors_gateway_routes`,
+// dashboard_control/mod.rs) pins the descriptor's coverage set against
+// `gateway_routes::ROUTES`, and the C1 route row lands from a concurrent
+// lane — the descriptor row + coverage-pin entry must ride together with
+// (or after) C1. Until then non-tunnel dashboards get the honest
+// "unavailable" note below.
+//
+// State lives in 31-init-identity-fleet.js's early client-state block
+// (`_sessionMsgSearch*` — deep-link TDZ rule); render-side touchpoints live
+// in 57-sessions-replay.js and are gated on `ctx.msgSearch`.
+
+const SESSION_MSG_SEARCH_DEBOUNCE_MS = 225;
+const SESSION_MSG_SEARCH_MIN_QUERY = 2;
+const SESSION_MSG_SEARCH_TIMEOUT_MS = 15000;
+
+function messageSearchFlagEnabled() {
+  if (_msgSearchFlagMemo === null) {
+    const raw = new URLSearchParams(window.location.search).get('message_search');
+    _msgSearchFlagMemo = raw === 'on' || raw === '1';
+  }
+  return _msgSearchFlagMemo;
+}
+
+// Superseded matches are included by default and badged (plan D2); the
+// toolbar toggle (revealed only under the flag) flips the server-side
+// `include_superseded` param. Absent element ⇒ the default (include).
+function sessionsIncludeSuperseded() {
+  return document.getElementById('sessions-include-superseded')?.checked !== false;
+}
+
+// The response entry for one session, keyed exactly like the render loop
+// keys its rows (normalizeAgentId'd source + session id).
+function sessionMessageSearchHitFor(source, sessionId) {
+  if (!_sessionMsgSearch.active) return null;
+  return _sessionMsgSearch.hits.get(sessionLogSearchKey(source, sessionId)) || null;
+}
+
+// "Results are live for the query the list is currently rendering." The
+// metadata lane compares lowercased text, so this does too — during the
+// debounce + flight window after an edit the applied results answer the
+// OLD query and must not paint against the new one (display-layer stale
+// rejection; the token check below is the response-layer one).
+function sessionMessageSearchActiveFor(queryLower) {
+  return messageSearchFlagEnabled()
+    && _sessionMsgSearch.active
+    && _sessionMsgSearch.queryLower === String(queryLower || '');
+}
+
+// The applied result set. Render passes derive stub rows from this map by
+// corpus membership (collectSessionsListMatches), never from an apply-time
+// snapshot — the corpus can hydrate under live results.
+function sessionMessageSearchHits() {
+  return _sessionMsgSearch.hits;
+}
+
+function sessionMessageSearchParams() {
+  const query = (document.getElementById('sessions-search')?.value || '').trim();
+  // Source filter: concrete ids ride the API's `source` csv; the synthetic
+  // 'external' value has no server vocabulary, so it widens to 'all' and
+  // the client-side sessionMatchesSourceFilter pass keeps the honest set.
+  const sourceFilter = sessionSourceFilterValue();
+  const source = (!sourceFilter.length || sourceFilter.includes('external'))
+    ? 'all'
+    : sourceFilter.join(',');
+  return {
+    q: query,
+    source,
+    include_superseded: sessionsIncludeSuperseded(),
+    subagents: sessionsShowSubagents(),
+    host: currentSessionsHostId(),
+  };
+}
+
+function sessionMessageSearchSig(params) {
+  return JSON.stringify([
+    params.q,
+    params.source,
+    params.include_superseded,
+    params.subagents,
+    params.host,
+  ]);
+}
+
+// Single entry point, called from _refreshSessionsFilters (input, Escape
+// clear, source/subagents/superseded toggles all funnel through it) and
+// from setSessionsHost. Inert with the flag off.
+function scheduleSessionMessageSearch() {
+  if (!messageSearchFlagEnabled()) return;
+  const params = sessionMessageSearchParams();
+  if (params.q.length < SESSION_MSG_SEARCH_MIN_QUERY) {
+    clearSessionMessageSearch();
+    return;
+  }
+  const sig = sessionMessageSearchSig(params);
+  if (sig === _sessionMsgSearch.sig && (_sessionMsgSearch.active || _sessionMsgSearch.loading)) {
+    return; // already answered or in flight for exactly this request
+  }
+  if (_sessionMsgSearchTimer) clearTimeout(_sessionMsgSearchTimer);
+  _sessionMsgSearchTimer = setTimeout(() => {
+    _sessionMsgSearchTimer = null;
+    runSessionMessageSearch(params, sig, 0);
+  }, SESSION_MSG_SEARCH_DEBOUNCE_MS);
+}
+
+// Query dropped under the minimum (or cleared): abort the lane and repaint
+// only if it was visible. Callers re-render via _refilterSessions.
+function clearSessionMessageSearch() {
+  if (_sessionMsgSearchTimer) {
+    clearTimeout(_sessionMsgSearchTimer);
+    _sessionMsgSearchTimer = null;
+  }
+  if (_sessionMsgSearchAbort) {
+    _sessionMsgSearchAbort.abort();
+    _sessionMsgSearchAbort = null;
+  }
+  _sessionMsgSearchToken += 1; // anything still in flight is stale
+  const hadState = _sessionMsgSearch.active || _sessionMsgSearch.loading
+    || !!_sessionMsgSearch.error || !!_sessionMsgSearch.unavailable;
+  if (!hadState) return;
+  _sessionMsgSearch = {
+    sig: '',
+    query: '',
+    queryLower: '',
+    active: false,
+    loading: false,
+    state: '',
+    partialReason: null,
+    error: '',
+    unavailable: '',
+    hits: new Map(),
+    extrasHint: 0,
+    moreAvailable: false,
+    windowDays: 0,
+    seq: _sessionMsgSearch.seq + 1,
+  };
+  updateSessionsMessageSearchStatus();
+}
+
+function failSessionMessageSearch(patch) {
+  _sessionMsgSearch = {
+    ..._sessionMsgSearch,
+    active: false,
+    loading: false,
+    state: '',
+    partialReason: null,
+    hits: new Map(),
+    extrasHint: 0,
+    moreAvailable: false,
+    error: '',
+    unavailable: '',
+    ...patch,
+    seq: _sessionMsgSearch.seq + 1,
+  };
+  _sessionMsgSearchAbort = null;
+  updateSessionsMessageSearchStatus();
+  _refilterSessions();
+}
+
+function runSessionMessageSearch(params, sig, attempt) {
+  if (_sessionMsgSearchAbort) _sessionMsgSearchAbort.abort();
+  const controller = new AbortController();
+  _sessionMsgSearchAbort = controller;
+  const token = ++_sessionMsgSearchToken;
+
+  // Keep the previous results painted while a same-query re-filter is in
+  // flight; drop them the moment the TEXT changes (they answer the old
+  // query and would highlight the wrong thing).
+  const sameQuery = _sessionMsgSearch.query === params.q;
+  _sessionMsgSearch = {
+    ..._sessionMsgSearch,
+    sig,
+    query: params.q,
+    queryLower: params.q.toLowerCase(),
+    active: sameQuery ? _sessionMsgSearch.active : false,
+    hits: sameQuery ? _sessionMsgSearch.hits : new Map(),
+    extrasHint: sameQuery ? _sessionMsgSearch.extrasHint : 0,
+    loading: true,
+    error: '',
+    unavailable: '',
+    seq: _sessionMsgSearch.seq + 1,
+  };
+  updateSessionsMessageSearchStatus();
+
+  const target = params.host && params.host !== selfPeerId ? params.host : null;
+
+  // Honest precheck via the daemon-derived method availability (the tunnel
+  // method table's `<method>_available` boolean once C1 lands; 'unsupported'
+  // on daemons without the route). Optimistic pre-hello states fall through
+  // to the request, which reports the truth itself.
+  const availability = daemonApi.availability('api_sessions_message_search', target);
+  if (!availability.ok) {
+    const note = availability.reason === 'denied'
+      ? 'Message search is not permitted for this dashboard connection.'
+      : availability.reason === 'transport-down'
+        ? 'Message search needs the dashboard tunnel — waiting for it to reconnect.'
+        : 'Message search is not available on this daemon yet.';
+    failSessionMessageSearch({ unavailable: note });
+    return;
+  }
+
+  const requestParams = {
+    q: params.q,
+    source: params.source,
+    include_superseded: params.include_superseded,
+    subagents: params.subagents,
+  };
+  const options = { signal: controller.signal, timeoutMs: SESSION_MSG_SEARCH_TIMEOUT_MS };
+  if (target) options.target = target;
+
+  daemonApi.request('api_sessions_message_search', requestParams, options)
+    .then(resp => {
+      if (token !== _sessionMsgSearchToken) return; // stale response
+      if (resp.status === 429) {
+        // Busy: back off one debounce period, retry once.
+        if (attempt >= 1) {
+          failSessionMessageSearch({ error: 'Message search is busy — edit the query to retry.' });
+          return;
+        }
+        setTimeout(() => {
+          if (token !== _sessionMsgSearchToken) return;
+          runSessionMessageSearch(params, sig, attempt + 1);
+        }, SESSION_MSG_SEARCH_DEBOUNCE_MS);
+        return;
+      }
+      if (resp.status === 410) {
+        // cursor_expired — restart the search transparently. This lane
+        // only requests first pages today, but the restart contract is
+        // cheap to honor and covers the C2/pagination follow-up.
+        if (attempt >= 2) {
+          failSessionMessageSearch({ error: 'Message search snapshot expired repeatedly — try again.' });
+          return;
+        }
+        runSessionMessageSearch(params, sig, attempt + 1);
+        return;
+      }
+      if (resp.status === 404 || resp.status === 405) {
+        failSessionMessageSearch({ unavailable: 'Message search is not available on this daemon yet.' });
+        return;
+      }
+      const body = resp.body && typeof resp.body === 'object' ? resp.body : {};
+      if (!resp.ok || body.ok === false) {
+        failSessionMessageSearch({
+          error: `Message search failed: ${body.error || `HTTP ${resp.status}`}`,
+        });
+        return;
+      }
+      applySessionMessageSearchResults(params, sig, body);
+    })
+    .catch(err => {
+      if (token !== _sessionMsgSearchToken) return;
+      if (err?.kind === 'abort' || err?.name === 'AbortError') return;
+      if (err?.kind === 'unavailable') {
+        failSessionMessageSearch({ unavailable: 'Message search is not available on this daemon yet.' });
+        return;
+      }
+      if (err?.kind === 'denied') {
+        failSessionMessageSearch({ unavailable: 'Message search is not permitted for this dashboard connection.' });
+        return;
+      }
+      failSessionMessageSearch({ error: `Message search failed: ${err?.message || err}` });
+    });
+}
+
+function applySessionMessageSearchResults(params, sig, body) {
+  const known = new Set();
+  for (const s of Array.isArray(_cachedSessions) ? _cachedSessions : []) {
+    const source = normalizeAgentId(s.source || '') || 'intendant';
+    if (s.session_id) known.add(sessionLogSearchKey(source, s.session_id));
+  }
+  const hits = new Map();
+  let extrasHint = 0;
+  for (const entry of Array.isArray(body.sessions) ? body.sessions : []) {
+    if (!entry || typeof entry !== 'object') continue;
+    const source = normalizeAgentId(entry.source || '') || 'intendant';
+    const sessionId = String(entry.session_id || '').trim();
+    if (!sessionId) continue;
+    const key = sessionLogSearchKey(source, sessionId);
+    const normalized = { ...entry, source, session_id: sessionId, key };
+    hits.set(key, normalized);
+    if (!known.has(key)) extrasHint += 1;
+  }
+  _sessionMsgSearch = {
+    sig,
+    query: params.q,
+    queryLower: params.q.toLowerCase(),
+    active: true,
+    loading: false,
+    state: String(body.state || ''),
+    partialReason: body.partial_reason || null,
+    error: '',
+    unavailable: '',
+    hits,
+    extrasHint,
+    moreAvailable: !!body.cursor,
+    windowDays: Number(body.window_days) || 0,
+    seq: _sessionMsgSearch.seq + 1,
+  };
+  _sessionMsgSearchAbort = null;
+  updateSessionsMessageSearchStatus();
+  _refilterSessions();
+}
+
+function updateSessionsMessageSearchStatus() {
+  const el = document.getElementById('sessions-msg-search-status');
+  if (!el) return;
+  if (!messageSearchFlagEnabled()) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.classList.remove('error');
+  el.title = _sessionMsgSearch.windowDays > 0
+    ? `The message index covers the last ${_sessionMsgSearch.windowDays} days.`
+    : '';
+  let text = '';
+  if (_sessionMsgSearch.unavailable) {
+    text = _sessionMsgSearch.unavailable;
+  } else if (_sessionMsgSearch.error) {
+    el.classList.add('error');
+    text = _sessionMsgSearch.error;
+  } else if (_sessionMsgSearch.loading) {
+    text = 'Searching messages...';
+  } else if (_sessionMsgSearch.active) {
+    const count = _sessionMsgSearch.hits.size;
+    const parts = [];
+    parts.push(count === 0
+      ? 'No message matches.'
+      : `Message matches in ${count.toLocaleString()} ${count === 1 ? 'session' : 'sessions'}.`);
+    if (_sessionMsgSearch.extrasHint > 0) {
+      parts.push(`${_sessionMsgSearch.extrasHint.toLocaleString()} of them are not in the loaded session list.`);
+    }
+    if (_sessionMsgSearch.state === 'building') {
+      parts.push('The message index is still building - results may be incomplete.');
+    } else if (_sessionMsgSearch.partialReason) {
+      parts.push(`Results may be incomplete (${_sessionMsgSearch.partialReason}).`);
+    }
+    if (_sessionMsgSearch.moreAvailable) {
+      parts.push('More matching sessions exist - refine the query to narrow them.');
+    }
+    text = parts.join(' ');
+  }
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+}
+
+// ── Snippet highlighting ──────────────────────────────────────────────────
+// Snippets are attacker-influenced text: they render through
+// textContent/createTextNode ONLY, and highlight placement comes from the
+// server's byte ranges — the client never re-derives matches (server-side
+// normalization changes lengths). `ranges` index into the ORIGINAL message
+// text as UTF-8 BYTE offsets; the snippet starts `snippet_offset_bytes`
+// into that text, so the in-snippet byte range is
+// [start - snippet_offset_bytes, end - snippet_offset_bytes). JS strings
+// are UTF-16, so the math runs on TextEncoder bytes and each piece decodes
+// back separately — never on code-unit indices.
+function messageSnippetSegments(snippet, ranges, offsetBytes) {
+  const text = String(snippet || '');
+  const bytes = new TextEncoder().encode(text);
+  const total = bytes.length;
+  const offset = Number.isFinite(Number(offsetBytes)) ? Number(offsetBytes) : 0;
+  const clamped = [];
+  for (const range of Array.isArray(ranges) ? ranges : []) {
+    if (!Array.isArray(range) || range.length < 2) continue;
+    let start = Number(range[0]) - offset;
+    let end = Number(range[1]) - offset;
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+    start = Math.max(0, Math.min(total, Math.floor(start)));
+    end = Math.max(0, Math.min(total, Math.floor(end)));
+    if (end > start) clamped.push([start, end]);
+  }
+  if (!clamped.length) return [{ text, hit: false }];
+  clamped.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const [start, end] of clamped) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+    else merged.push([start, end]);
+  }
+  const decoder = new TextDecoder('utf-8');
+  const segments = [];
+  let pos = 0;
+  for (const [start, end] of merged.slice(0, 16)) {
+    if (start > pos) segments.push({ text: decoder.decode(bytes.subarray(pos, start)), hit: false });
+    segments.push({ text: decoder.decode(bytes.subarray(start, end)), hit: true });
+    pos = end;
+  }
+  if (pos < total) segments.push({ text: decoder.decode(bytes.subarray(pos)), hit: false });
+  return segments;
+}
+
+function messageSearchTimestampLabels(tsMs) {
+  const ms = Number(tsMs);
+  if (!Number.isFinite(ms) || ms <= 0) return { rel: '', abs: '' };
+  const iso = new Date(ms).toISOString();
+  return { rel: sessionRelativeLabel(iso), abs: iso };
+}
+
+// One quiet row on the session card: count, role, time, badges, best
+// snippet. The server orders a session's hits most-recent-first, so
+// hits[0] is the display pick; total_hits covers the rest.
+function buildSessionMessageHitBlock(entry) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sc-msg-hit';
+  const hits = Array.isArray(entry.hits) ? entry.hits : [];
+  const best = hits[0] && typeof hits[0] === 'object' ? hits[0] : null;
+  const total = Number(entry.total_hits) || hits.length;
+
+  const count = document.createElement('span');
+  count.className = 'sc-msg-hit-count';
+  count.textContent = `${total} message ${total === 1 ? 'match' : 'matches'}`;
+  const titleParts = ['Most recent matching message is shown.'];
+  if (entry.source_gone) titleParts.push('The source log is no longer on disk; matches come from the index.');
+  count.title = titleParts.join('\n');
+  wrap.appendChild(count);
+
+  if (!best) return wrap;
+
+  const role = document.createElement('span');
+  role.className = 'sc-msg-hit-role';
+  role.textContent = String(best.role || '');
+  wrap.appendChild(role);
+
+  const { rel, abs } = messageSearchTimestampLabels(best.ts_ms);
+  if (rel || abs) {
+    const time = document.createElement('span');
+    time.className = 'sc-msg-hit-time';
+    time.textContent = rel || abs;
+    if (abs) time.title = abs;
+    wrap.appendChild(time);
+  }
+
+  const addChip = (tone, label, title) => {
+    const chip = document.createElement('span');
+    chip.className = `ui-chip ${tone} sc-msg-hit-chip`;
+    chip.textContent = label;
+    if (title) chip.title = title;
+    wrap.appendChild(chip);
+  };
+  if (best.superseded) {
+    addChip('warn', 'superseded', 'This message was superseded by a rewind or restore. Use the Superseded toggle to hide such matches.');
+  }
+  if (best.truncated) {
+    addChip('muted', 'truncated', 'The indexed text was truncated at the per-message cap; the match may continue beyond it.');
+  }
+  if (best.subagent) {
+    addChip('muted', 'subagent', 'This message lives in a subagent transcript of the session.');
+  }
+
+  const snippet = document.createElement('span');
+  snippet.className = 'sc-msg-hit-text';
+  const segments = messageSnippetSegments(best.snippet, best.ranges, best.snippet_offset_bytes);
+  for (const segment of segments) {
+    if (!segment.text) continue;
+    if (segment.hit) {
+      const mark = document.createElement('mark');
+      mark.textContent = segment.text;
+      snippet.appendChild(mark);
+    } else {
+      snippet.appendChild(document.createTextNode(segment.text));
+    }
+  }
+  snippet.title = String(best.snippet || '');
+  wrap.appendChild(snippet);
+
+  // C2 seam: `best.locator` (opaque, versioned) is the anchor for a
+  // locate-jump (`/api/session/{id}?locate=<locator>`) once C2 lands; the
+  // card's whole-row click stays the plain session open until then.
+  return wrap;
+}
+
+// ── Stub rows: hits outside the loaded metadata corpus ────────────────────
+function sessionMessageSearchStubMatch(entry) {
+  const { abs } = messageSearchTimestampLabels(entry.best_ts_ms);
+  return {
+    s: {
+      session_id: entry.session_id,
+      source: entry.source,
+      updated_at: abs,
+    },
+    source: entry.source,
+    shortId: String(entry.session_id).substring(0, 8),
+    isCurrent: false,
+    displayStatus: '',
+    logHit: null,
+    msgHit: entry,
+    msgStub: true,
+  };
+}
+
+// Card-cache twin of sessionCardFor for stub rows (same node-reuse
+// contract; the sig covers everything the card renders).
+function sessionMessageSearchStubCardFor(m, ctx, st, nextCards) {
+  const key = `msg\u001f${m.msgHit.key}`;
+  const sig = 'msg-stub\u001f' + JSON.stringify(m.msgHit) + '\u001f' + String(!!ctx.viewingPeer);
+  const cached = st.cards.get(key);
+  let card;
+  if (cached && cached.sig === sig) {
+    card = cached.card;
+  } else {
+    card = buildSessionMessageSearchStubCard(m, ctx);
+    card.dataset.sessionKey = key;
+    card.dataset.qaBuildSeq = String(++_sessionCardBuildSeq);
+  }
+  (nextCards || st.cards).set(key, { sig, card });
+  return card;
+}
+
+function buildSessionMessageSearchStubCard(m, ctx) {
+  const entry = m.msgHit;
+  const card = document.createElement('div');
+  card.className = 'session-card sc-split sc-msg-stub';
+  const main = document.createElement('div');
+  main.className = 'sc-main';
+  card.appendChild(main);
+
+  const top = document.createElement('div');
+  top.className = 'sc-top';
+  const titleBlock = document.createElement('div');
+  titleBlock.className = 'sc-title-block';
+  const titleRow = document.createElement('div');
+  titleRow.className = 'sc-title-row';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'sc-name';
+  nameEl.textContent = `Session ${m.shortId}`;
+  nameEl.title = entry.session_id;
+  titleRow.appendChild(nameEl);
+  titleBlock.appendChild(titleRow);
+  top.appendChild(titleBlock);
+
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'ui-badge sc-source' + (m.source === 'intendant' ? ' local' : '');
+  sourceEl.textContent = m.source === 'intendant' ? 'Intendant' : (prettyAgentName(m.source) || m.source);
+  sourceEl.dataset.src = m.source;
+  top.appendChild(sourceEl);
+
+  const stubChip = document.createElement('span');
+  stubChip.className = 'ui-chip muted sc-role';
+  stubChip.textContent = 'not in loaded list';
+  stubChip.title = 'The message index knows this session, but it is not in the loaded session list (still hydrating, or beyond this host’s list). Click to open its detail view.';
+  top.appendChild(stubChip);
+  main.appendChild(top);
+
+  card.appendChild(buildSessionMessageHitBlock(entry));
+
+  const meta = document.createElement('div');
+  meta.className = 'sc-meta';
+  const idSpan = document.createElement('span');
+  const idLabel = document.createElement('span');
+  idLabel.className = 'label';
+  idLabel.textContent = 'id';
+  const idValue = document.createElement('span');
+  idValue.className = 'value sc-id';
+  idValue.textContent = entry.session_id;
+  idSpan.appendChild(idLabel);
+  idSpan.appendChild(idValue);
+  meta.appendChild(idSpan);
+  const { rel, abs } = messageSearchTimestampLabels(entry.best_ts_ms);
+  if (rel || abs) {
+    const tsSpan = document.createElement('span');
+    const tsLabel = document.createElement('span');
+    tsLabel.className = 'label';
+    tsLabel.textContent = 'matched';
+    const tsValue = document.createElement('span');
+    tsValue.className = 'value';
+    tsValue.textContent = rel || abs;
+    if (abs) tsValue.title = abs;
+    tsSpan.appendChild(tsLabel);
+    tsSpan.appendChild(tsValue);
+    meta.appendChild(tsSpan);
+  }
+  main.appendChild(meta);
+
+  // Jump-to-session: the plain detail open (C2's locate-anchored jump
+  // replaces this seam with an anchored one).
+  const stubSession = { session_id: entry.session_id, source: entry.source };
+  if (ctx.viewingPeer) {
+    card.classList.add('sc-peer');
+    card.title = 'Open this session on the peer’s dashboard';
+    card.addEventListener('click', () => openPeerSessionExternally(stubSession));
+  } else {
+    card.addEventListener('click', () => openSessionDetail(stubSession));
+  }
+  return card;
+}
+
+// ── Boot wiring (inert unless the flag is on) ─────────────────────────────
+(function initSessionsMessageSearchControls() {
+  if (!messageSearchFlagEnabled()) return;
+  const supersededField = document.getElementById('sessions-msg-superseded-field');
+  if (supersededField) supersededField.classList.remove('hidden');
+  const supersededInput = document.getElementById('sessions-include-superseded');
+  if (supersededInput) {
+    supersededInput.checked = localStorage.getItem(SESSIONS_MSG_SUPERSEDED_KEY) !== 'false';
+    supersededInput.addEventListener('change', (ev) => {
+      localStorage.setItem(SESSIONS_MSG_SUPERSEDED_KEY, String(!!ev.target.checked));
+      scheduleSessionMessageSearch();
+    });
+  }
+})();
+
+// QA readback (window.qa convention): the message-lane facts the
+// validate-dashboard harness and the flagged soak assert on.
+window.qa = Object.assign(window.qa || {}, {
+  messageSearch: () => ({
+    flag: messageSearchFlagEnabled(),
+    query: _sessionMsgSearch.query,
+    active: _sessionMsgSearch.active,
+    loading: _sessionMsgSearch.loading,
+    state: _sessionMsgSearch.state,
+    partialReason: _sessionMsgSearch.partialReason,
+    error: _sessionMsgSearch.error,
+    unavailable: _sessionMsgSearch.unavailable,
+    sessions: _sessionMsgSearch.hits.size,
+    extrasHint: _sessionMsgSearch.extrasHint,
+    moreAvailable: _sessionMsgSearch.moreAvailable,
+    windowDays: _sessionMsgSearch.windowDays,
+    includeSuperseded: sessionsIncludeSuperseded(),
+    seq: _sessionMsgSearch.seq,
+    token: _sessionMsgSearchToken,
+  }),
+});
 /* ── static/app/57-attention-notifications.js ── */
 // ── Attention center: pending agent→user requests ──────────────────────
 //

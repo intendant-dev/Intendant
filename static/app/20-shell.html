@@ -1160,6 +1160,15 @@
                     <span>Show</span>
                   </label>
                 </div>
+                <!-- Message-search superseded toggle: hidden unless the
+                     ?message_search=on flag is on (57-sessions-message-search.js). -->
+                <div class="sessions-control sessions-toggle-field hidden" id="sessions-msg-superseded-field">
+                  <span>Superseded</span>
+                  <label class="sessions-toggle sessions-superseded-toggle" title="Include message matches superseded by rewinds and restores (they stay badged)">
+                    <input type="checkbox" id="sessions-include-superseded" checked>
+                    <span>Include</span>
+                  </label>
+                </div>
                 <label class="sessions-sort">
                   <span>Sort</span>
                   <select id="sort-sessions">
@@ -1179,6 +1188,8 @@
             </div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
             <div class="sessions-hydration-status hidden" id="sessions-hydration-status" aria-live="polite"></div>
+            <!-- Message-search lane status (flagged; 57-sessions-message-search.js). -->
+            <div class="sessions-msg-search-status hidden" id="sessions-msg-search-status" aria-live="polite"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
             </div>

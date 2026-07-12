@@ -141,6 +141,34 @@ let _sessionDeepSearch = {
   truncatedFiles: 0,
   results: new Map(),
 };
+// Quick-search message lane (feature flag: ?message_search=on): state of
+// the last /api/sessions/message-search request, unioned into the Recent
+// list under the metadata lane. Declared up here with the other sessions
+// module state (deep-link TDZ, above); the lane's code lives in
+// 57-sessions-message-search.js and the render touchpoints in
+// 57-sessions-replay.js.
+let _msgSearchFlagMemo = null;
+let _sessionMsgSearchToken = 0;
+let _sessionMsgSearchAbort = null;
+let _sessionMsgSearchTimer = null;
+let _sessionMsgSearch = {
+  sig: '',            // request signature the current state answers
+  query: '',          // raw query text of that request
+  queryLower: '',     // lowercased twin (the metadata lane compares lowercased)
+  active: false,      // results applied and live
+  loading: false,     // request in flight (or scheduled retry)
+  state: '',          // server coverage state: ready | building | partial
+  partialReason: null,
+  error: '',
+  unavailable: '',    // non-empty: honest "cannot serve here" note
+  hits: new Map(),    // `${source}:${session_id}` → response session entry
+  extrasHint: 0,      // apply-time count of hits with no row in _cachedSessions
+                      // (status-line hint; render-side stubs re-derive
+                      // membership per pass from `hits`)
+  moreAvailable: false, // server returned a cursor (further pages exist)
+  windowDays: 0,
+  seq: 0,             // bumps on every visible change; render keys include it
+};
 let _sessionsHydrationHideTimer = null;
 let _sessionsHydrationState = {
   active: false,
@@ -560,6 +588,8 @@ const SESSIONS_FILTER_PROJECT_KEY = 'intendant_sessions_filter_project';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
 const SESSIONS_SHOW_SUBAGENTS_KEY = 'intendant_sessions_show_subagents';
+// Message-lane superseded toggle (flagged; 57-sessions-message-search.js).
+const SESSIONS_MSG_SUPERSEDED_KEY = 'intendant_sessions_msg_superseded';
 const SESSIONS_DEEP_FILTER_PROJECT_KEY = 'intendant_sessions_deep_filter_project';
 const SESSIONS_DEEP_FILTER_SOURCE_KEY = 'intendant_sessions_deep_filter_source';
 const SESSIONS_DEEP_FILTER_STATUS_KEY = 'intendant_sessions_deep_filter_status';

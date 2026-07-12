@@ -82,6 +82,7 @@ ui2-settings.js
 55-files-ide.js
 56-debug-sessions.js
 57-sessions-replay.js
+57-sessions-message-search.js
 57-attention-notifications.js
 58-shortcuts-boot.js
 58-display-request.js
