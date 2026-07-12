@@ -298,13 +298,13 @@ pub(crate) fn apply_external_wrapper_index_to_session(
         return;
     };
     let wrappers = crate::external_wrapper_index::wrappers_for(home, &source, &backend_session_id);
-    if wrappers.is_empty() {
+    // "Active wins" selection lives in the wrapper index, not here.
+    let Some(latest) = crate::external_wrapper_index::active_wrapper_in(&wrappers) else {
         return;
-    }
+    };
     let Some(obj) = session.as_object_mut() else {
         return;
     };
-    let latest = &wrappers[0];
     obj.insert(
         "intendant_session_id".to_string(),
         serde_json::Value::String(latest.intendant_session_id.clone()),
