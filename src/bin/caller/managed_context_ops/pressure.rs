@@ -178,7 +178,10 @@ pub(crate) fn latest_external_context_snapshot_from_log(
             context_window,
             hard_context_window,
             item_count,
-            raw,
+            // The event was just built from the log entry, so this Arc is
+            // uniquely held and try_unwrap recovers the Value without a
+            // deep clone; the fallback only fires if that ever changes.
+            raw: std::sync::Arc::try_unwrap(raw).unwrap_or_else(|arc| (*arc).clone()),
         });
     }
 
@@ -977,7 +980,7 @@ pub(crate) async fn emit_external_context_snapshot_if_changed(
                     context_window: snapshot.context_window,
                     hard_context_window: snapshot.hard_context_window,
                     item_count: snapshot.item_count,
-                    raw: snapshot.raw,
+                    raw: std::sync::Arc::new(snapshot.raw),
                 });
                 if let Some(main) = usage {
                     emit_external_context_usage_snapshot_from_usage(config, main);

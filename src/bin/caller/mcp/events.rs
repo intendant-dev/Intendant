@@ -2543,7 +2543,7 @@ mod tests {
                 context_window: Some(258_400),
                 hard_context_window: Some(272_000),
                 item_count: Some(300),
-                raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+                raw: std::sync::Arc::new(serde_json::json!({ "model": "gpt-5.2-codex" })),
             },
         );
         let pressure = s.context_pressure_snapshot();
@@ -3361,7 +3361,7 @@ mod tests {
                         context_window: Some(1_000),
                         hard_context_window: Some(1_200),
                         item_count: Some(12),
-                        raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+                        raw: std::sync::Arc::new(serde_json::json!({ "model": "gpt-5.2-codex" })),
                     },
                 );
             }

@@ -692,7 +692,11 @@ pub enum AppEvent {
         context_window: Option<u64>,
         hard_context_window: Option<u64>,
         item_count: Option<usize>,
-        raw: serde_json::Value,
+        /// The whole serialized provider request context — multi-MB for a
+        /// long session. `Arc`'d so the broadcast ring slot and every
+        /// subscriber's `AppEvent::clone` share one allocation instead of
+        /// deep-copying the payload per subscriber.
+        raw: Arc<serde_json::Value>,
     },
 
     /// Proactive status broadcast (emitted on turn start, phase change, etc.)
@@ -5575,7 +5579,7 @@ mod tests {
             context_window: Some(128000),
             hard_context_window: Some(128000),
             item_count: Some(2),
-            raw: serde_json::json!({"thread": {"turns": []}}),
+            raw: Arc::new(serde_json::json!({"thread": {"turns": []}})),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -5584,6 +5588,40 @@ mod tests {
         assert!(json.contains("\"source\":\"codex\""));
         assert!(json.contains("\"request_index\":7"));
         assert!(json.contains("\"raw\""));
+    }
+
+    /// The whole point of `Arc`-ing `ContextSnapshot::raw`: every bus
+    /// subscriber receives the event via `AppEvent::clone`, and that clone
+    /// must share the (multi-MB) payload allocation, not deep-copy it.
+    #[test]
+    fn context_snapshot_clone_shares_raw_allocation() {
+        let event = AppEvent::ContextSnapshot {
+            session_id: Some("sess-ctx".to_string()),
+            source: "native".to_string(),
+            label: "Internal agent request payload".to_string(),
+            request_id: Some("req-share".to_string()),
+            request_index: Some(1),
+            turn: Some(1),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: None,
+            token_count_kind: None,
+            context_window: Some(128000),
+            hard_context_window: Some(128000),
+            item_count: Some(1),
+            raw: Arc::new(serde_json::json!({"input": [{"role": "user"}]})),
+        };
+        let cloned = event.clone();
+        let (
+            AppEvent::ContextSnapshot { raw: original, .. },
+            AppEvent::ContextSnapshot { raw: copy, .. },
+        ) = (&event, &cloned)
+        else {
+            panic!("expected two context snapshots");
+        };
+        assert!(
+            Arc::ptr_eq(original, copy),
+            "cloning a ContextSnapshot must refcount the raw payload, not deep-copy it"
+        );
     }
 
     #[test]
@@ -5602,10 +5640,10 @@ mod tests {
             context_window: Some(128000),
             hard_context_window: Some(128000),
             item_count: Some(1),
-            raw: serde_json::json!({
+            raw: Arc::new(serde_json::json!({
                 "input": [{"role": "user", "content": large_text}],
                 "model": "codex",
-            }),
+            })),
         };
 
         let outbound = app_event_to_outbound(&event).unwrap();
