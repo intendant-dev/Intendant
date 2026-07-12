@@ -32018,6 +32018,12 @@ function stationOpenPanel(target, message = '') {
 window.stationProbe = Object.assign(window.stationProbe || {}, {
   renderedPrimary: () => stationRenderedPrimaryActive(),
   state: () => station?.debug_state?.() || stationRendererStateLabel(),
+  // QA hook: simulate WebGPU device loss (validators drive the recovery
+  // path). False until a station-web build exporting debug_lose_gpu loads.
+  loseGpu: () => {
+    try { return Boolean(station && typeof station.debug_lose_gpu === 'function' && station.debug_lose_gpu()); }
+    catch (_) { return false; }
+  },
   debugJson: () => {
     try {
       return station && typeof station.debug_json === 'function' ? String(station.debug_json() || '') : '';
