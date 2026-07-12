@@ -2139,6 +2139,25 @@ function sessionsAggregateTokenTile(label, value, loading) {
   };
 }
 
+// The Cost twin of sessionsAggregateTokenTile: an exact "$118,694.20"
+// ellipsizes on narrow tiles (observed "$118,69..." at 390px), so large
+// totals render compactly ($10k+ → "$118.7k", $1M+ → "$1.53M") with the
+// exact toLocaleString figure in the title attribute — same pattern as
+// the token tiles. Below $10k the exact figure fits and stays.
+function sessionsAggregateCostTile(totalCost, loading) {
+  const n = Number(totalCost || 0);
+  const exact = '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  let compact = exact;
+  if (n >= 1e6) compact = '$' + (n / 1e6).toFixed(2) + 'M';
+  else if (n >= 10000) compact = '$' + (n / 1000).toFixed(1) + 'k';
+  return {
+    label: 'Cost',
+    value: loading ? 'Loading' : compact,
+    title: loading ? '' : exact,
+    loading,
+  };
+}
+
 function renderSessionsAggregate(sessions, el) {
   if (!el) return;
   const totalSessions = sessions.length;
@@ -2205,13 +2224,7 @@ function renderSessionsAggregate(sessions, el) {
   const cards = [
     sessionsTile,
     sessionsAggregateTokenTile('Tokens', totalTokens, detailsLoading),
-    {
-      label: 'Cost',
-      value: detailsLoading
-        ? loadingValue
-        : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      loading: detailsLoading,
-    },
+    sessionsAggregateCostTile(totalCost, detailsLoading),
     { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
     inputTile, cachedTile, outputTile, diskTile,
   ];

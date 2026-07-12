@@ -202,6 +202,14 @@ class PeerDisplayConnection {
             <button class="ann-attach-btn peer-display-attach"
                     data-host-id="${escapeHtml(this.hostId)}"
                     title="Capture current frame and attach to next task">Attach</button>
+            <button class="annotate-btn peer-display-annotate"
+                    data-host-id="${escapeHtml(this.hostId)}"
+                    title="Freeze current frame and annotate it">&#9998; Annotate</button>
+            <button class="callout-btn peer-display-callout"
+                    data-host-id="${escapeHtml(this.hostId)}"
+                    aria-pressed="false"
+                    disabled
+                    title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
             <button class="peer-display-close" data-host-id="${escapeHtml(this.hostId)}">Close</button>
           </div>
         </div>`;
@@ -222,6 +230,14 @@ class PeerDisplayConnection {
       const attachBtn = container.querySelector('.peer-display-attach');
       if (attachBtn) {
         attachBtn.addEventListener('click', () => this.attachCurrentFrame(attachBtn));
+      }
+      const annotateBtn = container.querySelector('.peer-display-annotate');
+      if (annotateBtn) {
+        annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
+      }
+      const calloutBtn = container.querySelector('.peer-display-callout');
+      if (calloutBtn) {
+        calloutBtn.addEventListener('click', () => this.toggleCallout(calloutBtn));
       }
     }
     container.style.display = 'block';
@@ -250,6 +266,11 @@ class PeerDisplayConnection {
     this._renderAuthorityChip();
     this._applyStageOverlayDom();
     this._applyMetricsDom(this._metricsText);
+    // A pane rebuild wiped any live-annotation editor / armed-callout
+    // overlays hosted in the previous pane DOM — end those modes if
+    // their overlays actually died (47-annotation-clips owns the modes;
+    // this is the provider-level lifecycle hook for pane rebuilds).
+    reconcileLiveSurfaceForOwner(this);
     // F-2 lifecycle: if the panel was rebuilt while we still hold
     // input authority, our `_boundHandlers` are bound to the
     // now-detached prior video element. Force-clear interactive
@@ -468,6 +489,65 @@ class PeerDisplayConnection {
       btn.textContent = '✓ Attached';
       window.setTimeout(() => { btn.textContent = orig; }, 1500);
     }
+  }
+
+  // ── Annotate + Callout (peer parity with the local display slot) ────
+  // The stage a live-annotation edit or callout arm anchors to: the
+  // pane hosting whichever surface is live (tile canvas or video).
+  _annotationStageEl() {
+    const surface = this._interactiveSurfaceCandidate();
+    const pane = surface && surface.closest ? surface.closest('.peer-display-pane') : null;
+    if (pane) return pane;
+    for (const container of this._containerCandidates()) {
+      const p = container.querySelector('.peer-display-pane');
+      if (p) return p;
+    }
+    return null;
+  }
+
+  // The surface-provider contract consumed by 47-annotation-clips'
+  // live-annotation editor + callout arming — the field-by-field
+  // enumeration lives above setLiveAnnotationButton there. streamBase
+  // follows the peer attach-lane convention (`peer_<host>_display_<id>`)
+  // so frame ids stay unique across hosts and never collide with local
+  // `display_<id>` streams.
+  _annotationSurfaceProvider() {
+    const safeHost = String(this.hostId).replace(/[^a-zA-Z0-9_.-]/g, '_');
+    return {
+      owner: this,
+      displayId: this.displayId,
+      streamBase: `peer_${safeHost}_display_${this.displayId}`,
+      stageEl: () => this._annotationStageEl(),
+      liveSurfaceEl: () => this._interactiveSurfaceCandidate(),
+      annotateBtn: () => {
+        const stage = this._annotationStageEl();
+        return stage ? stage.querySelector('.peer-display-annotate') : null;
+      },
+      toolbarHostEl: () => this._annotationStageEl(),
+    };
+  }
+
+  annotateCurrentFrame() {
+    const frame = this.captureCurrentFrame(0.92);
+    if (!frame) {
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'No frame available from this peer display yet');
+      }
+      return;
+    }
+    enterLiveAnnotationMode(this._annotationSurfaceProvider(), frame);
+  }
+
+  // Toolbar-armed Callout: one-shot region flag shipped through the
+  // annotation-attach lane. Shared machinery lives in 47-annotation-clips
+  // (toggleLiveCallout); armable only while federated input authority is
+  // 'you' (button disabled otherwise, disarmed on authority loss).
+  toggleCallout(btn) {
+    toggleLiveCallout({
+      provider: this._annotationSurfaceProvider(),
+      button: btn || null,
+      captureFrame: (q) => this.captureCurrentFrame(q),
+    });
   }
 
   async connect() {
@@ -1132,6 +1212,10 @@ class PeerDisplayConnection {
     }
     this.peerAuthorityState = state;
     this._renderAuthorityChip();
+    // Callout arming requires held input authority; losing it disarms.
+    if (state !== 'you' && liveCalloutArmedFor(this)) {
+      disarmLiveCallout();
+    }
     // Item 7b: any authoritative state answers an in-flight take —
     // disarm the 5s no-answer timeout.
     if (this._takePendingTimer) {
@@ -1250,17 +1334,34 @@ class PeerDisplayConnection {
       this._heldKeys.clear();
     };
 
+    // Suppression parity with local DisplaySlot._enterInteractive:
+    // a live-annotation edit on this pane suppresses all forwarding;
+    // an armed callout suppresses only the drag's md/mm/mu (keyboard
+    // and wheel keep flowing — the arm overlay swallows most pointer
+    // events already, these checks catch the letterbox bars).
     this._boundHandlers.keydown = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       this._heldKeys.add(e.code);
       sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.keyup = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       this._heldKeys.delete(e.code);
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       target.focus();
       target.setPointerCapture(e.pointerId);
@@ -1268,16 +1369,28 @@ class PeerDisplayConnection {
       sendControl({ t: 'md', x, y, b: e.button });
     };
     this._boundHandlers.pointerup = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       target.releasePointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'mu', x, y, b: e.button });
     };
     this._boundHandlers.pointermove = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
+        e.preventDefault();
+        return;
+      }
       const { x, y } = normalize(e);
       sendPointer({ t: 'mm', x, y, buttons: e.buttons });
     };
     this._boundHandlers.wheel = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       const { x, y } = normalize(e);
       let dx = e.deltaX, dy = e.deltaY;
@@ -1385,6 +1498,12 @@ class PeerDisplayConnection {
           takeBtn.style.display = '';
           releaseBtn.style.display = 'none';
         }
+      }
+      // Callout is armable only while this browser holds federated
+      // input authority — same gate as the local display slot.
+      const calloutBtn = container.querySelector('.peer-display-callout');
+      if (calloutBtn) {
+        calloutBtn.disabled = this.peerAuthorityState !== 'you';
       }
     }
   }
@@ -1521,6 +1640,10 @@ class PeerDisplayConnection {
     this._stopStatsSampler();
     stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
     stationScheduleUpdate();
+    // Provider-level teardown (47-annotation-clips): ends a live-
+    // annotation edit or armed callout on this pane — lifecycle parity
+    // with removeDisplaySlot on the local path.
+    teardownLiveSurfaceForOwner(this);
     // F-2: tear down input listeners FIRST. The `pc.close()` chain
     // below would close the data channels anyway, but uninstalling
     // listeners eagerly prevents a final mousemove from racing the
