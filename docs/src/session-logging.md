@@ -109,6 +109,7 @@ The event vocabulary is broad and grows with the system. Grouped by area
 |------|--------|
 | Lifecycle | `session_start`, `session_started`, `agent_started`, `turn_start`, `round_complete`, `task_complete`, `done_signal`, `safety_cap_reached`, `session_end`, `session_ended` |
 | Model I/O | `messages_input`, `model_response`, `reasoning`, `json_extracted` |
+| Message lane | `conversation_message`, `conversation_rewound`, `conversation_message_epoch` |
 | Runtime | `agent_input`, `agent_output` |
 | Approvals | `approval`, `approval_resolved`, `auto_approved`, `human_question`, `human_response_sent` |
 | Context | `context_snapshot`, `snapshot_created`, `conversation_rolled_back`, `rolled_back`, `redone`, `history_pruned` |
@@ -122,6 +123,28 @@ The event vocabulary is broad and grows with the system. Grouped by area
 Each is written by a typed method on `SessionLog` (e.g. `turn_start`,
 `model_response`, `agent_input`, `agent_output`, `approval`, `json_extracted`,
 `reasoning_content`), not by hand-formatting JSON.
+
+### The message lane (`conversation_message`)
+
+`conversation_message` is the canonical append-only record of what was
+*actually said* in the native worker conversation — the source the
+message-search index consumes. One record per genuine entry: the task
+(provenance `task`), resume continuations (`resume_task`), follow-ups
+(`follow_up`), steers delivered into model context (`steer`), accepted
+askHuman answers (`ask_human_answer`), and non-empty assistant responses
+(`assistant` — emitted by the same call that writes the `turns/*_model.txt`
+sidecar span the record references via `file` + `data.model_offset`/
+`data.model_bytes`). System injections, tool output, context summaries, the
+CU sub-conversation, and presence never emit it. `data.text` carries the RAW
+user text (no attachment preludes or `[New Task]`-style wrappers);
+`data.message_seq` is the conversation's monotonic ordinal (`Message.seq`);
+`data.ref_seq` marks a projection (a native-tool askHuman answer riding a
+tool result). `conversation_rewound { cut_after_seq, kind }` marks messages
+past a rewind cut as superseded — compaction deliberately does NOT emit it.
+`conversation_message_epoch` records the resume-time seq assignment for
+legacy files (`mapping: [[seq, role, content-hash16], …]`); extractors use
+legacy extraction strictly before the marker and `conversation_message`
+records after it.
 
 ### Querying
 

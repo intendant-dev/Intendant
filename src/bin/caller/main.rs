@@ -2735,25 +2735,27 @@ All relative paths and commands execute from this directory.",
 
 /// Set up a fresh conversation with project context, memory, skills, and task.
 #[allow(dead_code)]
-fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
+fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
-    conv.add_user(MessageProvenance::Task, task.to_string());
+    conv.add_user(MessageProvenance::Task, task.to_string())
 }
 
 /// Set up a fresh conversation with project context, memory, skills, task, and
 /// optional user-attached images.  When images are present, they are added to
 /// the same user message as the task so the model sees them as inline context.
+/// Returns the seq of the task message, so callers can emit its canonical
+/// `conversation_message` record (this helper has no session-log handle).
 fn setup_fresh_conversation_with_attachments(
     conv: &mut Conversation,
     project: &Project,
     task: &str,
     images: Vec<conversation::ImageData>,
-) {
+) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
     if images.is_empty() {
-        conv.add_user(MessageProvenance::Task, task.to_string());
+        conv.add_user(MessageProvenance::Task, task.to_string())
     } else {
-        conv.add_user_with_images(MessageProvenance::Task, task.to_string(), images);
+        conv.add_user_with_images(MessageProvenance::Task, task.to_string(), images)
     }
 }
 

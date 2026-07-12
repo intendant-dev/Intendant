@@ -1342,7 +1342,7 @@ impl SessionLog {
         total_tokens: u64,
         cached_tokens: u64,
         source: Option<&str>,
-    ) {
+    ) -> Option<TurnFileSpan> {
         self.model_response_for_session(
             None,
             content,
@@ -1351,9 +1351,13 @@ impl SessionLog {
             total_tokens,
             cached_tokens,
             source,
-        );
+        )
     }
 
+    /// Returns the sidecar span the response text was appended to, so the
+    /// combined op ([`Self::model_response_with_message`]) can reference the
+    /// same bytes from the canonical `conversation_message` record without a
+    /// second write.
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn model_response_for_session(
         &mut self,
@@ -1364,7 +1368,7 @@ impl SessionLog {
         total_tokens: u64,
         cached_tokens: u64,
         source: Option<&str>,
-    ) {
+    ) -> Option<TurnFileSpan> {
         self.summary_builder.total_tokens += total_tokens;
         // Codex fires multiple `model_response` events per turn (one per
         // assistant message in the same turn). Appending keeps the full
@@ -1401,6 +1405,162 @@ impl SessionLog {
             message: Some(preview),
             data: Some(data),
             file,
+            file2: None,
+        });
+        span
+    }
+
+    /// Combined assistant logging op (message-search plan §4): ONE call
+    /// writes the sidecar span, the diagnostic `model_response` event, and
+    /// the canonical `conversation_message` record — no crash window between
+    /// diagnostic and canonical, and no second copy of the text. Native
+    /// acceptance-point only; external wrappers keep plain `model_response`
+    /// (their messages are canonical in the NATIVE backend logs, and the
+    /// intendant extractor skips wrapper sessions to avoid duplicates).
+    pub fn model_response_with_message(
+        &mut self,
+        seq: u64,
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cached_tokens: u64,
+    ) -> String {
+        let span = self.model_response_for_session(
+            None,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            None,
+        );
+        let message_id = Uuid::new_v4().to_string();
+        let mut data = serde_json::json!({
+            "message_id": message_id,
+            "message_seq": seq,
+            "role": "assistant",
+            "provenance": crate::conversation::MessageProvenance::Assistant,
+        });
+        let file = span.as_ref().map(|span| {
+            data["model_offset"] = serde_json::Value::from(span.offset);
+            data["model_bytes"] = serde_json::Value::from(span.len);
+            span.relative.clone()
+        });
+        let preview: String = content.chars().take(200).collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: Some(self.current_turn),
+            event: "conversation_message".to_string(),
+            level: Some("info".to_string()),
+            message: Some(preview),
+            data: Some(data),
+            file,
+            file2: None,
+        });
+        message_id
+    }
+
+    /// Canonical message-lane record for a user-side conversation entry
+    /// (task / resume task / follow-up / delivered steer / askHuman answer).
+    /// Emitted only where text genuinely enters the worker conversation;
+    /// system injections, tool output, and context summaries are
+    /// deliberately absent. `text` is the RAW user text — attachment
+    /// preludes and `[Session resumed]`/`[New Task]`/`[User]` wrappers are
+    /// the conversation's concern, not the record's. `ref_seq` marks a
+    /// projection: the text entered the conversation inside another entry
+    /// (the native-tool askHuman answer rides a tool result) whose seq it
+    /// references for rewind-cut semantics.
+    pub fn conversation_message_user(
+        &mut self,
+        seq: u64,
+        provenance: crate::conversation::MessageProvenance,
+        text: &str,
+        ref_seq: Option<u64>,
+    ) -> String {
+        let message_id = Uuid::new_v4().to_string();
+        let mut data = serde_json::json!({
+            "message_id": message_id,
+            "message_seq": seq,
+            "role": "user",
+            "provenance": provenance,
+            "text": text,
+        });
+        if let Some(ref_seq) = ref_seq {
+            data["ref_seq"] = serde_json::Value::from(ref_seq);
+        }
+        let preview: String = text.chars().take(200).collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "conversation_message".to_string(),
+            level: Some("info".to_string()),
+            message: Some(preview),
+            data: Some(data),
+            file: None,
+            file2: None,
+        });
+        message_id
+    }
+
+    /// A rewind/tail-rollback cut: messages with `seq > cut_after_seq` are
+    /// superseded. Compaction (`drop_turns`/`summarize_turns`) deliberately
+    /// does NOT emit this — a compacted message was still said and remains
+    /// canonical history (message-search plan D2).
+    pub fn conversation_rewound(&mut self, cut_after_seq: u64, kind: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "conversation_rewound".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Conversation rewound ({}): messages after seq {} superseded",
+                kind, cut_after_seq
+            )),
+            data: Some(serde_json::json!({
+                "cut_after_seq": cut_after_seq,
+                "kind": kind,
+                "superseded_at_ms": Self::ts_ms(),
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Mixed-version cutover marker: emitted when a resumed legacy
+    /// conversation gets seqs assigned (`ensure_seqs_assigned`). `mapping`
+    /// is `(seq, role, content-hash)` per message, in order — extractors use
+    /// legacy extraction strictly before this marker and only
+    /// `conversation_message` records after it, correlating legacy records
+    /// through the hashes.
+    pub fn conversation_message_epoch(&mut self, mapping: &[(u64, String, String)]) {
+        let rows: Vec<serde_json::Value> = mapping
+            .iter()
+            .map(|(seq, role, hash)| serde_json::json!([seq, role, hash]))
+            .collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: None,
+            event: "conversation_message_epoch".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Assigned seqs to {} legacy conversation messages",
+                mapping.len()
+            )),
+            data: Some(serde_json::json!({ "mapping": rows })),
+            file: None,
             file2: None,
         });
     }

@@ -2941,7 +2941,7 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
     if !content.is_empty() {
         slog(config.session_log, |l| {
-            l.model_response_for_session(
+            let _ = l.model_response_for_session(
                 session_id,
                 content,
                 0,
@@ -2949,7 +2949,7 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
                 0,
                 0,
                 config.agent_source.as_deref(),
-            )
+            );
         });
     }
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {

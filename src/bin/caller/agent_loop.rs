@@ -982,10 +982,18 @@ pub(crate) async fn run_agent_loop(
                     ("System", MessageProvenance::SystemInjection)
                 };
                 let text = format!("[{}] {}", prefix, inj.text);
-                if inj.images.is_empty() {
-                    conversation.add_user(provenance, text.clone());
+                let seq = if inj.images.is_empty() {
+                    conversation.add_user(provenance, text.clone())
                 } else {
-                    conversation.add_user_with_images(provenance, text.clone(), inj.images);
+                    conversation.add_user_with_images(provenance, text.clone(), inj.images)
+                };
+                // Delivered steers are message-lane; system injections are
+                // not. The record carries the raw steer text, not the
+                // `[User]`-prefixed conversation string.
+                if provenance == MessageProvenance::Steer {
+                    slog(&session_log, |l| {
+                        let _ = l.conversation_message_user(seq, provenance, &inj.text, None);
+                    });
                 }
                 slog(&session_log, |l| {
                     l.info(&format!("Context injected: {}", inj.text))
@@ -1181,7 +1189,7 @@ pub(crate) async fn run_agent_loop(
         // Store assistant message — with or without tool calls
         let has_tool_calls = !response.tool_calls.is_empty();
         let has_cu_calls = !response.cu_calls.is_empty();
-        if has_tool_calls || has_cu_calls {
+        let assistant_seq = if has_tool_calls || has_cu_calls {
             let refs: Vec<conversation::ToolCallRef> = response
                 .tool_calls
                 .iter()
@@ -1196,21 +1204,35 @@ pub(crate) async fn run_agent_loop(
                 response.content.clone(),
                 refs,
                 response.raw_output.clone(),
-            );
-        } else {
-            conversation.add_assistant(response.content.clone());
-        }
-
-        // Log the full model response (no truncation)
-        slog(&session_log, |l| {
-            l.model_response(
-                &response.content,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                response.usage.total_tokens,
-                response.usage.cached_tokens,
-                None,
             )
+        } else {
+            conversation.add_assistant(response.content.clone())
+        };
+
+        // Log the full model response (no truncation). Non-empty content —
+        // on BOTH branches: assistant prose regularly accompanies tool
+        // calls — also gets its canonical conversation_message record,
+        // written by the same call as the sidecar span (no crash window).
+        slog(&session_log, |l| {
+            if response.content.trim().is_empty() {
+                let _ = l.model_response(
+                    &response.content,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cached_tokens,
+                    None,
+                );
+            } else {
+                let _ = l.model_response_with_message(
+                    assistant_seq,
+                    &response.content,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cached_tokens,
+                );
+            }
         });
 
         // Log reasoning content if available
@@ -1703,19 +1725,38 @@ pub(crate) async fn run_agent_loop(
                             .unwrap_or_default(),
                         Ok(_) | Err(_) => String::new(),
                     };
-                    let reply = if answer.trim().is_empty() {
+                    let answered = !answer.trim().is_empty();
+                    let reply = if answered {
+                        slog(&session_log, |l| l.human_response_sent());
+                        answer
+                    } else {
                         "The user dismissed the question without answering. Proceed with \
                          your best judgment; you can re-ask later if it is still relevant."
                             .to_string()
-                    } else {
-                        slog(&session_log, |l| l.human_response_sent());
-                        answer
                     };
+                    let mut first_result_seq: Option<u64> = None;
                     for (call_id, tool_name) in &batch.call_id_names {
                         if handled_call_ids.contains(call_id) {
                             continue;
                         }
-                        conversation.add_tool_result(call_id, tool_name, &reply);
+                        let seq = conversation.add_tool_result(call_id, tool_name, &reply);
+                        first_result_seq.get_or_insert(seq);
+                    }
+                    // Native-tool askHuman answers enter the conversation as
+                    // tool results; project the raw answer into the message
+                    // lane referencing that result's seq (rewind cuts cover
+                    // it through ref_seq).
+                    if answered {
+                        if let Some(seq) = first_result_seq {
+                            slog(&session_log, |l| {
+                                let _ = l.conversation_message_user(
+                                    seq,
+                                    MessageProvenance::AskHumanAnswer,
+                                    &reply,
+                                    Some(seq),
+                                );
+                            });
+                        }
                     }
                     continue;
                 }
@@ -2225,10 +2266,20 @@ Proceed with explicit assumptions and continue without additional questions."
                     );
                 } else {
                     slog(&session_log, |l| l.human_response_sent());
-                    conversation.add_user(
+                    let seq = conversation.add_user(
                         MessageProvenance::AskHumanAnswer,
                         format!("The user's answer to your question: {answer}"),
                     );
+                    // The canonical record carries the raw answer, closing
+                    // the audit hole where human_response_sent has no text.
+                    slog(&session_log, |l| {
+                        let _ = l.conversation_message_user(
+                            seq,
+                            MessageProvenance::AskHumanAnswer,
+                            &answer,
+                            None,
+                        );
+                    });
                 }
                 continue;
             }
@@ -2708,15 +2759,30 @@ pub(crate) async fn run_round_loop(
                         }
                     ))
                 });
-                if followup_images.is_empty() {
-                    conversation.add_user(MessageProvenance::FollowUp, followup_text);
+                // A between-rounds steer is delivered through this path
+                // (steer_id set); classify it as such rather than follow_up.
+                let followup_provenance = if message.steer_id.is_some() {
+                    MessageProvenance::Steer
+                } else {
+                    MessageProvenance::FollowUp
+                };
+                let followup_seq = if followup_images.is_empty() {
+                    conversation.add_user(followup_provenance, followup_text)
                 } else {
                     conversation.add_user_with_images(
-                        MessageProvenance::FollowUp,
+                        followup_provenance,
                         followup_text,
                         followup_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        followup_seq,
+                        followup_provenance,
+                        &message.text,
+                        None,
                     );
-                }
+                });
                 if let Some(id) = message.steer_id {
                     bus.send(AppEvent::SteerDelivered {
                         session_id: local_session_id.clone(),
@@ -2744,4 +2810,69 @@ pub(crate) async fn run_round_loop(
     }
 
     Ok(cumulative_stats)
+}
+
+#[cfg(test)]
+mod provenance_parity {
+    //! Emission-site parity: every conversation entry point must declare a
+    //! provenance, and new call sites must be consciously added to the
+    //! pinned counts (message-search plan §3 F1). This is the drift guard
+    //! for the `conversation_message` emit/skip allowlist.
+
+    fn source(file: &str) -> String {
+        let path = format!("{}/src/bin/caller/{}", env!("CARGO_MANIFEST_DIR"), file);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path, e))
+    }
+
+    /// Every add_user-family call's first argument must be a provenance
+    /// expression (`MessageProvenance::…` or a `*provenance` variable).
+    /// Patterns are assembled with `concat!` — and this comment avoids
+    /// spelling them — so the module never matches itself.
+    fn assert_classified(file: &str, pattern: &str, expected: usize) {
+        let text = source(file);
+        let mut count = 0;
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(pattern) {
+            let arg_start = from + pos + pattern.len();
+            let rest: String = text[arg_start..]
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take(80)
+                .collect();
+            let first_arg = rest.split(',').next().unwrap_or("");
+            assert!(
+                first_arg.contains("rovenance"),
+                "{}: `{}` call with unclassified first argument `{}` — every \
+                 conversation entry point declares a MessageProvenance",
+                file,
+                pattern,
+                first_arg
+            );
+            count += 1;
+            from = arg_start;
+        }
+        assert_eq!(
+            count, expected,
+            "{}: expected {} `{}` sites, found {} — a conversation entry \
+             point was added or removed; reconcile the emission map \
+             (message-search plan §4) and re-pin",
+            file, expected, pattern, count
+        );
+    }
+
+    #[test]
+    fn conversation_entry_points_are_classified_and_pinned() {
+        let add_user = concat!(".add_", "user(");
+        let add_user_with_images = concat!(".add_", "user_with_images(");
+        for (file, users, with_images) in [
+            ("agent_loop.rs", 9usize, 2usize),
+            ("main.rs", 17, 1),
+            ("run_modes.rs", 5, 3),
+            ("display_glue.rs", 1, 2),
+            ("presence.rs", 2, 0),
+        ] {
+            assert_classified(file, add_user, users);
+            assert_classified(file, add_user_with_images, with_images);
+        }
+    }
 }

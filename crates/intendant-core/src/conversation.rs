@@ -480,7 +480,6 @@ impl Conversation {
             out.push(synthetic(&id, &name));
             repaired += 1;
         }
-        drop(synthetic);
         self.next_seq = next_seq;
         self.messages = out;
         repaired
