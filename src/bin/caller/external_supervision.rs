@@ -272,10 +272,6 @@ pub(crate) fn emit_external_session_loop_error(
     bus.send(AppEvent::LoopError(message));
 }
 
-pub(crate) fn json_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
-    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
-}
-
 /// Resolve external agent backend from an explicit override, falling back to
 /// the project config's `agent.default_backend` setting.
 pub(crate) fn resolve_agent_backend_from_config(

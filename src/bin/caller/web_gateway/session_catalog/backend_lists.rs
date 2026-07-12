@@ -926,54 +926,15 @@ pub(crate) fn list_gemini_sessions_with_limit(
     rows
 }
 
-pub(crate) fn codex_session_file_id(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).ok()?;
-        if bytes == 0 {
-            return None;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
-            return obj
-                .get("payload")
-                .and_then(|payload| value_str(payload, "id"));
-        }
-    }
-}
+// Consolidated (message-search F3 phase 2): the streaming id reader moved
+// to `external_agent::codex::rollout` (this file's copy was the canonical
+// body), and the finder delegates to `codex_history`'s engine — which
+// ported this file's filename fast path and adds the wrapper-index
+// stored-path cache, so catalog lookups stop rescanning migrated homes.
+pub(crate) use crate::external_agent::codex::rollout::codex_session_file_id;
 
 pub(crate) fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
-    let codex = codex_dir(home);
-    let mut files = Vec::new();
-    collect_files(&codex.join("sessions"), ".jsonl", &mut files);
-    collect_files(&codex.join("archived_sessions"), ".jsonl", &mut files);
-
-    if let Some(path) = files
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(session_id))
-                && codex_session_file_id(path).as_deref() == Some(session_id)
-        })
-        .cloned()
-    {
-        return Some(path);
-    }
-
-    files
-        .into_iter()
-        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+    crate::codex_history::find_codex_session_file_in(&codex_dir(home), home, session_id)
 }
 
 #[allow(dead_code)]
