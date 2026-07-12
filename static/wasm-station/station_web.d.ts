@@ -33,6 +33,14 @@ export class StationWeb {
      * frozen for the validator probe; new fields land here instead.
      */
     debug_json(): string;
+    /**
+     * QA hook: destroy the live WebGPU device so the browser resolves
+     * `device.lost` — this drives the real device-loss recovery path
+     * (`gpu::GpuRecovery`) end-to-end without waiting for an actual GPU
+     * reset. Returns true when there was a live device to lose; watch
+     * `debug_json().gpuRecovery` afterwards for the outcome.
+     */
+    debug_lose_gpu(): boolean;
     debug_state(): string;
     focus_on(id: string): void;
     /**
@@ -83,6 +91,7 @@ export interface InitOutput {
     readonly stationweb_close_transcript: (a: number) => void;
     readonly stationweb_composer_state: (a: number) => [number, number];
     readonly stationweb_debug_json: (a: number) => [number, number];
+    readonly stationweb_debug_lose_gpu: (a: number) => number;
     readonly stationweb_debug_state: (a: number) => [number, number];
     readonly stationweb_focus_on: (a: number, b: number, c: number) => void;
     readonly stationweb_hotspot_rects: (a: number) => [number, number];
@@ -98,12 +107,14 @@ export interface InitOutput {
     readonly stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
     readonly stationweb_update_snapshot: (a: number, b: any) => [number, number];
-    readonly wasm_bindgen__closure__destroy__h829070727a6c9b28: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h4ff6b53127c2b240: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__he88d688485a742c0: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hb9ef122cd6bafce1: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h0a33e0948713da17: (a: number, b: number, c: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hdef3f4e3a527b0f6: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h7c0bc6c87088e3ce: (a: number, b: number, c: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h05c5132f81506063: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hca5f75ff963c78a9: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7dfd20110b18ff44: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h18ce2992322c96bf: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h21475fd29d262b33: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

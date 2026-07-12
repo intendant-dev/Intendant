@@ -2,6 +2,11 @@
 
 use bytemuck::{Pod, Zeroable};
 use std::f32::consts::PI;
+#[cfg(target_arch = "wasm32")]
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc,
+};
 use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
@@ -42,6 +47,12 @@ pub(crate) struct GpuState {
     pub(crate) atlas_layout: wgpu::BindGroupLayout,
     pub(crate) atlas_sampler: wgpu::Sampler,
     pub(crate) atlas_bind: Option<wgpu::BindGroup>,
+    /// Flipped by the browser's `device.lost` resolution; the render loop
+    /// consumes it through `is_lost` and drives the `GpuRecovery` state
+    /// machine. Per-GpuState on purpose: a late callback from an
+    /// already-replaced device flips an orphaned flag, never the
+    /// replacement's.
+    lost: Arc<AtomicBool>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -125,6 +136,36 @@ impl GpuState {
             })
             .await
             .map_err(|e| JsValue::from_str(&format!("request WebGPU device failed: {e:?}")))?;
+
+        // Device-health surfacing (see `GpuRecovery` below for the state
+        // machine the render loop drives off this flag). Registered before
+        // any pipeline work so a loss during init is not missed.
+        let lost = Arc::new(AtomicBool::new(false));
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                lost.store(true, Ordering::SeqCst);
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "Station WebGPU device lost ({reason:?}): {message}"
+                )));
+            });
+        }
+        // Uncaptured errors are logged (capped — a broken frame can emit
+        // one per submit) but never trigger recovery themselves: the
+        // browser resolves `device.lost` for anything actually fatal.
+        let uncaptured_errors = Arc::new(AtomicU32::new(0));
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            let seen = uncaptured_errors.fetch_add(1, Ordering::Relaxed);
+            if seen < 3 {
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "Station WebGPU uncaptured error: {error}"
+                )));
+            } else if seen == 3 {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "Station WebGPU uncaptured error: further reports suppressed",
+                ));
+            }
+        }));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -333,7 +374,14 @@ impl GpuState {
             atlas_layout,
             atlas_sampler,
             atlas_bind: None,
+            lost,
         })
+    }
+
+    /// True once the browser reported this device lost. The render loop
+    /// polls this every tick (`StationInner::service_gpu_loss`).
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
     }
 
     /// Create the glyph-atlas texture + bind group from the CPU-side bake,
@@ -557,6 +605,89 @@ impl GpuState {
         _atlas: Option<&TextAtlas>,
     ) -> Result<(), JsValue> {
         Ok(())
+    }
+}
+
+/// WebGPU device-loss recovery state machine, driven by the render loop
+/// (`StationInner::service_gpu_loss`) off the per-device `is_lost` flag.
+/// Kept as pure data plus a pure transition so the logic is natively
+/// testable; only the loop's side-effect glue (dropping the dead
+/// GpuState, spawning the async re-init, installing the Canvas 2D
+/// fallback) is wasm-only.
+///
+/// ```text
+///            device.lost                re-init Ok
+///  Healthy ─────────────► Recovering ─────────────► Recovered
+///  (init)                     │                         │
+///                             │ re-init Err             │ device.lost again
+///                             ▼                         ▼
+///                          Fallback ◄───────────────────┘
+///          (terminal: Canvas 2D renderer, WebGPU never retried)
+/// ```
+///
+/// One async re-init is the whole budget: the first loss re-requests
+/// adapter/device/surface/pipelines once (the `GpuState::new` path init
+/// used); a second loss — or a failed re-init — drops to the existing
+/// Canvas 2D fallback permanently. An *initial-init* failure (no device
+/// was ever lost) also falls back but keeps the state `Healthy`, so
+/// `renderer_label` reports a plain "Canvas" for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuRecovery {
+    /// The current device has never been lost.
+    Healthy,
+    /// A loss was consumed; the single async re-init attempt is in
+    /// flight (no live GpuState in this state).
+    Recovering,
+    /// The re-init succeeded; a fresh device is live and the one-shot
+    /// budget is spent.
+    Recovered,
+    /// Terminal: WebGPU abandoned for the Canvas 2D fallback.
+    Fallback,
+}
+
+impl GpuRecovery {
+    /// Stable token for `debug_json` (`gpuRecovery`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovering => "recovering",
+            Self::Recovered => "recovered",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// What the render loop must do after consuming a device-lost flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuLossStep {
+    /// Spawn the single async re-init attempt.
+    Reinit,
+    /// Install the permanent Canvas 2D fallback.
+    Fallback,
+}
+
+/// Pure transition for an observed device loss on the live GpuState.
+/// `Recovering`/`Fallback` cannot observe a loss (their GpuState was
+/// dropped on entry) but stay closed under repeats anyway.
+pub(crate) fn gpu_loss_transition(state: GpuRecovery) -> (GpuRecovery, GpuLossStep) {
+    match state {
+        GpuRecovery::Healthy => (GpuRecovery::Recovering, GpuLossStep::Reinit),
+        GpuRecovery::Recovered | GpuRecovery::Recovering | GpuRecovery::Fallback => {
+            (GpuRecovery::Fallback, GpuLossStep::Fallback)
+        }
+    }
+}
+
+/// Human renderer label for `debug_json` — the dashboard's status chip
+/// shows it verbatim, so the device-loss fallback carries its own note.
+/// (`debug_state`'s flat `renderer=` token stays frozen to
+/// WebGPU/Canvas for the validator probe.)
+pub(crate) fn renderer_label(gpu_live: bool, recovery: GpuRecovery) -> &'static str {
+    match (gpu_live, recovery) {
+        (true, _) => "WebGPU",
+        (false, GpuRecovery::Recovering) => "Canvas (WebGPU lost; reinitializing)",
+        (false, GpuRecovery::Fallback) => "Canvas (WebGPU lost)",
+        (false, _) => "Canvas",
     }
 }
 
@@ -1022,6 +1153,57 @@ impl GpuFrame {
 mod tests {
     use super::*;
     use crate::util::Color;
+
+    #[test]
+    fn gpu_loss_spends_one_reinit_then_falls_back_permanently() {
+        // First loss on a healthy device: the single re-init attempt.
+        assert_eq!(
+            gpu_loss_transition(GpuRecovery::Healthy),
+            (GpuRecovery::Recovering, GpuLossStep::Reinit)
+        );
+        // A device lost after a successful re-init: no second attempt.
+        assert_eq!(
+            gpu_loss_transition(GpuRecovery::Recovered),
+            (GpuRecovery::Fallback, GpuLossStep::Fallback)
+        );
+        // Defensive closure: states without a live device stay terminal.
+        assert_eq!(
+            gpu_loss_transition(GpuRecovery::Recovering),
+            (GpuRecovery::Fallback, GpuLossStep::Fallback)
+        );
+        assert_eq!(
+            gpu_loss_transition(GpuRecovery::Fallback),
+            (GpuRecovery::Fallback, GpuLossStep::Fallback)
+        );
+    }
+
+    #[test]
+    fn renderer_label_notes_loss_only_on_the_loss_paths() {
+        // Live device always reads WebGPU, whatever history it carries.
+        assert_eq!(renderer_label(true, GpuRecovery::Healthy), "WebGPU");
+        assert_eq!(renderer_label(true, GpuRecovery::Recovered), "WebGPU");
+        // The loss-driven states carry the note the status chip shows.
+        assert_eq!(
+            renderer_label(false, GpuRecovery::Fallback),
+            "Canvas (WebGPU lost)"
+        );
+        assert_eq!(
+            renderer_label(false, GpuRecovery::Recovering),
+            "Canvas (WebGPU lost; reinitializing)"
+        );
+        // Init-time fallback (nothing was lost) stays a plain Canvas.
+        assert_eq!(renderer_label(false, GpuRecovery::Healthy), "Canvas");
+        assert_eq!(renderer_label(false, GpuRecovery::Recovered), "Canvas");
+        // debug_json labels are stable tokens.
+        for (state, label) in [
+            (GpuRecovery::Healthy, "healthy"),
+            (GpuRecovery::Recovering, "recovering"),
+            (GpuRecovery::Recovered, "recovered"),
+            (GpuRecovery::Fallback, "fallback"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+    }
 
     #[test]
     fn quads_push_two_triangles() {

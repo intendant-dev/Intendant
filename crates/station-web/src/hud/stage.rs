@@ -324,20 +324,12 @@ impl StationInner {
 
         let margin = 24.0;
         let top_y = 58.0;
-        let gap = 14.0;
-        let available_w = (w - margin * 2.0).max(760.0);
-        let available_h = (h - top_y - 24.0).max(420.0);
         let command_h = if h < 640.0 { 78.0 } else { 92.0 };
-        let lane_h = lane_metrics(self.density, h).2;
-        let main_h = (available_h - command_h - lane_h - gap * 2.0).max(250.0);
+        let (center_x, main_y, center_w, main_h) = scene_core_rect(w, h, self.density);
 
-        let center_x = margin;
-        let center_w = available_w;
-        let main_y = top_y + command_h + gap;
-
-        self.draw_station_command_deck(margin, top_y, available_w, command_h);
+        self.draw_station_command_deck(margin, top_y, center_w, command_h);
         self.draw_station_scene_core(center_x, main_y, center_w, main_h, time_ms);
-        self.draw_station_activity_lane(margin, h, available_w);
+        self.draw_station_activity_lane(margin, h, center_w);
     }
 
     pub(crate) fn draw_station_command_deck(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -555,15 +547,12 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_scene_core(&mut self, x: f32, y: f32, w: f32, h: f32, time_ms: f64) {
-        let core_h = h.clamp(330.0, 560.0);
+        let (cx, cy, ring_scale, core_h) = scene_core_metrics(x, y, w, h);
         if core_h < 150.0 {
             return;
         }
         // Clear glass: low tint so the 3D scene stays visible through it.
         self.glass_panel(x, y, w, core_h, 12.0, C_LAVENDER, 0.5, 0.28);
-        let cx = x + w * 0.5;
-        let cy = y + core_h * 0.52;
-        let ring_scale = (core_h * 0.42).clamp(132.0, 230.0);
         self.hud.set_stroke(match self.mood {
             Mood::Cockpit => "rgba(137,180,250,0.28)",
             Mood::Calm => "rgba(137,180,250,0.18)",
@@ -625,46 +614,6 @@ impl StationInner {
             "normal",
         );
 
-        let node_w = (w * 0.20).clamp(158.0, 230.0);
-        let node_h = 58.0;
-        let node_specs = [
-            (
-                "system:activity",
-                cx - ring_scale - node_w - 26.0,
-                cy - 30.0,
-            ),
-            (
-                "system:context",
-                cx - ring_scale * 0.72 - node_w,
-                cy + ring_scale * 0.62,
-            ),
-            ("system:managed", cx + ring_scale + 26.0, cy - 30.0),
-            (
-                "system:controls",
-                cx + ring_scale * 0.58,
-                cy + ring_scale * 0.66,
-            ),
-            ("system:peers", cx - node_w * 0.72, cy - ring_scale - 86.0),
-            ("system:view", cx - node_w * 0.5, cy + ring_scale + 34.0),
-            // Previously these three lived only in an invisible click matrix;
-            // they're real nodes now so every system target is visible,
-            // mouse-reachable, and exported through hotspot_rects.
-            (
-                "system:sessions",
-                cx + ring_scale * 0.52,
-                cy - ring_scale - 86.0,
-            ),
-            (
-                "system:changes",
-                cx - ring_scale - node_w - 26.0,
-                cy + ring_scale * 0.7,
-            ),
-            (
-                "system:worktrees",
-                cx + ring_scale + 26.0,
-                cy + ring_scale * 0.7,
-            ),
-        ];
         // World panes own their screen area: a summary card that would
         // paint over an in-scene panel is skipped for the frame (the HUD
         // canvas sits above the scene canvas, so it would otherwise cover
@@ -675,29 +624,17 @@ impl StationInner {
         } else {
             Vec::new()
         };
-        for (id, nx, ny) in node_specs {
-            if let Some(target) = targets.iter().find(|target| target.id == id) {
-                let node_w = if id == "system:peers" {
-                    (node_w * 1.45).min(330.0)
-                } else {
-                    node_w
-                };
-                let node_h = if id == "system:peers" {
-                    node_h + 16.0
-                } else {
-                    node_h
-                };
-                let node_x = nx.clamp(x + 20.0, x + w - node_w - 20.0);
-                let node_y = ny.clamp(y + 58.0, y + core_h - node_h - 20.0);
+        for slot in orbital_card_slots(x, y, w, h) {
+            if let Some(target) = targets.iter().find(|target| target.id == slot.id) {
                 if pane_rects.iter().any(|(_, px, py, pw, ph)| {
-                    node_x < px + pw
-                        && node_x + node_w > *px
-                        && node_y < py + ph
-                        && node_y + node_h > *py
+                    slot.x < px + pw
+                        && slot.x + slot.w > *px
+                        && slot.y < py + ph
+                        && slot.y + slot.h > *py
                 }) {
                     continue;
                 }
-                self.station_orbital_node(cx, cy, node_x, node_y, node_w, node_h, target);
+                self.station_orbital_node(cx, cy, slot.x, slot.y, slot.w, slot.h, target);
             }
         }
 
@@ -1064,5 +1001,370 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+    }
+}
+
+/// Scene-core rect `(x, y, w, h)` — the space `draw_station_control_center`
+/// hands `draw_station_scene_core` on a `css_w`×`css_h` canvas: full width
+/// inside the 24px margins, between the command deck and the activity
+/// lane. Pure so the orbital card placement tests exercise the exact
+/// draw-path geometry; the deck-strip constants (24px margin, 58px top,
+/// 78/92px deck, 14px gaps) mirror `draw_station_control_center`.
+pub(crate) fn scene_core_rect(css_w: f32, css_h: f32, density: f32) -> (f32, f32, f32, f32) {
+    let margin = 24.0;
+    let top_y = 58.0;
+    let gap = 14.0;
+    let available_w = (css_w - margin * 2.0).max(760.0);
+    let available_h = (css_h - top_y - 24.0).max(420.0);
+    let command_h = if css_h < 640.0 { 78.0 } else { 92.0 };
+    let lane_h = lane_metrics(density, css_h).2;
+    let main_h = (available_h - command_h - lane_h - gap * 2.0).max(250.0);
+    (margin, top_y + command_h + gap, available_w, main_h)
+}
+
+/// Shared scene-core metrics for a `(x, y, w, main_h)` rect: ring center
+/// `(cx, cy)`, ring radius, and the clamped core height. One derivation
+/// for the draw pass and the card placement, so they can never disagree.
+pub(crate) fn scene_core_metrics(x: f32, y: f32, w: f32, main_h: f32) -> (f32, f32, f32, f32) {
+    let core_h = main_h.clamp(330.0, 560.0);
+    let cx = x + w * 0.5;
+    let cy = y + core_h * 0.52;
+    let ring = (core_h * 0.42).clamp(132.0, 230.0);
+    (cx, cy, ring, core_h)
+}
+
+/// One placed system card in the orbital scene core (CSS px, logical
+/// rect — the glass chrome and hit zone extend a little beyond it).
+pub(crate) struct OrbitalSlot {
+    pub(crate) id: &'static str,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+}
+
+/// Minimum separations between orbital cards. The painted chrome
+/// overshoots the logical rect (`station_orbital_node` draws its glass
+/// at x−12..x+w+6, y−4..y+h+4) and the hit zone extends ±8px, so these
+/// logical gaps keep both the pixels and the click targets apart.
+const CARD_GAP_X: f32 = 28.0;
+const CARD_GAP_Y: f32 = 20.0;
+/// Inset from the scene-core panel edges (the pre-slot code clamped to
+/// the same 20px).
+const CARD_EDGE: f32 = 20.0;
+
+/// Place the nine system cards inside the scene core `(x, y, w, main_h)`.
+///
+/// The previous hand-tuned polar offsets collided at common canvas sizes:
+/// once `node_w` hit its 230px cap (any canvas ≥ ~1200px wide — observed
+/// live at a 1440×900 window: Peers over Sessions, Context over Changes,
+/// Controls over View/Worktrees). Positions are therefore derived from
+/// the available space as flow rows with minimum gaps:
+///
+/// ```text
+/// top band (y+58):        [ peers | sessions ]      one row centered on cx
+/// middle band (~cy):  [activity]        [managed]   pinned outside the ring
+/// tall panels, two bottom tiers stacked up from the panel bottom:
+///   tier 1:               [ context ]  [ controls ]     flanking cx
+///   tier 2:             [changes]  [ view ]  [worktrees]  rails + center
+/// short panels (the tiers would cross the middle band — a 1440×900
+/// window leaves the canvas ~580px tall and the core at its 330px floor):
+///   one row:   [changes] [context] [ view ] [controls] [worktrees]
+///              evenly spread across the panel, card width shrunk so the
+///              gaps never drop below `CARD_GAP_X`
+/// ```
+///
+/// Bands never share a vertical range (the middle band is floored below
+/// the top band; the bottom tiers/row are floored below the middle band
+/// and pinned inside the panel bottom — the short-mode row provably fits
+/// at the 330px core floor), and cards within a band flow with at least
+/// `CARD_GAP_X`, so no two cards can overlap at any full-surface size.
+/// Unit-tested across 1280×520…2560×1440.
+pub(crate) fn orbital_card_slots(x: f32, y: f32, w: f32, main_h: f32) -> [OrbitalSlot; 9] {
+    let (cx, cy, ring, core_h) = scene_core_metrics(x, y, w, main_h);
+    let node_w = (w * 0.20).clamp(158.0, 230.0);
+    let node_h = 58.0;
+    let wide_w = (node_w * 1.45).min(330.0);
+    let wide_h = node_h + 16.0;
+
+    // Top band: peers (wide) + sessions as one flow row centered on the
+    // ring axis. The row always fits (max 588px vs the ≥760px panel), so
+    // the edge clamp is defensive only.
+    let top_y = y + 58.0;
+    let top_x = (cx - (wide_w + CARD_GAP_X + node_w) * 0.5).max(x + CARD_EDGE);
+
+    // Middle band: activity / managed flank the ring at its equator,
+    // clamped inside the panel and floored below the top band (the ring
+    // equator rides up into it once the core hits its height floor).
+    // They can never meet each other: the ring keeps them a diameter
+    // apart before clamping, and the clamps engage only on panels far
+    // wider than two cards.
+    let mid_y = (cy - node_h * 0.5).max(top_y + wide_h + CARD_GAP_Y);
+    let activity_x = (cx - ring - 26.0 - node_w).max(x + CARD_EDGE);
+    let managed_x = (cx + ring + 26.0).min(x + w - CARD_EDGE - node_w);
+
+    let peers = OrbitalSlot {
+        id: "system:peers",
+        x: top_x,
+        y: top_y,
+        w: wide_w,
+        h: wide_h,
+    };
+    let sessions = OrbitalSlot {
+        id: "system:sessions",
+        x: top_x + wide_w + CARD_GAP_X,
+        y: top_y,
+        w: node_w,
+        h: node_h,
+    };
+    let activity = OrbitalSlot {
+        id: "system:activity",
+        x: activity_x,
+        y: mid_y,
+        w: node_w,
+        h: node_h,
+    };
+    let managed = OrbitalSlot {
+        id: "system:managed",
+        x: managed_x,
+        y: mid_y,
+        w: node_w,
+        h: node_h,
+    };
+
+    // Bottom band. Tall panels stack two tiers up from the panel bottom;
+    // when the pinned upper tier would cross the middle band, collapse to
+    // one evenly-spread row instead — a single row always fits above the
+    // panel bottom at the 330px core floor (58 top offset + 74 peers +
+    // 20 + 58 mid + 20 + 58 row + 20 edge = 308 < 330).
+    let tier1_pinned = y + core_h - CARD_EDGE - 2.0 * node_h - CARD_GAP_Y;
+    if tier1_pinned >= mid_y + node_h + CARD_GAP_Y {
+        let tier2_y = tier1_pinned + node_h + CARD_GAP_Y;
+        // Tier 1 flanks the ring axis symmetrically; tier 2 reuses the
+        // middle band's rails (changes under activity, worktrees under
+        // managed) with view centered — the rails and the center are
+        // provably a card apart.
+        let flank = ring * 0.45;
+        let context_x = (cx - flank - node_w).max(x + CARD_EDGE);
+        let controls_x = (cx + flank).min(x + w - CARD_EDGE - node_w);
+        let bottom = |id, bx, by| OrbitalSlot {
+            id,
+            x: bx,
+            y: by,
+            w: node_w,
+            h: node_h,
+        };
+        [
+            peers,
+            sessions,
+            activity,
+            managed,
+            bottom("system:context", context_x, tier1_pinned),
+            bottom("system:controls", controls_x, tier1_pinned),
+            bottom("system:changes", activity_x, tier2_y),
+            bottom("system:view", cx - node_w * 0.5, tier2_y),
+            bottom("system:worktrees", managed_x, tier2_y),
+        ]
+    } else {
+        let row_y = y + core_h - CARD_EDGE - node_h;
+        let inner = w - 2.0 * CARD_EDGE;
+        // Shrink the row's cards until five of them fit with full gaps,
+        // then spread the leftover evenly (view lands centered on cx).
+        let row_w = node_w.min((inner - 4.0 * CARD_GAP_X) / 5.0);
+        let step = row_w + (inner - 5.0 * row_w) / 4.0;
+        let row = |id, index: usize| OrbitalSlot {
+            id,
+            x: x + CARD_EDGE + index as f32 * step,
+            y: row_y,
+            w: row_w,
+            h: node_h,
+        };
+        [
+            peers,
+            sessions,
+            activity,
+            managed,
+            row("system:changes", 0),
+            row("system:context", 1),
+            row("system:view", 2),
+            row("system:controls", 3),
+            row("system:worktrees", 4),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Painted + interactive footprint of a card: the glass extends 12px
+    /// left / 6px right / 4px vertically beyond the logical rect and the
+    /// hit zone ±8px; the union is what must stay disjoint between cards.
+    fn footprint(slot: &OrbitalSlot) -> (f32, f32, f32, f32) {
+        (slot.x - 12.0, slot.y - 8.0, slot.w + 20.0, slot.h + 16.0)
+    }
+
+    fn overlaps(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32)) -> bool {
+        a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1
+    }
+
+    /// The audited failure (a 1440×900 window: Peers over Sessions,
+    /// Context over Changes — plus Controls over View/Worktrees by the
+    /// same math) and the surrounding common sizes: no two cards may
+    /// collide even counting their painted overhang and hit-zone outset,
+    /// and every card stays inside the panel. Sizes are CANVAS CSS px —
+    /// the dashboard chrome eats 150-320px of a window's height, so a
+    /// 1440×900 window really hands the canvas ~580px (measured live);
+    /// the short heights below cover exactly that regime.
+    #[test]
+    fn orbital_cards_do_not_collide_at_common_sizes() {
+        for (w, h) in [
+            (1280.0, 800.0),
+            (1366.0, 768.0),
+            (1440.0, 900.0),
+            (1512.0, 982.0),
+            (1536.0, 960.0),
+            (1680.0, 1050.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (1024.0, 768.0),
+            (820.0, 700.0),
+            // Chrome-shortened canvases (window height minus dashboard
+            // chrome): the live 1440×900-window case and neighbors.
+            (1440.0, 581.0),
+            (1440.0, 620.0),
+            (1280.0, 560.0),
+            (1920.0, 640.0),
+            (2560.0, 700.0),
+        ] {
+            for density in [0.5f32, 1.0, 1.8] {
+                let (x, y, pw, main_h) = scene_core_rect(w, h, density);
+                let slots = orbital_card_slots(x, y, pw, main_h);
+                let (_, _, _, core_h) = scene_core_metrics(x, y, pw, main_h);
+                for (i, a) in slots.iter().enumerate() {
+                    for b in slots.iter().skip(i + 1) {
+                        assert!(
+                            !overlaps(&footprint(a), &footprint(b)),
+                            "{w}x{h} d{density}: {} {:?} collides with {} {:?}",
+                            a.id,
+                            footprint(a),
+                            b.id,
+                            footprint(b),
+                        );
+                    }
+                }
+                for slot in &slots {
+                    assert!(
+                        slot.x >= x + CARD_EDGE - 0.5
+                            && slot.x + slot.w <= x + pw - CARD_EDGE + 0.5,
+                        "{w}x{h} d{density}: {} exits the panel horizontally",
+                        slot.id,
+                    );
+                    assert!(
+                        slot.y >= y && slot.y + slot.h <= y + core_h,
+                        "{w}x{h} d{density}: {} exits the panel vertically ({}..{} vs {}..{})",
+                        slot.id,
+                        slot.y,
+                        slot.y + slot.h,
+                        y,
+                        y + core_h,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression pin for the audited pairs, at both the raw audited
+    /// window size and the chrome-shortened canvas it actually yields.
+    #[test]
+    fn audited_pairs_are_separated_at_1440x900() {
+        for h in [900.0, 581.0] {
+            let (x, y, w, main_h) = scene_core_rect(1440.0, h, 1.0);
+            let slots = orbital_card_slots(x, y, w, main_h);
+            let rect = |id: &str| {
+                slots
+                    .iter()
+                    .find(|slot| slot.id == id)
+                    .map(footprint)
+                    .unwrap_or_else(|| panic!("missing card {id}"))
+            };
+            for (a, b) in [
+                ("system:peers", "system:sessions"),
+                ("system:context", "system:changes"),
+                ("system:controls", "system:worktrees"),
+                ("system:controls", "system:view"),
+                ("system:context", "system:view"),
+            ] {
+                assert!(
+                    !overlaps(&rect(a), &rect(b)),
+                    "{a} still collides with {b} at 1440x{h}"
+                );
+            }
+        }
+    }
+
+    /// The placement covers all nine system targets exactly once, and the
+    /// tall-mode band structure holds: peers/sessions share the top row,
+    /// the bottom tiers sit strictly below the middle band and strictly
+    /// apart.
+    #[test]
+    fn orbital_slots_cover_the_system_targets_in_bands() {
+        let (x, y, w, main_h) = scene_core_rect(1440.0, 900.0, 1.0);
+        let slots = orbital_card_slots(x, y, w, main_h);
+        let mut ids: Vec<&str> = slots.iter().map(|slot| slot.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 9, "duplicate or missing system card ids");
+        let slot = |id: &str| slots.iter().find(|slot| slot.id == id).unwrap();
+        assert_eq!(slot("system:peers").y, slot("system:sessions").y);
+        assert_eq!(slot("system:context").y, slot("system:controls").y);
+        assert_eq!(slot("system:changes").y, slot("system:view").y);
+        assert_eq!(slot("system:view").y, slot("system:worktrees").y);
+        let mid_bottom = slot("system:activity").y + slot("system:activity").h;
+        assert!(slot("system:context").y >= mid_bottom + CARD_GAP_Y);
+        let tier1_bottom = slot("system:context").y + slot("system:context").h;
+        assert!(slot("system:changes").y >= tier1_bottom + CARD_GAP_Y);
+    }
+
+    /// Short-mode structure (chrome-shortened canvas, core at its 330px
+    /// floor): the five bottom cards collapse onto one row, evenly
+    /// spread with at least the standard gap, view centered on the ring
+    /// axis, and the row still clears the middle band.
+    #[test]
+    fn short_panels_collapse_the_bottom_band_to_one_row() {
+        let (x, y, w, main_h) = scene_core_rect(1440.0, 581.0, 1.0);
+        let slots = orbital_card_slots(x, y, w, main_h);
+        let slot = |id: &str| {
+            slots
+                .iter()
+                .find(|slot| slot.id == id)
+                .unwrap_or_else(|| panic!("missing card {id}"))
+        };
+        let row = [
+            slot("system:changes"),
+            slot("system:context"),
+            slot("system:view"),
+            slot("system:controls"),
+            slot("system:worktrees"),
+        ];
+        for card in &row[1..] {
+            assert_eq!(card.y, row[0].y, "{} left the bottom row", card.id);
+        }
+        for pair in row.windows(2) {
+            let gap = pair[1].x - (pair[0].x + pair[0].w);
+            assert!(
+                gap >= CARD_GAP_X - 0.5,
+                "{}→{} gap {gap} under the minimum",
+                pair[0].id,
+                pair[1].id,
+            );
+        }
+        // View stays centered on the ring axis.
+        let (cx, ..) = scene_core_metrics(x, y, w, main_h);
+        let view = slot("system:view");
+        assert!((view.x + view.w * 0.5 - cx).abs() < 0.5);
+        // The row clears the (floored) middle band by the standard gap.
+        let mid = slot("system:activity");
+        assert!(row[0].y >= mid.y + mid.h + CARD_GAP_Y);
     }
 }
