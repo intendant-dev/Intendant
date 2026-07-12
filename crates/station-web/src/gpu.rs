@@ -632,6 +632,8 @@ impl GpuState {
 /// was ever lost) also falls back but keeps the state `Healthy`, so
 /// `renderer_label` reports a plain "Canvas" for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Constructed from the wasm render loop; native builds see only the tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) enum GpuRecovery {
     /// The current device has never been lost.
     Healthy,
@@ -659,6 +661,7 @@ impl GpuRecovery {
 
 /// What the render loop must do after consuming a device-lost flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) enum GpuLossStep {
     /// Spawn the single async re-init attempt.
     Reinit,
@@ -669,6 +672,7 @@ pub(crate) enum GpuLossStep {
 /// Pure transition for an observed device loss on the live GpuState.
 /// `Recovering`/`Fallback` cannot observe a loss (their GpuState was
 /// dropped on entry) but stay closed under repeats anyway.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn gpu_loss_transition(state: GpuRecovery) -> (GpuRecovery, GpuLossStep) {
     match state {
         GpuRecovery::Healthy => (GpuRecovery::Recovering, GpuLossStep::Reinit),
