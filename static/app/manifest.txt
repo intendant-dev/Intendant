@@ -80,6 +80,7 @@ ui2-settings.js
 53-transfer-fsm.js
 54-session-lifecycle.js
 55-files-ide.js
+55b-session-launch.js
 56-debug-sessions.js
 57-sessions-replay.js
 57-sessions-message-search.js
