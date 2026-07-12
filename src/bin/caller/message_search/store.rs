@@ -179,16 +179,25 @@ impl Store {
         if let Some(existing) = manifest.sessions.get(session_key) {
             // A lower watermark from the SAME source state is a stale
             // writer (lost race) — reject; the loser re-derives next pass.
-            // A lower watermark with CHANGED source fingerprints is a
-            // legitimate rebuild of a rewritten/shrunk source — allow.
-            let same_source_state = existing.cursors.iter().all(|old| {
-                cursors
+            // A lower watermark with CHANGED source fingerprints OR a
+            // changed cursor set is a legitimate rebuild (rewritten/
+            // shrunk source, or a publisher that stopped double-counting
+            // a source file — the soak's hardlink-twin dedup halved a
+            // session's watermark and must not be rejected forever).
+            let same_paths = existing.cursors.len() == cursors.len()
+                && existing
+                    .cursors
                     .iter()
-                    .find(|new| new.path == old.path)
-                    .is_none_or(|new| {
-                        new.prefix_hash16 == old.prefix_hash16 && new.identity == old.identity
-                    })
-            });
+                    .all(|old| cursors.iter().any(|new| new.path == old.path));
+            let same_source_state = same_paths
+                && existing.cursors.iter().all(|old| {
+                    cursors
+                        .iter()
+                        .find(|new| new.path == old.path)
+                        .is_none_or(|new| {
+                            new.prefix_hash16 == old.prefix_hash16 && new.identity == old.identity
+                        })
+                });
             if watermark < existing.source_watermark && same_source_state {
                 return Ok(PublishOutcome::RejectedStale);
             }
@@ -511,6 +520,51 @@ mod tests {
         assert_eq!(
             store.snapshot().read_shard("intendant:s1").unwrap().records[0].text,
             "rebuilt view"
+        );
+    }
+
+    #[test]
+    fn changed_cursor_set_republish_may_lower_the_watermark() {
+        // A publisher that stops double-counting a source (the soak's
+        // hardlink-twin dedup) publishes FEWER cursors summing to a lower
+        // watermark over unchanged files — a legitimate rebuild, not a
+        // stale writer.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let path = tmp.path().join("main.jsonl");
+        std::fs::write(&path, "line\n".repeat(64)).unwrap();
+        let twin = SourceCursor::capture(&path, 100).unwrap();
+        let shard = SessionShard {
+            records: vec![record(100, "doubled")],
+            marks: vec![],
+        };
+        store
+            .publish_session(
+                "claude-code:s1",
+                &shard,
+                vec![twin.clone(), twin.clone()],
+                false,
+            )
+            .unwrap();
+
+        let deduped = SessionShard {
+            records: vec![record(100, "single")],
+            marks: vec![],
+        };
+        assert!(matches!(
+            store
+                .publish_session("claude-code:s1", &deduped, vec![twin], false)
+                .unwrap(),
+            PublishOutcome::Published
+        ));
+        assert_eq!(
+            store
+                .snapshot()
+                .read_shard("claude-code:s1")
+                .unwrap()
+                .records[0]
+                .text,
+            "single"
         );
     }
 

@@ -439,7 +439,28 @@ impl Indexer {
             }
 
             for (session_id, main_path) in mains {
-                let agent_paths = subagents.remove(&session_id).unwrap_or_default();
+                let mut agent_paths = subagents.remove(&session_id).unwrap_or_default();
+                // Relocated project dirs can carry HARDLINKED twins of the
+                // same subagent transcripts (one session observed under
+                // both its real project path and a volume-alias path, same
+                // inodes) — extracting both would duplicate every subagent
+                // record. Dedup by file identity, path as the fallback.
+                agent_paths.sort();
+                agent_paths.dedup();
+                let mut seen_identities: Vec<crate::platform::FileIdentity> = Vec::new();
+                agent_paths.retain(
+                    |path| match crate::platform::FileIdentity::from_path(path) {
+                        Ok(identity) if identity.is_reliable() => {
+                            if seen_identities.contains(&identity) {
+                                false
+                            } else {
+                                seen_identities.push(identity);
+                                true
+                            }
+                        }
+                        _ => true,
+                    },
+                );
                 let newest_mtime = std::iter::once(&main_path)
                     .chain(agent_paths.iter())
                     .map(|path| file_mtime_ms(path))
