@@ -202,3 +202,35 @@ pub(crate) fn codex_thread_rollback_anchor(
 pub(crate) fn is_codex_injected_user_text(text: &str) -> bool {
     is_injected_external_user_text(text)
 }
+
+/// The session id a rollout file records (`session_meta.payload.id`),
+/// streaming line-by-line and stopping at the first `session_meta` — the
+/// finder opens EVERY rollout under a Codex home when its caches miss, so
+/// this must not read whole files. Consolidated from the two prior copies
+/// (`codex_history.rs` read the whole file; the catalog's streamed).
+pub(crate) fn codex_session_file_id(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            return obj
+                .get("payload")
+                .and_then(|payload| value_str(payload, "id"));
+        }
+    }
+}

@@ -2,9 +2,15 @@
 //! files under `$CODEX_HOME` and reconstructing per-user-turn revision
 //! state from recorded events.
 
-use crate::json_string_field;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+// Consolidated (message-search F3 phase 2): the rollout-file shapes this
+// module used to duplicate live in `external_agent`; the local copies had
+// already drifted (whole-file reads vs streaming, a stale injection list).
+// `codex_message_content_text` died outright — its one caller now goes
+// through the shared `codex_payload_text` shape.
+pub(crate) use crate::external_agent::codex::rollout::codex_session_file_id;
 
 pub(crate) fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -23,25 +29,6 @@ pub(crate) fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-pub(crate) fn codex_session_file_id(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
-            return obj
-                .get("payload")
-                .and_then(|payload| json_string_field(payload, "id"));
-        }
-    }
-    None
 }
 
 pub(crate) fn find_codex_session_file_for_main(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -75,49 +62,36 @@ pub(crate) fn find_codex_session_file_in(
     let mut files = Vec::new();
     collect_jsonl_files(&codex_root.join("sessions"), &mut files);
     collect_jsonl_files(&codex_root.join("archived_sessions"), &mut files);
+    // Codex embeds the session id in rollout filenames — try the cheap
+    // name match before opening every file (ported from the catalog's
+    // finder during consolidation; the id check stays authoritative).
     let found = files
-        .into_iter()
-        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))?;
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+                && codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+        .cloned()
+        .or_else(|| {
+            files
+                .into_iter()
+                .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+        })?;
     let _ = crate::external_wrapper_index::record_rollout_path(home, "codex", session_id, &found);
     Some(found)
 }
 
-pub(crate) fn codex_message_content_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|item| {
-                    item.get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
-                        .map(str::to_string)
-                })
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
+/// A genuine user message from a `response_item` payload: the shared
+/// `message` shape, filtered to `role == "user"` and stripped of
+/// harness-injected text no human typed.
 pub(crate) fn codex_payload_user_text(payload: &serde_json::Value) -> Option<String> {
-    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+    let (role, text) = crate::external_agent::codex::rollout::codex_payload_text(payload)?;
+    if role != "user" || is_codex_injected_user_text_for_main(&text) {
         return None;
     }
-    if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
-        return None;
-    }
-    let text = codex_message_content_text(payload.get("content")?)?;
-    if is_codex_injected_user_text_for_main(&text) {
-        None
-    } else {
-        Some(text)
-    }
+    Some(text)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,9 +185,9 @@ impl UserTurnRevisionState {
 }
 
 pub(crate) fn is_codex_injected_user_text_for_main(text: &str) -> bool {
-    // Delegates to the canonical predicate — this was a byte-for-byte copy
-    // that had already drifted from the session-catalog vocabulary.
-    crate::web_gateway::is_injected_external_user_text(text)
+    // Delegates to the canonical predicate at its post-F3 home (this was a
+    // byte-for-byte copy that had already drifted once before).
+    crate::external_agent::transcript_text::is_injected_external_user_text(text)
 }
 
 pub(crate) fn codex_user_turn_state_from_history(
