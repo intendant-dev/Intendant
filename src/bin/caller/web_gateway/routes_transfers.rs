@@ -44,6 +44,137 @@ pub(crate) fn transfer_id_param(params: &serde_json::Value) -> String {
     )
 }
 
+/// The one denial every failed job-scope re-check surfaces —
+/// unresolvable handle, artifact-shaped job, or out-of-scope path all
+/// read identically, so a denial never becomes a job-existence or
+/// job-path oracle for a scope-restricted caller. Both lanes emit this
+/// string verbatim (the mirror tests pin it).
+pub(crate) const TRANSFER_JOB_SCOPE_DENIED: &str =
+    "transfer job is outside the granted filesystem scope";
+
+/// The filesystem access a job-addressed transfer method exercises on
+/// the resolved job (the 2026-07-11 job-path re-check: scope-restricted
+/// callers act on a job by re-checking the job's *real* filesystem path
+/// under the standard scope rules, replacing the old blanket pathless
+/// denial that made the flow unusable for exactly the principals it was
+/// scoped for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferJobAccess {
+    /// Ranged download reads: read the job's download source.
+    ReadSource,
+    /// List/status visibility: read the job's user path (a write scope
+    /// implies read under `filesystem_access_allowed`, so a write-only
+    /// grant still sees the upload jobs it can chunk into).
+    ReadJobPath,
+    /// Upload chunk appends and commits: write the upload destination.
+    WriteDestination,
+    /// Delete: write the job's user path (upload destination, else
+    /// download source — cancelling a job is authority over its file).
+    WriteJobPath,
+}
+
+impl TransferJobAccess {
+    fn kind(self) -> crate::peer::access_policy::FilesystemAccessKind {
+        match self {
+            Self::ReadSource | Self::ReadJobPath => {
+                crate::peer::access_policy::FilesystemAccessKind::Read
+            }
+            Self::WriteDestination | Self::WriteJobPath => {
+                crate::peer::access_policy::FilesystemAccessKind::Write
+            }
+        }
+    }
+}
+
+/// The transfer's *real* user-filesystem path for a scope re-check —
+/// the job record's download source / upload destination, never the
+/// store's JSON record location (`transfer_store::job_path`). `None`
+/// (⇒ deny fail-closed) for artifact-shaped jobs — daemon-materialized
+/// or artifact-resolved sources (session reports, staged uploads,
+/// recording/frame assets; their creates are tunnel-only, divergence
+/// #24) live in daemon-internal stores no user grant names — and for
+/// jobs lacking the rule's path (e.g. a chunk aimed at a download job).
+fn transfer_job_scope_path(
+    job: &TransferJob,
+    access: TransferJobAccess,
+) -> Option<&std::path::Path> {
+    if job.managed_source || job.artifact.is_some() {
+        return None;
+    }
+    match access {
+        TransferJobAccess::ReadSource => job.source_path.as_deref(),
+        TransferJobAccess::WriteDestination => job.destination_path.as_deref(),
+        TransferJobAccess::ReadJobPath | TransferJobAccess::WriteJobPath => job
+            .destination_path
+            .as_deref()
+            .or(job.source_path.as_deref()),
+    }
+}
+
+/// Whether one already-loaded job passes a scope-restricted caller's
+/// policy under `access` — the list row's filter predicate and the core
+/// of [`check_scoped_transfer_job`].
+fn transfer_job_passes_scope(
+    policy: &crate::peer::access_policy::FilesystemAccessPolicy,
+    job: &TransferJob,
+    access: TransferJobAccess,
+) -> bool {
+    let Some(path) = transfer_job_scope_path(job, access) else {
+        return false;
+    };
+    let subject = match access {
+        // List/status visibility must include in-flight upload jobs,
+        // whose final destination is not on disk yet: judge the
+        // nearest existing ancestor, exactly as the Write kind
+        // normalizes inside `filesystem_access_allowed` — the strict
+        // per-row checks still gate the actual IO.
+        TransferJobAccess::ReadJobPath => {
+            match path.ancestors().find(|candidate| candidate.exists()) {
+                Some(existing) => existing,
+                None => return false,
+            }
+        }
+        _ => path,
+    };
+    crate::peer::access_policy::filesystem_access_allowed(policy, access.kind(), subject).is_ok()
+}
+
+/// A job-addressed re-check's outcome. `path` is the job's resolved
+/// real filesystem path whenever the handle resolved to one — the
+/// lanes' audit trails log it even on an out-of-scope denial — and a
+/// denial always reads [`TRANSFER_JOB_SCOPE_DENIED`] verbatim.
+pub(crate) struct TransferJobScopeCheck {
+    pub(crate) path: Option<std::path::PathBuf>,
+    pub(crate) allowed: bool,
+}
+
+/// Resolve and scope-check one job-addressed transfer method for a
+/// scope-restricted caller — the shared, transport-neutral twin of the
+/// create-time target check. Both lanes call exactly this fn (HTTP's
+/// job-addressed rows and the tunnel's `api_transfer_*` authorizer), so
+/// their decisions and denial wording are identical by construction.
+/// The handle resolves by id or resume token through the *lane's own*
+/// store scope (`http_transfer_scope` / the tunnel's
+/// `transfer_store_scope`); unrestricted principals never reach here —
+/// their job-addressed rows stay op-only, with no store lookup.
+pub(crate) fn check_scoped_transfer_job(
+    store: &StoreScope,
+    policy: &crate::peer::access_policy::FilesystemAccessPolicy,
+    handle: &str,
+    access: TransferJobAccess,
+) -> TransferJobScopeCheck {
+    let Some(job) = crate::transfer_store::find_job(store, handle) else {
+        return TransferJobScopeCheck {
+            path: None,
+            allowed: false,
+        };
+    };
+    TransferJobScopeCheck {
+        path: transfer_job_scope_path(&job, access).map(std::path::Path::to_path_buf),
+        allowed: transfer_job_passes_scope(policy, &job, access),
+    }
+}
+
 /// `{"ok": false, "error": …}` under the canonical json tail — the
 /// transfer family's error shape on both lanes (the tunnel injects its
 /// `_httpStatus` metadata on top; HTTP carries the status line).
@@ -83,13 +214,37 @@ fn transfer_join_error(label: &str, error: tokio::task::JoinError) -> ApiRespons
 /// param (any [`transfer_id_param`] alias) filters to that job — the
 /// HTTP row's `?id=` filter; the tunnel gains it additively (its
 /// callers historically pass no params, pinned by the goldens).
+///
+/// `fs_scope` is the caller's filesystem policy when the caller is
+/// scope-restricted (`None` = unrestricted, listing unchanged): the
+/// listing is never blanket-denied for scoped callers — it is filtered
+/// to the jobs whose real paths pass the caller's read scope
+/// ([`TransferJobAccess::ReadJobPath`]; artifact-shaped jobs are
+/// daemon-internal and never listed). The `?id=`/resume-token form gets
+/// the same per-job re-check *as a filter*: an out-of-scope or
+/// unresolvable handle yields an empty 200, never a denial that would
+/// oracle job existence. Both lanes pass their own caller's policy, so
+/// the filtered listings are identical.
 pub(crate) async fn transfer_jobs_api_response(
     scope: StoreScope,
     params: &serde_json::Value,
+    fs_scope: Option<&crate::peer::access_policy::FilesystemAccessPolicy>,
 ) -> ApiResponse {
     let filter = transfer_id_param(params);
-    let result =
-        tokio::task::spawn_blocking(move || crate::transfer_store::list_jobs(&scope)).await;
+    let policy = fs_scope.cloned();
+    let result = tokio::task::spawn_blocking(move || {
+        let jobs = crate::transfer_store::list_jobs(&scope);
+        match policy {
+            Some(policy) => jobs
+                .into_iter()
+                .filter(|job| {
+                    transfer_job_passes_scope(&policy, job, TransferJobAccess::ReadJobPath)
+                })
+                .collect(),
+            None => jobs,
+        }
+    })
+    .await;
     match result {
         Ok(jobs) => {
             let jobs: Vec<TransferJob> = if filter.is_empty() {
@@ -218,8 +373,9 @@ fn upload_create_params(
 /// The path a path-based create targets — the download source (its
 /// param aliases) or the upload destination (its). This is the path
 /// the caller's lane gate scope-checks at create; the job-addressed
-/// methods (chunk/commit/delete/download) act on that already-scoped
-/// destination and carry no path of their own.
+/// methods (chunk/commit/delete/download) carry no path of their own —
+/// for scope-restricted callers each re-checks the resolved job's real
+/// path instead ([`check_scoped_transfer_job`]).
 pub(crate) fn transfer_create_target_path(
     params: &serde_json::Value,
     kind: TransferKind,
@@ -532,58 +688,147 @@ async fn resolve_transfer_range_header(
 //    transfer-family authorization mirror, store-scope resolution —
 //    every response body comes from the shared fns. ──
 
+/// What a transfer row authorizes for scope-restricted callers (a peer
+/// identity or an fs-scoped IAM grant; unrestricted principals pass on
+/// the row's operation alone, which the pre-dispatch gate checked).
+pub(crate) enum TransferAccessTarget<'a> {
+    /// POST create: the kind-aware target path the create will act on.
+    /// `None` — an artifact-shaped or unparseable create — denies
+    /// scope-restricted callers fail-closed, wording unchanged.
+    Create(Option<&'a str>),
+    /// A job-addressed row: re-check the resolved job's real path in
+    /// the lane's store under the row's access rule
+    /// ([`check_scoped_transfer_job`]).
+    Job {
+        store: &'a StoreScope,
+        handle: &'a str,
+        access: TransferJobAccess,
+    },
+}
+
 /// The transfer family's fs gate, mirroring the tunnel's
 /// `authorize_dashboard_control_filesystem` exactly:
 ///
-/// - **create** names a target path (`Some`) — scope-checked (+
-///   audited) through [`authorize_http_filesystem_access`], write-kind
-///   for both job kinds, exactly as the tunnel derives kind from the
-///   method's operation;
-/// - the **job-addressed** methods carry no path (`None`): a
-///   scope-restricted caller — a peer identity or an fs-scoped grant —
-///   is denied fail-closed with the tunnel's wording (its destination
-///   was scoped at create, but a scoped principal must never reach
-///   job-addressed reads/writes it could not have created), while
-///   unrestricted principals pass on the row's operation alone.
-fn authorize_http_transfer_access(
+/// - **create** names a target path (`Create(Some)`) — scope-checked
+///   (+ audited) through [`authorize_http_filesystem_access`],
+///   write-kind for both job kinds, exactly as the tunnel derives kind
+///   from the method's operation; a pathless create (artifact-shaped —
+///   tunnel-only, divergence #24 — or unparseable) keeps the historical
+///   fail-closed denial for scope-restricted callers;
+/// - the **job-addressed** methods name only a job: a scope-restricted
+///   caller is re-checked against the resolved job's real filesystem
+///   path through the shared [`check_scoped_transfer_job`] (the tunnel
+///   authorizer calls the same fn), denying fail-closed — with one
+///   uniform wording — on an unresolvable handle, an artifact-shaped
+///   job, or an out-of-scope path, while unrestricted principals pass
+///   on the row's operation alone with no store lookup.
+///
+/// `pub(crate)` so the tunnel's parity fixtures can pin both lanes'
+/// decisions against each other.
+pub(crate) fn authorize_http_transfer_access(
     access: &HttpAccessContext,
     identity: Option<&PeerConnectionIdentity>,
     op: crate::peer::access_policy::PeerOperation,
-    target_path: Option<&str>,
+    target: TransferAccessTarget<'_>,
     bus: &EventBus,
 ) -> Result<(), String> {
-    if let Some(path) = target_path {
-        return authorize_http_filesystem_access(
+    let (store, handle, job_access) = match target {
+        TransferAccessTarget::Create(Some(path)) => {
+            return authorize_http_filesystem_access(
+                access,
+                identity,
+                op,
+                crate::peer::access_policy::FilesystemAccessKind::Write,
+                path,
+                bus,
+            );
+        }
+        TransferAccessTarget::Create(None) => {
+            let denied = "filesystem request missing path".to_string();
+            if let Some(identity) = identity {
+                audit_peer_filesystem_access(bus, identity, op, "", false, &denied);
+                return Err(denied);
+            }
+            if http_transfer_fs_scope(access, None).is_some() {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "[grant-fs] denied principal={} op={:?} path= detail={}",
+                        access.principal.label, op, denied
+                    ),
+                    level: Some(LogLevel::Warn),
+                    turn: None,
+                });
+                return Err(denied);
+            }
+            return Ok(());
+        }
+        TransferAccessTarget::Job {
+            store,
+            handle,
             access,
+        } => (store, handle, access),
+    };
+    if let Some(identity) = identity {
+        let check = check_scoped_transfer_job(store, &identity.filesystem, handle, job_access);
+        // Audit the job's resolved real path when the handle resolved
+        // to one (even on an out-of-scope denial); the raw handle is
+        // the best identity an unresolvable denial has.
+        let audit_path = check
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| handle.to_string());
+        if check.allowed {
+            audit_peer_filesystem_access(bus, identity, op, &audit_path, true, "allowed");
+            return Ok(());
+        }
+        audit_peer_filesystem_access(
+            bus,
             identity,
             op,
-            crate::peer::access_policy::FilesystemAccessKind::Write,
-            path,
-            bus,
+            &audit_path,
+            false,
+            TRANSFER_JOB_SCOPE_DENIED,
         );
+        return Err(TRANSFER_JOB_SCOPE_DENIED.to_string());
     }
-    let denied = "filesystem request missing path".to_string();
+    let Some(policy) = http_transfer_fs_scope(access, None) else {
+        return Ok(());
+    };
+    let check = check_scoped_transfer_job(store, policy, handle, job_access);
+    if check.allowed {
+        return Ok(());
+    }
+    let audit_path = check
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| handle.to_string());
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[grant-fs] denied principal={} op={:?} path={} detail={}",
+            access.principal.label, op, audit_path, TRANSFER_JOB_SCOPE_DENIED
+        ),
+        level: Some(LogLevel::Warn),
+        turn: None,
+    });
+    Err(TRANSFER_JOB_SCOPE_DENIED.to_string())
+}
+
+/// The caller's filesystem scope on this request, `None` when the
+/// caller is unrestricted: a peer identity's connection policy, else an
+/// fs-scoped IAM grant's scope.
+fn http_transfer_fs_scope<'a>(
+    access: &'a HttpAccessContext,
+    identity: Option<&'a PeerConnectionIdentity>,
+) -> Option<&'a crate::peer::access_policy::FilesystemAccessPolicy> {
     if let Some(identity) = identity {
-        audit_peer_filesystem_access(bus, identity, op, "", false, &denied);
-        return Err(denied);
+        return Some(&identity.filesystem);
     }
-    let scoped = access
+    access
         .iam_state
         .as_ref()
         .and_then(|state| crate::access::iam::fs_scope_for_principal(state, &access.principal))
-        .is_some();
-    if scoped {
-        bus.send(AppEvent::PresenceLog {
-            message: format!(
-                "[grant-fs] denied principal={} op={:?} path= detail={}",
-                access.principal.label, op, denied
-            ),
-            level: Some(LogLevel::Warn),
-            turn: None,
-        });
-        return Err(denied);
-    }
-    Ok(())
 }
 
 /// Transport edge: where transfer jobs persist for this daemon — the
@@ -595,6 +840,10 @@ fn http_transfer_scope(project_root: Option<&std::path::Path>) -> StoreScope {
 }
 
 /// `GET /api/transfers` — list jobs (`?id=`/`?resume_token=` filter).
+/// Never blanket-denied for scope-restricted callers: the shared list
+/// core filters the listing to the jobs whose real paths pass the
+/// caller's read scope (the `?id=` form gets the same per-job re-check
+/// as a filter); unrestricted principals list unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_transfer_jobs(
     stream: DemuxStream,
@@ -613,18 +862,25 @@ pub(crate) async fn handle_transfer_jobs(
         }
     }
     let params = serde_json::Value::Object(params);
-    let response = match authorize_http_transfer_access(
-        &http_access_context,
-        peer_connection_identity.as_ref(),
-        crate::peer::access_policy::PeerOperation::FilesystemRead,
-        None,
-        &bus,
-    ) {
-        Ok(()) => {
-            transfer_jobs_api_response(http_transfer_scope(project_root.as_deref()), &params).await
-        }
-        Err(message) => transfer_error_api_response(403, message),
-    };
+    let fs_scope = http_transfer_fs_scope(&http_access_context, peer_connection_identity.as_ref());
+    if let Some(identity) = peer_connection_identity.as_ref() {
+        // The scope-filtered listing is an allowed read; leave the
+        // same [peer-fs] trail line the other filesystem reads leave.
+        audit_peer_filesystem_access(
+            &bus,
+            identity,
+            crate::peer::access_policy::PeerOperation::FilesystemRead,
+            "",
+            true,
+            "allowed",
+        );
+    }
+    let response = transfer_jobs_api_response(
+        http_transfer_scope(project_root.as_deref()),
+        &params,
+        fs_scope,
+    )
+    .await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -659,7 +915,7 @@ pub(crate) async fn handle_transfer_job_create(
                 &http_access_context,
                 peer_connection_identity.as_ref(),
                 crate::peer::access_policy::PeerOperation::FilesystemWrite,
-                target.as_deref(),
+                TransferAccessTarget::Create(target.as_deref()),
                 &bus,
             ) {
                 Ok(()) => {
@@ -681,8 +937,9 @@ pub(crate) async fn handle_transfer_job_create(
 /// `POST /api/transfers/{id}/chunk?offset=N[&resume_token=…]` — spool
 /// the raw body (S8's `SpooledBody` lane, capped at
 /// [`TRANSFER_HTTP_CHUNK_MAX_BYTES`]) and append it through the shared
-/// core. Chunk auth needs only the row's operation — the destination
-/// was path-scoped at create (the tunnel's upload-frame model).
+/// core. Chunk auth is the row's operation plus, for scope-restricted
+/// callers, the job-path re-check: the resolved job's destination must
+/// pass the caller's write scope (denied before the body is read).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_transfer_upload_chunk(
     mut stream: DemuxStream,
@@ -691,10 +948,34 @@ pub(crate) async fn handle_transfer_upload_chunk(
     discard: Vec<u8>,
     job_id: String,
     project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
     use tokio::io::AsyncWriteExt;
+    let scope = http_transfer_scope(project_root.as_deref());
+    if let Err(message) = authorize_http_transfer_access(
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+        TransferAccessTarget::Job {
+            store: &scope,
+            handle: &job_id,
+            access: TransferJobAccess::WriteDestination,
+        },
+        &bus,
+    ) {
+        write_api_response(
+            stream,
+            transfer_error_api_response(403, message),
+            cors,
+            fleet_origin,
+        )
+        .await;
+        return;
+    }
     let mut params = serde_json::Map::new();
     params.insert("id".to_string(), serde_json::Value::String(job_id));
     for key in ["offset", "resume_token"] {
@@ -721,30 +1002,49 @@ pub(crate) async fn handle_transfer_upload_chunk(
             let status = if e.contains("too large") { 413 } else { 400 };
             transfer_error_api_response(status, e)
         }
-        Ok(body) => {
-            transfer_upload_chunk_api_response(
-                http_transfer_scope(project_root.as_deref()),
-                &params,
-                body,
-            )
-            .await
-        }
+        Ok(body) => transfer_upload_chunk_api_response(scope, &params, body).await,
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// `POST /api/transfers/{id}/commit` — verify and place the finished
 /// upload. An optional JSON body may carry extra params; the path
-/// capture is the job handle.
+/// capture is the job handle. Scope-restricted callers are re-checked
+/// against the job's destination path (write kind) before anything
+/// parses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_transfer_upload_commit(
     stream: DemuxStream,
     body_text: String,
     job_id: String,
     project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let scope = http_transfer_scope(project_root.as_deref());
+    if let Err(message) = authorize_http_transfer_access(
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+        TransferAccessTarget::Job {
+            store: &scope,
+            handle: &job_id,
+            access: TransferJobAccess::WriteDestination,
+        },
+        &bus,
+    ) {
+        write_api_response(
+            stream,
+            transfer_error_api_response(403, message),
+            cors,
+            fleet_origin,
+        )
+        .await;
+        return;
+    }
     let params = if body_text.trim().is_empty() {
         Ok(serde_json::Map::new())
     } else {
@@ -757,11 +1057,7 @@ pub(crate) async fn handle_transfer_upload_commit(
     let response = match params {
         Ok(mut params) => {
             params.insert("id".to_string(), serde_json::Value::String(job_id));
-            transfer_upload_commit_api_response(
-                http_transfer_scope(project_root.as_deref()),
-                &serde_json::Value::Object(params),
-            )
-            .await
+            transfer_upload_commit_api_response(scope, &serde_json::Value::Object(params)).await
         }
         Err(message) => transfer_error_api_response(400, message),
     };
@@ -770,34 +1066,84 @@ pub(crate) async fn handle_transfer_upload_commit(
 
 /// `DELETE /api/transfers/{id}` (+ the WKWebView POST
 /// `/api/transfers/{id}/delete` fallback — both shapes capture the same
-/// id and share this handler).
+/// id and share this handler). Scope-restricted callers are re-checked
+/// against the job's user path (write kind).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_transfer_job_delete(
     stream: DemuxStream,
     job_id: String,
     project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = transfer_job_delete_api_response(
-        http_transfer_scope(project_root.as_deref()),
-        &serde_json::json!({ "id": job_id }),
-    )
-    .await;
+    let scope = http_transfer_scope(project_root.as_deref());
+    if let Err(message) = authorize_http_transfer_access(
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+        TransferAccessTarget::Job {
+            store: &scope,
+            handle: &job_id,
+            access: TransferJobAccess::WriteJobPath,
+        },
+        &bus,
+    ) {
+        write_api_response(
+            stream,
+            transfer_error_api_response(403, message),
+            cors,
+            fleet_origin,
+        )
+        .await;
+        return;
+    }
+    let response =
+        transfer_job_delete_api_response(scope, &serde_json::json!({ "id": job_id })).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// `GET /api/transfers/{id}/download` — ranged read: an HTTP `Range`
 /// header takes precedence (it is the protocol's range mechanism);
 /// otherwise `?offset=&length=`; otherwise the full (capped) extent.
+/// Scope-restricted callers are re-checked against the job's source
+/// path (read kind).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_transfer_download_read(
     stream: DemuxStream,
     header_text: &str,
     request_line: &str,
     job_id: String,
     project_root: Option<std::path::PathBuf>,
+    http_access_context: HttpAccessContext,
+    peer_connection_identity: Option<PeerConnectionIdentity>,
+    bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let scope = http_transfer_scope(project_root.as_deref());
+    if let Err(message) = authorize_http_transfer_access(
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        crate::peer::access_policy::PeerOperation::FilesystemRead,
+        TransferAccessTarget::Job {
+            store: &scope,
+            handle: &job_id,
+            access: TransferJobAccess::ReadSource,
+        },
+        &bus,
+    ) {
+        write_api_response(
+            stream,
+            transfer_error_api_response(403, message),
+            cors,
+            fleet_origin,
+        )
+        .await;
+        return;
+    }
     let params = serde_json::json!({ "id": job_id });
     let range = if let Some(header) = dashboard_http_header_value(header_text, "range") {
         Ok(ByteRange::HttpHeader(header.to_string()))
@@ -818,14 +1164,7 @@ pub(crate) async fn handle_transfer_download_read(
         }
     };
     let response = match range {
-        Ok(range) => {
-            transfer_download_read_api_response(
-                http_transfer_scope(project_root.as_deref()),
-                &params,
-                range,
-            )
-            .await
-        }
+        Ok(range) => transfer_download_read_api_response(scope, &params, range).await,
         Err(message) => transfer_error_api_response(400, message),
     };
     write_api_response(stream, response, cors, fleet_origin).await;
@@ -960,11 +1299,20 @@ mod tests {
         );
 
         // The client vanished and came back: re-list (filtered by the
-        // resume token) and read the received extent off the job.
+        // resume token) and read the received extent off the job. The
+        // status poll works scope-filtered too — a write-only grant on
+        // the destination still sees its own in-flight job (write
+        // implies read; the pending destination is judged by its
+        // nearest existing ancestor).
+        let write_only = crate::peer::access_policy::FilesystemAccessPolicy {
+            read_roots: vec![],
+            write_roots: vec![dest_dir.clone()],
+        };
         let (status, listed) = json_body(
             &transfer_jobs_api_response(
                 scope.clone(),
                 &serde_json::json!({ "resume_token": resume_token }),
+                Some(&write_only),
             )
             .await,
         );
@@ -1030,21 +1378,68 @@ mod tests {
     }
 
     /// The HTTP lane's transfer-family gate mirrors the tunnel's
-    /// `authorize_dashboard_control_filesystem` exactly: unrestricted
-    /// principals pass on the row's operation; scope-restricted callers
-    /// (fs-scoped grants, peer identities) are scope-checked on the
-    /// create target and denied fail-closed on the pathless
-    /// job-addressed rows with the tunnel's wording.
+    /// `authorize_dashboard_control_filesystem` exactly (both lanes run
+    /// the shared [`check_scoped_transfer_job`]): unrestricted
+    /// principals pass on the row's operation alone, with no store
+    /// lookup; scope-restricted callers (fs-scoped grants, peer
+    /// identities) are scope-checked on the create target and re-checked
+    /// against the resolved job's real filesystem path on the
+    /// job-addressed rows — in-scope jobs pass each row's access rule,
+    /// while out-of-scope, artifact-shaped, and unresolvable handles are
+    /// denied fail-closed with one uniform wording.
     #[test]
-    fn transfer_authorization_mirrors_the_tunnel_fail_closed_rule() {
+    fn transfer_authorization_mirrors_the_tunnel_scope_recheck_rule() {
         use crate::peer::access_policy::PeerOperation;
         let bus = crate::event::EventBus::new();
         let dir = tempfile::tempdir().unwrap();
         let in_scope = dir.path().join("shared");
-        std::fs::create_dir_all(&in_scope).unwrap();
+        let outside = dir.path().join("outside");
+        let project = dir.path().join("project");
+        for path in [&in_scope, &outside, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let store = project_scope(&project);
 
-        // Unrestricted (root-session) context: pathless rows and any
-        // create target pass on the operation alone.
+        // Fixtures: a download job with an in-scope source, an upload
+        // job with an in-scope destination, an out-of-scope download
+        // job, and an artifact-shaped (daemon-materialized) job.
+        std::fs::write(in_scope.join("data.txt"), b"in scope").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"out of scope").unwrap();
+        let dl_in = crate::transfer_store::create_download_job(
+            &store,
+            in_scope.join("data.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        let up_in = crate::transfer_store::create_upload_job(
+            &store,
+            in_scope.join("up.bin").to_str().unwrap(),
+            "up.bin",
+            "application/octet-stream",
+            Some(4),
+            None,
+            crate::transfer_store::TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let dl_out = crate::transfer_store::create_download_job(
+            &store,
+            outside.join("secret.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        let artifact = crate::transfer_store::create_download_job_from_bytes(
+            &store,
+            b"report".to_vec(),
+            "report.zip",
+            "application/zip",
+            "session_report",
+            None,
+            Some(serde_json::json!({ "type": "session_report" })),
+        )
+        .unwrap();
+        let unresolvable = "00000000-0000-0000-0000-000000000000";
+
+        // Unrestricted (root-session) context: job-addressed rows and
+        // any create target pass on the operation alone — even an
+        // unresolvable handle proves no store lookup gates them.
         let root = HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
                 "unit-test",
@@ -1052,11 +1447,35 @@ mod tests {
             ),
             iam_state: None,
         };
+        for (op, access) in [
+            (PeerOperation::FilesystemRead, TransferJobAccess::ReadSource),
+            (
+                PeerOperation::FilesystemWrite,
+                TransferJobAccess::WriteDestination,
+            ),
+            (
+                PeerOperation::FilesystemWrite,
+                TransferJobAccess::WriteJobPath,
+            ),
+        ] {
+            assert!(authorize_http_transfer_access(
+                &root,
+                None,
+                op,
+                TransferAccessTarget::Job {
+                    store: &store,
+                    handle: unresolvable,
+                    access,
+                },
+                &bus
+            )
+            .is_ok());
+        }
         assert!(authorize_http_transfer_access(
             &root,
             None,
-            PeerOperation::FilesystemRead,
-            None,
+            PeerOperation::FilesystemWrite,
+            TransferAccessTarget::Create(None),
             &bus
         )
         .is_ok());
@@ -1064,14 +1483,14 @@ mod tests {
             &root,
             None,
             PeerOperation::FilesystemWrite,
-            Some(&in_scope.join("up.bin").to_string_lossy()),
+            TransferAccessTarget::Create(Some(&in_scope.join("up.bin").to_string_lossy())),
             &bus
         )
         .is_ok());
 
         // An fs-scoped user-client grant: in-scope create passes,
-        // out-of-scope create is refused, and the pathless rows are
-        // denied fail-closed exactly as the tunnel denies them.
+        // out-of-scope create is refused, and a pathless create keeps
+        // the historical fail-closed wording.
         let mut state = crate::access::iam::LocalIamState::default();
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("admin", "https");
         let result = crate::access::iam::upsert_user_client_grant(
@@ -1098,7 +1517,7 @@ mod tests {
             &scoped,
             None,
             PeerOperation::FilesystemWrite,
-            Some(&in_scope.join("up.bin").to_string_lossy()),
+            TransferAccessTarget::Create(Some(&in_scope.join("up2.bin").to_string_lossy())),
             &bus
         )
         .is_ok());
@@ -1106,40 +1525,99 @@ mod tests {
             &scoped,
             None,
             PeerOperation::FilesystemWrite,
-            Some("/etc/shadow-copy"),
+            TransferAccessTarget::Create(Some(&outside.join("escape.bin").to_string_lossy())),
             &bus
         )
         .is_err());
-        for op in [
-            PeerOperation::FilesystemRead,
-            PeerOperation::FilesystemWrite,
-        ] {
-            assert_eq!(
-                authorize_http_transfer_access(&scoped, None, op, None, &bus).unwrap_err(),
-                "filesystem request missing path",
-                "{op:?}"
-            );
-        }
+        assert_eq!(
+            authorize_http_transfer_access(
+                &scoped,
+                None,
+                PeerOperation::FilesystemWrite,
+                TransferAccessTarget::Create(None),
+                &bus
+            )
+            .unwrap_err(),
+            "filesystem request missing path",
+        );
 
-        // A peer identity is scope-restricted by construction: pathless
-        // rows are denied even under a permissive-looking policy.
+        // The job-addressed rows re-check the resolved job's real path,
+        // for the fs-scoped grant and for a peer identity carrying the
+        // same policy — identical decisions and wording on both.
         let peer = PeerConnectionIdentity {
             fingerprint: "aabbccdd".to_string(),
             label: "peer".to_string(),
             profile: "file-operator".to_string(),
-            filesystem: Default::default(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots: vec![in_scope.clone()],
+                write_roots: vec![in_scope.clone()],
+            },
         };
-        assert_eq!(
+        let authorize = |identity: Option<&PeerConnectionIdentity>,
+                         op: PeerOperation,
+                         handle: &str,
+                         access: TransferJobAccess| {
+            let context = if identity.is_some() { &root } else { &scoped };
             authorize_http_transfer_access(
-                &root,
-                Some(&peer),
-                PeerOperation::FilesystemRead,
-                None,
-                &bus
+                context,
+                identity,
+                op,
+                TransferAccessTarget::Job {
+                    store: &store,
+                    handle,
+                    access,
+                },
+                &bus,
             )
-            .unwrap_err(),
-            "filesystem request missing path"
-        );
+        };
+        for identity in [None, Some(&peer)] {
+            // Download read (read-checks the source): the in-scope
+            // download passes; an upload job has no source.
+            let read = TransferJobAccess::ReadSource;
+            assert!(authorize(identity, PeerOperation::FilesystemRead, &dl_in.id, read).is_ok());
+            assert!(authorize(identity, PeerOperation::FilesystemRead, &up_in.id, read).is_err());
+
+            // Chunk/commit (write-check the destination): the in-scope
+            // upload passes (its resume token works anywhere its id
+            // does); a download job has no destination.
+            let write = TransferJobAccess::WriteDestination;
+            assert!(authorize(identity, PeerOperation::FilesystemWrite, &up_in.id, write).is_ok());
+            assert!(authorize(
+                identity,
+                PeerOperation::FilesystemWrite,
+                &up_in.resume_token,
+                write
+            )
+            .is_ok());
+            assert!(authorize(identity, PeerOperation::FilesystemWrite, &dl_in.id, write).is_err());
+
+            // Delete (write-checks the job's user path): both in-scope
+            // jobs pass.
+            let delete = TransferJobAccess::WriteJobPath;
+            for job_id in [&up_in.id, &dl_in.id] {
+                assert!(
+                    authorize(identity, PeerOperation::FilesystemWrite, job_id, delete).is_ok()
+                );
+            }
+
+            // Out-of-scope, artifact-shaped, and unresolvable handles
+            // deny fail-closed with the one uniform wording on every
+            // job-addressed rule.
+            for access in [read, write, delete] {
+                let op = match access {
+                    TransferJobAccess::ReadSource => PeerOperation::FilesystemRead,
+                    _ => PeerOperation::FilesystemWrite,
+                };
+                for handle in [dl_out.id.as_str(), artifact.id.as_str(), unresolvable, ""] {
+                    assert_eq!(
+                        authorize(identity, op, handle, access).unwrap_err(),
+                        TRANSFER_JOB_SCOPE_DENIED,
+                        "{access:?} {handle:?} peer={}",
+                        identity.is_some(),
+                    );
+                }
+            }
+        }
     }
 
     /// Raw HTTP transcripts for the rows' distinctive wire shapes
@@ -1308,8 +1786,9 @@ mod tests {
         let job_b =
             crate::transfer_store::create_download_job(&scope, source_b.to_str().unwrap()).unwrap();
 
-        let (_, all) =
-            json_body(&transfer_jobs_api_response(scope.clone(), &serde_json::json!({})).await);
+        let (_, all) = json_body(
+            &transfer_jobs_api_response(scope.clone(), &serde_json::json!({}), None).await,
+        );
         assert_eq!(all["jobs"].as_array().unwrap().len(), 2);
 
         for (params, expect) in [
@@ -1320,7 +1799,7 @@ mod tests {
             ),
         ] {
             let (status, filtered) =
-                json_body(&transfer_jobs_api_response(scope.clone(), &params).await);
+                json_body(&transfer_jobs_api_response(scope.clone(), &params, None).await);
             assert_eq!(status, 200);
             let jobs = filtered["jobs"].as_array().unwrap();
             assert_eq!(jobs.len(), 1, "{params}");
@@ -1331,11 +1810,115 @@ mod tests {
             &transfer_jobs_api_response(
                 scope.clone(),
                 &serde_json::json!({ "id": "00000000-0000-0000-0000-000000000000" }),
+                None,
             )
             .await,
         );
         assert_eq!(status, 200);
         assert_eq!(missing["jobs"].as_array().unwrap().len(), 0);
+    }
+
+    /// The list row's scope filter (the one judgment call of the
+    /// job-path re-check): a scope-restricted caller is never
+    /// blanket-denied — the listing shows exactly the jobs whose real
+    /// paths pass its read scope, artifact-shaped jobs stay
+    /// daemon-internal, and the `?id=` form applies the same per-job
+    /// re-check as a filter (an out-of-scope handle reads as an empty
+    /// 200, never a denial that would oracle job existence).
+    #[tokio::test]
+    async fn jobs_list_scope_filters_to_the_callers_readable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_scope = dir.path().join("shared");
+        let outside = dir.path().join("outside");
+        let project = dir.path().join("project");
+        for path in [&in_scope, &outside, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let scope = project_scope(&project);
+        std::fs::write(in_scope.join("data.txt"), b"in scope").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"out of scope").unwrap();
+        let dl_in = crate::transfer_store::create_download_job(
+            &scope,
+            in_scope.join("data.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        // Pending upload: the destination is not on disk yet — judged
+        // by its nearest existing ancestor, so the in-flight job stays
+        // visible to the grant that is chunking into it.
+        let up_in = crate::transfer_store::create_upload_job(
+            &scope,
+            in_scope.join("up.bin").to_str().unwrap(),
+            "up.bin",
+            "application/octet-stream",
+            Some(4),
+            None,
+            crate::transfer_store::TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let dl_out = crate::transfer_store::create_download_job(
+            &scope,
+            outside.join("secret.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        crate::transfer_store::create_download_job_from_bytes(
+            &scope,
+            b"report".to_vec(),
+            "report.zip",
+            "application/zip",
+            "session_report",
+            None,
+            Some(serde_json::json!({ "type": "session_report" })),
+        )
+        .unwrap();
+
+        // Unrestricted callers list all four jobs, unchanged.
+        let (_, all) = json_body(
+            &transfer_jobs_api_response(scope.clone(), &serde_json::json!({}), None).await,
+        );
+        assert_eq!(all["jobs"].as_array().unwrap().len(), 4);
+
+        // A read-only grant on the shared root sees exactly the two
+        // in-scope jobs (write roots imply read, pinned by the resume
+        // flow test's write-only policy).
+        let policy = crate::peer::access_policy::FilesystemAccessPolicy {
+            read_roots: vec![in_scope.clone()],
+            write_roots: vec![],
+        };
+        let (status, listed) = json_body(
+            &transfer_jobs_api_response(scope.clone(), &serde_json::json!({}), Some(&policy)).await,
+        );
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = listed["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&dl_in.id.as_str()));
+        assert!(ids.contains(&up_in.id.as_str()));
+
+        // ?id= on an in-scope job answers it; on an out-of-scope job it
+        // answers empty — same 200 shape either way.
+        let (_, one) = json_body(
+            &transfer_jobs_api_response(
+                scope.clone(),
+                &serde_json::json!({ "id": dl_in.id }),
+                Some(&policy),
+            )
+            .await,
+        );
+        assert_eq!(one["jobs"].as_array().unwrap().len(), 1);
+        let (status, hidden) = json_body(
+            &transfer_jobs_api_response(
+                scope.clone(),
+                &serde_json::json!({ "id": dl_out.id }),
+                Some(&policy),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(hidden["jobs"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

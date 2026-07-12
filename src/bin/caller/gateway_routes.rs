@@ -633,7 +633,10 @@ pub(crate) static ROUTES: &[Route] = &[
     //    over direct HTTP, twinning the datachannel api_transfer_*
     //    methods onto the same neutral cores. Create scope-checks its
     //    target path (both kinds); the job-addressed rows carry no path
-    //    and act on the destination that check already fixed.
+    //    of their own — scope-restricted callers are re-checked against
+    //    the resolved job's real filesystem path (and the list row is
+    //    scope-filtered), through the same shared helper the tunnel
+    //    authorizer uses (`web_gateway::check_scoped_transfer_job`).
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/transfers"),

@@ -1570,21 +1570,76 @@ fn dashboard_control_filesystem_paths(
         .collect()
 }
 
+/// On success carries an optional audit-path override — the transfer
+/// re-check's resolved job path (or the create's kind-aware target),
+/// which the method's params don't name — for
+/// `audit_dashboard_control_filesystem`; `Ok(None)` means the audit
+/// trail derives its path from the params as before.
 fn authorize_dashboard_control_filesystem(
     runtime: &ControlRuntime,
     method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use crate::peer::access_policy::{FilesystemAccessKind, PeerOperation};
     let kind = match op {
         PeerOperation::FilesystemRead => FilesystemAccessKind::Read,
         PeerOperation::FilesystemWrite => FilesystemAccessKind::Write,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let Some(policy) = runtime.grant.filesystem() else {
-        return Ok(());
+        return Ok(None);
     };
+    // The transfer family: create scope-checks the kind-aware path the
+    // create will actually target; the job-addressed methods re-check
+    // the resolved job's *real* filesystem path through the shared
+    // transport-neutral helper (HTTP's rows call the same fn, so both
+    // lanes decide and word identically); the list method is never
+    // blanket-denied — its handler scope-filters the listing instead.
+    match method {
+        "api_transfer_jobs" => return Ok(None),
+        "api_transfer_job_create" => {
+            let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+            let target = crate::web_gateway::classify_transfer_create(&params)
+                .ok()
+                .and_then(|request| match request {
+                    crate::web_gateway::TransferCreateRequest::Path(kind) => {
+                        crate::web_gateway::transfer_create_target_path(&params, kind)
+                    }
+                    // Artifact-shaped creates resolve daemon-internal
+                    // sources no user grant names (divergence #24):
+                    // pathless, so scoped callers fail closed below.
+                    crate::web_gateway::TransferCreateRequest::Artifact(_) => None,
+                });
+            let Some(target) = target else {
+                return Err("filesystem request missing path".to_string());
+            };
+            let path = crate::web_gateway::expand_dashboard_fs_path(&target)?;
+            crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
+            return Ok(Some(target));
+        }
+        "api_transfer_upload_chunk"
+        | "api_transfer_upload_commit"
+        | "api_transfer_job_delete"
+        | "api_transfer_download_read" => {
+            let access = match method {
+                "api_transfer_download_read" => crate::web_gateway::TransferJobAccess::ReadSource,
+                "api_transfer_job_delete" => crate::web_gateway::TransferJobAccess::WriteJobPath,
+                _ => crate::web_gateway::TransferJobAccess::WriteDestination,
+            };
+            let handle = params
+                .map(crate::web_gateway::transfer_id_param)
+                .unwrap_or_default();
+            let store = transfer_store_scope(runtime);
+            let check =
+                crate::web_gateway::check_scoped_transfer_job(&store, policy, &handle, access);
+            if check.allowed {
+                return Ok(check.path.map(|path| path.display().to_string()));
+            }
+            return Err(crate::web_gateway::TRANSFER_JOB_SCOPE_DENIED.to_string());
+        }
+        _ => {}
+    }
     let raw_paths = dashboard_control_filesystem_paths(method, params);
     // Fail closed on missing params: a rename that names only one leg must
     // not slip past the scope check and let the handler report a plain 400.
@@ -1595,7 +1650,7 @@ fn authorize_dashboard_control_filesystem(
         let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
         crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
     }
-    Ok(())
+    Ok(None)
 }
 
 fn authorize_dashboard_control_method(
@@ -1618,19 +1673,21 @@ fn authorize_dashboard_control_method(
         .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))
         .and_then(|()| authorize_dashboard_control_filesystem(runtime, method, op, params));
     audit_dashboard_control_filesystem(runtime, method, op, params, &result);
-    result
+    result.map(|_| ())
 }
 
 /// Audit twin of the HTTP lane's `[peer-fs]` / `[grant-fs]` lines
 /// (`web_gateway::audit_peer_filesystem_access`) for filesystem methods that
 /// arrive over the dashboard-control tunnel, so both transports leave the
 /// same trail: peer grants log allow and deny, other grants log denials.
+/// A successful transfer re-check overrides the logged path with the
+/// resolved job path (the params name only a job handle).
 fn audit_dashboard_control_filesystem(
     runtime: &ControlRuntime,
     method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
-    result: &Result<(), String>,
+    result: &Result<Option<String>, String>,
 ) {
     use crate::peer::access_policy::PeerOperation;
     if !matches!(
@@ -1639,7 +1696,10 @@ fn audit_dashboard_control_filesystem(
     ) {
         return;
     }
-    let path = dashboard_control_filesystem_paths(method, params).join(" -> ");
+    let path = match result {
+        Ok(Some(resolved)) => resolved.clone(),
+        _ => dashboard_control_filesystem_paths(method, params).join(" -> "),
+    };
     match &runtime.grant {
         DashboardControlGrant::Peer {
             fingerprint,
@@ -1648,7 +1708,7 @@ fn audit_dashboard_control_filesystem(
             ..
         } => {
             let (allowed, detail) = match result {
-                Ok(()) => (true, "allowed".to_string()),
+                Ok(_) => (true, "allowed".to_string()),
                 Err(e) => (false, e.clone()),
             };
             runtime.bus.send(AppEvent::PresenceLog {
@@ -1690,9 +1750,11 @@ fn audit_dashboard_control_filesystem(
 
 /// Upload frames are authorized by the method they deliver — the same
 /// operation that method needs on the direct routes — not by a blanket
-/// filesystem grant. Transfer chunks skip path scoping: their destination
-/// was scoped when the transfer job was created and the chunk only names
-/// that job.
+/// filesystem grant. Path scoping runs at `upload_end`, where the params
+/// are final: `api_fs_write` re-authorizes through the full method gate,
+/// and a transfer chunk's job-path re-check
+/// (`web_gateway::check_scoped_transfer_job`) resolves the named job and
+/// scope-checks its destination the same way.
 fn authorize_dashboard_control_upload(
     runtime: &ControlRuntime,
     method: &str,
