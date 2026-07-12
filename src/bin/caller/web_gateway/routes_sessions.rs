@@ -3414,6 +3414,92 @@ pub(crate) async fn handle_sessions_search(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Transport-neutral core of `GET /api/sessions/message-search` (tunnel
+/// twin `api_sessions_message_search`): the message-lane search over the
+/// shard store (plan §7). Freshness rides a bounded refresh-if-stale
+/// sweep; a small per-daemon concurrency cap sheds bursts; responses are
+/// `Cache-Control: no-store` and `q` is never logged (audited: neither
+/// the HTTP lane nor the tunnel logs request lines or params).
+pub(crate) async fn sessions_message_search_api_response(
+    params: crate::message_search::MessageSearchParams,
+) -> ApiResponse {
+    static CAP: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let cap = CAP.get_or_init(|| tokio::sync::Semaphore::new(2));
+    let Ok(_permit) = cap.try_acquire() else {
+        return message_search_json(429, serde_json::json!({"ok": false, "error": "busy"}));
+    };
+    let (status, body) = match tokio::task::spawn_blocking(move || {
+        // Plan §7 acceptance: native freshness ~1s. A no-op until the
+        // boot backfill has completed once.
+        crate::message_search::refresh_if_stale(1_000);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        crate::message_search::run_message_search(
+            &crate::message_search::Store::default_root(),
+            &params,
+            now_ms,
+            150,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => (
+            500,
+            serde_json::json!({"ok": false, "error": format!("search task failed: {err}")}),
+        ),
+    };
+    message_search_json(status, body)
+}
+
+/// Search responses are per-query and may embed private message text:
+/// `no-store` (the canonical envelope's `no-cache` still allows caching).
+fn message_search_json(status: u16, body: serde_json::Value) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::Value(body),
+        headers: vec![
+            ("Cache-Control", "no-store".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
+pub(crate) fn message_search_params_from_request(
+    request_line: &str,
+) -> crate::message_search::MessageSearchParams {
+    let flag = |name: &str, default: bool| {
+        query_param(request_line, name)
+            .map(|value| !matches!(value.as_str(), "false" | "0"))
+            .unwrap_or(default)
+    };
+    crate::message_search::MessageSearchParams {
+        q: query_param(request_line, "q").unwrap_or_default(),
+        sources: crate::message_search::parse_sources(
+            &query_param(request_line, "source").unwrap_or_default(),
+        ),
+        include_superseded: flag("include_superseded", true),
+        include_subagents: flag("subagents", true),
+        cursor: query_param(request_line, "cursor").filter(|cursor| !cursor.is_empty()),
+        limit: query_param(request_line, "limit")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20),
+    }
+}
+
+pub(crate) async fn handle_sessions_message_search(
+    stream: DemuxStream,
+    request_line: &str,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let params = message_search_params_from_request(request_line);
+    let response = sessions_message_search_api_response(params).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 pub(crate) async fn handle_worktrees_inspect(
     stream: DemuxStream,
     body_text: String,

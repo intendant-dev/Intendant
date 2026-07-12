@@ -21,11 +21,13 @@ mod extract_claude;
 mod extract_codex;
 mod extract_intendant;
 mod indexer;
+mod query;
 mod record;
 mod store;
 
-pub(crate) use indexer::spawn_indexer;
-use store::Store;
+pub(crate) use indexer::{refresh_if_stale, spawn_indexer};
+pub(crate) use query::{parse_sources, run_message_search, MessageSearchParams};
+pub(crate) use store::Store;
 
 /// Boot-time retention GC over the production store root (plan §6):
 /// expired shards and tombstones must not accumulate before the first

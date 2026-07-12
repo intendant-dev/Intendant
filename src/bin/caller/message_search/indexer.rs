@@ -566,6 +566,43 @@ impl Indexer {
     }
 }
 
+/// The production sweep state: one shared [`Indexer`] serves the 30s loop
+/// AND the query edge's freshness refresh, so both share the
+/// unpublishable-source cache and never sweep concurrently.
+fn shared_indexer() -> &'static std::sync::Mutex<Indexer> {
+    static SHARED: std::sync::OnceLock<std::sync::Mutex<Indexer>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| std::sync::Mutex::new(Indexer::default()))
+}
+
+/// Epoch ms of the last COMPLETED production sweep; 0 = never (the boot
+/// backfill hasn't finished).
+static LAST_SWEEP_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// One production sweep over freshly resolved roots (blocking; callers
+/// use `spawn_blocking`).
+pub(crate) fn sweep_shared_production() -> SweepStats {
+    let roots = resolve_production_roots();
+    let mut indexer = shared_indexer()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stats = indexer.sweep(&roots);
+    LAST_SWEEP_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    stats
+}
+
+/// Query-edge freshness (plan §7 acceptance: native ~1 s): sweep now if
+/// the last completed sweep is older than `max_age_ms`. Deliberately a
+/// no-op before the FIRST sweep completes — the boot backfill can take
+/// seconds and must never run inline with a query; coverage reports
+/// `building` until it lands.
+pub(crate) fn refresh_if_stale(max_age_ms: i64) {
+    let last = LAST_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 || now_ms().saturating_sub(last) <= max_age_ms {
+        return;
+    }
+    let _ = sweep_shared_production();
+}
+
 /// Resolve the box's real message sources: the user's default homes, the
 /// lease-active registry (live materialized homes, indexed DURING the
 /// lease), and staged lease remnants awaiting drain. The one
@@ -642,29 +679,18 @@ pub(crate) fn add_registry_and_staged_roots(
 /// interval after boot (one-shot CLI runs exit before paying for it).
 pub(crate) fn spawn_indexer() {
     tokio::spawn(async {
-        let mut indexer = Indexer::default();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // the immediate first tick — skip it
         loop {
             ticker.tick().await;
-            let roots = resolve_production_roots();
             // Sweeps read and hash real files: keep them off the async
-            // executor's worker threads.
-            let swept = tokio::task::spawn_blocking(move || {
-                let mut indexer = indexer;
-                let stats = indexer.sweep(&roots);
-                (indexer, stats)
-            })
-            .await;
-            let stats = match swept {
-                Ok((returned, stats)) => {
-                    indexer = returned;
-                    stats
-                }
+            // executor's worker threads. The shared instance also serves
+            // the query edge's refresh_if_stale.
+            let stats = match tokio::task::spawn_blocking(sweep_shared_production).await {
+                Ok(stats) => stats,
                 Err(err) => {
                     eprintln!("[message-search] sweep task failed: {err}");
-                    indexer = Indexer::default();
                     continue;
                 }
             };
