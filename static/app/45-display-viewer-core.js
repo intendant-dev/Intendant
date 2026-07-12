@@ -672,3 +672,28 @@ function displayViewerToggleCallout(viewer, button) {
     captureFrame: (q) => viewer.captureCurrentFrame(q),
   });
 }
+
+// ── Bounded-retry budget (shared shape; mechanics are policy) ───────────
+// Both viewers retry a failed connection at most 5 times with the same
+// backoff and end in the same dead-end copy with a manual retry button.
+// The MECHANICS deliberately differ and stay in the classes (see each
+// policy object's `retrySemantics`): the local slot renegotiates in
+// place — its server-side DisplaySession survives, so disconnect() +
+// connect() on the same slot is a fresh offer the session can answer —
+// while the peer path re-opens with a fresh session id via the full
+// openPeerDisplay path, because re-offering on the same session id is
+// not a wire shape the peer's WebRtcPeer lifecycle supports (its attempt
+// counter therefore lives in a module-scope map keyed host|display,
+// surviving connection replacement).
+const DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS = 5;
+
+function displayViewerRetryDelayMs(attempts) {
+  return Math.min(2000 * attempts, 10000);
+}
+
+// Dead-end copy, shared verbatim by both paths (status line + stage
+// overlay variant with the trailing period).
+const DISPLAY_VIEWER_RETRY_DEAD_END_STATUS =
+  `Connection failed after ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS} attempts`;
+const DISPLAY_VIEWER_RETRY_DEAD_END_OVERLAY =
+  DISPLAY_VIEWER_RETRY_DEAD_END_STATUS + '.';

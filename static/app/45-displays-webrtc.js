@@ -86,6 +86,102 @@ function sendDisplayInputForSlot(displayId, msg) {
 // 45-display-viewer-core.js — the shared viewer core both this class and
 // PeerDisplayConnection (52-peer-display.js) compose over.
 
+// ── LOCAL display viewer policy ─────────────────────────────────────────
+// The named home for every deliberate difference between this class and
+// the federated PeerDisplayConnection (whose counterpart is
+// PEER_DISPLAY_POLICY in 52-peer-display.js). The shared mechanics live
+// in 45-display-viewer-core; each field below cites the decision it
+// carries. Pure consolidation: each method's behavior is byte-identical
+// to the inline code it replaced.
+const DISPLAY_SLOT_POLICY = {
+  name: 'local-display-slot',
+
+  // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
+  // default empty for local LAN deployments. Goes through the shared
+  // helper so the peer-display path can't drift in what it hands to the
+  // browser's ICE agent. NO relay pinning here — that is the FEDERATED
+  // policy (#41–#45): local display must never be forced through TURN.
+  buildRtcConfig() {
+    return { iceServers: buildIceServersFromGatewayConfig(gatewayConfig) };
+  },
+
+  // **#58**: NO `setCodecPreferences` reorder. WKWebView's default
+  // codec order puts H.264 PTs (96/98/100) before VP8 (107) — let
+  // it. On macOS the server then negotiates H.264, which spawns a
+  // hardware-accelerated VideoToolbox encoder
+  // ([`crate::display::encode::h264_macos`]) — single-encoding,
+  // single thread, ~5-10 % CPU at full resolution.
+  //
+  // Pre-#58 this path force-reordered VP8 first because the local
+  // DisplaySlot also injected `a=simulcast:recv f;h;q` for
+  // multi-encoding receive, and rtc 0.9's SDP writer mishandles
+  // multi-RID H.264 (single SSRC covering all RIDs → browser
+  // chokes). #58 also drops to `a=simulcast:recv f` (single-RID
+  // receive — see `DISPLAY_SIMULCAST_RIDS`), so the rtc 0.9
+  // multi-RID-H.264 bug is no longer reachable: with single-RID
+  // receive the answer is plain sendonly, identical for VP8 and
+  // H.264. Restoring default codec order = restoring the
+  // hardware-accelerated path the macOS UTM guest needs to stay
+  // usable. Pre-#58 idle dashboard pegged the guest at 245 %+
+  // CPU on three software VP8 encoders for one viewer.
+  //
+  // Chrome viewers on macOS still default VP8 first; they get
+  // single-encoding VP8 (libvpx software, 1 encoder) at ~80 % CPU
+  // — also a substantial drop from ~245 %, just less dramatic
+  // than WKWebView's hardware H.264 path.
+  //
+  // (The FEDERATED policy is the opposite: an explicit VP8 pin, #67.)
+  applyCodecPreferences(_videoTransceiver) {},
+
+  // **#58** (LOCAL ONLY): inject `a=rid:<rid> recv` lines +
+  // `a=simulcast:recv <rids>` into the m=video section before
+  // setLocalDescription. `<rids>` is `DISPLAY_SIMULCAST_RIDS` (default
+  // `['f']` — single-RID receive post-#58; opt-in `['f','h','q']` for
+  // the experimental multi-encoding adaptive-bandwidth path). The
+  // federated path deliberately SKIPS this injection (#46: rtc 0.9
+  // answers a recv-simulcast hint on a single-encoding track with a
+  // malformed multi-RID/single-SSRC shape the browser refuses to
+  // decode).
+  mungeOfferSdp(sdp) {
+    return injectRecvSimulcastIntoVideoOffer(sdp, DISPLAY_SIMULCAST_RIDS);
+  },
+
+  // Retry semantics: renegotiate IN PLACE on the same slot — the
+  // server-side DisplaySession survives an ICE failure, so disconnect()
+  // + connect() issues a fresh offer the same session answers. The
+  // attempt counter lives on the instance (`_reconnectAttempts`). The
+  // peer path instead re-opens with a fresh session id (its WebRtcPeer
+  // lifecycle cannot re-offer). Budget/backoff/dead-end copy are the
+  // shared DISPLAY_VIEWER_RETRY_* constants.
+  retrySemantics: 'renegotiate-in-place',
+
+  // Signaling transport: the verified dashboard-control tunnel
+  // (displayWebRtcSignal) first, legacy /ws lane frames
+  // (display_offer / display_ice / display_answer) as the direct-origin
+  // fallback — see sendDisplayOffer / sendDisplayIceCandidate. The peer
+  // path signals through the daemon HTTP/tunnel facade
+  // (api_peer_webrtc_signal) instead.
+  signalingLane: 'dashboard-control-or-ws',
+
+  // Container resolution: a fixed stage — the slot owns its DOM for its
+  // whole life (canvasEl/overlayEl/metricsEl created once in the
+  // constructor and reparented as a unit). The peer path re-resolves
+  // Station-aware containers on every render because its pane DOM is
+  // rebuilt by daemons-list re-renders.
+  containerResolution: 'fixed-stage',
+
+  // Clipboard sync: LOCAL ONLY today (paste interceptor + remote
+  // clipboard_update applier). Federated clipboard is a follow-up.
+  clipboardSync: true,
+
+  // Attach/annotation stream naming: `display_<id>` (byte-identical to
+  // the pre-provider strings; the peer path namespaces by host —
+  // `peer_<safeHost>_display_<id>` — so ids stay unique across hosts).
+  streamBase(slot) {
+    return 'display_' + slot.displayId;
+  },
+};
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -299,7 +395,7 @@ class DisplaySlot {
       setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
       return;
     }
-    if (!(await displayViewerUploadAttachFrame(this, 'display_' + this.displayId, frame))) {
+    if (!(await displayViewerUploadAttachFrame(this, DISPLAY_SLOT_POLICY.streamBase(this), frame))) {
       return;
     }
     // Brief visual confirmation
@@ -317,7 +413,7 @@ class DisplaySlot {
     return {
       owner: this,
       displayId: this.displayId,
-      streamBase: 'display_' + this.displayId,
+      streamBase: DISPLAY_SLOT_POLICY.streamBase(this),
       stageEl: () => this.canvasEl,
       liveSurfaceEl: () => this.videoEl,
       annotateBtn: () => this.annotateBtn,
@@ -414,42 +510,19 @@ class DisplaySlot {
     this.statusEl.textContent = 'Connecting...';
     this.statusEl.className = 'display-status';
     this._setStageOverlay('progress', 'Negotiating…');
-    // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
-    // default empty for local LAN deployments. Goes through the shared
-    // helper so the peer-display path (PeerDisplayConnection.connect) can't
-    // drift in what it hands to the browser's ICE agent.
-    const config = { iceServers: buildIceServersFromGatewayConfig(gatewayConfig) };
-    this.pc = new RTCPeerConnection(config);
+    // ICE config: DISPLAY_SLOT_POLICY.buildRtcConfig — no relay pinning
+    // on the local path (that's the federated policy).
+    this.pc = new RTCPeerConnection(DISPLAY_SLOT_POLICY.buildRtcConfig());
 
     // Add a recvonly video transceiver so the SDP offer includes a video
     // media section. Without this, the server can't attach its video track
     // because the answerer can't introduce new media lines.
     const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
 
-    // **#58**: NO `setCodecPreferences` reorder. WKWebView's default
-    // codec order puts H.264 PTs (96/98/100) before VP8 (107) — let
-    // it. On macOS the server then negotiates H.264, which spawns a
-    // hardware-accelerated VideoToolbox encoder
-    // ([`crate::display::encode::h264_macos`]) — single-encoding,
-    // single thread, ~5-10 % CPU at full resolution.
-    //
-    // Pre-#58 this path force-reordered VP8 first because the local
-    // DisplaySlot also injected `a=simulcast:recv f;h;q` for
-    // multi-encoding receive, and rtc 0.9's SDP writer mishandles
-    // multi-RID H.264 (single SSRC covering all RIDs → browser
-    // chokes). #58 also drops to `a=simulcast:recv f` (single-RID
-    // receive — see `DISPLAY_SIMULCAST_RIDS`), so the rtc 0.9
-    // multi-RID-H.264 bug is no longer reachable: with single-RID
-    // receive the answer is plain sendonly, identical for VP8 and
-    // H.264. Restoring default codec order = restoring the
-    // hardware-accelerated path the macOS UTM guest needs to stay
-    // usable. Pre-#58 idle dashboard pegged the guest at 245 %+
-    // CPU on three software VP8 encoders for one viewer.
-    //
-    // Chrome viewers on macOS still default VP8 first; they get
-    // single-encoding VP8 (libvpx software, 1 encoder) at ~80 % CPU
-    // — also a substantial drop from ~245 %, just less dramatic
-    // than WKWebView's hardware H.264 path.
+    // Codec order: **#58** — deliberately a no-op (browser default order;
+    // WKWebView lands hardware H.264). Full rationale on
+    // DISPLAY_SLOT_POLICY.applyCodecPreferences.
+    DISPLAY_SLOT_POLICY.applyCodecPreferences(videoTransceiver);
 
     // Create data channels BEFORE offer (browser is the offerer)
     this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
@@ -532,14 +605,14 @@ class DisplaySlot {
         this.connected = false;
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
-        if (attempts <= 5) {
-          const delay = Math.min(2000 * attempts, 10000);
+        if (attempts <= DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
+          const delay = displayViewerRetryDelayMs(attempts);
           // disconnect() first: it clears watchdogs/samplers and hides
           // the overlay, so set the retry copy AFTER it runs.
           this.disconnect();
           this.statusEl.textContent = `Connection failed, reconnecting in ${delay/1000}s (attempt ${attempts})...`;
           this.statusEl.className = 'display-status error';
-          this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of 5)…`);
+          this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS})…`);
           setTimeout(() => {
             if (this._closedByUser) return;
             this.connect();
@@ -547,10 +620,10 @@ class DisplaySlot {
         } else {
           // Dead end used to be terminal with no control; now it alarms
           // and offers a manual Reconnect that restarts the retry budget.
-          this.statusEl.textContent = 'Connection failed after 5 attempts';
+          this.statusEl.textContent = DISPLAY_VIEWER_RETRY_DEAD_END_STATUS;
           this.statusEl.className = 'display-status error';
           this._stopStatsSampler();
-          this._setStageOverlay('error', 'Connection failed after 5 attempts.', {
+          this._setStageOverlay('error', DISPLAY_VIEWER_RETRY_DEAD_END_OVERLAY, {
             retryLabel: 'Reconnect',
             onRetry: () => this.manualReconnect(),
           });
@@ -568,19 +641,16 @@ class DisplaySlot {
 
     // Create offer and send to server.
     //
-    // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
-    // the m=video section before setLocalDescription. `<rids>` is
-    // `DISPLAY_SIMULCAST_RIDS` (default `['f']` — single-RID receive
-    // post-#58; opt-in `['f','h','q']` for the experimental
-    // multi-encoding adaptive-bandwidth path). Munge BEFORE
-    // setLocalDescription so the localDescription matches what's sent
-    // on the wire — server-side SDP-validation tests parse the
+    // Simulcast injection is the LOCAL-ONLY munge policy (#58 single-RID
+    // receive; rationale on DISPLAY_SLOT_POLICY.mungeOfferSdp). Munge
+    // BEFORE setLocalDescription so the localDescription matches what's
+    // sent on the wire — server-side SDP-validation tests parse the
     // received offer/local-description and assume the recv-RID list
     // matches the configured constant.
     this.pc.createOffer().then(offer => {
       const munged = {
         type: offer.type,
-        sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
+        sdp: DISPLAY_SLOT_POLICY.mungeOfferSdp(offer.sdp),
       };
       // Diagnostic: log the first video codec in the emitted offer.
       // Codec order is intentionally left to the browser — WKWebView
