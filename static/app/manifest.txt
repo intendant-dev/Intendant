@@ -76,6 +76,7 @@ ui2-activity.js
 
 50-control-transport.js
 51-peer-approvals.js
+51b-freshness-samplers.js
 52-peer-display.js
 53-stats-settings.js
 ui2-settings.js
