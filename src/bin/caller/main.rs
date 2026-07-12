@@ -47,6 +47,7 @@ mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+mod message_search;
 mod peer;
 mod peer_file_transfer;
 pub(crate) use intendant_platform::platform;
@@ -3458,6 +3459,9 @@ async fn main() -> Result<(), CallerError> {
     // anything can spawn an external agent; the timer keeps expiry
     // deleting materializations even when the lease store sees no calls.
     credential_leases::startup_materialization_sweep();
+    // Message-search retention: expired shards die at boot (plan §6 —
+    // the store must not accumulate while no extractor runs).
+    message_search::startup_gc();
     tokio::spawn(async {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
