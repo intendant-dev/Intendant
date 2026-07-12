@@ -85,6 +85,19 @@ function vaultDaemonStoreUnavailableText() {
   if (reason === 'unsupported') {
     return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect dashboards use the account vault instead.';
   }
+  // 'transport-down': the store rides the secure control channel (a
+  // tunnel-only method). Whether that channel is even coming decides the
+  // honest copy — "retries automatically" was a lie on dashboards that
+  // never open one.
+  if (!dashboardControlTransportEnabled()) {
+    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics, or open this daemon through a hosted Connect dashboard to use the account vault instead.';
+  }
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: true, connected: false };
+  if (dashboardTransportStatusSummary(status).kind === 'err') {
+    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect dashboards use the account vault instead.';
+  }
   return 'No vault store reachable yet: the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
 }
 
@@ -368,13 +381,11 @@ async function vaultServerPublish(blob) {
       throw err;
     }
   }
-  const headers = await accessFleetHostedHeaders();
-  if (!headers) throw new Error('sign in to the hosted account first');
-  const resp = await fetch(accessFleetHostedUrl('/api/vault'), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ revision: blob.revision, vault: blob }),
-  });
+  // Rides the shared hosted-POST helper (42-usage-terminal.js): one
+  // CSRF-expiry retry, so a rotated session token cannot strand publishes.
+  const resp = await accessFleetHostedPost('/api/vault',
+    JSON.stringify({ revision: blob.revision, vault: blob }));
+  if (!resp) throw new Error('sign in to the hosted account first');
   const body = await resp.json().catch(() => ({}));
   if (resp.status === 409) {
     const err = new Error(body.error || 'vault revision conflict');

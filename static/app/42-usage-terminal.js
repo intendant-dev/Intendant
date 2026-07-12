@@ -1,9 +1,10 @@
 // ── Usage Tab Rendering ──
 // ── Token Ticker ──
+// Thin alias over the canonical compact-number formatter (declared in
+// 53-stats-settings.js; function declarations hoist module-wide, so the
+// later fragment is safely callable from these event-time paths).
 function fmtK(n) {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
-  return String(n);
+  return formatCompactNumber(n);
 }
 
 function flashEl(el) {
@@ -341,7 +342,8 @@ function accessFleetHostedUrl(path) {
   return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 }
 
-async function accessFleetHostedHeaders() {
+async function accessFleetHostedHeaders(options = {}) {
+  if (options.refresh) accessFleetHostedCsrfToken = '';
   if (!accessFleetHostedCsrfToken) {
     const resp = await fetch(accessFleetHostedUrl('/api/me'));
     const body = await resp.json().catch(() => ({}));
@@ -351,6 +353,36 @@ async function accessFleetHostedHeaders() {
   const headers = { 'content-type': 'application/json' };
   if (accessFleetHostedCsrfToken) headers['x-intendant-csrf'] = accessFleetHostedCsrfToken;
   return headers;
+}
+
+/* Hosted-sync health, surfaced on the fleet strip: true after a hosted
+   fleet write kept failing even through the CSRF-refresh retry below.
+   Cleared by the next successful write. */
+let accessFleetHostedSyncFailing = false;
+
+function accessFleetHostedSetSyncFailing(failing) {
+  const value = Boolean(failing);
+  if (accessFleetHostedSyncFailing === value) return;
+  accessFleetHostedSyncFailing = value;
+  renderAccessFleetStrip();
+}
+
+/* POST to the hosted fleet store with one CSRF-expiry retry: hosted
+   sessions rotate the CSRF token with the login session, and the old
+   cached-forever copy turned every rotation into permanent silent
+   failure. A 401/403 drops the cached token, re-fetches it once, and
+   replays the call once. Returns the final Response, or null when the
+   hosted session is signed out (not a sync failure). */
+async function accessFleetHostedPost(path, body) {
+  let headers = await accessFleetHostedHeaders();
+  if (!headers) return null;
+  let resp = await fetch(accessFleetHostedUrl(path), { method: 'POST', headers, body });
+  if (resp.status === 401 || resp.status === 403) {
+    headers = await accessFleetHostedHeaders({ refresh: true });
+    if (!headers) return null;
+    resp = await fetch(accessFleetHostedUrl(path), { method: 'POST', headers, body });
+  }
+  return resp;
 }
 
 function accessFleetMergeHostedTargets(targets) {
@@ -418,6 +450,7 @@ function accessFleetScheduleHostedSync() {
   accessFleetHostedSyncTimer = window.setTimeout(() => {
     accessFleetHostedSyncTimer = null;
     accessFleetPushToHosted().catch(err => {
+      accessFleetHostedSetSyncFailing(true);
       console.warn('[access] hosted fleet sync failed', err);
     });
   }, 400);
@@ -432,21 +465,17 @@ async function accessFleetPushToHosted() {
   accessFleetHostedSyncInFlight = true;
   accessFleetHostedSyncDirty = false;
   try {
-    const headers = await accessFleetHostedHeaders();
-    if (!headers) return;
     // Sign just-in-time so the pushed record always covers its current
     // content; browsers without WebCrypto push unsigned (shown as such).
     const targets = await Promise.all(
       (accessFleetRead().targets || []).map(async target =>
         accessFleetSignRecord(await accessFleetEncryptRecord(target)))
     );
-    const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ targets }),
-    });
+    const resp = await accessFleetHostedPost('/api/fleet/targets/sync', JSON.stringify({ targets }));
+    if (!resp) return; // signed out — nothing to sync, not a failure
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
+    accessFleetHostedSetSyncFailing(false);
     const merged = await Promise.all(
       (body.targets || []).map(target => accessFleetDecryptRecord(target))
     );
@@ -462,16 +491,16 @@ function accessFleetForgetHostedTarget(hostId) {
   if (!accessFleetHostedSyncEnabled()) return;
   const id = String(hostId || '').trim();
   if (!id) return;
-  accessFleetHostedHeaders()
-    .then(headers => {
-      if (!headers) return null;
-      return fetch(accessFleetHostedUrl(`/api/fleet/targets/${encodeURIComponent(id)}/forget`), {
-        method: 'POST',
-        headers,
-        body: '{}',
-      });
+  accessFleetHostedPost(`/api/fleet/targets/${encodeURIComponent(id)}/forget`, '{}')
+    .then(resp => {
+      if (!resp) return;
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      accessFleetHostedSetSyncFailing(false);
     })
-    .catch(err => console.warn('[access] hosted fleet forget failed', err));
+    .catch(err => {
+      accessFleetHostedSetSyncFailing(true);
+      console.warn('[access] hosted fleet forget failed', err);
+    });
 }
 
 function accessFleetTargetUrl(target) {
@@ -713,6 +742,9 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
   } catch (err) {
     showControlToast?.('error', err?.message || 'Enrollment decision failed');
   }
+  // The role select's value was consumed by the decision — re-baseline it
+  // so the shared render guard lets the pending-devices list rebuild.
+  accessGuardStamp(document.getElementById('access-enrollment-requests'));
   await refreshAccessEnrollments({ silent: true }).catch(() => null);
   await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
   renderAccessAdminSummaries();
@@ -2607,22 +2639,107 @@ async function accessApplyGrantToTarget(target, payload) {
   return resp.body;
 }
 
+/* ── Shared render guard for the Access surface ──
+   Background refreshes (transport ticks, peer events) re-run the whole
+   17-renderer Access fanout, and each renderer rebuilds its mount with
+   innerHTML — destroying whatever the user was mid-interaction with:
+   the fleet strip's petname rename input, org trust/issue/renew fields,
+   output textareas holding freshly signed documents, open selects.
+   Generalized from this grant form's proven bespoke guard:
+
+   - accessGuardStamp(mount) records, after a rebuild, the value every
+     field was rendered with (dataset.accessGuardBase).
+   - accessMountHoldsUserWork(mount) answers "would a rebuild destroy
+     the user's work?": the focused element lives inside the mount, or
+     any stamped field's value differs from its rendered baseline
+     (inputs, selects, radios/checkboxes, textareas — including the
+     readOnly outputs a signed document lands in). Fields created after
+     the stamp (e.g. the inline rename input) are guarded by focus.
+   - accessGuardedRender(mountId, fp, renderFn) applies both around one
+     section's rebuild, plus a cheap state-fingerprint short-circuit
+     (the enrollments refresher's pattern): when `fp` matches the last
+     rendered fingerprint the section is provably unchanged and the
+     rebuild is skipped outright. Pass null for time-driven sections
+     that must repaint every tick. */
+function accessGuardStamp(mount) {
+  if (!mount) return;
+  for (const el of mount.querySelectorAll('input, textarea, select')) {
+    el.dataset.accessGuardBase = (el.type === 'checkbox' || el.type === 'radio')
+      ? (el.checked ? '1' : '0')
+      : el.value;
+  }
+}
+
+function accessMountHoldsUserWork(mount) {
+  if (!mount) return false;
+  // Focus counts for FIELDS only (the vault section's own guard set the
+  // precedent): a focused button must not block the rebuild its own click
+  // handler asks for (e.g. Reveal claim phrase re-rendering to show it).
+  const active = document.activeElement;
+  if (active && mount.contains(active)
+    && active.matches('input, textarea, select, [contenteditable]')) return true;
+  for (const el of mount.querySelectorAll('input, textarea, select')) {
+    const base = el.dataset.accessGuardBase;
+    if (base === undefined) continue;
+    const now = (el.type === 'checkbox' || el.type === 'radio')
+      ? (el.checked ? '1' : '0')
+      : el.value;
+    if (now !== base) return true;
+  }
+  return false;
+}
+
+function accessGuardedRender(mountId, fp, renderFn) {
+  const mount = document.getElementById(mountId);
+  if (!mount) return;
+  // Store a short digest, never the fingerprint itself: fp strings are
+  // whole model slices (large, and some carry secrets like the claim
+  // phrase) and must not land in a DOM attribute.
+  const fpKey = fp === null ? null : accessFpHash(fp);
+  if (fpKey !== null && mount.dataset.accessGuardFp === fpKey) return;
+  if (accessMountHoldsUserWork(mount)) return;
+  renderFn();
+  accessGuardStamp(mount);
+  if (fpKey !== null) mount.dataset.accessGuardFp = fpKey;
+  else delete mount.dataset.accessGuardFp;
+}
+
+/* Fingerprint helper: JSON over the model slices a section reads. A
+   stringify failure returns a unique value so the section still renders. */
+function accessSectionFp(value) {
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch (_) {
+    return `fp-err-${Date.now()}-${Math.random()}`;
+  }
+}
+
+/* Two independent FNV-1a-style streams + length — cheap, and a collision
+   only costs one deferred repaint (the next real state change renders). */
+function accessFpHash(text) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01234567;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x0100012d) >>> 0;
+  }
+  return `${text.length.toString(36)}.${h1.toString(36)}.${h2.toString(36)}`;
+}
+
 function renderAccessUserClientGrantForm() {
   const mount = document.getElementById('access-user-client-grant-form');
   if (!mount) return;
   // Background refreshes (peer events, transport status) re-render the whole
   // Access surface. Never clobber a grant the user is in the middle of
-  // typing: skip the rebuild while the form is focused or holds edits. A
-  // submit cycle bypasses this via the submitting flag so button state and
-  // the post-save reset still render.
+  // typing: skip the rebuild while the form is focused or holds edits (the
+  // shared guard above — this form's old bespoke check is where it came
+  // from). A submit cycle bypasses this via the submitting flag so button
+  // state and the post-save reset still render.
   const existing = mount.querySelector('form');
-  if (existing && !accessUserClientGrantSubmitting && existing.dataset.submitting !== 'true') {
-    if (existing.contains(document.activeElement)) return;
-    const dirty = Array.from(existing.querySelectorAll('input[type="text"]'))
-      .some(input => (input.dataset.autofill || '') !== input.value)
-      || Array.from(existing.querySelectorAll('input[name="access-grant-fanout"]'))
-        .some(input => input.checked !== input.defaultChecked);
-    if (dirty) return;
+  if (existing && !accessUserClientGrantSubmitting && existing.dataset.submitting !== 'true'
+    && accessMountHoldsUserWork(mount)) {
+    return;
   }
   const overview = accessOverviewModel();
   const iam = accessIamModel(overview);
@@ -2982,6 +3099,9 @@ function renderAccessUserClientGrantForm() {
   }
   setRadio('access-user-client-role', 'role:scoped-human');
   accessSyncUserClientGrantFields(form);
+  // Baseline for the shared guard: everything above (autofill included)
+  // is the rendered state; anything differing from it is the user's.
+  accessGuardStamp(mount);
 }
 
 async function accessSubmitUserClientGrant(event) {
@@ -3282,4 +3402,73 @@ function accessDiagnosticsCards() {
         : 'No peer targets configured.',
     },
   ];
+}
+
+// ── Coordinator route preview ──
+// The Route form dispatches blind to "the lexicographically-first peer
+// that satisfies all required capabilities"; the eligibility probe
+// (api_peer_eligible — the Find panel above the form uses it) can answer
+// the same question before the user commits. On capability input,
+// debounced, resolve eligibility and show which peer the coordinator
+// would pick. Wired here (the dialog markup is 21-access-dialogs.html;
+// the Route button's own handlers live in 52-peer-display.js — this
+// listener is additive and touches only the preview line).
+{
+  const capsInput = document.getElementById('coord-route-caps');
+  const preview = document.getElementById('coord-route-preview');
+  if (capsInput && preview) {
+    let previewTimer = 0;
+    let previewSeq = 0;
+    const setPreview = (text, kind) => {
+      preview.textContent = text || '';
+      preview.className = 'coord-result coord-route-preview' + (kind ? ` ${kind}` : '');
+    };
+    const resolveRoutePreview = async () => {
+      const caps = String(capsInput.value || '')
+        .split(/[\s,]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
+      const seq = ++previewSeq;
+      if (!caps.length) {
+        setPreview('');
+        return;
+      }
+      if (!daemonApi.availability('api_peer_eligible').ok) {
+        setPreview('');
+        return;
+      }
+      try {
+        const resp = await daemonApi.request('api_peer_eligible', { capabilities: caps });
+        if (seq !== previewSeq) return; // a newer keystroke superseded this probe
+        const result = resp.body || {};
+        if (!resp.ok) {
+          const hint = result.hint ? ` (${result.hint})` : '';
+          setPreview(result.error ? `Eligibility: ${result.error}${hint}` : '', 'error');
+          return;
+        }
+        const peers = Array.isArray(result.peers) ? result.peers : [];
+        if (!peers.length) {
+          setPreview('No eligible peer — no connected peer satisfies these capabilities.', 'error');
+          return;
+        }
+        // Mirror the coordinator's deterministic choice: lexicographically
+        // first peer id (plain code-unit order, not locale order).
+        const chosen = peers.slice().sort((a, b) => {
+          const idA = String(a.host_id || a.id || '');
+          const idB = String(b.host_id || b.id || '');
+          return idA < idB ? -1 : idA > idB ? 1 : 0;
+        })[0];
+        const id = String(chosen.host_id || chosen.id || '');
+        const label = String(chosen.label || id);
+        setPreview(`Will route to: ${label}${label !== id && id ? ` (${id})` : ''}`, 'ok');
+      } catch (err) {
+        if (seq !== previewSeq) return;
+        setPreview('');
+      }
+    };
+    capsInput.addEventListener('input', () => {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(resolveRoutePreview, 350);
+    });
+  }
 }

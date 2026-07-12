@@ -205,7 +205,7 @@ async function loadSettings() {
     const debugEmpty = document.getElementById('debug-empty');
     if (d.env_overrides && Object.keys(d.env_overrides).length > 0) {
       envDiv.innerHTML = Object.entries(d.env_overrides)
-        .map(([k, v]) => '<div><code style="color:var(--peach)">' + k + '</code> = <code>' + v + '</code></div>')
+        .map(([k, v]) => '<div><code style="color:var(--peach)">' + escapeHtml(k) + '</code> = <code>' + escapeHtml(v) + '</code></div>')
         .join('');
       envWrap.classList.remove('hidden');
       if (debugEmpty) debugEmpty.classList.add('hidden');
@@ -288,7 +288,16 @@ async function saveSettings() {
     }
     setTimeout(() => { status.textContent = ''; }, 3000);
   } catch (e) {
+    // Mirror saveApiKeys: a network/transport failure must not be
+    // console-only — the user just clicked Save and needs the verdict.
     console.error('Failed to save settings:', e);
+    const status = g('settings-status');
+    if (status) {
+      status.textContent = 'Save failed: ' + (e?.message || 'network error');
+      status.style.color = 'var(--red)';
+      setTimeout(() => { status.textContent = ''; }, 5000);
+    }
+    showControlToast?.('error', 'Settings save failed: ' + (e?.message || 'network error'));
   }
   // Also emit the control messages so the in-memory shared state
   // updates immediately (without waiting for the next daemon restart
@@ -447,6 +456,14 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 
 // ── All Sessions Usage (in Stats tab) ──
 
+// Every Stats tab entry used to force a whole-corpus refetch
+// (renderStatsForActiveHost({forceSessions:true}) → loadAllSessionsUsage
+// force). The corpus is a couple of MB and changes slowly; a short TTL
+// makes tab flips free while keeping the data fresh. An explicit
+// {ignoreTtl:true} (a manual Refresh affordance) still forces through.
+const STATS_USAGE_FORCE_TTL_MS = 45_000;
+const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
+
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
   const cacheSessionMetadata = options.cacheSessionMetadata !== false;
@@ -525,6 +542,9 @@ function fetchSessionsForHost(hostId, options = {}) {
         throw new Error('/api/sessions returned a non-array payload');
       }
       sessionsListCache.set(cacheKey, sessions);
+      // Only real network loads land here (cache hits returned above) —
+      // record usage-corpus freshness for the force-TTL gate.
+      if (view === 'usage') statsUsageCorpusFetchedAt.set(hostId, Date.now());
       if (hostId === selfPeerId && cacheSessionMetadata) cacheSessionWindowMetadata(sessions);
       return sessions;
     })
@@ -1497,10 +1517,16 @@ function loadAllSessionsUsage(hostId, options = {}) {
     clearStatsSessionSections();
     setStatsSessionLoading(hostId, true);
   }
+  // Tab-entry forces respect the freshness TTL: a corpus fetched within
+  // the last 45s is served from cache instead of re-downloaded. A manual
+  // refresh passes {ignoreTtl:true} to force regardless.
+  const fetchedAt = statsUsageCorpusFetchedAt.get(hostId) || 0;
+  const fresh = Date.now() - fetchedAt < STATS_USAGE_FORCE_TTL_MS;
+  const force = !!options.force && (options.ignoreTtl === true || !fresh);
   // The usage view fetches the same corpus at ~a tenth of the payload
   // (usage/cost/day-bucket/disk fields only) — the stats fold reads
   // nothing else. Older peer daemons ignore the param and send full rows.
-  fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all', view: 'usage', cacheSessionMetadata: false })
+  fetchSessionsForHost(hostId, { force, limit: 'all', view: 'usage', cacheSessionMetadata: false })
     .then(sessions => {
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
