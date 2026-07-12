@@ -1599,6 +1599,56 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Message-search hit row (flagged quick-search message lane). */
+.session-card .sc-msg-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--green);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.session-card .sc-msg-hit-count,
+.session-card .sc-msg-hit-role {
+  flex: 0 0 auto;
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-card .sc-msg-hit-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--overlay1);
+}
+.session-card .sc-msg-hit .ui-chip { flex: 0 0 auto; }
+.session-card .sc-msg-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Highlights are server-anchored byte ranges rendered as <mark>. */
+.session-card .sc-msg-hit-text mark {
+  background: color-mix(in srgb, var(--yellow) 32%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+/* Stub card for message hits outside the loaded metadata corpus. */
+.session-card.sc-msg-stub { opacity: 0.92; }
+/* Message-lane status line under the hydration status (flag-gated). */
+.sessions-msg-search-status {
+  font-size: 12px;
+  color: var(--subtext0);
+  margin: 2px 0 6px;
+}
+.sessions-msg-search-status.error { color: var(--red); }
 .session-card .sc-meta {
   display: flex;
   gap: 11px;
