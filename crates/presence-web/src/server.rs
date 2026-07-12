@@ -283,28 +283,6 @@ impl ServerConnection {
         }
     }
 
-    /// Send a keyboard event.
-    pub fn send_key(&self, key: &str, ctrl: bool, alt: bool, shift: bool) {
-        let msg = serde_json::json!({
-            "t": "key",
-            "key": key,
-            "ctrl": ctrl,
-            "alt": alt,
-            "shift": shift,
-        });
-        self.send_json(&msg);
-    }
-
-    /// Send a resize event.
-    pub fn send_resize(&self, cols: u16, rows: u16) {
-        let msg = serde_json::json!({
-            "t": "resize",
-            "cols": cols,
-            "rows": rows,
-        });
-        self.send_json(&msg);
-    }
-
     /// Send presence_connect notification (replaces live_connected).
     /// Includes the active voice provider/model so the server can display the correct name.
     pub fn send_presence_connect(&self) {
