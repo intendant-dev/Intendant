@@ -295,10 +295,21 @@ html.ui-v2 .ui2-palette-row {
   text-align: left; font-family: inherit; font-size: 13.5px; font-weight: 600;
 }
 html.ui-v2 .ui2-palette-row .ui2-nav-icon { color: inherit; }
-html.ui-v2 .ui2-palette-row-label { flex: 1; min-width: 0; }
+html.ui-v2 .ui2-palette-row-label {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 html.ui-v2 .ui2-palette-row-hint {
   font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
 }
+/* Message hits: session name + highlighted snippet on one ellipsized line */
+html.ui-v2 .ui2-palette-msg-session { color: var(--text); }
+html.ui-v2 .ui2-palette-msg-snippet { color: var(--text-3); margin-left: 8px; }
+html.ui-v2 .ui2-palette-msg-snippet mark {
+  background: color-mix(in srgb, var(--iris) 28%, transparent);
+  color: var(--text); border-radius: 3px; padding: 0 1px;
+}
+html.ui-v2 .ui2-palette-row.inert { cursor: default; color: var(--text-3); }
 html.ui-v2 .ui2-palette-row.selected,
 html.ui-v2 .ui2-palette-row:hover { background: var(--surface-2); color: var(--text); }
 html.ui-v2 .ui2-palette-row.selected { color: var(--iris-2); }

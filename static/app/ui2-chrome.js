@@ -404,6 +404,183 @@ function ui2PaletteSessionEntries(q) {
   return scored.slice(0, 6).map(x => x.entry);
 }
 
+// ── Messages section: full-text hits from the rolling message index ──
+// Async side-lane of the synchronous palette: renders re-entrantly when
+// results land. Same flag, debounce, and request vocabulary as the
+// Sessions-tab quick-search lane (57-sessions-message-search.js); scoped
+// to this daemon (no host fanout) and capped to a palette-sized page.
+const ui2PaletteMsg = {
+  sig: '',        // query the current entries/answer belong to
+  scheduled: '',  // query the armed debounce timer will run
+  entries: [],
+  loading: false,
+  unavailable: false,
+  timer: null,
+  abort: null,
+  token: 0,
+};
+
+function ui2PaletteMsgReset() {
+  if (ui2PaletteMsg.timer) { clearTimeout(ui2PaletteMsg.timer); ui2PaletteMsg.timer = null; }
+  if (ui2PaletteMsg.abort) { try { ui2PaletteMsg.abort.abort(); } catch {} ui2PaletteMsg.abort = null; }
+  ui2PaletteMsg.sig = '';
+  ui2PaletteMsg.scheduled = '';
+  ui2PaletteMsg.entries = [];
+  ui2PaletteMsg.loading = false;
+  ui2PaletteMsg.token += 1;
+}
+
+function ui2PaletteMsgEnabled() {
+  return typeof messageSearchFlagEnabled === 'function' && messageSearchFlagEnabled()
+    && typeof daemonApi !== 'undefined';
+}
+
+function ui2PaletteMsgSchedule(query) {
+  if (!ui2PaletteMsgEnabled() || ui2PaletteMsg.unavailable) return;
+  if (!query || query.length < 2) { if (ui2PaletteMsg.sig || ui2PaletteMsg.loading) ui2PaletteMsgReset(); return; }
+  if (query === ui2PaletteMsg.sig || query === ui2PaletteMsg.scheduled) return; // answered or already armed
+  if (ui2PaletteMsg.timer) clearTimeout(ui2PaletteMsg.timer);
+  ui2PaletteMsg.scheduled = query;
+  ui2PaletteMsg.loading = true;
+  ui2PaletteMsg.timer = setTimeout(() => { ui2PaletteMsg.timer = null; ui2PaletteMsgRun(query); }, 225);
+}
+
+function ui2PaletteMsgRun(query, attempt = 0) {
+  if (!ui2Palette.open) { ui2PaletteMsgReset(); return; }
+  const availability = daemonApi.availability('api_sessions_message_search', null);
+  if (!availability.ok && availability.reason === 'unsupported') {
+    // Daemon predates the index: hide the section for this page load.
+    ui2PaletteMsg.unavailable = true;
+    ui2PaletteMsgReset();
+    return;
+  }
+  if (ui2PaletteMsg.abort) { try { ui2PaletteMsg.abort.abort(); } catch {} }
+  const controller = new AbortController();
+  ui2PaletteMsg.abort = controller;
+  const token = ++ui2PaletteMsg.token;
+  daemonApi.request('api_sessions_message_search', {
+    q: query,
+    source: 'all',
+    include_superseded: false,
+    subagents: true,
+    limit: 5,
+  }, { signal: controller.signal, timeoutMs: 15000 })
+    .then(resp => {
+      if (token !== ui2PaletteMsg.token || !ui2Palette.open) return;
+      if (resp.status === 429 && attempt < 1) {
+        setTimeout(() => { if (token === ui2PaletteMsg.token) ui2PaletteMsgRun(query, attempt + 1); }, 300);
+        return;
+      }
+      const body = resp.body && typeof resp.body === 'object' ? resp.body : {};
+      if (!resp.ok || body.ok === false) {
+        // Quiet failure: the palette must never nag; the Sessions tab
+        // carries the detailed error surface.
+        ui2PaletteMsg.loading = false;
+        ui2PaletteMsg.sig = query;
+        ui2PaletteMsg.entries = [];
+        ui2PaletteRerenderIfCurrent(query);
+        return;
+      }
+      ui2PaletteMsg.entries = ui2PaletteMsgShape(query, Array.isArray(body.sessions) ? body.sessions : []);
+      ui2PaletteMsg.sig = query;
+      ui2PaletteMsg.loading = false;
+      ui2PaletteMsg.abort = null;
+      ui2PaletteRerenderIfCurrent(query);
+    })
+    .catch(err => {
+      if (token !== ui2PaletteMsg.token) return;
+      if (err?.kind === 'abort' || err?.name === 'AbortError') return;
+      ui2PaletteMsg.loading = false;
+      ui2PaletteMsg.sig = query;
+      ui2PaletteMsg.entries = [];
+      ui2PaletteRerenderIfCurrent(query);
+    });
+}
+
+function ui2PaletteRerenderIfCurrent(query) {
+  const input = ui2PaletteInput();
+  if (ui2Palette.open && input && input.value.trim().toLowerCase() === query) {
+    ui2PaletteRender(input.value);
+  }
+}
+
+function ui2PaletteMsgShape(query, sessions) {
+  const cached = (typeof _cachedSessions !== 'undefined' && Array.isArray(_cachedSessions)) ? _cachedSessions : [];
+  const entries = [];
+  for (const entry of sessions.slice(0, 5)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const sessionId = String(entry.session_id || '').trim();
+    if (!sessionId) continue;
+    const source = String(entry.source || 'intendant');
+    const hits = Array.isArray(entry.hits) ? entry.hits : [];
+    const best = hits[0] && typeof hits[0] === 'object' ? hits[0] : null;
+    const row = cached.find(s => s && s.session_id === sessionId) || null;
+    const sessionLabel = (row && (String(row.name || '').trim() || String(row.task || '').trim().slice(0, 40)))
+      || `Session ${sessionId.slice(0, 8)}`;
+    const total = Number(entry.total_hits) || hits.length;
+    entries.push({
+      section: 'Messages',
+      icon: 'search',
+      label: sessionLabel,
+      labelNode: best ? ui2PaletteMsgLabelNode(sessionLabel, best) : null,
+      hint: `${total} ${total === 1 ? 'match' : 'matches'}`,
+      matchless: true,
+      run: () => {
+        const sid = sessionId;
+        if (typeof sessionWindows !== 'undefined' && sessionWindows.has(sid)
+            && typeof focusSessionWindow === 'function') {
+          routeTo('activity');
+          focusSessionWindow(sid);
+          return;
+        }
+        routeTo('sessions');
+        if (typeof openSessionDetail === 'function') {
+          openSessionDetail(row || { session_id: sid, source });
+        }
+      },
+    });
+  }
+  return entries;
+}
+
+function ui2PaletteMsgLabelNode(sessionLabel, best) {
+  const frag = document.createDocumentFragment();
+  const name = document.createElement('span');
+  name.className = 'ui2-palette-msg-session';
+  name.textContent = sessionLabel;
+  frag.appendChild(name);
+  const snippet = document.createElement('span');
+  snippet.className = 'ui2-palette-msg-snippet';
+  if (typeof messageSnippetSegments === 'function') {
+    for (const segment of messageSnippetSegments(best.snippet, best.ranges, best.snippet_offset_bytes)) {
+      if (!segment.text) continue;
+      if (segment.hit) {
+        const mark = document.createElement('mark');
+        mark.textContent = segment.text;
+        snippet.appendChild(mark);
+      } else {
+        snippet.appendChild(document.createTextNode(segment.text));
+      }
+    }
+  } else {
+    snippet.textContent = String(best.snippet || '');
+  }
+  snippet.title = String(best.snippet || '');
+  frag.appendChild(snippet);
+  return frag;
+}
+
+function ui2PaletteMessageEntries(query) {
+  if (!ui2PaletteMsgEnabled() || ui2PaletteMsg.unavailable) return [];
+  ui2PaletteMsgSchedule(query);
+  if (!query || query.length < 2) return [];
+  if (ui2PaletteMsg.sig === query) return ui2PaletteMsg.entries;
+  if (ui2PaletteMsg.loading) {
+    return [{ section: 'Messages', icon: 'search', label: 'Searching messages…', hint: '', matchless: true, inert: true }];
+  }
+  return [];
+}
+
 function ui2PaletteActionEntries(q) {
   const entries = [];
   // Pending approval verbs — only while one is actually on screen.
@@ -499,7 +676,7 @@ function ui2PaletteEntries(q) {
   const filtered = entries.filter((item) => !query || item.label.toLowerCase().includes(query));
   const actions = ui2PaletteActionEntries(q)
     .filter((item) => item.matchless || !query || item.label.toLowerCase().includes(query));
-  return [...filtered, ...ui2PaletteSessionEntries(query), ...actions];
+  return [...filtered, ...ui2PaletteSessionEntries(query), ...ui2PaletteMessageEntries(query), ...actions];
 }
 
 const ui2Palette = { open: false, selected: 0, entries: [] };
@@ -541,14 +718,18 @@ function ui2PaletteRender(filter) {
     icon.innerHTML = ui2Icon(item.icon, 17);
     const label = document.createElement('span');
     label.className = 'ui2-palette-row-label';
-    label.textContent = item.label;
+    // Message hits carry a prebuilt node (session name + highlighted
+    // snippet); every other entry stays plain text.
+    if (item.labelNode) label.appendChild(item.labelNode.cloneNode(true));
+    else label.textContent = item.label;
     const hint = document.createElement('span');
     hint.className = 'ui2-palette-row-hint';
     hint.textContent = item.run
       ? (item.hint || 'run')
       : (isCurrent ? 'current' : 'go');
     row.append(icon, label, hint);
-    row.addEventListener('click', () => ui2PaletteGo(item));
+    if (item.inert) { row.disabled = true; row.classList.add('inert'); }
+    else row.addEventListener('click', () => ui2PaletteGo(item));
     row.addEventListener('mousemove', () => {
       if (ui2Palette.selected !== i) { ui2Palette.selected = i; ui2PaletteRender(ui2PaletteInput().value); }
     });
@@ -591,6 +772,7 @@ function ui2PaletteClose() {
   if (!backdrop || !ui2Palette.open) return;
   ui2Palette.open = false;
   backdrop.hidden = true;
+  ui2PaletteMsgReset();
 }
 
 function ui2WirePalette() {
@@ -631,7 +813,7 @@ function ui2WirePalette() {
     } else if (e.key === 'Enter') {
       e.preventDefault(); e.stopPropagation();
       const item = ui2Palette.entries[ui2Palette.selected];
-      if (item) ui2PaletteGo(item);
+      if (item && !item.inert) ui2PaletteGo(item);
     }
   }, true);
 }

@@ -18,15 +18,12 @@
 // status boolean (derived from the tunnel method table) is what the
 // availability precheck below consults — no hand-mirrored capability flag.
 //
-// Transport note (deliberate seam): this lane calls
-// `daemonApi.request('api_sessions_message_search', …)` WITHOUT a
-// DAEMON_API_HTTP_MAP descriptor row, so it is tunnel-only for now. The
+// Transport: `daemonApi.request('api_sessions_message_search', …)` rides
+// tunnel-first with the direct-HTTP GET fallback — the descriptor row
+// (32-daemon-api.js) and the C1 route row are both landed, and the
 // daemon-side parity test (`daemon_api_http_map_mirrors_gateway_routes`,
-// dashboard_control/mod.rs) pins the descriptor's coverage set against
-// `gateway_routes::ROUTES`, and the C1 route row lands from a concurrent
-// lane — the descriptor row + coverage-pin entry must ride together with
-// (or after) C1. Until then non-tunnel dashboards get the honest
-// "unavailable" note below.
+// dashboard_control/mod.rs) pins them together. The ⌘K palette's Messages
+// section (ui2-chrome.js) shares this method and the flag below.
 //
 // State lives in 31-init-identity-fleet.js's early client-state block
 // (`_sessionMsgSearch*` — deep-link TDZ rule); render-side touchpoints live
