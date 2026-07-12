@@ -253,14 +253,8 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 match event {
                     Ok(line) => {
                         runtime.events_sent = runtime.events_sent.saturating_add(1);
-                        let payload = serde_json::from_str::<serde_json::Value>(&line)
-                            .unwrap_or_else(|_| serde_json::json!({"raw": line}));
-                        let frame = serde_json::json!({
-                            "t": "event",
-                            "seq": runtime.events_sent,
-                            "payload": payload,
-                        });
-                        send_control_text(&mut rtc, &channels, frame.to_string());
+                        let frame = event_lane_frame(runtime.events_sent, &line);
+                        send_control_text(&mut rtc, &channels, frame);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         let frame = serde_json::json!({
@@ -330,6 +324,33 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     for handle in forwarder_handles {
         let _ = handle.await;
     }
+}
+
+/// Build one event-lane frame `{"t":"event","seq":N,"payload":<line>}` by
+/// splicing the already-serialized outbound line into the envelope instead
+/// of parse→wrap→re-serialize per event per tunnel: every producer into the
+/// outbound broadcast serializes JSON objects, so the line embeds verbatim.
+/// Lines that don't look like a JSON object/array (never produced today)
+/// take the legacy parse path and wrap as `{"raw": <line>}`.
+pub(crate) fn event_lane_frame(seq: u64, line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let mut frame = String::with_capacity(line.len() + 40);
+        frame.push_str("{\"t\":\"event\",\"seq\":");
+        frame.push_str(&seq.to_string());
+        frame.push_str(",\"payload\":");
+        frame.push_str(line);
+        frame.push('}');
+        return frame;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(line)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": line }));
+    serde_json::json!({
+        "t": "event",
+        "seq": seq,
+        "payload": payload,
+    })
+    .to_string()
 }
 
 pub(crate) fn send_event_payload<I: rtc::interceptor::Interceptor>(
@@ -873,6 +894,33 @@ pub(crate) fn dashboard_control_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spliced fast path must be byte-equivalent (as JSON) to the old
+    /// parse→wrap→serialize path: same `t`/`seq`, payload embedded as the
+    /// parsed object, no double-encoding.
+    #[test]
+    fn event_lane_frame_splices_serialized_lines_without_reparsing() {
+        let line = r#"{"event":"status","session_id":"s-1","turn":3}"#;
+        let frame = event_lane_frame(42, line);
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(parsed["t"], "event");
+        assert_eq!(parsed["seq"], 42);
+        assert_eq!(parsed["payload"]["event"], "status");
+        assert_eq!(parsed["payload"]["session_id"], "s-1");
+        assert_eq!(parsed["payload"]["turn"], 3);
+        // The payload text is embedded verbatim — proof no reserialization
+        // (which would reorder keys) happened on the fast path.
+        assert!(frame.contains(line));
+    }
+
+    #[test]
+    fn event_lane_frame_wraps_non_json_lines_as_raw() {
+        let frame = event_lane_frame(7, "not json at all");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(parsed["t"], "event");
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["payload"]["raw"], "not json at all");
+    }
 
     #[test]
     fn oversized_response_frames_are_chunked_and_reassemble() {
