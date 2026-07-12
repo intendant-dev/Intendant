@@ -1147,7 +1147,11 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
       // Non-Connect postures resolve false instead of throwing (see
       // DashboardTransport.startControl) — fail the cycle now rather
       // than waiting out the 30 s readiness poll on a transport that
-      // never began connecting.
+      // never began connecting. This also covers a send-refused offer:
+      // sendWsSignal reports send_server_action's verdict, so an offer
+      // with no open signaling lane (daemon down in the macOS-app
+      // posture) rejects connect() and lands here in well under a
+      // second instead of burning the full poll each cycle.
       const err = new Error(dashboardControlLastError || 'dashboard control transport failed to start');
       err.controlErrorKind = dashboardControlLastErrorKind || 'transport';
       throw err;

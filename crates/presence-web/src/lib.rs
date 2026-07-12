@@ -882,13 +882,25 @@ mod wasm_impl {
             self.server.borrow().send_raw(json_str)
         }
 
+        /// Send a ControlMsg action (or transport frame) to the server.
+        /// Returns true when the message was handed to an OPEN server
+        /// WebSocket (or accepted by the installed custom sender); false
+        /// when the socket is missing/not-open, the send threw, or the
+        /// value failed to deserialize. Callers use false to fail fast
+        /// (e.g. the dashboard's control-tunnel signaling) instead of
+        /// waiting on a reply that can never arrive; callers that ignore
+        /// the return keep working.
         #[wasm_bindgen]
-        pub fn send_server_action(&self, action: JsValue) {
+        pub fn send_server_action(&self, action: JsValue) -> bool {
             match serde_wasm_bindgen::from_value::<serde_json::Value>(action) {
                 Ok(val) => {
                     let sent = self.server.borrow().send_action(&val);
                     if !sent {
-                        let action_type = val.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                        let action_type = val
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| val.get("t").and_then(|v| v.as_str()))
+                            .unwrap_or("?");
                         self.callbacks.invoke_diagnostic(
                             "action_drop",
                             &format!(
@@ -897,6 +909,7 @@ mod wasm_impl {
                             ),
                         );
                     }
+                    sent
                 }
                 Err(e) => {
                     self.callbacks.invoke_diagnostic(
@@ -906,6 +919,7 @@ mod wasm_impl {
                             e
                         ),
                     );
+                    false
                 }
             }
         }
