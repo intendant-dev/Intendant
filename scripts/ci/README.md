@@ -116,26 +116,28 @@ cargo ──[build] rustc-wrapper=governor──▶ rustc-governor <real rustc> 
                     │  probe (-vV / pure --print):
                     │    exec(2) real rustc directly — no permit, no sccache
                     ▼  compile: acquire flock(2) permit
-              exec(2) sccache <real rustc> <args…>
-                    │    the blocking sccache CLIENT; the permit's flock
-                    │    rides the FD_CLOEXEC-cleared fd until it exits
+              governor (HOLDS the permit, waits)
+                    │  spawns; the permit fd keeps FD_CLOEXEC —
+                    ▼  no child ever sees it
+              sccache <real rustc> <args…>   (the blocking sccache CLIENT)
                     ▼
               sccache server ── hit: answer from cache (client exits in
                     │                ~tens of ms, permit released)
                     ▼  miss / non-cacheable
-              real rustc runs; the client — and so the permit — blocks
-              until it finishes
+              real rustc runs; the client — and so the waiting governor,
+              and so the permit — blocks until it finishes
 ```
 
 The governor is cargo's `rustc-wrapper`; sccache is no longer the
-wrapper — the governor execs it, prepending the real compiler path cargo
-handed it as argv[1] (the `wrap_with` config key names the sccache
-binary; unset it and the compiler runs directly, governed but uncached):
+wrapper — the governor runs it as its child, prepending the real
+compiler path cargo handed it as argv[1] (the `wrap_with` config key
+names the sccache binary; unset it and the compiler runs directly,
+governed but uncached):
 
-- **The ceiling holds transitively.** The permit is held by the exec'd
-  sccache *client*, which blocks until the server answers: at most N
-  outstanding clients ⇒ at most N server-side compiles, no matter which
-  rustc binary the server resolves and runs.
+- **The ceiling holds transitively.** The permit is held by the
+  governor, whose spawned sccache *client* blocks until the server
+  answers: at most N outstanding clients ⇒ at most N server-side
+  compiles, no matter which rustc binary the server resolves and runs.
 - **Probes never wait and never touch sccache** — `-vV` / `--version` /
   pure `--print` queries (cargo fires them at every startup) exec the
   real compiler directly: snappy under a full pool, and cargo startup no
@@ -146,10 +148,23 @@ binary; unset it and the compiler runs directly, governed but uncached):
   the client round-trip (~tens of ms); under a miss-saturated pool, hits
   queue head-of-line behind running compiles. Accepted trade, decided
   with the operator: ceiling correctness over warm-path latency.
-- Exit status and signal disposition are inherited through the exec
-  chain, and the permit's flock rides the FD_CLOEXEC-cleared fd until
-  the chain exits — any exit, including SIGKILL, releases it in the
-  kernel (crash release is structural, nothing to clean up).
+- **Parent-held permits (the 2026-07-12 leak post-mortem).** The
+  governor originally exec(2)'d the chain over a FD_CLOEXEC-cleared
+  permit fd so the flock rode into the sccache client — but when no
+  server is running, the client *daemonizes* one, and that long-lived
+  server (ppid 1) inherited the fd: flock belongs to the open file
+  description, so the permit stayed held long after the client exited
+  (verified live — a 3-permit pool ran as 2 for hours while a local
+  server held a borrowed CI permit on fd 9). Now the governor stays
+  alive as the chain's parent: the permit fd keeps FD_CLOEXEC and is
+  invisible to every child, the child's exit code is propagated, signal
+  death is re-raised so cargo observes the same disposition, and
+  TERM/INT/HUP are forwarded to the child while the governor waits.
+  Crash semantics, accepted: SIGKILL on the governor releases the
+  permit in the kernel the instant its fds close; the orphaned child
+  finishes its current compile momentarily ungoverned. Regression:
+  `daemonized_server_does_not_inherit_the_permit` in
+  `crates/rustc-governor/tests/sccache_chain.rs`.
 
 #### Why wrapper-side (the 2026-07 bypass post-mortem)
 

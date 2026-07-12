@@ -37,14 +37,15 @@ pub struct Config {
     /// Usernames whose invocations are classed `ci`; everyone else is
     /// `local`.
     pub ci_users: Vec<String>,
-    /// Front of the exec chain for governed *and* fail-open invocations:
-    /// `wrap_with <real-compiler> <args…>` — in production the sccache
-    /// client, whose blocking round-trip is what carries the permit's
-    /// ceiling to server-side compiles. Unset (or written as `""`, which
-    /// the parser normalizes to unset) means "run the compiler directly":
-    /// the governor works without sccache. The real compiler itself is
-    /// never configured here — cargo passes it as argv[1] (the
-    /// RUSTC_WRAPPER contract).
+    /// Front of the compile chain for governed *and* fail-open
+    /// invocations: `wrap_with <real-compiler> <args…>` — in production
+    /// the sccache client, whose blocking round-trip is what carries the
+    /// permit's ceiling to server-side compiles (governed runs spawn it
+    /// and wait, permit parent-held; fail-open runs exec it). Unset (or
+    /// written as `""`, which the parser normalizes to unset) means "run
+    /// the compiler directly": the governor works without sccache. The
+    /// real compiler itself is never configured here — cargo passes it
+    /// as argv[1] (the RUSTC_WRAPPER contract).
     pub wrap_with: Option<PathBuf>,
 }
 

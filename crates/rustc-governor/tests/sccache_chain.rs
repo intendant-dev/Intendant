@@ -1,19 +1,21 @@
-//! Regression test for THE production bypass (2026-07): the governor used
-//! to be wired as cargo's `[build] rustc` with sccache as `rustc-wrapper`,
-//! so sccache treated the governor as the compiler. sccache 0.15
-//! identifies rustup proxies by probing the compiler with `+stable -vV`;
-//! the governor's probe fast path passed that through to the rustup proxy,
-//! so sccache classified the governor AS a proxy, resolved the underlying
-//! toolchain rustc, and had its SERVER invoke that binary directly for
-//! every cacheable miss — ungoverned (verified live: five toolchain rustcs
-//! as sccache-server children while all permits were held). Only
-//! non-cacheable work stayed governed.
+//! Regression tests that drive the REAL sccache binary through the real
+//! governor chain (governor = rustc-wrapper, `wrap_with` = sccache)
+//! against private rigs — one test per production incident:
 //!
-//! This test drives the REAL sccache binary through the new chain
-//! (governor = rustc-wrapper, `wrap_with` = sccache) against a private
-//! server and asserts the property the old chain silently lost: with the
-//! single permit held, a CACHEABLE rlib miss must NOT complete — it queues
-//! on the permit — while a `-vV` probe still completes promptly.
+//! THE BYPASS (2026-07): the governor used to be wired as cargo's
+//! `[build] rustc` with sccache as `rustc-wrapper`, so sccache treated
+//! the governor as the compiler. sccache 0.15 identifies rustup proxies
+//! by probing the compiler with `+stable -vV`; the governor's probe fast
+//! path passed that through to the rustup proxy, so sccache classified
+//! the governor AS a proxy, resolved the underlying toolchain rustc, and
+//! had its SERVER invoke that binary directly for every cacheable miss —
+//! ungoverned (verified live: five toolchain rustcs as sccache-server
+//! children while all permits were held). Only non-cacheable work stayed
+//! governed. `cacheable_miss_queues_on_the_permit_and_probe_stays_fast`
+//! asserts the property that design silently lost.
+//!
+//! THE PERMIT LEAK (2026-07-12): see
+//! `daemonized_server_does_not_inherit_the_permit`.
 //!
 //! THE SHAPE OF THE COMPILE IS LOAD-BEARING. sccache only routes
 //! *cacheable* invocations through its server-side compile path — an rlib
@@ -28,14 +30,15 @@
 //! Hermetic per repo doctrine: private `SCCACHE_DIR` + dedicated
 //! `SCCACHE_SERVER_PORT` in tempdirs, `SCCACHE_IDLE_TIMEOUT=10` as a
 //! belt-and-braces reaper for leaks, the server stopped in cleanup (Drop —
-//! runs on panic too), and the only processes signalled are ones this test
-//! spawned. Skips cleanly — with an explicit message — when sccache is not
-//! installed.
+//! runs on panic too), and the only processes signalled are ones these
+//! tests spawned. Skips cleanly — with an explicit message — when sccache
+//! is not installed.
 
 #![cfg(unix)]
 
 use std::fs::File;
 use std::io::Read;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -98,33 +101,36 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A private sccache server: own cache dir, own port, idle-timeout
-/// backstop; stopped on drop. Nothing it does touches the account's real
-/// sccache server (default port) or cache.
-struct SccacheServer {
+/// A private sccache endpoint: own cache dir, own port, idle-timeout
+/// backstop; `--stop-server` on drop. Nothing it does touches the
+/// account's real sccache server (default port) or cache. Built either
+/// with the server pre-started (`with_running_server`) or with the port
+/// verified silent (`with_no_server` — the on-demand daemonization rig).
+struct SccacheRig {
     bin: PathBuf,
     dir: PathBuf,
     port: u16,
 }
 
-impl SccacheServer {
-    fn start(bin: &Path, dir: &Path) -> SccacheServer {
+impl SccacheRig {
+    /// Start a private server up front (retrying ports on bind races).
+    fn with_running_server(bin: &Path, dir: &Path) -> SccacheRig {
         let mut last = String::new();
         for attempt in 0..3_u32 {
-            let server = SccacheServer {
+            let rig = SccacheRig {
                 bin: bin.to_path_buf(),
                 dir: dir.to_path_buf(),
                 port: candidate_port(attempt),
             };
             let mut cmd = Command::new(bin);
             cmd.arg("--start-server");
-            server.apply_env(&mut cmd);
+            rig.apply_env(&mut cmd);
             match cmd.output() {
-                Ok(out) if out.status.success() => return server,
+                Ok(out) if out.status.success() => return rig,
                 Ok(out) => {
                     last = format!(
                         "port {}: {}{}",
-                        server.port,
+                        rig.port,
                         String::from_utf8_lossy(&out.stdout),
                         String::from_utf8_lossy(&out.stderr)
                     );
@@ -133,6 +139,23 @@ impl SccacheServer {
             }
         }
         panic!("could not start a private sccache server (3 ports tried); last: {last}");
+    }
+
+    /// Pick a port nothing answers on and do NOT start a server: the
+    /// first governed compile's sccache client will daemonize one on
+    /// demand — the exact production shape that leaked permits.
+    fn with_no_server(bin: &Path, dir: &Path) -> SccacheRig {
+        for attempt in 0..8_u32 {
+            let port = candidate_port(attempt);
+            if !tcp_port_answers(port) {
+                return SccacheRig {
+                    bin: bin.to_path_buf(),
+                    dir: dir.to_path_buf(),
+                    port,
+                };
+            }
+        }
+        panic!("could not find a silent port for the no-server rig (8 tried)");
     }
 
     /// Scrub every inherited SCCACHE_* var, then pin this server's env:
@@ -152,7 +175,7 @@ impl SccacheServer {
     }
 }
 
-impl Drop for SccacheServer {
+impl Drop for SccacheRig {
     fn drop(&mut self) {
         let mut cmd = Command::new(&self.bin);
         cmd.arg("--stop-server")
@@ -174,11 +197,20 @@ fn candidate_port(attempt: u32) -> u16 {
     (20_000 + seed % 40_000) as u16
 }
 
+/// True iff something accepts TCP on 127.0.0.1:`port`.
+fn tcp_port_answers(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(250),
+    )
+    .is_ok()
+}
+
 /// Spawn `governor <rustc> <cargo-shaped cacheable rlib args>` wired to the
-/// rig's config and the private sccache server. stderr goes to a file:
+/// rig's config and the private sccache endpoint. stderr goes to a file:
 /// readable after any failure, and no pipe to deadlock an unread child.
 fn governed_compile(
-    server: &SccacheServer,
+    server: &SccacheRig,
     config: &Path,
     rustc: &Path,
     source: &Path,
@@ -233,7 +265,7 @@ fn cacheable_miss_queues_on_the_permit_and_probe_stays_fast() {
     for dir in [&cache_dir, &permit_dir, &out_prime, &out_miss] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let server = SccacheServer::start(&sccache, &cache_dir);
+    let server = SccacheRig::with_running_server(&sccache, &cache_dir);
 
     // One permit total; the current user classes local (impossible
     // ci_users name), so that permit is permit-local-0.
@@ -356,4 +388,150 @@ fn cacheable_miss_queues_on_the_permit_and_probe_stays_fast() {
         read(&miss_err)
     );
     assert!(miss_rlib.is_file(), "miss produced no rlib after release");
+}
+
+/// Regression test for THE production permit leak (2026-07-12): the old
+/// governed path cleared FD_CLOEXEC on the permit fd and exec(2)'d the
+/// sccache client — and when no server was listening, the client
+/// daemonized one, so the long-lived server (ppid 1) inherited the
+/// permit fd through client → server fd inheritance. flock(2) locks
+/// belong to the open file description, so the permit stayed held after
+/// the client exited, for the server's whole lifetime: a 3-permit pool
+/// silently ran as 2 for hours (verified live — a local sccache server
+/// held permit-ci-1 on fd 9; killing it released the permit).
+///
+/// The fix is parent-held permits: the governor keeps the fd (CLOEXEC
+/// set, invisible to every child), spawns the chain, and waits. This
+/// test reproduces the daemonization shape — NO pre-started server, one
+/// governed CACHEABLE compile whose client spins the server up on
+/// demand — and hard-asserts the permit is immediately lockable the
+/// moment the governor exits. Best-effort second half: confirm the
+/// daemonized server exists and (where lsof is available) holds no fd
+/// on the permit file.
+#[test]
+fn daemonized_server_does_not_inherit_the_permit() {
+    let Some(sccache) = find_on_path("sccache") else {
+        eprintln!("skipped: sccache not installed");
+        return;
+    };
+    let rustc = find_on_path("rustc").unwrap_or_else(|| PathBuf::from("rustc"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cache_dir = root.join("sccache-cache");
+    let permit_dir = root.join("permits");
+    let out_dir = root.join("out");
+    for dir in [&cache_dir, &permit_dir, &out_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    // NO server pre-started — the rig verified the port is silent, so the
+    // governed compile below is what daemonizes one.
+    let rig = SccacheRig::with_no_server(&sccache, &cache_dir);
+    assert!(
+        !tcp_port_answers(rig.port),
+        "rig port must be silent before the governed compile"
+    );
+
+    // One permit total; the current user classes local (impossible
+    // ci_users name), so that permit is permit-local-0.
+    let config = root.join("governor.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "enabled = true\npermit_dir = \"{}\"\nlocal_reserved = 1\nci_reserved = 0\nci_users = [\"governor-test-no-such-user\"]\nwrap_with = \"{}\"\n",
+            permit_dir.display(),
+            sccache.display(),
+        ),
+    )
+    .unwrap();
+
+    // One governed CACHEABLE compile (the shape is load-bearing — module
+    // doc): its client finds no server and daemonizes one mid-compile.
+    let src = root.join("leak.rs");
+    std::fs::write(&src, "pub fn leak_probe() {}\n").unwrap();
+    let stderr = root.join("leak.stderr");
+    let mut compile =
+        governed_compile(&rig, &config, &rustc, &src, "leak_probe", &out_dir, &stderr);
+    let status = wait_deadline(&mut compile, GENEROUS)
+        .unwrap_or_else(|| panic!("compile did not finish: {}", read(&stderr)));
+    assert!(status.success(), "compile failed: {}", read(&stderr));
+    assert!(
+        out_dir.join("libleak_probe.rlib").is_file(),
+        "compile produced no rlib"
+    );
+    // The run really was governed — a fail-open run holds no permit and
+    // would pass the leak assert vacuously.
+    let log = read(&permit_dir.join("governor.log"));
+    assert!(
+        log.contains("permit=permit-local-0"),
+        "compile was not governed (rig broken?): {log:?}"
+    );
+
+    // THE hard assert: the governor is gone, so the permit must be
+    // immediately lockable. Under the leak, the daemonized server —
+    // ppid 1, lifetime unbounded next to a compile — still holds the
+    // flock right here.
+    let permit = File::open(permit_dir.join("permit-local-0")).unwrap();
+    // SAFETY: `permit` owns an open fd for the duration of the call.
+    let lockable = unsafe { libc::flock(permit.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    assert!(
+        lockable,
+        "permit still flocked after the governed compile exited — a child of the \
+         governed chain (the daemonized sccache server) inherited the permit fd: \
+         the 2026-07-12 permit leak regressed"
+    );
+    // SAFETY: as above; LOCK_UN releases the probe lock this test took.
+    unsafe {
+        libc::flock(permit.as_raw_fd(), libc::LOCK_UN);
+    }
+
+    // Best-effort half: the daemonization really happened (a server now
+    // answers stats on the private port)…
+    let mut stats = Command::new(&sccache);
+    stats
+        .arg("--show-stats")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    rig.apply_env(&mut stats);
+    let server_up = stats.status().map(|s| s.success()).unwrap_or(false);
+    assert!(
+        server_up,
+        "no daemonized sccache server answering on the private port — the rig did \
+         not exercise the on-demand daemonization path this regression is about"
+    );
+    // …and, where lsof exists, that server holds no fd on the permit file.
+    if let Some(lsof) = find_on_path("lsof") {
+        match pid_listening_on(&lsof, rig.port) {
+            Some(pid) => {
+                let out = Command::new(&lsof)
+                    .args(["-p", &pid.to_string()])
+                    .output()
+                    .expect("run lsof -p");
+                let table = String::from_utf8_lossy(&out.stdout);
+                let permit_path = permit_dir.join("permit-local-0").display().to_string();
+                assert!(
+                    !table.contains(&permit_path),
+                    "daemonized sccache server (pid {pid}) holds an fd on the permit file:\n{table}"
+                );
+            }
+            None => eprintln!("lsof found no listener pid; skipping the server fd scan"),
+        }
+    } else {
+        eprintln!("lsof not installed; skipping the server fd scan");
+    }
+    // rig Drop stops the daemonized server.
+}
+
+/// Pid listening on 127.0.0.1:`port`, via `lsof -t` (best-effort).
+fn pid_listening_on(lsof: &Path, port: u16) -> Option<i32> {
+    let out = Command::new(lsof)
+        .args(["-t", "-n", "-P", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }

@@ -4,19 +4,26 @@
 //! invokes it as `rustc-governor <real-rustc> <args…>` and the chain is:
 //!
 //! ```text
-//! cargo → THIS BINARY → [flock(2) permit] → exec(2) of
-//!   `wrap_with <real-rustc> <args…>` (the blocking sccache client)
-//!   → sccache server: hits answered from cache, misses compiled
-//!     server-side
+//! cargo → THIS BINARY (acquires + HOLDS the flock(2) permit, waits) →
+//!   spawn of `wrap_with <real-rustc> <args…>` (the blocking sccache
+//!   client) → sccache server: hits answered from cache, misses
+//!   compiled server-side
 //! ```
 //!
-//! The permit is held by the exec'd sccache *client*, which blocks until
-//! the server answers: at most N outstanding clients ⇒ at most N
-//! server-side compiles, so the machine-wide ceiling holds transitively —
-//! no matter which rustc binary the server resolves and runs. Exit status
-//! and signal disposition are inherited by construction, and the permit's
-//! flock rides the FD_CLOEXEC-cleared fd until the exec'd chain exits,
-//! however it exits. A cache hit occupies its permit only for the client
+//! The permit is held by the governor itself, which stays alive as the
+//! spawned chain's parent. The sccache *client* blocks until the server
+//! answers: at most N outstanding clients ⇒ at most N server-side
+//! compiles, so the machine-wide ceiling holds transitively — no matter
+//! which rustc binary the server resolves and runs. The permit fd keeps
+//! FD_CLOEXEC set, so no child — crucially, not even the sccache server
+//! the client daemonizes when none is running — can inherit it: flock
+//! belongs to the open file description, and a long-lived inheritor
+//! keeps the permit held long after the compile exits (the 2026-07-12
+//! production leak; post-mortem in `run_governed`'s doc and
+//! `scripts/ci/README.md`). The child's exit code is propagated, its
+//! signal death is re-raised so cargo observes the same disposition,
+//! and TERM/INT/HUP are forwarded to the child while the governor
+//! waits. A cache hit occupies its permit only for the client
 //! round-trip (~tens of ms); hits queueing head-of-line behind
 //! miss-saturated permits is an accepted trade (ceiling correctness over
 //! warm-path latency).
@@ -65,12 +72,15 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
 
 // `config` and `probe` are cross-platform (the portable fallback below
 // honors `wrap_with` and the probe fast path); the governor proper —
-// flock permits, exec — is Unix-only, so the non-unix build deliberately
-// leaves the permit-sizing parts of the config unread.
+// flock permits, the permit-holding parent — is Unix-only, so the
+// non-unix build deliberately leaves the permit-sizing parts of the
+// config unread.
 #[cfg_attr(not(unix), allow(dead_code))]
 mod config;
 #[cfg(unix)]
@@ -164,8 +174,8 @@ fn guard_against_self_exec(real: &Path) {
 
 /// Exec (spawn on non-unix) the real compiler with argv passed through
 /// untouched. Shared by the probe fast path — probes bypass permits and
-/// sccache both — and the last-resort fallback when the wrap chain won't
-/// exec.
+/// sccache both — and, on unix, the fail-open fallback when the wrap
+/// chain won't exec.
 fn run_compiler_direct(real: &Path, args: &[OsString]) -> ! {
     #[cfg(unix)]
     {
@@ -194,40 +204,223 @@ fn run_unix(
     cfg: Option<config::Config>,
     config_path: &Path,
 ) -> ! {
-    use std::os::unix::process::CommandExt as _;
+    match governed_permit(cfg, config_path) {
+        // Fail-open: no permit is held, so there is no fd whose lifetime
+        // must outlast the chain — exec(2) keeps the zero-overhead shape
+        // (this process image simply BECOMES the chain, and a disabled
+        // governor stays indistinguishable from a plain sccache
+        // rustc-wrapper).
+        None => exec_wrap_chain(real, args, wrap.as_deref()),
+        // Governed: the permit is parent-held — see `run_governed`.
+        Some(permit) => run_governed(real, args, wrap.as_deref(), permit),
+    }
+}
 
-    let permit = governed_permit(cfg, config_path);
-    // exec(2): on success this process IS the governed chain — the sccache
-    // client when wrap_with is configured, else the real compiler. argv
-    // and the environment pass through untouched, exit status and signal
-    // disposition propagate by construction, and the permit's flock (if
-    // any) rides the FD_CLOEXEC-cleared fd until the exec'd chain exits.
-    // Any exit — clean, panic, SIGKILL — releases the permit in the
-    // kernel.
-    if let Some(wrap) = &wrap {
+/// Exec `wrap_with <real> <args…>`, falling back to the real compiler
+/// when the wrap chain won't exec. Fail-open (permitless) invocations
+/// only: on the governed path the governor must outlive the child to
+/// keep holding the permit, so it never execs there.
+#[cfg(unix)]
+fn exec_wrap_chain(real: &Path, args: &[OsString], wrap: Option<&Path>) -> ! {
+    use std::os::unix::process::CommandExt as _;
+    if let Some(wrap) = wrap {
         let err = Command::new(wrap).arg(real).args(args).exec();
         // Reachable only when the wrap exec failed (missing / not
-        // executable): fail open to the direct compiler — the permit is
-        // still held, the build must not break; caching is what's lost.
+        // executable): fail open to the direct compiler — the build must
+        // not break; caching is what's lost.
         eprintln!(
             "rustc-governor: failed to exec wrap_with {}: {err}; running {} directly (uncached)",
             wrap.display(),
             real.display()
         );
     }
-    let err = Command::new(real).args(args).exec();
-    // Reachable only when exec failed (real compiler missing / not
-    // executable).
+    run_compiler_direct(real, args);
+}
+
+/// The governed path: the governor stays alive as the permit-owning
+/// parent — spawn the chain, forward TERM/INT/HUP to it, wait, and exit
+/// the way the child exited.
+///
+/// This shape (vs. exec(2)'ing the chain over a FD_CLOEXEC-cleared
+/// permit fd, the original design) is the fix for the 2026-07-12
+/// production leak: when no sccache server is running, the exec'd
+/// client daemonizes one, and that long-lived server (ppid 1) inherited
+/// the cleared fd — flock belongs to the open file description, so the
+/// permit stayed held for the server's whole lifetime and a 3-permit
+/// pool silently ran as 2 for hours. Parent-held, the fd never leaves
+/// this process.
+///
+/// Crash semantics (accepted — same spirit as the exec design's
+/// any-exit-releases story): SIGKILL on the governor releases the
+/// permit in the kernel the instant the process dies (its fds close),
+/// and the child orphans and finishes its current compile momentarily
+/// ungoverned.
+#[cfg(unix)]
+fn run_governed(
+    real: &Path,
+    args: &[OsString],
+    wrap: Option<&Path>,
+    permit: permits::AcquiredPermit,
+) -> ! {
+    let Some(mut child) = spawn_chain(real, args, wrap) else {
+        // Neither the wrap chain nor the compiler would spawn (messages
+        // already printed by spawn_chain).
+        drop(permit);
+        std::process::exit(127);
+    };
+    // Between spawn and handler install, TERM/INT/HUP still hits the
+    // default disposition: the governor dies, the kernel releases the
+    // permit, the child orphans — the documented crash semantics, for a
+    // few-instruction window.
+    CHILD_PID.store(child.id() as i32, Ordering::Release);
+    install_signal_forwarders();
+    let status = child.wait();
+    // The child is reaped: its pid is free for reuse, so the forwarders
+    // must stop aiming at it before this process does anything else.
+    CHILD_PID.store(0, Ordering::Release);
+    // The permit was held for the child's whole run (the fd kept
+    // O_CLOEXEC, so the child never saw it); releasing it now is
+    // release-on-exit made explicit.
     drop(permit);
-    eprintln!("rustc-governor: failed to exec {}: {err}", real.display());
-    std::process::exit(127);
+    match status {
+        Ok(status) => exit_like_child(status),
+        Err(err) => {
+            eprintln!("rustc-governor: failed to wait for the governed chain: {err}");
+            std::process::exit(127);
+        }
+    }
+}
+
+/// Spawn `wrap_with <real> <args…>` — the real compiler directly when
+/// `wrap_with` is unset or won't spawn — with argv, environment, and
+/// stdio all inherited untouched. `None` only when nothing would spawn
+/// (both failures already reported on stderr).
+fn spawn_chain(real: &Path, args: &[OsString], wrap: Option<&Path>) -> Option<Child> {
+    if let Some(wrap) = wrap {
+        match Command::new(wrap).arg(real).args(args).spawn() {
+            Ok(child) => return Some(child),
+            // Fail open to the direct compiler — the build must not
+            // break; caching is what's lost.
+            Err(err) => eprintln!(
+                "rustc-governor: failed to run wrap_with {}: {err}; running {} directly (uncached)",
+                wrap.display(),
+                real.display()
+            ),
+        }
+    }
+    match Command::new(real).args(args).spawn() {
+        Ok(child) => Some(child),
+        Err(err) => {
+            eprintln!("rustc-governor: failed to run {}: {err}", real.display());
+            None
+        }
+    }
+}
+
+/// Pid of the governed child while the governor waits on it; 0 outside
+/// that window. Read by the signal forwarders (pid_t is i32 on every
+/// supported unix target).
+#[cfg(unix)]
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Async-signal-safe forwarder installed for SIGTERM/SIGINT/SIGHUP
+/// while the governor waits: relay the same signal to the child and
+/// return — the child's exit (not the handler) drives the governor's
+/// exit, which then re-raises. Chosen over the self-pipe pattern
+/// because the handler's entire job is one kill(2) — which is on the
+/// async-signal-safe list — plus one atomic load; a pipe would add
+/// machinery only to move that same kill out of the handler.
+#[cfg(unix)]
+extern "C" fn forward_to_child(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe and touches no caller
+        // memory. `pid` is the child this process spawned: until
+        // run_governed's wait reaps it the pid cannot be recycled (a
+        // dead child stays a zombie), and CHILD_PID is zeroed
+        // immediately after that wait returns, so the residual window
+        // in which a stale pid could be signalled is a few
+        // instructions.
+        unsafe {
+            libc::kill(pid as libc::pid_t, sig);
+        }
+    }
+}
+
+/// Install `forward_to_child` for the forwarded signals. SA_RESTART so
+/// the wait in `run_governed` resumes instead of surfacing EINTR (std
+/// retries EINTR anyway; the flag just keeps the interruption out of
+/// the hot path).
+#[cfg(unix)]
+fn install_signal_forwarders() {
+    let handler: extern "C" fn(libc::c_int) = forward_to_child;
+    // SAFETY: sigaction is a plain C struct for which all-zero bytes are
+    // a valid value; every field consulted below is set explicitly.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handler as libc::sighandler_t;
+    sa.sa_flags = libc::SA_RESTART;
+    // SAFETY: `sa.sa_mask` is a live local; sigemptyset only writes it.
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: `sa` is fully initialized and the handler it installs
+        // is async-signal-safe (see forward_to_child). A failed install
+        // is tolerated: the signal keeps its default disposition, which
+        // is the documented crash semantics.
+        let _ = unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) };
+    }
+}
+
+/// Exit the way the governed child exited: its code when it exited;
+/// its signal re-raised on ourselves when it died by one — after
+/// restoring the default disposition — so cargo observes the same
+/// signal death the exec design produced by construction. exit(128+N)
+/// is the belt-and-braces fallback if the re-raise somehow returns.
+#[cfg(unix)]
+fn exit_like_child(status: std::process::ExitStatus) -> ! {
+    use std::os::unix::process::ExitStatusExt as _;
+    if let Some(sig) = status.signal() {
+        // SAFETY: sigaction is a plain C struct for which all-zero bytes
+        // are a valid value; SIG_DFL needs no other fields set.
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = libc::SIG_DFL;
+        // SAFETY: `sa.sa_mask` is a live local; sigemptyset only writes
+        // it.
+        unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+        // SAFETY: restoring SIG_DFL is always sound; failure (e.g.
+        // SIGKILL, which cannot be caught or reset) is tolerated because
+        // raise(2) below delivers such signals regardless.
+        let _ = unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) };
+        // SAFETY: sigset_t is a plain C type for which all-zero bytes
+        // are a valid starting value; it is emptied and extended with
+        // `sig` before use, and both calls only write `set`.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, sig);
+        }
+        // SAFETY: unblocking `sig` in our own mask; `set` is initialized
+        // and this thread owns its signal mask (defensive — nothing here
+        // blocks signals).
+        let _ = unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        // SAFETY: raise(2) sends `sig` to this thread; under the default
+        // disposition of a fatal signal it does not return.
+        let _ = unsafe { libc::raise(sig) };
+        // The re-raise returned (the disposition could not be restored):
+        // encode the signal the way shells do.
+        std::process::exit(128 + sig);
+    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Decide whether this invocation is governed, and if so acquire its
 /// permit. `None` always means "run ungoverned" — every fail-open path
-/// funnels here, and the caller execs the same `wrap_with` chain either
-/// way: a disabled governor must be indistinguishable from a plain
-/// sccache rustc-wrapper.
+/// funnels here, and the caller execs the same `wrap_with` chain,
+/// permitless: a disabled governor must be indistinguishable from a
+/// plain sccache rustc-wrapper. On `Some`, the permit fd deliberately
+/// keeps std's FD_CLOEXEC: the caller stays alive as the permit-holding
+/// parent, and the fd must be invisible to every child — a leaked fd in
+/// a long-lived child (in production: the sccache server the client
+/// daemonizes on demand) keeps the flock held long after the compile.
 #[cfg(unix)]
 fn governed_permit(
     cfg: Option<config::Config>,
@@ -252,35 +445,27 @@ fn governed_permit(
         &permit.name,
         permit.wait_ms,
     );
-    // Rust's std opens every file O_CLOEXEC; the permit must survive the
-    // exec (the flock IS the permit). If clearing fails, proceed anyway:
-    // losing the permit at exec oversubscribes the box by one compile,
-    // while failing the compile would break the build — and a governor
-    // must never break a build.
-    let _ = flock::clear_cloexec(&permit.file);
     Some(permit)
 }
 
-/// The governor is a Unix (macOS / Linux) tool — flock(2) permit pools and
-/// exec(2) semantics don't map onto Windows, and it is never deployed
-/// there. This fallback keeps the workspace building on every first-class
-/// platform (repo policy): degrade gracefully with the same chain shape,
-/// minus permits — spawn `wrap_with <real> <args…>` (the real compiler
-/// directly when `wrap_with` is unset or won't run) and propagate the
-/// exit code.
+/// The governor is a Unix (macOS / Linux) tool — flock(2) permit pools
+/// don't map onto Windows, and it is never deployed there. This fallback
+/// keeps the workspace building on every first-class platform (repo
+/// policy): degrade gracefully with the same chain shape, minus permits —
+/// structurally the unix governed parent (spawn the chain, wait, exit
+/// like the child) without the permit or the signal forwarding.
 #[cfg(not(unix))]
 fn run_portable(real: &Path, args: &[OsString], wrap: Option<PathBuf>) -> ! {
-    if let Some(wrap) = &wrap {
-        match Command::new(wrap).arg(real).args(args).status() {
-            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-            Err(err) => eprintln!(
-                "rustc-governor: failed to run wrap_with {}: {err}; running {} directly (uncached)",
-                wrap.display(),
-                real.display()
-            ),
+    let Some(mut child) = spawn_chain(real, args, wrap.as_deref()) else {
+        std::process::exit(127);
+    };
+    match child.wait() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(err) => {
+            eprintln!("rustc-governor: failed to wait for the governed chain: {err}");
+            std::process::exit(127);
         }
     }
-    run_compiler_direct(real, args);
 }
 
 #[cfg(test)]

@@ -12,11 +12,11 @@
 //! - `demand-local`, `demand-ci`             — one demand file per class
 //!
 //! Protocol:
-//! - Holding a permit = holding LOCK_EX on its file. The lock rides the fd
-//!   across exec(2) into the governed chain (the blocking sccache client,
-//!   or the real rustc when `wrap_with` is unset) and is released by the
-//!   kernel when that process exits, however it exits — crash release is
-//!   structural.
+//! - Holding a permit = holding LOCK_EX on its file. The governor holds
+//!   the lock itself for the governed chain's whole run — it stays alive
+//!   as the chain's parent, and the fd keeps std's O_CLOEXEC so no child
+//!   ever inherits it — and the kernel releases it when the governor
+//!   exits, however it exits: crash release is structural.
 //! - A waiter holds LOCK_SH on its OWN class's demand file for the whole
 //!   wait, and releases it the moment it holds a permit.
 //! - Borrowing: before touching a foreign-class permit, probe that class's
@@ -115,9 +115,13 @@ pub(crate) fn current_username() -> Option<String> {
 }
 
 pub(crate) struct AcquiredPermit {
-    /// Keeping this `File` open (with FD_CLOEXEC cleared) across the exec
-    /// IS the permit; the kernel releases the flock when the process exits.
-    pub(crate) file: File,
+    /// Keeping this `File` open IS the permit — held for RAII alone,
+    /// never read: the governor holds it, parent-side, for the governed
+    /// chain's whole run — the fd keeps std's O_CLOEXEC so no child (the
+    /// sccache client, or any server it daemonizes) can inherit it — and
+    /// the kernel releases the flock when the `File` closes (drop, or
+    /// any governor exit).
+    pub(crate) _file: File,
     pub(crate) name: String,
     pub(crate) wait_ms: u64,
 }
@@ -208,7 +212,7 @@ pub(crate) fn acquire(cfg: &Config, class: Class, config_path: &Path) -> Option<
     let start = Instant::now();
     let acquired = |start: Instant, (name, file): (String, File)| {
         Some(AcquiredPermit {
-            file,
+            _file: file,
             name,
             wait_ms: start.elapsed().as_millis() as u64,
         })
