@@ -739,7 +739,113 @@ pub fn save_state(cert_dir: &Path, state: &LocalIamState) -> AccessResult<()> {
             path.display()
         ))
     })?;
+    // Refresh the read cache with the state just persisted, keyed by the
+    // renamed file's fresh fingerprint. Best-effort: the per-read
+    // fingerprint re-check below is the correctness backbone, so a lost
+    // refresh only costs one re-parse.
+    if let Some(fingerprint) = iam_state_fingerprint(&path) {
+        store_cached_iam_state(&path, fingerprint, normalized);
+    }
     Ok(())
+}
+
+/// Stat-level identity of `iam.json`. A `save_state` rename always mints a
+/// new inode, and external writers (a second daemon on the same cert dir,
+/// `intendant org …` CLI invocations, hand edits) move `len`/`mtime`, so a
+/// matching fingerprint proves the cached parse is current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IamStateFingerprint {
+    len: u64,
+    mtime_nanos: u128,
+    dev: u64,
+    ino: u64,
+}
+
+fn iam_state_fingerprint(path: &Path) -> Option<IamStateFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(IamStateFingerprint {
+        len: metadata.len(),
+        mtime_nanos,
+        dev,
+        ino,
+    })
+}
+
+struct IamStateCacheEntry {
+    fingerprint: IamStateFingerprint,
+    state: std::sync::Arc<LocalIamState>,
+}
+
+/// Cache is keyed by the state file path so tests (and multi-cert-dir
+/// processes) with distinct cert dirs never cross-talk.
+fn iam_state_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, IamStateCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, IamStateCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+const IAM_STATE_CACHE_MAX_DIRS: usize = 8;
+
+fn store_cached_iam_state(path: &Path, fingerprint: IamStateFingerprint, state: LocalIamState) {
+    let mut cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= IAM_STATE_CACHE_MAX_DIRS && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        IamStateCacheEntry {
+            fingerprint,
+            state: std::sync::Arc::new(state),
+        },
+    );
+}
+
+/// [`load_state`] behind a stat-fingerprint cache: the per-request read
+/// path (mTLS request authorization stats + parses `iam.json` on every
+/// HTTP request, including statics) pays one `stat` instead of a full
+/// read + parse + normalize when the file is unchanged. Never trusts
+/// invalidation alone — every call re-checks the fingerprint, so writers
+/// that bypass [`save_state`] (other processes, hand edits) are picked up
+/// on the next request. Parse errors are never cached.
+pub fn load_state_cached(cert_dir: &Path) -> AccessResult<LocalIamState> {
+    let path = iam_state_path(cert_dir);
+    let Some(fingerprint) = iam_state_fingerprint(&path) else {
+        // Missing file: same contract as load_state. Nothing to cache —
+        // the default is cheap relative to a request.
+        return Ok(LocalIamState::default());
+    };
+    {
+        let cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache
+            .get(&path)
+            .filter(|entry| entry.fingerprint == fingerprint)
+        {
+            return Ok((*entry.state).clone());
+        }
+    }
+    let state = load_state(cert_dir)?;
+    // Re-stat AFTER the read: if the file changed between the stat and the
+    // read, caching the read under the pre-read fingerprint could pin a
+    // torn view. Matching fingerprints prove read and stat saw one file.
+    match iam_state_fingerprint(&path) {
+        Some(after) if after == fingerprint => {
+            store_cached_iam_state(&path, fingerprint, state.clone());
+        }
+        _ => {}
+    }
+    Ok(state)
 }
 
 struct UserClientBinding {
@@ -3253,6 +3359,67 @@ mod tests {
 
         assert!(matches!(loaded.status, IamStateStatus::Error(_)));
         assert_eq!(loaded.state.managed_grant_count(), 0);
+    }
+
+    #[test]
+    fn load_state_cached_matches_uncached_and_sees_external_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Missing file: same default-state contract as load_state.
+        assert_eq!(
+            load_state_cached(tmp.path()).unwrap(),
+            load_state(tmp.path()).unwrap()
+        );
+
+        // save_state → cached read returns the saved state (and matches a
+        // fresh uncached parse).
+        let mut state = LocalIamState::default();
+        state.principals.push(IamPrincipal {
+            id: "principal:cache-a".to_string(),
+            kind: "user_client".to_string(),
+            label: "Cache A".to_string(),
+            status: "active".to_string(),
+            source: "test".to_string(),
+            account: None,
+            organization: None,
+            authn: Vec::new(),
+            notes: None,
+            created_at_unix_ms: Some(1),
+        });
+        save_state(tmp.path(), &state).unwrap();
+        let cached = load_state_cached(tmp.path()).unwrap();
+        assert_eq!(cached, load_state(tmp.path()).unwrap());
+        assert!(cached
+            .principals
+            .iter()
+            .any(|p| p.id == "principal:cache-a"));
+        // Second read (a cache hit) is identical.
+        assert_eq!(load_state_cached(tmp.path()).unwrap(), cached);
+
+        // A writer that bypasses save_state (another process, a hand
+        // edit) must be picked up by the per-call fingerprint re-check —
+        // never trust invalidation.
+        let mut external = cached.clone();
+        for principal in &mut external.principals {
+            if principal.id == "principal:cache-a" {
+                principal.label = "Cache A (externally rewritten)".to_string();
+            }
+        }
+        let body = serde_json::to_string_pretty(&external).unwrap();
+        std::fs::write(iam_state_path(tmp.path()), body).unwrap();
+        let reread = load_state_cached(tmp.path()).unwrap();
+        assert!(reread
+            .principals
+            .iter()
+            .any(|p| p.label == "Cache A (externally rewritten)"));
+        assert_eq!(reread, load_state(tmp.path()).unwrap());
+
+        // Deleting the file falls back to the default state.
+        std::fs::remove_file(iam_state_path(tmp.path())).unwrap();
+        assert_eq!(
+            load_state_cached(tmp.path()).unwrap(),
+            LocalIamState::default()
+        );
     }
 
     #[test]
