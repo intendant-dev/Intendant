@@ -5,10 +5,69 @@
 
 use super::*;
 
+/// Cache-backed resync lines for a `/ws` connection that lagged the
+/// outbound broadcast: the same latest-state lines a fresh bootstrap
+/// replays, in the bootstrap block's relative order (usage, live usage,
+/// status, per-session state, autonomy, external agent, user display).
+/// `session_started` lines are stamped `replayed: true` exactly like the
+/// bootstrap path so the frontend rebuilds windows without live-start side
+/// effects (thinking phase, focus steal, current-task clobber).
+pub(crate) fn bootstrap_cache_resync_lines(
+    caches: &crate::dashboard_control::DashboardBootstrapCaches,
+) -> Vec<String> {
+    fn push_latest(lines: &mut Vec<String>, cache: &Arc<Mutex<Option<String>>>) {
+        if let Ok(guard) = cache.lock() {
+            if let Some(line) = guard.as_ref() {
+                lines.push(line.clone());
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    push_latest(&mut lines, &caches.last_usage_json);
+    push_latest(&mut lines, &caches.last_live_usage_json);
+    push_latest(&mut lines, &caches.last_status_json);
+    if let Ok(guard) = caches.session_state_lines.lock() {
+        for kinds in guard.values() {
+            if let Some(line) = kinds.get("session_started") {
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(mut parsed) => {
+                        parsed["replayed"] = serde_json::json!(true);
+                        lines.push(parsed.to_string());
+                    }
+                    Err(_) => lines.push(line.clone()),
+                }
+            }
+            for (kind, line) in kinds.iter() {
+                if *kind != "session_started" {
+                    lines.push(line.clone());
+                }
+            }
+        }
+    }
+    push_latest(&mut lines, &caches.last_autonomy_json);
+    push_latest(&mut lines, &caches.last_external_agent_json);
+    push_latest(&mut lines, &caches.last_user_display_json);
+    lines
+}
+
 /// Outbound half of a local `/ws` session: broadcast + direct responses ->
 /// the WebSocket, converting each input-authority change into a personalized
 /// `display_input_authority_state` wire message. Connection IDs never leave
 /// the daemon -- only the resolved `you|other|unclaimed` state does.
+///
+/// Two live-update guarantees ride here:
+/// - **Bootstrap ordering:** live broadcast events stay gated until the
+///   listener's bootstrap frames (queued on the direct lane before this task
+///   spawns) have drained — `bootstrap_flushed_rx` fires after the last
+///   enqueue, and the `biased` select drains the direct lane first, so no
+///   live event can precede or interleave the bootstrap. Heartbeats are
+///   unaffected: protocol pings ride the tungstenite stream itself and the
+///   direct/authority lanes are never gated.
+/// - **Loss visibility:** a lagged broadcast receiver no longer skips
+///   silently — the connection gets an `event_gap` frame (same `skipped`
+///   payload the tunnel's `event_gap` carries) followed by a cached-state
+///   resync, mirroring the authority lane's snapshot-on-lag pattern below.
+#[allow(clippy::too_many_arguments)] // established per-connection wiring: the params are distinct lanes, not a bundle
 pub(crate) async fn ws_outbound_task(
     mut outbound_rx: broadcast::Receiver<String>,
     mut direct_rx: mpsc::UnboundedReceiver<String>,
@@ -20,24 +79,13 @@ pub(crate) async fn ws_outbound_task(
     connection_id: String,
     display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     session_registry: Option<crate::display::SharedSessionRegistry>,
+    bootstrap_caches: crate::dashboard_control::DashboardBootstrapCaches,
+    mut bootstrap_flushed_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let mut bootstrap_flushed = false;
     loop {
         tokio::select! {
-            msg = outbound_rx.recv() => {
-                match msg {
-                    Ok(line) => {
-                        if ws_tx
-                            .send(Message::Text(line.into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
+            biased;
             msg = direct_rx.recv() => {
                 match msg {
                     Some(line) => {
@@ -50,6 +98,77 @@ pub(crate) async fn ws_outbound_task(
                         }
                     }
                     None => break,
+                }
+            }
+            _ = &mut bootstrap_flushed_rx, if !bootstrap_flushed => {
+                // Fired after the listener queued the last bootstrap frame
+                // (a dropped sender reads the same way). The biased arm
+                // order above guarantees those frames drained before this
+                // branch can win, so the broadcast lane opens exactly at
+                // the bootstrap/live boundary.
+                bootstrap_flushed = true;
+            }
+            msg = outbound_rx.recv(), if bootstrap_flushed => {
+                match msg {
+                    Ok(line) => {
+                        if ws_tx
+                            .send(Message::Text(line.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Tell the browser it has a gap, then re-send the
+                        // cached bootstrap state so latest-state UI heals
+                        // now instead of sticking stale until each kind's
+                        // next natural emission.
+                        let mut frames = vec![serde_json::json!({
+                            "event": "event_gap",
+                            "skipped": skipped,
+                        })
+                        .to_string()];
+                        frames.extend(bootstrap_cache_resync_lines(&bootstrap_caches));
+                        // Live display slots: rebuild display_ready from the
+                        // authoritative session registry (browser-side
+                        // addDisplaySlot is idempotent for live slots).
+                        // Snapshot under the read guard, drop it before the
+                        // awaited sends.
+                        if let Some(sr) = session_registry.as_ref() {
+                            let reg = sr.read().await;
+                            let ready_frames: Vec<String> = reg
+                                .all_display_ids()
+                                .into_iter()
+                                .filter_map(|did| {
+                                    reg.get_any(did).map(|session| {
+                                        let (w, h) = session.resolution();
+                                        serde_json::json!({
+                                            "event": "display_ready",
+                                            "display_id": did,
+                                            "width": w,
+                                            "height": h,
+                                            "agent_visible": session.agent_visible(),
+                                        })
+                                        .to_string()
+                                    })
+                                })
+                                .collect();
+                            drop(reg);
+                            frames.extend(ready_frames);
+                        }
+                        let mut send_failed = false;
+                        for frame in frames {
+                            if ws_tx.send(Message::Text(frame.into())).await.is_err() {
+                                send_failed = true;
+                                break;
+                            }
+                        }
+                        if send_failed {
+                            break;
+                        }
+                    }
                 }
             }
             msg = authority_change_rx.recv() => {
@@ -1404,10 +1523,10 @@ pub(crate) async fn ws_inbound_task(
                         {
                             Ok((session, _created)) => {
                                 // Spawn a forwarder task that drains the session's
-                                // per-listener channel and sends base64-encoded
+                                // per-listener queue (coalesced + bounded in
+                                // terminal.rs) and sends base64-encoded
                                 // output to this WS connection.
-                                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                                session.attach(tx);
+                                let mut rx = session.attach();
 
                                 let forwarder_tx = direct_tx_inbound.clone();
                                 let fwd_host = host_id.clone();

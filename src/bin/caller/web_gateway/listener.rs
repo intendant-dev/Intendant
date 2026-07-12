@@ -521,38 +521,6 @@ pub fn spawn_web_gateway(
     let federated_authority_subscribers: FederatedAuthoritySubscribers =
         Arc::new(StdRwLock::new(HashMap::new()));
 
-    // Spawn a listener that fires an "unclaimed" authority change for
-    // every newly-created display session so already-connected browsers'
-    // chips flip from `unknown` to `unclaimed` without waiting for the
-    // first Request/Release.  Subscribes to the broadcast_tx event
-    // stream (already serialized JSON) and pattern-matches on
-    // `display_ready` rather than the typed AppEvent — same source the
-    // existing `display_ready_cache` task uses, keeps the dependency
-    // surface small.
-    {
-        let authority_change_tx = authority_change_tx.clone();
-        let mut display_events_rx = broadcast_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match display_events_rx.recv().await {
-                    Ok(line) => {
-                        if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                let _ = authority_change_tx.send(DisplayInputAuthorityChange {
-                                    display_id: did,
-                                    holder: None,
-                                });
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-    }
-
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
     let last_usage_json = bootstrap_caches.last_usage_json.clone();
@@ -592,185 +560,25 @@ pub fn spawn_web_gateway(
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    {
-        let usage_cache = last_usage_json.clone();
-        let live_usage_cache = last_live_usage_json.clone();
-        let status_cache = last_status_json.clone();
-        let autonomy_cache = last_autonomy_json.clone();
-        let external_agent_cache = last_external_agent_json.clone();
-        let session_attached_cache = attached_external_sessions.clone();
-        let user_display_cache = last_user_display_json.clone();
-        let session_state_cache = session_state_lines.clone();
-        let display_cache = display_ready_cache.clone();
-        let mut usage_rx = broadcast_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match usage_rx.recv().await {
-                    Ok(line) => {
-                        // Cache display_ready events per display_id for
-                        // late-connecting browsers.
-                        if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                if let Ok(mut guard) = display_cache.lock() {
-                                    guard.insert(did, line.clone());
-                                }
-                            }
-                        }
-                        // Evict display_ready cache when display is revoked.
-                        if line.contains("\"event\":\"user_display_revoked\"")
-                            || line.contains("\"event\":\"display_capture_lost\"")
-                        {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                if let Ok(mut guard) = display_cache.lock() {
-                                    guard.remove(&did);
-                                }
-                            }
-                        }
-                        // Cache user_display_granted for replay on reconnect.
-                        // Clear the cache on user_display_revoked so a refreshed
-                        // browser after a revoke doesn't re-enable the badge.
-                        if line.contains("\"event\":\"user_display_granted\"") {
-                            if let Ok(mut guard) = user_display_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"user_display_revoked\"") {
-                            if let Ok(mut guard) = user_display_cache.lock() {
-                                *guard = None;
-                            }
-                        }
-                        if line.contains("\"event\":\"usage_update\"")
-                            || line.contains("\"event\":\"usage\"")
-                        {
-                            if let Ok(mut guard) = usage_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"live_usage_update\"") {
-                            if let Ok(mut guard) = live_usage_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"status\"") {
-                            if let Ok(mut guard) = status_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"autonomy_changed\"") {
-                            if let Ok(mut guard) = autonomy_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"external_agent_changed\"") {
-                            if let Ok(mut guard) = external_agent_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"session_attached\"")
-                            || line.contains("\"event\":\"session_identity\"")
-                        {
-                            if let Ok(mut guard) = session_attached_cache.lock() {
-                                update_external_attached_sessions_from_wire(&mut guard, &line);
-                            }
-                        }
-                        if line.contains("\"event\":\"session_vitals\"")
-                            || line.contains("\"event\":\"session_goal\"")
-                            || line.contains("\"event\":\"session_started\"")
-                            || line.contains("\"event\":\"approval_required\"")
-                            || line.contains("\"event\":\"user_question\"")
-                        {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let kind = match parsed["event"].as_str() {
-                                    Some("session_vitals") => Some("session_vitals"),
-                                    Some("session_goal") => Some("session_goal"),
-                                    // A live session's birth announcement:
-                                    // replayed to late joiners so their
-                                    // Activity grid rebuilds windows for
-                                    // work that predates the connection
-                                    // (session_started routinely falls off
-                                    // the tail-limited log replay).
-                                    Some("session_started") => Some("session_started"),
-                                    // Pending approvals/questions: the
-                                    // daemon-side registry survives a page
-                                    // reload but the panel state does not —
-                                    // replay the ask so a reconnecting
-                                    // operator can still answer. Cleared on
-                                    // approval_resolved below.
-                                    Some("approval_required") => Some("approval_required"),
-                                    Some("user_question") => Some("user_question"),
-                                    _ => None,
-                                };
-                                if let (Some(kind), Some(sid)) =
-                                    (kind, parsed["session_id"].as_str())
-                                {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        guard
-                                            .entry(sid.to_string())
-                                            .or_default()
-                                            .insert(kind, line.clone());
-                                        // Bound the cache against a runaway
-                                        // session-id source. session_ended is
-                                        // the normal prune; this evicts the
-                                        // lexicographically first key, which
-                                        // is arbitrary but keeps it finite.
-                                        if guard.len() > 256 {
-                                            if let Some(first) = guard.keys().next().cloned() {
-                                                guard.remove(&first);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if line.contains("\"event\":\"approval_resolved\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                if let (Some(sid), Some(id)) =
-                                    (parsed["session_id"].as_str(), parsed["id"].as_u64())
-                                {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        if let Some(kinds) = guard.get_mut(sid) {
-                                            for kind in ["approval_required", "user_question"] {
-                                                let matches = kinds
-                                                    .get(kind)
-                                                    .and_then(|cached| {
-                                                        serde_json::from_str::<serde_json::Value>(
-                                                            cached,
-                                                        )
-                                                        .ok()
-                                                    })
-                                                    .is_some_and(|cached| {
-                                                        cached["id"].as_u64() == Some(id)
-                                                    });
-                                                if matches {
-                                                    kinds.remove(kind);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if line.contains("\"event\":\"session_ended\"") {
-                            if let Ok(mut guard) = session_attached_cache.lock() {
-                                update_external_attached_sessions_from_wire(&mut guard, &line);
-                            }
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                if let Some(sid) = parsed["session_id"].as_str() {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        guard.remove(sid);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    // Bootstrap-cache maintenance rides the TYPED bus (4096-slot), not the
+    // 256-slot serialized channel it used to sniff with `line.contains`
+    // probes: a lag on the old channel silently poisoned every future
+    // tab's bootstrap (ghost approvals, ghost sessions). The typed
+    // maintainer matches AppEvent variants, serializes only the relevant
+    // ones through the same canonical converter the broadcaster uses, and
+    // on Lagged clears the affected sections so the next bootstrap omits
+    // stale lines instead of replaying ghosts (see
+    // `BootstrapCacheMaintainer::clear_on_gap` for the per-section
+    // ground-truth story). It also owns the "unclaimed" authority nudge
+    // the old display_ready sniffer task fired.
+    spawn_bootstrap_cache_maintainer(
+        &bus,
+        BootstrapCacheMaintainer {
+            caches: bootstrap_caches.clone(),
+            display_ready_cache: display_ready_cache.clone(),
+            authority_change_tx: authority_change_tx.clone(),
+        },
+    );
 
     // Peer registry → dashboard push translator.
     //
@@ -980,6 +788,7 @@ pub fn spawn_web_gateway(
             let last_user_display_json = last_user_display_json.clone();
             let session_state_lines = session_state_lines.clone();
             let display_ready_cache = display_ready_cache.clone();
+            let bootstrap_caches = bootstrap_caches.clone();
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
             let mcp_server = mcp_server.clone();
@@ -1369,6 +1178,16 @@ pub fn spawn_web_gateway(
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
 
+                    // Ordering barrier for the outbound task: live broadcast
+                    // events stay gated until every bootstrap frame queued on
+                    // `direct_tx` below has drained to the socket, so a live
+                    // event can never interleave into (or precede) the
+                    // bootstrap sequence. Fired after the last bootstrap
+                    // enqueue; `ws_outbound_task`'s biased select drains
+                    // direct frames first, then opens the broadcast lane.
+                    let (bootstrap_flushed_tx, bootstrap_flushed_rx) =
+                        tokio::sync::oneshot::channel::<()>();
+
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
                     // doesn't carry those. The top-level `session_id` is the
@@ -1694,6 +1513,10 @@ pub fn spawn_web_gateway(
                         let _ = direct_tx.send(auth_msg.to_string());
                     }
 
+                    // Bootstrap fully queued — open the outbound task's
+                    // broadcast lane once these frames have drained.
+                    let _ = bootstrap_flushed_tx.send(());
+
                     // Inbound: WebSocket → EventBus
                     // Handles message types:
                     //   {"t":"presence_connect",...}     → AppEvent::PresenceConnected
@@ -1756,6 +1579,8 @@ pub fn spawn_web_gateway(
                         connection_id.clone(),
                         display_input_authority.clone(),
                         session_registry.clone(),
+                        bootstrap_caches.clone(),
+                        bootstrap_flushed_rx,
                     ));
 
                     let _ = tokio::join!(inbound, outbound);
@@ -1809,6 +1634,452 @@ pub fn spawn_web_gateway(
             });
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap-cache maintenance (typed bus)
+// ---------------------------------------------------------------------------
+
+/// Serialize an AppEvent to the exact wire line browsers receive — the same
+/// `app_event_to_outbound` + serde path the outbound broadcaster uses, so
+/// cached lines are byte-identical to the broadcast copies they stand in for.
+fn bootstrap_wire_line(event: &crate::event::AppEvent) -> Option<String> {
+    crate::event::app_event_to_outbound(event)
+        .and_then(|outbound| serde_json::to_string(&outbound).ok())
+}
+
+/// State fed by [`spawn_bootstrap_cache_maintainer`]: the shared bootstrap
+/// caches every new `/ws` connection (and the tunnel's
+/// `api_dashboard_bootstrap`) replays, the per-display `display_ready`
+/// fallback cache, and the authority-change channel for the
+/// "fresh display ⇒ unclaimed chip" nudge.
+pub(crate) struct BootstrapCacheMaintainer {
+    pub(crate) caches: crate::dashboard_control::DashboardBootstrapCaches,
+    pub(crate) display_ready_cache: Arc<Mutex<HashMap<u32, String>>>,
+    pub(crate) authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+}
+
+impl BootstrapCacheMaintainer {
+    fn set_latest(cache: &Arc<Mutex<Option<String>>>, event: &crate::event::AppEvent) {
+        if let Some(line) = bootstrap_wire_line(event) {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some(line);
+            }
+        }
+    }
+
+    /// Latest change-detected per-session state (`session_started` /
+    /// `session_vitals` / `session_goal` / pending `approval_required` /
+    /// `user_question`), replayed to late joiners. Bounded at 256 sessions
+    /// against a runaway session-id source: `session_ended` is the normal
+    /// prune; overflow evicts the lexicographically first key, which is
+    /// arbitrary but keeps it finite.
+    fn cache_session_state_line(
+        &self,
+        kind: &'static str,
+        session_id: &str,
+        event: &crate::event::AppEvent,
+    ) {
+        let Some(line) = bootstrap_wire_line(event) else {
+            return;
+        };
+        if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+            guard
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(kind, line);
+            if guard.len() > 256 {
+                if let Some(first) = guard.keys().next().cloned() {
+                    guard.remove(&first);
+                }
+            }
+        }
+    }
+
+    /// Fold one typed event into the bootstrap caches. Only the variants a
+    /// bootstrap replays are serialized; the high-volume stream events
+    /// (deltas, context snapshots) fall through untouched.
+    pub(crate) fn apply(&self, event: &crate::event::AppEvent) {
+        use crate::event::AppEvent as E;
+        match event {
+            E::DisplayReady { display_id, .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.display_ready_cache.lock() {
+                        guard.insert(*display_id, line);
+                    }
+                }
+                // Fresh display session: flip already-connected browsers'
+                // authority chips from `unknown` to `unclaimed` without
+                // waiting for the first Request/Release.
+                let _ = self.authority_change_tx.send(DisplayInputAuthorityChange {
+                    display_id: *display_id,
+                    holder: None,
+                });
+            }
+            // Evict display_ready on revoke / capture loss; a revoke also
+            // clears the cached grant so a refreshed browser after a revoke
+            // doesn't re-enable the badge.
+            E::UserDisplayRevoked { display_id, .. } => {
+                if let Ok(mut guard) = self.display_ready_cache.lock() {
+                    guard.remove(display_id);
+                }
+                if let Ok(mut guard) = self.caches.last_user_display_json.lock() {
+                    *guard = None;
+                }
+            }
+            E::DisplayCaptureLost { display_id, .. } => {
+                if let Ok(mut guard) = self.display_ready_cache.lock() {
+                    guard.remove(display_id);
+                }
+            }
+            E::UserDisplayGranted { .. } => {
+                Self::set_latest(&self.caches.last_user_display_json, event)
+            }
+            E::UsageSnapshot { .. } => Self::set_latest(&self.caches.last_usage_json, event),
+            E::LiveUsageUpdate { .. } => Self::set_latest(&self.caches.last_live_usage_json, event),
+            E::StatusUpdate { .. } => Self::set_latest(&self.caches.last_status_json, event),
+            E::AutonomyChanged { .. } => Self::set_latest(&self.caches.last_autonomy_json, event),
+            E::ExternalAgentChanged { .. } => {
+                Self::set_latest(&self.caches.last_external_agent_json, event)
+            }
+            E::SessionAttached { .. } | E::SessionIdentity { .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+                        update_external_attached_sessions_from_wire(&mut guard, &line);
+                    }
+                }
+            }
+            // A live session's birth announcement: replayed to late joiners
+            // so their Activity grid rebuilds windows for work that predates
+            // the connection (session_started routinely falls off the
+            // tail-limited log replay).
+            E::SessionStarted { session_id, .. } => {
+                self.cache_session_state_line("session_started", session_id, event)
+            }
+            E::SessionVitals { session_id, .. } => {
+                self.cache_session_state_line("session_vitals", session_id, event)
+            }
+            E::SessionGoal { session_id, .. } => {
+                self.cache_session_state_line("session_goal", session_id, event)
+            }
+            // Pending approvals/questions: the daemon-side registry survives
+            // a page reload but the panel state does not — replay the ask so
+            // a reconnecting operator can still answer. Cleared on
+            // ApprovalResolved below. Session-less asks were never cached by
+            // the wire sniffer (no `session_id` key on the line) — same here.
+            E::ApprovalRequired {
+                session_id: Some(session_id),
+                ..
+            } => self.cache_session_state_line("approval_required", session_id, event),
+            E::UserQuestionRequired {
+                session_id: Some(session_id),
+                ..
+            } => self.cache_session_state_line("user_question", session_id, event),
+            E::ApprovalResolved {
+                session_id: Some(session_id),
+                id,
+                ..
+            } => {
+                if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                    if let Some(kinds) = guard.get_mut(session_id) {
+                        for kind in ["approval_required", "user_question"] {
+                            let matches = kinds
+                                .get(kind)
+                                .and_then(|cached| {
+                                    serde_json::from_str::<serde_json::Value>(cached).ok()
+                                })
+                                .is_some_and(|cached| cached["id"].as_u64() == Some(*id));
+                            if matches {
+                                kinds.remove(kind);
+                            }
+                        }
+                    }
+                }
+            }
+            E::SessionEnded { session_id, .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+                        update_external_attached_sessions_from_wire(&mut guard, &line);
+                    }
+                }
+                if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                    guard.remove(session_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The maintainer lagged the typed bus: any number of grants, revokes,
+    /// approvals, or session ends were missed, so every cached line may now
+    /// be a ghost. Clear the affected sections — the next bootstrap omits
+    /// stale lines instead of replaying them, and each cache refills on its
+    /// next live event:
+    /// - `display_ready_cache` is only the bootstrap's NO-registry fallback;
+    ///   whenever a session registry exists the bootstrap already reads that
+    ///   ground truth directly, so clearing here never blanks a live path.
+    /// - the "latest line" caches (usage/status/autonomy/agent/grant) have
+    ///   no in-scope authority to rebuild from; empty means the dashboard
+    ///   falls back to its defaults instead of trusting a stale value.
+    /// - pending approvals/questions clear rather than replay as ghosts;
+    ///   the daemon-side approval registry still holds the real pending set
+    ///   and live `approval_required` re-emissions repopulate the panel.
+    pub(crate) fn clear_on_gap(&self) {
+        if let Ok(mut guard) = self.display_ready_cache.lock() {
+            guard.clear();
+        }
+        for cache in [
+            &self.caches.last_usage_json,
+            &self.caches.last_live_usage_json,
+            &self.caches.last_status_json,
+            &self.caches.last_autonomy_json,
+            &self.caches.last_external_agent_json,
+            &self.caches.last_user_display_json,
+        ] {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = None;
+            }
+        }
+        if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+            guard.clear();
+        }
+    }
+}
+
+/// Drive a [`BootstrapCacheMaintainer`] from the typed event bus.
+fn spawn_bootstrap_cache_maintainer(
+    bus: &EventBus,
+    maintainer: BootstrapCacheMaintainer,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => maintainer.apply(&event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "[web_gateway] bootstrap-cache maintainer lagged the event bus \
+                         ({skipped} events skipped); clearing caches so bootstraps omit \
+                         stale state instead of replaying ghosts"
+                    );
+                    maintainer.clear_on_gap();
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod bootstrap_cache_tests {
+    use super::*;
+    use crate::event::AppEvent;
+
+    fn maintainer() -> (
+        BootstrapCacheMaintainer,
+        broadcast::Receiver<DisplayInputAuthorityChange>,
+    ) {
+        let (authority_change_tx, authority_rx) = broadcast::channel(8);
+        (
+            BootstrapCacheMaintainer {
+                caches: crate::dashboard_control::DashboardBootstrapCaches::default(),
+                display_ready_cache: Arc::new(Mutex::new(HashMap::new())),
+                authority_change_tx,
+            },
+            authority_rx,
+        )
+    }
+
+    fn status_event(session_id: &str, phase: &str) -> AppEvent {
+        AppEvent::StatusUpdate {
+            turn: 1,
+            phase: phase.to_string(),
+            autonomy: "medium".to_string(),
+            session_id: session_id.to_string(),
+            task: "task".to_string(),
+        }
+    }
+
+    #[test]
+    fn typed_events_fill_the_caches_with_wire_lines() {
+        let (m, mut authority_rx) = maintainer();
+        let display_cache = m.display_ready_cache.clone();
+
+        m.apply(&status_event("s-1", "running"));
+        let status_line = m
+            .caches
+            .last_status_json
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("status cached");
+        let parsed: serde_json::Value = serde_json::from_str(&status_line).unwrap();
+        assert_eq!(parsed["event"], "status", "cached line is the wire shape");
+        assert_eq!(parsed["session_id"], "s-1");
+
+        m.apply(&AppEvent::AutonomyChanged {
+            autonomy: "High".to_string(),
+        });
+        assert!(m
+            .caches
+            .last_autonomy_json
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("\"autonomy_changed\""));
+
+        // display_ready caches per display AND nudges the authority chip.
+        m.apply(&AppEvent::DisplayReady {
+            display_id: 3,
+            width: 1280,
+            height: 720,
+            agent_visible: true,
+        });
+        assert!(display_cache.lock().unwrap().contains_key(&3));
+        let nudge = authority_rx.try_recv().expect("unclaimed nudge fired");
+        assert_eq!(nudge.display_id, 3);
+        assert!(nudge.holder.is_none());
+
+        // Grant cached; revoke clears it AND evicts the display entry.
+        m.apply(&AppEvent::UserDisplayGranted {
+            display_id: 3,
+            agent_visible: true,
+        });
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_some());
+        m.apply(&AppEvent::UserDisplayRevoked {
+            display_id: 3,
+            note: None,
+        });
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_none());
+        assert!(!display_cache.lock().unwrap().contains_key(&3));
+    }
+
+    #[test]
+    fn pending_ask_lines_track_their_resolution_by_id() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::ApprovalRequired {
+            session_id: Some("s-1".to_string()),
+            id: 41,
+            command_preview: "rm -rf scratch".to_string(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        assert!(
+            m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+
+        // A different id resolving must NOT clear the pending ask.
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: Some("s-1".to_string()),
+            id: 40,
+            action: "approved".to_string(),
+        });
+        assert!(
+            m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+
+        // The matching id clears it — no ghost approval on the next
+        // bootstrap.
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: Some("s-1".to_string()),
+            id: 41,
+            action: "approved".to_string(),
+        });
+        assert!(
+            !m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+    }
+
+    #[test]
+    fn session_end_prunes_session_state() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-2".to_string(),
+            task: Some("t".to_string()),
+        });
+        assert!(m
+            .caches
+            .session_state_lines
+            .lock()
+            .unwrap()
+            .contains_key("s-2"));
+        m.apply(&AppEvent::SessionEnded {
+            session_id: "s-2".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(!m
+            .caches
+            .session_state_lines
+            .lock()
+            .unwrap()
+            .contains_key("s-2"));
+    }
+
+    /// Lag policy: clear every affected section so a bootstrap after the
+    /// gap omits possibly-stale lines instead of replaying ghosts.
+    #[test]
+    fn clear_on_gap_empties_every_cache_section() {
+        let (m, _rx) = maintainer();
+        let display_cache = m.display_ready_cache.clone();
+        m.apply(&status_event("s-1", "running"));
+        m.apply(&AppEvent::DisplayReady {
+            display_id: 1,
+            width: 640,
+            height: 480,
+            agent_visible: true,
+        });
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-1".to_string(),
+            task: None,
+        });
+        m.apply(&AppEvent::UserDisplayGranted {
+            display_id: 1,
+            agent_visible: true,
+        });
+
+        m.clear_on_gap();
+
+        assert!(m.caches.last_status_json.lock().unwrap().is_none());
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_none());
+        assert!(m.caches.session_state_lines.lock().unwrap().is_empty());
+        assert!(m
+            .caches
+            .attached_external_sessions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(display_cache.lock().unwrap().is_empty());
+    }
+
+    /// End to end: intents flooding past the broadcast ring can lag the
+    /// old string maintainer; the typed one keeps serving fresh state and
+    /// resync lines mirror the bootstrap subset.
+    #[test]
+    fn resync_lines_replay_cached_state_with_session_started_stamped() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-3".to_string(),
+            task: Some("hello".to_string()),
+        });
+        m.apply(&status_event("s-3", "running"));
+        let lines = crate::web_gateway::ws_session::bootstrap_cache_resync_lines(&m.caches);
+        let started = lines
+            .iter()
+            .find(|line| line.contains("\"session_started\""))
+            .expect("session_started replayed");
+        let parsed: serde_json::Value = serde_json::from_str(started).unwrap();
+        assert_eq!(
+            parsed["replayed"], true,
+            "resync must stamp session_started like the bootstrap replay"
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"status\"")));
+    }
 }
 
 #[cfg(test)]

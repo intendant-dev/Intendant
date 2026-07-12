@@ -1266,8 +1266,7 @@ pub(crate) fn control_terminal_open_frame(
             .await
         {
             Ok((session, _created)) => {
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                session.attach(tx);
+                let mut rx = session.attach();
                 let _ = terminal_events_tx.send(serde_json::json!({
                     "t": "terminal_opened",
                     "host_id": host_id.clone(),

@@ -19,17 +19,44 @@
 //!   for now but is threaded through everywhere so multi-host phase 1 can
 //!   add sibling daemons without a refactor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, MasterPty, PtySize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
-/// Max scrollback retained per session, in bytes. 32 KB is enough to
-/// replay a few screens of recent output on reconnect without holding a
-/// whole terminal history in memory.
-const SCROLLBACK_LIMIT: usize = 32 * 1024;
+/// Max scrollback retained per session, in bytes. 256 KB replays several
+/// screens of recent output (full-screen TUI redraws included) on
+/// reconnect without holding a whole terminal history in memory.
+const SCROLLBACK_LIMIT: usize = 256 * 1024;
+
+/// Upper bound on bytes queued for one attached listener. A listener that
+/// stops draining (frozen tab, wedged forwarder) gets its OLDEST output
+/// dropped — spliced in-stream as [`OUTPUT_DROPPED_MARKER`] — instead of
+/// growing daemon memory without bound the way the old unbounded
+/// per-listener channels did.
+const LISTENER_QUEUE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Cap on one merged `Output` entry, and therefore on one drained event
+/// (one WS text message before base64 framing).
+const LISTENER_MERGE_ENTRY_CAP: usize = 64 * 1024;
+
+/// Visible splice where dropped output would have been.
+const OUTPUT_DROPPED_MARKER: &[u8] = b"\r\n[...output dropped...]\r\n";
+
+/// How long [`TerminalListener::recv`] lingers after output first becomes
+/// available so a burst coalesces into one event: the PTY reader emits
+/// <=4 KB fragments and one shell paint is many fragments, which used to
+/// become one WS message EACH. Small enough to be imperceptible on
+/// interactive echo.
+const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(6);
+
+/// Skip the coalescing linger once this much is already queued — the
+/// burst is already batched.
+const OUTPUT_COALESCE_SKIP_BYTES: usize = 4096;
 
 /// Device Status Report (cursor position) query / reply.
 ///
@@ -428,21 +455,23 @@ fn seatbelt_profile(
 }
 
 /// Fixed-capacity byte ring used for reconnect scrollback replay.
+/// `VecDeque` so trimming the front is a pointer bump, not a memmove of
+/// the whole retained window on every 4 KB read during bulk output.
 struct Scrollback {
-    buf: Vec<u8>,
+    buf: VecDeque<u8>,
     capacity: usize,
 }
 
 impl Scrollback {
     fn new(capacity: usize) -> Self {
         Self {
-            buf: Vec::with_capacity(capacity.min(4096)),
+            buf: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+        self.buf.extend(data.iter().copied());
         if self.buf.len() > self.capacity {
             let drop = self.buf.len() - self.capacity;
             self.buf.drain(..drop);
@@ -450,7 +479,244 @@ impl Scrollback {
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        self.buf.clone()
+        let (front, back) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(self.buf.len());
+        out.extend_from_slice(front);
+        out.extend_from_slice(back);
+        out
+    }
+}
+
+/// Per-listener event queue state. Bounded by bytes; overflowing drops the
+/// OLDEST output (never `Exited`) and owes the stream one
+/// [`OUTPUT_DROPPED_MARKER`] at the gap position.
+struct ListenerQueue {
+    entries: VecDeque<TerminalEvent>,
+    queued_bytes: usize,
+    /// Oldest entries were dropped since the consumer last drained past
+    /// this point; the next pop delivers the marker before post-gap data.
+    gap_pending: bool,
+    /// The owning session is gone; `recv` returns `None` once drained.
+    detached: bool,
+    /// Byte bound for `entries` (tests shrink it; production uses
+    /// [`LISTENER_QUEUE_MAX_BYTES`]).
+    max_queued_bytes: usize,
+}
+
+/// Shared half of one attached listener: the session side pushes under the
+/// output-hub lock, the [`TerminalListener`] handle drains.
+struct ListenerShared {
+    queue: StdMutex<ListenerQueue>,
+    notify: tokio::sync::Notify,
+    /// Set when the `TerminalListener` handle drops; the fan-out prunes.
+    closed: AtomicBool,
+}
+
+impl ListenerShared {
+    fn new(max_queued_bytes: usize) -> Self {
+        Self {
+            queue: StdMutex::new(ListenerQueue {
+                entries: VecDeque::new(),
+                queued_bytes: 0,
+                gap_pending: false,
+                detached: false,
+                max_queued_bytes,
+            }),
+            notify: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn push_event(&self, event: TerminalEvent) {
+        {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            match event {
+                TerminalEvent::Output(bytes) => {
+                    if bytes.is_empty() {
+                        return;
+                    }
+                    q.queued_bytes += bytes.len();
+                    // Entry merge cap: never more than half the queue
+                    // bound, so overflow always has an oldest entry
+                    // distinct from the newest one to drop.
+                    let merge_cap = LISTENER_MERGE_ENTRY_CAP.min(q.max_queued_bytes / 2);
+                    let merged = match q.entries.back_mut() {
+                        Some(TerminalEvent::Output(tail))
+                            if tail.len() + bytes.len() <= merge_cap =>
+                        {
+                            tail.extend_from_slice(&bytes);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !merged {
+                        q.entries.push_back(TerminalEvent::Output(bytes));
+                    }
+                    // Enforce the byte bound by dropping the oldest output.
+                    // Never drop the entry just pushed (`len() > 1`) and
+                    // never drop an `Exited`.
+                    while q.queued_bytes > q.max_queued_bytes && q.entries.len() > 1 {
+                        let drop_len = match q.entries.front() {
+                            Some(TerminalEvent::Output(front)) => front.len(),
+                            _ => break,
+                        };
+                        q.entries.pop_front();
+                        q.queued_bytes -= drop_len;
+                        q.gap_pending = true;
+                    }
+                }
+                TerminalEvent::Exited { .. } => {
+                    q.entries.push_back(event);
+                }
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    fn mark_detached(&self) {
+        {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.detached = true;
+        }
+        self.notify.notify_one();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+}
+
+/// What `recv` should do next, decided under the queue lock.
+enum RecvStep {
+    Deliver(TerminalEvent),
+    /// Output is queued but small and fresh — linger one coalescing
+    /// window so trailing fragments merge into the same event.
+    Linger,
+    /// Nothing queued — park on the notify.
+    Wait,
+    Done,
+}
+
+/// Receiving half of one attachment, returned by [`PtySession::attach`].
+/// Dropping it detaches: the session's fan-out prunes the queue on its
+/// next event.
+pub struct TerminalListener {
+    shared: Arc<ListenerShared>,
+}
+
+impl Drop for TerminalListener {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+impl TerminalListener {
+    /// Next event for this listener, coalesced: bursts of PTY fragments
+    /// merge into one `Output` (bounded by [`LISTENER_MERGE_ENTRY_CAP`]),
+    /// waiting at most [`OUTPUT_COALESCE_WINDOW`] beyond first
+    /// availability. Returns `None` once the session is gone and the
+    /// queue is drained.
+    pub async fn recv(&mut self) -> Option<TerminalEvent> {
+        self.recv_with_window(OUTPUT_COALESCE_WINDOW).await
+    }
+
+    async fn recv_with_window(&mut self, window: Duration) -> Option<TerminalEvent> {
+        let mut lingered = false;
+        loop {
+            let notified = self.shared.notify.notified();
+            let step = {
+                let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.gap_pending && !q.entries.is_empty() {
+                    // The marker is delivered at the gap position — before
+                    // the oldest retained post-gap entry. Not coalesced
+                    // with real output so it always stands alone.
+                    q.gap_pending = false;
+                    RecvStep::Deliver(TerminalEvent::Output(OUTPUT_DROPPED_MARKER.to_vec()))
+                } else if q.entries.is_empty() {
+                    if q.detached {
+                        RecvStep::Done
+                    } else {
+                        RecvStep::Wait
+                    }
+                } else {
+                    let deliver_now = lingered
+                        || window.is_zero()
+                        || q.queued_bytes >= OUTPUT_COALESCE_SKIP_BYTES
+                        || matches!(q.entries.front(), Some(TerminalEvent::Exited { .. }));
+                    if deliver_now {
+                        match q.entries.pop_front() {
+                            Some(TerminalEvent::Output(bytes)) => {
+                                q.queued_bytes -= bytes.len();
+                                RecvStep::Deliver(TerminalEvent::Output(bytes))
+                            }
+                            Some(event @ TerminalEvent::Exited { .. }) => RecvStep::Deliver(event),
+                            None => RecvStep::Wait,
+                        }
+                    } else {
+                        RecvStep::Linger
+                    }
+                }
+            };
+            match step {
+                RecvStep::Deliver(event) => return Some(event),
+                RecvStep::Done => return None,
+                RecvStep::Linger => {
+                    tokio::time::sleep(window).await;
+                    lingered = true;
+                }
+                RecvStep::Wait => notified.await,
+            }
+        }
+    }
+}
+
+/// Scrollback and the attached listeners under ONE lock: the reader's
+/// push+fan-out and attach's snapshot+register are each atomic with
+/// respect to the other, so an attaching client can neither lose a chunk
+/// (pushed after its snapshot, broadcast before it registered) nor see
+/// one twice (pushed before its snapshot, broadcast after it registered).
+struct OutputHub {
+    scrollback: Scrollback,
+    listeners: Vec<Arc<ListenerShared>>,
+}
+
+impl OutputHub {
+    fn new(scrollback_capacity: usize) -> Self {
+        Self {
+            scrollback: Scrollback::new(scrollback_capacity),
+            listeners: Vec::new(),
+        }
+    }
+
+    fn fan_out(&mut self, chunk: &[u8]) {
+        self.scrollback.push(chunk);
+        self.listeners.retain(|listener| !listener.is_closed());
+        for listener in &self.listeners {
+            listener.push_event(TerminalEvent::Output(chunk.to_vec()));
+        }
+    }
+
+    fn fan_out_exit(&mut self, status: i32) {
+        self.listeners.retain(|listener| !listener.is_closed());
+        for listener in &self.listeners {
+            listener.push_event(TerminalEvent::Exited { status });
+        }
+    }
+
+    fn attach(&mut self, max_queued_bytes: usize) -> TerminalListener {
+        let shared = Arc::new(ListenerShared::new(max_queued_bytes));
+        let snapshot = self.scrollback.snapshot();
+        if !snapshot.is_empty() {
+            shared.push_event(TerminalEvent::Output(snapshot));
+        }
+        self.listeners.push(shared.clone());
+        TerminalListener { shared }
+    }
+
+    fn detach_all(&self) {
+        for listener in &self.listeners {
+            listener.mark_detached();
+        }
     }
 }
 
@@ -460,8 +726,7 @@ impl Scrollback {
 pub struct PtySession {
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
-    listeners: StdMutex<Vec<mpsc::UnboundedSender<TerminalEvent>>>,
-    scrollback: StdMutex<Scrollback>,
+    output: StdMutex<OutputHub>,
     alive: StdMutex<bool>,
     /// Windows: the refcounted RESTRICTED ACE grants for this session's
     /// scope roots. Held for the session's lifetime so overlapping scoped
@@ -574,8 +839,7 @@ impl PtySession {
         let session = Arc::new(Self {
             master: StdMutex::new(pair.master),
             writer: StdMutex::new(writer),
-            listeners: StdMutex::new(Vec::new()),
-            scrollback: StdMutex::new(Scrollback::new(SCROLLBACK_LIMIT)),
+            output: StdMutex::new(OutputHub::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
             #[cfg(windows)]
             scope_grants,
@@ -727,10 +991,11 @@ impl PtySession {
                             let _ = w.flush();
                         }
                     }
-                    if let Ok(mut sb) = session.scrollback.lock() {
-                        sb.push(&chunk);
-                    }
-                    session.broadcast(TerminalEvent::Output(chunk));
+                    // Scrollback push + listener fan-out under the ONE
+                    // output-hub lock, atomic against `attach`'s
+                    // snapshot+register (see [`OutputHub`]).
+                    let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
+                    hub.fan_out(&chunk);
                 }
                 Err(_) => break,
             }
@@ -745,14 +1010,8 @@ impl PtySession {
         if let Ok(mut alive) = session.alive.lock() {
             *alive = false;
         }
-        session.broadcast(TerminalEvent::Exited { status });
-    }
-
-    fn broadcast(&self, event: TerminalEvent) {
-        if let Ok(mut listeners) = self.listeners.lock() {
-            // Prune any senders whose receivers have been dropped.
-            listeners.retain(|tx| tx.send(event.clone()).is_ok());
-        }
+        let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
+        hub.fan_out_exit(status);
     }
 
     /// Write bytes to the PTY stdin. Silently drops if the writer has
@@ -775,22 +1034,14 @@ impl PtySession {
         }
     }
 
-    /// Attach a new listener. Immediately replays the scrollback buffer
-    /// to the listener before any live bytes arrive, so a reconnecting
-    /// client sees what it missed.
-    pub fn attach(&self, tx: mpsc::UnboundedSender<TerminalEvent>) {
-        // Replay scrollback first.
-        let snapshot = self
-            .scrollback
-            .lock()
-            .map(|sb| sb.snapshot())
-            .unwrap_or_default();
-        if !snapshot.is_empty() {
-            let _ = tx.send(TerminalEvent::Output(snapshot));
-        }
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(tx);
-        }
+    /// Attach a new listener. The scrollback snapshot is seeded into the
+    /// listener's queue and the listener registered in ONE critical
+    /// section on the output hub, so a chunk racing in from the reader
+    /// thread is either in the snapshot or delivered live — never both,
+    /// never neither. The snapshot replays before any live bytes.
+    pub fn attach(&self) -> TerminalListener {
+        let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        hub.attach(LISTENER_QUEUE_MAX_BYTES)
     }
 
     pub fn is_alive(&self) -> bool {
@@ -827,6 +1078,18 @@ impl PtySession {
         match actor {
             TerminalActor::Root => true,
             TerminalActor::Principal(id) => self.owner.as_deref() == Some(id.as_str()),
+        }
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // The session (registry entry + reader thread) is gone: wake every
+        // parked listener so `recv` drains what's queued and returns
+        // `None` — the same end-of-stream the old dropped-sender channels
+        // signalled.
+        if let Ok(hub) = self.output.lock() {
+            hub.detach_all();
         }
     }
 }
@@ -996,11 +1259,7 @@ mod tests {
     /// chunk, so a token split across PTY read chunks still matches.
     /// Panics loudly — including everything that WAS received — on
     /// deadline, shell exit, or channel close.
-    async fn expect_output(
-        rx: &mut mpsc::UnboundedReceiver<TerminalEvent>,
-        needle: Option<&str>,
-        phase: &str,
-    ) -> String {
+    async fn expect_output(rx: &mut TerminalListener, needle: Option<&str>, phase: &str) -> String {
         let deadline = tokio::time::Instant::now() + OUTPUT_BUDGET;
         let mut transcript = String::new();
         loop {
@@ -1038,8 +1297,7 @@ mod tests {
             .unwrap();
         assert!(created);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        session.attach(tx);
+        let mut rx = session.attach();
 
         // Don't type until the shell has painted something: zsh's tty
         // setup flushes pending input, so bytes written during startup can
@@ -1067,10 +1325,9 @@ mod tests {
         // for the shell to paint before typing (startup can flush pending
         // input — see open_attach_write_and_receive_output), and confirm
         // the token echoed before detaching: the reader thread pushes to
-        // scrollback before broadcasting, so once a listener saw the
-        // token the scrollback provably contains it.
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        session.attach(tx1);
+        // scrollback before broadcasting (one critical section), so once a
+        // listener saw the token the scrollback provably contains it.
+        let mut rx1 = session.attach();
         expect_output(&mut rx1, None, "shell startup").await;
         // CR (Enter), not LF — see open_attach_write_and_receive_output.
         session.write_input(b"echo scroll_token_abc\r");
@@ -1080,8 +1337,7 @@ mod tests {
         // Reattach with a fresh listener and expect the scrollback replay
         // to contain the token — no additional commands driven, so the
         // token can only come from the replay.
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
-        session.attach(tx2);
+        let mut rx2 = session.attach();
         expect_output(&mut rx2, Some("scroll_token_abc"), "scrollback replay").await;
     }
 
@@ -1179,6 +1435,143 @@ mod tests {
         assert!(!session.managed_by(&other));
         assert!(registry.close_visible(&key, &TerminalActor::Root).await);
         assert_eq!(registry.len().await, 0);
+    }
+
+    /// Drain everything currently available from `listener` with no
+    /// coalescing linger, appending output bytes to `out`. Returns the
+    /// exit status if an `Exited` was drained.
+    async fn drain_now(listener: &mut TerminalListener, out: &mut Vec<u8>) -> Option<i32> {
+        loop {
+            let step = {
+                let q = listener
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                q.entries.is_empty() && !q.gap_pending
+            };
+            if step {
+                return None;
+            }
+            match listener.recv_with_window(Duration::ZERO).await {
+                Some(TerminalEvent::Output(bytes)) => out.extend_from_slice(&bytes),
+                Some(TerminalEvent::Exited { status }) => return Some(status),
+                None => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn scrollback_ring_keeps_exactly_the_tail() {
+        let mut ring = Scrollback::new(8);
+        ring.push(b"abcd");
+        assert_eq!(ring.snapshot(), b"abcd");
+        ring.push(b"efgh");
+        assert_eq!(ring.snapshot(), b"abcdefgh");
+        // Overflow trims from the FRONT, byte-exactly.
+        ring.push(b"XY");
+        assert_eq!(ring.snapshot(), b"cdefghXY");
+        // A push larger than capacity keeps its own tail.
+        ring.push(b"0123456789AB");
+        assert_eq!(ring.snapshot(), b"456789AB");
+    }
+
+    #[test]
+    fn production_scrollback_capacity_is_256k() {
+        assert_eq!(SCROLLBACK_LIMIT, 256 * 1024);
+    }
+
+    /// The attach race, deterministically: bytes fanned out before the
+    /// attach land in the snapshot; bytes fanned out after it arrive
+    /// live — each byte exactly once, in order, regardless of the
+    /// interleave point.
+    #[tokio::test]
+    async fn attach_snapshot_and_live_bytes_are_exactly_once_in_order() {
+        let mut hub = OutputHub::new(SCROLLBACK_LIMIT);
+        hub.fan_out(b"A1");
+        let mut listener = hub.attach(LISTENER_QUEUE_MAX_BYTES);
+        hub.fan_out(b"B2");
+        hub.fan_out(b"C3");
+
+        let mut got = Vec::new();
+        assert_eq!(drain_now(&mut listener, &mut got).await, None);
+        assert_eq!(got, b"A1B2C3");
+
+        // A second attacher's snapshot has everything so far, once.
+        let mut late = hub.attach(LISTENER_QUEUE_MAX_BYTES);
+        let mut late_got = Vec::new();
+        assert_eq!(drain_now(&mut late, &mut late_got).await, None);
+        assert_eq!(late_got, b"A1B2C3");
+    }
+
+    /// Consecutive output fragments merge into one queue entry (fewer,
+    /// larger events on the wire) without changing the byte stream.
+    #[tokio::test]
+    async fn listener_queue_merges_adjacent_output() {
+        let mut hub = OutputHub::new(SCROLLBACK_LIMIT);
+        let mut listener = hub.attach(LISTENER_QUEUE_MAX_BYTES);
+        for fragment in [b"one ".as_slice(), b"two ", b"three"] {
+            hub.fan_out(fragment);
+        }
+        {
+            let q = listener
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(q.entries.len(), 1, "fragments should tail-merge");
+        }
+        let mut got = Vec::new();
+        drain_now(&mut listener, &mut got).await;
+        assert_eq!(got, b"one two three");
+    }
+
+    /// A listener that stops draining is bounded: oldest output drops, a
+    /// visible marker splices at the gap, newest output and the exit
+    /// event survive.
+    #[tokio::test]
+    async fn listener_queue_drops_oldest_with_visible_marker() {
+        let mut hub = OutputHub::new(SCROLLBACK_LIMIT);
+        // Tiny queue (2 entries of <=8 bytes once the merge cap is
+        // considered) so the test overflows deterministically. Merge cap
+        // still applies per entry, so use fragments larger than half the
+        // bound to prevent merging.
+        let mut listener = hub.attach(16);
+        hub.fan_out(b"AAAAAAAAAA"); // 10 bytes, entry 1
+        hub.fan_out(b"BBBBBBBBBB"); // 10 bytes, entry 2 -> over 16, drops A
+        hub.fan_out_exit(0);
+
+        let mut got = Vec::new();
+        let status = drain_now(&mut listener, &mut got).await;
+        assert_eq!(status, Some(0), "Exited must never be dropped");
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.starts_with("\r\n[...output dropped...]\r\n"),
+            "gap marker must precede post-gap output: {text:?}"
+        );
+        assert!(
+            text.ends_with("BBBBBBBBBB"),
+            "newest output survives: {text:?}"
+        );
+        assert!(!text.contains('A'), "oldest output was dropped: {text:?}");
+    }
+
+    /// Dropping the receiving handle prunes the listener from the hub on
+    /// the next fan-out; a detached hub ends the stream with `None`.
+    #[tokio::test]
+    async fn dropped_listener_prunes_and_detach_ends_stream() {
+        let mut hub = OutputHub::new(SCROLLBACK_LIMIT);
+        let listener = hub.attach(LISTENER_QUEUE_MAX_BYTES);
+        let mut kept = hub.attach(LISTENER_QUEUE_MAX_BYTES);
+        drop(listener);
+        hub.fan_out(b"after-drop");
+        assert_eq!(hub.listeners.len(), 1, "closed listener pruned on fan-out");
+
+        hub.detach_all();
+        let mut got = Vec::new();
+        assert_eq!(drain_now(&mut kept, &mut got).await, None);
+        assert_eq!(got, b"after-drop");
+        assert!(kept.recv_with_window(Duration::ZERO).await.is_none());
     }
 
     #[test]
@@ -1333,8 +1726,7 @@ mod tests {
             .unwrap();
         assert!(created);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        session.attach(tx);
+        let mut rx = session.attach();
 
         // Let the shell finish initializing before typing: zsh's tty
         // setup flushes pending input, so bytes written during startup are
