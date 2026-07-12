@@ -146,6 +146,9 @@ pub(crate) enum SupersessionMark {
 /// restores their generation (Codex re-writes restored turns into the new
 /// generation, so reactivation-by-rewrite appears as fresh records; the
 /// mark exists so records of abandoned generations stop reading active).
+// The one un-wired piece of the extraction pipeline: the C1 query side
+// is its production consumer (extractor tests replay it today).
+#[allow(dead_code)]
 pub(crate) fn derive_active(records: &[MessageRecord], marks: &[SupersessionMark]) -> Vec<bool> {
     let mut active: Vec<bool> = records.iter().map(|_| true).collect();
     let mut active_generation: Generation = records

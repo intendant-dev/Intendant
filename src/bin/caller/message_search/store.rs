@@ -236,6 +236,8 @@ impl Store {
     }
 
     /// Deliberate session deletion: drop the shard and tombstone the key.
+    // Un-wired until the dashboard/API deletion flow lands with C1.
+    #[allow(dead_code)]
     pub(crate) fn delete_session(&self, session_key: &str) -> std::io::Result<()> {
         let _lock = WriterLock::acquire(&self.root)?;
         let mut manifest = self.read_manifest();

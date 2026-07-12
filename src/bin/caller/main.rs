@@ -3460,8 +3460,13 @@ async fn main() -> Result<(), CallerError> {
     // deleting materializations even when the lease store sees no calls.
     credential_leases::startup_materialization_sweep();
     // Message-search retention: expired shards die at boot (plan §6 —
-    // the store must not accumulate while no extractor runs).
+    // the sweep's own GC rides a slow cadence).
     message_search::startup_gc();
+    // The message-search indexer: a 30s cursor-driven sweep over this
+    // box's session logs, Codex/Claude homes (including leased-active
+    // ones), and staged lease remnants. First sweep runs one interval
+    // after boot, so one-shot CLI runs exit before paying for it.
+    message_search::spawn_indexer();
     tokio::spawn(async {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
