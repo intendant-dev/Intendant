@@ -1,3 +1,10 @@
+// Item 2: bounded auto-retry bookkeeping for peer displays, keyed
+// `${hostId}|${displayId}`. Lives at module scope (not on the connection)
+// because every retry replaces the PeerDisplayConnection with a fresh one
+// via the full open path — the budget must survive that. Reset on a
+// successful connect and by the manual Retry button.
+const peerDisplayReconnectAttempts = new Map();
+
 class PeerDisplayConnection {
   constructor(hostId, displayId, sessionId, advertiseTcpViaUrl) {
     this.hostId = hostId;
@@ -68,7 +75,30 @@ class PeerDisplayConnection {
     // is the security boundary; this flag is UX consistency only.
     this.interactive = false;
     this._boundHandlers = {};
-    this._heldModifiers = new Set();
+    // Item 3: every held key code (not just modifiers) — see the local
+    // DisplaySlot's `_heldKeys` for the latched-key rationale.
+    this._heldKeys = new Set();
+    // Set by `_enterInteractive`; lets `_exitInteractive` /
+    // `releaseControl` flush synthetic keyups while the send closure
+    // still exists (and, for release, while we still hold authority).
+    this._flushHeldKeys = null;
+    // Item 2: bounded auto-retry state. The attempt COUNTER lives in the
+    // module-level `peerDisplayReconnectAttempts` map keyed by
+    // host|display, because each retry replaces this object with a fresh
+    // PeerDisplayConnection (fresh session id) via the full open path.
+    this._retryTimer = null;
+    // Item 5: in-stage status overlay state, persisted across the
+    // daemons-list re-renders that rebuild the pane DOM.
+    this._overlay = null;
+    this._firstFrameSeen = false;
+    // Item 6: live metrics chip sampler.
+    this._statsTimer = null;
+    this._statsPrev = null;
+    this._metricsText = '';
+    // Item 7a: revert timer for the transient "Stream fell back to …" note.
+    this._fallbackNoteTimer = null;
+    // Item 7b: 5s no-answer timeout for Take Control.
+    this._takePendingTimer = null;
     // **Phase 0 visual-freshness sampler** (task #83). `null` unless
     // the dashboard URL is opened with `?diag=1`. Activated in
     // `ontrack` once the video stream is attached (so videoWidth /
@@ -96,6 +126,9 @@ class PeerDisplayConnection {
       const message = 'peer did not answer — its display may need a capture grant';
       this._log('warn', `no video track within ${PeerDisplayConnection.NO_TRACK_TIMEOUT_MS}ms — ${message}`);
       this.setStatus(message, 'error');
+      // Item 5: the watchdog verdict belongs on the stage too, with a
+      // Retry that re-runs the open path.
+      this._setStageOverlay('error', `No video within ${Math.round(PeerDisplayConnection.NO_TRACK_TIMEOUT_MS / 1000)}s — ${message}.`, true);
       stationPublishActivityEvent({
         id: `peer-display-timeout:${this.hostId}:${this.displayId}:${this.sessionId}`,
         hostId: this.hostId,
@@ -130,16 +163,29 @@ class PeerDisplayConnection {
   // the freshly-built pane needs to reflect the LATEST
   // `peerAuthorityState`, not the default 'unknown' — so this
   // function calls `_renderAuthorityChip()` after binding handlers.
-  attachToDom() {
-    const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
-    const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
+  // Resolve the container that hosts (or should host) this connection's
+  // pane: the Station endpoint when the Station tab is active, else the
+  // daemons-list panel, else the Station fallback. This is the single
+  // resolution rule — `ontrack` and `_handleTileWireMessage` reuse it so
+  // Station-hosted panes get the same treatment as list-hosted ones
+  // (they used to query only `peer-display-${hostId}` and dead-ended on
+  // Station). `createFallback: false` makes it a pure query.
+  _resolveContainer(createFallback = true) {
+    const preferStation = stationPeerDisplayPrefersStationEndpoint();
+    return (preferStation && stationPeerDisplayContainer(this.hostId, createFallback, true))
       || document.getElementById(`peer-display-${this.hostId}`)
-      || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
+      || stationPeerDisplayContainer(this.hostId, preferStation && createFallback);
+  }
+
+  attachToDom() {
+    const container = this._resolveContainer();
     if (!container) return;
     if (!container.querySelector('.peer-display-pane')) {
       container.innerHTML = `
         <div class="peer-display-pane" data-host-id="${escapeHtml(this.hostId)}">
           <video class="peer-display-video" autoplay playsinline muted></video>
+          <div class="display-stage-overlay" style="display:none"></div>
+          <div class="display-live-metrics" style="display:none"></div>
           <div class="peer-display-controls">
             <span class="peer-display-status">${escapeHtml(this.displayStatusText)}</span>
             <span class="peer-display-authority display-input-authority"
@@ -153,6 +199,9 @@ class PeerDisplayConnection {
                     data-host-id="${escapeHtml(this.hostId)}"
                     style="display:none"
                     title="Release federated input control and return to view-only">Release</button>
+            <button class="ann-attach-btn peer-display-attach"
+                    data-host-id="${escapeHtml(this.hostId)}"
+                    title="Capture current frame and attach to next task">Attach</button>
             <button class="peer-display-close" data-host-id="${escapeHtml(this.hostId)}">Close</button>
           </div>
         </div>`;
@@ -169,6 +218,10 @@ class PeerDisplayConnection {
       const releaseBtn = container.querySelector('.release-control-btn');
       if (releaseBtn) {
         releaseBtn.addEventListener('click', () => this.releaseControl());
+      }
+      const attachBtn = container.querySelector('.peer-display-attach');
+      if (attachBtn) {
+        attachBtn.addEventListener('click', () => this.attachCurrentFrame(attachBtn));
       }
     }
     container.style.display = 'block';
@@ -192,8 +245,11 @@ class PeerDisplayConnection {
     // F-1.3c: re-render the chip from the latest state so a daemons-
     // list re-render that destroyed the prior pane doesn't reset the
     // chip to 'unknown' — the live `peerAuthorityState` survives the
-    // DOM swap on the connection object.
+    // DOM swap on the connection object. Same for the stage overlay and
+    // the live metrics chip, whose state also lives on the connection.
     this._renderAuthorityChip();
+    this._applyStageOverlayDom();
+    this._applyMetricsDom(this._metricsText);
     // F-2 lifecycle: if the panel was rebuilt while we still hold
     // input authority, our `_boundHandlers` are bound to the
     // now-detached prior video element. Force-clear interactive
@@ -210,9 +266,15 @@ class PeerDisplayConnection {
     // `_enterInteractive` install fresh bindings on the current
     // video element.
     if (this.peerAuthorityState === 'you') {
+      // Flush held keys through the still-open channels before dropping
+      // the stale bindings — the destroyed pane never fired blur.
+      if (this._flushHeldKeys) {
+        try { this._flushHeldKeys(); } catch (_) {}
+        this._flushHeldKeys = null;
+      }
       this.interactive = false;
       this._boundHandlers = {};
-      if (this._heldModifiers) this._heldModifiers.clear();
+      if (this._heldKeys) this._heldKeys.clear();
       this._enterInteractive();
     }
   }
@@ -229,7 +291,190 @@ class PeerDisplayConnection {
     }
   }
 
+  // ── Item 5: in-stage status overlay (peer pane) ─────────────────────
+  // State lives on the connection (`this._overlay`) and is re-applied
+  // into every pane the host currently has (daemons list + Station
+  // endpoint) — the pane DOM is rebuilt on every daemons-list re-render.
+  _setStageOverlay(mode, text, retry = false) {
+    this._overlay = mode ? { mode, text: text || '', retry: !!retry } : null;
+    this._applyStageOverlayDom();
+  }
+
+  _applyStageOverlayDom() {
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
+      const el = container.querySelector('.display-stage-overlay');
+      if (!el) continue;
+      el.textContent = '';
+      if (!this._overlay) {
+        el.style.display = 'none';
+        el.classList.remove('error');
+        continue;
+      }
+      el.classList.toggle('error', this._overlay.mode === 'error');
+      const inner = document.createElement('div');
+      inner.className = 'stage-overlay-inner';
+      if (this._overlay.mode !== 'error') {
+        const spinner = document.createElement('span');
+        spinner.className = 'stage-overlay-spinner';
+        inner.appendChild(spinner);
+      }
+      const label = document.createElement('span');
+      label.className = 'stage-overlay-text';
+      label.textContent = this._overlay.text;
+      inner.appendChild(label);
+      if (this._overlay.retry) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'stage-overlay-retry';
+        btn.textContent = 'Retry';
+        btn.addEventListener('click', () => this.retry());
+        inner.appendChild(btn);
+      }
+      el.appendChild(inner);
+      el.style.display = '';
+    }
+  }
+
+  // ── Item 2: retry / bounded auto-reconnect ──────────────────────────
+  // A retry re-runs the FULL open path (fresh session id, fresh
+  // PeerDisplayConnection) — re-offering on the same session id is not a
+  // wire shape the peer's WebRtcPeer lifecycle supports. Manual retry
+  // (button) resets the attempt budget; auto-retry consumes it.
+  retry() {
+    peerDisplayReconnectAttempts.delete(`${this.hostId}|${this.displayId}`);
+    openPeerDisplay(this.hostId, this.displayId, this.advertiseTcpViaUrl)
+      .catch(err => this._log('warn', `manual retry failed: ${err.message}`));
+  }
+
+  _scheduleAutoRetry() {
+    const key = `${this.hostId}|${this.displayId}`;
+    const attempts = (peerDisplayReconnectAttempts.get(key) || 0) + 1;
+    peerDisplayReconnectAttempts.set(key, attempts);
+    if (attempts > 5) {
+      this.setStatus('Connection failed after 5 attempts', 'error');
+      this._setStageOverlay('error', 'Connection failed after 5 attempts.', true);
+      return;
+    }
+    const delay = Math.min(2000 * attempts, 10000);
+    this.setStatus(`Connection failed — retrying in ${delay / 1000}s (attempt ${attempts} of 5)…`, 'error');
+    this._setStageOverlay('progress', `Connection failed — retrying in ${delay / 1000}s (attempt ${attempts} of 5)…`);
+    this._log('warn', `connection failed — auto-retry ${attempts}/5 in ${delay}ms`);
+    if (this._retryTimer) window.clearTimeout(this._retryTimer);
+    this._retryTimer = window.setTimeout(() => {
+      this._retryTimer = null;
+      // Bail if the user closed the pane (close() deregisters us) or a
+      // manual retry already replaced this connection.
+      if (peerDisplayConnections.get(this.sessionKey()) !== this) return;
+      openPeerDisplay(this.hostId, this.displayId, this.advertiseTcpViaUrl)
+        .catch(err => this._log('warn', `auto-retry open failed: ${err.message}`));
+    }, delay);
+  }
+
+  // ── Item 6: live metrics chip (getStats sampler) ────────────────────
+  _startStatsSampler() {
+    if (this._statsTimer) return;
+    this._statsPrev = null;
+    this._statsTimer = window.setInterval(() => {
+      this._sampleStats().catch(() => {});
+    }, 3000);
+    this._sampleStats().catch(() => {});
+  }
+
+  _stopStatsSampler() {
+    if (this._statsTimer) {
+      window.clearInterval(this._statsTimer);
+      this._statsTimer = null;
+    }
+    this._statsPrev = null;
+    this._applyMetricsDom('');
+  }
+
+  async _sampleStats() {
+    if (!this.pc || this.pc.connectionState !== 'connected') return;
+    const stats = await this.pc.getStats();
+    // Shared summarizer with the local DisplaySlot chip (45-displays).
+    const summary = summarizeRtcStats(stats, this._statsPrev);
+    this._statsPrev = summary.snapshot;
+    if (summary.text) this._applyMetricsDom(summary.text);
+  }
+
+  _applyMetricsDom(text) {
+    this._metricsText = text || '';
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
+      const el = container.querySelector('.display-live-metrics');
+      if (!el) continue;
+      el.textContent = this._metricsText;
+      el.style.display = this._metricsText ? '' : 'none';
+      el.classList.toggle('active', !!this._metricsText);
+    }
+  }
+
+  // ── Item 11: capture + attach (peer parity with the local Attach) ───
+  // Rasterizes whichever surface is live (tile canvas or video) and
+  // queues it as a pending attachment through the same transport-
+  // abstracted annotation lane the local slot uses.
+  captureCurrentFrame(quality = 0.85) {
+    const surface = this._interactiveSurfaceCandidate();
+    if (!surface) return null;
+    const isCanvas = typeof HTMLCanvasElement !== 'undefined' && surface instanceof HTMLCanvasElement;
+    const w = isCanvas ? surface.width : surface.videoWidth;
+    const h = isCanvas ? surface.height : surface.videoHeight;
+    if (!w || !h) return null;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d').drawImage(surface, 0, 0, w, h);
+    const dataUrl = c.toDataURL('image/jpeg', quality);
+    return { canvas: c, dataUrl, b64: dataUrl.split(',')[1], width: w, height: h };
+  }
+
+  async attachCurrentFrame(btn = null) {
+    const frame = this.captureCurrentFrame(0.85);
+    if (!frame) {
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'No frame available from this peer display yet');
+      }
+      return;
+    }
+    if (!this._attachCounter) this._attachCounter = 0;
+    this._attachCounter++;
+    const safeHost = String(this.hostId).replace(/[^a-zA-Z0-9_.-]/g, '_');
+    const stream = `peer_${safeHost}_display_${this.displayId}_attach`;
+    const frameId = stream + '-f' + String(this._attachCounter).padStart(5, '0');
+    const payload = {
+      t: 'annotation_attach',
+      frame_id: frameId,
+      stream,
+      data: frame.b64,
+      note: '',
+    };
+    try {
+      await sendDashboardMediaUpload(
+        'api_media_annotation_attach',
+        { frame_id: frameId, stream, note: '' },
+        dashboardControlBase64ToBytes(frame.b64),
+        payload,
+        'annotation attach'
+      );
+    } catch (err) {
+      dashboardMediaTransferFailed(err, 'annotation attach');
+      return;
+    }
+    if (typeof addPendingAttachment === 'function') {
+      addPendingAttachment({ frameId, stream, note: '', dataUrl: frame.dataUrl });
+    }
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = '✓ Attached';
+      window.setTimeout(() => { btn.textContent = orig; }, 1500);
+    }
+  }
+
   async connect() {
+    // Item 5: stage the time-to-first-frame copy where the user is
+    // looking (the pane), not just the small status text.
+    this._firstFrameSeen = false;
+    this._setStageOverlay('progress', 'Negotiating…');
     // ICE config — same shared helper as the local primary-display path
     // (DisplaySlot.connect). Default is empty (trust-the-network LAN
     // deployment); operators wanting STUN/TURN-relay-style ICE on the
@@ -456,16 +701,31 @@ class PeerDisplayConnection {
     this.pc.ontrack = (e) => {
       this._clearNoTrackWatchdog();
       this.stream = e.streams[0];
-      const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
-      const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
-        || document.getElementById(`peer-display-${this.hostId}`)
-        || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
+      const container = this._resolveContainer();
       const videoEl = container && container.querySelector('.peer-display-video');
       if (videoEl) {
         videoEl.srcObject = this.stream;
         // See the reapply path above: explicit play() because autoplay
         // doesn't re-fire on (re)attached offscreen elements.
         videoEl.play().catch(() => {});
+      }
+      // Item 5: track arrived, frames haven't — stage the last step and
+      // drop the overlay on the first actually-rendered frame.
+      if (!this._firstFrameSeen) {
+        this._setStageOverlay('progress', 'Waiting for first frame…');
+      }
+      const markFirstFrame = () => {
+        if (!this.pc) return; // closed before the first frame
+        this._firstFrameSeen = true;
+        this._setStageOverlay(null);
+      };
+      if (videoEl && typeof videoEl.requestVideoFrameCallback === 'function') {
+        videoEl.requestVideoFrameCallback(() => markFirstFrame());
+      } else if (videoEl) {
+        if (videoEl.readyState >= 2) markFirstFrame();
+        else videoEl.addEventListener('loadeddata', markFirstFrame, { once: true });
+      } else {
+        markFirstFrame();
       }
       if (videoEl) {
         stationRegisterVideoSource(
@@ -565,11 +825,20 @@ class PeerDisplayConnection {
       const state = this.pc.connectionState;
       this._log('debug', `connectionState=${state}`);
       if (state === 'connected') {
+        peerDisplayReconnectAttempts.delete(`${this.hostId}|${this.displayId}`);
         this.setStatus('Connected (view-only)', 'connected');
+        this._startStatsSampler();
       } else if (state === 'failed') {
-        this.setStatus('Connection failed', 'error');
+        // Item 2: port of the local retry policy — bounded attempts with
+        // backoff, then a dead-end state that offers a Retry button
+        // (previously 'failed' was terminal with only Close available).
+        this._stopStatsSampler();
+        this._scheduleAutoRetry();
       } else if (state === 'disconnected') {
-        this.setStatus('Disconnected', 'error');
+        // Transient more often than not — matches the local slot's copy.
+        // If it hardens into 'failed', the auto-retry above kicks in.
+        this._stopStatsSampler();
+        this.setStatus('Connection interrupted — recovering…', 'warn');
       }
     };
 
@@ -618,6 +887,9 @@ class PeerDisplayConnection {
     } catch (err) {
       this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
+      // Item 5: offer failure was a quiet status line — surface it on
+      // the stage with a way out.
+      this._setStageOverlay('error', `Offer failed: ${err.message}`, true);
     }
   }
 
@@ -638,10 +910,14 @@ class PeerDisplayConnection {
           );
         }
         this._pendingCandidates = [];
+        if (!this._firstFrameSeen && !this.stream) {
+          this._setStageOverlay('progress', 'Waiting for first frame…');
+        }
       })
       .catch((err) => {
         this._log('error', `setRemoteDescription(answer) failed: ${err.message}`);
         this.setStatus(`Answer failed: ${err.message}`, 'error');
+        this._setStageOverlay('error', `Answer failed: ${err.message}`, true);
       });
   }
 
@@ -683,7 +959,10 @@ class PeerDisplayConnection {
           this._log('debug', `${label} tile frame before snapshot: ${parsed.type}`);
           return;
         }
-        const container = document.getElementById(`peer-display-${this.hostId}`);
+        // Item 4: resolve the live container (Station endpoint included)
+        // — the getElementById-only lookup dead-ended tile streams on
+        // Station-hosted panes.
+        const container = this._resolveContainer();
         if (!container) return;
         this.tileCompositor = new TileCompositor(
           container.querySelector('.peer-display-pane') || container,
@@ -694,6 +973,10 @@ class PeerDisplayConnection {
             sendControlFrame: (bytes) => this._sendTileControlFrame(bytes),
           },
         );
+        // Tile mode's "first frame": the compositor exists and is about
+        // to paint the snapshot — drop the connecting overlay.
+        this._firstFrameSeen = true;
+        this._setStageOverlay(null);
         if (diagModeEnabled()) {
           if (this._diagSampler) {
             try { this._diagSampler.stop(); } catch (e) {
@@ -716,10 +999,30 @@ class PeerDisplayConnection {
       }
       const parsed = this.tileCompositor.onWireFrame(data);
       this._syncDiagSamplerForTileSurface(parsed);
+      this._noteTileFallback(parsed);
       this._log('debug', `${label} tile frame applied: ${parsed.type}`);
     } catch (err) {
       this._log('warn', `${label} tile frame failed: ${err.message}`);
     }
+  }
+
+  // Item 7a: tile↔video fallback transitions used to swap surfaces
+  // silently (the TileCompositor stays UI-framework-agnostic — it is
+  // also driven by the synthetic tile-test harness — so the user-facing
+  // note lives here, on the connection). Brief: revert to the steady
+  // state copy after a few seconds.
+  _noteTileFallback(parsed) {
+    if (!parsed) return;
+    if (parsed.type !== 'fallback_to_video' && parsed.type !== 'fallback_to_tile') return;
+    const surface = parsed.type === 'fallback_to_video' ? 'video' : 'tiles';
+    this.setStatus(`Stream fell back to ${surface}`, 'connected');
+    if (this._fallbackNoteTimer) window.clearTimeout(this._fallbackNoteTimer);
+    this._fallbackNoteTimer = window.setTimeout(() => {
+      this._fallbackNoteTimer = null;
+      if (this.pc && this.pc.connectionState === 'connected') {
+        this.setStatus('Connected (view-only)', 'connected');
+      }
+    }, 4000);
   }
 
   _stopDiagSampler() {
@@ -730,10 +1033,41 @@ class PeerDisplayConnection {
     this._diagSampler = null;
   }
 
+  // Item 4: ordered container candidates for read-only surface lookups —
+  // the resolved (live) container first, then every other container this
+  // host has. Never creates the Station fallback.
+  _containerCandidates() {
+    const candidates = [];
+    const resolved = this._resolveContainer(false);
+    if (resolved) candidates.push(resolved);
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
+      if (!candidates.includes(container)) candidates.push(container);
+    }
+    return candidates;
+  }
+
+  // The surface input listeners should bind on / captures rasterize from:
+  // the live tile canvas when tile streaming is active, else the first
+  // video element across the host's containers (Station panes included).
+  _interactiveSurfaceCandidate() {
+    if (this.tileCompositor && this.tileCompositor.canvas && this.tileCompositor.canvas.isConnected) {
+      return this.tileCompositor.canvas;
+    }
+    for (const container of this._containerCandidates()) {
+      const surface = container.querySelector('.tile-compositor-canvas')
+        || container.querySelector('.peer-display-video');
+      if (surface) return surface;
+    }
+    return null;
+  }
+
   _startVideoDiagSampler() {
     if (!diagModeEnabled()) return;
-    const container = document.getElementById(`peer-display-${this.hostId}`);
-    const videoEl = container && container.querySelector('.peer-display-video');
+    let videoEl = null;
+    for (const container of this._containerCandidates()) {
+      videoEl = container.querySelector('.peer-display-video');
+      if (videoEl) break;
+    }
     if (!videoEl) return;
     this._stopDiagSampler();
     this._diagSampler = new VisualFreshnessSampler(videoEl, this.hostId, this.displayId);
@@ -798,6 +1132,12 @@ class PeerDisplayConnection {
     }
     this.peerAuthorityState = state;
     this._renderAuthorityChip();
+    // Item 7b: any authoritative state answers an in-flight take —
+    // disarm the 5s no-answer timeout.
+    if (this._takePendingTimer) {
+      window.clearTimeout(this._takePendingTimer);
+      this._takePendingTimer = null;
+    }
     if (state === 'you' && this._takeControlPending) {
       this._takeControlPending = false;
       this._log('info', 'authority granted: you');
@@ -829,11 +1169,10 @@ class PeerDisplayConnection {
   // (federated clipboard is a follow-up).
   _enterInteractive() {
     if (this.interactive) return;
-    const container = document.getElementById(`peer-display-${this.hostId}`);
-    const target = container && (
-      container.querySelector('.tile-compositor-canvas') ||
-      container.querySelector('.peer-display-video')
-    );
+    // Item 4: bind on whichever surface is live — Station-hosted panes
+    // included. The old getElementById-only lookup meant Take Control on
+    // a Station pane silently installed no listeners.
+    const target = this._interactiveSurfaceCandidate();
     if (!target) {
       // Pane was destroyed between authority grant and entry. Bail
       // WITHOUT flipping `interactive` so a subsequent
@@ -848,7 +1187,9 @@ class PeerDisplayConnection {
     target.tabIndex = 0;
     target.focus();
     this._interactiveTarget = target;
-    this._heldModifiers = new Set();
+    // Item 3: track EVERY held key code, not just the 8 modifiers — a
+    // latched non-modifier auto-repeats on the peer forever otherwise.
+    this._heldKeys = new Set();
 
     const normalize = (e) => {
       // Same letterbox-aware normalization as local DisplaySlot —
@@ -897,16 +1238,26 @@ class PeerDisplayConnection {
       }
     };
 
+    // Item 3: synthetic-keyup flusher, stored on the instance so
+    // `_exitInteractive` / `releaseControl` / the attachToDom rebind
+    // path can release held keys after this closure's listeners are
+    // otherwise unreachable. Mirrors local DisplaySlot exactly.
+    this._flushHeldKeys = () => {
+      if (!this._heldKeys) return;
+      for (const code of this._heldKeys) {
+        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+      }
+      this._heldKeys.clear();
+    };
+
     this._boundHandlers.keydown = (e) => {
       e.preventDefault();
-      if (['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight'].includes(e.code)) {
-        this._heldModifiers.add(e.code);
-      }
+      this._heldKeys.add(e.code);
       sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.keyup = (e) => {
       e.preventDefault();
-      this._heldModifiers.delete(e.code);
+      this._heldKeys.delete(e.code);
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
@@ -940,13 +1291,10 @@ class PeerDisplayConnection {
     };
     this._boundHandlers.contextmenu = (e) => e.preventDefault();
     this._boundHandlers.blur = () => {
-      // Release all held modifier keys when the video element loses
-      // focus — without this, the peer thinks Shift/Ctrl/Alt/Meta
-      // are still held because no keyup ever fires.
-      for (const code of this._heldModifiers) {
-        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
-      }
-      this._heldModifiers.clear();
+      // Release ALL held keys when the surface loses focus — without
+      // this, the peer thinks they are still held because no keyup
+      // ever fires.
+      this._flushHeldKeys?.();
     };
     this._boundHandlers.pointerenter = () => {
       if (this.interactive) target.focus();
@@ -969,7 +1317,14 @@ class PeerDisplayConnection {
   _exitInteractive() {
     if (!this.interactive) return;
     this.interactive = false;
-    if (this._heldModifiers) this._heldModifiers.clear();
+    // Item 3: flush synthetic keyups BEFORE listener removal — a
+    // peer-side authority demotion never fires blur, and without this
+    // any held key stays latched down on the peer's display.
+    if (this._flushHeldKeys) {
+      try { this._flushHeldKeys(); } catch (_) {}
+      this._flushHeldKeys = null;
+    }
+    if (this._heldKeys) this._heldKeys.clear();
     const target = this._interactiveTarget;
     if (target) {
       for (const [evt, handler] of Object.entries(this._boundHandlers)) {
@@ -987,45 +1342,49 @@ class PeerDisplayConnection {
   // behaves the same. Reuses the `display-input-authority` CSS
   // classes (.you/.other/.unclaimed) defined for local 5c.
   _renderAuthorityChip() {
-    const container = document.getElementById(`peer-display-${this.hostId}`);
-    if (!container) return;
-    const chip = container.querySelector('.peer-display-authority');
-    const takeBtn = container.querySelector('.take-control-btn');
-    const releaseBtn = container.querySelector('.release-control-btn');
-    if (chip) {
-      switch (this.peerAuthorityState) {
-        case 'you':
-          chip.style.display = '';
-          chip.textContent = 'Input: you';
-          chip.className = 'peer-display-authority display-input-authority you';
-          break;
-        case 'other':
-          chip.style.display = '';
-          chip.textContent = 'Input: another viewer';
-          chip.className = 'peer-display-authority display-input-authority other';
-          break;
-        case 'unclaimed':
-          chip.style.display = '';
-          chip.textContent = 'Input: shared';
-          chip.className = 'peer-display-authority display-input-authority unclaimed';
-          break;
-        default:
-          // 'unknown' — peer hasn't told us yet (snapshot in
-          // flight). Hide the chip rather than show 'unclaimed'
-          // speculatively, same convention as local 5c.
-          chip.style.display = 'none';
-          chip.textContent = '';
-          chip.className = 'peer-display-authority display-input-authority';
-          break;
+    // Item 4: render into EVERY container this host currently has
+    // (daemons-list panel + Station endpoint) — mirroring setStatus —
+    // instead of only the getElementById panel, which left Station-
+    // hosted panes with a stale chip and the wrong Take/Release button.
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
+      const chip = container.querySelector('.peer-display-authority');
+      const takeBtn = container.querySelector('.take-control-btn');
+      const releaseBtn = container.querySelector('.release-control-btn');
+      if (chip) {
+        switch (this.peerAuthorityState) {
+          case 'you':
+            chip.style.display = '';
+            chip.textContent = 'Input: you';
+            chip.className = 'peer-display-authority display-input-authority you';
+            break;
+          case 'other':
+            chip.style.display = '';
+            chip.textContent = 'Input: another viewer';
+            chip.className = 'peer-display-authority display-input-authority other';
+            break;
+          case 'unclaimed':
+            chip.style.display = '';
+            chip.textContent = 'Input: shared';
+            chip.className = 'peer-display-authority display-input-authority unclaimed';
+            break;
+          default:
+            // 'unknown' — peer hasn't told us yet (snapshot in
+            // flight). Hide the chip rather than show 'unclaimed'
+            // speculatively, same convention as local 5c.
+            chip.style.display = 'none';
+            chip.textContent = '';
+            chip.className = 'peer-display-authority display-input-authority';
+            break;
+        }
       }
-    }
-    if (takeBtn && releaseBtn) {
-      if (this.peerAuthorityState === 'you') {
-        takeBtn.style.display = 'none';
-        releaseBtn.style.display = '';
-      } else {
-        takeBtn.style.display = '';
-        releaseBtn.style.display = 'none';
+      if (takeBtn && releaseBtn) {
+        if (this.peerAuthorityState === 'you') {
+          takeBtn.style.display = 'none';
+          releaseBtn.style.display = '';
+        } else {
+          takeBtn.style.display = '';
+          releaseBtn.style.display = 'none';
+        }
       }
     }
   }
@@ -1043,7 +1402,23 @@ class PeerDisplayConnection {
       return;
     }
     this._takeControlPending = true;
-    this._sendAuthorityFrame('display_input_authority_request');
+    if (!this._sendAuthorityFrame('display_input_authority_request')) {
+      // Frame never left the browser — don't leave a silently armed
+      // pending flag behind (the drop itself already toasted).
+      this._takeControlPending = false;
+      return;
+    }
+    // Item 7b: parity with the local slot — a request the peer never
+    // answers resets itself with a toast instead of hanging forever.
+    if (this._takePendingTimer) window.clearTimeout(this._takePendingTimer);
+    this._takePendingTimer = window.setTimeout(() => {
+      this._takePendingTimer = null;
+      if (!this._takeControlPending) return;
+      this._takeControlPending = false;
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'The peer did not answer the input-control request — try again');
+      }
+    }, 5000);
   }
 
   // F-1.3c: user-intent release. Sends Release on the authority
@@ -1052,6 +1427,14 @@ class PeerDisplayConnection {
   // the broadcast pushes `'unclaimed'` back. Idempotent on the
   // peer side (release with no holder is a no-op there too).
   releaseControl() {
+    // Item 3: flush held-key keyups BEFORE the release frame — the
+    // channels are open and we still hold authority here; after the
+    // peer processes the release, our keyups would be gated away and
+    // the keys would stay latched down. (`_exitInteractive`, driven by
+    // the peer's `unclaimed` push, re-flushes an already-empty set.)
+    if (this._flushHeldKeys) {
+      try { this._flushHeldKeys(); } catch (_) {}
+    }
     this._sendAuthorityFrame('display_input_authority_release');
     this._takeControlPending = false;
   }
@@ -1068,7 +1451,12 @@ class PeerDisplayConnection {
       this._log('warn',
         `${t} dropped — authority channel not open ` +
         `(readyState=${this.authorityChannel ? this.authorityChannel.readyState : '(no channel)'})`);
-      return;
+      // Item 7b: the user clicked a button and nothing happened — say so
+      // instead of confessing only to the console.
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Peer display control channel is still connecting — try again in a moment');
+      }
+      return false;
     }
     try {
       this.authorityChannel.send(JSON.stringify({
@@ -1076,8 +1464,13 @@ class PeerDisplayConnection {
         display_id: this.displayId,
       }));
       this._log('debug', `sent ${t} (display_id=${this.displayId})`);
+      return true;
     } catch (err) {
       this._log('warn', `${t} send failed: ${err.message}`);
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Sending the input-control request to the peer failed — try again');
+      }
+      return false;
     }
   }
 
@@ -1111,6 +1504,21 @@ class PeerDisplayConnection {
 
   async close() {
     this._clearNoTrackWatchdog();
+    // Stop every per-connection timer — no leaked intervals/timeouts
+    // across close/retry cycles.
+    if (this._retryTimer) {
+      window.clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
+    if (this._takePendingTimer) {
+      window.clearTimeout(this._takePendingTimer);
+      this._takePendingTimer = null;
+    }
+    if (this._fallbackNoteTimer) {
+      window.clearTimeout(this._fallbackNoteTimer);
+      this._fallbackNoteTimer = null;
+    }
+    this._stopStatsSampler();
     stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
     stationScheduleUpdate();
     // F-2: tear down input listeners FIRST. The `pc.close()` chain

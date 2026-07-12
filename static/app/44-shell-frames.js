@@ -601,6 +601,56 @@ function ui2ShellTheme() {
   };
 }
 
+// ── Terminal appearance settings (item 9) ──
+// CONTRACT with the Appearance settings pane (owned elsewhere): it writes
+// the two localStorage keys below and, for same-tab immediacy, dispatches
+// the `intendant-term-appearance` custom event on window (cross-tab edits
+// arrive via the native `storage` event). Values are parsed defensively
+// and clamped; anything unparsable falls back to the historical defaults
+// (fontSize 13, scrollback 5000).
+const TERM_FONT_SIZE_KEY = 'intendant.ui2.termFontSize';
+const TERM_SCROLLBACK_KEY = 'intendant.ui2.termScrollback';
+
+function termAppearanceSettings() {
+  const clampInt = (raw, lo, hi, dflt) => {
+    const n = Math.round(Number(raw));
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  let fontRaw = null;
+  let scrollRaw = null;
+  try {
+    fontRaw = window.localStorage ? localStorage.getItem(TERM_FONT_SIZE_KEY) : null;
+    scrollRaw = window.localStorage ? localStorage.getItem(TERM_SCROLLBACK_KEY) : null;
+  } catch { /* storage disabled (private mode etc.) — use defaults */ }
+  return {
+    fontSize: (fontRaw === null || fontRaw === '') ? 13 : clampInt(fontRaw, 8, 24, 13),
+    scrollback: (scrollRaw === null || scrollRaw === '') ? 5000 : clampInt(scrollRaw, 1000, 100000, 5000),
+  };
+}
+
+// Apply the font size to the live terminal (scrollback deliberately only
+// applies at terminal creation — i.e. the next dashboard load, since the
+// shell terminal is created once per page).
+function applyTermAppearanceLive() {
+  if (!shellTerm) return;
+  const { fontSize } = termAppearanceSettings();
+  if (shellTerm.options.fontSize !== fontSize) {
+    shellTerm.options.fontSize = fontSize;
+    if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+  }
+}
+
+// Cross-tab (and DevTools) edits: the storage event carries the key; a
+// null key means clear() — re-apply in both cases.
+window.addEventListener('storage', (e) => {
+  if (e.key === null || e.key === TERM_FONT_SIZE_KEY || e.key === TERM_SCROLLBACK_KEY) {
+    applyTermAppearanceLive();
+  }
+});
+// Same-tab edits from the Appearance settings pane.
+window.addEventListener('intendant-term-appearance', applyTermAppearanceLive);
+
 // Loads the vendored xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
@@ -618,11 +668,12 @@ function initShell() {
     // if the tokens ever fail to resolve.
     const theme = ui2ShellTheme() || undefined;
     const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
+    const appearance = termAppearanceSettings();
     shellTerm = new Terminal({
       theme,
       fontFamily: mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
-      fontSize: 13, allowProposedApi: true,
-      scrollback: 5000,
+      fontSize: appearance.fontSize, allowProposedApi: true,
+      scrollback: appearance.scrollback,
       cursorBlink: true,
     });
     shellFitAddon = new FitAddon.FitAddon();
