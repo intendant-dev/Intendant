@@ -2685,6 +2685,11 @@ pub(crate) async fn run_round_loop(
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
     let local_session_id = session_log_id(&session_log);
     let mut follow_up_cancel_rx = bus.subscribe();
+    // Per-session round ledger: (round number, native message count at its
+    // end) — the parked drain resolves targeted conversation rollbacks
+    // from it (the supervised twin of the headless shape's file-watcher
+    // History lookup; round numbers are the ones RoundComplete broadcast).
+    let mut round_ledger: Vec<(usize, u32)> = Vec::new();
     let mut cancelled_follow_ups: HashSet<String> = HashSet::new();
 
     loop {
@@ -2740,6 +2745,7 @@ pub(crate) async fn run_round_loop(
                 // truncate the tail back to this point.
                 let turns_in_round = stats.turns;
                 let native_message_count = Some(conversation.messages().len() as u32);
+                round_ledger.push((round, conversation.messages().len() as u32));
                 bus.send(AppEvent::RoundComplete {
                     session_id: local_session_id.clone(),
                     round,
@@ -2844,6 +2850,79 @@ pub(crate) async fn run_round_loop(
                                             text,
                                             id,
                                         ));
+                                    }
+                                    Ok(AppEvent::ConversationRollbackRequested {
+                                        session_id: Some(target),
+                                        round_id,
+                                        ..
+                                    }) if event_targets_session(
+                                        &Some(target.clone()),
+                                        &local_session_id,
+                                    ) =>
+                                    {
+                                        // Targeted conversation rollback:
+                                        // this parked drain is the
+                                        // supervised session's rollback
+                                        // executor. Resolve the round from
+                                        // the local ledger and truncate;
+                                        // the dashboard observes the
+                                        // completion event (the HTTP
+                                        // response never waited, same as
+                                        // the legacy path).
+                                        let target_count = round_ledger
+                                            .iter()
+                                            .find(|(number, _)| *number as u64 == round_id)
+                                            .map(|(_, count)| *count);
+                                        let removed = match target_count {
+                                            Some(count) => {
+                                                // Capture the surviving
+                                                // tail's seq BEFORE the
+                                                // truncate: truncate_to
+                                                // appends synthetic
+                                                // dangling-call repairs
+                                                // with fresh seqs that must
+                                                // not shift the cut (same
+                                                // rule as the headless
+                                                // path).
+                                                let clamped = (count as usize)
+                                                    .max(1)
+                                                    .min(conversation.len());
+                                                let cut_after_seq = conversation
+                                                    .messages()
+                                                    .get(clamped - 1)
+                                                    .map(|m| m.seq)
+                                                    .unwrap_or(0);
+                                                let removed = conversation
+                                                    .truncate_to(count as usize);
+                                                if removed > 0 {
+                                                    slog(&session_log, |l| {
+                                                        l.conversation_rewound(
+                                                            cut_after_seq,
+                                                            "tail_rollback",
+                                                        )
+                                                    });
+                                                }
+                                                round_ledger.retain(|(number, _)| {
+                                                    *number as u64 <= round_id
+                                                });
+                                                round = round_id as usize;
+                                                removed
+                                            }
+                                            // Unknown round: emit a 0-turn
+                                            // completion so the dashboard
+                                            // clears its pending state (the
+                                            // legacy path does the same
+                                            // when it cannot truncate).
+                                            None => 0,
+                                        };
+                                        bus.send(AppEvent::ConversationRolledBack {
+                                            session_id: local_session_id.clone(),
+                                            round_id,
+                                            turns_removed: removed as u32,
+                                            backend: "native".into(),
+                                            method: "truncated".into(),
+                                        });
+                                        continue;
                                     }
                                     Ok(_) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
