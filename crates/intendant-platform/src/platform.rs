@@ -1031,6 +1031,9 @@ pub fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> i128 {
 ///   for both callers: cache keys still vary on `len`+mtime+ctime, and the
 ///   disk-usage de-dup is paired with [`metadata_is_multiply_linked`] which
 ///   reports `false` on Windows, so the de-dup set is never consulted.
+///
+/// New code that needs a real identity on Windows too should use
+/// [`FileIdentity`], which reaches the NTFS pair through an open handle.
 pub fn metadata_dev_ino(metadata: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
@@ -1082,6 +1085,119 @@ pub fn metadata_on_disk_bytes(metadata: &std::fs::Metadata) -> u64 {
     #[cfg(not(unix))]
     {
         metadata.len()
+    }
+}
+
+/// Stable on-disk identity of a file, independent of its path: the pair the
+/// OS uses to name the underlying object. Two paths with an equal
+/// `FileIdentity` refer to the same file — hardlinks compare equal, a
+/// deleted-and-recreated file generally does not — which is what persistent
+/// incremental readers (message-search cursors, catalog caches) key on to
+/// detect renames and replacement without re-reading content.
+///
+/// - **Unix**: `(st_dev, st_ino)`, the same pair [`metadata_dev_ino`]
+///   returns.
+/// - **Windows**: `(dwVolumeSerialNumber, nFileIndexHigh << 32 |
+///   nFileIndexLow)` from `GetFileInformationByHandle`. That query needs an
+///   open handle — stable `std::fs::Metadata` cannot produce it, which is why
+///   [`FileIdentity::from_metadata`] is Unix-only and [`metadata_dev_ino`]
+///   degenerates to `(0, 0)` there.
+///
+/// Serde derives are for persistence: cursor files store the identity and
+/// compare it against a fresh query on the next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FileIdentity {
+    /// Unix `st_dev` / Windows volume serial number (zero-extended).
+    pub volume: u64,
+    /// Unix `st_ino` / Windows 64-bit file index.
+    pub file_index: u64,
+}
+
+impl FileIdentity {
+    /// Identity of an already-open file.
+    ///
+    /// Windows queries `GetFileInformationByHandle` on the file's handle; a
+    /// failed query returns the error rather than a degenerate identity, so
+    /// callers can fall back to folding `len`+mtime+ctime into their
+    /// fingerprint — exactly what `session_catalog/caches.rs` does today
+    /// where [`metadata_dev_ino`] yields `(0, 0)`.
+    pub fn from_file(file: &std::fs::File) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            Ok(Self {
+                volume: metadata.dev(),
+                file_index: metadata.ino(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+
+            // SAFETY: BY_HANDLE_FILE_INFORMATION is a plain Win32 POD struct
+            // (u32 fields plus FILETIME pairs), for which the all-zero bit
+            // pattern is a valid value.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the borrowed `File` keeps its handle open and valid for
+            // the duration of the call, and `info` is a live writable
+            // out-pointer of exactly the type the API fills in.
+            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                volume: u64::from(info.dwVolumeSerialNumber),
+                file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            })
+        }
+    }
+
+    /// Identity of the file at `path` (symlinks followed). Opens the file
+    /// read-only — on Windows the identity is only reachable through a
+    /// handle. Errors (missing file, permission, failed handle query)
+    /// surface so callers can fall back to len+mtime+ctime fingerprints.
+    pub fn from_path(path: &std::path::Path) -> std::io::Result<Self> {
+        Self::from_file(&std::fs::File::open(path)?)
+    }
+
+    /// Cheap identity from an already-fetched [`std::fs::Metadata`] — **Unix
+    /// only**, where `(dev, ino)` ride along in every stat. Returns `None`
+    /// on Windows: identity there needs an open handle
+    /// ([`FileIdentity::from_file`]), so callers holding only a `Metadata`
+    /// either open the file or fold len+mtime+ctime like
+    /// `session_catalog/caches.rs` does today.
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                volume: metadata.dev(),
+                file_index: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+
+    /// Whether this identity is backed by a real OS file identity.
+    ///
+    /// The constructors return errors instead of degenerate values, so
+    /// identities they produce are reliable in practice; the residual `false`
+    /// case is a filesystem that genuinely reports no identity (some
+    /// FAT-family and network filesystems on Windows return a zero file
+    /// index — the same all-zero shape [`metadata_dev_ino`]'s Windows arm
+    /// returns). An unreliable identity must not be trusted for cross-file
+    /// equality: fold len+mtime+ctime into the fingerprint instead, as
+    /// `session_catalog/caches.rs` does today.
+    pub const fn is_reliable(&self) -> bool {
+        !(self.volume == 0 && self.file_index == 0)
     }
 }
 
@@ -1463,5 +1579,109 @@ mod tests {
                 "explicit-path/exe input {name:?} should be spawned directly, not via cmd.exe"
             );
         }
+    }
+
+    // ── FileIdentity ────────────────────────────────────────────────────
+
+    // Runs on every platform: the same file must present the same identity
+    // through repeated path lookups and through an open handle, and a real
+    // filesystem (CI temp dirs: APFS / ext4 / NTFS) must report a reliable
+    // identity.
+    #[test]
+    fn file_identity_is_stable_for_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"contents").unwrap();
+
+        let first = FileIdentity::from_path(&path).unwrap();
+        let second = FileIdentity::from_path(&path).unwrap();
+        assert_eq!(first, second);
+        assert!(first.is_reliable());
+
+        let via_file = FileIdentity::from_file(&std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(first, via_file);
+    }
+
+    #[test]
+    fn file_identity_differs_between_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        assert_ne!(
+            FileIdentity::from_path(&a).unwrap(),
+            FileIdentity::from_path(&b).unwrap()
+        );
+    }
+
+    // Hardlinks are the identity's raison d'être: two paths, one file.
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_hardlink_shares_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&original, b"shared").unwrap();
+        std::fs::hard_link(&original, &link).unwrap();
+
+        assert_eq!(
+            FileIdentity::from_path(&original).unwrap(),
+            FileIdentity::from_path(&link).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_from_metadata_matches_path_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.txt");
+        std::fs::write(&path, b"m").unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let from_meta =
+            FileIdentity::from_metadata(&metadata).expect("Unix metadata carries (dev, ino)");
+        assert_eq!(from_meta, FileIdentity::from_path(&path).unwrap());
+        assert!(from_meta.is_reliable());
+
+        // Agrees with the legacy pair helper it grew out of.
+        assert_eq!(
+            (from_meta.volume, from_meta.file_index),
+            metadata_dev_ino(&metadata)
+        );
+    }
+
+    // Windows leg: the handle query must yield a real NTFS identity, shared
+    // across hardlinked paths, while the Metadata-only constructor stays
+    // honestly unavailable.
+    #[cfg(windows)]
+    #[test]
+    fn file_identity_windows_handle_query_yields_real_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"contents").unwrap();
+
+        let identity = FileIdentity::from_path(&path).unwrap();
+        assert_eq!(identity, FileIdentity::from_path(&path).unwrap());
+        assert!(
+            identity.is_reliable(),
+            "NTFS must report a nonzero (volume, file-index) identity"
+        );
+
+        // A Metadata alone cannot produce an identity on Windows.
+        assert_eq!(
+            FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap()),
+            None
+        );
+
+        // NTFS supports hardlinks natively; both names share the identity.
+        let link = dir.path().join("link.txt");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert_eq!(identity, FileIdentity::from_path(&link).unwrap());
+
+        let other = dir.path().join("b.txt");
+        std::fs::write(&other, b"other").unwrap();
+        assert_ne!(identity, FileIdentity::from_path(&other).unwrap());
     }
 }
