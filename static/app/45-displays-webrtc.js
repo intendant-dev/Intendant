@@ -225,6 +225,7 @@ class DisplaySlot {
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
         <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">Attach</button>
         <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
+        <button class="callout-btn" id="ds-callout-${displayId}" aria-pressed="false" disabled title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
         <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">Record</button>
         <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
         <button class="display-close-btn" id="ds-close-${displayId}" title="Close this display stream">&times;</button>
@@ -249,6 +250,7 @@ class DisplaySlot {
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
     this.attachBtn = this.el.querySelector(`#ds-attach-${displayId}`);
     this.annotateBtn = this.el.querySelector(`#ds-annotate-${displayId}`);
+    this.calloutBtn = this.el.querySelector(`#ds-callout-${displayId}`);
     this.recording = false;
 
     // Video element for WebRTC media track
@@ -298,6 +300,7 @@ class DisplaySlot {
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
     this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
+    this.calloutBtn.addEventListener('click', () => this.toggleCallout());
   }
 
   // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — keep the
@@ -409,6 +412,23 @@ class DisplaySlot {
     setTimeout(() => { this.attachBtn.innerHTML = orig; }, 1500);
   }
 
+  // The surface-provider contract consumed by 47-annotation-clips'
+  // live-annotation editor and callout arming — the field-by-field
+  // enumeration lives above setLiveAnnotationButton there. Zero behavior
+  // change vs. the pre-provider slot coupling: every getter returns
+  // exactly the member the editor used to reach into directly.
+  _annotationSurfaceProvider() {
+    return {
+      owner: this,
+      displayId: this.displayId,
+      streamBase: 'display_' + this.displayId,
+      stageEl: () => this.canvasEl,
+      liveSurfaceEl: () => this.videoEl,
+      annotateBtn: () => this.annotateBtn,
+      toolbarHostEl: () => this.el,
+    };
+  }
+
   annotateCurrentFrame() {
     const frame = this.captureCurrentFrame(0.92);
     if (!frame) {
@@ -416,7 +436,19 @@ class DisplaySlot {
       setTimeout(() => { this.annotateBtn.title = 'Freeze current frame and annotate it'; }, 2000);
       return;
     }
-    enterLiveAnnotationMode(this, frame);
+    enterLiveAnnotationMode(this._annotationSurfaceProvider(), frame);
+  }
+
+  // Toolbar-armed Callout: one-shot region flag shipped through the
+  // annotation-attach lane. Shared machinery lives in 47-annotation-clips
+  // (toggleLiveCallout); armable only while input authority is 'you'
+  // (button disabled otherwise, disarmed on authority loss).
+  toggleCallout() {
+    toggleLiveCallout({
+      provider: this._annotationSurfaceProvider(),
+      button: this.calloutBtn,
+      captureFrame: (q) => this.captureCurrentFrame(q),
+    });
   }
 
   sendLegacyDisplaySignal(payload) {
@@ -1048,7 +1080,11 @@ class DisplaySlot {
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
+      // Annotation editing suppresses everything; an armed callout
+      // suppresses only the drag's md/mm/mu (keyboard + wheel keep
+      // flowing — the arm overlay swallows most of these already, this
+      // catches pointer events on the letterbox bars).
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
         e.preventDefault();
         return;
       }
@@ -1059,7 +1095,7 @@ class DisplaySlot {
       sendControl({ t: 'md', x, y, b: e.button });
     };
     this._boundHandlers.pointerup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
         e.preventDefault();
         return;
       }
@@ -1069,7 +1105,7 @@ class DisplaySlot {
       sendControl({ t: 'mu', x, y, b: e.button });
     };
     this._boundHandlers.pointermove = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
+      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
         e.preventDefault();
         return;
       }
@@ -1284,6 +1320,11 @@ class DisplaySlot {
     this.authorityState = state;
     this._renderAuthority();
 
+    // Callout arming requires held input authority; losing it disarms.
+    if (state !== 'you' && liveCalloutArmedFor(this)) {
+      disarmLiveCallout();
+    }
+
     // Promote pending take into interactive mode the moment the server
     // confirms we hold it.  Without this, the user would click Take
     // Control and see the chip flip but the listeners would not install.
@@ -1345,6 +1386,12 @@ class DisplaySlot {
     } else {
       this.takeBtn.style.display = '';
       this.releaseBtn.style.display = 'none';
+    }
+    // Callout is armable only while this browser holds input authority
+    // (the drag would otherwise be view-only theater; the arm/suppress
+    // semantics assume our pointer stream is what the remote receives).
+    if (this.calloutBtn) {
+      this.calloutBtn.disabled = this.authorityState !== 'you';
     }
   }
 
@@ -1493,14 +1540,9 @@ function removeDisplaySlot(displayId) {
   displayId = Number(displayId);
   const slot = displaySlots.get(displayId);
   if (!slot) return;
-  if (
-    annotationMode &&
-    annotationContext &&
-    annotationContext.kind === 'live' &&
-    annotationContext.slot === slot
-  ) {
-    exitAnnotationMode();
-  }
+  // Provider-level teardown (47-annotation-clips): ends a live-annotation
+  // edit or armed callout owned by this slot before its DOM goes away.
+  teardownLiveSurfaceForOwner(slot);
   // Mark as user-intent-closed BEFORE disconnect so any in-flight
   // reconnect timer short-circuits and any subsequent `failed` event
   // skips the retry path. See DisplaySlot._closedByUser.

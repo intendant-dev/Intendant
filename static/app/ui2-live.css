@@ -1127,6 +1127,108 @@ html.ui-v2 .peer-display-controls .release-control-btn {
 html.ui-v2 .peer-display-close { color: var(--rose); border-color: rgba(var(--rose-rgb), .4); }
 html.ui-v2 .peer-display-close:hover { background: rgba(var(--rose-rgb), .1); }
 
+/* ── Annotate / Callout on live surfaces ──────────────────────────────
+   Peer-pane Annotate/Callout wear the same quiet-secondary chrome as
+   the other peer controls; the local Callout inherits the
+   .display-toolbar button base. Callout's armed state is the pressed
+   toggle (aria-pressed), amber to match the stroked rectangle. */
+html.ui-v2 .peer-display-controls .annotate-btn,
+html.ui-v2 .peer-display-controls .callout-btn {
+  min-height: 0;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .peer-display-controls .annotate-btn:hover,
+html.ui-v2 .peer-display-controls .annotate-btn.active {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .display-toolbar .callout-btn:hover,
+html.ui-v2 .peer-display-controls .callout-btn:hover {
+  background: rgba(var(--amber-rgb), .10);
+  border-color: rgba(var(--amber-rgb), .45);
+  color: var(--amber);
+}
+html.ui-v2 .display-toolbar .callout-btn[aria-pressed="true"],
+html.ui-v2 .peer-display-controls .callout-btn[aria-pressed="true"] {
+  background: rgba(var(--amber-rgb), .16);
+  border-color: rgba(var(--amber-rgb), .5);
+  color: var(--amber);
+  font-weight: 700;
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .display-toolbar .callout-btn:disabled,
+html.ui-v2 .peer-display-controls .callout-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+html.ui-v2 .display-toolbar .callout-btn:disabled:hover,
+html.ui-v2 .peer-display-controls .callout-btn:disabled:hover {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--text-2);
+  box-shadow: none;
+}
+
+/* Callout arm overlay: pinned over the rendered frame's content box
+   (letterbox math in 47's surfaceContentBox); swallows pointer input
+   while armed so the drag never reaches the remote display. z-index
+   above the live-annotation layers (4/5), the stage overlay (5), and
+   the metrics chip (8) so the drag can start anywhere on the frame. */
+html.ui-v2 .callout-arm-overlay {
+  position: absolute;
+  z-index: 9;
+  cursor: crosshair;
+  touch-action: none;
+  background: rgba(var(--amber-rgb), .05);
+  outline: 1.5px dashed rgba(var(--amber-rgb), .55);
+  outline-offset: -1.5px;
+}
+html.ui-v2 .callout-arm-rect {
+  position: absolute;
+  border: 2px solid var(--amber);
+  background: rgba(var(--amber-rgb), .12);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+  pointer-events: none;
+}
+html.ui-v2 .callout-arm-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 16px);
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--line-2);
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+/* Live-annotation editor on peer panes: same stacking contract as the
+   local stage (14-styles scopes the original rules to .display-canvas;
+   here the pane is the stage). */
+html.ui-v2 .peer-display-pane .live-annotation-source,
+html.ui-v2 .peer-display-pane .live-annotation-overlay {
+  position: absolute;
+  pointer-events: none;
+}
+html.ui-v2 .peer-display-pane .live-annotation-source { z-index: 4; background: #000; }
+html.ui-v2 .peer-display-pane .live-annotation-overlay { z-index: 5; }
+
 /* ── right rail (injected, display-only mirror) ── */
 html.ui-v2 .ui2-live-rail {
   position: absolute;
