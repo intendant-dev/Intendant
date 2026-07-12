@@ -2047,6 +2047,7 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
 | GET | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |
 | GET | `/api/sessions/search` | SessionInspect | own origin | none | Search sessions (q, source, mode, project filters) |
+| GET | `/api/sessions/message-search` | SessionInspect | own origin | none | Message-lane search over the shard index (q, source, superseded, subagents, cursor) |
 | GET | `/api/sessions` | SessionInspect | own origin | none | List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab) |
 | GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |

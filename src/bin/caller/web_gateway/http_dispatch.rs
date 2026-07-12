@@ -816,6 +816,15 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::SessionsMessageSearch => {
+                return handle_sessions_message_search(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ProjectRoot => {
                 return handle_project_root(
                     stream,

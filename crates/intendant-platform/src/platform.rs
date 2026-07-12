@@ -1509,7 +1509,48 @@ mod tests {
             .await
             .expect("detached spawn should succeed");
         assert!(pid > 1);
-        assert!(process_alive(pid), "detached child should be alive");
+        // Intermittent on loaded CI Mac legs (2026-07-11 and -12, two
+        // unrelated PRs' merge groups): the child reads as gone
+        // microseconds after a successful spawn, mechanism unproven —
+        // reaper hooks, sibling tests, and the wrapper's pid handoff
+        // were each ruled out on evidence. Instrumented so the next
+        // occurrence is self-diagnosing instead of a third mystery: on
+        // a dead probe, capture the raw kill(2) errno and a filtered
+        // process-table snapshot BEFORE failing.
+        if !process_alive(pid) {
+            #[cfg(unix)]
+            let errno = {
+                // SAFETY: signal 0 probes existence only; pid came from
+                // our own spawn and the >1 assert above.
+                let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+                if ret == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                }
+            };
+            #[cfg(windows)]
+            let errno = -1;
+            let table = std::process::Command::new("ps")
+                .args(["-axo", "pid,ppid,stat,command"])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| {
+                            l.contains("sleep")
+                                || l.contains("nohup")
+                                || l.contains(&pid.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|e| format!("(ps failed: {e})"));
+            panic!(
+                "detached child should be alive: pid={pid} kill0_errno={errno} \
+                 table:\n{table}"
+            );
+        }
 
         // Best-effort cleanup.
         #[cfg(windows)]

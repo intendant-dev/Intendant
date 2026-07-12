@@ -40,6 +40,12 @@ pub(crate) struct Manifest {
     pub schema: u32,
     pub parser_version: u32,
     pub updated_at_ms: i64,
+    /// Monotonic write counter — the query side's snapshot watermark.
+    /// `updated_at_ms` alone cannot pin a snapshot: two writes inside one
+    /// clock millisecond read as unchanged (caught live by the merge
+    /// queue's Linux leg). Additive; pre-revision manifests read 0.
+    #[serde(default)]
+    pub revision: u64,
     /// Keyed by `<source>:<session_id>`.
     #[serde(default)]
     pub sessions: BTreeMap<String, SessionEntry>,
@@ -215,7 +221,7 @@ impl Store {
         manifest.schema = 1;
         manifest.parser_version = PARSER_VERSION;
         manifest.updated_at_ms = now_ms();
-        self.write_manifest(&manifest)?;
+        self.write_manifest(&mut manifest)?;
         Ok(PublishOutcome::Published)
     }
 
@@ -229,7 +235,7 @@ impl Store {
             if !entry.source_gone {
                 entry.source_gone = true;
                 manifest.updated_at_ms = now_ms();
-                self.write_manifest(&manifest)?;
+                self.write_manifest(&mut manifest)?;
             }
         }
         Ok(())
@@ -246,7 +252,7 @@ impl Store {
             .tombstones
             .insert(session_key.to_string(), now_ms());
         manifest.updated_at_ms = now_ms();
-        self.write_manifest(&manifest)?;
+        self.write_manifest(&mut manifest)?;
         self.gc_unreferenced_generations(&manifest);
         Ok(())
     }
@@ -263,7 +269,7 @@ impl Store {
             .tombstones
             .retain(|_, at| now_ms_value.saturating_sub(*at) <= RETENTION_MS);
         manifest.updated_at_ms = now_ms_value;
-        self.write_manifest(&manifest)?;
+        self.write_manifest(&mut manifest)?;
         self.gc_unreferenced_generations(&manifest);
         Ok(())
     }
@@ -286,7 +292,8 @@ impl Store {
         }
     }
 
-    fn write_manifest(&self, manifest: &Manifest) -> std::io::Result<()> {
+    fn write_manifest(&self, manifest: &mut Manifest) -> std::io::Result<()> {
+        manifest.revision += 1;
         let body = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
         crate::file_watcher::atomic_write(&self.manifest_path(), body.as_bytes())
     }

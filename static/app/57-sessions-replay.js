@@ -61,6 +61,9 @@ function sessionsListOptionsKey(options, currentSessionId) {
     !!options.hideSubagents,
     currentSessionId,
     sessionsViewingPeer() ? currentSessionsHostId() : '',
+    // Message lane (flagged): seq bumps on every visible lane change, so
+    // arriving/clearing results re-key the pass. Constant 0 when inactive.
+    options.mode === 'recent' ? _sessionMsgSearch.seq : 0,
   ]);
 }
 
@@ -88,9 +91,14 @@ function collectSessionsListMatches(sessions, options, ctx) {
   const sourceFilter = options.sourceFilter || [];
   const statusFilter = options.statusFilter || [];
   const matched = [];
+  // Message lane: corpus membership decides which hits become stub rows —
+  // evaluated per pass (a hit session can enter the corpus mid-hydration,
+  // and its stub must yield to the real row, filters included).
+  const msgKnown = ctx.msgSearch ? new Set() : null;
   let hiddenSubagentCount = 0;
   for (const [, s] of decorated) {
     const source = normalizeAgentId(s.source || '') || 'intendant';
+    if (msgKnown && s.session_id) msgKnown.add(sessionLogSearchKey(source, s.session_id));
     const shortId = (s.session_id || '').substring(0, 8);
     const isCurrent = !!(ctx.currentSessionId && s.session_id && s.session_id.startsWith(ctx.currentSessionId));
 
@@ -105,14 +113,32 @@ function collectSessionsListMatches(sessions, options, ctx) {
     if (!sessionMatchesProjectFilter(s, projectFilter)) continue;
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
-    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent)) continue;
+    // Union with the message lane (flagged): a row whose messages match
+    // stays visible even when the metadata haystack misses the query.
+    const msgHit = ctx.msgSearch ? sessionMessageSearchHitFor(source, s.session_id) : null;
+    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent) && !msgHit) continue;
     const logHit = ctx.deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
     if (ctx.deepSearchActive && !logHit) continue;
     if (ctx.hideSubagents && sessionRelationshipKindForRow(s) === 'subagent') {
       hiddenSubagentCount += 1;
       continue;
     }
-    matched.push({ s, source, shortId, isCurrent, displayStatus, logHit });
+    matched.push({ s, source, shortId, isCurrent, displayStatus, logHit, msgHit });
+  }
+  // Message-lane stubs: hits whose sessions are absent from the loaded
+  // metadata corpus (mid-hydration, capped peer lists). Only the filters we
+  // can honestly evaluate apply — source rides the response; project and
+  // status are unknown for these rows, so any active project/status filter
+  // hides them rather than guessing.
+  if (ctx.msgSearch) {
+    const projectActive = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
+    if (!projectActive && statusFilter.length === 0) {
+      for (const entry of sessionMessageSearchHits().values()) {
+        if (msgKnown.has(entry.key)) continue;
+        if (!sessionMatchesSourceFilter(entry.source, sourceFilter)) continue;
+        matched.push(sessionMessageSearchStubMatch(entry));
+      }
+    }
   }
   return { matched, hiddenSubagentCount };
 }
@@ -182,6 +208,9 @@ function sessionCardDerived(m, ctx) {
 }
 
 function sessionCardSig(m, derived, ctx) {
+  // Message-lane hit (flagged): the whole entry is card content (count,
+  // best snippet, ranges, badges), so sign all of it. Empty when inactive.
+  const msgHitSig = m.msgHit ? JSON.stringify(m.msgHit) : '';
   const childSig = derived.lineageChildren.map(child => {
     const childId = sessionLineageIds(child)[0] || child.session_id || '';
     return `${sessionRelationshipKindForRow(child)}\u001e${childId}\u001e${sessionLineageDisplayLabel(child, childId)}`;
@@ -196,7 +225,7 @@ function sessionCardSig(m, derived, ctx) {
     m.displayStatus, m.isCurrent, m.source, ctx.viewingPeer,
     derived.relationshipKind, derived.configSource, derived.backendSource,
     derived.hasExternalBackend, derived.nickname, derived.parentId,
-    derived.parentLabel, childSig, hitSig, previewHitSig,
+    derived.parentLabel, childSig, hitSig, previewHitSig, msgHitSig,
   ]);
 }
 
@@ -213,6 +242,9 @@ function refreshSessionCardRelativeLabel(card) {
 }
 
 function sessionCardFor(m, ctx, st, nextCards) {
+  // Message-lane stub rows (sessions the index knows but the loaded
+  // metadata corpus does not) render their own compact card.
+  if (m.msgStub) return sessionMessageSearchStubCardFor(m, ctx, st, nextCards);
   const key = sessionListRowKey(m.s);
   const derived = sessionCardDerived(m, ctx);
   const sig = sessionCardSig(m, derived, ctx);
@@ -317,6 +349,9 @@ function renderSessionsList(sessions, el, options = {}) {
   const ctx = {
     deepSearchOnly,
     deepSearchActive: deepSearchOnly && _sessionDeepSearch.active,
+    // Message lane (flagged): live only when the applied results answer
+    // exactly the query this pass renders (display-layer stale rejection).
+    msgSearch: !deepSearchOnly && sessionMessageSearchActiveFor(options.query || ''),
     hideSubagents: !!options.hideSubagents,
     viewingPeer: sessionsViewingPeer(),
     currentSessionId,
@@ -622,6 +657,13 @@ function buildSessionCard(m, derived, ctx) {
     hitText.title = firstSnippet.content || '';
     hitEl.appendChild(hitText);
     card.appendChild(hitEl);
+  }
+
+  // Message-search hit (flagged quick-search message lane): the most
+  // recent matching message with server-anchored highlights and
+  // superseded/truncated/subagent badges.
+  if (m.msgHit) {
+    card.appendChild(buildSessionMessageHitBlock(m.msgHit));
   }
 
   // Quick-search hit inside the conversation preview: one quiet snippet

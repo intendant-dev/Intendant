@@ -459,6 +459,9 @@ function setSessionsHost(hostId) {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   renderSessionsHostStrip();
   loadSessions({ force: true });
+  // Message lane (flagged): the tunnel twin serves the selected peer's own
+  // index, so a host switch re-keys the search. No-op with the flag off.
+  scheduleSessionMessageSearch();
 }
 
 // Whole-card action while browsing a peer: hand off to the peer's own
@@ -1101,6 +1104,10 @@ function _refilterSessions() {
 // Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
+  // Message lane (flagged; 57-sessions-message-search.js): every
+  // search/filter change funnels through here, so the lane re-keys or
+  // clears BEFORE the re-render below. No-op with the flag off.
+  scheduleSessionMessageSearch();
   _refilterSessions();
 }
 

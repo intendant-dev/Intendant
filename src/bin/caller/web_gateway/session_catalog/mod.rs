@@ -14,6 +14,8 @@ mod external_rows;
 pub(crate) use external_rows::*;
 mod detail_search;
 pub(crate) use detail_search::*;
+mod locate;
+pub(crate) use locate::*;
 mod codex_values;
 pub(crate) use codex_values::*;
 mod caches;

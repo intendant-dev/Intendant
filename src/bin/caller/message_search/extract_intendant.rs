@@ -459,7 +459,9 @@ fn read_event_span(
 /// `" ({n} attachment(s))"` suffix the emitter appends is stripped.
 /// Best-effort by design: user text that itself ends with that shape loses
 /// the tail (plan §5 records this lane as best-effort).
-fn parse_round_follow_up(message: &str) -> Option<String> {
+/// `pub(crate)`: the `locate=` resolver re-derives the same text to verify
+/// a `NativeEvent` locator's content hash against the live line.
+pub(crate) fn parse_round_follow_up(message: &str) -> Option<String> {
     let rest = message.strip_prefix("Round ")?;
     let space = rest.find(' ')?;
     if rest[..space].is_empty() || !rest[..space].bytes().all(|byte| byte.is_ascii_digit()) {

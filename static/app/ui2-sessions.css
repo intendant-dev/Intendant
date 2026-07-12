@@ -518,6 +518,26 @@ html.ui-v2 #tab-sessions .session-card .sc-preview-hit {
   font-size: 12px;
 }
 html.ui-v2 #tab-sessions .session-card .sc-preview-hit-role { color: var(--violet); }
+/* Message-search hit row (flagged quick-search message lane). */
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit {
+  border-left: 2px solid var(--green);
+  border-radius: 0 8px 8px 0;
+  background: rgba(var(--green-rgb), .08);
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-count,
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-role { color: var(--green); }
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-time { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-card .sc-msg-hit-text mark {
+  background: rgba(var(--amber-rgb), .3);
+  color: inherit;
+}
+html.ui-v2 #tab-sessions .sessions-msg-search-status {
+  font-size: 12px;
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .sessions-msg-search-status.error { color: var(--red); }
 
 /* Meta row — mono microtext per the reference card's third line. */
 html.ui-v2 #tab-sessions .session-card .sc-meta {

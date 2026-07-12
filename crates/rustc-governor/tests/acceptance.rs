@@ -3,10 +3,14 @@
 //! this crate carries an integration-test file rather than the repo's usual
 //! inline-only tests: a unit test inside the bin target links the libtest
 //! harness `main`, so there is no governor binary to exec) against hermetic
-//! tempdir rigs wired through `INTENDANT_GOVERNOR_CONFIG`. No machine state
-//! is read or mutated: every permit dir, config, marker, and fake HOME
-//! lives in the test's own tempdir, and the only processes signalled are
-//! the ones a test itself spawned.
+//! tempdir rigs wired through `INTENDANT_GOVERNOR_CONFIG`.
+//!
+//! The governor is cargo's RUSTC_WRAPPER, so every spawn follows the
+//! wrapper argv contract: argv[1] is the "real compiler" (a /bin/sh
+//! fixture the rig provides), argv[2..] are its args. No machine state is
+//! read or mutated: every permit dir, config, marker, and fixture lives in
+//! the test's own tempdir, and the only processes signalled are the ones a
+//! test itself spawned.
 //!
 //! Loaded-box tolerance: assertions use generous deadlines (`GENEROUS`) and
 //! never assert that something happened *fast* — only that invariants hold
@@ -62,19 +66,45 @@ impl Rig {
         local: u32,
         ci: u32,
         ci_user_is_me: bool,
-        real_rustc: &Path,
         enabled: bool,
+    ) -> PathBuf {
+        self.config_inner(name, local, ci, ci_user_is_me, enabled, None)
+    }
+
+    /// Same, plus a `wrap_with` chain front (the sccache stand-in).
+    fn config_with_wrap(
+        &self,
+        name: &str,
+        local: u32,
+        ci: u32,
+        ci_user_is_me: bool,
+        enabled: bool,
+        wrap: &Path,
+    ) -> PathBuf {
+        self.config_inner(name, local, ci, ci_user_is_me, enabled, Some(wrap))
+    }
+
+    fn config_inner(
+        &self,
+        name: &str,
+        local: u32,
+        ci: u32,
+        ci_user_is_me: bool,
+        enabled: bool,
+        wrap: Option<&Path>,
     ) -> PathBuf {
         let ci_users = if ci_user_is_me {
             format!("[\"{}\"]", me())
         } else {
             "[\"governor-test-no-such-user\"]".to_string()
         };
-        let text = format!(
-            "enabled = {enabled}\npermit_dir = \"{}\"\nlocal_reserved = {local}\nci_reserved = {ci}\nci_users = {ci_users}\nreal_rustc = \"{}\"\n",
+        let mut text = format!(
+            "enabled = {enabled}\npermit_dir = \"{}\"\nlocal_reserved = {local}\nci_reserved = {ci}\nci_users = {ci_users}\n",
             self.permit_dir.display(),
-            real_rustc.display(),
         );
+        if let Some(wrap) = wrap {
+            text.push_str(&format!("wrap_with = \"{}\"\n", wrap.display()));
+        }
         let path = self.root.join(name);
         std::fs::write(&path, text).unwrap();
         path
@@ -103,9 +133,12 @@ fn me() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn spawn_governor(config: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
+/// Spawn the governor under the RUSTC_WRAPPER contract: `real` becomes
+/// argv[1] (the compiler), `args` become argv[2..] (the compiler's args).
+fn spawn_governor(config: &Path, real: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(GOVERNOR);
-    cmd.args(args)
+    cmd.arg(real)
+        .args(args)
         .env("INTENDANT_GOVERNOR_CONFIG", config)
         // Hygiene: never inherit an operator kill switch into the rig.
         .env_remove("INTENDANT_GOVERNOR")
@@ -220,9 +253,11 @@ fn global_ceiling_bounds_concurrent_holders() {
             ev = events.display()
         ),
     );
-    let config = rig.config("gov.toml", 1, 2, false, &script, true);
+    let config = rig.config("gov.toml", 1, 2, false, true);
 
-    let mut kids: Vec<Child> = (0..8).map(|_| spawn_governor(&config, &[], &[])).collect();
+    let mut kids: Vec<Child> = (0..8)
+        .map(|_| spawn_governor(&config, &script, &[], &[]))
+        .collect();
     let overall = Instant::now();
     for child in &mut kids {
         let left = Duration::from_secs(45)
@@ -262,10 +297,10 @@ fn idle_borrowing_takes_foreign_permit() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 2, false, &script, true);
+    let config = rig.config("gov.toml", 1, 2, false, true);
 
     let _local_held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     let status = wait_deadline(&mut child, GENEROUS).expect("borrower must not wait");
     assert!(status.success());
     assert!(marker.exists());
@@ -285,7 +320,7 @@ fn contested_ci_reserve_is_not_borrowed_by_local() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 2, false, &script, true);
+    let config = rig.config("gov.toml", 1, 2, false, true);
 
     let local_held = hold_exclusive(&rig.permit("permit-local-0"));
     // Pre-create the CI permits so their freeness is observable.
@@ -293,7 +328,7 @@ fn contested_ci_reserve_is_not_borrowed_by_local() {
     let (_c0, _c1) = (open_rw(&ci0), open_rw(&ci1));
     let _ci_waiters = hold_shared(&rig.permit("demand-ci"));
 
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     assert_still_running_for(&mut child, BLOCKED_OBSERVATION);
     assert!(
         !marker.exists(),
@@ -325,7 +360,7 @@ fn contested_local_reserve_is_not_borrowed_by_ci() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 2, true, &script, true);
+    let config = rig.config("gov.toml", 1, 2, true, true);
 
     let ci_held_0 = hold_exclusive(&rig.permit("permit-ci-0"));
     let _ci_held_1 = hold_exclusive(&rig.permit("permit-ci-1"));
@@ -333,7 +368,7 @@ fn contested_local_reserve_is_not_borrowed_by_ci() {
     let _l0 = open_rw(&local0);
     let _local_waiters = hold_shared(&rig.permit("demand-local"));
 
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     assert_still_running_for(&mut child, BLOCKED_OBSERVATION);
     assert!(!marker.exists());
     assert!(
@@ -359,10 +394,10 @@ fn waiter_acquires_promptly_after_release() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
 
     let held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     assert_still_running_for(&mut child, Duration::from_millis(400));
     drop(held);
     let status = wait_deadline(&mut child, GENEROUS).expect("waiter starved");
@@ -388,10 +423,10 @@ fn sigkilled_holder_releases_its_permit() {
             ready.display()
         ),
     );
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
     let permit = rig.permit("permit-local-0");
 
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     wait_for(|| ready.exists(), GENEROUS, "holder to start");
     assert!(is_exclusively_locked(&permit));
     child.kill().unwrap();
@@ -405,8 +440,8 @@ fn sigkilled_holder_releases_its_permit() {
     // And a fresh governed invocation can take it end to end.
     let marker = rig.root.join("marker");
     let quick = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config2 = rig.config("gov2.toml", 1, 0, false, &quick, true);
-    let mut second = spawn_governor(&config2, &[], &[]);
+    let config2 = rig.config("gov2.toml", 1, 0, false, true);
+    let mut second = spawn_governor(&config2, &quick, &[], &[]);
     assert!(wait_deadline(&mut second, GENEROUS).unwrap().success());
     assert!(marker.exists());
 }
@@ -427,10 +462,10 @@ fn permit_lock_survives_exec() {
             s = stop.display()
         ),
     );
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
     let permit = rig.permit("permit-local-0");
 
-    let mut child = spawn_governor(&config, &[], &[]);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     wait_for(|| ready.exists(), GENEROUS, "exec'd fixture to start");
     // The shell fixture is the post-exec process image; the lock must have
     // ridden through the exec.
@@ -452,8 +487,8 @@ fn permit_lock_survives_exec() {
 fn exit_status_propagates() {
     let rig = Rig::new();
     let script = rig.script("exit42.sh", "exit 42");
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
-    let mut child = spawn_governor(&config, &[], &[]);
+    let config = rig.config("gov.toml", 1, 0, false, true);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     let status = wait_deadline(&mut child, GENEROUS).unwrap();
     assert_eq!(status.code(), Some(42));
 }
@@ -471,8 +506,8 @@ fn signal_disposition_propagates() {
             ready.display()
         ),
     );
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
-    let mut child = spawn_governor(&config, &[], &[]);
+    let config = rig.config("gov.toml", 1, 0, false, true);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     wait_for(|| ready.exists(), GENEROUS, "fixture to start");
     // SAFETY: pid was spawned by this test and not yet reaped; kill(2)
     // takes only the pid and signal number.
@@ -490,7 +525,7 @@ fn probe_fast_path_ignores_exhausted_pool() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("probe.sh", &format!("echo probed >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 2, false, &script, true);
+    let config = rig.config("gov.toml", 1, 2, false, true);
 
     let _p0 = hold_exclusive(&rig.permit("permit-local-0"));
     let _p1 = hold_exclusive(&rig.permit("permit-ci-0"));
@@ -498,9 +533,9 @@ fn probe_fast_path_ignores_exhausted_pool() {
     let _d0 = hold_shared(&rig.permit("demand-local"));
     let _d1 = hold_shared(&rig.permit("demand-ci"));
 
-    let mut version = spawn_governor(&config, &["-vV"], &[]);
+    let mut version = spawn_governor(&config, &script, &["-vV"], &[]);
     assert!(wait_deadline(&mut version, GENEROUS).unwrap().success());
-    let mut print = spawn_governor(&config, &["--print", "cfg"], &[]);
+    let mut print = spawn_governor(&config, &script, &["--print", "cfg"], &[]);
     assert!(wait_deadline(&mut print, GENEROUS).unwrap().success());
     let text = std::fs::read_to_string(&marker).unwrap();
     assert_eq!(text.lines().count(), 2, "both probes must have exec'd");
@@ -509,6 +544,7 @@ fn probe_fast_path_ignores_exhausted_pool() {
     // wait behind the exhausted pool, not bypass.
     let mut governed = spawn_governor(
         &config,
+        &script,
         &[
             "--print",
             "native-static-libs",
@@ -534,49 +570,222 @@ fn kill_switch_flips_live() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
 
     let _held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut waiter = spawn_governor(&config, &[], &[]);
+    let mut waiter = spawn_governor(&config, &script, &[], &[]);
     assert_still_running_for(&mut waiter, Duration::from_millis(600));
 
     // Flip the switch in place (same path the running waiter re-reads).
-    rig.config("gov.toml", 1, 0, false, &script, false);
+    rig.config("gov.toml", 1, 0, false, false);
 
     let status = wait_deadline(&mut waiter, GENEROUS).expect("waiter must unwedge, fail-open");
     assert!(status.success());
-    let mut next = spawn_governor(&config, &[], &[]);
+    let mut next = spawn_governor(&config, &script, &[], &[]);
     assert!(wait_deadline(&mut next, GENEROUS).unwrap().success());
     assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 2);
 }
 
-/// Fail-open: no config at the configured path — the governor skips permits
-/// and execs the real rustc resolved via $HOME/.cargo/bin/rustc.
+// ------------------------------------------------ wrapper chain shape ----
+
+/// Governed chain shape: with `wrap_with` configured, a governed
+/// invocation acquires its permit and execs `wrap_with <real> <args…>` —
+/// argv order is the sccache client contract (argv[1] = the compiler,
+/// the rest its args, exactly as cargo handed them to the governor).
 #[test]
-fn missing_config_fails_open_via_default_chain() {
+fn governed_invocation_execs_wrap_chain() {
+    let rig = Rig::new();
+    let real_marker = rig.root.join("real");
+    let wrap_marker = rig.root.join("wrap");
+    let real = rig.script(
+        "rustc.sh",
+        &format!("echo \"real $*\" >> {}", real_marker.display()),
+    );
+    // Log the argv the wrap step received, then run it — what the sccache
+    // client does with its compiler argv.
+    let wrap = rig.script(
+        "wrap.sh",
+        &format!("echo \"$*\" >> {}\nexec \"$@\"", wrap_marker.display()),
+    );
+    let config = rig.config_with_wrap("gov.toml", 1, 0, false, true, &wrap);
+
+    let mut child = spawn_governor(&config, &real, &["--crate-name", "x", "lib.rs"], &[]);
+    assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
+
+    let wrap_line = std::fs::read_to_string(&wrap_marker).unwrap();
+    assert_eq!(
+        wrap_line.trim_end(),
+        format!("{} --crate-name x lib.rs", real.display()),
+        "wrap front must receive <real> <args…> verbatim"
+    );
+    let real_line = std::fs::read_to_string(&real_marker).unwrap();
+    assert_eq!(real_line.trim_end(), "real --crate-name x lib.rs");
+    // And the run really was governed: exactly the permit path, logged.
+    assert!(
+        rig.log().contains("permit=permit-local-0"),
+        "governed wrap-chain run must hold a permit: {:?}",
+        rig.log()
+    );
+}
+
+/// Fail-open paths keep the wrap chain: a disabled governor must behave
+/// exactly like a plain sccache rustc-wrapper — caching is never dropped.
+/// Covers the config kill switch, the env override, and zero configured
+/// permits. (Missing/unparseable config cannot know `wrap_with` and runs
+/// the compiler directly — covered by the missing/unparseable tests
+/// below.)
+#[test]
+fn fail_open_paths_still_exec_wrap_chain() {
+    struct Case {
+        name: &'static str,
+        enabled: bool,
+        local: u32,
+        envs: &'static [(&'static str, &'static str)],
+    }
+    for case in [
+        Case {
+            name: "kill-switch",
+            enabled: false,
+            local: 1,
+            envs: &[],
+        },
+        Case {
+            name: "env-off",
+            enabled: true,
+            local: 1,
+            envs: &[("INTENDANT_GOVERNOR", "off")],
+        },
+        Case {
+            name: "zero-permits",
+            enabled: true,
+            local: 0,
+            envs: &[],
+        },
+    ] {
+        let rig = Rig::new();
+        let real_marker = rig.root.join("real");
+        let wrap_marker = rig.root.join("wrap");
+        let real = rig.script(
+            "rustc.sh",
+            &format!("echo real >> {}", real_marker.display()),
+        );
+        let wrap = rig.script(
+            "wrap.sh",
+            &format!("echo wrap >> {}\nexec \"$@\"", wrap_marker.display()),
+        );
+        let config = rig.config_with_wrap("gov.toml", case.local, 0, false, case.enabled, &wrap);
+        // Where a permit exists, hold it: fail-open must not wait on it.
+        let _held = (case.local > 0).then(|| hold_exclusive(&rig.permit("permit-local-0")));
+
+        let mut child = spawn_governor(&config, &real, &[], case.envs);
+        let status = wait_deadline(&mut child, GENEROUS)
+            .unwrap_or_else(|| panic!("[{}] fail-open run must complete", case.name));
+        assert!(status.success(), "[{}] chain must succeed", case.name);
+        assert!(
+            wrap_marker.exists(),
+            "[{}] fail-open dropped the wrap_with chain (caching lost)",
+            case.name
+        );
+        assert!(
+            real_marker.exists(),
+            "[{}] the real compiler never ran",
+            case.name
+        );
+        // Ungoverned runs are silent in the log (doctrine: the log answers
+        // "who waited on which permit").
+        assert_eq!(rig.log(), "", "[{}] fail-open must not log", case.name);
+    }
+}
+
+/// `wrap_with` pointing at a path that doesn't exist must not break the
+/// build: the wrap exec fails, and the governor falls back to running the
+/// compiler directly — still governed (the permit was already held).
+#[test]
+fn missing_wrap_with_falls_back_to_direct_exec() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let home = rig.root.join("home");
-    let bin = home.join(".cargo").join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let fake_rustc = bin.join("rustc");
-    std::fs::write(
-        &fake_rustc,
-        format!("#!/bin/sh\necho fake >> {}\n", marker.display()),
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&fake_rustc).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_rustc, perms).unwrap();
-
-    let missing = rig.root.join("no-such-config.toml");
-    let mut child = spawn_governor(
-        &missing,
-        &["--crate-name", "x"],
-        &[("HOME", home.to_str().unwrap())],
+    let real = rig.script("rustc.sh", &format!("echo real >> {}", marker.display()));
+    let config = rig.config_with_wrap(
+        "gov.toml",
+        1,
+        0,
+        false,
+        true,
+        Path::new("/nonexistent/rustc-governor-test/sccache"),
     );
+    let mut child = spawn_governor(&config, &real, &["--crate-name", "x"], &[]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
-    assert!(marker.exists(), "fail-open must still exec the real rustc");
+    assert!(marker.exists(), "fallback must still run the compiler");
+    assert!(
+        rig.log().contains("permit=permit-local-0"),
+        "fallback run stays governed: {:?}",
+        rig.log()
+    );
+}
+
+/// `wrap_with` pointing back at the governor binary would exec an
+/// identical invocation forever. It is config-file state, so it fails
+/// OPEN: the chain front is ignored and the compiler runs directly.
+#[test]
+fn wrap_with_pointing_at_governor_falls_back_to_direct_exec() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let real = rig.script("rustc.sh", &format!("echo real >> {}", marker.display()));
+    let config = rig.config_with_wrap("gov.toml", 1, 0, false, true, Path::new(GOVERNOR));
+    let mut child = spawn_governor(&config, &real, &["--crate-name", "x"], &[]);
+    let status =
+        wait_deadline(&mut child, GENEROUS).expect("self-wrap must fall back, not loop or wait");
+    assert!(status.success());
+    assert!(marker.exists(), "the real compiler must still run");
+}
+
+/// Probes exec the real compiler DIRECTLY: no permit, no `wrap_with` —
+/// they must stay snappy under a full pool and must not depend on a
+/// healthy sccache. All permits held + wrap fixture present: `-vV`
+/// completes and the wrap marker stays absent.
+#[test]
+fn probe_bypasses_wrap_chain_and_permits() {
+    let rig = Rig::new();
+    let real_marker = rig.root.join("real");
+    let wrap_marker = rig.root.join("wrap");
+    let real = rig.script(
+        "rustc.sh",
+        &format!("echo real >> {}", real_marker.display()),
+    );
+    let wrap = rig.script(
+        "wrap.sh",
+        &format!("echo wrap >> {}\nexec \"$@\"", wrap_marker.display()),
+    );
+    let config = rig.config_with_wrap("gov.toml", 1, 0, false, true, &wrap);
+    let _held = hold_exclusive(&rig.permit("permit-local-0"));
+
+    let mut probe = spawn_governor(&config, &real, &["-vV"], &[]);
+    assert!(wait_deadline(&mut probe, GENEROUS).unwrap().success());
+    assert!(real_marker.exists(), "probe must exec the real compiler");
+    assert!(
+        !wrap_marker.exists(),
+        "probe must bypass the wrap_with chain (it ran through sccache)"
+    );
+    assert_eq!(rig.log(), "", "probes must not log");
+}
+
+// -------------------------------------------------------- fail open ----
+
+/// Fail-open: no config at the configured path — the governor skips
+/// permits, and with no config there is no `wrap_with` either: it execs
+/// the compiler cargo handed it as argv[1], directly.
+#[test]
+fn missing_config_fails_open_execs_argv1() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let real = rig.script("rustc.sh", &format!("echo fake >> {}", marker.display()));
+    let missing = rig.root.join("no-such-config.toml");
+    let mut child = spawn_governor(&missing, &real, &["--crate-name", "x"], &[]);
+    assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
+    assert!(
+        marker.exists(),
+        "fail-open must still run the real compiler"
+    );
 }
 
 /// Fail-open: an unparseable config behaves exactly like a missing one.
@@ -584,22 +793,10 @@ fn missing_config_fails_open_via_default_chain() {
 fn unparseable_config_fails_open() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let home = rig.root.join("home");
-    let bin = home.join(".cargo").join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let fake_rustc = bin.join("rustc");
-    std::fs::write(
-        &fake_rustc,
-        format!("#!/bin/sh\necho fake >> {}\n", marker.display()),
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&fake_rustc).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_rustc, perms).unwrap();
-
+    let real = rig.script("rustc.sh", &format!("echo fake >> {}", marker.display()));
     let config = rig.root.join("broken.toml");
     std::fs::write(&config, "enabled = maybe\n").unwrap();
-    let mut child = spawn_governor(&config, &[], &[("HOME", home.to_str().unwrap())]);
+    let mut child = spawn_governor(&config, &real, &[], &[]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
     assert!(marker.exists());
 }
@@ -610,9 +807,9 @@ fn env_off_bypasses_permits() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 0, false, &script, true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
     let _held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut child = spawn_governor(&config, &[], &[("INTENDANT_GOVERNOR", "off")]);
+    let mut child = spawn_governor(&config, &script, &[], &[("INTENDANT_GOVERNOR", "off")]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
     assert!(marker.exists());
 }
@@ -623,19 +820,25 @@ fn zero_permits_fails_open() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
     let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 0, 0, false, &script, true);
-    let mut child = spawn_governor(&config, &[], &[]);
+    let config = rig.config("gov.toml", 0, 0, false, true);
+    let mut child = spawn_governor(&config, &script, &[], &[]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
     assert!(marker.exists());
 }
 
-/// Misconfiguration guard: real_rustc pointing back at the governor must
-/// refuse (exit 127) instead of exec-looping into a fork bomb.
+// ---------------------------------------------------- wiring guards ----
+
+/// Misconfiguration guard: cargo handing the governor ITSELF as the
+/// compiler (a legacy `[build] rustc = …rustc-governor` line left next to
+/// the new `rustc-wrapper` wiring) must refuse (exit 127) instead of
+/// exec-looping into a fork bomb.
 #[test]
 fn refuses_to_exec_itself() {
     let rig = Rig::new();
-    let config = rig.config("gov.toml", 1, 0, false, Path::new(GOVERNOR), true);
+    let config = rig.config("gov.toml", 1, 0, false, true);
     let mut child = Command::new(GOVERNOR)
+        .arg(GOVERNOR)
+        .args(["--crate-name", "x"])
         .env("INTENDANT_GOVERNOR_CONFIG", &config)
         .env_remove("INTENDANT_GOVERNOR")
         .stdout(Stdio::null())
@@ -652,4 +855,30 @@ fn refuses_to_exec_itself() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(stderr.contains("refusing to exec itself"), "{stderr:?}");
+}
+
+/// No argv[1] at all is not a build (there is nothing to run): loud usage
+/// error, so a mis-wired account is caught immediately instead of
+/// half-working.
+#[test]
+fn missing_compiler_argv_is_a_loud_error() {
+    let rig = Rig::new();
+    let config = rig.config("gov.toml", 1, 0, false, true);
+    let mut child = Command::new(GOVERNOR)
+        .env("INTENDANT_GOVERNOR_CONFIG", &config)
+        .env_remove("INTENDANT_GOVERNOR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = wait_deadline(&mut child, GENEROUS).unwrap();
+    assert_eq!(status.code(), Some(127));
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("argv[1]"), "{stderr:?}");
 }
