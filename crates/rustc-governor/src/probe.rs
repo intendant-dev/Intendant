@@ -1,12 +1,15 @@
-//! Probe fast path: classify invocations that may bypass the permit pool
-//! (they still exec the real rustc — bypass is about *waiting*, never about
-//! *what runs*).
+//! Probe fast path: classify invocations that bypass the permit pool AND
+//! the `wrap_with` chain — a probe execs the real compiler (argv[1])
+//! directly, so it neither waits on permits nor depends on a healthy
+//! sccache server.
 //!
 //! cargo probes the compiler at every startup (`rustc -vV`, and the target
-//! probe `rustc - --crate-name ___ --print=file-names --print=cfg …`), and
-//! sccache runs its own identification probes; none of those may queue
-//! behind a full permit pool or cargo startup wedges whenever the box is
-//! busy. An invocation is probe-only iff it *cannot* compile anything:
+//! probe `rustc - --crate-name ___ --print=file-names --print=cfg …`);
+//! none of those may queue behind a full permit pool or cargo startup
+//! wedges whenever the box is busy. (sccache's own compiler-identification
+//! probes no longer pass through the governor at all: sccache sits behind
+//! it in the chain and probes argv[1] itself.) An invocation is probe-only
+//! iff it *cannot* compile anything:
 //!
 //! - it asks for the version (`-vV`, `-V`, `--version`), rustc prints and
 //!   exits regardless of other flags; or

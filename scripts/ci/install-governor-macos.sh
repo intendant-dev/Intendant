@@ -10,9 +10,11 @@
 # that file is live operator state (the kill switch lives in it).
 #
 # Deliberately does NOT touch any account's ~/.cargo/config.toml: the
-# governor stays inert until an account's cargo points at it, and the
-# operator canaries the CI account before wiring their own. This script
-# only prints the lines to add. Doc: scripts/ci/README.md, "Governor".
+# governor stays inert until an account's cargo points at it (as
+# `[build] rustc-wrapper`; the governor execs sccache itself via the
+# conf's wrap_with key), and the operator canaries the CI account before
+# wiring their own. This script only prints the lines to set/remove.
+# Doc: scripts/ci/README.md, "Governor".
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -50,13 +52,27 @@ permit_dir = "/usr/local/var/intendant-governor"
 local_reserved = 1
 ci_reserved = 2
 ci_users = ["_intendant-ci", "ci"]
-# real_rustc = "/absolute/path/to/rustc"   # optional; default resolution is
-#                                          # $HOME/.cargo/bin/rustc, else PATH
+# Governed (and fail-open) invocations exec `wrap_with <rustc> <args…>` —
+# the sccache client; the flock permit rides into it and is held for the
+# whole cache round-trip / server-side compile. Unset, empty, or a missing
+# path: the compiler runs directly (correct, just uncached).
+wrap_with = "/opt/homebrew/bin/sccache"
 CONF_EOF
     chmod 0644 "$CONF"
     echo "wrote $CONF"
 else
     echo "keeping existing $CONF (live operator state — edit by hand)"
+    if ! grep -q '^[[:space:]]*wrap_with[[:space:]]*=' "$CONF"; then
+        cat <<'WRAP_EOF'
+  NOTE: this conf predates the wrapper-chain flip and has no wrap_with key.
+  The governor is now cargo's rustc-wrapper and invokes sccache itself;
+  without wrap_with, governed builds still work but run UNCACHED. Add to
+  the conf by hand:
+    wrap_with = "/opt/homebrew/bin/sccache"
+  (Any leftover real_rustc line is inert and can be dropped: the governor
+  now receives the compiler path from cargo as argv[1].)
+WRAP_EOF
+    fi
 fi
 
 # Pre-create the flock files for the *effective* config (an existing conf
@@ -98,21 +114,28 @@ echo "permit dir ready: $permit_dir (local=$local_n ci=$ci_n)"
 cat <<'NEXT_EOF'
 
 The governor is installed but INERT: no account uses it until its cargo
-config points at it. For each account to govern, add under the EXISTING
-[build] table in that account's ~/.cargo/config.toml (keep the
-rustc-wrapper = sccache line exactly as it is):
+config points at it. For each account to govern, set under the EXISTING
+[build] table in that account's ~/.cargo/config.toml:
 
 [build]
-rustc = "/usr/local/lib/intendant-ci/bin/rustc-governor"
+rustc-wrapper = "/usr/local/lib/intendant-ci/bin/rustc-governor"
+
+replacing any `rustc-wrapper = ".../sccache"` line (the governor execs
+sccache itself, via the conf's wrap_with key), and REMOVE any legacy
+`rustc = ".../rustc-governor"` line — the governor now receives the real
+compiler path from cargo as argv[1]; if cargo hands it the governor
+itself, it refuses with exit 127 rather than exec-looping.
 
 Rollout order (see scripts/ci/README.md "Governor"): the CI account
 first, soak a day of green runs, then the operator account.
 
 Notes:
-- sccache hashes the compiler binary (the governor) into its cache keys:
-  first enablement — and every governor upgrade — invalidates that
-  account's sccache cache once.
+- Cache keys are computed against the real rustc again (sccache is asked
+  to run the real compiler, not the governor), so enablement and governor
+  upgrades no longer invalidate the account's sccache cache.
 - Kill switch: set `enabled = false` in /usr/local/etc/intendant-governor.toml
-  (immediate, machine-wide); removing the rustc= line fully unwires an account.
+  (immediate, machine-wide); a disabled governor still execs the wrap_with
+  chain, so caching survives the kill switch. Removing the rustc-wrapper=
+  line fully unwires an account.
 - Watch it: tail -f /usr/local/var/intendant-governor/governor.log
 NEXT_EOF
