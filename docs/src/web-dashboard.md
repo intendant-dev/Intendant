@@ -652,7 +652,8 @@ and peer federation:
   topology separates `peer.inspect`, `peer.manage`, and `peer.use`.
   `peer.use` is the delegation gate: acting through a connected peer —
   opening a tunnel (dashboard-control, file-transfer, or display signaling)
-  or sending it a message, task, or approval decision — presents *this
+  or sending it a message, task, or approval decision, directly or via
+  coordinator routing — presents *this
   daemon's* peer credentials, and the receiving peer authorizes each action
   against its own grants for this daemon — so relaying is
   never inferred from local capabilities, it is granted by name
@@ -1824,11 +1825,13 @@ Acting through an already-connected peer is gated by `peer.use` instead —
 using a peer relationship is not administering it. That covers the signaling
 relays that open tunnels (`api_peer_webrtc_signal`,
 `api_peer_file_transfer_signal`, `api_peer_dashboard_control_signal`, and
-their `POST /api/peers/{id}/…-webrtc` HTTP twins) and the quick controls
+their `POST /api/peers/{id}/…-webrtc` HTTP twins), the quick controls
 (`api_peer_message`, `api_peer_task`, `api_peer_approval`, and their
-`POST /api/peers/{id}/message|task|approval` HTTP twins): each delegates this
-daemon's peer identity, and the receiving peer authorizes the action against
-its own grants for this daemon.
+`POST /api/peers/{id}/message|task|approval` HTTP twins), and coordinator
+task routing (`api_coordinator_route` and its `POST /api/coordinator/route`
+HTTP twin, which picks the capability-matched peer for you): each delegates
+this daemon's peer identity, and the receiving peer authorizes the action
+against its own grants for this daemon.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,

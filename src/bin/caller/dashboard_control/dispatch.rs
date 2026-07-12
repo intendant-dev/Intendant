@@ -2346,9 +2346,11 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             peer_registry_available && peer_use,
         ),
         ("api_peer_pairing_available", peer_manage || access_manage),
+        // Coordinator routing acts *through* a peer too (owner decision
+        // 2026-07-11): the aggregate follows the method's PeerUse gate.
         (
             "api_coordinator_available",
-            peer_registry_available && peer_manage,
+            peer_registry_available && peer_use,
         ),
         // Host capability, not a grant: dashboards derive the "New virtual
         // display" affordance from this (Xvfb-based, Linux-only).

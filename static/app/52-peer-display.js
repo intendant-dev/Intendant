@@ -2384,9 +2384,9 @@ async function routeTask() {
       task: { instructions },
     };
     // Coordinator routing is a mutation (transport F5): verb-derived
-    // no-replay. The method's per-lane IAM divergence (HTTP: Task via the
-    // federation ladder; tunnel: PeerManage, documented op-override) is
-    // preserved on the rows — the facade only names the twin.
+    // no-replay. Both lanes gate on peer.use (owner decision 2026-07-11:
+    // the coordinator spends this daemon's peer identity, like the
+    // per-peer task quick control) — the facade only names the twin.
     const resp = await daemonApi.request('api_coordinator_route', payload);
     const result = resp.body || {};
     if (resp.ok) {
