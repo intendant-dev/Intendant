@@ -89,6 +89,12 @@ pub struct ExternalWrapperRecord {
     pub log_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
+    /// Activity mtime of the wrapper's log dir — EXCEPT that `0` is the
+    /// deliberate supersession sentinel: `upsert` demotes rows that lost an
+    /// identity conflict by zeroing this field (see the demotion loops
+    /// there), which sorts them behind every live row. Never "fix" a zero
+    /// by re-stamping it with a fresh mtime — that resurrects a demoted
+    /// row.
     #[serde(default)]
     pub updated_at_secs: u64,
 }
@@ -195,6 +201,13 @@ pub fn upsert(
     // whether anything actually changed and skip the write when not.
     let mut dirty = false;
 
+    // Demotion, not deletion: rows that conflict with the upserted identity
+    // (same backend session under another wrapper; same wrapper now bound to
+    // another backend session) are kept for history, and `updated_at_secs`
+    // is zeroed as the DELIBERATE supersession sentinel — demoted rows sort
+    // behind every live row in `wrappers_for`. Do not "repair" the zero with
+    // a real mtime; only a fresh upsert of the row's exact identity triple
+    // (the branch below) may make it current again.
     for record in index.wrappers.iter_mut().filter(|record| {
         record.source == source
             && record.backend_session_id == backend_session_id
