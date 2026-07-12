@@ -531,3 +531,84 @@ html.ui-v2 .ui2-skip:focus-visible { top: 8px; outline: 2px solid var(--iris); o
   html.ui-v2 .ui2-nav-item-label, html.ui-v2 .ui2-nav-badge { display: none; }
   html.ui-v2 .ui2-nav-bottom { display: none; }
 }
+
+/* ── rail: short viewports ──
+   The nav-groups region is the ONLY scroller; the autonomy/account footer
+   stays pinned and opaque. min-height:0 is the flexbox correctness bit —
+   without it the groups' content size can win and push the SYSTEM group
+   under the footer instead of scrolling. */
+html.ui-v2 .ui2-nav-groups { min-height: 0; }
+html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
+@media (max-height: 950px) {
+  html.ui-v2 .ui2-nav-top { padding: 10px 16px 8px; gap: 8px; }
+  html.ui-v2 .ui2-nav-group { margin-bottom: 6px; }
+  html.ui-v2 .ui2-nav-eyebrow { padding: 4px 8px 3px; }
+  html.ui-v2 .ui2-nav-item { padding: 6px 9px; }
+  html.ui-v2 .ui2-nav-bottom { padding: 8px 10px; gap: 6px; }
+}
+
+/* ── composer: phones (≤500px) ──
+   At rest the dock is one compact row — the input plus Send — instead of
+   ~40% of the viewport; focusing it (or targeting a session) expands the
+   full control set. :focus-within covers typing, target chip, attach and
+   Direct once expanded. */
+@media (max-width: 500px) {
+  html.ui-v2 .global-task-bar {
+    bottom: 8px;
+    width: calc(100vw - var(--ui2-nav-w) - 16px);
+    padding: 6px 8px;
+    flex-wrap: wrap;
+  }
+  html.ui-v2 #app { padding-bottom: 64px; }
+  html.ui-v2 .global-task-bar .task-new-session-btn,
+  html.ui-v2 .global-task-bar .global-attach-btn,
+  html.ui-v2 .global-task-bar .global-direct-toggle {
+    display: none;
+  }
+  html.ui-v2 .global-task-bar:focus-within .task-new-session-btn,
+  html.ui-v2 .global-task-bar:focus-within .global-attach-btn,
+  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle {
+    display: inline-flex;
+  }
+  html.ui-v2 .global-task-bar .global-task-input {
+    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
+    max-height: 2.4em;
+  }
+  html.ui-v2 .global-task-bar:focus-within .global-task-input {
+    max-height: 6em;
+  }
+}
+
+/* ── Activity subtab strip: phones scroll horizontally, never wrap ──
+   Supersedes 14-styles-displays-voice.css's ≤600px flex-wrap rule (this
+   file loads later and the html.ui-v2 prefix outweighs it): the strip
+   scrolls sideways; buttons and the verbosity/host controls keep their
+   natural width. */
+@media (max-width: 600px) {
+  html.ui-v2 #activity-subtabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  html.ui-v2 #activity-subtabs::-webkit-scrollbar { display: none; }
+  html.ui-v2 #activity-subtabs .subtab-btn { flex: 0 0 auto; white-space: nowrap; }
+  html.ui-v2 #activity-subtabs .activity-subtab-controls {
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+}
+
+/* ── fuel/lease chip (oversight bar, display-only) ── */
+html.ui-v2 .ui2-fuel-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+  border: 1px solid rgba(var(--green-rgb), .28);
+  white-space: nowrap;
+}

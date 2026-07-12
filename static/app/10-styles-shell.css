@@ -816,3 +816,35 @@ html {
   grid-column: 1 / -1;
 }
 
+
+/* ── Approval delivery states (fragment 41/58 drive these) ──
+   While an approve/deny is in flight the panel disables its buttons and
+   shows a quiet "Sending…" line instead of vanishing optimistically; the
+   title badge counts queued concurrent approvals ("1 of N"). */
+#approval-panel.approval-sending .approval-actions button {
+  opacity: 0.55;
+  cursor: progress;
+}
+.approval-sending-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--subtext0, var(--text-3, #a6adc8));
+}
+.approval-sending-note::before {
+  content: '⠋';
+  margin-right: 6px;
+  animation: ui-braille-spin 0.8s steps(1, end) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .approval-sending-note::before { animation: none; }
+}
+.approval-pending-count {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(249, 226, 175, 0.14);
+  color: var(--yellow, #f9e2af);
+  vertical-align: middle;
+}

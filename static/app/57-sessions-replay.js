@@ -434,6 +434,32 @@ window.qa = Object.assign(window.qa || {}, {
   },
 });
 
+// Compaction boilerplate ("This session is being continued from a previous
+// conversation…") makes a useless card title for continued sessions — skip
+// to the next meaningful conversation content when the initial-message
+// fallback starts with it. The full original stays in the tooltip via the
+// callers' title attributes.
+const SESSION_CONTINUED_BOILERPLATE_RE = /^this session is being continued from/i;
+
+function sessionCardTaskText(s) {
+  const raw = compactSessionText(s?.task);
+  if (!raw || !SESSION_CONTINUED_BOILERPLATE_RE.test(raw)) return raw;
+  // Next meaningful preview message (server-side conversation preview).
+  if (Array.isArray(s?.preview)) {
+    for (const p of s.preview) {
+      const t = compactSessionText(p && p.text);
+      if (t && !SESSION_CONTINUED_BOILERPLATE_RE.test(t)) return t;
+    }
+  }
+  // Skip past the preamble to the summary body the boilerplate introduces.
+  const idx = raw.search(/summar(?:ized|y)[^:]{0,40}:/i);
+  if (idx >= 0) {
+    const rest = raw.slice(raw.indexOf(':', idx) + 1).trim();
+    if (rest) return `Continued · ${rest}`;
+  }
+  return `Continued session · ${raw}`;
+}
+
 function buildSessionCard(m, derived, ctx) {
   const { s, source, shortId, isCurrent, displayStatus, logHit } = m;
   const { configMeta, configSource, relationshipKind, backendSource, hasExternalBackend } = derived;
@@ -454,7 +480,8 @@ function buildSessionCard(m, derived, ctx) {
   card.appendChild(main);
 
   const sessionName = compactSessionText(s.name);
-  const taskText = compactSessionText(s.task);
+  const rawTaskText = compactSessionText(s.task);
+  const taskText = sessionCardTaskText(s);
   const sessionId = s.session_id || '';
   const isResident = s.role === 'resident' || displayStatus === 'resident';
   const primaryText = sessionName || taskText || (isResident ? 'Daemon session' : 'Untitled session');
@@ -483,7 +510,9 @@ function buildSessionCard(m, derived, ctx) {
   const nameEl = document.createElement('div');
   nameEl.className = 'sc-name';
   nameEl.textContent = primaryText;
-  nameEl.title = primaryText;
+  // Tooltip keeps the untrimmed original when the visible title skipped
+  // continuation boilerplate.
+  nameEl.title = (!sessionName && rawTaskText && rawTaskText !== taskText) ? rawTaskText : primaryText;
   titleRow.appendChild(nameEl);
   titleBlock.appendChild(titleRow);
   top.appendChild(titleBlock);
@@ -574,7 +603,7 @@ function buildSessionCard(m, derived, ctx) {
     const taskEl = document.createElement('div');
     taskEl.className = 'sc-task';
     taskEl.textContent = taskText;
-    taskEl.title = taskText;
+    taskEl.title = rawTaskText || taskText;
     card.appendChild(taskEl);
   }
 
@@ -809,8 +838,26 @@ function buildSessionCard(m, derived, ctx) {
 
         if (menu.children.length > 0) {
           actions.appendChild(menu);
-          const close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); } };
-          setTimeout(() => document.addEventListener('click', close), 0);
+          const closeMenu = () => {
+            menu.remove();
+            document.removeEventListener('click', close);
+            document.removeEventListener('keydown', onKey);
+          };
+          const close = (ev) => { if (!menu.contains(ev.target)) closeMenu(); };
+          // Escape closes and hands focus back to the Delete… trigger so
+          // keyboard users don't drop to the document body.
+          const onKey = (ev) => {
+            if (ev.key !== 'Escape') return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            closeMenu();
+            btn.focus();
+          };
+          setTimeout(() => {
+            document.addEventListener('click', close);
+            document.addEventListener('keydown', onKey);
+          }, 0);
+          menu.querySelector('.sc-delete-menu-item')?.focus();
         }
       });
       actions.appendChild(btn);
@@ -825,6 +872,18 @@ function buildSessionCard(m, derived, ctx) {
   } else {
     card.addEventListener('click', () => openSessionDetail(s));
   }
+  // Keyboard access: the whole card is the open-detail affordance, so it
+  // must be reachable and activatable without a pointer. Enter/Space on
+  // the card itself (not on inner buttons — those handle their own keys).
+  card.setAttribute('role', 'button');
+  card.tabIndex = 0;
+  card.setAttribute('aria-label', `Open session: ${primaryText}`);
+  card.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.target !== card) return;
+    e.preventDefault();
+    card.click();
+  });
   return card;
 }
 
@@ -2013,10 +2072,18 @@ function openSessionDetail(sessionOrId, taskArg) {
 
   const detailSessionId = sessionId;
   const detailSource = source;
+  const renderDetailFailure = (message) => {
+    // Server/exception text renders as text, never markup.
+    logsEl.textContent = '';
+    const failure = document.createElement('div');
+    failure.className = 'empty-state';
+    failure.textContent = message;
+    logsEl.appendChild(failure);
+  };
   fetchSessionDetailPayload(detailSessionId, { source: detailSource, limit: SESSION_DETAIL_PAGE_LIMIT })
     .then(data => {
       if (data.error) {
-        logsEl.innerHTML = '<div class="empty-state">' + data.error + '</div>';
+        renderDetailFailure(String(data.error));
         return;
       }
       const entries = data.entries || [];
@@ -2039,7 +2106,7 @@ function openSessionDetail(sessionOrId, taskArg) {
       }
     })
     .catch(e => {
-      logsEl.innerHTML = '<div class="empty-state">Failed to load</div>';
+      renderDetailFailure(`Failed to load${e?.message ? ` — ${e.message}` : ''}`);
     });
 
   // Lazy-load recordings for Intendant sessions. External CLI histories do not
@@ -2572,6 +2639,23 @@ const sessionDetailSourceLabels = {
   presence: 'Prsnc', user: 'User',
 };
 
+// External Claude Code tool results ride user-role transcript lines; the
+// server flattening keeps no marker, so only unambiguous shapes relabel
+// USER \u2192 TOOL: explicit tool_result fields, a serialized tool_result block
+// that escaped flattening, a <tool_use_error> envelope, or two consecutive
+// Read-tool "N\u2192" numbered lines. Anything a human could plausibly have
+// typed stays USER.
+function sessionDetailToolResultShape(e) {
+  if (String(e?.kind || '').toLowerCase() === 'tool_result') return true;
+  if (e?.tool_use_id) return true;
+  const head = String(e?.content || '').slice(0, 600).trimStart();
+  if (/^\[?\s*\{\s*"type"\s*:\s*"tool_result"/.test(head)) return true;
+  if (head.startsWith('<tool_use_error>')) return true;
+  const lines = head.split('\n', 3);
+  if (/^\s{0,8}\d+\u2192/.test(lines[0] || '') && /^\s{0,8}\d+\u2192/.test(lines[1] || '')) return true;
+  return false;
+}
+
 function isSessionDetailUserEntry(entry) {
   const source = String(entry?.source || '').trim().toLowerCase();
   const role = String(entry?.role || entry?.type || '').trim().toLowerCase();
@@ -2636,7 +2720,15 @@ function buildSessionDetailRows(entries) {
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
     const source = e.source || '';
-    const displaySource = sessionDetailSourceLabels[source] || source || '\u2139';
+    let displaySource = sessionDetailSourceLabels[source] || source || '\u2139';
+    // 'YOU/USER' mislabel on external tool results: user-role lines whose
+    // shape is unambiguously a tool result render as TOOL. External
+    // transcripts only \u2014 native logs label their sources correctly.
+    if (source === 'user'
+        && (currentSessionDetail?.source || 'intendant') !== 'intendant'
+        && sessionDetailToolResultShape(e)) {
+      displaySource = 'Tool';
+    }
     const content = e.content || e.summary || e.message || e.stdout || e.stderr || '';
     if (!String(content).trim()) continue;
     const detailRecord = {

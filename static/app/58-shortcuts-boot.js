@@ -19,8 +19,17 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ── Approval / Input / Follow-up actions (from HTML onclick) ──
+// Not fire-and-forget anymore: the panel flips to a disabled "Sending…"
+// state and clears only when the resolution is observed (fragment 41's
+// beginApprovalSend hooks — attention-set drop on approval_resolved, a
+// phase transition out of waiting, or an external panel clear). After 5s
+// with no evidence the buttons re-enable and a toast says the approval may
+// not have reached the daemon.
 window.sendApproval = function(action) {
   if (!app || pendingApprovalId === null) return;
+  // A send is already in flight for the shown approval — don't double-fire
+  // (keyboard shortcuts stay wired; they just no-op while disabled).
+  if (approvalSendPending) return;
   if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
     showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
     approvalSessionIds.delete(String(pendingApprovalId));
@@ -30,11 +39,17 @@ window.sendApproval = function(action) {
   }
   const msg = { action, id: pendingApprovalId };
   if (pendingApprovalSessionId) msg.session_id = pendingApprovalSessionId;
-  dispatchSessionControlMsg(msg);
-  approvalSessionIds.delete(String(pendingApprovalId));
-  clearPendingApproval();
-  hidePanel('approval-panel');
-  setPhase('running');
+  beginApprovalSend(pendingApprovalId, pendingApprovalSessionId);
+  let failed = false;
+  const failSend = (err) => {
+    // Transport said no (sync or async) — don't wait out the ack timeout.
+    if (failed) return;
+    failed = true;
+    resolveApprovalSend();
+    showControlToast('error', err?.message || 'Approval could not be sent — retry');
+  };
+  const sent = dispatchSessionControlMsg(msg, { onError: failSend });
+  if (sent === false) failSend(new Error('Approval could not be sent — no daemon connection; retry'));
 };
 window.sendHumanResponse = function() {
   const input = document.getElementById('human-input');
@@ -372,13 +387,31 @@ function shareUserDisplayWithAgent() {
 window.shareUserDisplayWithAgent = shareUserDisplayWithAgent;
 window.startUserDisplayGrantFlow = startUserDisplayGrantFlow;
 
+// Cycle reads the daemon-confirmed level (fragment 41 tracks it off status
+// frames / autonomy_changed echoes), not the DOM chip text; the optimistic
+// label reverts if no echo confirms within the window. Rapid clicks chain
+// off the pending guess so Low→…→Full still takes three clicks.
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
-  const el = document.getElementById('sb-autonomy');
-  const current = normalizeAutonomyLabel(el.textContent.trim());
+  const domLevel = document.getElementById('sb-autonomy')?.textContent?.trim() || '';
+  const current = normalizeAutonomyLabel(autonomyPendingLevel || lastConfirmedAutonomy || domLevel);
   const idx = levels.indexOf(current);
   const next = levels[(idx + 1) % levels.length];
-  updateStatusBar({ autonomy: next });
+  autonomyPendingLevel = next;
+  updateStatusBar({ autonomy: next }, { optimisticAutonomy: true });
+  if (autonomyRevertTimer) clearTimeout(autonomyRevertTimer);
+  autonomyRevertTimer = setTimeout(() => {
+    autonomyRevertTimer = null;
+    if (!autonomyPendingLevel) return;
+    autonomyPendingLevel = '';
+    // No echo arrived: paint back the last level the daemon actually
+    // reported (when we have one) and say so.
+    if (lastConfirmedAutonomy && lastConfirmedAutonomy !== normalizeAutonomyLabel(
+      document.getElementById('sb-autonomy')?.textContent?.trim() || '')) {
+      updateStatusBar({ autonomy: lastConfirmedAutonomy });
+      showControlToast('error', 'The daemon did not confirm the autonomy change');
+    }
+  }, 5000);
   dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
@@ -562,7 +595,9 @@ document.getElementById('verbosity-select').addEventListener('change', (e) => {
 // Host filter (Activity tab)
 document.getElementById('host-filter-select').addEventListener('change', (e) => {
   activeHostFilter = e.target.value;
-  localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
+  // Guarded like the neighboring filter persistence: Safari private mode
+  // throws on setItem and would kill the handler before applying.
+  try { localStorage.setItem(HOST_FILTER_KEY, activeHostFilter); } catch (_) {}
   applyHostFilter();
 });
 

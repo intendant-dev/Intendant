@@ -927,12 +927,33 @@ function newSessionProjectInputValue() {
   return document.getElementById('new-session-project-root')?.value.trim() || '';
 }
 
+// True when `path` is neither this daemon's project root nor inside it.
+// Cross-project launches are legitimate (never blocked) — this only feeds
+// the status line's neutral warning so a foreign path is a visible choice,
+// not an accident (observed: a datalist prefill launched an agent into
+// another agent's live worktree).
+function newSessionPathOutsideProjectRoot(path) {
+  const p = String(path || '').trim();
+  const root = String(dashboardProjectRoot || '').trim();
+  if (!p || !root) return false;
+  if (p === root) return false;
+  return !p.startsWith(root.endsWith('/') ? root : root + '/');
+}
+
 function setNewSessionProjectStatus(kind, text) {
   const el = document.getElementById('new-session-project-status');
   if (!el) return;
+  const outside = !!text && newSessionPathOutsideProjectRoot(newSessionProjectInputValue());
   el.className = 'sessions-project-status' + (kind ? ` ${kind}` : '');
   el.textContent = text || '';
-  el.title = text || '';
+  if (outside) {
+    // Own span so the warn tint doesn't repaint the status' ok/error tone.
+    const note = document.createElement('span');
+    note.className = 'sessions-project-outside-note';
+    note.textContent = ' · Outside this daemon’s project root';
+    el.appendChild(note);
+  }
+  el.title = (text || '') + (outside ? ' · Outside this daemon’s project root' : '');
 }
 
 function setNewSessionCreateVisible(visible) {
@@ -1106,7 +1127,20 @@ function updateNewSessionProjectPrefills(sessions = _cachedSessions) {
 
   const input = document.getElementById('new-session-project-root');
   if (input) {
-    if (!input.value.trim() && options.length > 0) input.value = options[0].path;
+    if (!input.value.trim()) {
+      // Auto-fill ONLY this daemon's own project root. options[0] used to
+      // fill in unconditionally — when dashboardProjectRoot is excluded by
+      // the temp-path filter, options[0] is a FOREIGN recent project, and
+      // that silent prefill launched an agent into another agent's live
+      // worktree. The datalist suggestions stay (they're labeled); an empty
+      // input is an explicit choice the user has to make.
+      const ownRoot = String(dashboardProjectRoot || '').trim();
+      if (ownRoot && newSessionPathPrefillable(ownRoot)) {
+        input.value = ownRoot;
+      } else if (ownRoot) {
+        input.placeholder = 'Pick a project directory — this daemon runs in a temporary root';
+      }
+    }
     input.title = input.value.trim() || '';
     scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
   }

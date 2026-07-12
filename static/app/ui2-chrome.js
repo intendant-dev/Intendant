@@ -337,12 +337,154 @@ function ui2WireMirrors() {
   updateTitle();
 }
 
-// ── ⌘K command palette (P1b) ──────────────────────────────────────────
-// Destinations only for now (the design excludes Debug from the palette;
-// it stays one click away in the rail). Sessions/actions search arrives
-// with the Sessions program phase.
+// ── ⌘K command palette (P1b + phase 2) ────────────────────────────────
+// Sections, in order: destinations (under the pane's static "Go to"
+// eyebrow), Sessions (fuzzy match over the cached session corpus, only
+// while typing), and Actions (contextual verbs + the theme toggle). All
+// cross-fragment state is read by name at event time with typeof guards —
+// the palette lives in an early fragment.
 
-function ui2PaletteEntries() {
+// Light fuzzy: exact substring first, else the query's characters in
+// order (subsequence). Returns a sort score, higher = better; -1 = miss.
+function ui2FuzzyScore(query, haystack) {
+  if (!query) return 0;
+  const q = query.toLowerCase();
+  const h = String(haystack || '').toLowerCase();
+  if (!h) return -1;
+  const at = h.indexOf(q);
+  if (at >= 0) return 1000 - at;
+  let hi = 0;
+  for (let qi = 0; qi < q.length; qi++) {
+    if (q[qi] === ' ') continue;
+    hi = h.indexOf(q[qi], hi);
+    if (hi < 0) return -1;
+    hi += 1;
+  }
+  return 1;
+}
+
+function ui2PaletteSessionEntries(q) {
+  if (!q || q.length < 2 || typeof _cachedSessions === 'undefined' || !Array.isArray(_cachedSessions)) return [];
+  // Bound the per-keystroke scan: the corpus can be tens of thousands of
+  // rows; the first slice is the recent end, which is what palette
+  // jumping is for. Deep history stays reachable via Sessions search.
+  const rows = _cachedSessions.length > 4000 ? _cachedSessions.slice(0, 4000) : _cachedSessions;
+  const scored = [];
+  for (const s of rows) {
+    if (!s || typeof s !== 'object') continue;
+    const sid = String(s.session_id || '');
+    const name = String(s.name || '').trim();
+    const task = String(s.task || '').trim();
+    const label = name || task || sid.slice(0, 8) || 'session';
+    const score = Math.max(
+      ui2FuzzyScore(q, name),
+      ui2FuzzyScore(q, task),
+      ui2FuzzyScore(q, sid),
+    );
+    if (score < 0) continue;
+    scored.push({ score, entry: {
+      section: 'Sessions',
+      icon: 'sessions',
+      label,
+      hint: sid.slice(0, 8),
+      matchless: true,
+      run: () => {
+        if (typeof sessionWindows !== 'undefined' && sid && sessionWindows.has(sid)
+            && typeof focusSessionWindow === 'function') {
+          routeTo('activity');
+          focusSessionWindow(sid);
+          return;
+        }
+        routeTo('sessions');
+        if (typeof openSessionDetail === 'function') openSessionDetail(s);
+      },
+    } });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 6).map(x => x.entry);
+}
+
+function ui2PaletteActionEntries(q) {
+  const entries = [];
+  // Pending approval verbs — only while one is actually on screen.
+  if (typeof pendingApprovalId !== 'undefined' && pendingApprovalId !== null
+      && typeof window.sendApproval === 'function') {
+    entries.push({
+      section: 'Actions', icon: 'check', label: 'Approve pending approval',
+      run: () => window.sendApproval('approve'),
+    });
+    entries.push({
+      section: 'Actions', icon: 'stop', label: 'Deny pending approval',
+      run: () => window.sendApproval('deny'),
+    });
+  }
+  // Stop — mirrors the v1 button's visibility (inline display, like the
+  // oversight-bar proxy).
+  const stopSrc = document.getElementById('stop-btn');
+  if (stopSrc && stopSrc.style.display !== 'none' && !stopSrc.disabled) {
+    entries.push({
+      section: 'Actions', icon: 'stop', label: 'Stop current session',
+      run: () => stopSrc.click(),
+    });
+  }
+  entries.push({
+    section: 'Actions', icon: 'plus', label: 'New session',
+    run: () => routeTo('sessions', 'new'),
+  });
+  // Deep search with the typed text — additive: prefill + focus only, the
+  // pane itself is untouched.
+  const deepQuery = (q || '').trim();
+  if (deepQuery.length >= 2) {
+    entries.push({
+      section: 'Actions', icon: 'search', label: `Deep search: “${deepQuery}”`,
+      matchless: true,
+      run: () => {
+        routeTo('sessions', 'deep');
+        const input = document.getElementById('sessions-deep-search-query');
+        if (input) {
+          input.value = deepQuery;
+          input.focus();
+          input.select?.();
+        }
+      },
+    });
+  }
+  // Layout verbs (CONTRACT: window.intendantLayouts is another agent's
+  // module — { save(), list() -> names|{name}[], apply(name) }; hidden
+  // entirely when absent or partial).
+  const layouts = window.intendantLayouts;
+  if (layouts && typeof layouts === 'object') {
+    if (typeof layouts.save === 'function') {
+      entries.push({
+        section: 'Actions', icon: 'station', label: 'Save layout…',
+        run: () => { try { layouts.save(); } catch (e) { console.warn('[ui2] layout save failed', e); } },
+      });
+    }
+    if (typeof layouts.list === 'function' && typeof layouts.apply === 'function') {
+      let names = [];
+      try { names = layouts.list() || []; } catch (_) { names = []; }
+      for (const item of names.slice(0, 8)) {
+        const name = typeof item === 'string' ? item : String(item?.name || '');
+        if (!name) continue;
+        entries.push({
+          section: 'Actions', icon: 'station', label: `Apply layout ${name}`,
+          run: () => { try { layouts.apply(name); } catch (e) { console.warn('[ui2] layout apply failed', e); } },
+        });
+      }
+    }
+  }
+  // The theme toggle keeps its palette seat.
+  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
+  entries.push({
+    section: 'Actions', icon: 'dial',
+    label: light ? 'Switch to dark theme' : 'Switch to light theme',
+    action: 'theme',
+  });
+  return entries;
+}
+
+function ui2PaletteEntries(q) {
+  const query = (q || '').trim().toLowerCase();
   const entries = [];
   for (const group of UI2_NAV_GROUPS) {
     for (const item of group.items) {
@@ -350,15 +492,14 @@ function ui2PaletteEntries() {
       entries.push(item);
     }
   }
-  // Actions (design-system import): the theme toggle rides the palette
-  // so light/dark is one ⌘K away from anywhere.
-  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
-  entries.push({
-    action: 'theme',
-    icon: 'dial',
-    label: light ? 'Switch to dark theme' : 'Switch to light theme',
-  });
-  return entries;
+  // Label-only matching for labeled entries: users type what they SEE
+  // (id matching surprised — "sta" surfaced Usage via its internal id).
+  // `matchless` entries carry the query themselves (sessions already
+  // matched; the deep-search verb embeds it).
+  const filtered = entries.filter((item) => !query || item.label.toLowerCase().includes(query));
+  const actions = ui2PaletteActionEntries(q)
+    .filter((item) => item.matchless || !query || item.label.toLowerCase().includes(query));
+  return [...filtered, ...ui2PaletteSessionEntries(query), ...actions];
 }
 
 const ui2Palette = { open: false, selected: 0, entries: [] };
@@ -366,32 +507,47 @@ const ui2Palette = { open: false, selected: 0, entries: [] };
 function ui2PaletteRender(filter) {
   const list = document.getElementById('ui2-palette-list');
   if (!list) return;
-  const q = (filter || '').trim().toLowerCase();
   const activePane = document.querySelector('.tab-pane.active');
   const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
-  // Label-only matching: users type what they SEE. Id matching surprised —
-  // "sta" surfaced Usage via its internal tab id `stats`.
-  ui2Palette.entries = ui2PaletteEntries().filter((item) =>
-    !q || item.label.toLowerCase().includes(q));
+  ui2Palette.entries = ui2PaletteEntries(filter);
   ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
   list.innerHTML = '';
   if (!ui2Palette.entries.length) {
     const empty = document.createElement('div');
     empty.className = 'ui2-palette-empty';
-    empty.textContent = 'No matching screens';
+    empty.textContent = 'No matches';
     list.appendChild(empty);
     return;
   }
+  let lastSection = '';
   ui2Palette.entries.forEach((item, i) => {
+    // Small section headers (Sessions / Actions); destinations stay under
+    // the pane's static "Go to" eyebrow.
+    if (item.section && item.section !== lastSection) {
+      const eyebrow = document.createElement('div');
+      eyebrow.className = 'ui2-palette-eyebrow';
+      eyebrow.textContent = item.section;
+      list.appendChild(eyebrow);
+    }
+    lastSection = item.section || lastSection;
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'ui2-palette-row' + (i === ui2Palette.selected ? ' selected' : '');
     row.setAttribute('role', 'option');
     const isCurrent = item.tab && item.tab === activeTab;
-    row.innerHTML =
-      `<span class="ui2-nav-icon">${ui2Icon(item.icon, 17)}</span>` +
-      `<span class="ui2-palette-row-label">${item.label}</span>` +
-      `<span class="ui2-palette-row-hint">${isCurrent ? 'current' : 'go'}</span>`;
+    // Session labels are user/session data — DOM text, never innerHTML.
+    const icon = document.createElement('span');
+    icon.className = 'ui2-nav-icon';
+    icon.innerHTML = ui2Icon(item.icon, 17);
+    const label = document.createElement('span');
+    label.className = 'ui2-palette-row-label';
+    label.textContent = item.label;
+    const hint = document.createElement('span');
+    hint.className = 'ui2-palette-row-hint';
+    hint.textContent = item.run
+      ? (item.hint || 'run')
+      : (isCurrent ? 'current' : 'go');
+    row.append(icon, label, hint);
     row.addEventListener('click', () => ui2PaletteGo(item));
     row.addEventListener('mousemove', () => {
       if (ui2Palette.selected !== i) { ui2Palette.selected = i; ui2PaletteRender(ui2PaletteInput().value); }
@@ -407,6 +563,10 @@ function ui2PaletteGo(item) {
   if (item.action === 'theme') {
     ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
     if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    return;
+  }
+  if (typeof item.run === 'function') {
+    try { item.run(); } catch (e) { console.warn('[ui2] palette action failed', e); }
     return;
   }
   if (item.tab) routeTo(item.tab);
@@ -476,6 +636,47 @@ function ui2WirePalette() {
   }, true);
 }
 
+// ── Fuel/lease chip (display-only) ─────────────────────────────────────
+// When the daemon's status reports the built-in agent unfueled but the
+// vault shows a live lease, the oversight bar gets a small "fueled ·
+// <time-left>" chip next to the transport control — the lease IS the fuel
+// (credential custody), and without this the chrome reads as broken while
+// the agent works fine. All state is read by name at event time
+// (dashboardControlTransport.lastStatus.fueled, vaultLeaseState.leases,
+// vaultLeaseExpiryText) with typeof guards; hidden whenever any of it is
+// missing.
+function ui2FuelChipSync() {
+  const bar = document.getElementById('ui2-oversight');
+  if (!bar) return;
+  let chip = document.getElementById('ui2-fuel-chip');
+  const status = (typeof dashboardControlTransport !== 'undefined' && dashboardControlTransport)
+    ? dashboardControlTransport.lastStatus : null;
+  const leases = (typeof vaultLeaseState !== 'undefined' && vaultLeaseState
+    && Array.isArray(vaultLeaseState.leases)) ? vaultLeaseState.leases : [];
+  const live = leases.filter(l => Number(l?.expires_at_unix_ms || 0) > Date.now());
+  const show = !!status && status.fueled === false && live.length > 0
+    && typeof vaultLeaseExpiryText === 'function';
+  if (!show) {
+    if (chip) chip.hidden = true;
+    return;
+  }
+  // The longest-lived lease is the effective fuel horizon.
+  const best = live.reduce((a, b) =>
+    Number(a.expires_at_unix_ms || 0) >= Number(b.expires_at_unix_ms || 0) ? a : b);
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'ui2-fuel-chip';
+    chip.className = 'ui2-fuel-chip';
+    const conn = document.getElementById('ui2-conn');
+    if (conn && conn.parentElement === bar) bar.insertBefore(chip, conn);
+    else bar.appendChild(chip);
+  }
+  chip.hidden = false;
+  chip.textContent = `fueled · ${vaultLeaseExpiryText(best)}`;
+  chip.title = 'The daemon holds no local provider key, but a vault lease is fueling the built-in agent'
+    + (best.kind ? ` (${best.kind})` : '') + '. Display only.';
+}
+
 ui2BuildNav();
 {
   // Single-boot: a module script executes at readyState 'interactive', so
@@ -483,7 +684,16 @@ ui2BuildNav();
   // everything twice — the doubled capture-phase keydown made one ⌘K
   // open-then-close the palette and arrows double-step. Same idiom as the
   // ui2-activity boot.
-  const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
+  const wire = () => {
+    ui2WireMirrors();
+    ui2WirePalette();
+    // Fuel chip: transport-status flips repaint it via the existing
+    // #sb-dashboard-transport mirror lane; the interval keeps the lease
+    // countdown honest between flips.
+    ui2Mirror('sb-dashboard-transport', ui2FuelChipSync);
+    setInterval(ui2FuelChipSync, 30000);
+    ui2FuelChipSync();
+  };
   if (document.readyState === 'complete') wire();
   else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
