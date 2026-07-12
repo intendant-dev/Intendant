@@ -73,6 +73,9 @@ intendant-platform = { path = "crates/intendant-platform" }
 rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
+# Offset-mapped canonical folding for message-search matching (already a
+# transitive dep; pure Rust).
+unicode-normalization = "0.1"
 bip39 = { version = "2", default-features = false, features = ["std"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 # rustls dep (matched to tokio-tungstenite 0.29's transitive version) so

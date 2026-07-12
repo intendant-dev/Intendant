@@ -242,6 +242,9 @@ pub(crate) async fn control_request_frame(
         "api_fs_rename" => api_fs_rename_response(id, params.as_ref()).await,
         "api_fs_delete" => api_fs_delete_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
+        "api_sessions_message_search" => {
+            api_sessions_message_search_response(id, params.as_ref()).await
+        }
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
         "api_control_msg" => api_control_msg_response(id, params.as_ref(), &runtime).await,
@@ -1236,6 +1239,50 @@ pub(crate) async fn api_session_current_upload_delete_response(
             "error": format!("upload delete task failed: {e}"),
         }),
     }
+}
+
+/// Tunnel twin of `GET /api/sessions/message-search` — same
+/// transport-neutral core, params in the frame payload.
+pub(crate) async fn api_sessions_message_search_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let flag = |names: &[&str], default: bool| {
+        names
+            .iter()
+            .find_map(|name| params.get(name))
+            .map(|value| match value {
+                serde_json::Value::Bool(flag) => *flag,
+                serde_json::Value::String(raw) => !matches!(raw.as_str(), "false" | "0"),
+                _ => default,
+            })
+            .unwrap_or(default)
+    };
+    let search = crate::message_search::MessageSearchParams {
+        q: string_param(&params, &["q", "query"]),
+        sources: crate::message_search::parse_sources(&string_param(
+            &params,
+            &["source", "sources"],
+        )),
+        include_superseded: flag(&["include_superseded", "includeSuperseded"], true),
+        include_subagents: flag(&["subagents", "include_subagents"], true),
+        cursor: {
+            let cursor = string_param(&params, &["cursor"]);
+            if cursor.is_empty() {
+                None
+            } else {
+                Some(cursor)
+            }
+        },
+        limit: params
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(20),
+    };
+    let response = crate::web_gateway::sessions_message_search_api_response(search).await;
+    frame_api_json_body_response(id, response, "message search")
 }
 
 pub(crate) async fn api_sessions_search_response(
