@@ -262,7 +262,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `model` | string | unset | Model override |
 | `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
 | `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
-| `reasoning_effort` | string | unset (model default) | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `reasoning_effort` | string | unset (model default) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (model-dependent; `ultra` enables automatic task delegation on supporting Codex models) |
 | `service_tier` | string | unset (inherit Codex default) | `priority` enables Fast, `flex` requests Flex, `standard` is a sentinel that sends an explicit `serviceTier: null` to opt managed sessions out of Fast |
 | `web_search` | bool | `false` | Enable the Responses-API `web_search` tool (`codex --search`) |
 | `network_access` | bool | `false` | Allow outbound network in `workspace-write` sandbox (ignored for `read-only` / `danger-full-access`) |

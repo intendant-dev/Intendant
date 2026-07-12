@@ -1257,13 +1257,14 @@ impl AppEventUpcaster {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                cache_creation_tokens,
             } => {
                 let cost_usd = estimate_session_cost(
                     model,
                     *prompt_tokens,
                     *completion_tokens,
                     *cached_tokens,
-                    0,
+                    *cache_creation_tokens,
                 );
                 vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -1341,7 +1342,7 @@ impl AppEventUpcaster {
                     main.prompt_tokens,
                     main.completion_tokens,
                     main.cached_tokens,
-                    0,
+                    main.cache_creation_tokens,
                 );
                 let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -2576,13 +2577,14 @@ impl WireEventUpcaster {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                cache_creation_tokens,
             } => {
                 let cost_usd = estimate_session_cost(
                     model,
                     *prompt_tokens,
                     *completion_tokens,
                     *cached_tokens,
-                    0,
+                    *cache_creation_tokens,
                 );
                 vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -2663,7 +2665,7 @@ impl WireEventUpcaster {
                     main.prompt_tokens,
                     main.completion_tokens,
                     main.cached_tokens,
-                    0,
+                    main.cache_creation_tokens,
                 );
                 let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {

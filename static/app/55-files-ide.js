@@ -1864,6 +1864,117 @@ window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 
+function selectedNewSessionCodexCatalogEntry() {
+  const selection = document.getElementById('new-session-codex-model-select')?.value || '';
+  if (selection === '__custom__') return null;
+  const model = selection || newSessionCodexGlobalModel;
+  return newSessionCodexModelCatalog
+    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
+    .sort((a, b) => b.id.length - a.id.length)[0] || null;
+}
+
+function populateNewSessionCodexReasoningEfforts() {
+  const select = document.getElementById('new-session-codex-reasoning-effort');
+  if (!select) return;
+  const previous = select.value || '';
+  const model = selectedNewSessionCodexCatalogEntry();
+  const efforts = model?.reasoning_efforts?.length
+    ? model.reasoning_efforts
+    : newSessionCodexReasoningEfforts;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  const globalSupported = !model || !newSessionCodexGlobalReasoningEffort ||
+    efforts.includes(newSessionCodexGlobalReasoningEffort);
+  inherit.textContent = newSessionCodexGlobalReasoningEffort && globalSupported
+    ? `Global setting (${newSessionCodexGlobalReasoningEffort})`
+    : (model?.default_reasoning_effort
+      ? `Model default (${model.default_reasoning_effort})`
+      : 'Model / global default');
+  select.appendChild(inherit);
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = efforts.includes(previous) ? previous : '';
+  if (model && !globalSupported && !select.value && efforts.includes(model.default_reasoning_effort)) {
+    // A selected model must not inherit an incompatible global effort (for
+    // example Luna under an Ultra global pin). Make its advertised default
+    // explicit on the create-session wire instead.
+    select.value = model.default_reasoning_effort;
+  }
+}
+
+function populateControlCodexReasoningEfforts() {
+  const select = document.getElementById('control-codex-reasoning');
+  if (!select) return;
+  const previous = select.value || controlCodexConfig.reasoning_effort || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = '(default)';
+  select.appendChild(inherit);
+  for (const effort of newSessionCodexReasoningEfforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = newSessionCodexReasoningEfforts.includes(previous) ? previous : '';
+}
+
+function populateNewSessionCodexModelSelect() {
+  const select = document.getElementById('new-session-codex-model-select');
+  if (!select) return;
+  const previous = select.value || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = newSessionCodexGlobalModel
+    ? `Global setting (${newSessionCodexGlobalModel})`
+    : 'Global / Codex default';
+  select.appendChild(inherit);
+  for (const entry of newSessionCodexModelCatalog) {
+    const option = document.createElement('option');
+    option.value = entry.id;
+    option.textContent = `${entry.display_name} — ${entry.id}`;
+    select.appendChild(option);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  select.value = previous === '__custom__' || newSessionCodexModelCatalog.some(entry => entry.id === previous)
+    ? previous
+    : '';
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+
+function updateNewSessionCodexCustomModelRow() {
+  const select = document.getElementById('new-session-codex-model-select');
+  const row = document.getElementById('new-session-codex-model-custom-row');
+  const input = document.getElementById('new-session-codex-model');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+  if (input) input.disabled = !custom;
+}
+
+function onNewSessionCodexModelSelectChange() {
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
+populateControlCodexReasoningEfforts();
+populateNewSessionCodexModelSelect();
+
 // The Claude model picker offers version-safe aliases (the CLI resolves
 // them to the latest model); the free-text id input only appears behind
 // the explicit "Custom model id…" choice.
@@ -2410,6 +2521,27 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
   newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
+  newSessionCodexGlobalModel = String(settings.codex_model || '').trim();
+  newSessionCodexGlobalReasoningEffort = String(settings.codex_reasoning_effort || '').trim();
+  const configuredCatalog = Array.isArray(settings.codex_models)
+    ? settings.codex_models
+      .map(entry => ({
+        id: String(entry?.id || '').trim(),
+        display_name: String(entry?.display_name || entry?.id || '').trim(),
+        default_reasoning_effort: String(entry?.default_reasoning_effort || '').trim(),
+        reasoning_efforts: Array.isArray(entry?.reasoning_efforts)
+          ? entry.reasoning_efforts.map(value => String(value || '').trim()).filter(Boolean)
+          : [],
+      }))
+      .filter(entry => entry.id)
+    : [];
+  if (configuredCatalog.length) newSessionCodexModelCatalog = configuredCatalog;
+  const configuredEfforts = Array.isArray(settings.codex_reasoning_efforts)
+    ? settings.codex_reasoning_efforts.map(value => String(value || '').trim()).filter(Boolean)
+    : [];
+  if (configuredEfforts.length) newSessionCodexReasoningEfforts = configuredEfforts;
+  populateControlCodexReasoningEfforts();
+  populateNewSessionCodexModelSelect();
   newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
@@ -2435,7 +2567,9 @@ function renderNewSessionAgentControls(options = {}) {
   const select = document.getElementById('new-session-agent');
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
+  const codexModelSel = document.getElementById('new-session-codex-model-select');
   const codexModelInp = document.getElementById('new-session-codex-model');
+  const codexReasoningSel = document.getElementById('new-session-codex-reasoning-effort');
   const sandboxSel = document.getElementById('new-session-codex-sandbox');
   const approvalSel = document.getElementById('new-session-codex-approval-policy');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
@@ -2497,9 +2631,17 @@ function renderNewSessionAgentControls(options = {}) {
   const claudeEffortSel = document.getElementById('new-session-claude-effort');
   const appliesToClaude = effectiveAgent === 'claude-code';
   const appliesToCodex = effectiveAgent === 'codex';
+  if (codexModelSel) {
+    codexModelSel.disabled = !appliesToCodex;
+    if (!appliesToCodex) codexModelSel.value = '';
+  }
   if (codexModelInp) {
-    codexModelInp.disabled = !appliesToCodex;
     if (!appliesToCodex) codexModelInp.value = '';
+  }
+  updateNewSessionCodexCustomModelRow();
+  if (codexReasoningSel) {
+    codexReasoningSel.disabled = !appliesToCodex;
+    if (!appliesToCodex) codexReasoningSel.value = '';
   }
   if (claudeModelSel) {
     claudeModelSel.disabled = !appliesToClaude;
@@ -3059,8 +3201,13 @@ async function startNewSession() {
     if (effort) msg.claude_effort = effort;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
-    const model = document.getElementById('new-session-codex-model')?.value.trim() || '';
+    const modelChoice = document.getElementById('new-session-codex-model-select')?.value || '';
+    const model = modelChoice === '__custom__'
+      ? (document.getElementById('new-session-codex-model')?.value.trim() || '')
+      : modelChoice;
     if (model) msg.codex_model = model;
+    const reasoningEffort = document.getElementById('new-session-codex-reasoning-effort')?.value || '';
+    if (reasoningEffort) msg.codex_reasoning_effort = reasoningEffort;
     if (newSessionCodexLaunchDefaultsLoaded) {
       msg.codex_sandbox = normalizeCodexSandbox(
         document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
@@ -3131,4 +3278,3 @@ function onNewSessionWorktreeToggle() {
   document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
 }
 window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
-

@@ -169,7 +169,8 @@ pub struct CodexConfig {
     pub sandbox: String,
     /// Reasoning effort passed to Codex for reasoning-capable models.
     /// Codex's `-c model_reasoning_effort=...` — accepted values:
-    /// `"minimal" | "low" | "medium" | "high" | "xhigh"`. Empty = Codex default.
+    /// `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" |
+    /// "max" | "ultra"`. Empty = Codex default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Optional Codex service-tier default for Intendant-managed Codex
@@ -267,7 +268,94 @@ pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never
 /// "default" as a menu choice without introducing a separate Option<String>
 /// juggling layer. All other values map straight to
 /// `-c model_reasoning_effort=...`.
-pub const CODEX_REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_REASONING_EFFORTS: &[&str] = &[
+    "", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// One entry in the Codex model picker catalog exposed to dashboard clients.
+///
+/// Codex itself remains the final authority (and the custom-id escape keeps
+/// staged/account-specific models usable), but keeping this compatibility
+/// snapshot on the daemon means every frontend derives the same model and
+/// effort vocabulary instead of carrying its own copy.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexModelCatalogEntry {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub default_reasoning_effort: &'static str,
+    pub reasoning_efforts: &'static [&'static str],
+}
+
+const CODEX_EFFORTS_THROUGH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+const CODEX_EFFORTS_THROUGH_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS_THROUGH_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// Current public Codex picker models, with recommended models before the
+/// still-supported "other models" group. Hidden/internal models stay out.
+pub const CODEX_MODEL_CATALOG: &[CodexModelCatalogEntry] = &[
+    CodexModelCatalogEntry {
+        id: "gpt-5.6",
+        display_name: "GPT-5.6 (Sol alias)",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-terra",
+        display_name: "GPT-5.6-Terra",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_MAX,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.5",
+        display_name: "GPT-5.5",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.3-codex-spark",
+        display_name: "GPT-5.3-Codex-Spark",
+        default_reasoning_effort: "high",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.4",
+        display_name: "GPT-5.4",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.4-mini",
+        display_name: "GPT-5.4-Mini",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+];
+
+/// Resolve exact or version-suffixed Codex model ids to the most specific
+/// catalog entry (`gpt-5.6-luna-preview` must beat the shorter `gpt-5.6`
+/// alias prefix).
+pub fn codex_model_catalog_entry(model: &str) -> Option<&'static CodexModelCatalogEntry> {
+    CODEX_MODEL_CATALOG
+        .iter()
+        .filter(|entry| {
+            model
+                .strip_prefix(entry.id)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        })
+        .max_by_key(|entry| entry.id.len())
+}
 pub const CODEX_STANDARD_SERVICE_TIER: &str = "standard";
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
@@ -2168,6 +2256,60 @@ default_backend = "codex"
         }
         // Typos still normalize to the safe default.
         assert_eq!(normalize_codex_context_archive("summry"), "summary");
+    }
+
+    #[test]
+    fn codex_reasoning_effort_accepts_current_full_vocabulary() {
+        for effort in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            assert_eq!(
+                normalize_reasoning_effort(Some(effort)).as_deref(),
+                Some(effort)
+            );
+        }
+        assert_eq!(
+            normalize_reasoning_effort(Some(" ultra ")).as_deref(),
+            Some("ultra")
+        );
+        assert!(normalize_reasoning_effort(Some("extreme")).is_none());
+        assert!(normalize_reasoning_effort(None).is_none());
+    }
+
+    #[test]
+    fn codex_catalog_prefers_the_most_specific_version_prefix() {
+        assert_eq!(
+            codex_model_catalog_entry("gpt-5.6-luna-preview").map(|entry| entry.id),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            codex_model_catalog_entry("gpt-5.6-sol").map(|entry| entry.id),
+            Some("gpt-5.6-sol")
+        );
+        assert!(codex_model_catalog_entry("account-private-model").is_none());
+    }
+
+    #[test]
+    fn codex_catalog_ids_defaults_and_efforts_are_consistent() {
+        let ids: std::collections::BTreeSet<_> =
+            CODEX_MODEL_CATALOG.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids.len(), CODEX_MODEL_CATALOG.len(), "duplicate model id");
+        for entry in CODEX_MODEL_CATALOG {
+            assert!(
+                entry
+                    .reasoning_efforts
+                    .contains(&entry.default_reasoning_effort),
+                "{} default is not supported",
+                entry.id
+            );
+            for effort in entry.reasoning_efforts {
+                assert!(
+                    CODEX_REASONING_EFFORTS.contains(effort),
+                    "{} advertises unknown effort {effort}",
+                    entry.id
+                );
+            }
+        }
     }
 
     /// `managed_context` defaults to "vanilla" when absent and is also

@@ -158,6 +158,8 @@ pub struct PresenceUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
 }
 
 /// Queryable snapshot of the agent's current state.

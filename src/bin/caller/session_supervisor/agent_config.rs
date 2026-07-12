@@ -527,6 +527,9 @@ impl LaunchOverrides {
             // switch models mid-session, so configure/restart never carries
             // one and the persisted pin must survive untouched.
             codex_model: None,
+            // Same launch-time pin policy as the model: configure/restart
+            // preserves the persisted effort selected when the session began.
+            codex_reasoning_effort: None,
             codex_sandbox: self.codex_sandbox.as_deref(),
             codex_approval_policy: self.codex_approval_policy.as_deref(),
             codex_managed_context: self.codex_managed_context.as_deref(),
@@ -664,6 +667,31 @@ pub(crate) fn apply_session_codex_model(
             Ok(())
         }
         _ => Err("codex_model requires Codex".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_codex_reasoning_effort(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    effort: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            let normalized = crate::project::normalize_reasoning_effort(Some(&effort))
+                .ok_or_else(|| format!("unsupported Codex reasoning effort: {effort}"))?;
+            if let Some(model) = project.config.agent.codex.model.as_deref() {
+                if let Some(entry) = crate::project::codex_model_catalog_entry(model) {
+                    if !entry.reasoning_efforts.contains(&normalized.as_str()) {
+                        return Err(format!(
+                            "Codex model {model} does not support reasoning effort {normalized}"
+                        ));
+                    }
+                }
+            }
+            project.config.agent.codex.reasoning_effort = Some(normalized);
+            Ok(())
+        }
+        _ => Err("codex_reasoning_effort requires Codex".to_string()),
     }
 }
 
@@ -1137,6 +1165,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("requires Codex"));
+    }
+
+    #[test]
+    fn rejects_reasoning_effort_incompatible_with_catalog_model() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        project.config.agent.codex.model = Some("gpt-5.6-luna".to_string());
+
+        let err = apply_session_codex_reasoning_effort(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "ultra".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("gpt-5.6-luna"));
+        assert!(err.contains("ultra"));
+
+        apply_session_codex_reasoning_effort(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "max".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            project.config.agent.codex.reasoning_effort.as_deref(),
+            Some("max")
+        );
     }
 
     #[test]

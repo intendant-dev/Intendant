@@ -34,6 +34,7 @@ pub struct McpAppState {
     pub session_prompt_tokens: u64,
     pub session_completion_tokens: u64,
     pub session_cached_tokens: u64,
+    pub session_cache_creation_tokens: u64,
     pub context_window: u64,
     pub hard_context_window: Option<u64>,
     pub session_id: String,
@@ -192,6 +193,7 @@ impl McpAppState {
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             session_cached_tokens: 0,
+            session_cache_creation_tokens: 0,
             context_window: 0,
             hard_context_window: None,
             session_id: String::new(),
@@ -346,6 +348,7 @@ impl McpAppState {
                 prompt_tokens: self.session_prompt_tokens,
                 completion_tokens: self.session_completion_tokens,
                 cached_tokens: self.session_cached_tokens,
+                cache_creation_tokens: self.session_cache_creation_tokens,
                 ..Default::default()
             },
             presence: self.presence_provider_name.as_ref().map(|p| {
@@ -380,6 +383,7 @@ impl McpAppState {
                 usage.main.prompt_tokens = 0;
                 usage.main.completion_tokens = 0;
                 usage.main.cached_tokens = 0;
+                usage.main.cache_creation_tokens = 0;
             }
         }
         usage
@@ -494,6 +498,7 @@ impl McpAppState {
             self.session_prompt_tokens = 0;
             self.session_completion_tokens = 0;
             self.session_cached_tokens = 0;
+            self.session_cache_creation_tokens = 0;
             self.context_window = 0;
             self.hard_context_window = None;
             self.budget_pct = 0.0;
@@ -715,6 +720,7 @@ impl McpAppState {
         self.session_prompt_tokens = usage.prompt_tokens;
         self.session_completion_tokens = usage.completion_tokens;
         self.session_cached_tokens = usage.cached_tokens;
+        self.session_cache_creation_tokens = usage.cache_creation_tokens;
         self.complete_pending_rewind_pressure_check();
     }
 

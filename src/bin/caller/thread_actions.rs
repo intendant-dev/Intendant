@@ -2948,6 +2948,7 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
                 0,
                 0,
                 0,
+                0,
                 config.agent_source.as_deref(),
             );
         });

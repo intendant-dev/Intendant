@@ -100,6 +100,7 @@ pub(crate) async fn start_task_with_state(
     s.session_prompt_tokens = 0;
     s.session_completion_tokens = 0;
     s.session_cached_tokens = 0;
+    s.session_cache_creation_tokens = 0;
     s.set_phase(Phase::Thinking);
     s.pending_approval = None;
     s.human_question = None;

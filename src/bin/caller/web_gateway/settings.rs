@@ -4,6 +4,14 @@
 
 use super::*;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CodexModelChoice {
+    pub id: String,
+    pub display_name: String,
+    pub default_reasoning_effort: String,
+    pub reasoning_efforts: Vec<String>,
+}
+
 /// Settings payload for GET/POST /api/settings.
 /// Flattened view of intendant.toml sections relevant to the web dashboard.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -56,6 +64,13 @@ pub struct SettingsPayload {
     pub codex_model: Option<String>,
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    /// Read-only picker catalog. POST callers may omit it; GET derives it
+    /// from the daemon's canonical Codex model snapshot.
+    #[serde(default)]
+    pub codex_models: Vec<CodexModelChoice>,
+    /// Read-only union accepted by the daemon, used for custom model ids.
+    #[serde(default)]
+    pub codex_reasoning_efforts: Vec<String>,
     // Empty / omitted = inherit Codex config; "standard" sends an explicit
     // normal/clear override for Intendant-managed Codex sessions.
     #[serde(default)]
@@ -179,6 +194,24 @@ pub(crate) fn settings_payload_from_config(
         codex_reasoning_effort: crate::project::normalize_reasoning_effort(
             config.agent.codex.reasoning_effort.as_deref(),
         ),
+        codex_models: crate::project::CODEX_MODEL_CATALOG
+            .iter()
+            .map(|entry| CodexModelChoice {
+                id: entry.id.to_string(),
+                display_name: entry.display_name.to_string(),
+                default_reasoning_effort: entry.default_reasoning_effort.to_string(),
+                reasoning_efforts: entry
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| (*effort).to_string())
+                    .collect(),
+            })
+            .collect(),
+        codex_reasoning_efforts: crate::project::CODEX_REASONING_EFFORTS
+            .iter()
+            .filter(|effort| !effort.is_empty())
+            .map(|effort| (*effort).to_string())
+            .collect(),
         codex_service_tier: crate::project::normalize_codex_service_tier(
             config.agent.codex.service_tier.as_deref(),
         ),
@@ -789,6 +822,24 @@ mod tests {
         assert_eq!(payload.codex_approval_policy.as_deref(), Some("on-request"));
         assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(payload.codex_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            crate::project::CODEX_MODEL_CATALOG
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(payload
+            .codex_reasoning_efforts
+            .contains(&"none".to_string()));
+        assert!(payload.codex_reasoning_efforts.contains(&"max".to_string()));
+        assert!(payload
+            .codex_reasoning_efforts
+            .contains(&"ultra".to_string()));
         assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")

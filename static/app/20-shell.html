@@ -705,11 +705,6 @@
                   <label for="control-codex-reasoning">Reasoning effort</label>
                   <select id="control-codex-reasoning">
                     <option value="">(default)</option>
-                    <option value="minimal">minimal</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="xhigh">xhigh</option>
                   </select>
                 </div>
                 <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
@@ -1437,9 +1432,22 @@
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
-                      <label class="sessions-new-session-field" for="new-session-codex-model">
+                      <label class="sessions-new-session-field" for="new-session-codex-model-select">
                         Codex model
-                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="Global setting (e.g. gpt-5.5)" disabled>
+                        <select id="new-session-codex-model-select" onchange="onNewSessionCodexModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-codex-model" id="new-session-codex-model-custom-row">
+                        Custom model id
+                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. staged-model-id" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-reasoning-effort">
+                        Reasoning effort
+                        <select id="new-session-codex-reasoning-effort" disabled>
+                          <option value="">Model / global default</option>
+                        </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model

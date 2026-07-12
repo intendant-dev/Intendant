@@ -143,6 +143,7 @@ pub(crate) async fn run_with_presence(
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         });
 
         let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));

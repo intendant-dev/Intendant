@@ -725,6 +725,8 @@ pub enum OutboundEvent {
         completion_tokens: u64,
         #[serde(default)]
         cached_tokens: u64,
+        #[serde(default)]
+        cache_creation_tokens: u64,
     },
     LiveUsageUpdate {
         provider: String,

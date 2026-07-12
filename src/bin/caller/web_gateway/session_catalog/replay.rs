@@ -1558,7 +1558,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.info("Provider: openai");
-        log.model_response("still here after refresh", 0, 0, 0, 0, None);
+        log.model_response("still here after refresh", 0, 0, 0, 0, 0, None);
         drop(log);
 
         let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");

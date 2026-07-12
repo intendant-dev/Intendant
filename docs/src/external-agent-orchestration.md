@@ -735,10 +735,10 @@ default_backend = "codex"
 
 [agent.codex]
 command          = "codex"            # binary on PATH or absolute path
-model            = "gpt-5-codex"      # optional; omit to use Codex's default
+model            = "gpt-5.6"          # optional; omit to use Codex's default
 approval_policy  = "on-request"       # untrusted | on-request | never
 sandbox          = "workspace-write"  # read-only | workspace-write | danger-full-access
-reasoning_effort = "medium"           # ""(default) | minimal | low | medium | high | xhigh
+reasoning_effort = "medium"           # ""(default) | none | minimal | low | medium | high | xhigh | max | ultra
 service_tier     = ""                 # ""(inherit Codex default) | priority (Fast) | flex | standard (explicit opt-out sentinel)
 web_search       = false              # enable the Responses web_search tool
 network_access   = false              # outbound net inside workspace-write only
@@ -795,7 +795,8 @@ shared state (when driven over MCP) → config default → native.
   runs do not silently display a requested root as if Codex had accepted it.
 - **Per-session launch config beats global defaults.** Dashboard-created and
   dashboard-configured external sessions persist their binary command and
-  backend-specific launch fields, including a launch-time Codex model pin. Both
+  backend-specific launch fields, including launch-time Codex model and
+  reasoning-effort pins. Both
   resume paths — daemon resume/attach and
   CLI `--resume` — rehydrate that persisted per-session config with the same
   precedence: explicit overrides (dashboard launch options or CLI flags), then

@@ -175,7 +175,8 @@ function renderUsageCard(label, data) {
   const prompt = data.prompt_tokens || 0;
   const completion = data.completion_tokens || 0;
   const cached = data.cached_tokens || 0;
-  const uncachedInput = Math.max(0, prompt - cached);
+  const cacheCreated = data.cache_creation_tokens || 0;
+  const uncachedInput = Math.max(0, prompt - cached - cacheCreated);
   const effectiveWindow = data.context_window || 0;
   const hardWindow = data.hard_context_window || data.hardContextWindow || null;
   const effectivePct = pctForWindow(data.tokens_used, effectiveWindow);
@@ -206,6 +207,7 @@ function renderUsageCard(label, data) {
       <span class="label">Input tokens</span><span class="value">${prompt.toLocaleString()}</span>
       <span class="label sub">Cached</span>
       <span class="value">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
+      ${cacheCreated > 0 ? `<span class="label sub">Cache writes</span><span class="value">${cacheCreated.toLocaleString()}</span>` : ''}
       <span class="label sub">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
       <span class="label">Output tokens</span><span class="value">${completion.toLocaleString()}</span>
       ${hardLine}
@@ -3281,4 +3283,3 @@ function accessDiagnosticsCards() {
     },
   ];
 }
-
