@@ -232,9 +232,11 @@ class DisplaySlot {
     this.calloutBtn.addEventListener('click', () => this.toggleCallout());
   }
 
-  // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — keep the
-  // two paths' patience identical.
-  static NO_TRACK_TIMEOUT_MS = 10000;
+  // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — both are
+  // the shared viewer-core constant, so the two paths' patience can't
+  // drift. The static stays public (QA overrides keep working: the
+  // watchdog arms with the static, not the constant).
+  static NO_TRACK_TIMEOUT_MS = DISPLAY_VIEWER_NO_TRACK_TIMEOUT_MS;
 
   toggleFullscreen(force) {
     const want = force === undefined
@@ -656,39 +658,13 @@ class DisplaySlot {
 
   // Render the stage overlay. `mode` is 'progress' (spinner + copy),
   // 'error' (alarming copy + optional retry button), or null to hide.
-  // All dynamic text goes through textContent — never innerHTML.
+  // Shared DOM builder in 45-display-viewer-core; this slot renders into
+  // its single fixed overlayEl (the peer path re-applies per container —
+  // its pane DOM is rebuilt on daemons-list re-renders, ours is not).
   _setStageOverlay(mode, text, { retryLabel = null, onRetry = null } = {}) {
     const el = this.overlayEl;
     if (!el) return;
-    if (!mode) {
-      el.style.display = 'none';
-      el.classList.remove('error');
-      el.textContent = '';
-      return;
-    }
-    el.textContent = '';
-    el.classList.toggle('error', mode === 'error');
-    const inner = document.createElement('div');
-    inner.className = 'stage-overlay-inner';
-    if (mode !== 'error') {
-      const spinner = document.createElement('span');
-      spinner.className = 'stage-overlay-spinner';
-      inner.appendChild(spinner);
-    }
-    const label = document.createElement('span');
-    label.className = 'stage-overlay-text';
-    label.textContent = text || '';
-    inner.appendChild(label);
-    if (retryLabel && typeof onRetry === 'function') {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'stage-overlay-retry';
-      btn.textContent = retryLabel;
-      btn.addEventListener('click', onRetry);
-      inner.appendChild(btn);
-    }
-    el.appendChild(inner);
-    el.style.display = '';
+    displayViewerRenderStageOverlayInto(el, mode ? { mode, text, retryLabel, onRetry } : null);
   }
 
   // Run `cb` once the <video> renders its first frame for THIS
@@ -707,13 +683,12 @@ class DisplaySlot {
     this.connect();
   }
 
-  // No-video watchdog, ported from the peer path: armed when the answer
-  // applies, cleared by the first rendered frame. Catches the "answer
-  // accepted, ICE/DTLS fine, but no frames ever arrive" black-stage case.
+  // No-video watchdog, ported from the peer path (shared driver in
+  // 45-display-viewer-core): armed when the answer applies, cleared by
+  // the first rendered frame. Catches the "answer accepted, ICE/DTLS
+  // fine, but no frames ever arrive" black-stage case.
   _armNoTrackWatchdog() {
-    this._clearNoTrackWatchdog();
-    this._noTrackTimer = window.setTimeout(() => {
-      this._noTrackTimer = null;
+    displayViewerArmNoTrackWatchdog(this, () => {
       if (this._firstFrameSeen || this._closedByUser) return;
       this.statusEl.textContent = 'No video received';
       this.statusEl.className = 'display-status error';
@@ -726,29 +701,19 @@ class DisplaySlot {
   }
 
   _clearNoTrackWatchdog() {
-    if (this._noTrackTimer !== null && this._noTrackTimer !== undefined) {
-      window.clearTimeout(this._noTrackTimer);
-      this._noTrackTimer = null;
-    }
+    displayViewerClearNoTrackWatchdog(this);
   }
 
   // ── Live metrics chip (getStats sampler) ────────────────────────────
+  // Shared cadence + summarizer (45-display-viewer-core); only where the
+  // text lands is ours: the slot's single fixed metricsEl.
 
   _startStatsSampler() {
-    if (this._statsTimer) return;
-    this._statsPrev = null;
-    this._statsTimer = window.setInterval(() => {
-      this._sampleStats().catch(() => {});
-    }, 3000);
-    this._sampleStats().catch(() => {});
+    displayViewerStartStatsSampler(this);
   }
 
   _stopStatsSampler() {
-    if (this._statsTimer) {
-      window.clearInterval(this._statsTimer);
-      this._statsTimer = null;
-    }
-    this._statsPrev = null;
+    displayViewerStopStatsSampler(this);
     if (this.metricsEl) {
       this.metricsEl.style.display = 'none';
       this.metricsEl.classList.remove('active');
@@ -757,14 +722,12 @@ class DisplaySlot {
   }
 
   async _sampleStats() {
-    if (!this.pc || this.pc.connectionState !== 'connected') return;
-    const stats = await this.pc.getStats();
-    const summary = summarizeRtcStats(stats, this._statsPrev);
-    this._statsPrev = summary.snapshot;
-    if (!summary.text || !this.metricsEl) return;
-    this.metricsEl.textContent = summary.text;
-    this.metricsEl.style.display = '';
-    this.metricsEl.classList.add('active');
+    await displayViewerSampleRtcStats(this, (text) => {
+      if (!this.metricsEl) return;
+      this.metricsEl.textContent = text;
+      this.metricsEl.style.display = '';
+      this.metricsEl.classList.add('active');
+    });
   }
 
   handleAnswer(sdp) {
@@ -866,7 +829,7 @@ class DisplaySlot {
         if (typeof showControlToast === 'function') {
           showControlToast('error', 'No response to the input-control request — try again');
         }
-      }, 5000);
+      }, DISPLAY_VIEWER_TAKE_PENDING_TIMEOUT_MS);
     }
   }
 
@@ -1062,7 +1025,7 @@ class DisplaySlot {
   }
 
   setAuthority(state) {
-    if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
+    if (!isDisplayInputAuthorityState(state)) {
       // Forward-compat: future state strings (we don't expect any) leave
       // the chip on its previous value rather than blanking it.
       return;
@@ -1096,53 +1059,17 @@ class DisplaySlot {
   // Phase 5c: render the chip + take/release button visibility from the
   // current `authorityState`.  Single-source UI projection so any code
   // that mutates state goes through `setAuthority` and never has to
-  // remember to update DOM directly.
+  // remember to update DOM directly.  Chip text/classes and the button
+  // toggle are the shared renderers in 45-display-viewer-core — the same
+  // vocabulary the federated chip renders.  Button visibility tracks
+  // state, not the `interactive` flag, so the user can click Take
+  // Control even before listeners install (the request flow handles
+  // waiting for the `'you'` callback).
   _renderAuthority() {
-    const e = this.authorityEl;
-    if (e) {
-      switch (this.authorityState) {
-        case 'you':
-          e.style.display = '';
-          e.textContent = 'Input: you';
-          e.className = 'display-input-authority you';
-          break;
-        case 'other':
-          e.style.display = '';
-          e.textContent = 'Input: another viewer';
-          e.className = 'display-input-authority other';
-          break;
-        case 'unclaimed':
-          e.style.display = '';
-          e.textContent = 'Input: shared';
-          e.className = 'display-input-authority unclaimed';
-          break;
-        default:
-          // 'unknown' — server hasn't told us yet.  Hide the chip rather
-          // than show "shared" speculatively, per phase 5c spec: "do not
-          // show 'unclaimed' unless the server has actually told this
-          // browser the display is unclaimed."
-          e.style.display = 'none';
-          e.textContent = '';
-          e.className = 'display-input-authority';
-          break;
-      }
-    }
-    // Button visibility tracks state, not the `interactive` flag, so the
-    // user can click Take Control even before listeners install (the
-    // request flow handles waiting for the `'you'` callback).
-    if (this.authorityState === 'you') {
-      this.takeBtn.style.display = 'none';
-      this.releaseBtn.style.display = '';
-    } else {
-      this.takeBtn.style.display = '';
-      this.releaseBtn.style.display = 'none';
-    }
-    // Callout is armable only while this browser holds input authority
-    // (the drag would otherwise be view-only theater; the arm/suppress
-    // semantics assume our pointer stream is what the remote receives).
-    if (this.calloutBtn) {
-      this.calloutBtn.disabled = this.authorityState !== 'you';
-    }
+    displayViewerRenderAuthorityChip(
+      this.authorityEl, this.authorityState, 'display-input-authority');
+    displayViewerApplyAuthorityButtons(
+      this.takeBtn, this.releaseBtn, this.calloutBtn, this.authorityState);
   }
 
   toggleStreaming() {

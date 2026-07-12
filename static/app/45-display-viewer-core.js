@@ -424,3 +424,178 @@ function displayViewerBuildPasteHandler(getChannel) {
     }
   };
 }
+
+// ── Input-authority chip + buttons (shared vocabulary) ──────────────────
+// Both viewers render the same three-state chip from the same server
+// vocabulary; only the chip's base class and which DOM the buttons live
+// in differ (fixed toolbar elements locally; per-container queries on the
+// peer path). The state machines around these renderers stay in the
+// classes — they differ deliberately (the local slot only auto-enters
+// interactive mode on a pending user take; the peer re-enters on ANY
+// 'you' so pane rebuilds rebind listeners).
+
+// The server-resolved authority states. Forward-compat convention shared
+// by both `setAuthority` paths: an unknown state string leaves the chip
+// on its previous value rather than blanking it.
+function isDisplayInputAuthorityState(state) {
+  return state === 'you' || state === 'other' || state === 'unclaimed';
+}
+
+// Render the chip element for `state`. `baseClass` is the class list the
+// chip keeps in every state ('display-input-authority' locally;
+// 'peer-display-authority display-input-authority' on peer panes — the
+// .you/.other/.unclaimed styling is shared CSS). The default arm is
+// 'unknown' — the server hasn't told us yet. Hide the chip rather than
+// show "shared" speculatively, per phase 5c spec: "do not show
+// 'unclaimed' unless the server has actually told this browser the
+// display is unclaimed."
+function displayViewerRenderAuthorityChip(chipEl, state, baseClass) {
+  if (!chipEl) return;
+  switch (state) {
+    case 'you':
+      chipEl.style.display = '';
+      chipEl.textContent = 'Input: you';
+      chipEl.className = `${baseClass} you`;
+      break;
+    case 'other':
+      chipEl.style.display = '';
+      chipEl.textContent = 'Input: another viewer';
+      chipEl.className = `${baseClass} other`;
+      break;
+    case 'unclaimed':
+      chipEl.style.display = '';
+      chipEl.textContent = 'Input: shared';
+      chipEl.className = `${baseClass} unclaimed`;
+      break;
+    default:
+      chipEl.style.display = 'none';
+      chipEl.textContent = '';
+      chipEl.className = baseClass;
+      break;
+  }
+}
+
+// Take/Release visibility + the callout arm gate, from the authority
+// state. Callout is armable only while this browser holds input
+// authority (the drag would otherwise be view-only theater; the
+// arm/suppress semantics assume our pointer stream is what the remote
+// receives).
+function displayViewerApplyAuthorityButtons(takeBtn, releaseBtn, calloutBtn, state) {
+  if (takeBtn && releaseBtn) {
+    if (state === 'you') {
+      takeBtn.style.display = 'none';
+      releaseBtn.style.display = '';
+    } else {
+      takeBtn.style.display = '';
+      releaseBtn.style.display = 'none';
+    }
+  }
+  if (calloutBtn) {
+    calloutBtn.disabled = state !== 'you';
+  }
+}
+
+// Item 7b: how long a Take Control request may sit unanswered before the
+// pending state resets itself with a toast instead of hanging armed
+// forever. Same patience on both paths; the toast copy stays per-class.
+const DISPLAY_VIEWER_TAKE_PENDING_TIMEOUT_MS = 5000;
+
+// ── In-stage status overlay (shared DOM builder) ────────────────────────
+// Render one stage overlay element. `overlay` is null to hide, or
+// { mode: 'progress'|'error', text, retryLabel, onRetry } — 'progress'
+// gets the spinner, 'error' the alarm styling, and a retry button
+// appears only when retryLabel + a callable onRetry are both present.
+// All dynamic text goes through textContent — never innerHTML. State
+// ownership stays with the callers (the local slot renders into its one
+// overlayEl; the peer keeps `_overlay` on the connection and re-applies
+// into every container its host has, because pane DOM is rebuilt on
+// every daemons-list re-render).
+function displayViewerRenderStageOverlayInto(el, overlay) {
+  el.textContent = '';
+  if (!overlay) {
+    el.style.display = 'none';
+    el.classList.remove('error');
+    return;
+  }
+  el.classList.toggle('error', overlay.mode === 'error');
+  const inner = document.createElement('div');
+  inner.className = 'stage-overlay-inner';
+  if (overlay.mode !== 'error') {
+    const spinner = document.createElement('span');
+    spinner.className = 'stage-overlay-spinner';
+    inner.appendChild(spinner);
+  }
+  const label = document.createElement('span');
+  label.className = 'stage-overlay-text';
+  label.textContent = overlay.text || '';
+  inner.appendChild(label);
+  if (overlay.retryLabel && typeof overlay.onRetry === 'function') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'stage-overlay-retry';
+    btn.textContent = overlay.retryLabel;
+    btn.addEventListener('click', overlay.onRetry);
+    inner.appendChild(btn);
+  }
+  el.appendChild(inner);
+  el.style.display = '';
+}
+
+// ── Live metrics chip sampler (getStats driver) ─────────────────────────
+// Both chips sample on the same cadence through the same summarizer so
+// they can't drift; only where the text lands differs (the local slot's
+// one metricsEl vs the peer's per-container fanout), which arrives as
+// the `applyText` hook on the viewer's own `_sampleStats`.
+const DISPLAY_VIEWER_STATS_SAMPLE_INTERVAL_MS = 3000;
+
+function displayViewerStartStatsSampler(viewer) {
+  if (viewer._statsTimer) return;
+  viewer._statsPrev = null;
+  viewer._statsTimer = window.setInterval(() => {
+    viewer._sampleStats().catch(() => {});
+  }, DISPLAY_VIEWER_STATS_SAMPLE_INTERVAL_MS);
+  viewer._sampleStats().catch(() => {});
+}
+
+function displayViewerStopStatsSampler(viewer) {
+  if (viewer._statsTimer) {
+    window.clearInterval(viewer._statsTimer);
+    viewer._statsTimer = null;
+  }
+  viewer._statsPrev = null;
+}
+
+async function displayViewerSampleRtcStats(viewer, applyText) {
+  if (!viewer.pc || viewer.pc.connectionState !== 'connected') return;
+  const stats = await viewer.pc.getStats();
+  const summary = summarizeRtcStats(stats, viewer._statsPrev);
+  viewer._statsPrev = summary.snapshot;
+  if (summary.text) applyText(summary.text);
+}
+
+// ── No-track watchdog (shared driver) ───────────────────────────────────
+// One patience budget for "the connection negotiated but no video ever
+// arrived" on both paths (the peer path had it first; the local slot
+// ported it). The verdict — status copy, overlay, side effects like the
+// peer's Station activity event — is per-class and runs in `onTimeout`,
+// which must ALSO re-check its own liveness guards (first frame seen /
+// closed-by-user locally; `this.stream` on the peer), exactly like the
+// original inline callbacks did. `timeoutMs` is passed from each class's
+// public NO_TRACK_TIMEOUT_MS static so a QA override on the class keeps
+// working.
+const DISPLAY_VIEWER_NO_TRACK_TIMEOUT_MS = 10000;
+
+function displayViewerArmNoTrackWatchdog(viewer, onTimeout, timeoutMs = DISPLAY_VIEWER_NO_TRACK_TIMEOUT_MS) {
+  displayViewerClearNoTrackWatchdog(viewer);
+  viewer._noTrackTimer = window.setTimeout(() => {
+    viewer._noTrackTimer = null;
+    onTimeout();
+  }, timeoutMs);
+}
+
+function displayViewerClearNoTrackWatchdog(viewer) {
+  if (viewer._noTrackTimer !== null && viewer._noTrackTimer !== undefined) {
+    window.clearTimeout(viewer._noTrackTimer);
+    viewer._noTrackTimer = null;
+  }
+}

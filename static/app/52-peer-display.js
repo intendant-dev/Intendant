@@ -116,12 +116,14 @@ class PeerDisplayConnection {
     this._noTrackTimer = null;
   }
 
-  static NO_TRACK_TIMEOUT_MS = 10000;
+  // Same budget as DisplaySlot.NO_TRACK_TIMEOUT_MS — both are the shared
+  // viewer-core constant, so the two paths' patience can't drift. The
+  // static stays public (QA overrides keep working: the watchdog arms
+  // with the static, not the constant).
+  static NO_TRACK_TIMEOUT_MS = DISPLAY_VIEWER_NO_TRACK_TIMEOUT_MS;
 
   _armNoTrackWatchdog() {
-    this._clearNoTrackWatchdog();
-    this._noTrackTimer = window.setTimeout(() => {
-      this._noTrackTimer = null;
+    displayViewerArmNoTrackWatchdog(this, () => {
       if (this.stream) return;
       const message = 'peer did not answer — its display may need a capture grant';
       this._log('warn', `no video track within ${PeerDisplayConnection.NO_TRACK_TIMEOUT_MS}ms — ${message}`);
@@ -144,10 +146,7 @@ class PeerDisplayConnection {
   }
 
   _clearNoTrackWatchdog() {
-    if (this._noTrackTimer !== null) {
-      window.clearTimeout(this._noTrackTimer);
-      this._noTrackTimer = null;
-    }
+    displayViewerClearNoTrackWatchdog(this);
   }
 
   sessionKey() {
@@ -322,37 +321,20 @@ class PeerDisplayConnection {
   }
 
   _applyStageOverlayDom() {
+    // Shared DOM builder (45-display-viewer-core); the per-container
+    // fanout is this class's container-resolution policy, and the retry
+    // affordance is always the 'Retry' button re-running the full open
+    // path (see the retry() doc — re-offering in place is not a wire
+    // shape the peer's WebRtcPeer lifecycle supports).
     for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
       const el = container.querySelector('.display-stage-overlay');
       if (!el) continue;
-      el.textContent = '';
-      if (!this._overlay) {
-        el.style.display = 'none';
-        el.classList.remove('error');
-        continue;
-      }
-      el.classList.toggle('error', this._overlay.mode === 'error');
-      const inner = document.createElement('div');
-      inner.className = 'stage-overlay-inner';
-      if (this._overlay.mode !== 'error') {
-        const spinner = document.createElement('span');
-        spinner.className = 'stage-overlay-spinner';
-        inner.appendChild(spinner);
-      }
-      const label = document.createElement('span');
-      label.className = 'stage-overlay-text';
-      label.textContent = this._overlay.text;
-      inner.appendChild(label);
-      if (this._overlay.retry) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'stage-overlay-retry';
-        btn.textContent = 'Retry';
-        btn.addEventListener('click', () => this.retry());
-        inner.appendChild(btn);
-      }
-      el.appendChild(inner);
-      el.style.display = '';
+      displayViewerRenderStageOverlayInto(el, this._overlay ? {
+        mode: this._overlay.mode,
+        text: this._overlay.text,
+        retryLabel: this._overlay.retry ? 'Retry' : null,
+        onRetry: this._overlay.retry ? () => this.retry() : null,
+      } : null);
     }
   }
 
@@ -392,31 +374,20 @@ class PeerDisplayConnection {
   }
 
   // ── Item 6: live metrics chip (getStats sampler) ────────────────────
+  // Shared cadence + summarizer with the local DisplaySlot chip
+  // (45-display-viewer-core); only where the text lands is ours — the
+  // per-container fanout below.
   _startStatsSampler() {
-    if (this._statsTimer) return;
-    this._statsPrev = null;
-    this._statsTimer = window.setInterval(() => {
-      this._sampleStats().catch(() => {});
-    }, 3000);
-    this._sampleStats().catch(() => {});
+    displayViewerStartStatsSampler(this);
   }
 
   _stopStatsSampler() {
-    if (this._statsTimer) {
-      window.clearInterval(this._statsTimer);
-      this._statsTimer = null;
-    }
-    this._statsPrev = null;
+    displayViewerStopStatsSampler(this);
     this._applyMetricsDom('');
   }
 
   async _sampleStats() {
-    if (!this.pc || this.pc.connectionState !== 'connected') return;
-    const stats = await this.pc.getStats();
-    // Shared summarizer with the local DisplaySlot chip (45-displays).
-    const summary = summarizeRtcStats(stats, this._statsPrev);
-    this._statsPrev = summary.snapshot;
-    if (summary.text) this._applyMetricsDom(summary.text);
+    await displayViewerSampleRtcStats(this, (text) => this._applyMetricsDom(text));
   }
 
   _applyMetricsDom(text) {
@@ -1191,7 +1162,7 @@ class PeerDisplayConnection {
   // without installing pointer / keyboard listeners; F-2 will hook
   // its `_enterInteractive` equivalent in here.
   setPeerAuthorityState(state) {
-    if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
+    if (!isDisplayInputAuthorityState(state)) {
       // Forward-compat: an unknown state string leaves the chip
       // on its previous value rather than blanking it. Same
       // policy as DisplaySlot's setAuthority.
@@ -1350,52 +1321,21 @@ class PeerDisplayConnection {
     // (daemons-list panel + Station endpoint) — mirroring setStatus —
     // instead of only the getElementById panel, which left Station-
     // hosted panes with a stale chip and the wrong Take/Release button.
+    // Chip text/classes ('unknown' hides rather than speculating
+    // 'unclaimed', same convention as local 5c), the Take/Release
+    // toggle, and the callout arm gate are the shared renderers in
+    // 45-display-viewer-core; the multi-container fanout is this
+    // class's container-resolution policy.
     for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
-      const chip = container.querySelector('.peer-display-authority');
-      const takeBtn = container.querySelector('.take-control-btn');
-      const releaseBtn = container.querySelector('.release-control-btn');
-      if (chip) {
-        switch (this.peerAuthorityState) {
-          case 'you':
-            chip.style.display = '';
-            chip.textContent = 'Input: you';
-            chip.className = 'peer-display-authority display-input-authority you';
-            break;
-          case 'other':
-            chip.style.display = '';
-            chip.textContent = 'Input: another viewer';
-            chip.className = 'peer-display-authority display-input-authority other';
-            break;
-          case 'unclaimed':
-            chip.style.display = '';
-            chip.textContent = 'Input: shared';
-            chip.className = 'peer-display-authority display-input-authority unclaimed';
-            break;
-          default:
-            // 'unknown' — peer hasn't told us yet (snapshot in
-            // flight). Hide the chip rather than show 'unclaimed'
-            // speculatively, same convention as local 5c.
-            chip.style.display = 'none';
-            chip.textContent = '';
-            chip.className = 'peer-display-authority display-input-authority';
-            break;
-        }
-      }
-      if (takeBtn && releaseBtn) {
-        if (this.peerAuthorityState === 'you') {
-          takeBtn.style.display = 'none';
-          releaseBtn.style.display = '';
-        } else {
-          takeBtn.style.display = '';
-          releaseBtn.style.display = 'none';
-        }
-      }
-      // Callout is armable only while this browser holds federated
-      // input authority — same gate as the local display slot.
-      const calloutBtn = container.querySelector('.peer-display-callout');
-      if (calloutBtn) {
-        calloutBtn.disabled = this.peerAuthorityState !== 'you';
-      }
+      displayViewerRenderAuthorityChip(
+        container.querySelector('.peer-display-authority'),
+        this.peerAuthorityState,
+        'peer-display-authority display-input-authority');
+      displayViewerApplyAuthorityButtons(
+        container.querySelector('.take-control-btn'),
+        container.querySelector('.release-control-btn'),
+        container.querySelector('.peer-display-callout'),
+        this.peerAuthorityState);
     }
   }
 
@@ -1428,7 +1368,7 @@ class PeerDisplayConnection {
       if (typeof showControlToast === 'function') {
         showControlToast('error', 'The peer did not answer the input-control request — try again');
       }
-    }, 5000);
+    }, DISPLAY_VIEWER_TAKE_PENDING_TIMEOUT_MS);
   }
 
   // F-1.3c: user-intent release. Sends Release on the authority
