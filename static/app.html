@@ -54105,6 +54105,14 @@ function shellHostLabel(hostId = currentShellHostId()) {
   const peer = daemons.find(d => d.host_id === id);
   return peer?.label || id;
 }
+/* ── static/app/42b-access-model.js ── */
+// ── Access model + rendering ──
+// The Access surface model + render domain: fleet targets (remembered +
+// live, hosted sync, petnames), enrollments, Connect status/claim, the
+// IAM overview model (roles/policies/permissions, fallback catalog),
+// target rows/feature chips/lane badges, grant forms + fanout, the
+// permission matrix, and the coordinator route preview. The Access pane
+// scaffolding lives in 43-access-panes.js.
 
 function normalizeDashboardAccessTarget(target) {
   if (!target || typeof target !== 'object') return null;
@@ -67310,6 +67318,236 @@ const contextViz = {
   zoom: 38,
 };
 
+// analyzeContextSnapshot walks the entire raw payload, which is expensive at
+// large context sizes. Both the legacy Context pane and the Station snapshot
+// builders need the same analysis, so memoize it per snapshot object. Exact
+// raw loads replace the snapshot object (replaceStoredContextSnapshot), which
+// naturally invalidates the memo entry.
+const contextAnalysisBySnapshot = new WeakMap();
+
+function switchActivitySubtab(name) {
+  if (activeActivitySubtab === name) return;
+  activeActivitySubtab = name;
+  document.querySelectorAll('#activity-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.activityTab === name);
+  });
+  document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
+  document.getElementById('activity-context-pane').classList.toggle('active', name === 'context');
+  document.getElementById('activity-managed-pane').classList.toggle('active', name === 'managed');
+  document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
+  document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
+  document.getElementById('activity-log-controls')?.classList.toggle('hidden', name !== 'log');
+  syncSessionWindowGridControls();
+  if (name === 'context') {
+    renderContextPane();
+    contextStartThreeAnimation();
+  } else {
+    setContextFocusMode(false);
+    contextStopThreeAnimation();
+  }
+  if (name === 'managed') {
+    refreshManagedContextPane({ force: true });
+  }
+  if (name === 'changes') {
+    const badge = document.getElementById('badge-changes');
+    if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
+    // Populate the timeline on first view in case the user opened the
+    // Changes tab after a session had already racked up history
+    // (refreshHistory is a no-op when the endpoint 404s).
+    if (typeof refreshHistory === 'function') refreshHistory();
+  }
+  if (name === 'control') {
+    refreshControlPane();
+  }
+}
+
+let activeSessionsSubtab = 'recent';
+
+function focusNewSessionInput() {
+  const input = document.getElementById('new-session-input');
+  if (!input) return;
+  resizeTaskTextarea(input);
+  input.focus();
+  if (typeof input.setSelectionRange === 'function') {
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  }
+}
+
+function switchSessionsSubtab(name) {
+  const next = VALID_SESSIONS_SUBTABS.includes(name) ? name : 'recent';
+  if (currentSessionDetail) closeSessionDetail();
+  activeSessionsSubtab = next;
+  document.querySelectorAll('#sessions-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.sessionsTab === next);
+  });
+  document.querySelectorAll('#tab-sessions .sessions-subtab-panes > .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `sessions-pane-${next}`);
+  });
+  if (next === 'new') {
+    updateNewSessionProjectPrefills();
+    requestAnimationFrame(focusNewSessionInput);
+  } else if (next === 'worktrees') {
+    if (worktreeHasScannedData(_cachedWorktreeScan)) {
+      renderWorktrees(_cachedWorktreeScan);
+      if (worktreesLoadInFlight === 'scan') {
+        setWorktreesActivityNotice('pending', 'Scanning worktrees...');
+      }
+    } else {
+      loadWorktrees({ forceScan: !worktreesLoaded });
+    }
+  } else if (!sessionsLoaded) {
+    loadSessions();
+  } else {
+    renderSessionsViews();
+  }
+}
+
+function openNewSessionFromPrompt() {
+  const source = document.getElementById('activity-task-input');
+  const dest = document.getElementById('new-session-input');
+  const draft = source?.value || '';
+  if (dest && draft.trim()) {
+    dest.value = draft;
+  }
+  routeTo('sessions', 'new');
+  requestAnimationFrame(focusNewSessionInput);
+}
+window.openNewSessionFromPrompt = openNewSessionFromPrompt;
+
+const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
+const ACCESS_SUBTAB_KEY = 'intendant_access_subtab';
+let activeSettingsSubtab =
+  normalizeSettingsSubtab(localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account');
+if (activeSettingsSubtab === 'network') {
+  activeSettingsSubtab = 'account';
+  localStorage.setItem(SETTINGS_SUBTAB_KEY, activeSettingsSubtab);
+}
+let activeAccessSubtab =
+  normalizeAccessSubtab(localStorage.getItem(ACCESS_SUBTAB_KEY) || 'overview');
+if (!VALID_ACCESS_SUBTABS.includes(activeAccessSubtab)) {
+  activeAccessSubtab = 'overview';
+  localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
+}
+
+function switchAccessSubtab(name) {
+  const next = normalizeAccessSubtab(name);
+  if (activeAccessSubtab !== next) {
+    activeAccessSubtab = next;
+    localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
+  }
+  document.querySelectorAll('#access-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.accessTab === activeAccessSubtab);
+  });
+  document.querySelectorAll('#tab-access .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `access-pane-${activeAccessSubtab}`);
+  });
+  renderAccessAdminSummaries();
+  if (activeAccessSubtab === 'daemons') renderDaemonsList();
+  if (activeAccessSubtab === 'overview' || activeAccessSubtab === 'people') {
+    refreshAccessEnrollments({ silent: true }).catch(() => {});
+  }
+  if (activeAccessSubtab === 'overview') {
+    refreshAccessConnectStatus({ silent: true }).catch(() => {});
+  }
+  if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
+}
+
+function switchSettingsSubtab(name) {
+  name = normalizeSettingsSubtab(name);
+  if (name === 'network') {
+    routeTo('access', 'overview');
+    return;
+  }
+  if (activeSettingsSubtab === name) return;
+  activeSettingsSubtab = name;
+  localStorage.setItem(SETTINGS_SUBTAB_KEY, name);
+  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.settingsTab === name);
+  });
+  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
+  });
+  updateSettingsSaveRow();
+  if (typeof ui2SettingsOnSubtabShown === 'function') ui2SettingsOnSubtabShown(name);
+}
+
+// Deep link to the Settings → Account API-keys card — the remediation
+// unfueled notices point at ("Add API keys").
+// Bridged onto window below: the dashboard runs as a module script, so
+// inline onclick handlers (the unfueled banner's Add-keys button) and the
+// validate-dashboard harness need an explicit global.
+function focusSettingsApiKeys() {
+  // The API-keys card lives in the Providers & models section.
+  routeTo('settings', 'providers');
+  requestAnimationFrame(() => {
+    const heading = document.getElementById('settings-keys-heading');
+    const card = heading?.closest('.ui-card') || heading;
+    if (card?.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const firstEmpty = ['settings-key-anthropic', 'settings-key-openai', 'settings-key-gemini']
+      .map(id => document.getElementById(id))
+      .find(el => el && !el.value.trim());
+    firstEmpty?.focus();
+  });
+}
+window.focusSettingsApiKeys = focusSettingsApiKeys;
+
+// Apply the remembered sub-tab on initial render, before anything
+// else toggles the default.
+function applyInitialSettingsSubtab() {
+  if (activeSettingsSubtab === 'account') {
+    updateSettingsSaveRow();
+    return;
+  }
+  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.settingsTab === activeSettingsSubtab);
+  });
+  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `settings-pane-${activeSettingsSubtab}`);
+  });
+  updateSettingsSaveRow();
+}
+
+// The main Save/Reset row only actually saves the Agent sub-tab's
+// settings (CU, Presence, Transcription, Recording, Live Audio +
+// External Agent). Account has its own "Save Keys" button inside the
+// API Keys fieldset; Network applies each daemon immediately on Add;
+// Debug is read-only. So we hide the global Save row on every
+// sub-tab except Agent to prevent the "I clicked Save and nothing
+// happened" confusion.
+function updateSettingsSaveRow() {
+  const row = document.querySelector('#tab-settings .settings-save-row');
+  if (!row) return;
+  // The batch-saved /api/settings fields live in the Providers & models
+  // and Presence & voice sections; Autonomy is live-apply and Account &
+  // advanced is read-only.
+  const visible = activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence';
+  row.style.display = visible ? '' : 'none';
+}
+
+let initialRouteAppliedFromHash = false;
+function applyInitialRouteFromHash() {
+  if (initialRouteAppliedFromHash) return;
+  initialRouteAppliedFromHash = true;
+  applyCurrentRoute();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', applyInitialRouteFromHash, { once: true });
+} else {
+  applyInitialRouteFromHash();
+}
+
+/* ── static/app/48b-context-viz.js ── */
+// ── Context visualizer (Activity → Context pane) ──
+// Snapshot store/replay, payload analysis, and the Three.js scene for
+// the managed-context visualization, plus the pane DOM render path. The
+// pane top-level state, category/theme tables, the contextViz handle
+// object, and the analysis memo WeakMap stay in 48-router-settings.js:
+// deep links run applyCurrentRoute during that fragment evaluation and
+// can reach these functions before this fragment evaluates — function
+// declarations hoist module-wide, but const/let would still be in TDZ.
 function contextValueText(value) {
   if (value === null || value === undefined) return '--';
   if (typeof value === 'number') return value.toLocaleString();
@@ -67830,13 +68068,6 @@ function contextAddSummaryParts(parts, summaryParts) {
     });
   }
 }
-
-// analyzeContextSnapshot walks the entire raw payload, which is expensive at
-// large context sizes. Both the legacy Context pane and the Station snapshot
-// builders need the same analysis, so memoize it per snapshot object. Exact
-// raw loads replace the snapshot object (replaceStoredContextSnapshot), which
-// naturally invalidates the memo entry.
-const contextAnalysisBySnapshot = new WeakMap();
 
 function analyzeContextSnapshotCached(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return analyzeContextSnapshot(snapshot);
@@ -68754,220 +68985,6 @@ function renderContextPane() {
   renderContextHotspots(analysis);
   contextBuildThree(analysis, snapshot);
   if (activeTab === 'activity' && activeActivitySubtab === 'context') contextStartThreeAnimation();
-}
-
-function switchActivitySubtab(name) {
-  if (activeActivitySubtab === name) return;
-  activeActivitySubtab = name;
-  document.querySelectorAll('#activity-subtabs .subtab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.activityTab === name);
-  });
-  document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
-  document.getElementById('activity-context-pane').classList.toggle('active', name === 'context');
-  document.getElementById('activity-managed-pane').classList.toggle('active', name === 'managed');
-  document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
-  document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
-  document.getElementById('activity-log-controls')?.classList.toggle('hidden', name !== 'log');
-  syncSessionWindowGridControls();
-  if (name === 'context') {
-    renderContextPane();
-    contextStartThreeAnimation();
-  } else {
-    setContextFocusMode(false);
-    contextStopThreeAnimation();
-  }
-  if (name === 'managed') {
-    refreshManagedContextPane({ force: true });
-  }
-  if (name === 'changes') {
-    const badge = document.getElementById('badge-changes');
-    if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
-    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
-    // Populate the timeline on first view in case the user opened the
-    // Changes tab after a session had already racked up history
-    // (refreshHistory is a no-op when the endpoint 404s).
-    if (typeof refreshHistory === 'function') refreshHistory();
-  }
-  if (name === 'control') {
-    refreshControlPane();
-  }
-}
-
-let activeSessionsSubtab = 'recent';
-
-function focusNewSessionInput() {
-  const input = document.getElementById('new-session-input');
-  if (!input) return;
-  resizeTaskTextarea(input);
-  input.focus();
-  if (typeof input.setSelectionRange === 'function') {
-    const end = input.value.length;
-    input.setSelectionRange(end, end);
-  }
-}
-
-function switchSessionsSubtab(name) {
-  const next = VALID_SESSIONS_SUBTABS.includes(name) ? name : 'recent';
-  if (currentSessionDetail) closeSessionDetail();
-  activeSessionsSubtab = next;
-  document.querySelectorAll('#sessions-subtabs .subtab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.sessionsTab === next);
-  });
-  document.querySelectorAll('#tab-sessions .sessions-subtab-panes > .subtab-pane').forEach(pane => {
-    pane.classList.toggle('active', pane.id === `sessions-pane-${next}`);
-  });
-  if (next === 'new') {
-    updateNewSessionProjectPrefills();
-    requestAnimationFrame(focusNewSessionInput);
-  } else if (next === 'worktrees') {
-    if (worktreeHasScannedData(_cachedWorktreeScan)) {
-      renderWorktrees(_cachedWorktreeScan);
-      if (worktreesLoadInFlight === 'scan') {
-        setWorktreesActivityNotice('pending', 'Scanning worktrees...');
-      }
-    } else {
-      loadWorktrees({ forceScan: !worktreesLoaded });
-    }
-  } else if (!sessionsLoaded) {
-    loadSessions();
-  } else {
-    renderSessionsViews();
-  }
-}
-
-function openNewSessionFromPrompt() {
-  const source = document.getElementById('activity-task-input');
-  const dest = document.getElementById('new-session-input');
-  const draft = source?.value || '';
-  if (dest && draft.trim()) {
-    dest.value = draft;
-  }
-  routeTo('sessions', 'new');
-  requestAnimationFrame(focusNewSessionInput);
-}
-window.openNewSessionFromPrompt = openNewSessionFromPrompt;
-
-const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
-const ACCESS_SUBTAB_KEY = 'intendant_access_subtab';
-let activeSettingsSubtab =
-  normalizeSettingsSubtab(localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account');
-if (activeSettingsSubtab === 'network') {
-  activeSettingsSubtab = 'account';
-  localStorage.setItem(SETTINGS_SUBTAB_KEY, activeSettingsSubtab);
-}
-let activeAccessSubtab =
-  normalizeAccessSubtab(localStorage.getItem(ACCESS_SUBTAB_KEY) || 'overview');
-if (!VALID_ACCESS_SUBTABS.includes(activeAccessSubtab)) {
-  activeAccessSubtab = 'overview';
-  localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
-}
-
-function switchAccessSubtab(name) {
-  const next = normalizeAccessSubtab(name);
-  if (activeAccessSubtab !== next) {
-    activeAccessSubtab = next;
-    localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
-  }
-  document.querySelectorAll('#access-subtabs .subtab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.accessTab === activeAccessSubtab);
-  });
-  document.querySelectorAll('#tab-access .subtab-pane').forEach(pane => {
-    pane.classList.toggle('active', pane.id === `access-pane-${activeAccessSubtab}`);
-  });
-  renderAccessAdminSummaries();
-  if (activeAccessSubtab === 'daemons') renderDaemonsList();
-  if (activeAccessSubtab === 'overview' || activeAccessSubtab === 'people') {
-    refreshAccessEnrollments({ silent: true }).catch(() => {});
-  }
-  if (activeAccessSubtab === 'overview') {
-    refreshAccessConnectStatus({ silent: true }).catch(() => {});
-  }
-  if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
-}
-
-function switchSettingsSubtab(name) {
-  name = normalizeSettingsSubtab(name);
-  if (name === 'network') {
-    routeTo('access', 'overview');
-    return;
-  }
-  if (activeSettingsSubtab === name) return;
-  activeSettingsSubtab = name;
-  localStorage.setItem(SETTINGS_SUBTAB_KEY, name);
-  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.settingsTab === name);
-  });
-  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
-    pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
-  });
-  updateSettingsSaveRow();
-  if (typeof ui2SettingsOnSubtabShown === 'function') ui2SettingsOnSubtabShown(name);
-}
-
-// Deep link to the Settings → Account API-keys card — the remediation
-// unfueled notices point at ("Add API keys").
-// Bridged onto window below: the dashboard runs as a module script, so
-// inline onclick handlers (the unfueled banner's Add-keys button) and the
-// validate-dashboard harness need an explicit global.
-function focusSettingsApiKeys() {
-  // The API-keys card lives in the Providers & models section.
-  routeTo('settings', 'providers');
-  requestAnimationFrame(() => {
-    const heading = document.getElementById('settings-keys-heading');
-    const card = heading?.closest('.ui-card') || heading;
-    if (card?.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    const firstEmpty = ['settings-key-anthropic', 'settings-key-openai', 'settings-key-gemini']
-      .map(id => document.getElementById(id))
-      .find(el => el && !el.value.trim());
-    firstEmpty?.focus();
-  });
-}
-window.focusSettingsApiKeys = focusSettingsApiKeys;
-
-// Apply the remembered sub-tab on initial render, before anything
-// else toggles the default.
-function applyInitialSettingsSubtab() {
-  if (activeSettingsSubtab === 'account') {
-    updateSettingsSaveRow();
-    return;
-  }
-  document.querySelectorAll('#tab-settings .subtab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.settingsTab === activeSettingsSubtab);
-  });
-  document.querySelectorAll('#tab-settings .subtab-pane').forEach(pane => {
-    pane.classList.toggle('active', pane.id === `settings-pane-${activeSettingsSubtab}`);
-  });
-  updateSettingsSaveRow();
-}
-
-// The main Save/Reset row only actually saves the Agent sub-tab's
-// settings (CU, Presence, Transcription, Recording, Live Audio +
-// External Agent). Account has its own "Save Keys" button inside the
-// API Keys fieldset; Network applies each daemon immediately on Add;
-// Debug is read-only. So we hide the global Save row on every
-// sub-tab except Agent to prevent the "I clicked Save and nothing
-// happened" confusion.
-function updateSettingsSaveRow() {
-  const row = document.querySelector('#tab-settings .settings-save-row');
-  if (!row) return;
-  // The batch-saved /api/settings fields live in the Providers & models
-  // and Presence & voice sections; Autonomy is live-apply and Account &
-  // advanced is read-only.
-  const visible = activeSettingsSubtab === 'providers' || activeSettingsSubtab === 'presence';
-  row.style.display = visible ? '' : 'none';
-}
-
-let initialRouteAppliedFromHash = false;
-function applyInitialRouteFromHash() {
-  if (initialRouteAppliedFromHash) return;
-  initialRouteAppliedFromHash = true;
-  applyCurrentRoute();
-}
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', applyInitialRouteFromHash, { once: true });
-} else {
-  applyInitialRouteFromHash();
 }
 
 /* ── static/app/49-daemons-multihost.js ── */
@@ -74638,327 +74655,6 @@ function peerCanShareDisplay(d) {
   return d.capabilities.some(c => c && c.kind === 'display');
 }
 
-// **Phase 0 visual-freshness sampler** (task #83).
-//
-// Reads the diagnostic marker the peer's pool-feed bridge stamps into
-// the top-left 128x64 px of every captured frame, decodes the 32-bit
-// timestamp, tracks transitions, and POSTs an NDJSON transcript to
-// `/api/diagnostics/visual-freshness?session_id=<browser_uuid>`. Used
-// to measure visual freshness (effective fps + freeze intervals) without
-// depending on getStats packet counters that proved misleading on
-// task #81 (frozen viewer + jump-cut despite framesDecoded advancing).
-//
-// Activation: a `?diag=1` URL query param. The marker itself must be
-// independently enabled on the peer side -- send
-// `{"action":"set_diagnostics_visual_marker","display_id":<id>,"enabled":true}`
-// to the peer's /ws (e.g. via the operator script in
-// docs/smoke-display.md). When the marker isn't on, the sampler runs
-// happily but observes zero transitions; the resulting transcript is
-// the "no marker" baseline (useful as a control; obvious to spot).
-//
-// Geometry constants must match `src/bin/caller/display/visual_marker.rs`.
-// 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
-// sample at (col*16+8, row*16+8); luma threshold 128 splits the
-// limited-range 16/235 pair the peer writes.
-// Transport F7: the transcript POST rides the daemonApi facade. The
-// method is twinned (POST /api/diagnostics/visual-freshness — the
-// descriptor's one rawBody entry: the tunnel carries the NDJSON as a
-// `body` param, the HTTP twin takes it as its raw request body), so the
-// facade keeps the legacy lane order by policy: tunnel first, the
-// POST-derived mutation rule refuses HTTP after any tunnel attempt, a
-// tunnel-less direct dashboard still POSTs pre-attempt, Connect mode
-// never touches HTTP. The daemon's own refusals (denied session /
-// too-old daemon) are consulted up front instead of firing an RPC that
-// can only bounce (F6 pattern); a transport-down verdict falls through —
-// the facade picks the honest lane.
-async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
-  const avail = daemonApi.availability('api_diagnostics_visual_freshness');
-  if (avail.reason === 'denied' || avail.reason === 'unsupported') {
-    throw new daemonApi.Error(
-      avail.reason === 'denied' ? 'denied' : 'unavailable',
-      'api_diagnostics_visual_freshness',
-      null,
-      `visual diagnostics are ${avail.reason} on this daemon`
-    );
-  }
-  const resp = await daemonApi.request('api_diagnostics_visual_freshness', {
-    session_id: sessionId,
-    body: ndjson,
-  }, { timeoutMs: 10000 });
-  if (!resp.ok) {
-    throw new Error(resp.body?.error || `diagnostics upload failed (${resp.status})`);
-  }
-  return resp.body;
-}
-
-// Shared base for the two marker-freshness samplers (video + canvas
-// sources). Owns everything that doesn't depend on the sampled surface:
-// marker geometry, the offscreen scratch canvas, transition bookkeeping,
-// the NDJSON record buffer + 5s flush loop, marker decode, the summary
-// percentiles, and stop(). Subclasses provide the frame scheduler
-// (`_scheduleFrame`), the source readiness check (`_sourceReady`), the
-// draw into the scratch canvas (`_drawSource`), and the session_start
-// record (`_sessionStartRecord`). This is the pure dedupe of the two
-// previously copy-pasted implementations — record shapes, timing, and
-// log tags are unchanged.
-class FreshnessSamplerBase {
-  constructor(hostId, displayId, idPrefix, logTag) {
-    this.hostId = hostId;
-    this.displayId = displayId;
-    this.browserSessionId = (window.crypto && window.crypto.randomUUID)
-      ? window.crypto.randomUUID()
-      : `${idPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-    this._logTag = logTag;
-
-    // Marker geometry -- MUST match the peer-side visual_marker
-    // module's TILE_PX / COLS / ROWS / THRESHOLD constants.
-    this.MARKER_W = 128;
-    this.MARKER_H = 64;
-    this.TILE_PX = 16;
-    this.COLS = 8;
-    this.ROWS = 4;
-    this.THRESHOLD = 128;
-
-    // Offscreen canvas sized exactly to the marker patch. We draw only
-    // the top-left region of the source into it so getImageData is
-    // bounded to ~32 KB per sample regardless of source resolution.
-    // willReadFrequently asks the browser to keep the backing buffer
-    // CPU-side rather than GPU-side; getImageData is then cheap.
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = this.MARKER_W;
-    this.canvas.height = this.MARKER_H;
-    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
-
-    this.startMs = performance.now();
-    this.lastValue = null;
-    this.lastTransitionMs = this.startMs;
-    this.firstTransitionAt = null;
-
-    // Buffered records. Flushed every 5s and on stop(); each flush also
-    // synthesizes a cumulative summary record so the transcript captures
-    // rolling stats even if the browser crashes before stop() runs.
-    this.records = [];
-    this.transitions = 0;
-    this.gaps = []; // for percentile computation across the session
-    this.longestFreezeMs = 0;
-
-    this.flushTimer = null;
-    this.stopped = false;
-  }
-
-  start() {
-    this._enqueue(this._sessionStartRecord());
-    this._scheduleFrame();
-    this.flushTimer = setInterval(() => this._flush(), 5000);
-  }
-
-  _onFrame() {
-    if (this.stopped) return;
-    if (!this._sourceReady()) {
-      // Source too small -- peer-side stamp is also a no-op at these
-      // dims (see visual_marker::stamp_y_plane bounds check). Try
-      // again next frame.
-      this._scheduleFrame();
-      return;
-    }
-    try {
-      // Source rect: top-left MARKER_W x MARKER_H of the source frame
-      // in *frame* (not displayed) coordinates. Dest rect: full
-      // scratch canvas (also MARKER_W x MARKER_H). One-to-one pixel
-      // copy -- no scaling, so tile centers in the canvas match tile
-      // centers in the source frame exactly.
-      this._drawSource();
-      const img = this.ctx.getImageData(0, 0, this.MARKER_W, this.MARKER_H);
-      const value = this._decode(img);
-      if (this.lastValue !== null && value !== this.lastValue) {
-        const nowMs = performance.now();
-        const gap = nowMs - this.lastTransitionMs;
-        this.transitions += 1;
-        this.gaps.push(gap);
-        if (gap > this.longestFreezeMs) this.longestFreezeMs = gap;
-        if (this.firstTransitionAt === null) this.firstTransitionAt = nowMs;
-        this._enqueue({
-          t: 'transition',
-          browser_ms: nowMs - this.startMs,
-          value: value,
-          gap_ms: Math.round(gap),
-        });
-        this.lastTransitionMs = nowMs;
-      } else if (this.lastValue === null) {
-        // First decoded marker value -- anchor `lastTransitionMs` HERE
-        // (at first sample) instead of leaving it pinned to startMs (the
-        // sampler-instantiation moment, which precedes ontrack→first-
-        // decoded-frame→peer-marker-propagation by ~1s on a typical
-        // federated VP8-q path). Without this, the first emitted
-        // transition's gap_ms would conflate stream-warmup time with
-        // actual frame-cadence -- which is exactly the 1044ms outlier
-        // observed in transcript b8e2b947 of the #83 acceptance run.
-        // After this fix, the first transition reports a gap_ms equal
-        // to the true encoder send cadence (~33ms at 30fps), and the
-        // session-percentile triple no longer carries a startup spike.
-        this.lastTransitionMs = performance.now();
-      }
-      this.lastValue = value;
-    } catch (e) {
-      // CORS-tainted canvas would throw on getImageData. The sources
-      // are same-origin (intendant:// scheme handler proxies to local
-      // backend), so this shouldn't happen in production -- but log
-      // loudly if it does.
-      console.warn(`${this._logTag} sample failed:`, e);
-    }
-    this._scheduleFrame();
-  }
-
-  // Decode the 32-bit marker by sampling each tile center pixel,
-  // computing BT.601 luminance, thresholding at 128. Bit layout:
-  // bit_idx = row * COLS + col, LSB at top-left tile, MSB at
-  // bottom-right -- matches `visual_marker::stamp_y_plane` exactly.
-  // Returns an unsigned 32-bit value (`>>> 0` coerces JS bitwise's
-  // signed-i32 result back to u32).
-  _decode(imageData) {
-    const { data, width } = imageData; // RGBA, 4 bytes per pixel
-    let v = 0;
-    for (let row = 0; row < this.ROWS; row++) {
-      const cy = row * this.TILE_PX + (this.TILE_PX >> 1);
-      for (let col = 0; col < this.COLS; col++) {
-        const cx = col * this.TILE_PX + (this.TILE_PX >> 1);
-        const idx = (cy * width + cx) * 4;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
-        // BT.601 luma matches what the peer's bgra_to_i420 produced
-        // (full-range Y = 0.299 R + 0.587 G + 0.114 B).
-        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (luma >= this.THRESHOLD) {
-          v |= 1 << (row * this.COLS + col);
-        }
-      }
-    }
-    return v >>> 0;
-  }
-
-  _enqueue(record) {
-    this.records.push(record);
-  }
-
-  _flush(options = {}) {
-    if (this.stopped && !options.allowStopped) return;
-    const summary = this._buildSummary();
-    this._enqueue(summary);
-    this._postBatch();
-  }
-
-  _buildSummary() {
-    const sorted = [...this.gaps].sort((a, b) => a - b);
-    const percentile = (q) => {
-      if (sorted.length === 0) return 0;
-      const idx = Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q));
-      return Math.round(sorted[idx]);
-    };
-    const elapsedMs = performance.now() - this.startMs;
-    const fps = elapsedMs > 0
-      ? Math.round((this.transitions * 100000 / elapsedMs)) / 100
-      : 0;
-    return {
-      t: 'summary',
-      browser_ms: Math.round(elapsedMs),
-      transitions: this.transitions,
-      p50_gap_ms: percentile(0.5),
-      p95_gap_ms: percentile(0.95),
-      max_gap_ms: sorted.length ? Math.round(sorted[sorted.length - 1]) : 0,
-      longest_freeze_ms: Math.round(this.longestFreezeMs),
-      effective_fps: fps,
-    };
-  }
-
-  _postBatch() {
-    if (this.records.length === 0) return;
-    const ndjson = this.records.map(r => JSON.stringify(r)).join('\n') + '\n';
-    this.records = [];
-    postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
-      .catch(err => console.warn(`${this._logTag} upload failed:`, err));
-  }
-
-  stop() {
-    if (this.stopped) return;
-    this.stopped = true;
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this._enqueue({
-      t: 'session_end',
-      browser_ms: Math.round(performance.now() - this.startMs),
-    });
-    // Final summary gets emitted as part of _flush() called by the
-    // session_end record's flush path.
-    this._flush({ allowStopped: true });
-  }
-}
-
-class VisualFreshnessSampler extends FreshnessSamplerBase {
-  constructor(videoEl, hostId, displayId) {
-    super(hostId, displayId, 'vf', '[diag-vf]');
-    this.videoEl = videoEl;
-    // Use rVFC where available (Safari 16+, Chrome 83+) so the
-    // callback fires once per actually-rendered frame instead of
-    // once per display refresh. On rVFC-less browsers we fall back to
-    // requestAnimationFrame which is good enough for Phase 0.
-    this._useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
-  }
-
-  _sessionStartRecord() {
-    return {
-      t: 'session_start',
-      browser_ms: 0,
-      browser_session_id: this.browserSessionId,
-      host_id: this.hostId,
-      display_id: this.displayId,
-      video_width: this.videoEl.videoWidth || 0,
-      video_height: this.videoEl.videoHeight || 0,
-      ua: navigator.userAgent,
-      uses_rvfc: this._useRVFC,
-      source: 'video',
-    };
-  }
-
-  _scheduleFrame() {
-    if (this.stopped) return;
-    if (this._useRVFC) {
-      this.videoEl.requestVideoFrameCallback(() => this._onFrame());
-    } else {
-      requestAnimationFrame(() => this._onFrame());
-    }
-  }
-
-  _sourceReady() {
-    const w = this.videoEl.videoWidth || 0;
-    const h = this.videoEl.videoHeight || 0;
-    return w >= this.MARKER_W && h >= this.MARKER_H;
-  }
-
-  _drawSource() {
-    this.ctx.drawImage(
-      this.videoEl,
-      0, 0, this.MARKER_W, this.MARKER_H,
-      0, 0, this.MARKER_W, this.MARKER_H,
-    );
-  }
-}
-
-// True when the dashboard URL has `?diag=1` (or `?...&diag=1`). The
-// peer-display sampler activates automatically on connect when this
-// is true; otherwise no canvas / rVFC / fetch overhead. The flag is
-// read once per page load.
-function diagModeEnabled() {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('diag') === '1';
-  } catch {
-    return false;
-  }
-}
-
 // =====================================================================
 // D-2: tile wire parsing + compositor + freshness samplers.
 //
@@ -75575,6 +75271,335 @@ class TileCompositor {
       };
       img.src = url;
     });
+  }
+}
+/* ── static/app/51b-freshness-samplers.js ── */
+// ── Visual-freshness samplers + display test toggles ──
+// The ?diag=1 marker-freshness rig: FreshnessSamplerBase and the video /
+// canvas subclasses 52-peer-display.js instantiates on connect, their
+// NDJSON diagnostics POST, and the ?tile-test / ?federation-h264 test
+// toggles plus the tile-test harness loader. The live tile pipeline the
+// harness exercises (TileWireReader / TileCompositor) stays in
+// 51-peer-approvals.js.
+
+// **Phase 0 visual-freshness sampler** (task #83).
+//
+// Reads the diagnostic marker the peer's pool-feed bridge stamps into
+// the top-left 128x64 px of every captured frame, decodes the 32-bit
+// timestamp, tracks transitions, and POSTs an NDJSON transcript to
+// `/api/diagnostics/visual-freshness?session_id=<browser_uuid>`. Used
+// to measure visual freshness (effective fps + freeze intervals) without
+// depending on getStats packet counters that proved misleading on
+// task #81 (frozen viewer + jump-cut despite framesDecoded advancing).
+//
+// Activation: a `?diag=1` URL query param. The marker itself must be
+// independently enabled on the peer side -- send
+// `{"action":"set_diagnostics_visual_marker","display_id":<id>,"enabled":true}`
+// to the peer's /ws (e.g. via the operator script in
+// docs/smoke-display.md). When the marker isn't on, the sampler runs
+// happily but observes zero transitions; the resulting transcript is
+// the "no marker" baseline (useful as a control; obvious to spot).
+//
+// Geometry constants must match `src/bin/caller/display/visual_marker.rs`.
+// 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
+// sample at (col*16+8, row*16+8); luma threshold 128 splits the
+// limited-range 16/235 pair the peer writes.
+// Transport F7: the transcript POST rides the daemonApi facade. The
+// method is twinned (POST /api/diagnostics/visual-freshness — the
+// descriptor's one rawBody entry: the tunnel carries the NDJSON as a
+// `body` param, the HTTP twin takes it as its raw request body), so the
+// facade keeps the legacy lane order by policy: tunnel first, the
+// POST-derived mutation rule refuses HTTP after any tunnel attempt, a
+// tunnel-less direct dashboard still POSTs pre-attempt, Connect mode
+// never touches HTTP. The daemon's own refusals (denied session /
+// too-old daemon) are consulted up front instead of firing an RPC that
+// can only bounce (F6 pattern); a transport-down verdict falls through —
+// the facade picks the honest lane.
+async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
+  const avail = daemonApi.availability('api_diagnostics_visual_freshness');
+  if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+    throw new daemonApi.Error(
+      avail.reason === 'denied' ? 'denied' : 'unavailable',
+      'api_diagnostics_visual_freshness',
+      null,
+      `visual diagnostics are ${avail.reason} on this daemon`
+    );
+  }
+  const resp = await daemonApi.request('api_diagnostics_visual_freshness', {
+    session_id: sessionId,
+    body: ndjson,
+  }, { timeoutMs: 10000 });
+  if (!resp.ok) {
+    throw new Error(resp.body?.error || `diagnostics upload failed (${resp.status})`);
+  }
+  return resp.body;
+}
+
+// Shared base for the two marker-freshness samplers (video + canvas
+// sources). Owns everything that doesn't depend on the sampled surface:
+// marker geometry, the offscreen scratch canvas, transition bookkeeping,
+// the NDJSON record buffer + 5s flush loop, marker decode, the summary
+// percentiles, and stop(). Subclasses provide the frame scheduler
+// (`_scheduleFrame`), the source readiness check (`_sourceReady`), the
+// draw into the scratch canvas (`_drawSource`), and the session_start
+// record (`_sessionStartRecord`). This is the pure dedupe of the two
+// previously copy-pasted implementations — record shapes, timing, and
+// log tags are unchanged.
+class FreshnessSamplerBase {
+  constructor(hostId, displayId, idPrefix, logTag) {
+    this.hostId = hostId;
+    this.displayId = displayId;
+    this.browserSessionId = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : `${idPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    this._logTag = logTag;
+
+    // Marker geometry -- MUST match the peer-side visual_marker
+    // module's TILE_PX / COLS / ROWS / THRESHOLD constants.
+    this.MARKER_W = 128;
+    this.MARKER_H = 64;
+    this.TILE_PX = 16;
+    this.COLS = 8;
+    this.ROWS = 4;
+    this.THRESHOLD = 128;
+
+    // Offscreen canvas sized exactly to the marker patch. We draw only
+    // the top-left region of the source into it so getImageData is
+    // bounded to ~32 KB per sample regardless of source resolution.
+    // willReadFrequently asks the browser to keep the backing buffer
+    // CPU-side rather than GPU-side; getImageData is then cheap.
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = this.MARKER_W;
+    this.canvas.height = this.MARKER_H;
+    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+
+    this.startMs = performance.now();
+    this.lastValue = null;
+    this.lastTransitionMs = this.startMs;
+    this.firstTransitionAt = null;
+
+    // Buffered records. Flushed every 5s and on stop(); each flush also
+    // synthesizes a cumulative summary record so the transcript captures
+    // rolling stats even if the browser crashes before stop() runs.
+    this.records = [];
+    this.transitions = 0;
+    this.gaps = []; // for percentile computation across the session
+    this.longestFreezeMs = 0;
+
+    this.flushTimer = null;
+    this.stopped = false;
+  }
+
+  start() {
+    this._enqueue(this._sessionStartRecord());
+    this._scheduleFrame();
+    this.flushTimer = setInterval(() => this._flush(), 5000);
+  }
+
+  _onFrame() {
+    if (this.stopped) return;
+    if (!this._sourceReady()) {
+      // Source too small -- peer-side stamp is also a no-op at these
+      // dims (see visual_marker::stamp_y_plane bounds check). Try
+      // again next frame.
+      this._scheduleFrame();
+      return;
+    }
+    try {
+      // Source rect: top-left MARKER_W x MARKER_H of the source frame
+      // in *frame* (not displayed) coordinates. Dest rect: full
+      // scratch canvas (also MARKER_W x MARKER_H). One-to-one pixel
+      // copy -- no scaling, so tile centers in the canvas match tile
+      // centers in the source frame exactly.
+      this._drawSource();
+      const img = this.ctx.getImageData(0, 0, this.MARKER_W, this.MARKER_H);
+      const value = this._decode(img);
+      if (this.lastValue !== null && value !== this.lastValue) {
+        const nowMs = performance.now();
+        const gap = nowMs - this.lastTransitionMs;
+        this.transitions += 1;
+        this.gaps.push(gap);
+        if (gap > this.longestFreezeMs) this.longestFreezeMs = gap;
+        if (this.firstTransitionAt === null) this.firstTransitionAt = nowMs;
+        this._enqueue({
+          t: 'transition',
+          browser_ms: nowMs - this.startMs,
+          value: value,
+          gap_ms: Math.round(gap),
+        });
+        this.lastTransitionMs = nowMs;
+      } else if (this.lastValue === null) {
+        // First decoded marker value -- anchor `lastTransitionMs` HERE
+        // (at first sample) instead of leaving it pinned to startMs (the
+        // sampler-instantiation moment, which precedes ontrack→first-
+        // decoded-frame→peer-marker-propagation by ~1s on a typical
+        // federated VP8-q path). Without this, the first emitted
+        // transition's gap_ms would conflate stream-warmup time with
+        // actual frame-cadence -- which is exactly the 1044ms outlier
+        // observed in transcript b8e2b947 of the #83 acceptance run.
+        // After this fix, the first transition reports a gap_ms equal
+        // to the true encoder send cadence (~33ms at 30fps), and the
+        // session-percentile triple no longer carries a startup spike.
+        this.lastTransitionMs = performance.now();
+      }
+      this.lastValue = value;
+    } catch (e) {
+      // CORS-tainted canvas would throw on getImageData. The sources
+      // are same-origin (intendant:// scheme handler proxies to local
+      // backend), so this shouldn't happen in production -- but log
+      // loudly if it does.
+      console.warn(`${this._logTag} sample failed:`, e);
+    }
+    this._scheduleFrame();
+  }
+
+  // Decode the 32-bit marker by sampling each tile center pixel,
+  // computing BT.601 luminance, thresholding at 128. Bit layout:
+  // bit_idx = row * COLS + col, LSB at top-left tile, MSB at
+  // bottom-right -- matches `visual_marker::stamp_y_plane` exactly.
+  // Returns an unsigned 32-bit value (`>>> 0` coerces JS bitwise's
+  // signed-i32 result back to u32).
+  _decode(imageData) {
+    const { data, width } = imageData; // RGBA, 4 bytes per pixel
+    let v = 0;
+    for (let row = 0; row < this.ROWS; row++) {
+      const cy = row * this.TILE_PX + (this.TILE_PX >> 1);
+      for (let col = 0; col < this.COLS; col++) {
+        const cx = col * this.TILE_PX + (this.TILE_PX >> 1);
+        const idx = (cy * width + cx) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        // BT.601 luma matches what the peer's bgra_to_i420 produced
+        // (full-range Y = 0.299 R + 0.587 G + 0.114 B).
+        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (luma >= this.THRESHOLD) {
+          v |= 1 << (row * this.COLS + col);
+        }
+      }
+    }
+    return v >>> 0;
+  }
+
+  _enqueue(record) {
+    this.records.push(record);
+  }
+
+  _flush(options = {}) {
+    if (this.stopped && !options.allowStopped) return;
+    const summary = this._buildSummary();
+    this._enqueue(summary);
+    this._postBatch();
+  }
+
+  _buildSummary() {
+    const sorted = [...this.gaps].sort((a, b) => a - b);
+    const percentile = (q) => {
+      if (sorted.length === 0) return 0;
+      const idx = Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q));
+      return Math.round(sorted[idx]);
+    };
+    const elapsedMs = performance.now() - this.startMs;
+    const fps = elapsedMs > 0
+      ? Math.round((this.transitions * 100000 / elapsedMs)) / 100
+      : 0;
+    return {
+      t: 'summary',
+      browser_ms: Math.round(elapsedMs),
+      transitions: this.transitions,
+      p50_gap_ms: percentile(0.5),
+      p95_gap_ms: percentile(0.95),
+      max_gap_ms: sorted.length ? Math.round(sorted[sorted.length - 1]) : 0,
+      longest_freeze_ms: Math.round(this.longestFreezeMs),
+      effective_fps: fps,
+    };
+  }
+
+  _postBatch() {
+    if (this.records.length === 0) return;
+    const ndjson = this.records.map(r => JSON.stringify(r)).join('\n') + '\n';
+    this.records = [];
+    postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
+      .catch(err => console.warn(`${this._logTag} upload failed:`, err));
+  }
+
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this._enqueue({
+      t: 'session_end',
+      browser_ms: Math.round(performance.now() - this.startMs),
+    });
+    // Final summary gets emitted as part of _flush() called by the
+    // session_end record's flush path.
+    this._flush({ allowStopped: true });
+  }
+}
+
+class VisualFreshnessSampler extends FreshnessSamplerBase {
+  constructor(videoEl, hostId, displayId) {
+    super(hostId, displayId, 'vf', '[diag-vf]');
+    this.videoEl = videoEl;
+    // Use rVFC where available (Safari 16+, Chrome 83+) so the
+    // callback fires once per actually-rendered frame instead of
+    // once per display refresh. On rVFC-less browsers we fall back to
+    // requestAnimationFrame which is good enough for Phase 0.
+    this._useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  }
+
+  _sessionStartRecord() {
+    return {
+      t: 'session_start',
+      browser_ms: 0,
+      browser_session_id: this.browserSessionId,
+      host_id: this.hostId,
+      display_id: this.displayId,
+      video_width: this.videoEl.videoWidth || 0,
+      video_height: this.videoEl.videoHeight || 0,
+      ua: navigator.userAgent,
+      uses_rvfc: this._useRVFC,
+      source: 'video',
+    };
+  }
+
+  _scheduleFrame() {
+    if (this.stopped) return;
+    if (this._useRVFC) {
+      this.videoEl.requestVideoFrameCallback(() => this._onFrame());
+    } else {
+      requestAnimationFrame(() => this._onFrame());
+    }
+  }
+
+  _sourceReady() {
+    const w = this.videoEl.videoWidth || 0;
+    const h = this.videoEl.videoHeight || 0;
+    return w >= this.MARKER_W && h >= this.MARKER_H;
+  }
+
+  _drawSource() {
+    this.ctx.drawImage(
+      this.videoEl,
+      0, 0, this.MARKER_W, this.MARKER_H,
+      0, 0, this.MARKER_W, this.MARKER_H,
+    );
+  }
+}
+
+// True when the dashboard URL has `?diag=1` (or `?...&diag=1`). The
+// peer-display sampler activates automatically on connect when this
+// is true; otherwise no canvas / rVFC / fetch overhead. The flag is
+// read once per page load.
+function diagModeEnabled() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('diag') === '1';
+  } catch {
+    return false;
   }
 }
 
@@ -82936,6 +82961,19 @@ function setFsPickerStatus(kind, text) {
   el.textContent = text || '';
 }
 
+function fsPathLooksAbsolute(path) {
+  const value = String(path || '').trim();
+  return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+/* ── static/app/54b-transfers.js ── */
+// ── Files transfers ──
+// The Files tab transfer engine: resumable downloads/uploads over the
+// transfer-job API, the IndexedDB part/blob store behind refresh-safe
+// resume, the queue pump, staged uploads, and transfer history. Status
+// writes flow through 53-transfer-fsm.js; the queue state lives in the
+// early client-state block (31-init-identity-fleet.js).
+
 function setSettingsDownloadFileStatus(text, kind = '') {
   const el = document.getElementById('settings-download-file-status');
   if (!el) return;
@@ -85214,12 +85252,6 @@ function queueFilesUploads(files, options = {}) {
 	    mime: String(upload.mime || upload.content_type || 'application/octet-stream'),
 	  }));
 	}
-
-function fsPathLooksAbsolute(path) {
-  const value = String(path || '').trim();
-  return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
-}
-
 /* ── static/app/55-files-ide.js ── */
 // ── Files tab: editor ──
 //
@@ -87313,131 +87345,6 @@ window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 
-function selectedNewSessionCodexCatalogEntry() {
-  const selection = document.getElementById('new-session-codex-model-select')?.value || '';
-  if (selection === '__custom__') return null;
-  const model = selection || newSessionCodexGlobalModel;
-  return newSessionCodexModelCatalog
-    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
-    .sort((a, b) => b.id.length - a.id.length)[0] || null;
-}
-
-function populateNewSessionCodexReasoningEfforts() {
-  const select = document.getElementById('new-session-codex-reasoning-effort');
-  if (!select) return;
-  const previous = select.value || '';
-  const model = selectedNewSessionCodexCatalogEntry();
-  const efforts = model?.reasoning_efforts?.length
-    ? model.reasoning_efforts
-    : newSessionCodexReasoningEfforts;
-  select.replaceChildren();
-  const inherit = document.createElement('option');
-  inherit.value = '';
-  const globalSupported = !model || !newSessionCodexGlobalReasoningEffort ||
-    efforts.includes(newSessionCodexGlobalReasoningEffort);
-  inherit.textContent = newSessionCodexGlobalReasoningEffort && globalSupported
-    ? `Global setting (${newSessionCodexGlobalReasoningEffort})`
-    : (model?.default_reasoning_effort
-      ? `Model default (${model.default_reasoning_effort})`
-      : 'Model / global default');
-  select.appendChild(inherit);
-  for (const effort of efforts) {
-    const option = document.createElement('option');
-    option.value = effort;
-    option.textContent = effort === 'ultra'
-      ? 'ultra — automatic task delegation'
-      : effort;
-    select.appendChild(option);
-  }
-  select.value = efforts.includes(previous) ? previous : '';
-  if (model && !globalSupported && !select.value && efforts.includes(model.default_reasoning_effort)) {
-    // A selected model must not inherit an incompatible global effort (for
-    // example Luna under an Ultra global pin). Make its advertised default
-    // explicit on the create-session wire instead.
-    select.value = model.default_reasoning_effort;
-  }
-}
-
-function populateControlCodexReasoningEfforts() {
-  const select = document.getElementById('control-codex-reasoning');
-  if (!select) return;
-  const previous = select.value || controlCodexConfig.reasoning_effort || '';
-  select.replaceChildren();
-  const inherit = document.createElement('option');
-  inherit.value = '';
-  inherit.textContent = '(default)';
-  select.appendChild(inherit);
-  for (const effort of newSessionCodexReasoningEfforts) {
-    const option = document.createElement('option');
-    option.value = effort;
-    option.textContent = effort === 'ultra'
-      ? 'ultra — automatic task delegation'
-      : effort;
-    select.appendChild(option);
-  }
-  select.value = newSessionCodexReasoningEfforts.includes(previous) ? previous : '';
-}
-
-function populateNewSessionCodexModelSelect() {
-  const select = document.getElementById('new-session-codex-model-select');
-  if (!select) return;
-  const previous = select.value || '';
-  select.replaceChildren();
-  const inherit = document.createElement('option');
-  inherit.value = '';
-  inherit.textContent = newSessionCodexGlobalModel
-    ? `Global setting (${newSessionCodexGlobalModel})`
-    : 'Global / Codex default';
-  select.appendChild(inherit);
-  for (const entry of newSessionCodexModelCatalog) {
-    const option = document.createElement('option');
-    option.value = entry.id;
-    option.textContent = `${entry.display_name} — ${entry.id}`;
-    select.appendChild(option);
-  }
-  const custom = document.createElement('option');
-  custom.value = '__custom__';
-  custom.textContent = 'Custom model id…';
-  select.appendChild(custom);
-  select.value = previous === '__custom__' || newSessionCodexModelCatalog.some(entry => entry.id === previous)
-    ? previous
-    : '';
-  updateNewSessionCodexCustomModelRow();
-  populateNewSessionCodexReasoningEfforts();
-}
-
-function updateNewSessionCodexCustomModelRow() {
-  const select = document.getElementById('new-session-codex-model-select');
-  const row = document.getElementById('new-session-codex-model-custom-row');
-  const input = document.getElementById('new-session-codex-model');
-  if (!select || !row) return;
-  const custom = select.value === '__custom__' && !select.disabled;
-  row.classList.toggle('hidden', !custom);
-  if (input) input.disabled = !custom;
-}
-
-function onNewSessionCodexModelSelectChange() {
-  updateNewSessionCodexCustomModelRow();
-  populateNewSessionCodexReasoningEfforts();
-}
-window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
-populateControlCodexReasoningEfforts();
-populateNewSessionCodexModelSelect();
-
-// The Claude model picker offers version-safe aliases (the CLI resolves
-// them to the latest model); the free-text id input only appears behind
-// the explicit "Custom model id…" choice.
-function updateNewSessionClaudeCustomModelRow() {
-  const select = document.getElementById('new-session-claude-model-select');
-  const row = document.getElementById('new-session-claude-model-custom-row');
-  if (!select || !row) return;
-  const custom = select.value === '__custom__' && !select.disabled;
-  row.classList.toggle('hidden', !custom);
-}
-function onNewSessionClaudeModelSelectChange() {
-  updateNewSessionClaudeCustomModelRow();
-}
-window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 	window.openDownloadFilePicker = openDownloadFilePicker;
 	window.openFilesDownloadPicker = openFilesDownloadPicker;
 	window.onFilesDownloadHostChanged = onFilesDownloadHostChanged;
@@ -87913,6 +87820,139 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 
 restoreFilesTransferState();
 renderFilesTransfers();
+/* ── static/app/55b-session-launch.js ── */
+// ── New Session launch ──
+// The Sessions tab New Session form: agent picker + launch-config
+// machinery, unfueled/projectless preflights and banners, spawn notices,
+// and startNewSession itself. The fs pickers the form opens (project
+// directory, agent binary) stay in 55-files-ide.js — they serve the
+// transfers flows too.
+
+function selectedNewSessionCodexCatalogEntry() {
+  const selection = document.getElementById('new-session-codex-model-select')?.value || '';
+  if (selection === '__custom__') return null;
+  const model = selection || newSessionCodexGlobalModel;
+  return newSessionCodexModelCatalog
+    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
+    .sort((a, b) => b.id.length - a.id.length)[0] || null;
+}
+
+function populateNewSessionCodexReasoningEfforts() {
+  const select = document.getElementById('new-session-codex-reasoning-effort');
+  if (!select) return;
+  const previous = select.value || '';
+  const model = selectedNewSessionCodexCatalogEntry();
+  const efforts = model?.reasoning_efforts?.length
+    ? model.reasoning_efforts
+    : newSessionCodexReasoningEfforts;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  const globalSupported = !model || !newSessionCodexGlobalReasoningEffort ||
+    efforts.includes(newSessionCodexGlobalReasoningEffort);
+  inherit.textContent = newSessionCodexGlobalReasoningEffort && globalSupported
+    ? `Global setting (${newSessionCodexGlobalReasoningEffort})`
+    : (model?.default_reasoning_effort
+      ? `Model default (${model.default_reasoning_effort})`
+      : 'Model / global default');
+  select.appendChild(inherit);
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = efforts.includes(previous) ? previous : '';
+  if (model && !globalSupported && !select.value && efforts.includes(model.default_reasoning_effort)) {
+    // A selected model must not inherit an incompatible global effort (for
+    // example Luna under an Ultra global pin). Make its advertised default
+    // explicit on the create-session wire instead.
+    select.value = model.default_reasoning_effort;
+  }
+}
+
+function populateControlCodexReasoningEfforts() {
+  const select = document.getElementById('control-codex-reasoning');
+  if (!select) return;
+  const previous = select.value || controlCodexConfig.reasoning_effort || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = '(default)';
+  select.appendChild(inherit);
+  for (const effort of newSessionCodexReasoningEfforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = newSessionCodexReasoningEfforts.includes(previous) ? previous : '';
+}
+
+function populateNewSessionCodexModelSelect() {
+  const select = document.getElementById('new-session-codex-model-select');
+  if (!select) return;
+  const previous = select.value || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = newSessionCodexGlobalModel
+    ? `Global setting (${newSessionCodexGlobalModel})`
+    : 'Global / Codex default';
+  select.appendChild(inherit);
+  for (const entry of newSessionCodexModelCatalog) {
+    const option = document.createElement('option');
+    option.value = entry.id;
+    option.textContent = `${entry.display_name} — ${entry.id}`;
+    select.appendChild(option);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  select.value = previous === '__custom__' || newSessionCodexModelCatalog.some(entry => entry.id === previous)
+    ? previous
+    : '';
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+
+function updateNewSessionCodexCustomModelRow() {
+  const select = document.getElementById('new-session-codex-model-select');
+  const row = document.getElementById('new-session-codex-model-custom-row');
+  const input = document.getElementById('new-session-codex-model');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+  if (input) input.disabled = !custom;
+}
+
+function onNewSessionCodexModelSelectChange() {
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
+populateControlCodexReasoningEfforts();
+populateNewSessionCodexModelSelect();
+
+// The Claude model picker offers version-safe aliases (the CLI resolves
+// them to the latest model); the free-text id input only appears behind
+// the explicit "Custom model id…" choice.
+function updateNewSessionClaudeCustomModelRow() {
+  const select = document.getElementById('new-session-claude-model-select');
+  const row = document.getElementById('new-session-claude-model-custom-row');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+}
+function onNewSessionClaudeModelSelectChange() {
+  updateNewSessionClaudeCustomModelRow();
+}
+window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 
 function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
@@ -90991,7 +91031,7 @@ function renderAggregateStatTiles(el, cards) {
   }
 }
 
-/* ── static/app/57-sessions-replay.js ── */
+/* ── static/app/57a-sessions-list.js ── */
 // ── Sessions list rendering: windowed, signature-guarded, node-stable ──
 // The corpus (_cachedSessions) can be thousands of rows; the DOM holds only
 // `sessionsRenderWindow` cards (one SESSION_CARD_RENDER_PAGE initially,
@@ -91922,6 +91962,13 @@ function buildSessionCard(m, derived, ctx) {
   });
   return card;
 }
+
+/* ── static/app/57-sessions-replay.js ── */
+// ── Sessions: worktrees panel + session detail/replay ──
+// The worktrees management panel (scan/filter/inspect/remove), session
+// resume/delete actions, and the session-detail overlay: title + lineage,
+// recordings and frame assets, and the windowed detail log/replay view.
+// The Recent-list rendering lives in 57a-sessions-list.js.
 
 function _refilterWorktrees() {
   // Filter/search/sort change — snap the Show-more window back.
