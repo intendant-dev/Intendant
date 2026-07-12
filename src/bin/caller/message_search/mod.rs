@@ -1,42 +1,35 @@
-//! Message-search shard store (B1 of the message-search program; plan
+//! Message-search shard store + extraction pipeline (plan
 //! `~/message-search-plan.md` §5–6, docs/src/session-logging.md for the
-//! event lane it consumes).
+//! native event lane it consumes).
 //!
-//! Layering: extractors (B2–B4) derive [`MessageRecord`]s +
-//! [`SupersessionMark`]s per session from the canonical sources and
-//! publish them here; the store owns durability (immutable content-named
-//! generations behind one manifest), multi-daemon coordination (advisory
-//! lock + watermark rejection — see `store.rs`), retention, and stable
-//! snapshots. Matching, normalization, and the byte-budget arena are the
-//! query side's concern (C1) and deliberately absent here. Active vs
-//! superseded is ALWAYS derived at read time ([`derive_active`]) — never
-//! stored — because Codex restores can reactivate messages (plan D2).
-
-// The store's API surface (types AND the re-exports below) is a
-// deliberately parked seed until its consumers land (B2–B4 extractors,
-// C1 query side — the very next program units); `startup_gc` is the one
-// production consumer wired today. Remove both allows as the extractors
-// adopt the API.
-#![allow(dead_code, unused_imports)]
+//! Layering: the per-source extractors (`extract_intendant` /
+//! `extract_codex` / `extract_claude`) derive [`MessageRecord`]s +
+//! [`SupersessionMark`]s per session from the canonical sources; the
+//! [`indexer`] sweep enumerates this box's sources (session logs, Codex
+//! and Claude homes, leased-active homes, staged lease remnants) and
+//! publishes shards to the store, which owns durability (immutable
+//! content-named generations behind one manifest), multi-daemon
+//! coordination (advisory lock + watermark rejection — see `store.rs`),
+//! retention, and stable snapshots. Matching, normalization, and the
+//! byte-budget arena are the query side's concern (C1) and deliberately
+//! absent here. Active vs superseded is ALWAYS derived at read time
+//! ([`record::derive_active`]) — never stored — because Codex restores
+//! can reactivate messages (plan D2).
 
 mod cursor;
 mod extract_claude;
 mod extract_codex;
 mod extract_intendant;
+mod indexer;
 mod record;
 mod store;
 
-pub(crate) use cursor::{read_complete_lines_from, CursorCheck, SourceCursor};
-pub(crate) use extract_intendant::{extract_intendant_session, IntendantExtraction};
-pub(crate) use record::{
-    cap_text, derive_active, Locator, MessageRecord, Role, Source, SupersessionMark,
-    MESSAGE_TEXT_CAP_BYTES, PARSER_VERSION,
-};
-pub(crate) use store::{PublishOutcome, SessionShard, Snapshot, Store, RETENTION_MS};
+pub(crate) use indexer::spawn_indexer;
+use store::Store;
 
 /// Boot-time retention GC over the production store root (plan §6):
-/// expired shards and tombstones must not accumulate while no extractor
-/// or drainer is running yet.
+/// expired shards and tombstones must not accumulate before the first
+/// sweep runs (the indexer's own GC rides a slow cadence).
 pub(crate) fn startup_gc() {
     let root = Store::default_root();
     if !root.exists() {

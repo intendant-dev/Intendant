@@ -18,7 +18,7 @@ mod caches;
 pub(crate) use caches::*;
 mod rows_usage;
 pub(crate) use rows_usage::*;
-mod backend_lists;
+pub(crate) mod backend_lists;
 pub(crate) use backend_lists::*;
 mod transcripts;
 pub(crate) use transcripts::*;

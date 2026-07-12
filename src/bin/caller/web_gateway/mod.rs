@@ -30,7 +30,7 @@ pub(crate) use http::*;
 mod api_core;
 pub(crate) use api_core::*;
 
-mod session_catalog;
+pub(crate) mod session_catalog;
 pub(crate) use session_catalog::*;
 
 mod media_store;
