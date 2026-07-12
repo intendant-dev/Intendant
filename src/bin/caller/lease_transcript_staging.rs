@@ -15,11 +15,12 @@
 //! a large sessions directory could delay secret deletion, and rename
 //! either succeeds instantly or we accept the coverage gap.
 //!
-//! Every function takes its roots as parameters (tests inject tempdirs);
-//! [`default_paths`] is the transport edge that resolves the real
-//! locations. An `active/` registry (one file per materialized home) tells
-//! the future indexer which leased roots exist RIGHT NOW, so live sessions
-//! are indexed during the lease rather than only at cleanup.
+//! Every function takes its roots as parameters (tests inject tempdirs,
+//! all the way through `credential_leases`' deletion paths);
+//! [`default_paths`] is the production transport edge that resolves the
+//! real locations. An `active/` registry (one file per materialized home)
+//! tells the future indexer which leased roots exist RIGHT NOW, so live
+//! sessions are indexed during the lease rather than only at cleanup.
 
 use std::path::{Path, PathBuf};
 
@@ -35,9 +36,12 @@ pub(crate) struct StagingPaths {
     pub active: PathBuf,
 }
 
-/// The real on-disk locations. `intendant_home()` is test-aware (process
-/// scratch under `cargo test`), so this edge is safe to reach from tests
-/// that exercise the lease flows end to end.
+/// The real on-disk locations — the PRODUCTION transport edge only.
+/// `intendant_home()`'s test scratch is a `#[cfg(test)]` branch inside
+/// intendant-core, which does NOT apply when the caller's test binary
+/// links it as a dependency — a test reaching this function writes to
+/// the live home (and under CI's threaded `cargo test`, races other
+/// tests' env mutations). Tests inject their own `StagingPaths`.
 pub(crate) fn default_paths() -> StagingPaths {
     let base = crate::platform::intendant_home()
         .join("cache")
