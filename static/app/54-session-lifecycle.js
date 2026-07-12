@@ -1232,15 +1232,21 @@ function onFilesDownloadHostChanged(options = {}) {
   const browse = document.getElementById('files-download-browse-btn');
   const selectedPeer = filesDownloadSelectedPeerId();
   if (browse) {
-    browse.disabled = Boolean(filesDownloadAbort || selectedPeer);
+    // Peer browsing rides the fs-picker's api_fs_list target lane (55);
+    // gate on reachability, not on peer-ness.
+    const peerBrowsable = !selectedPeer
+      || (typeof filesDownloadPeerBrowsable === 'function' && filesDownloadPeerBrowsable(selectedPeer));
+    browse.disabled = Boolean(filesDownloadAbort || !peerBrowsable);
     browse.title = selectedPeer
-      ? 'Remote peer browsing is not available yet; enter a full path'
+      ? (peerBrowsable
+        ? 'Browse files on the selected peer'
+        : 'Peer browsing is unavailable right now; enter a full path')
       : 'Choose a local file to download';
   }
   renderDashboardTargetSummary('files-target-summary', selectedPeer, 'files');
   refreshFilesDownloadAvailability();
   if (!options.preserveStatus) {
-    setFilesDownloadStatus('', selectedPeer ? 'Enter a full path on the selected target' : 'Ready');
+    setFilesDownloadStatus('', selectedPeer ? 'Browse the selected target or enter a full path' : 'Ready');
     setFilesDownloadProgress(0, 0);
   }
 }
@@ -1607,11 +1613,13 @@ function setFilesDownloadBusy(busy) {
   const download = document.getElementById('files-download-btn');
   const host = document.getElementById('files-download-host');
   const meter = document.getElementById('files-download-meter');
-  const peerSelected = !!filesDownloadSelectedPeerId();
+  const selectedPeer = filesDownloadSelectedPeerId();
+  const peerBrowsable = !selectedPeer
+    || (typeof filesDownloadPeerBrowsable === 'function' && filesDownloadPeerBrowsable(selectedPeer));
   const hasPath = !!filesDownloadPathValue();
   if (input) input.disabled = !!busy;
   if (host) host.disabled = !!busy;
-  if (browse) browse.disabled = !!busy || peerSelected;
+  if (browse) browse.disabled = !!busy || !peerBrowsable;
   if (download) download.disabled = !!busy || !hasPath || !filesDownloadTunnelAvailable();
   // Idle meter reads as a stray gray bar under the card — show it only
   // while a download is actually running.

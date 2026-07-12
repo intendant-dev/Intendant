@@ -1076,7 +1076,11 @@ function renderSessionWindowRange(win, start) {
   if (history.length === 0) {
     win.renderStart = 0;
     win.renderEnd = 0;
-    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+    if (typeof renderSessionWindowLogPlaceholder === 'function') {
+      renderSessionWindowLogPlaceholder(win);
+    } else {
+      win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+    }
     scheduleSessionWindowGridFit();
     return;
   }

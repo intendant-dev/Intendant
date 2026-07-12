@@ -1899,39 +1899,9 @@ function openFilesDownloadPicker() {
   loadFsPicker(filesDownloadPathValue() || (peerId ? '~' : (dashboardProjectRoot || '~')));
 }
 
-/* The transfers card's Browse button predates peer browsing: its owner
-   code (54-session-lifecycle.js onFilesDownloadHostChanged /
-   setFilesDownloadBusy) still force-disables it whenever a peer is
-   selected. Reconcile from here — the picker side that actually serves
-   peers now — re-enabling only when the peer is browsable and no
-   transfer is running. The disabled-attribute observer wins against
-   every foreign writer without editing their code; collapse this into
-   54's gates when that file is next open. */
-function filesIdeSyncFilesDownloadBrowse() {
-  const browse = document.getElementById('files-download-browse-btn');
-  if (!browse) return;
-  const peerId = filesDownloadSelectedPeerId();
-  if (!peerId || filesDownloadAbort) return; // local/busy: 54's gating is right
-  const canBrowse = filesDownloadPeerBrowsable(peerId);
-  const title = canBrowse
-    ? `Browse files on ${filesDownloadPeerLabel(peerId)}`
-    : 'Peer browsing is unavailable right now; enter a full path';
-  if (browse.title !== title) browse.title = title;
-  // Only write when wrong: the observer below watches `disabled`, and
-  // no-op writes are what keep it loop-free.
-  if (browse.disabled === !canBrowse) return;
-  browse.disabled = !canBrowse;
-}
-{
-  const browse = document.getElementById('files-download-browse-btn');
-  if (browse) {
-    new MutationObserver(() => filesIdeSyncFilesDownloadBrowse())
-      .observe(browse, { attributes: true, attributeFilter: ['disabled'] });
-  }
-  document.getElementById('files-download-host')
-    ?.addEventListener('change', () => filesIdeSyncFilesDownloadBrowse());
-  filesIdeSyncFilesDownloadBrowse();
-}
+/* 54's transfer gates (onFilesDownloadHostChanged / setFilesDownloadBusy)
+   now consult filesDownloadPeerBrowsable directly, so peer selection no
+   longer force-disables Browse; no reconciliation needed here. */
 
 function openFilesUploadDestinationPicker() {
   configureFsPicker({

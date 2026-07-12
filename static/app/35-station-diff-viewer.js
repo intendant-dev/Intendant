@@ -2351,7 +2351,7 @@ let stripMinimized = false;
 let stripHeight = 280;
 
 // Recording replay
-const recordingStreams = new Map(); // stream_name -> {segments, totalDuration, manifest}
+const recordingStreams = new Map(); // stream_name -> {active} (writes live in 46; liveness registry only)
 let activeRecordingStream = null;
 let recPlayer = null;
 
