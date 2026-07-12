@@ -334,9 +334,13 @@ pub(crate) async fn api_transfer_jobs_response(
 ) -> serde_json::Value {
     let scope = transfer_store_scope(runtime);
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    // Scope-restricted grants get the shared core's scope-filtered
+    // listing (HTTP passes its caller's policy the same way);
+    // unrestricted grants list unchanged.
     frame_api_response(
         id,
-        crate::web_gateway::transfer_jobs_api_response(scope, &params).await,
+        crate::web_gateway::transfer_jobs_api_response(scope, &params, runtime.grant.filesystem())
+            .await,
         "transfer jobs",
     )
 }
@@ -408,14 +412,33 @@ pub(crate) async fn api_transfer_upload_commit_response(
 
 /// Terminal leg of a transfer chunk upload: the bytes arrived via
 /// `upload_start`/`upload_chunk` frames (op-level authority checked at
-/// `upload_start`; the destination was path-scoped at job create), and
-/// the spool rides the same [`crate::web_gateway::SpooledBody`] handle
-/// the HTTP chunk row streams into.
+/// `upload_start`), and the spool rides the same
+/// [`crate::web_gateway::SpooledBody`] handle the HTTP chunk row
+/// streams into. The path scope check runs here, where the params are
+/// final — the same late-authorization pattern as `api_fs_write`'s
+/// upload leg: for scope-restricted grants the method gate re-checks
+/// the named job's destination against the caller's write scope.
 pub(crate) async fn api_transfer_upload_chunk_task_response(
     id: String,
     upload: InboundUploadState,
     runtime: ControlRuntime,
 ) -> ControlTaskResponse {
+    if let Err(error) = authorize_dashboard_control_method(
+        &runtime,
+        "api_transfer_upload_chunk",
+        Some(&upload.params),
+    ) {
+        return ControlTaskResponse {
+            id: id.clone(),
+            frame: frame_api_response(
+                id,
+                crate::web_gateway::transfer_error_api_response(403, error),
+                "transfer upload chunk",
+            ),
+            byte_stream: None,
+            done: true,
+        };
+    }
     let scope = transfer_store_scope(&runtime);
     let (params, body) = upload.into_spooled_body();
     let frame = frame_api_response(
@@ -2684,6 +2707,7 @@ mod tests {
             crate::web_gateway::transfer_jobs_api_response(
                 http.scope.clone(),
                 &serde_json::json!({ "id": http_job_id }),
+                None,
             )
             .await,
         );
@@ -2800,5 +2824,395 @@ mod tests {
         )
         .await;
         assert_eq!(tunnel_result_body(&read.frame, 416), http_body);
+    }
+
+    /// Fixtures for the job-path re-check parity set: one store with an
+    /// in-scope download, an in-scope upload, an out-of-scope download,
+    /// and an artifact-shaped job, plus the shared scope root.
+    struct ScopeRecheckRig {
+        _dir: tempfile::TempDir,
+        in_scope: std::path::PathBuf,
+        outside: std::path::PathBuf,
+        project: std::path::PathBuf,
+        store: crate::global_store::StoreScope,
+        dl_in: crate::transfer_store::TransferJob,
+        up_in: crate::transfer_store::TransferJob,
+        dl_out: crate::transfer_store::TransferJob,
+        artifact: crate::transfer_store::TransferJob,
+    }
+
+    fn scope_recheck_rig() -> ScopeRecheckRig {
+        let dir = tempfile::tempdir().unwrap();
+        let in_scope = dir.path().join("shared");
+        let outside = dir.path().join("outside");
+        let project = dir.path().join("project");
+        for path in [&in_scope, &outside, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let store = crate::global_store::StoreScope::Project(project.clone());
+        std::fs::write(in_scope.join("data.txt"), b"in scope").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"out of scope").unwrap();
+        let dl_in = crate::transfer_store::create_download_job(
+            &store,
+            in_scope.join("data.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        let up_in = crate::transfer_store::create_upload_job(
+            &store,
+            in_scope.join("up.bin").to_str().unwrap(),
+            "up.bin",
+            "application/octet-stream",
+            Some(11),
+            None,
+            crate::transfer_store::TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let dl_out = crate::transfer_store::create_download_job(
+            &store,
+            outside.join("secret.txt").to_str().unwrap(),
+        )
+        .unwrap();
+        let artifact = crate::transfer_store::create_download_job_from_bytes(
+            &store,
+            b"report".to_vec(),
+            "report.zip",
+            "application/zip",
+            "session_report",
+            None,
+            Some(serde_json::json!({ "type": "session_report" })),
+        )
+        .unwrap();
+        ScopeRecheckRig {
+            _dir: dir,
+            in_scope,
+            outside,
+            project,
+            store,
+            dl_in,
+            up_in,
+            dl_out,
+            artifact,
+        }
+    }
+
+    fn shared_scope_policy(
+        rig: &ScopeRecheckRig,
+    ) -> crate::peer::access_policy::FilesystemAccessPolicy {
+        crate::peer::access_policy::FilesystemAccessPolicy {
+            read_roots: vec![rig.in_scope.clone()],
+            write_roots: vec![rig.in_scope.clone()],
+        }
+    }
+
+    fn peer_runtime(rig: &ScopeRecheckRig) -> ControlRuntime {
+        let mut rt = runtime();
+        rt.project_root = Some(rig.project.clone());
+        rt.grant = DashboardControlGrant::Peer {
+            fingerprint: "fp".into(),
+            label: "scoped-peer".into(),
+            profile: "file-operator".into(),
+            filesystem: shared_scope_policy(rig),
+            attributed: None,
+        };
+        rt
+    }
+
+    /// The job-path re-check decides and words identically on both
+    /// lanes: for every job-addressed method and every handle class
+    /// (in-scope per each row's rule, out-of-scope, artifact-shaped,
+    /// unresolvable), the tunnel's method authorizer and the HTTP
+    /// transfer gate return the same `Result` — and the create arm's
+    /// kind-aware target derivation matches too. This is the mirror
+    /// pin for the shared `check_scoped_transfer_job` helper.
+    #[test]
+    fn transfer_scope_recheck_decisions_are_lane_identical() {
+        use crate::peer::access_policy::PeerOperation;
+        use crate::web_gateway::{TransferAccessTarget, TransferJobAccess};
+        let rig = scope_recheck_rig();
+        let bus = crate::event::EventBus::new();
+        let rt = peer_runtime(&rig);
+        let identity = crate::web_gateway::PeerConnectionIdentity {
+            fingerprint: "fp".into(),
+            label: "scoped-peer".into(),
+            profile: "file-operator".into(),
+            filesystem: shared_scope_policy(&rig),
+        };
+        let http_root = crate::web_gateway::HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "unit-test",
+                "https",
+            ),
+            iam_state: None,
+        };
+
+        let unresolvable = "00000000-0000-0000-0000-000000000000";
+        let handles = [
+            rig.dl_in.id.as_str(),
+            rig.up_in.id.as_str(),
+            rig.up_in.resume_token.as_str(),
+            rig.dl_out.id.as_str(),
+            rig.artifact.id.as_str(),
+            unresolvable,
+        ];
+        let methods = [
+            (
+                "api_transfer_download_read",
+                PeerOperation::FilesystemRead,
+                TransferJobAccess::ReadSource,
+            ),
+            (
+                "api_transfer_upload_chunk",
+                PeerOperation::FilesystemWrite,
+                TransferJobAccess::WriteDestination,
+            ),
+            (
+                "api_transfer_upload_commit",
+                PeerOperation::FilesystemWrite,
+                TransferJobAccess::WriteDestination,
+            ),
+            (
+                "api_transfer_job_delete",
+                PeerOperation::FilesystemWrite,
+                TransferJobAccess::WriteJobPath,
+            ),
+        ];
+        for (method, op, access) in methods {
+            for handle in handles {
+                let tunnel = authorize_dashboard_control_method(
+                    &rt,
+                    method,
+                    Some(&serde_json::json!({ "id": handle })),
+                );
+                let http = crate::web_gateway::authorize_http_transfer_access(
+                    &http_root,
+                    Some(&identity),
+                    op,
+                    TransferAccessTarget::Job {
+                        store: &rig.store,
+                        handle,
+                        access,
+                    },
+                    &bus,
+                );
+                assert_eq!(tunnel, http, "{method} {handle}");
+            }
+        }
+        // Spot-check the decisions themselves (the loop above only pins
+        // lane equality): each row's in-scope job passes, everything
+        // else denies with the uniform wording.
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_transfer_download_read",
+            Some(&serde_json::json!({ "id": rig.dl_in.id })),
+        )
+        .is_ok());
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_transfer_upload_chunk",
+            Some(&serde_json::json!({ "id": rig.up_in.id })),
+        )
+        .is_ok());
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_transfer_job_delete",
+            Some(&serde_json::json!({ "id": rig.dl_in.id })),
+        )
+        .is_ok());
+        for handle in [
+            rig.dl_out.id.as_str(),
+            rig.artifact.id.as_str(),
+            unresolvable,
+        ] {
+            assert_eq!(
+                authorize_dashboard_control_method(
+                    &rt,
+                    "api_transfer_download_read",
+                    Some(&serde_json::json!({ "id": handle })),
+                )
+                .unwrap_err(),
+                crate::web_gateway::TRANSFER_JOB_SCOPE_DENIED,
+                "{handle}"
+            );
+        }
+
+        // Create: the tunnel derives the same kind-aware target the
+        // HTTP lane derives (upload creates name `destination` — the
+        // old path-alias extractor missed it and denied in-scope
+        // upload creates over the tunnel).
+        let create_cases = [
+            serde_json::json!({
+                "kind": "upload",
+                "destination": rig.in_scope.join("new.bin").to_string_lossy(),
+            }),
+            serde_json::json!({
+                "kind": "download",
+                "path": rig.in_scope.join("data.txt").to_string_lossy(),
+            }),
+            serde_json::json!({
+                "kind": "upload",
+                "destination": rig.outside.join("escape.bin").to_string_lossy(),
+            }),
+            serde_json::json!({
+                "kind": "download",
+                "artifact": { "type": "session_report" },
+            }),
+        ];
+        for params in create_cases {
+            let tunnel =
+                authorize_dashboard_control_method(&rt, "api_transfer_job_create", Some(&params));
+            // The HTTP handler's derivation, verbatim.
+            let target = crate::web_gateway::classify_transfer_create(&params)
+                .ok()
+                .and_then(|request| match request {
+                    crate::web_gateway::TransferCreateRequest::Path(kind) => {
+                        crate::web_gateway::transfer_create_target_path(&params, kind)
+                    }
+                    crate::web_gateway::TransferCreateRequest::Artifact(_) => None,
+                });
+            let http = crate::web_gateway::authorize_http_transfer_access(
+                &http_root,
+                Some(&identity),
+                PeerOperation::FilesystemWrite,
+                TransferAccessTarget::Create(target.as_deref()),
+                &bus,
+            );
+            assert_eq!(tunnel, http, "{params}");
+        }
+        assert!(authorize_dashboard_control_method(
+            &rt,
+            "api_transfer_job_create",
+            Some(&serde_json::json!({
+                "kind": "upload",
+                "destination": rig.in_scope.join("new.bin").to_string_lossy(),
+            })),
+        )
+        .is_ok());
+
+        // The list method is never blanket-denied for scoped grants —
+        // its handler scope-filters instead (pinned below).
+        assert!(authorize_dashboard_control_method(&rt, "api_transfer_jobs", None).is_ok());
+    }
+
+    /// The tunnel chunk upload's terminal leg re-checks the named job's
+    /// destination for scope-restricted grants (the fs_write pattern):
+    /// in-scope jobs append, everything else answers the uniform 403
+    /// without touching the partial. Unrestricted grants are unchanged.
+    #[tokio::test]
+    async fn transfer_chunk_upload_rechecks_job_destination_scope() {
+        let rig = scope_recheck_rig();
+
+        // In-scope job: the chunk appends.
+        let chunk = api_transfer_upload_chunk_task_response(
+            "chunk-in".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": rig.up_in.id, "offset": 0 }),
+                b"hello",
+            ),
+            peer_runtime(&rig),
+        )
+        .await;
+        assert_eq!(chunk.frame["result"]["_httpStatus"], 200, "{}", chunk.frame);
+        assert_eq!(chunk.frame["result"]["job"]["completed_bytes"], 5);
+
+        // Out-of-scope and artifact-shaped jobs: uniform 403, nothing
+        // written.
+        let up_out = crate::transfer_store::create_upload_job(
+            &rig.store,
+            rig.outside.join("escape.bin").to_str().unwrap(),
+            "escape.bin",
+            "application/octet-stream",
+            Some(4),
+            None,
+            crate::transfer_store::TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        for handle in [up_out.id.as_str(), rig.artifact.id.as_str()] {
+            let denied = api_transfer_upload_chunk_task_response(
+                format!("chunk-denied-{handle}"),
+                test_upload_state(
+                    "api_transfer_upload_chunk",
+                    serde_json::json!({ "id": handle, "offset": 0 }),
+                    b"data",
+                ),
+                peer_runtime(&rig),
+            )
+            .await;
+            assert_eq!(denied.frame["result"]["_httpStatus"], 403, "{handle}");
+            assert_eq!(
+                denied.frame["result"]["error"],
+                crate::web_gateway::TRANSFER_JOB_SCOPE_DENIED,
+                "{handle}"
+            );
+        }
+        let untouched = crate::transfer_store::find_job(&rig.store, &up_out.id).unwrap();
+        assert_eq!(untouched.completed_bytes, 0);
+
+        // Unrestricted (trusted-local) grants stay op-only: the same
+        // out-of-scope job accepts their chunk.
+        let mut unrestricted = runtime();
+        unrestricted.project_root = Some(rig.project.clone());
+        let chunk = api_transfer_upload_chunk_task_response(
+            "chunk-root".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({ "id": up_out.id, "offset": 0 }),
+                b"data",
+            ),
+            unrestricted,
+        )
+        .await;
+        assert_eq!(chunk.frame["result"]["_httpStatus"], 200, "{}", chunk.frame);
+    }
+
+    /// The tunnel's job listing scope-filters for scope-restricted
+    /// grants exactly as the HTTP row does (same shared core, same
+    /// policy ⇒ byte-identical job sets): in-scope jobs stay, the
+    /// out-of-scope and artifact-shaped jobs disappear, and an
+    /// out-of-scope `id` filter reads as an empty 200.
+    #[tokio::test]
+    async fn transfer_jobs_listing_scope_filters_identically_on_both_lanes() {
+        let rig = scope_recheck_rig();
+        let rt = peer_runtime(&rig);
+
+        let frame = api_transfer_jobs_response("list-scoped".to_string(), None, &rt).await;
+        let tunnel_body = tunnel_result_body(&frame, 200);
+        let (status, _headers, body) = http_parts(
+            crate::web_gateway::transfer_jobs_api_response(
+                rig.store.clone(),
+                &serde_json::json!({}),
+                Some(&shared_scope_policy(&rig)),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let http_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tunnel_body, http_body);
+        let ids: Vec<&str> = tunnel_body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&rig.dl_in.id.as_str()));
+        assert!(ids.contains(&rig.up_in.id.as_str()));
+
+        // The id filter gets the same per-job re-check as a filter.
+        let hidden = api_transfer_jobs_response(
+            "list-hidden".to_string(),
+            Some(&serde_json::json!({ "id": rig.dl_out.id })),
+            &rt,
+        )
+        .await;
+        let hidden_body = tunnel_result_body(&hidden, 200);
+        assert_eq!(hidden_body["jobs"].as_array().unwrap().len(), 0);
+
+        // Unrestricted grants list all four jobs, unchanged.
+        let mut unrestricted = runtime();
+        unrestricted.project_root = Some(rig.project.clone());
+        let all = api_transfer_jobs_response("list-root".to_string(), None, &unrestricted).await;
+        let all_body = tunnel_result_body(&all, 200);
+        assert_eq!(all_body["jobs"].as_array().unwrap().len(), 4);
     }
 }

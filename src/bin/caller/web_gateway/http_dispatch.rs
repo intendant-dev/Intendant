@@ -481,6 +481,9 @@ pub(crate) async fn serve_http_request(
                     discard,
                     transfer_job_id(),
                     project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -492,6 +495,9 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     transfer_job_id(),
                     project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -502,6 +508,9 @@ pub(crate) async fn serve_http_request(
                     stream,
                     transfer_job_id(),
                     project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -514,6 +523,9 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     transfer_job_id(),
                     project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
