@@ -193,3 +193,234 @@ function displayViewerOnFirstFrame(videoEl, isStale, cb) {
     fire();
   }
 }
+
+// ── Input forwarder (interactive mode) ──────────────────────────────────
+// The pointer/keyboard/wheel capture stack both interactive modes install.
+// The wire format is the raw `InputEvent` JSON both server sides parse
+// with one handler ({t:'kd'|'ku'|'md'|'mu'|'mm'|'sc', ...}); the policy
+// differences stay in the callers: WHERE events go (local: /ws input lane
+// with datachannel fallback; peer: datachannels only), WHICH surface they
+// bind to (local: the slot's <video>; peer: live tile canvas or video),
+// and the listener options (local passes { passive: false }; the peer
+// path historically adds listeners without options — preserved as-is).
+
+// Letterbox-aware pointer normalization: map a client-coordinate event to
+// logical (0..1) display coords accounting for the rendered surface's
+// preserved aspect ratio (pillarbox/letterbox bars). Canvas-aware superset
+// of the two per-class copies: for a <video> it reads videoWidth/Height
+// exactly like the local slot's `normalize` did; for the peer tile canvas
+// it reads width/height.
+function displayViewerNormalizePointerEvent(surface, e) {
+  const rect = surface.getBoundingClientRect();
+  const isCanvas = typeof HTMLCanvasElement !== 'undefined' && surface instanceof HTMLCanvasElement;
+  const surfaceW = isCanvas ? (surface.width || rect.width) : (surface.videoWidth || rect.width);
+  const surfaceH = isCanvas ? (surface.height || rect.height) : (surface.videoHeight || rect.height);
+  const videoAspect = surfaceW / surfaceH;
+  const elAspect = rect.width / rect.height;
+  let contentW, contentH, offsetX, offsetY;
+  if (elAspect > videoAspect) {
+    // Element is wider than video -> pillarbox (black bars left/right)
+    contentH = rect.height;
+    contentW = contentH * videoAspect;
+    offsetX = (rect.width - contentW) / 2;
+    offsetY = 0;
+  } else {
+    // Element is taller than video -> letterbox (black bars top/bottom)
+    contentW = rect.width;
+    contentH = contentW / videoAspect;
+    offsetX = 0;
+    offsetY = (rect.height - contentH) / 2;
+  }
+  const relX = (e.clientX - rect.left - offsetX) / contentW;
+  const relY = (e.clientY - rect.top - offsetY) / contentH;
+  return {
+    x: Math.max(0, Math.min(relX, 0.9999)),
+    y: Math.max(0, Math.min(relY, 0.9999)),
+  };
+}
+
+// Item 3: synthetic-keyup flusher for every currently-held key (not just
+// the 8 modifiers — a latched non-modifier auto-repeats remotely forever).
+// Returned closure is stored on `owner._flushHeldKeys` so exit paths that
+// run outside the enter closure (server demotion, release, pane rebuild)
+// can release held keys BEFORE the listeners are removed / authority is
+// gone. Reads `owner._heldKeys` at flush time, like both originals did.
+function displayViewerMakeHeldKeyFlusher(owner, sendControl) {
+  return () => {
+    if (!owner._heldKeys) return;
+    for (const code of owner._heldKeys) {
+      sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+    }
+    owner._heldKeys.clear();
+  };
+}
+
+// Build the interactive-mode handler set. `owner` is the DisplaySlot /
+// PeerDisplayConnection (annotation/callout suppression and the
+// `interactive` re-focus check read it live); `target` is the bound
+// surface; `sendControl` / `sendPointer` are the policy-owned transports
+// (reliable-ordered vs lossy-unordered lanes).
+//
+// Suppression semantics (shared with 47-annotation-clips): a live-
+// annotation edit on this owner suppresses ALL forwarding; an armed
+// callout suppresses only the drag's md/mm/mu — keyboard and wheel keep
+// flowing (the arm overlay swallows most pointer events already; these
+// checks catch the letterbox bars).
+//
+// NOTE: Both `code` (physical key position) and `key` (logical character)
+// are sent in KeyDown/KeyUp events. Backends currently use `code` only
+// for physical key injection (xdotool key / CGEvent keycode). Using `key`
+// for character-based text input is a follow-up.
+function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPointer }) {
+  const handlers = {};
+  handlers.keydown = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    owner._heldKeys.add(e.code);
+    sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+  };
+  handlers.keyup = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    owner._heldKeys.delete(e.code);
+    sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+  };
+  handlers.pointerdown = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    target.focus();
+    target.setPointerCapture(e.pointerId);
+    const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    sendControl({ t: 'md', x, y, b: e.button });
+  };
+  handlers.pointerup = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    target.releasePointerCapture(e.pointerId);
+    const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    sendControl({ t: 'mu', x, y, b: e.button });
+  };
+  handlers.pointermove = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
+      e.preventDefault();
+      return;
+    }
+    const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    sendPointer({ t: 'mm', x, y, buttons: e.buttons });
+  };
+  handlers.wheel = (e) => {
+    if (shouldSuppressDisplayInputForAnnotation(owner)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    // Normalize pixel deltas to discrete scroll notches.
+    // DOM_DELTA_PIXEL (0): divide by 100 to approximate notches.
+    // DOM_DELTA_LINE (1): use as-is (already logical lines).
+    // DOM_DELTA_PAGE (2): multiply by 3 (approximate lines per page).
+    let dx = e.deltaX, dy = e.deltaY;
+    if (e.deltaMode === 0) {
+      dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
+      dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
+    } else if (e.deltaMode === 2) {
+      dx *= 3; dy *= 3;
+    }
+    sendPointer({ t: 'sc', x, y, dx, dy });
+  };
+  handlers.contextmenu = (e) => e.preventDefault();
+  // Release ALL held keys when the surface loses focus (e.g. Alt+Tab
+  // away). Without this, the remote side thinks they are still held
+  // because no keyup event ever fires for them.
+  handlers.blur = () => {
+    owner._flushHeldKeys?.();
+  };
+  // Re-focus the surface when the pointer enters it while interactive.
+  // This restores keyboard input after Alt+Tab back to the dashboard.
+  handlers.pointerenter = () => {
+    if (owner.interactive) target.focus();
+  };
+  return handlers;
+}
+
+// ── Clipboard sync hooks (policy-gated: local DisplaySlot only today) ───
+// Federated clipboard is a follow-up; PEER_DISPLAY_POLICY.clipboardSync
+// is false and PeerDisplayConnection never calls these.
+
+// Remote → browser: apply a `clipboard_update` payload to the local
+// clipboard. Image payloads decode base64 into a ClipboardItem; text goes
+// through writeText. Failures surface once per page session via
+// noteDisplayClipboardWriteFailure (Item 8).
+function displayViewerApplyRemoteClipboardUpdate(d) {
+  const mime = d.mime || 'text/plain';
+  if (mime.startsWith('image/') && d.data) {
+    // Image clipboard: decode base64 and write as ClipboardItem.
+    try {
+      const binary = atob(d.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: mime });
+      const item = new ClipboardItem({ [mime]: blob });
+      navigator.clipboard.write([item]).catch(noteDisplayClipboardWriteFailure);
+    } catch { noteDisplayClipboardWriteFailure(); }
+  } else if (d.text !== undefined) {
+    navigator.clipboard.writeText(d.text).catch(noteDisplayClipboardWriteFailure);
+  }
+}
+
+// Browser → remote: build the document-level paste interceptor that ships
+// clipboard contents over the viewer's clipboard channel. `getChannel` is
+// read at event time (and re-read inside the async FileReader callback,
+// like the original field reads) so a renegotiated channel is honored.
+function displayViewerBuildPasteHandler(getChannel) {
+  return (e) => {
+    if (getChannel()?.readyState !== 'open') return;
+    // Check for image content first.
+    if (e.clipboardData?.items) {
+      for (const item of e.clipboardData.items) {
+        if (item.type.startsWith('image/')) {
+          const blob = item.getAsFile();
+          if (!blob) continue;
+          // 5 MB size limit.
+          if (blob.size > 5 * 1024 * 1024) {
+            console.warn('[clipboard] skipping image paste: exceeds 5 MB limit');
+            e.preventDefault();
+            return;
+          }
+          const mime = item.type;
+          const reader = new FileReader();
+          reader.onload = () => {
+            const base64 = reader.result.split(',')[1];
+            const channel = getChannel();
+            if (base64 && channel?.readyState === 'open') {
+              channel.send(JSON.stringify({
+                t: 'clipboard_set', mime, data: base64
+              }));
+            }
+          };
+          reader.readAsDataURL(blob);
+          e.preventDefault();
+          return;
+        }
+      }
+    }
+    // Fall back to text.
+    const text = e.clipboardData?.getData('text');
+    if (text !== undefined) {
+      getChannel().send(JSON.stringify({t: 'clipboard_set', mime: 'text/plain', text}));
+      e.preventDefault();
+    }
+  };
+}

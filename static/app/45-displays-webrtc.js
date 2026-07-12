@@ -496,25 +496,14 @@ class DisplaySlot {
     });
     this.clipboardChannel = this.pc.createDataChannel('clipboard', { ordered: true });
 
-    // Handle incoming clipboard updates from the remote display
+    // Handle incoming clipboard updates from the remote display.
+    // Clipboard sync is a LOCAL-ONLY policy today (federated clipboard is
+    // a follow-up); the applier itself is shared viewer-core code.
     this.clipboardChannel.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
         if (d.t === 'clipboard_update' && this.interactive) {
-          const mime = d.mime || 'text/plain';
-          if (mime.startsWith('image/') && d.data) {
-            // Image clipboard: decode base64 and write as ClipboardItem.
-            try {
-              const binary = atob(d.data);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-              const blob = new Blob([bytes], { type: mime });
-              const item = new ClipboardItem({ [mime]: blob });
-              navigator.clipboard.write([item]).catch(noteDisplayClipboardWriteFailure);
-            } catch { noteDisplayClipboardWriteFailure(); }
-          } else if (d.text !== undefined) {
-            navigator.clipboard.writeText(d.text).catch(noteDisplayClipboardWriteFailure);
-          }
+          displayViewerApplyRemoteClipboardUpdate(d);
         }
       } catch {}
     };
@@ -912,38 +901,10 @@ class DisplaySlot {
     // server demotes us) otherwise auto-repeats remotely forever.
     this._heldKeys = new Set();
 
-    const normalize = (e) => {
-      const rect = vid.getBoundingClientRect();
-      // Account for letterboxing: the video element preserves aspect ratio,
-      // so the actual video content occupies a sub-rectangle inside the
-      // element bounds. Compute that content rect from the video's intrinsic
-      // dimensions, then normalize the cursor relative to it (not the element).
-      const vW = vid.videoWidth || rect.width;
-      const vH = vid.videoHeight || rect.height;
-      const videoAspect = vW / vH;
-      const elAspect = rect.width / rect.height;
-      let contentW, contentH, offsetX, offsetY;
-      if (elAspect > videoAspect) {
-        // Element is wider than video -> pillarbox (black bars left/right)
-        contentH = rect.height;
-        contentW = contentH * videoAspect;
-        offsetX = (rect.width - contentW) / 2;
-        offsetY = 0;
-      } else {
-        // Element is taller than video -> letterbox (black bars top/bottom)
-        contentW = rect.width;
-        contentH = contentW / videoAspect;
-        offsetX = 0;
-        offsetY = (rect.height - contentH) / 2;
-      }
-      const relX = (e.clientX - rect.left - offsetX) / contentW;
-      const relY = (e.clientY - rect.top - offsetY) / contentH;
-      return {
-        x: Math.max(0, Math.min(relX, 0.9999)),
-        y: Math.max(0, Math.min(relY, 0.9999))
-      };
-    };
-
+    // Input transport — the LOCAL policy: prefer the verified
+    // dashboard-control input lane (sendDisplayInputForSlot), fall back
+    // to this pc's data channels. The federated path sends over its
+    // data channels only.
     const sendControl = (msg) => {
       if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
@@ -957,147 +918,23 @@ class DisplaySlot {
       }
     };
 
-    // Flush synthetic keyups for every currently-held key. Stored on the
-    // instance so `_exitInteractive` (which runs outside this closure)
-    // can release held keys BEFORE the listeners are removed — a
-    // server-side authority demotion otherwise latches keys down
-    // remotely. Cleared by `_exitInteractive`.
-    this._flushHeldKeys = () => {
-      if (!this._heldKeys) return;
-      for (const code of this._heldKeys) {
-        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
-      }
-      this._heldKeys.clear();
-    };
+    // Held-key flusher, stored on the instance so `_exitInteractive`
+    // (which runs outside this closure) can release held keys BEFORE the
+    // listeners are removed — a server-side authority demotion otherwise
+    // latches keys down remotely. Cleared by `_exitInteractive`.
+    this._flushHeldKeys = displayViewerMakeHeldKeyFlusher(this, sendControl);
+    // The shared capture stack (letterbox normalize, kd/ku/md/mu/mm/sc,
+    // blur flush, pointerenter refocus) — 45-display-viewer-core.
+    this._boundHandlers = displayViewerBuildInputHandlers({
+      owner: this,
+      target: vid,
+      sendControl,
+      sendPointer,
+    });
 
-    // NOTE: Both `code` (physical key position) and `key` (logical character) are sent
-    // in KeyDown/KeyUp events. Backends currently use `code` only for physical key
-    // injection (xdotool key / CGEvent keycode). Using `key` for character-based text
-    // input (e.g. xdotool type, CGEvent character input) is a follow-up.
-    this._boundHandlers.keydown = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.add(e.code);
-      sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.keyup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.delete(e.code);
-      sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.pointerdown = (e) => {
-      // Annotation editing suppresses everything; an armed callout
-      // suppresses only the drag's md/mm/mu (keyboard + wheel keep
-      // flowing — the arm overlay swallows most of these already, this
-      // catches pointer events on the letterbox bars).
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      vid.focus();
-      vid.setPointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'md', x, y, b: e.button });
-    };
-    this._boundHandlers.pointerup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      vid.releasePointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'mu', x, y, b: e.button });
-    };
-    this._boundHandlers.pointermove = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      const { x, y } = normalize(e);
-      sendPointer({ t: 'mm', x, y, buttons: e.buttons });
-    };
-    this._boundHandlers.wheel = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      const { x, y } = normalize(e);
-      // Normalize pixel deltas to discrete scroll notches.
-      // DOM_DELTA_PIXEL (0): divide by 100 to approximate notches.
-      // DOM_DELTA_LINE (1): use as-is (already logical lines).
-      // DOM_DELTA_PAGE (2): multiply by 3 (approximate lines per page).
-      let dx = e.deltaX, dy = e.deltaY;
-      if (e.deltaMode === 0) {
-        dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
-        dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
-      } else if (e.deltaMode === 2) {
-        dx *= 3; dy *= 3;
-      }
-      sendPointer({ t: 'sc', x, y, dx, dy });
-    };
-    this._boundHandlers.contextmenu = (e) => e.preventDefault();
-
-    // Release ALL held keys when the video element loses focus (e.g.
-    // Alt+Tab away). Without this, the remote side thinks they are still
-    // held because no keyup event ever fires for them.
-    this._boundHandlers.blur = () => {
-      this._flushHeldKeys?.();
-    };
-
-    // Re-focus the video element when the pointer enters it while interactive.
-    // This restores keyboard input after Alt+Tab back to the dashboard.
-    this._boundHandlers.pointerenter = () => {
-      if (this.interactive) vid.focus();
-    };
-
-    // Clipboard: intercept paste events and send to remote display
-    this._boundHandlers.paste = (e) => {
-      if (this.clipboardChannel?.readyState !== 'open') return;
-      // Check for image content first.
-      if (e.clipboardData?.items) {
-        for (const item of e.clipboardData.items) {
-          if (item.type.startsWith('image/')) {
-            const blob = item.getAsFile();
-            if (!blob) continue;
-            // 5 MB size limit.
-            if (blob.size > 5 * 1024 * 1024) {
-              console.warn('[clipboard] skipping image paste: exceeds 5 MB limit');
-              e.preventDefault();
-              return;
-            }
-            const mime = item.type;
-            const reader = new FileReader();
-            reader.onload = () => {
-              const base64 = reader.result.split(',')[1];
-              if (base64 && this.clipboardChannel?.readyState === 'open') {
-                this.clipboardChannel.send(JSON.stringify({
-                  t: 'clipboard_set', mime, data: base64
-                }));
-              }
-            };
-            reader.readAsDataURL(blob);
-            e.preventDefault();
-            return;
-          }
-        }
-      }
-      // Fall back to text.
-      const text = e.clipboardData?.getData('text');
-      if (text !== undefined) {
-        this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', mime: 'text/plain', text}));
-        e.preventDefault();
-      }
-    };
+    // Clipboard: intercept paste events and send to remote display.
+    // LOCAL-ONLY policy (federated clipboard is a follow-up).
+    this._boundHandlers.paste = displayViewerBuildPasteHandler(() => this.clipboardChannel);
     document.addEventListener('paste', this._boundHandlers.paste);
 
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {

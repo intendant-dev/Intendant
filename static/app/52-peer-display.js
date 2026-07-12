@@ -1263,42 +1263,16 @@ class PeerDisplayConnection {
     // latched non-modifier auto-repeats on the peer forever otherwise.
     this._heldKeys = new Set();
 
-    const normalize = (e) => {
-      // Same letterbox-aware normalization as local DisplaySlot —
-      // map screen-pixel cursor to logical (0..1) display coords
-      // accounting for the rendered surface's preserved aspect ratio.
-      const rect = target.getBoundingClientRect();
-      const isCanvas = target instanceof HTMLCanvasElement;
-      const surfaceW = isCanvas ? (target.width || rect.width) : (target.videoWidth || rect.width);
-      const surfaceH = isCanvas ? (target.height || rect.height) : (target.videoHeight || rect.height);
-      const videoAspect = surfaceW / surfaceH;
-      const elAspect = rect.width / rect.height;
-      let contentW, contentH, offsetX, offsetY;
-      if (elAspect > videoAspect) {
-        contentH = rect.height;
-        contentW = contentH * videoAspect;
-        offsetX = (rect.width - contentW) / 2;
-        offsetY = 0;
-      } else {
-        contentW = rect.width;
-        contentH = contentW / videoAspect;
-        offsetX = 0;
-        offsetY = (rect.height - contentH) / 2;
-      }
-      const relX = (e.clientX - rect.left - offsetX) / contentW;
-      const relY = (e.clientY - rect.top - offsetY) / contentH;
-      return {
-        x: Math.max(0, Math.min(relX, 0.9999)),
-        y: Math.max(0, Math.min(relY, 0.9999)),
-      };
-    };
-
     // Wire format identical to local DisplaySlot's: raw `InputEvent`
     // JSON. The peer's `display/webrtc.rs::handle_message` already
     // dispatches `control` and `pointer` channels through the same
     // `serde_json::from_str::<InputEvent>` parser. F-2 changes
     // nothing about the wire shape — only the gate that decides
     // whether the parsed event reaches `inject_input`.
+    //
+    // Input transport — the FEDERATED policy: data channels only (the
+    // local slot prefers its verified dashboard-control input lane and
+    // falls back to channels; no such lane exists to a peer).
     const sendControl = (msg) => {
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
         this.controlChannel.send(JSON.stringify(msg));
@@ -1313,94 +1287,23 @@ class PeerDisplayConnection {
     // Item 3: synthetic-keyup flusher, stored on the instance so
     // `_exitInteractive` / `releaseControl` / the attachToDom rebind
     // path can release held keys after this closure's listeners are
-    // otherwise unreachable. Mirrors local DisplaySlot exactly.
-    this._flushHeldKeys = () => {
-      if (!this._heldKeys) return;
-      for (const code of this._heldKeys) {
-        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
-      }
-      this._heldKeys.clear();
-    };
+    // otherwise unreachable. Shared with local DisplaySlot
+    // (45-display-viewer-core), as is the whole capture stack below —
+    // letterbox normalize (canvas-aware for the tile surface),
+    // kd/ku/md/mu/mm/sc handlers with annotation/callout suppression,
+    // blur flush, pointerenter refocus.
+    this._flushHeldKeys = displayViewerMakeHeldKeyFlusher(this, sendControl);
+    this._boundHandlers = displayViewerBuildInputHandlers({
+      owner: this,
+      target,
+      sendControl,
+      sendPointer,
+    });
 
-    // Suppression parity with local DisplaySlot._enterInteractive:
-    // a live-annotation edit on this pane suppresses all forwarding;
-    // an armed callout suppresses only the drag's md/mm/mu (keyboard
-    // and wheel keep flowing — the arm overlay swallows most pointer
-    // events already, these checks catch the letterbox bars).
-    this._boundHandlers.keydown = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.add(e.code);
-      sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.keyup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.delete(e.code);
-      sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.pointerdown = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      target.focus();
-      target.setPointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'md', x, y, b: e.button });
-    };
-    this._boundHandlers.pointerup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      target.releasePointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'mu', x, y, b: e.button });
-    };
-    this._boundHandlers.pointermove = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      const { x, y } = normalize(e);
-      sendPointer({ t: 'mm', x, y, buttons: e.buttons });
-    };
-    this._boundHandlers.wheel = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      const { x, y } = normalize(e);
-      let dx = e.deltaX, dy = e.deltaY;
-      if (e.deltaMode === 0) {
-        dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
-        dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
-      } else if (e.deltaMode === 2) {
-        dx *= 3; dy *= 3;
-      }
-      sendPointer({ t: 'sc', x, y, dx, dy });
-    };
-    this._boundHandlers.contextmenu = (e) => e.preventDefault();
-    this._boundHandlers.blur = () => {
-      // Release ALL held keys when the surface loses focus — without
-      // this, the peer thinks they are still held because no keyup
-      // ever fires.
-      this._flushHeldKeys?.();
-    };
-    this._boundHandlers.pointerenter = () => {
-      if (this.interactive) target.focus();
-    };
-
+    // (No clipboard hooks here: clipboard sync is a LOCAL-ONLY policy —
+    // federated clipboard is a follow-up. Listener options also differ
+    // deliberately: the local slot passes { passive: false }; this path
+    // has always installed without options.)
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
       target.addEventListener(evt, handler);
     }
