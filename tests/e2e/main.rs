@@ -1503,10 +1503,13 @@ async fn display_request_rail_round_trips_over_ws() {
     // fast on every platform. A platform capture stack sneaking back in
     // shows up here as seconds-to-minutes (Windows GDI Access-denied retry
     // storms on a locked runner, SCK/TCC stalls) — so pin the wall clock.
-    // Generous versus the single-digit-second measured times to stay
-    // robust on loaded CI runners.
+    // Generous versus the single-digit-second measured times: the fleet
+    // Mac leg breached a 30s bound at 35s while 3x oversubscribed (load
+    // avg 39 on 12 cores, two merge-queue ejections on 2026-07-12), and
+    // the failure classes this guards are minutes-scale, so 90s keeps
+    // the guard while shrugging off runner load.
     let wall_clock = std::time::Instant::now();
-    const RAIL_WALL_CLOCK_BOUND: Duration = Duration::from_secs(30);
+    const RAIL_WALL_CLOCK_BOUND: Duration = Duration::from_secs(90);
 
     let idle_script = serde_json::json!({
         "profiles": [{

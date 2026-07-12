@@ -245,6 +245,7 @@ pub(crate) enum RouteHandlerId {
     WorktreesList,
     SessionsStream,
     SessionsSearch,
+    SessionsMessageSearch,
     SessionsList,
     ProjectRoot,
     SettingsPost,
@@ -1150,6 +1151,15 @@ pub(crate) static ROUTES: &[Route] = &[
         "Search sessions (q, source, mode, project filters)",
     )
     .with_tunnel(tunnel_method("api_sessions_search")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/sessions/message-search"),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionsMessageSearch,
+        "Message-lane search over the shard index (q, source, superseded, subagents, cursor)",
+    )
+    .with_tunnel(tunnel_method("api_sessions_message_search")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
