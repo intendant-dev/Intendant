@@ -384,17 +384,6 @@ export class PresenceWeb {
         return ret;
     }
     /**
-     * @param {string} key
-     * @param {boolean} ctrl
-     * @param {boolean} alt
-     * @param {boolean} shift
-     */
-    send_key(key, ctrl, alt, shift) {
-        const ptr0 = passStringToWasm0(key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        wasm.presenceweb_send_key(this.__wbg_ptr, ptr0, len0, ctrl, alt, shift);
-    }
-    /**
      * Request to become the active voice owner (triggers handover from current active).
      * @returns {boolean}
      */
@@ -438,13 +427,6 @@ export class PresenceWeb {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.presenceweb_send_raw(this.__wbg_ptr, ptr0, len0);
         return ret !== 0;
-    }
-    /**
-     * @param {number} cols
-     * @param {number} rows
-     */
-    send_resize(cols, rows) {
-        wasm.presenceweb_send_resize(this.__wbg_ptr, cols, rows);
     }
     /**
      * @param {any} action

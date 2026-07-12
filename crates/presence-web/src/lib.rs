@@ -653,16 +653,6 @@ mod wasm_impl {
             self.server.borrow().send_make_active()
         }
 
-        #[wasm_bindgen]
-        pub fn send_key(&self, key: &str, ctrl: bool, alt: bool, shift: bool) {
-            self.server.borrow().send_key(key, ctrl, alt, shift);
-        }
-
-        #[wasm_bindgen]
-        pub fn send_resize(&self, cols: u16, rows: u16) {
-            self.server.borrow().send_resize(cols, rows);
-        }
-
         /// Set passive mode — this browser will never request active status.
         /// Use for observer/follow-along mode.
         #[wasm_bindgen]
