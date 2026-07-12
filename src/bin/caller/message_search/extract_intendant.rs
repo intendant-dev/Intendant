@@ -119,6 +119,21 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
     let mut pending_steers: Vec<(String, String, u64)> = Vec::new(); // (id, text, line_no)
     let mut legacy_task_seen = false;
 
+    // A daemon/parent log mirrors its supervised children's activity as
+    // session-scoped rows (`data.session_id` = the child): those rows are
+    // canonical in the CHILD's own log dir and must not be re-extracted
+    // here. Rows scoped to this session (or unscoped — the classic
+    // single-session shape) stay. Deliberate coverage loss: February-era
+    // MCP multi-task logs scoped their per-task rows to child ids inside
+    // the parent dir; those pre-F1 corpses lose their task rows to this
+    // rule, which is the right trade against double-indexing every
+    // currently-supervised session.
+    let foreign = |data: Option<&serde_json::Value>| -> bool {
+        data.and_then(|data| data.get("session_id"))
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| id != session_id)
+    };
+
     let record_base = |role: Role, ts_ms: i64, text: String, locator: Locator| {
         let (text, truncated) = cap_text(text);
         MessageRecord {
@@ -193,6 +208,9 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
             }
             // ---- Legacy lane (strictly before the era boundary) ----
             Some("session_started") if position < legacy_end => {
+                if foreign(data) {
+                    continue;
+                }
                 let ts_ms = dater.date_row(ts_ms_field, event);
                 let task = data
                     .and_then(|data| data.get("task"))
@@ -216,6 +234,9 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
                 }
             }
             Some("steer_requested") if position < legacy_end => {
+                if foreign(data) {
+                    continue;
+                }
                 let Some(data) = data else { continue };
                 if let (Some(id), Some(text)) = (
                     data.get("id").and_then(|id| id.as_str()),
@@ -225,14 +246,16 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
                 }
             }
             Some("steer_delivered") if position < legacy_end => {
+                if foreign(data) {
+                    continue;
+                }
                 let Some(id) = data
                     .and_then(|data| data.get("id"))
                     .and_then(|id| id.as_str())
                 else {
                     continue;
                 };
-                let Some(slot) = pending_steers.iter().position(|(known, _, _)| known == id)
-                else {
+                let Some(slot) = pending_steers.iter().position(|(known, _, _)| known == id) else {
                     continue; // delivered without a seen request: nothing to say
                 };
                 let (_, text, requested_line) = pending_steers.remove(slot);
@@ -279,6 +302,9 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
                 );
             }
             Some("model_response") if position < legacy_end => {
+                if foreign(data) {
+                    continue;
+                }
                 let Some(data) = data else { continue };
                 let Some(text) = read_event_span(log_dir, event, data) else {
                     continue;
@@ -395,18 +421,21 @@ fn read_meta(log_dir: &Path) -> Option<SessionMeta> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Read the sidecar span an event references (`file` + `data.model_offset`
-/// + `data.model_bytes`). The read is bounded a little past the record
-/// text cap — a corrupt length must not balloon memory; the overlong tail
-/// is dropped by [`cap_text`] anyway. A short read (bytes the event
-/// promised aren't there) is an anomaly: skip, don't guess.
+/// Read the sidecar span an event references (`file` plus
+/// `data.model_offset`/`data.model_bytes`). The read is bounded a little
+/// past the record text cap — a corrupt length must not balloon memory;
+/// the overlong tail is dropped by [`cap_text`] anyway. A short read
+/// (bytes the event promised aren't there) is an anomaly: skip, don't
+/// guess.
 fn read_event_span(
     log_dir: &Path,
     event: &serde_json::Value,
     data: &serde_json::Value,
 ) -> Option<String> {
     let file = event.get("file").and_then(|file| file.as_str())?;
-    let offset = data.get("model_offset").and_then(|offset| offset.as_u64())?;
+    let offset = data
+        .get("model_offset")
+        .and_then(|offset| offset.as_u64())?;
     let len = data.get("model_bytes").and_then(|len| len.as_u64())?;
     let relative = Path::new(file);
     // The log dir is the trust boundary: never follow an absolute or
@@ -505,10 +534,7 @@ impl LegacyDater {
             return 0;
         };
         let date = if tod < current.time() {
-            current
-                .date()
-                .succ_opt()
-                .unwrap_or_else(|| current.date())
+            current.date().succ_opt().unwrap_or_else(|| current.date())
         } else {
             current.date()
         };
@@ -639,7 +665,11 @@ mod tests {
         assert_eq!(out.shard.records[2].ts_ms, 3_000);
         assert_eq!(out.shard.marks.len(), 1);
         let active = derive_active(&out.shard.records, &out.shard.marks);
-        assert_eq!(active, vec![true, true, false], "seq 3 superseded by the cut");
+        assert_eq!(
+            active,
+            vec![true, true, false],
+            "seq 3 superseded by the cut"
+        );
         assert_eq!(out.cursors.len(), 1);
         assert_eq!(out.cursors[0].check(), CursorCheck::Unchanged);
     }
@@ -782,11 +812,11 @@ mod tests {
                     "data":{"session_id":"sess-mixed","task":"old task"}}),
                 model_response("10:00:02.000", "turns/turn_001_model.txt", 0, 13),
                 serde_json::json!({"ts":"11:00:00.000","ts_ms":100,"event":"conversation_message_epoch",
-                    "data":{"mapping":[
-                        [1, "system", "ffffffffffffffff"],
-                        [2, "user", content_hash_hex16("old task")],
-                        [3, "assistant", content_hash_hex16("legacy answer")],
-                    ]}}),
+                "data":{"mapping":[
+                    [1, "system", "ffffffffffffffff"],
+                    [2, "user", content_hash_hex16("old task")],
+                    [3, "assistant", content_hash_hex16("legacy answer")],
+                ]}}),
                 conversation_message_user(4, 200, "post-resume message"),
                 // Legacy-shaped rows AFTER the marker must be ignored:
                 model_response("11:00:02.000", "turns/turn_001_model.txt", 0, 13),
@@ -797,7 +827,11 @@ mod tests {
 
         let out = extract_intendant_session(&dir).unwrap();
         let records = &out.shard.records;
-        assert_eq!(records.len(), 3, "legacy task + legacy span + one canonical");
+        assert_eq!(
+            records.len(),
+            3,
+            "legacy task + legacy span + one canonical"
+        );
         assert_eq!(records[0].seq, Some(2), "correlated through the mapping");
         assert_eq!(records[1].seq, Some(3));
         assert_eq!(records[2].seq, Some(4));
@@ -817,8 +851,10 @@ mod tests {
         write_meta(&dir, "2026-01-01T00:00:00", None, None);
         write_lines(
             &dir,
-            &[serde_json::json!({"ts":"12:00:00.000","ts_ms":42_000,"event":"session_started",
-                "data":{"session_id":"sess-f2","task":"dated task"}})],
+            &[
+                serde_json::json!({"ts":"12:00:00.000","ts_ms":42_000,"event":"session_started",
+                "data":{"session_id":"sess-f2","task":"dated task"}}),
+            ],
         );
         let out = extract_intendant_session(&dir).unwrap();
         assert_eq!(out.shard.records[0].ts_ms, 42_000);
@@ -874,6 +910,44 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_mirror_rows_are_skipped_as_foreign() {
+        // A daemon/parent log carries its supervised children's rows
+        // tagged with the CHILD's session id — canonical in the child's
+        // own dir, never re-extracted here. Rows scoped to this session
+        // itself stay.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("daemon-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_meta(&dir, "2026-07-01T09:00:00", None, None);
+        sidecar(&dir, "turn_000_model.txt", "mirrored child text");
+        write_lines(
+            &dir,
+            &[
+                serde_json::json!({"ts":"09:00:01.000","ts_ms":1,"event":"session_started",
+                    "data":{"session_id":"child-1","task":"the child task"}}),
+                serde_json::json!({"ts":"09:00:02.000","ts_ms":2,"event":"model_response",
+                    "file":"turns/turn_000_model.txt",
+                    "data":{"model_offset":0,"model_bytes":19,"session_id":"child-1"}}),
+                serde_json::json!({"ts":"09:00:03.000","ts_ms":3,"event":"steer_requested",
+                    "data":{"id":"st-1","status":"pending","text":"child steer","session_id":"child-1"}}),
+                serde_json::json!({"ts":"09:00:04.000","ts_ms":4,"event":"steer_delivered",
+                    "data":{"id":"st-1","status":"delivered","session_id":"child-1"}}),
+                // Self-scoped row: kept.
+                serde_json::json!({"ts":"09:00:05.000","ts_ms":5,"event":"session_started",
+                    "data":{"session_id":"daemon-root","task":"the daemon's own task"}}),
+            ],
+        );
+        let out = extract_intendant_session(&dir).unwrap();
+        let texts: Vec<&str> = out
+            .shard
+            .records
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["the daemon's own task"]);
+    }
+
+    #[test]
     fn round_follow_up_parsing_is_strict_about_shape() {
         assert_eq!(
             parse_round_follow_up("Round 3 follow-up: plain text"),
@@ -884,7 +958,10 @@ mod tests {
             Some("with files".to_string())
         );
         assert_eq!(parse_round_follow_up("Round x follow-up: nope"), None);
-        assert_eq!(parse_round_follow_up("Skipped cancelled queued follow-up"), None);
+        assert_eq!(
+            parse_round_follow_up("Skipped cancelled queued follow-up"),
+            None
+        );
         assert_eq!(parse_round_follow_up("Round 12 complete (3 turns)"), None);
     }
 }
