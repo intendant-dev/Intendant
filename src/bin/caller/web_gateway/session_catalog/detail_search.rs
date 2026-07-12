@@ -69,8 +69,17 @@ pub(crate) fn get_session_detail_from_home_with_page(
         .unwrap_or_default();
     compact_context_snapshot_entries_for_replay(&mut entries);
     let page = session_detail_page_entries(entries, limit, before);
-    let entries = page.entries;
+    native_session_detail_body(&session_dir, page, None)
+}
 
+/// Shared assembly of the native session-detail body (the historical
+/// field set) plus the optional additive `locate` object the anchored
+/// read (`locate.rs`) attaches.
+pub(crate) fn native_session_detail_body(
+    session_dir: &Path,
+    page: SessionDetailPageEntries,
+    locate: Option<serde_json::Value>,
+) -> String {
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
     let mut frames: Vec<String> = Vec::new();
@@ -86,16 +95,20 @@ pub(crate) fn get_session_detail_from_home_with_page(
         frames.sort();
     }
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-        "entries": entries,
+        "entries": page.entries,
         "total_entries": page.total_entries,
         "page_start": page.page_start,
         "page_end": page.page_end,
         "has_older": page.page_start > 0,
         "frames": frames,
-        "relationships": session_relationships_from_log_dir(&session_dir),
-    }).to_string()
+        "relationships": session_relationships_from_log_dir(session_dir),
+    });
+    if let Some(locate) = locate {
+        body["locate"] = locate;
+    }
+    body.to_string()
 }
 
 #[derive(Default)]

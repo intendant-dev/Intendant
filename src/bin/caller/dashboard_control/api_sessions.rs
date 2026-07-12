@@ -607,9 +607,27 @@ pub(crate) async fn api_session_detail_response_from_home(
     let session_id = session_id.trim().to_string();
     let limit = control_session_detail_limit(&params);
     let before = control_session_detail_before(&params);
+    // Anchored-read parameter (message-search C2): the tunnel's params
+    // are structured, so `locate` may arrive as the locator JSON object
+    // itself — stringify it into the same wire form the HTTP lane's
+    // query parameter carries (raw JSON or base64url). Non-string
+    // non-object values stringify too and fail parsing as 400, like any
+    // malformed locate.
+    let locate = params.get("locate").and_then(|value| match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(raw) => Some(raw.clone()),
+        other => Some(other.to_string()),
+    });
     let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_detail_api_response(&home, &session_id, &source, limit, before)
+        crate::web_gateway::session_detail_api_response(
+            &home,
+            &session_id,
+            &source,
+            limit,
+            before,
+            locate.as_deref(),
+        )
     })
     .await;
     match result {
@@ -2008,6 +2026,7 @@ mod tests {
                 "intendant",
                 Some(5),
                 None,
+                None,
             ));
         let frame = api_session_detail_response_from_home(
             "parity-detail".to_string(),
@@ -2032,6 +2051,7 @@ mod tests {
                 home.path(),
                 "..",
                 "intendant",
+                None,
                 None,
                 None,
             ));

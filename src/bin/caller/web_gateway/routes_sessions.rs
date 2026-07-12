@@ -3070,6 +3070,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
         let entry_limit = session_detail_entry_limit_from_request(request_line);
         let entry_before = session_detail_before_from_request(request_line);
+        let locate = query_param(request_line, "locate");
         let session_id_owned = session_id.to_string();
         let home = home.to_path_buf();
         let response = match tokio::task::spawn_blocking(move || {
@@ -3079,6 +3080,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 &source,
                 entry_limit,
                 entry_before,
+                locate.as_deref(),
             )
         })
         .await
@@ -3111,17 +3113,36 @@ pub(crate) async fn handle_session_sub_router_from_home(
 /// untrimmed id — the HTTP lane's historical strictness; the tunnel
 /// trims before delegating), then the paged replay body with its
 /// historical status mapping (404 only for "session not found").
+///
+/// `locate` is the optional anchored-read parameter (message-search plan
+/// §7, C2): a serialized [`crate::message_search::Locator`] — raw JSON or
+/// base64url of it (`session_catalog::parse_locate_param`). A malformed
+/// value is a 400 like any bad parameter; a well-formed locator that no
+/// longer resolves degrades typed inside the 200 body (`locate.state` =
+/// `stale`/`unavailable`) so the dashboard can open the detail view
+/// unanchored and say why.
 pub(crate) fn session_detail_api_response(
     home: &Path,
     session_id: &str,
     source: &str,
     limit: Option<usize>,
     before: Option<usize>,
+    locate: Option<&str>,
 ) -> ApiResponse {
     if !session_lookup_id_is_safe(session_id) {
         return ApiResponse::json_error(400, "invalid session id");
     }
-    let body = session_detail_response_body_with_page(home, session_id, source, limit, before);
+    let body = match locate {
+        None => session_detail_response_body_with_page(home, session_id, source, limit, before),
+        Some(raw) => match parse_locate_param(raw) {
+            Ok(locator) => session_detail_response_body_with_locate(
+                home, session_id, source, limit, before, &locator,
+            ),
+            Err(error) => {
+                return ApiResponse::json_error(400, format!("invalid locate parameter: {error}"))
+            }
+        },
+    };
     let status = if session_detail_http_status(&body) == "404 Not Found" {
         404
     } else {

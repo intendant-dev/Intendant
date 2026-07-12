@@ -963,28 +963,39 @@ pub(crate) fn external_session_detail_from_home_with_page(
     limit: Option<usize>,
     before: Option<usize>,
 ) -> Option<String> {
-    let mut entries = external_session_entries_from_home(home, source, session_id)?;
+    let entries = external_session_entries_from_home(home, source, session_id)?;
     let effective_limit = limit.or(Some(EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT));
-    let mut page = session_detail_page_entries(entries, effective_limit, before);
-    entries = page.entries;
-    for entry in &mut entries {
+    let page = session_detail_page_entries(entries, effective_limit, before);
+    Some(external_session_detail_body(session_id, page, None))
+}
+
+/// Shared assembly of the external session-detail body (the historical
+/// field set — per-entry websocket text compaction included) plus the
+/// optional additive `locate` object the anchored read (`locate.rs`)
+/// attaches.
+pub(crate) fn external_session_detail_body(
+    session_id: &str,
+    mut page: SessionDetailPageEntries,
+    locate: Option<serde_json::Value>,
+) -> String {
+    for entry in &mut page.entries {
         compact_replay_entry_text_fields_for_websocket(entry);
     }
-    page.entries = entries;
 
-    Some(
-        serde_json::json!({
-            "session_id": session_id,
-            "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
-            "entries": page.entries,
-            "total_entries": page.total_entries,
-            "page_start": page.page_start,
-            "page_end": page.page_end,
-            "has_older": page.page_start > 0,
-            "frames": [],
-        })
-        .to_string(),
-    )
+    let mut body = serde_json::json!({
+        "session_id": session_id,
+        "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+        "entries": page.entries,
+        "total_entries": page.total_entries,
+        "page_start": page.page_start,
+        "page_end": page.page_end,
+        "has_older": page.page_start > 0,
+        "frames": [],
+    });
+    if let Some(locate) = locate {
+        body["locate"] = locate;
+    }
+    body.to_string()
 }
 
 #[cfg(test)]
