@@ -49,12 +49,37 @@ pub(crate) fn find_codex_session_file_for_main(home: &Path, session_id: &str) ->
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".codex"));
+    find_codex_session_file_in(&codex, home, session_id)
+}
+
+/// Locate the rollout whose `session_meta.payload.id` is `session_id`
+/// under `codex_root`, consulting the wrapper index's stored rollout path
+/// before paying for the recursive scan (the scan opens EVERY rollout
+/// under `sessions/` + `archived_sessions/` to match the id). The stored
+/// path is trusted only after re-verifying the session id — rollouts
+/// migrate `sessions/` → `archived_sessions/` — and a successful rescan
+/// re-records the fresh location. `codex_root` is resolved by the caller
+/// (the `CODEX_HOME` env edge above); `home` scopes the wrapper index.
+pub(crate) fn find_codex_session_file_in(
+    codex_root: &Path,
+    home: &Path,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if let Some(stored) =
+        crate::external_wrapper_index::resolved_rollout_path(home, "codex", session_id, |path| {
+            codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+    {
+        return Some(stored);
+    }
     let mut files = Vec::new();
-    collect_jsonl_files(&codex.join("sessions"), &mut files);
-    collect_jsonl_files(&codex.join("archived_sessions"), &mut files);
-    files
+    collect_jsonl_files(&codex_root.join("sessions"), &mut files);
+    collect_jsonl_files(&codex_root.join("archived_sessions"), &mut files);
+    let found = files
         .into_iter()
-        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))?;
+    let _ = crate::external_wrapper_index::record_rollout_path(home, "codex", session_id, &found);
+    Some(found)
 }
 
 pub(crate) fn codex_message_content_text(content: &serde_json::Value) -> Option<String> {
@@ -356,5 +381,92 @@ mod tests {
         assert!(!is_codex_injected_user_text_for_main(
             "please inspect <bash-input> handling"
         ));
+    }
+
+    #[test]
+    fn find_codex_session_file_in_reuses_stored_rollout_path_and_survives_migration() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "019ea8b9-0000-7000-8000-00000000dd01";
+        let wrapper_id = "9a411507-4a41-4a37-95a2-6a8f4f9edc01";
+        let log_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            session_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+
+        let codex_root = home.path().join("codex-root");
+        let sessions_dir = codex_root.join("sessions").join("2026").join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let meta = serde_json::json!({
+            "timestamp": "2026-07-11T10:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        });
+        let decoy = serde_json::json!({
+            "timestamp": "2026-07-11T10:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "019ea8b9-9999-7000-8000-00000000dd99" }
+        });
+        std::fs::write(sessions_dir.join("decoy.jsonl"), decoy.to_string()).unwrap();
+        let live = sessions_dir.join("rollout.jsonl");
+        std::fs::write(&live, meta.to_string()).unwrap();
+
+        // First resolution scans and records the location.
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(live.clone())
+        );
+        assert_eq!(
+            crate::external_wrapper_index::resolved_rollout_path(
+                home.path(),
+                "codex",
+                session_id,
+                |_| true
+            ),
+            Some(live.clone())
+        );
+
+        // Migration sessions/ -> archived_sessions/: the stored path goes
+        // stale, the scan fallback finds the new home and re-records it.
+        let archived_dir = codex_root.join("archived_sessions");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let archived = archived_dir.join("rollout.jsonl");
+        std::fs::rename(&live, &archived).unwrap();
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(archived.clone())
+        );
+        assert_eq!(
+            crate::external_wrapper_index::resolved_rollout_path(
+                home.path(),
+                "codex",
+                session_id,
+                |_| true
+            ),
+            Some(archived.clone())
+        );
+
+        // The stored path short-circuits the scan: a recorded location
+        // outside the scanned roots still resolves, as long as the file
+        // exists and its session id verifies.
+        let outside = codex_root.join("kept.jsonl");
+        std::fs::rename(&archived, &outside).unwrap();
+        crate::external_wrapper_index::record_rollout_path(
+            home.path(),
+            "codex",
+            session_id,
+            &outside,
+        )
+        .unwrap();
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(outside)
+        );
     }
 }

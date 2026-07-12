@@ -119,6 +119,14 @@ pub struct ExternalWrapperRecord {
     /// zero-sentinel: demotion sets both, reactivation clears both.
     #[serde(default)]
     pub state: WrapperState,
+    /// Resolved native backend log (e.g. the Codex rollout file) for this
+    /// record's backend session, cached by [`record_rollout_path`] the
+    /// first time a consumer pays for the full scan. Never trust it
+    /// blindly: resolve through [`resolved_rollout_path`], which re-checks
+    /// existence plus a caller-supplied identity predicate — native files
+    /// migrate (Codex `sessions/` → `archived_sessions/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,6 +286,7 @@ pub fn upsert(
             project_root,
             updated_at_secs,
             state: WrapperState::Active,
+            rollout_path: None,
         });
     }
 
@@ -379,6 +388,100 @@ pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperReco
     });
     records.sort_by(wrapper_preference);
     records
+}
+
+/// Remember the resolved native backend log (e.g. a Codex rollout file)
+/// for `(source, backend_session_id)`. The path is stamped on EVERY record
+/// of that backend session — the native file is a property of the backend
+/// session, not of one wrapper — so resolution keeps working after the
+/// current wrapper row is later demoted. No-op when the index has no
+/// record for the session (the caller's scan fallback simply runs again
+/// next time).
+pub fn record_rollout_path(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    rollout_path: &Path,
+) -> Result<(), String> {
+    let source = crate::session_names::normalize_source(source);
+    let backend_session_id = backend_session_id.trim();
+    let rollout_path = rollout_path.to_string_lossy().to_string();
+    if source.is_empty() || backend_session_id.is_empty() || rollout_path.is_empty() {
+        return Ok(());
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = with_index_unlocked(home, |index| index.clone());
+    let mut dirty = false;
+    for record in index
+        .wrappers
+        .iter_mut()
+        .filter(|record| record.source == source && record.backend_session_id == backend_session_id)
+    {
+        dirty |= record.rollout_path.as_deref() != Some(rollout_path.as_str());
+        record.rollout_path = Some(rollout_path.clone());
+    }
+    if !dirty {
+        return Ok(());
+    }
+    write_index_unlocked(home, &index)?;
+    note_index_written(home, &index);
+    Ok(())
+}
+
+/// The stored native-log path for `(source, backend_session_id)`, verified
+/// before trust: the file must still exist and `verify` (typically "does
+/// its session id still match?") must accept it — otherwise `None`, and
+/// the caller falls back to its scan (native files migrate, e.g. Codex
+/// `sessions/` → `archived_sessions/`) and re-records the fresh location.
+/// Stored candidates are tried in the "active wins" preference order;
+/// `verify` runs outside the index lock (it may read a large file). Stale
+/// paths are not cleared here — the caller's post-scan
+/// [`record_rollout_path`] overwrite is the heal.
+pub fn resolved_rollout_path(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    verify: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let source = crate::session_names::normalize_source(source);
+    let backend_session_id = backend_session_id.trim();
+    if source.is_empty() || backend_session_id.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<String> = {
+        let _guard = INDEX_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        with_index_unlocked(home, |index| {
+            let mut records: Vec<&ExternalWrapperRecord> = index
+                .wrappers
+                .iter()
+                .filter(|record| {
+                    record.source == source
+                        && record.backend_session_id == backend_session_id
+                        && record.rollout_path.is_some()
+                })
+                .collect();
+            records.sort_by(|a, b| wrapper_preference(a, b));
+            records
+                .into_iter()
+                .filter_map(|record| record.rollout_path.clone())
+                .collect()
+        })
+    };
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() && verify(&path) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 pub fn record_to_json(record: &ExternalWrapperRecord) -> serde_json::Value {
@@ -645,6 +748,7 @@ mod tests {
         let wrappers = wrappers_for(home.path(), "codex", backend_id);
         assert_eq!(wrappers.len(), 1);
         assert_eq!(wrappers[0].state, WrapperState::Active);
+        assert_eq!(wrappers[0].rollout_path, None);
         assert_eq!(wrappers[0].updated_at_secs, 1234);
     }
 
@@ -742,6 +846,56 @@ mod tests {
             active_wrapper_for(home.path(), "codex", backend_two)
                 .map(|record| record.intendant_session_id),
             Some("eeee0000-0000-4000-8000-000000000005".to_string())
+        );
+    }
+
+    #[test]
+    fn rollout_path_roundtrip_and_stale_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_id = "5f8a33fe-6cbb-49f0-8d2a-52a4de17c001";
+        let log_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let backend_id = "019ea8b9-0000-7000-8000-00000000cc01";
+        upsert(home.path(), "codex", backend_id, wrapper_id, &log_dir, None).unwrap();
+
+        let rollout = home.path().join("rollouts").join("r.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, "{\"type\":\"session_meta\"}\n").unwrap();
+
+        // Unknown backend session: the setter no-ops, the resolver stays
+        // empty — callers just keep scanning.
+        let unknown_backend = "019ea8b9-ffff-7000-8000-00000000cc99";
+        record_rollout_path(home.path(), "codex", unknown_backend, &rollout).unwrap();
+        assert_eq!(
+            resolved_rollout_path(home.path(), "codex", unknown_backend, |_| true),
+            None
+        );
+
+        // Roundtrip.
+        record_rollout_path(home.path(), "codex", backend_id, &rollout).unwrap();
+        assert_eq!(
+            resolved_rollout_path(home.path(), "codex", backend_id, |_| true),
+            Some(rollout.clone())
+        );
+        // The caller's identity re-verification is a veto.
+        assert_eq!(
+            resolved_rollout_path(home.path(), "codex", backend_id, |_| false),
+            None
+        );
+        // The stored path is persisted, not cache-only.
+        let raw = std::fs::read_to_string(index_path(home.path())).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            disk["wrappers"][0]["rollout_path"],
+            serde_json::Value::String(rollout.to_string_lossy().to_string())
+        );
+
+        // Stale path (file deleted): the resolver declines even with a
+        // permissive verify, so callers fall back to the scan.
+        std::fs::remove_file(&rollout).unwrap();
+        assert_eq!(
+            resolved_rollout_path(home.path(), "codex", backend_id, |_| true),
+            None
         );
     }
 }
