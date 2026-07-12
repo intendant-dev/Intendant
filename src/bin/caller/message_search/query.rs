@@ -38,7 +38,11 @@ const HIT_OVERHEAD_BYTES: usize = 320;
 const SNIPPET_BEFORE_BYTES: usize = 120;
 const SNIPPET_TOTAL_BYTES: usize = 280;
 /// Byte budget for shards resident in the fold arena (LRU beyond it).
-const ARENA_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Calibrated on the real corpus (soak 2026-07-12): 1.4k sessions cost
+/// ~2x their 36MB of shard JSON with the ASCII fast path — a budget
+/// smaller than the working set makes every query re-load and re-fold
+/// under its time budget, answering `partial` forever.
+const ARENA_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 /// Per-query ceiling on freshly loaded shard bytes: a query that would
 /// have to page the whole arena through memory ends early with
 /// `partial: "budget"` instead of thrashing.
@@ -147,12 +151,36 @@ pub(crate) fn run_message_search(
     let mut partial_reason: Option<&'static str> = None;
     let mut loaded_bytes: usize = 0;
 
-    // Scan pass: match every (source-filtered) session, keep its summary.
+    // Scan newest-first with an early exit: a session's best hit can
+    // never be newer than its entry's newest_ts_ms, so once the page is
+    // full and the next entry is older than the page's worst kept best
+    // hit, nothing later can displace it. Broad terms become
+    // limit-bounded instead of full-corpus (soak 2026-07-12: key-order
+    // scanning answered `partial` forever on the real corpus, and a
+    // timeout cut could drop the newest sessions from the page).
+    let mut ordered: Vec<(&String, &super::store::SessionEntry)> =
+        snapshot.manifest.sessions.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.newest_ts_ms
+            .cmp(&a.1.newest_ts_ms)
+            .then_with(|| a.0.cmp(b.0))
+    });
     let mut matched: Vec<SessionMatch> = Vec::new();
-    for (session_key, entry) in &snapshot.manifest.sessions {
+    let mut kept_past_cursor = 0usize;
+    for (session_key, entry) in ordered {
         if std::time::Instant::now() >= deadline {
             partial_reason = Some("timeout");
             break;
+        }
+        if kept_past_cursor > limit {
+            let worst_kept = matched
+                .iter()
+                .map(|m| m.best_ts_ms)
+                .min()
+                .unwrap_or(i64::MIN);
+            if entry.newest_ts_ms < worst_kept {
+                break;
+            }
         }
         let Some(source) = source_of_key(session_key) else {
             continue;
@@ -176,7 +204,7 @@ pub(crate) fn run_message_search(
             partial_reason = Some("budget");
             break;
         }
-        let active = derive_active(&shard.shard.records, &shard.shard.marks);
+        let active = &shard.active;
         let mut hits: Vec<Hit> = Vec::new();
         for (index, record) in shard.shard.records.iter().enumerate() {
             if record.ts_ms < horizon_ms {
@@ -211,6 +239,16 @@ pub(crate) fn run_message_search(
         });
         hits.truncate(HITS_PER_SESSION);
         let best_ts_ms = shard.shard.records[hits[0].record_index].ts_ms;
+        let past_cursor = match &after {
+            None => true,
+            Some(after) => {
+                best_ts_ms < after.best_ts_ms
+                    || (best_ts_ms == after.best_ts_ms && *session_key > after.session_key)
+            }
+        };
+        if past_cursor {
+            kept_past_cursor += 1;
+        }
         matched.push(SessionMatch {
             session_key: session_key.clone(),
             source,
@@ -495,12 +533,23 @@ fn decode_cursor(raw: &str, expected_fingerprint: &str) -> Result<DecodedCursor,
 /// Folded text with an exact folded-byte → original-byte-offset map.
 pub(crate) struct FoldedText {
     folded: String,
-    /// Original char START offset for each folded byte.
+    /// Original char START offset for each folded byte. EMPTY when the
+    /// fold is byte-aligned (pure-ASCII text: lowercasing is 1:1, and
+    /// canonical decomposition of ASCII is identity) — the map is the
+    /// arena's dominant cost (4 bytes per folded byte), and the corpus
+    /// is overwhelmingly ASCII.
     starts: Vec<u32>,
     original_len: u32,
 }
 
 pub(crate) fn fold_text(text: &str) -> FoldedText {
+    if text.is_ascii() {
+        return FoldedText {
+            folded: text.to_ascii_lowercase(),
+            starts: Vec::new(),
+            original_len: text.len() as u32,
+        };
+    }
     let mut folded = String::with_capacity(text.len());
     let mut starts = Vec::with_capacity(text.len());
     for (offset, ch) in text.char_indices() {
@@ -524,6 +573,13 @@ impl FoldedText {
     /// is the producing char's start; the end extends to the end of the
     /// original char that produced the last folded byte.
     fn original_range(&self, folded_start: usize, folded_end: usize) -> (u32, u32) {
+        if self.starts.is_empty() {
+            // Byte-aligned fold (ASCII fast path): offsets are identity.
+            return (
+                (folded_start as u32).min(self.original_len),
+                (folded_end as u32).min(self.original_len),
+            );
+        }
         let start = self
             .starts
             .get(folded_start)
@@ -554,6 +610,11 @@ impl FoldedText {
 pub(crate) struct LoadedShard {
     pub shard: SessionShard,
     pub folded: Vec<FoldedText>,
+    /// Derived active flags, index-aligned with `records` — pure per
+    /// content-named generation file, so computed once at load instead
+    /// of per query (rare terms scan every session; per-query
+    /// derive_active dominated their cost on the real corpus).
+    pub active: Vec<bool>,
     cost_bytes: usize,
 }
 
@@ -602,6 +663,7 @@ fn arena_load(store_root: &Path, generation_file: &str) -> Option<(Arc<LoadedSha
         .iter()
         .map(|record| fold_text(&record.text))
         .collect();
+    let active = derive_active(&shard.records, &shard.marks);
     let cost_bytes = raw.len()
         + folded
             .iter()
@@ -610,6 +672,7 @@ fn arena_load(store_root: &Path, generation_file: &str) -> Option<(Arc<LoadedSha
     let loaded = Arc::new(LoadedShard {
         shard,
         folded,
+        active,
         cost_bytes,
     });
 
