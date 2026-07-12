@@ -52,10 +52,11 @@ permit_dir = "/usr/local/var/intendant-governor"
 local_reserved = 1
 ci_reserved = 2
 ci_users = ["_intendant-ci", "ci"]
-# Governed (and fail-open) invocations exec `wrap_with <rustc> <args…>` —
-# the sccache client; the flock permit rides into it and is held for the
-# whole cache round-trip / server-side compile. Unset, empty, or a missing
-# path: the compiler runs directly (correct, just uncached).
+# Governed invocations spawn `wrap_with <rustc> <args…>` (the sccache
+# client) as a CHILD while the governor itself holds the permit until the
+# child exits — the fd is close-on-exec, so no child (crucially, no
+# daemonized sccache server) can inherit the flock. Unset, empty, or a
+# missing path: the compiler runs directly (correct, just uncached).
 wrap_with = "/opt/homebrew/bin/sccache"
 CONF_EOF
     chmod 0644 "$CONF"

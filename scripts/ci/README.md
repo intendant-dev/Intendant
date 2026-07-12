@@ -109,6 +109,17 @@ swap → `kernel_task` throttle spiral follows. `crates/rustc-governor`
 adds the missing machine-wide bound: a compile-permit pool shared by
 every account on the box.
 
+This is a **policy ceiling, not a hard one**: cargo's env layer beats
+config, so `RUSTC_WRAPPER=""` (or a direct `RUSTC=…` override) opts a
+build out of the governor entirely — observed in the wild from an agent
+session (an ungoverned 1.8GB rustc while all permits sat free). The
+box's inhabitants are cooperative agents, so the enforcement stack is
+doctrine (CLAUDE.md forbids the override outside wrapper diagnostics)
+plus observability (the watchdog logs any substantial rustc with
+neither a governor nor an sccache ancestor). Enforcement below cargo's
+overridable layer was considered and deliberately skipped as
+disproportionate.
+
 ### The chain
 
 ```
