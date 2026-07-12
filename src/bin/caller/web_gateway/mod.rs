@@ -3,7 +3,6 @@ use crate::presence::{self, AgentStateSnapshot};
 use crate::types::{LogLevel, SessionGoal};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};

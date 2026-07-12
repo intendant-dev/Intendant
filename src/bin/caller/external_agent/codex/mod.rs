@@ -27,6 +27,7 @@ mod context_trace;
 pub(crate) use context_trace::*;
 mod reader;
 pub(crate) use reader::*;
+pub(crate) mod rollout;
 
 // ---------------------------------------------------------------------------
 // Display tools system prompt
