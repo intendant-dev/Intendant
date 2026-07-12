@@ -1049,7 +1049,7 @@ pub(crate) async fn run_agent_loop(
                     context_window: Some(conversation.context_window()),
                     hard_context_window: Some(conversation.context_window()),
                     item_count: provider_request_item_count(&raw_context),
-                    raw: raw_context,
+                    raw: std::sync::Arc::new(raw_context),
                 });
             }
             Err(e) => {

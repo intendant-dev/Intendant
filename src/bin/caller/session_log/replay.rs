@@ -320,7 +320,7 @@ pub fn session_log_entry_to_app_event(
                 context_window,
                 hard_context_window,
                 item_count,
-                raw,
+                raw: std::sync::Arc::new(raw),
             })
         }
 
