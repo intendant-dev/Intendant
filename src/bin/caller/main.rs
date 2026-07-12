@@ -40,6 +40,7 @@ mod gateway_routes;
 mod global_store;
 mod hosted_verify;
 pub(crate) use intendant_core::knowledge;
+mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
 mod live_audio;

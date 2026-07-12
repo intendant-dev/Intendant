@@ -310,6 +310,20 @@ Mitigations: the materialization root is outside worktrees and is never
 seen by rewind/snapshot machinery, the file exists only while leased,
 and crash recovery deletes stale materializations at startup.
 
+**Transcript staging at cleanup.** The materialized home also holds the
+agent's session transcripts (Codex `sessions/`, Claude `projects/`), and
+deleting the home would erase them from message search. Cleanup therefore
+first *renames* those transcript subdirectories into a credential-free
+staging area under `~/.intendant/cache/message_search/staging/`
+(same-volume rename — effectively instant), then deletes the home
+immediately (`lease_transcript_staging.rs`). Staging is strictly
+best-effort and never delays secret deletion: on any failure a marker
+records the coverage gap and the deletion proceeds. The startup crash
+sweep stages the same way before removing leftovers, staged entries not
+drained within the search retention window are GC'd at startup, and an
+`active/` registry (one file per materialized home) tells the
+message-search indexer which leased homes are live right now.
+
 **Fallback.** `.env` keeps working untouched (`custody = "local"`, the
 implicit default), so nothing breaks for existing daemons and CI. A
 daemon with no local keys and no lease reports "unfueled" in the
