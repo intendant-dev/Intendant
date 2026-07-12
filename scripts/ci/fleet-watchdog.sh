@@ -197,6 +197,27 @@ evict_until() {
     done
 }
 
+# Policy-ceiling observability: a substantial rustc with neither a
+# rustc-governor nor an sccache ancestor means someone opted out of the
+# governor (env beats config: RUSTC_WRAPPER="" / RUSTC=… — seen in the
+# wild from an agent session). Log-only; the inhabitants are cooperative
+# agents and CLAUDE.md carries the doctrine. Known blind spot: a build
+# run with RUSTC_WRAPPER=sccache (bypassing the governor but keeping
+# sccache) is ancestry-indistinguishable from a governed compile.
+detect_ungoverned_rustc() {
+    ps -axo pid=,rss=,comm= 2>/dev/null | awk '$3 ~ /rustc$/ && $2 > 512000 {print $1, $2}'     | while read -r rpid rss; do
+        p="$rpid" governed=0 hop=0
+        while [ "$hop" -lt 10 ] && [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+            case "$(ps -o comm= -p "$p" 2>/dev/null)" in
+                *rustc-governor* | *sccache*) governed=1; break ;;
+            esac
+            p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+            hop=$((hop + 1))
+        done
+        [ "$governed" = 0 ] && log "ungoverned rustc pid=$rpid rss=$((rss / 1024))MB — no governor/sccache ancestor (RUSTC_WRAPPER override?)"
+    done
+}
+
 main() {
     free=$(free_gb)
 
@@ -225,6 +246,7 @@ main() {
         fi
     fi
 
+    detect_ungoverned_rustc
     prune_stale_keys
     evict_until 0  # steady-state cap enforcement
 
