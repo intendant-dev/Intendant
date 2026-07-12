@@ -1596,6 +1596,15 @@ pub(crate) fn spawn_consent_pending(id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Proof that a human approved one live-audio spawn.
+///
+/// The only mint is [`request_spawn_consent`]; [`run_session`] demands one,
+/// so a dispatch path that skips the gate is a compile error rather than a
+/// policy bug. Single-use by move, deliberately neither `Clone` nor `Copy`,
+/// and the private field keeps construction inside this module.
+#[derive(Debug)]
+pub(crate) struct SpawnConsent(());
+
 /// Everything the consent gate needs from a dispatch path.
 pub(crate) struct SpawnConsentRequest<'a> {
     pub bus: &'a crate::event::EventBus,
@@ -1696,15 +1705,16 @@ fn spawn_consent_timeout_message(wait: Duration) -> String {
 
 /// Block until a human approves or denies this live-audio spawn.
 ///
-/// Returns `Ok(())` on approval and `Err(message_for_the_model)` otherwise
-/// (denied, skipped, timed out, or unapprovable). `ApproveAll` approves
-/// this prompt only — it never records a session-wide grant, because
-/// `LiveAudioSpawn` is always-ask by policy; the gate deliberately never
-/// touches the autonomy guard or the approved-command dedup set.
+/// Returns the [`SpawnConsent`] token on approval and
+/// `Err(message_for_the_model)` otherwise (denied, skipped, timed out, or
+/// unapprovable). `ApproveAll` approves this prompt only — it never records
+/// a session-wide grant, because `LiveAudioSpawn` is always-ask by policy;
+/// the gate deliberately never touches the autonomy guard or the
+/// approved-command dedup set.
 pub(crate) async fn request_spawn_consent(
     req: SpawnConsentRequest<'_>,
     wait: Duration,
-) -> Result<(), String> {
+) -> Result<SpawnConsent, String> {
     use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
 
     let id = next_spawn_consent_id();
@@ -1732,7 +1742,9 @@ pub(crate) async fn request_spawn_consent(
             }
         }
         let (action, verdict) = match outcome {
-            Ok(Ok(ApprovalResponse::Approve | ApprovalResponse::ApproveAll)) => ("approve", Ok(())),
+            Ok(Ok(ApprovalResponse::Approve | ApprovalResponse::ApproveAll)) => {
+                ("approve", Ok(SpawnConsent(())))
+            }
             Ok(Ok(ApprovalResponse::Skip)) => ("skip", Err(SPAWN_CONSENT_SKIPPED.to_string())),
             Ok(Ok(ApprovalResponse::Deny | ApprovalResponse::Answer { .. })) | Ok(Err(_)) => {
                 ("deny", Err(SPAWN_CONSENT_DENIED.to_string()))
@@ -1787,7 +1799,7 @@ pub(crate) async fn request_spawn_consent(
                 return match response {
                     Ok(ApprovalResponse::Approve | ApprovalResponse::ApproveAll) => {
                         guard.resolve("approve");
-                        Ok(())
+                        Ok(SpawnConsent(()))
                     }
                     Ok(ApprovalResponse::Skip) => {
                         guard.resolve("skip");
@@ -1821,7 +1833,7 @@ pub(crate) async fn request_spawn_consent(
                             if verb_id == id =>
                         {
                             guard.resolve("approve");
-                            return Ok(());
+                            return Ok(SpawnConsent(()));
                         }
                         ControlMsg::Deny { id: verb_id, .. } if verb_id == id => {
                             guard.resolve("deny");
@@ -1850,8 +1862,11 @@ pub(crate) fn spawn_consent_preview(spec: &LiveAudioSpec) -> String {
 ///
 /// This is the main entry point called from the agent loop when handling a
 /// `spawn_live_audio` tool call. It blocks until the call finishes or times out.
+/// Requires a [`SpawnConsent`] minted by [`request_spawn_consent`]: the
+/// always-ask policy holds by construction, not by caller discipline.
 pub async fn run_session(
     spec: &LiveAudioSpec,
+    _consent: SpawnConsent,
     api_key: &str,
     bridge: &AudioBridge,
     session_log_dir: &Path,
@@ -3035,8 +3050,10 @@ mod tests {
 
         let tmp_dir = tempfile::tempdir().expect("create temp dir");
 
+        // In-module mint: the live test stands in for an approved dispatch.
         let result = run_session(
             &spec,
+            SpawnConsent(()),
             &api_key,
             &bridge,
             tmp_dir.path(),
@@ -3161,8 +3178,10 @@ mod tests {
         eprintln!("  Session ID: {}", session_id);
         eprintln!("  Log dir: {}", tmp_dir.path().display());
 
+        // In-module mint: the live test stands in for an approved dispatch.
         let result = run_session(
             &spec,
+            SpawnConsent(()),
             &api_key,
             &bridge,
             tmp_dir.path(),

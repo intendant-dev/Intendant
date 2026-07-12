@@ -1525,7 +1525,7 @@ pub(crate) async fn run_agent_loop(
                         slog(&session_log, |l| {
                             l.approval(&category, &consent_preview, "waiting")
                         });
-                        let consent = live_audio::request_spawn_consent(
+                        let consent = match live_audio::request_spawn_consent(
                             live_audio::SpawnConsentRequest {
                                 bus,
                                 approval_registry: Some(approval_registry),
@@ -1536,14 +1536,17 @@ pub(crate) async fn run_agent_loop(
                             },
                             live_audio::SPAWN_CONSENT_WAIT,
                         )
-                        .await;
-                        if let Err(denied) = consent {
-                            slog(&session_log, |l| {
-                                l.approval(&category, &consent_preview, "denied")
-                            });
-                            conversation.add_tool_result(call_id, "spawn_live_audio", &denied);
-                            continue;
-                        }
+                        .await
+                        {
+                            Ok(consent) => consent,
+                            Err(denied) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&category, &consent_preview, "denied")
+                                });
+                                conversation.add_tool_result(call_id, "spawn_live_audio", &denied);
+                                continue;
+                            }
+                        };
                         slog(&session_log, |l| {
                             l.approval(&category, &consent_preview, "approved")
                         });
@@ -1604,6 +1607,7 @@ pub(crate) async fn run_agent_loop(
 
                         let result = live_audio::run_session(
                             &spec,
+                            consent,
                             &api_key,
                             &bridge,
                             log_dir,

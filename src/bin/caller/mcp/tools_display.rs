@@ -1289,7 +1289,7 @@ impl IntendantServer {
                     Some(fallback.to_string())
                 }
             });
-        if let Err(denied) = live_audio::request_spawn_consent(
+        let consent = match live_audio::request_spawn_consent(
             live_audio::SpawnConsentRequest {
                 bus: &self.bus,
                 approval_registry: Some(&approval_registry),
@@ -1302,8 +1302,9 @@ impl IntendantServer {
         )
         .await
         {
-            return denied;
-        }
+            Ok(consent) => consent,
+            Err(denied) => return denied,
+        };
 
         // Build system prompt from playbook + schema
         let project_root = std::env::var("INTENDANT_PROJECT_ROOT")
@@ -1365,6 +1366,7 @@ impl IntendantServer {
 
         let result = live_audio::run_session(
             &spec,
+            consent,
             &api_key,
             &bridge,
             &log_dir,
