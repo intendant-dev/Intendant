@@ -850,9 +850,7 @@ pub(crate) fn persisted_log_dir_for_session_in_home(
     ["codex", "claude-code", "gemini"]
         .into_iter()
         .find_map(|source| {
-            crate::external_wrapper_index::wrappers_for(home, source, session_id)
-                .into_iter()
-                .next()
+            crate::external_wrapper_index::active_wrapper_for(home, source, session_id)
                 .map(|record| std::path::PathBuf::from(record.log_path))
         })
 }
