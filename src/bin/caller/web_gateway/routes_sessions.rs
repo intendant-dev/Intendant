@@ -2233,6 +2233,78 @@ pub(crate) async fn handle_history_get(
     ("200 OK", body)
 }
 
+/// Targeted conversation rollback for a supervised session (additive
+/// shape on `POST /api/session/current/rollback`): body carries
+/// `session_id` + `round_id` (the session's round number as broadcast by
+/// its `round_complete` events) + `revert_conversation: true`. The
+/// session's parked drain resolves the round from its own ledger and
+/// truncates; delivery is drain-time and the dashboard observes
+/// `ConversationRolledBack` for completion, exactly like the legacy
+/// current-session path. The file half stays legacy-only — per-session
+/// file rollback needs per-root watchers that don't exist yet.
+fn handle_targeted_conversation_rollback(
+    body_text: &str,
+    session_id: String,
+    bus: &EventBus,
+) -> (&'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body_text) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": format!("invalid body: {}", e)}).to_string(),
+            );
+        }
+    };
+    let Some(round_id) = parsed.get("round_id").and_then(|v| v.as_u64()) else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "missing round_id"}).to_string(),
+        );
+    };
+    let revert_files = parsed
+        .get("revert_files")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let revert_conversation = parsed
+        .get("revert_conversation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if revert_files {
+        return (
+            "400 Bad Request",
+            serde_json::json!({
+                "error": "revert_files is not supported for a targeted session; \
+                 pass revert_files: false"
+            })
+            .to_string(),
+        );
+    }
+    if !revert_conversation {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "targeted rollback requires revert_conversation: true"})
+                .to_string(),
+        );
+    }
+    bus.send(AppEvent::ConversationRollbackRequested {
+        session_id: Some(session_id.clone()),
+        round_id,
+        target_native_message_count: None,
+        turns_to_drop: 0,
+    });
+    (
+        "200 OK",
+        serde_json::json!({
+            "to_round_id": round_id,
+            "files_reverted": 0,
+            "session_id": session_id,
+            "conversation": "requested",
+        })
+        .to_string(),
+    )
+}
+
 /// POST /api/session/current/rollback — body:
 /// ```json
 /// { "round_id": N,
@@ -2259,6 +2331,24 @@ pub(crate) async fn handle_history_rollback(
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
     bus: &EventBus,
 ) -> (&'static str, String) {
+    // Targeted shape: roll back a SUPERVISED session's conversation
+    // (see handle_targeted_conversation_rollback). Peeked
+    // non-destructively so every historical request (no session_id)
+    // keeps its exact guard order and transcripts (golden-pinned:
+    // watcher-less daemons answer 503 before body validation).
+    let targeted_session: Option<String> = serde_json::from_str::<serde_json::Value>(body_text)
+        .ok()
+        .and_then(|v| {
+            v.get("session_id")
+                .and_then(|id| id.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
+    if let Some(session_id) = targeted_session {
+        return handle_targeted_conversation_rollback(body_text, session_id, bus);
+    }
+
     let Some(fw) = file_watcher else {
         return (
             "503 Service Unavailable",
@@ -2379,6 +2469,7 @@ pub(crate) async fn handle_history_rollback(
     // up and emits `ConversationRolledBack` when done.
     if let Some((target_msg_count, turns_to_drop)) = conv_params {
         bus.send(AppEvent::ConversationRollbackRequested {
+            session_id: None,
             round_id,
             target_native_message_count: target_msg_count,
             turns_to_drop,

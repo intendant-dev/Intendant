@@ -3234,6 +3234,225 @@ async fn parked_session_delivers_an_id_less_steer() {
     assert_eq!(msg_field(steer_row, "provenance").as_str(), Some("steer"));
 }
 
+/// Targeted conversation rollback: a SUPERVISED session's parked drain
+/// executes `POST /api/session/current/rollback { session_id, round_id,
+/// revert_conversation: true, revert_files: false }` — previously the
+/// signal was only handled by the headless boot-session loop, so the
+/// pure-daemon rollback rail was dead (the gap the B2 message-lane e2e
+/// documented). Two rounds run, the conversation rolls back to round 1,
+/// and a third round proves the session keeps working on the truncated
+/// conversation; the session log carries the same `conversation_rewound`
+/// cut the message-search extractor derives supersession from, and the
+/// completion event carries the session id.
+#[tokio::test]
+async fn supervised_session_rolls_back_conversation_to_a_round() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Round one done.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Round two done.",
+                  "expect_transcript_contains": "start round two",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] },
+                { "content": "Post-rollback round done.",
+                  "expect_transcript_contains": "after the rewind",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round three" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the sibling tests.
+    let mut completed = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "run round one",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        completed = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+        })
+        .await;
+        if completed.is_some() {
+            break;
+        }
+    }
+    let completed = completed.unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = completed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("round_complete carries its session id")
+        .to_string();
+
+    // Round 2 via a follow-up steer (id-carrying, the delivered path).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "rollback-e2e-steer-1",
+            "text": "start round two",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send round-2 steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("round").and_then(|v| v.as_u64()) == Some(2)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 2 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // Targeted conversation rollback to round 1 through the route.
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/session/current/rollback"
+        ))
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "round_id": 1,
+            "revert_conversation": true,
+            "revert_files": false,
+        }))
+        .send()
+        .await
+        .expect("send targeted rollback");
+    assert!(
+        response.status().is_success(),
+        "targeted rollback rejected: {:?}",
+        response.text().await
+    );
+    let rolled = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("conversation_rolled_back")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "targeted rollback never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    assert!(
+        rolled
+            .get("turns_removed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0,
+        "rollback must remove round 2's messages: {rolled}"
+    );
+
+    // The session still works: round 3 on the truncated conversation.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "rollback-e2e-steer-2",
+            "text": "after the rewind",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send post-rollback steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("round").and_then(|v| v.as_u64()) == Some(2)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "post-rollback round never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    let _ = child.kill().await;
+
+    // The wire contract: the cut partitions round 2, round 3's steer rides
+    // after it with a fresh seq.
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+    let round2_seq = msg_field(
+        user_message_row(&messages, "start round two"),
+        "message_seq",
+    )
+    .as_u64()
+    .unwrap();
+    let round3_seq = msg_field(
+        user_message_row(&messages, "after the rewind"),
+        "message_seq",
+    )
+    .as_u64()
+    .unwrap();
+    let rewound = rows
+        .iter()
+        .find(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_rewound"))
+        .expect("conversation_rewound row exists");
+    let cut_after_seq = msg_field(rewound, "cut_after_seq").as_u64().unwrap();
+    assert!(
+        cut_after_seq < round2_seq && round2_seq < round3_seq,
+        "cut {cut_after_seq} must supersede round 2 (seq {round2_seq}) and precede          round 3 (seq {round3_seq})"
+    );
+}
+
 /// Message-lane wire contract, rollback half: the HEADLESS shape (task on
 /// argv) is the one execution shape whose outer loop (run_with_presence)
 /// handles `ConversationRollbackRequested`, so the round-rollback rail —

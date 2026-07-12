@@ -862,6 +862,8 @@ pub enum OutboundEvent {
     /// (native / Codex `thread/rollback`) or "session-reset"
     /// (CC / Gemini re-init).
     ConversationRolledBack {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         round_id: u64,
         turns_removed: u32,
         backend: String,

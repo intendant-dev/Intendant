@@ -913,6 +913,14 @@ pub enum AppEvent {
     /// (from `HistoryRound`) and `turn_count`; both are passed through
     /// here so the consumer doesn't have to look them up again.
     ConversationRollbackRequested {
+        /// Target session. `None` preserves the legacy shape: the
+        /// daemon's current/boot session (the headless outer loop).
+        /// `Some(id)` targets a supervised session's parked drain, which
+        /// resolves the round from its own ledger — delivery is
+        /// drain-time (a mid-round session is not listening; the
+        /// dashboard observes `ConversationRolledBack` for completion,
+        /// as it already does on the legacy path).
+        session_id: Option<String>,
         /// The round we are rolling back to. Echoed through to the
         /// completion event for UI correlation.
         round_id: u64,
@@ -928,6 +936,9 @@ pub enum AppEvent {
 
     /// Conversation was rolled back to a specific round.
     ConversationRolledBack {
+        /// The session that rolled back; `None` = the legacy
+        /// current-session shape.
+        session_id: Option<String>,
         round_id: u64,
         /// Number of messages/turns removed from the conversation.
         /// Semantics are backend-dependent:
@@ -2801,11 +2812,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             bytes_freed: *bytes_freed,
         }),
         AppEvent::ConversationRolledBack {
+            session_id,
             round_id,
             turns_removed,
             backend,
             method,
         } => Some(OutboundEvent::ConversationRolledBack {
+            session_id: session_id.clone(),
             round_id: *round_id,
             turns_removed: *turns_removed,
             backend: backend.clone(),
@@ -3439,6 +3452,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.history_pruned(*branches_removed, *bytes_freed);
         }
         AppEvent::ConversationRolledBack {
+            session_id: _,
             round_id,
             turns_removed,
             backend,
