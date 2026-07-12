@@ -283,18 +283,15 @@ class DisplaySlot {
     const logicalResolution = options.logicalResolution === true;
     const w = logicalResolution ? Math.round(sw / dpr) : sw;
     const h = logicalResolution ? Math.round(sh / dpr) : sh;
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    c.getContext('2d').drawImage(this.videoEl, 0, 0, w, h);
-    const dataUrl = c.toDataURL('image/jpeg', quality);
-    const b64 = dataUrl.split(',')[1];
-    return { canvas: c, dataUrl, b64, width: w, height: h };
+    return displayViewerRasterizeSurface(this.videoEl, w, h, quality);
   }
 
   /// Capture the currently-rendered video frame and queue it as a pending
   /// attachment. Works whether or not the display is currently streaming —
   /// just rasterizes whatever the <video> element is showing right now.
+  /// The frame-id scheme and upload live in the shared attach lane
+  /// (45-display-viewer-core); the stream name is the LOCAL policy
+  /// (`display_<id>`).
   async attachCurrentFrame() {
     const frame = this.captureCurrentFrame(0.85, { logicalResolution: true });
     if (!frame) {
@@ -302,40 +299,8 @@ class DisplaySlot {
       setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
       return;
     }
-    const dataUrl = frame.dataUrl;
-    const b64 = dataUrl.split(',')[1];
-    // Use a deterministic frame_id scheme so attachments are distinguishable
-    // from streamed frames in the registry.
-    if (!this._attachCounter) this._attachCounter = 0;
-    this._attachCounter++;
-    const stream = 'display_' + this.displayId + '_attach';
-    const frameId = stream + '-f' + String(this._attachCounter).padStart(5, '0');
-    const payload = {
-      t: 'annotation_attach',
-      frame_id: frameId,
-      stream: stream,
-      data: b64,
-      note: '',
-    };
-    try {
-      await sendDashboardMediaUpload(
-        'api_media_annotation_attach',
-        { frame_id: frameId, stream, note: '' },
-        dashboardControlBase64ToBytes(b64),
-        payload,
-        'annotation attach'
-      );
-    } catch (err) {
-      dashboardMediaTransferFailed(err, 'annotation attach');
+    if (!(await displayViewerUploadAttachFrame(this, 'display_' + this.displayId, frame))) {
       return;
-    }
-    if (typeof addPendingAttachment === 'function') {
-      addPendingAttachment({
-        frameId,
-        stream,
-        note: '',
-        dataUrl,
-      });
     }
     // Brief visual confirmation
     const orig = this.attachBtn.innerHTML;
@@ -371,15 +336,11 @@ class DisplaySlot {
   }
 
   // Toolbar-armed Callout: one-shot region flag shipped through the
-  // annotation-attach lane. Shared machinery lives in 47-annotation-clips
-  // (toggleLiveCallout); armable only while input authority is 'you'
-  // (button disabled otherwise, disarmed on authority loss).
+  // annotation-attach lane (shared wiring in 45-display-viewer-core;
+  // machinery in 47-annotation-clips). Armable only while input
+  // authority is 'you' (button disabled otherwise, disarmed on loss).
   toggleCallout() {
-    toggleLiveCallout({
-      provider: this._annotationSurfaceProvider(),
-      button: this.calloutBtn,
-      captureFrame: (q) => this.captureCurrentFrame(q),
-    });
+    displayViewerToggleCallout(this, this.calloutBtn);
   }
 
   sendLegacyDisplaySignal(payload) {

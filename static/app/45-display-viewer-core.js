@@ -599,3 +599,76 @@ function displayViewerClearNoTrackWatchdog(viewer) {
     viewer._noTrackTimer = null;
   }
 }
+
+// ── Frame capture + attach lane ─────────────────────────────────────────
+// Rasterize a live surface (<video> or the peer tile canvas) at the given
+// target size into { canvas, dataUrl, b64, width, height } — the frame
+// shape 47-annotation-clips' editor, the callout arm, and the attach lane
+// all consume. Sizing policy stays with the callers (the local slot
+// optionally divides by devicePixelRatio for logical-resolution captures;
+// the peer captures at intrinsic surface size).
+function displayViewerRasterizeSurface(surface, width, height, quality) {
+  const c = document.createElement('canvas');
+  c.width = width;
+  c.height = height;
+  c.getContext('2d').drawImage(surface, 0, 0, width, height);
+  const dataUrl = c.toDataURL('image/jpeg', quality);
+  return { canvas: c, dataUrl, b64: dataUrl.split(',')[1], width, height };
+}
+
+// Ship a captured frame down the annotation-attach lane and queue it as a
+// pending attachment. Owns the deterministic frame_id scheme (so
+// attachments are distinguishable from streamed frames in the registry):
+// `<streamBase>_attach-fNNNNN` with a per-viewer counter. `streamBase` is
+// the policy-owned name — `display_<id>` locally,
+// `peer_<safeHost>_display_<id>` on peer panes — so frame ids stay unique
+// across hosts and never collide across surfaces. Returns false when the
+// upload failed (already surfaced via dashboardMediaTransferFailed);
+// callers gate their button confirmation on it.
+async function displayViewerUploadAttachFrame(viewer, streamBase, frame) {
+  if (!viewer._attachCounter) viewer._attachCounter = 0;
+  viewer._attachCounter++;
+  const stream = streamBase + '_attach';
+  const frameId = stream + '-f' + String(viewer._attachCounter).padStart(5, '0');
+  const payload = {
+    t: 'annotation_attach',
+    frame_id: frameId,
+    stream: stream,
+    data: frame.b64,
+    note: '',
+  };
+  try {
+    await sendDashboardMediaUpload(
+      'api_media_annotation_attach',
+      { frame_id: frameId, stream, note: '' },
+      dashboardControlBase64ToBytes(frame.b64),
+      payload,
+      'annotation attach'
+    );
+  } catch (err) {
+    dashboardMediaTransferFailed(err, 'annotation attach');
+    return false;
+  }
+  if (typeof addPendingAttachment === 'function') {
+    addPendingAttachment({
+      frameId,
+      stream,
+      note: '',
+      dataUrl: frame.dataUrl,
+    });
+  }
+  return true;
+}
+
+// Toolbar-armed Callout: one-shot region flag shipped through the
+// annotation-attach lane. Shared machinery lives in 47-annotation-clips
+// (toggleLiveCallout); armable only while input authority is 'you'
+// (button disabled otherwise via displayViewerApplyAuthorityButtons,
+// disarmed on authority loss by both setAuthority paths).
+function displayViewerToggleCallout(viewer, button) {
+  toggleLiveCallout({
+    provider: viewer._annotationSurfaceProvider(),
+    button,
+    captureFrame: (q) => viewer.captureCurrentFrame(q),
+  });
+}

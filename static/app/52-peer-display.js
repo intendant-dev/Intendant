@@ -412,14 +412,12 @@ class PeerDisplayConnection {
     const w = isCanvas ? surface.width : surface.videoWidth;
     const h = isCanvas ? surface.height : surface.videoHeight;
     if (!w || !h) return null;
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    c.getContext('2d').drawImage(surface, 0, 0, w, h);
-    const dataUrl = c.toDataURL('image/jpeg', quality);
-    return { canvas: c, dataUrl, b64: dataUrl.split(',')[1], width: w, height: h };
+    return displayViewerRasterizeSurface(surface, w, h, quality);
   }
 
+  // The frame-id scheme and upload live in the shared attach lane
+  // (45-display-viewer-core); the stream name is the FEDERATED policy
+  // (`peer_<safeHost>_display_<id>`) so ids stay unique across hosts.
   async attachCurrentFrame(btn = null) {
     const frame = this.captureCurrentFrame(0.85);
     if (!frame) {
@@ -428,32 +426,9 @@ class PeerDisplayConnection {
       }
       return;
     }
-    if (!this._attachCounter) this._attachCounter = 0;
-    this._attachCounter++;
     const safeHost = String(this.hostId).replace(/[^a-zA-Z0-9_.-]/g, '_');
-    const stream = `peer_${safeHost}_display_${this.displayId}_attach`;
-    const frameId = stream + '-f' + String(this._attachCounter).padStart(5, '0');
-    const payload = {
-      t: 'annotation_attach',
-      frame_id: frameId,
-      stream,
-      data: frame.b64,
-      note: '',
-    };
-    try {
-      await sendDashboardMediaUpload(
-        'api_media_annotation_attach',
-        { frame_id: frameId, stream, note: '' },
-        dashboardControlBase64ToBytes(frame.b64),
-        payload,
-        'annotation attach'
-      );
-    } catch (err) {
-      dashboardMediaTransferFailed(err, 'annotation attach');
+    if (!(await displayViewerUploadAttachFrame(this, `peer_${safeHost}_display_${this.displayId}`, frame))) {
       return;
-    }
-    if (typeof addPendingAttachment === 'function') {
-      addPendingAttachment({ frameId, stream, note: '', dataUrl: frame.dataUrl });
     }
     if (btn) {
       const orig = btn.textContent;
@@ -510,15 +485,12 @@ class PeerDisplayConnection {
   }
 
   // Toolbar-armed Callout: one-shot region flag shipped through the
-  // annotation-attach lane. Shared machinery lives in 47-annotation-clips
-  // (toggleLiveCallout); armable only while federated input authority is
-  // 'you' (button disabled otherwise, disarmed on authority loss).
+  // annotation-attach lane (shared wiring in 45-display-viewer-core;
+  // machinery in 47-annotation-clips). Armable only while federated
+  // input authority is 'you' (button disabled otherwise, disarmed on
+  // authority loss).
   toggleCallout(btn) {
-    toggleLiveCallout({
-      provider: this._annotationSurfaceProvider(),
-      button: btn || null,
-      captureFrame: (q) => this.captureCurrentFrame(q),
-    });
+    displayViewerToggleCallout(this, btn || null);
   }
 
   async connect() {
