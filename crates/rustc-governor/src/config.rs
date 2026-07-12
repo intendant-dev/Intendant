@@ -37,9 +37,15 @@ pub struct Config {
     /// Usernames whose invocations are classed `ci`; everyone else is
     /// `local`.
     pub ci_users: Vec<String>,
-    /// Explicit compiler path; when unset the governor resolves
-    /// `$HOME/.cargo/bin/rustc`, then `rustc` from PATH.
-    pub real_rustc: Option<PathBuf>,
+    /// Front of the exec chain for governed *and* fail-open invocations:
+    /// `wrap_with <real-compiler> <args…>` — in production the sccache
+    /// client, whose blocking round-trip is what carries the permit's
+    /// ceiling to server-side compiles. Unset (or written as `""`, which
+    /// the parser normalizes to unset) means "run the compiler directly":
+    /// the governor works without sccache. The real compiler itself is
+    /// never configured here — cargo passes it as argv[1] (the
+    /// RUSTC_WRAPPER contract).
+    pub wrap_with: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -50,7 +56,7 @@ impl Default for Config {
             local_reserved: 1,
             ci_reserved: 2,
             ci_users: vec!["_intendant-ci".to_string(), "ci".to_string()],
-            real_rustc: None,
+            wrap_with: None,
         }
     }
 }
@@ -94,8 +100,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
             "local_reserved" => cfg.local_reserved = parse_u32(value).map_err(|e| err(&e))?,
             "ci_reserved" => cfg.ci_reserved = parse_u32(value).map_err(|e| err(&e))?,
             "ci_users" => cfg.ci_users = parse_string_array(value).map_err(|e| err(&e))?,
-            "real_rustc" => {
-                cfg.real_rustc = Some(PathBuf::from(parse_string(value).map_err(|e| err(&e))?))
+            "wrap_with" => {
+                // Empty means unset: the installer's here-doc always writes
+                // the key, and operators blank it to unwrap without
+                // deleting the line. (The pre-wrapper-chain `real_rustc`
+                // key needs no arm: unknown keys with well-formed values
+                // are ignored below, so old confs stay parseable and the
+                // key is simply inert.)
+                let s = parse_string(value).map_err(|e| err(&e))?;
+                cfg.wrap_with = (!s.is_empty()).then(|| PathBuf::from(s));
             }
             // Unknown keys are ignored for forward compatibility, but the
             // value must still be one of the shapes we understand — a file
@@ -231,9 +244,16 @@ permit_dir = "/usr/local/var/intendant-governor"
 local_reserved = 1
 ci_reserved = 2   # per-box sizing
 ci_users = ["_intendant-ci", "ci"]
+wrap_with = "/opt/homebrew/bin/sccache"
 "#;
         let cfg = parse(text).unwrap();
-        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            cfg,
+            Config {
+                wrap_with: Some(PathBuf::from("/opt/homebrew/bin/sccache")),
+                ..Config::default()
+            }
+        );
     }
 
     #[test]
@@ -249,7 +269,7 @@ ci_users = ["_intendant-ci", "ci"]
             "local_reserved = 3\n",
             "ci_reserved = 0\n",
             "ci_users = [\"a\", \"b\",]\n",
-            "real_rustc = \"/opt/rustc\"\n",
+            "wrap_with = \"/opt/sccache\"\n",
         );
         let cfg = parse(text).unwrap();
         assert!(!cfg.enabled);
@@ -257,7 +277,23 @@ ci_users = ["_intendant-ci", "ci"]
         assert_eq!(cfg.local_reserved, 3);
         assert_eq!(cfg.ci_reserved, 0);
         assert_eq!(cfg.ci_users, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(cfg.real_rustc, Some(PathBuf::from("/opt/rustc")));
+        assert_eq!(cfg.wrap_with, Some(PathBuf::from("/opt/sccache")));
+    }
+
+    #[test]
+    fn empty_wrap_with_means_unset() {
+        let cfg = parse("wrap_with = \"\"\n").unwrap();
+        assert_eq!(cfg.wrap_with, None);
+    }
+
+    /// Migration property: confs written before the wrapper-chain flip
+    /// carry `real_rustc`. That key must stay *parseable* (unknown-key
+    /// tolerance) and inert — if it made the file unparseable the governor
+    /// would silently fail open and stop governing the box.
+    #[test]
+    fn legacy_real_rustc_key_is_ignored_not_fatal() {
+        let cfg = parse("real_rustc = \"/opt/toolchain/bin/rustc\"\n").unwrap();
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]

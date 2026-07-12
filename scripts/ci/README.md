@@ -112,32 +112,66 @@ every account on the box.
 ### The chain
 
 ```
-cargo ──[build] rustc=governor──▶ sccache client ──▶ sccache server
-                                        │  cache hit: reply from cache —
-                                        │  the "compiler" never executes
-                                        ▼  miss / non-cacheable
-                                  rustc-governor
-                                        │  acquire flock(2) permit
-                                        ▼
-                                  exec(2) real rustc   (permit rides the
-                                                        fd until exit)
+cargo ──[build] rustc-wrapper=governor──▶ rustc-governor <real rustc> <args…>
+                    │  probe (-vV / pure --print):
+                    │    exec(2) real rustc directly — no permit, no sccache
+                    ▼  compile: acquire flock(2) permit
+              exec(2) sccache <real rustc> <args…>
+                    │    the blocking sccache CLIENT; the permit's flock
+                    │    rides the FD_CLOEXEC-cleared fd until it exits
+                    ▼
+              sccache server ── hit: answer from cache (client exits in
+                    │                ~tens of ms, permit released)
+                    ▼  miss / non-cacheable
+              real rustc runs; the client — and so the permit — blocks
+              until it finishes
 ```
 
-`[build] rustc` points at the governor while `rustc-wrapper` stays
-sccache, so sccache treats the governor as *the compiler*:
+The governor is cargo's `rustc-wrapper`; sccache is no longer the
+wrapper — the governor execs it, prepending the real compiler path cargo
+handed it as argv[1] (the `wrap_with` config key names the sccache
+binary; unset it and the compiler runs directly, governed but uncached):
 
-- **Hits never wait** — sccache answers cache hits without executing
-  the compiler at all, so warm builds feel no governor.
-- **Probes never wait** — `-vV` / `--version` / pure `--print` queries
-  (cargo fires them at every startup, sccache when identifying the
-  compiler) bypass the pool via the probe fast path. A real compile
-  that merely *carries* `--print` (e.g. `--print native-static-libs`
-  with `--emit link`) is still governed.
-- Everything else acquires one machine-wide permit, then `exec(2)`s
-  the real rustc: exit status and signal disposition are inherited by
-  construction, and the permit's flock rides the FD_CLOEXEC-cleared fd
-  until that rustc exits — any exit, including SIGKILL, releases it in
-  the kernel (crash release is structural, nothing to clean up).
+- **The ceiling holds transitively.** The permit is held by the exec'd
+  sccache *client*, which blocks until the server answers: at most N
+  outstanding clients ⇒ at most N server-side compiles, no matter which
+  rustc binary the server resolves and runs.
+- **Probes never wait and never touch sccache** — `-vV` / `--version` /
+  pure `--print` queries (cargo fires them at every startup) exec the
+  real compiler directly: snappy under a full pool, and cargo startup no
+  longer depends on a healthy sccache server (a real incident class). A
+  real compile that merely *carries* `--print` (e.g.
+  `--print native-static-libs` with `--emit link`) is still governed.
+- **Hits hold a permit briefly.** A cache hit occupies its permit for
+  the client round-trip (~tens of ms); under a miss-saturated pool, hits
+  queue head-of-line behind running compiles. Accepted trade, decided
+  with the operator: ceiling correctness over warm-path latency.
+- Exit status and signal disposition are inherited through the exec
+  chain, and the permit's flock rides the FD_CLOEXEC-cleared fd until
+  the chain exits — any exit, including SIGKILL, releases it in the
+  kernel (crash release is structural, nothing to clean up).
+
+#### Why wrapper-side (the 2026-07 bypass post-mortem)
+
+The governor originally sat on the compiler side of sccache
+(`[build] rustc = governor`, `rustc-wrapper = sccache`) so cache hits
+never executed it — and that design was silently bypassed for exactly
+the work it existed to bound. sccache 0.15 identifies rustup proxies by
+probing the compiler with `+stable -vV`; the governor's probe fast path
+passed the probe through to `$HOME/.cargo/bin/rustc` — the rustup proxy,
+which accepts `+toolchain` selectors where a real rustc errors — so
+sccache classified the governor as a rustup proxy, resolved the
+underlying toolchain rustc itself, and had its server invoke that binary
+directly for every cacheable miss: ungoverned (verified live — five
+toolchain rustcs as sccache-server children while all permits were
+held). Only non-cacheable invocations (bin links etc., which the client
+runs locally) stayed governed. Wrapper-side, nothing reaches sccache
+without a permit, so no compiler-identification cleverness can route
+around the pool. The regression test that would have caught it —
+`crates/rustc-governor/tests/sccache_chain.rs` — drives the real sccache
+binary and asserts a *cacheable* rlib miss queues behind a held permit
+(bin/link and metadata-emit shapes are non-cacheable and silently test
+the wrong path).
 
 ### Permits and the demand gate
 
@@ -157,12 +191,16 @@ holder exits.
 
 ### Fail-open doctrine + live kill switch
 
-A governor must never break a build. Missing or unparseable config,
-`enabled = false`, `INTENDANT_GOVERNOR=off` in the env, an unusable
-permit dir, zero configured permits — every degraded state means "run
-ungoverned", never "block". The config is re-read by every invocation
-(and once per poll tick by in-flight waiters), so
-`/usr/local/etc/intendant-governor.toml` is live: flipping
+A governor must never break a build — and, since the wrapper-chain flip,
+must never cost a build its caching either. Missing or unparseable
+config, `enabled = false`, `INTENDANT_GOVERNOR=off` in the env, an
+unusable permit dir, zero configured permits — every degraded state
+means "run ungoverned", never "block", and still execs the `wrap_with`
+chain when it is configured (a disabled governor is indistinguishable
+from a plain sccache rustc-wrapper; only a missing/unparseable config,
+which cannot know `wrap_with`, runs the compiler directly). The config
+is re-read by every invocation (and once per poll tick by in-flight
+waiters), so `/usr/local/etc/intendant-governor.toml` is live: flipping
 `enabled = false` drains the governor within ~100ms, no listener
 restarts. Observability: one line per *governed* invocation in
 `<permit_dir>/governor.log` (timestamp, pid, class, permit, wait_ms;
@@ -184,12 +222,21 @@ sudo scripts/ci/install-governor-macos.sh   # binary + permit dir + conf
 ```
 
 The installer never edits account cargo configs; it prints the
-`[build] rustc = ".../rustc-governor"` line to add per account.
+`[build] rustc-wrapper = ".../rustc-governor"` line to set per account
+(replacing sccache as the wrapper — the governor execs sccache itself,
+via the conf's `wrap_with` key) and the legacy `rustc = ".../rustc-governor"`
+line to REMOVE (cargo passes the real compiler as argv[1] now; a
+leftover rustc= line would hand the governor itself, which it refuses
+with exit 127 rather than exec-looping). The installer never overwrites
+an existing conf, so on upgraded boxes the operator adds
+`wrap_with = "/opt/homebrew/bin/sccache"` by hand — the installer
+prints that reminder when the key is missing.
 **Canary order: the CI account first, soak a day of green runs, then
-the operator account.** Known accepted cost: sccache hashes the
-compiler binary — the governor — into its cache keys, so enablement
-and every governor upgrade invalidate that account's sccache cache
-once (one cold rebuild, warm again after). Resizing the reservations
+the operator account.** Cache keys: sccache hashes the compiler it is
+asked to run — the real rustc again — so enablement and governor
+upgrades no longer invalidate the account's sccache cache (the old
+governor-as-compiler wiring paid one cold rebuild per governor change;
+that cost is gone). Resizing the reservations
 upward needs the installer re-run (or a root `touch` + `chmod 0644`)
 to mint the new permit files; permit files the governor cannot open
 are simply not part of the pool, and if none are usable it fails open.
@@ -405,8 +452,10 @@ before-images land in `/etc/intendant-ci/migration/` for audit.
   create files in the root-owned permit dir). Change the naming or the
   file ACLs in one, change both.
 - The governor's config keys (`enabled`, `permit_dir`,
-  `local_reserved`, `ci_reserved`, `ci_users`, `real_rustc`) are
+  `local_reserved`, `ci_reserved`, `ci_users`, `wrap_with`) are
   written by the installer's here-doc and parsed by
   `crates/rustc-governor/src/config.rs` — a minimal TOML-subset
   reader, so keep the conf flat `key = value` (unknown keys are
-  ignored; malformed lines make the whole file fail open).
+  ignored — which is also why pre-flip confs carrying the retired
+  `real_rustc` key stay parseable; malformed lines make the whole
+  file fail open).

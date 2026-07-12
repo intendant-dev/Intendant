@@ -47,7 +47,8 @@ pub(crate) fn unlock(file: &File) {
 }
 
 /// Rust's std opens every file O_CLOEXEC; a permit's flock must survive the
-/// exec into the real rustc (the flock IS the permit). Load-bearing —
+/// exec into the governed chain — the sccache client, or the real rustc
+/// when `wrap_with` is unset (the flock IS the permit). Load-bearing —
 /// covered by the `permit_lock_survives_exec` acceptance test.
 pub(crate) fn clear_cloexec(file: &File) -> io::Result<()> {
     // SAFETY: the fd is owned by `file` and stays open across both calls;

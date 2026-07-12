@@ -13,8 +13,10 @@
 //!
 //! Protocol:
 //! - Holding a permit = holding LOCK_EX on its file. The lock rides the fd
-//!   across exec(2) into the real rustc and is released by the kernel when
-//!   that process exits, however it exits — crash release is structural.
+//!   across exec(2) into the governed chain (the blocking sccache client,
+//!   or the real rustc when `wrap_with` is unset) and is released by the
+//!   kernel when that process exits, however it exits — crash release is
+//!   structural.
 //! - A waiter holds LOCK_SH on its OWN class's demand file for the whole
 //!   wait, and releases it the moment it holds a permit.
 //! - Borrowing: before touching a foreign-class permit, probe that class's
@@ -284,7 +286,7 @@ mod tests {
             local_reserved: local,
             ci_reserved: ci,
             ci_users: vec!["_intendant-ci".into(), "ci".into()],
-            real_rustc: None,
+            wrap_with: None,
         };
         let config_path = tmp.path().join("governor.toml");
         std::fs::write(
