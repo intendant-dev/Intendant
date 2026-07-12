@@ -124,7 +124,9 @@ pub(crate) fn run_message_search(
         }
     };
     let snapshot = store.snapshot();
-    let watermark = snapshot.manifest.updated_at_ms;
+    // The snapshot pin: a monotonic write counter, never the clock (two
+    // writes can share a millisecond).
+    let watermark = snapshot.manifest.revision;
     let filters_fingerprint = fingerprint(params, &terms);
     let after = match params.cursor.as_deref() {
         None => None,
@@ -422,7 +424,7 @@ fn coverage(manifest: &super::store::Manifest, horizon_ms: i64) -> serde_json::V
 
 struct Cursor {
     fingerprint: String,
-    watermark: i64,
+    watermark: u64,
     best_ts_ms: i64,
     session_key: String,
 }
@@ -461,7 +463,7 @@ fn encode_cursor(cursor: &Cursor) -> String {
 }
 
 struct DecodedCursor {
-    watermark: i64,
+    watermark: u64,
     best_ts_ms: i64,
     session_key: String,
 }
@@ -478,7 +480,7 @@ fn decode_cursor(raw: &str, expected_fingerprint: &str) -> Result<DecodedCursor,
         return Err("invalid_cursor");
     }
     Ok(DecodedCursor {
-        watermark: value.get("wm").and_then(|v| v.as_i64()).unwrap_or(-1),
+        watermark: value.get("wm").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
         best_ts_ms: value.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
         session_key: value
             .get("key")
