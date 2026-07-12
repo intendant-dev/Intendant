@@ -24,7 +24,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{CanvasRenderingContext2d, Event, HtmlCanvasElement, HtmlVideoElement};
 
-use gpu::{GpuFrame, GpuState};
+use gpu::{GpuFrame, GpuRecovery, GpuState};
 use hud::{Hud, SystemTarget};
 use input::{HitZone, PinchZoom, PointerDrag, ScrollZone};
 use model::{StationEvent, StationSnapshot, StationTranscript};
@@ -245,8 +245,12 @@ impl StationWeb {
             .collect();
         serde_json::json!({
             "fps": inner.present_fps(),
-            "renderer": if inner.gpu.is_some() { "WebGPU" } else { "Canvas" },
+            // The status chip shows this verbatim, so the device-loss
+            // fallback carries its own note (debug_state stays frozen).
+            "renderer": gpu::renderer_label(inner.gpu.is_some(), inner.gpu_recovery),
             "gpu": inner.gpu.is_some(),
+            // Device-loss recovery progress (gpu::GpuRecovery).
+            "gpuRecovery": inner.gpu_recovery.label(),
             "hosts": inner.snapshot.hosts.len(),
             "agents": inner.snapshot.agents.len(),
             "events": inner.snapshot.events.len(),
@@ -405,6 +409,29 @@ impl StationWeb {
         }
         true
     }
+
+    /// QA hook: destroy the live WebGPU device so the browser resolves
+    /// `device.lost` — this drives the real device-loss recovery path
+    /// (`gpu::GpuRecovery`) end-to-end without waiting for an actual GPU
+    /// reset. Returns true when there was a live device to lose; watch
+    /// `debug_json().gpuRecovery` afterwards for the outcome.
+    pub fn debug_lose_gpu(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = self.inner.borrow();
+            match inner.gpu.as_ref() {
+                Some(gpu) => {
+                    gpu.device.destroy();
+                    true
+                }
+                None => false,
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
+        }
+    }
 }
 
 /// Hotspot targets as JSON objects (shared by `debug_json` and
@@ -424,6 +451,10 @@ struct StationInner {
     hud: Hud,
     scene_ctx: Option<CanvasRenderingContext2d>,
     gpu: Option<GpuState>,
+    /// Device-loss recovery progress. The loss *flag* lives on GpuState
+    /// (per device); this tracks how much of the one-re-init budget is
+    /// spent. See `gpu::GpuRecovery` for the full state machine.
+    gpu_recovery: GpuRecovery,
     active: bool,
     width: u32,
     height: u32,
@@ -569,6 +600,7 @@ impl StationInner {
             hud: Hud::new(ctx),
             scene_ctx,
             gpu: None,
+            gpu_recovery: GpuRecovery::Healthy,
             active: false,
             width: 1,
             height: 1,
@@ -643,6 +675,9 @@ impl StationInner {
         self.layout_cache = layout_positions(&self.snapshot, self.layout);
     }
 
+    /// Async WebGPU bring-up, shared by the initial init and the one
+    /// post-loss re-init (the caller marks the difference by putting
+    /// `gpu_recovery` in `Recovering` first — see `service_gpu_loss`).
     #[cfg(target_arch = "wasm32")]
     fn start_gpu(inner: Rc<RefCell<Self>>) {
         let canvas = inner.borrow().scene_canvas.clone();
@@ -650,14 +685,29 @@ impl StationInner {
             match GpuState::new(canvas).await {
                 Ok(gpu) => {
                     let mut s = inner.borrow_mut();
+                    // A re-init after device loss lands in Recovered: the
+                    // one-shot budget is spent. The initial init leaves
+                    // Healthy untouched.
+                    if s.gpu_recovery == GpuRecovery::Recovering {
+                        s.gpu_recovery = GpuRecovery::Recovered;
+                    }
                     s.gpu = Some(gpu);
+                    s.hud_dirty = true;
                     s.resize();
                 }
                 Err(err) => {
                     web_sys::console::warn_1(&JsValue::from_str(&format!(
                         "Station WebGPU unavailable, falling back to Canvas renderer: {err:?}"
                     )));
-                    inner.borrow_mut().install_canvas_scene_fallback();
+                    let mut s = inner.borrow_mut();
+                    if s.gpu_recovery == GpuRecovery::Recovering {
+                        s.gpu_recovery = GpuRecovery::Fallback;
+                    }
+                    s.install_canvas_scene_fallback();
+                    s.hud_dirty = true;
+                    // Recompute the DPR cap for the canvas renderer (a
+                    // lost WebGPU session may have been running at 2x).
+                    s.resize();
                 }
             }
             StationInner::schedule_frame(&inner);
@@ -666,6 +716,49 @@ impl StationInner {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn start_gpu(_inner: Rc<RefCell<Self>>) {}
+
+    /// Consume a device-lost flag from the live GpuState: drop the dead
+    /// state and either spawn the single async re-init or install the
+    /// permanent Canvas 2D fallback. Runs at the top of every rAF tick —
+    /// outside `render`'s borrow, because the re-init needs the `Rc`.
+    /// See `gpu::GpuRecovery` for the state machine.
+    #[cfg(target_arch = "wasm32")]
+    fn service_gpu_loss(inner: &Rc<RefCell<Self>>) {
+        let step = {
+            let mut s = inner.borrow_mut();
+            if !s.gpu.as_ref().is_some_and(|gpu| gpu.is_lost()) {
+                return;
+            }
+            let (next, step) = gpu::gpu_loss_transition(s.gpu_recovery);
+            s.gpu_recovery = next;
+            // The device is dead either way; release it so the loop stops
+            // presenting through it (renders paint the HUD underlay until
+            // the re-init lands or the fallback takes over).
+            s.gpu = None;
+            s.hud_dirty = true;
+            step
+        };
+        match step {
+            gpu::GpuLossStep::Reinit => {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "Station WebGPU device lost; attempting one re-init",
+                ));
+                Self::start_gpu(inner.clone());
+            }
+            gpu::GpuLossStep::Fallback => {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "Station WebGPU device lost again; dropping to the Canvas renderer permanently",
+                ));
+                let mut s = inner.borrow_mut();
+                s.install_canvas_scene_fallback();
+                s.resize();
+            }
+        }
+        StationInner::schedule_frame(inner);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_gpu_loss(_inner: &Rc<RefCell<Self>>) {}
 
     /// Runtime WebGPU failure: give the scene a 2D context so the wireframe
     /// fallback renders, matching the `?station_gpu=canvas` visual. If wgpu
@@ -697,6 +790,9 @@ impl StationInner {
     fn start_loop(inner: Rc<RefCell<Self>>) {
         let loop_inner = inner.clone();
         let cb = Closure::wrap(Box::new(move |time_ms: f64| {
+            // Device-loss check first, outside the render borrow: a dead
+            // device must never be presented through again.
+            Self::service_gpu_loss(&loop_inner);
             let animating = {
                 let mut s = loop_inner.borrow_mut();
                 s.raf_pending = false;
