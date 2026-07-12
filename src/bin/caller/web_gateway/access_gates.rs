@@ -605,10 +605,13 @@ mod tests {
         assert_eq!(dashboard_http_operation("POST", "/api/fs/deleted"), None);
         // Historically unclassified (browsers ungated); the table row
         // delegates to federation_http_operation, closing the gap the
-        // federation bearer gate already closed for peers.
+        // federation bearer gate already closed for peers. PeerUse since
+        // the 2026-07-11 owner decision: coordinator routing spends this
+        // daemon's peer identity, like the /api/peers/{id}/task quick
+        // control.
         assert_eq!(
             dashboard_http_operation("POST", "/api/coordinator/route"),
-            Some(PeerOperation::Task)
+            Some(PeerOperation::PeerUse)
         );
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
         // The prefix families use the same boundary rule as dispatch:

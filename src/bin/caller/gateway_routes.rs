@@ -1738,12 +1738,14 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::PeersSubRouter,
         "Peers sub-router catch-all (handler-owned JSON 404/405 for unknown subpaths and undeclared methods)",
     ),
-    // The coordinator twin carries a documented op override: the ladder
-    // classifies POST /api/coordinator/* as Task (a federated peer
-    // routing work here needs task authority), while the tunnel method
-    // has always gated on PeerManage for dashboard sessions. The
-    // override preserves both historical mappings exactly — see the
-    // enumeration test — pending an owner decision on unifying them.
+    // Owner decision 2026-07-11: coordinator routing gates on PeerUse on
+    // both transport lanes (the quick-controls doctrine — routing a task
+    // through the coordinator dispatches it to a capability-matched peer
+    // under this daemon's peer identity, the same action class as
+    // POST /api/peers/{id}/task). The tunnel twin derives from the
+    // federation ladder like every other twinned method here; this
+    // supersedes the previously preserved per-lane split (HTTP: Task,
+    // tunnel: PeerManage via a documented op override).
     federation_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/coordinator/route"),
@@ -1751,15 +1753,7 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::CoordinatorRoute,
         "Capability-based task routing through the Coordinator",
     )
-    .with_tunnel(tunnel_method_with_op(
-        "api_coordinator_route",
-        PeerOperation::PeerManage,
-        "historical per-lane divergence, preserved: the federation ladder \
-         classifies POST /api/coordinator/* as Task for the HTTP lane, but \
-         the datachannel method has always required PeerManage of a \
-         dashboard session — re-gating either lane is an owner decision, \
-         not a migration rider",
-    )),
+    .with_tunnel(tunnel_method("api_coordinator_route")),
     // ── MCP Streamable HTTP (token-bound inside the handler; the
     //    per-tool IAM gate lives in the MCP layer).
     Route {
@@ -2632,10 +2626,10 @@ mod tests {
     /// added deliberately. The occupants: the signed-org doorbell twins
     /// (S6) — Public rows on HTTP (the signed document/list is the
     /// authorization) while the tunnel methods deliberately gate on a
-    /// bound session's operation — and the coordinator twin (S7), whose
-    /// historical PeerManage gate diverges from the federation ladder's
-    /// Task classification; the override preserves both lanes' historical
-    /// mappings verbatim (see
+    /// bound session's operation. The coordinator twin's historical
+    /// override (tunnel PeerManage vs the ladder's Task) left the set on
+    /// the 2026-07-11 owner decision unifying coordinator routing on
+    /// PeerUse — both lanes now derive from the federation ladder (see
     /// `peers_family_tunnel_ops_assert_against_the_federation_ladder`).
     #[test]
     fn tunnel_op_overrides_are_a_closed_documented_enumeration() {
@@ -2644,7 +2638,6 @@ mod tests {
             "api_access_org_orl_apply",
             "api_access_org_present",
             "api_access_org_renew",
-            "api_coordinator_route",
         ];
         let mut actual: Vec<&str> = Vec::new();
         for (_, spec) in tunnel_specs() {
@@ -2673,8 +2666,9 @@ mod tests {
     /// reproduces it, and (c) the canonical leaf really is served by
     /// this row (first match), so the leaf a twin is derived from can
     /// never silently belong to a different row. The coordinator twin
-    /// is the documented exception: the ladder says Task, the tunnel
-    /// stays PeerManage via its pinned override.
+    /// joined the derivation on the 2026-07-11 owner decision (PeerUse
+    /// on both lanes) and is asserted in the tail — it lives on its own
+    /// handler, so it stays out of the PeersSubRouter loop.
     #[test]
     fn peers_family_tunnel_ops_assert_against_the_federation_ladder() {
         use crate::peer::access_policy::{federation_http_operation, PeerOperation as Op};
@@ -2805,19 +2799,40 @@ mod tests {
             );
             assert_eq!(matched.handler, RouteHandlerId::PeersSubRouter, "{name}");
         }
-        // The one deliberate exception, pinned from both directions: the
-        // HTTP lane classifies coordinator routing as Task, the tunnel
-        // twin keeps its historical PeerManage through the documented
-        // override (the enumeration test above pins the override set).
+        // Owner decision 2026-07-11: coordinator routing dispatches a
+        // task to a capability-matched connected peer under this daemon's
+        // peer identity — the quick-controls action class — so both lanes
+        // gate on PeerUse. This supersedes the preserved per-lane split
+        // (HTTP: Task, tunnel: PeerManage via a documented override),
+        // which let a task-authority peer spend this daemon's identity on
+        // a third peer over HTTP. Pinned from both directions, same
+        // (a)/(b)/(c) facts as the loop above (the coordinator lives on
+        // its own handler, not the peers sub-router).
         assert_eq!(
             federation_http_operation("POST", "/api/coordinator/route"),
-            Some(Op::Task),
+            Some(Op::PeerUse),
         );
         let (route, spec) = tunnel_specs()
             .find(|(_, spec)| spec.name == "api_coordinator_route")
             .expect("coordinator twin declared");
-        assert!(spec.op_override.is_some(), "coordinator override present");
-        assert_eq!(route.tunnel_operation(), Some(Op::PeerManage));
+        assert!(
+            spec.op_override.is_none(),
+            "the coordinator twin derives from the ladder — its historical \
+             override was retired by the 2026-07-11 owner decision",
+        );
+        assert_eq!(route.tunnel_operation(), Some(Op::PeerUse));
+        assert_eq!(
+            route.canonical_leaf(),
+            Some(("POST", "/api/coordinator/route".to_string())),
+        );
+        let (matched, _) = match_route("POST", "/api/coordinator/route")
+            .expect("no route matches POST /api/coordinator/route");
+        assert!(
+            std::ptr::eq(matched, route),
+            "the coordinator leaf is served by a different row than the one \
+             declaring the twin",
+        );
+        assert_eq!(matched.handler, RouteHandlerId::CoordinatorRoute);
     }
 
     /// The docs chapter's generated endpoint table must equal the one

@@ -171,6 +171,11 @@ cross-machine display (see below).
   eligible peer — one that is `Connected` *and* whose card advertises every
   required capability — in lexicographic `PeerId` order (deterministic, so
   idempotent retries route to the same peer) and delegates via the handle.
+  Routing through the coordinator (`POST /api/coordinator/route` and its
+  `api_coordinator_route` tunnel twin) is authorized as `peer.use` on both
+  transport lanes, same as the per-peer quick controls: the routed task is
+  delegated under *this daemon's* peer identity, and the receiving peer
+  authorizes it against its own grants for this daemon.
 
 ### Per-peer sessions — the folded `SessionInfo` rail
 

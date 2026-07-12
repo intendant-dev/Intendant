@@ -234,9 +234,10 @@ const CONTROL_ONLY_METHODS: &[ControlMethodSpec] = &[
     // on its row's canonical leaf — acting through a connected peer
     // (quick controls + signaling relays) classifies as peer use, not
     // peer administration, exactly as the HTTP gate has always ruled.
-    // api_coordinator_route carries the family's one documented op
-    // override (PeerManage; the ladder says Task) — see the closed
-    // enumeration in gateway_routes.
+    // Coordinator routing joined that rule on the 2026-07-11 owner
+    // decision: it delegates this daemon's peer identity like the quick
+    // controls, so both lanes gate on PeerUse (its historical
+    // PeerManage-tunnel / Task-HTTP op override is gone).
     // The sessions read-core methods (api_sessions, api_sessions_search,
     // api_session_detail, api_session_agent_output,
     // api_session_context_snapshot) live as tunnel columns on their
@@ -3146,9 +3147,10 @@ mod tests {
                 Row,
                 Some(Op::PeerManage),
             ),
-            // The coordinator's PeerManage rides its documented op
-            // override (the ladder classifies the HTTP leaf as Task).
-            ("api_coordinator_route", Row, Some(Op::PeerManage)),
+            // Coordinator routing derives PeerUse from the ladder like
+            // the quick controls (owner decision 2026-07-11; its
+            // historical PeerManage override is gone).
+            ("api_coordinator_route", Row, Some(Op::PeerUse)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
             ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
@@ -3351,8 +3353,8 @@ mod tests {
     /// the row's IAM operation equals the tunnel method's (the signed-org
     /// doorbell rows are Public on HTTP by design and instead pin their
     /// documented tunnel op-override; the peers/coordinator federation
-    /// rows pin the row's own derivation — ladder on the canonical leaf,
-    /// or the coordinator's documented override); and the path
+    /// rows pin the row's own derivation — the federation ladder on the
+    /// canonical leaf); and the path
     /// template restates the row's declared pattern (captures by name).
     /// Plus the exact coverage set, so entries appear and disappear
     /// deliberately. When the route table grows its `tunnel:` column
@@ -3621,14 +3623,12 @@ mod tests {
                 // The peers/coordinator family rows delegate HTTP authz to
                 // the federation ladder (F5). Their tunnel op derives from
                 // the row itself — `Route::tunnel_operation` applies the
-                // same ladder to the row's canonical leaf, or the
-                // documented override (api_coordinator_route: the ladder
-                // classifies the HTTP leaf as Task while the tunnel method
-                // has always gated on PeerManage — a preserved per-lane
-                // divergence the descriptor must not paper over). Require
-                // the resolved row to carry THIS method's tunnel column
-                // and its derivation to equal the effective tunnel
-                // operation.
+                // same ladder to the row's canonical leaf
+                // (api_coordinator_route included: both of its lanes gate
+                // on PeerUse since the 2026-07-11 owner decision retired
+                // its historical PeerManage override). Require the
+                // resolved row to carry THIS method's tunnel column and
+                // its derivation to equal the effective tunnel operation.
                 RouteAuthz::PeerFederation => {
                     let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
                         panic!("{method_name}: federation descriptor row lost its tunnel column")

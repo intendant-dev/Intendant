@@ -938,7 +938,9 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     // for this daemon. Keeping the quick controls on peer.manage would be a
     // hollow boundary anyway — a peer.use principal can reach the same
     // effects through the dashboard-control tunnel it may already open.
-    // Registry and pairing mutations stay peer.manage.
+    // Registry and pairing mutations stay peer.manage. Coordinator
+    // routing (the `/api/coordinator/` branch below) is the same action
+    // class and rides the same doctrine.
     if method == "POST" {
         let mut segments = path
             .strip_prefix("/api/peers/")
@@ -966,8 +968,15 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
         }
         return Some(PeerOperation::PeerManage);
     }
+    // Coordinator routing dispatches a task to a capability-matched
+    // connected peer under this daemon's peer identity — the same action
+    // class as the `/api/peers/{id}/task` quick control, so it rides the
+    // peer-use doctrine above. Owner decision 2026-07-11: both transport
+    // lanes gate on PeerUse (this branch previously classified as Task
+    // while the tunnel twin gated on PeerManage — a split that let a
+    // task-authority peer spend this daemon's identity on a third peer).
     if path.starts_with("/api/coordinator/") {
-        return Some(PeerOperation::Task);
+        return Some(PeerOperation::PeerUse);
     }
     if under("/api/sessions") {
         return Some(PeerOperation::SessionInspect);
@@ -1633,6 +1642,37 @@ mod tests {
             "peer-operator",
             PeerOperation::PeerUse
         ));
+    }
+
+    /// Owner decision 2026-07-11: coordinator routing is peer *use* on
+    /// both transport lanes. `POST /api/coordinator/route` dispatches a
+    /// task to a capability-matched connected peer under this daemon's
+    /// peer identity — the same action class as the `/api/peers/{id}/task`
+    /// quick control — so the federation ladder classifies it as PeerUse;
+    /// the tunnel twin derives the same operation from its route row
+    /// (pinned by gateway_routes'
+    /// `peers_family_tunnel_ops_assert_against_the_federation_ladder`).
+    /// Supersedes the historical per-lane split (HTTP: Task, tunnel:
+    /// PeerManage): among peer profiles only peer-root holds PeerUse, so a
+    /// task-runner or peer-operator peer can no longer spend this daemon's
+    /// identity on a third peer through the coordinator — the
+    /// transitive-delegation seam the Task classification left open.
+    #[test]
+    fn coordinator_routing_classifies_as_peer_use() {
+        assert_eq!(
+            federation_http_operation("POST", "/api/coordinator/route"),
+            Some(PeerOperation::PeerUse)
+        );
+        // The gate is delegation authority, not task authority: the
+        // task-running profiles hold Task but not PeerUse.
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerUse
+        ));
+        for profile in ["task-runner", "peer-operator"] {
+            assert!(profile_allows_operation(profile, PeerOperation::Task));
+            assert!(!profile_allows_operation(profile, PeerOperation::PeerUse));
+        }
     }
 
     #[test]
