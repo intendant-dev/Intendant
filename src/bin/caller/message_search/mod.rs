@@ -20,6 +20,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod cursor;
+mod extract_codex;
 mod extract_intendant;
 mod record;
 mod store;
