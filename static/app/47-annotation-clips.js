@@ -493,13 +493,8 @@ function clearPendingAttachments(options = {}) {
 const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 let activeUploadFlows = 0;
 
-/// Short human-readable file-size string, matches the server's formatter.
-function humanBytes(n) {
-  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
-  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
-  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
-  return n + ' B';
-}
+// humanBytes lives in 46-recording-replay.js (the canonical dashboard
+// bytes formatter; `_fmtBytes` there is its legacy alias).
 
 // "Can staged uploads ride the TUNNEL upload-frame / byte-stream lane?"
 // Derived through the facade (F1b): reason 'connected' folds the live
@@ -1048,23 +1043,39 @@ function renderAnnotationRefs() {
   }
   panel.style.display = savedAnnotations.length > 0 ? '' : 'none';
 
+  // Daemon-derived strings never ride an inline onclick: rows carry the
+  // frame id in a data attribute and get real listeners after the build.
   const items = savedAnnotations.map(a => {
     const badge = a.injected ? '<span style="color:var(--green);font-size:10px"> sent</span>' : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
-    return `<span class="ann-ref-item" title="Click to copy frame ID" onclick="copyAnnotationRef('${a.frameId}')">${a.frameId}${badge}</span>`;
+    return `<span class="ann-ref-item" title="Click to copy frame ID" data-frame-id="${escapeHtml(a.frameId)}">${escapeHtml(a.frameId)}${badge}</span>`;
   }).join('');
 
   const framesPath = currentSessionFullId ? `~/.intendant/logs/${currentSessionFullId}/frames/` : '';
   panel.innerHTML = `
     <span style="font-size:11px;color:var(--subtext1);font-weight:600">Annotations:</span>
     ${items}
-    <button class="ann-copy-all-btn" onclick="copyAllAnnotationRefs()" title="Copy all frame IDs to clipboard">Copy all</button>
-    ${framesPath ? `<span class="ann-path-hint" style="display:block;font-size:10px;color:var(--overlay0);margin-top:4px;cursor:pointer" title="Click to copy" onclick="navigator.clipboard.writeText('${framesPath}').then(()=>{this.textContent='Copied!';setTimeout(()=>{this.textContent='${framesPath}'},1000)})">${framesPath}</span>` : ''}
+    <button class="ann-copy-all-btn" title="Copy all frame IDs to clipboard">Copy all</button>
+    ${framesPath ? `<span class="ann-path-hint" style="display:block;font-size:10px;color:var(--overlay0);margin-top:4px;cursor:pointer" title="Click to copy">${escapeHtml(framesPath)}</span>` : ''}
   `;
+  panel.querySelectorAll('.ann-ref-item').forEach(el => {
+    el.addEventListener('click', () => copyAnnotationRef(el.dataset.frameId || ''));
+  });
+  panel.querySelector('.ann-copy-all-btn')?.addEventListener('click', copyAllAnnotationRefs);
+  const pathHint = panel.querySelector('.ann-path-hint');
+  if (pathHint) {
+    pathHint.addEventListener('click', () => {
+      navigator.clipboard.writeText(framesPath).then(() => {
+        pathHint.textContent = 'Copied!';
+        setTimeout(() => { pathHint.textContent = framesPath; }, 1000);
+      });
+    });
+  }
 }
 
 window.copyAnnotationRef = function(frameId) {
   navigator.clipboard.writeText(frameId).then(() => {
-    const el = document.querySelector(`.ann-ref-item[onclick*="${frameId}"]`);
+    const el = [...document.querySelectorAll('#annotation-refs-panel .ann-ref-item')]
+      .find(item => item.dataset.frameId === frameId);
     if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
   });
 };
@@ -2106,24 +2117,31 @@ function renderClipRefs() {
   }
   panel.style.display = savedClips.length > 0 ? '' : 'none';
 
+  // Same discipline as renderAnnotationRefs: ids ride data attributes and
+  // real listeners, never string-interpolated inline handlers.
   const items = savedClips.map(c => {
     const badge = c.injected
       ? '<span style="color:var(--green);font-size:10px"> sent</span>'
       : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
-    const info = `${c.clipId} (${c.frameCount} frames)`;
-    return `<span class="ann-ref-item" title="Click to copy clip ID" onclick="copyClipRef('${c.clipId}')">${info}${badge}</span>`;
+    const info = `${escapeHtml(c.clipId)} (${escapeHtml(String(c.frameCount))} frames)`;
+    return `<span class="ann-ref-item" title="Click to copy clip ID" data-clip-id="${escapeHtml(c.clipId)}">${info}${badge}</span>`;
   }).join('');
 
   panel.innerHTML = `
     <span style="font-size:11px;color:var(--subtext1);font-weight:600">Clips:</span>
     ${items}
-    <button class="ann-copy-all-btn" onclick="copyAllClipRefs()" title="Copy all clip IDs to clipboard">Copy all</button>
+    <button class="ann-copy-all-btn" title="Copy all clip IDs to clipboard">Copy all</button>
   `;
+  panel.querySelectorAll('.ann-ref-item').forEach(el => {
+    el.addEventListener('click', () => copyClipRef(el.dataset.clipId || ''));
+  });
+  panel.querySelector('.ann-copy-all-btn')?.addEventListener('click', copyAllClipRefs);
 }
 
 window.copyClipRef = function(clipId) {
   navigator.clipboard.writeText(clipId).then(() => {
-    const el = document.querySelector(`.ann-ref-item[onclick*="${clipId}"]`);
+    const el = [...document.querySelectorAll('#clip-refs-panel .ann-ref-item')]
+      .find(item => item.dataset.clipId === clipId);
     if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
   });
 };

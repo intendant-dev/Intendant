@@ -129,6 +129,104 @@ fn open_session_log_dirs() -> &'static StdMutex<HashSet<PathBuf>> {
     OPEN_SESSION_LOG_DIRS.get_or_init(|| StdMutex::new(HashSet::new()))
 }
 
+/// How a memoized id→dir resolution is re-validated on a cache hit.
+#[derive(Clone, Debug)]
+enum SessionDirLookupValidation {
+    /// The dir name itself answered to the id — revalidation is a free
+    /// string check plus one `is_dir` stat.
+    NamePrefix,
+    /// The id came from `session_meta.json` — revalidate by the meta
+    /// file's (len, mtime): unchanged meta means unchanged session_id.
+    MetaFingerprint((u64, u128)),
+}
+
+#[derive(Clone, Debug)]
+struct SessionDirLookupEntry {
+    dir: PathBuf,
+    validation: SessionDirLookupValidation,
+}
+
+fn session_dir_lookup_cache(
+) -> &'static StdMutex<std::collections::HashMap<(PathBuf, String), SessionDirLookupEntry>> {
+    static CACHE: OnceLock<
+        StdMutex<std::collections::HashMap<(PathBuf, String), SessionDirLookupEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+const SESSION_DIR_LOOKUP_CACHE_LIMIT: usize = 4096;
+
+fn meta_fingerprint(meta_path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(meta_path).ok()?;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((metadata.len(), mtime_nanos))
+}
+
+/// Memo hit for `find_session_by_id_in_home`, validated against the live
+/// filesystem before being trusted (a deleted dir or rewritten meta drops
+/// the entry and the caller re-scans).
+fn cached_session_dir_for_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let key = (home.to_path_buf(), session_id.to_string());
+    let entry = {
+        let cache = session_dir_lookup_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.get(&key).cloned()
+    }?;
+    let valid = entry.dir.is_dir()
+        && match &entry.validation {
+            SessionDirLookupValidation::NamePrefix => entry
+                .dir
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with(session_id))
+                .unwrap_or(false),
+            SessionDirLookupValidation::MetaFingerprint(fingerprint) => {
+                meta_fingerprint(&entry.dir.join("session_meta.json")).as_ref() == Some(fingerprint)
+            }
+        };
+    if valid {
+        return Some(entry.dir);
+    }
+    let mut cache = session_dir_lookup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.remove(&key);
+    None
+}
+
+fn store_cached_session_dir_for_id(
+    home: &Path,
+    session_id: &str,
+    dir: &Path,
+    validation: SessionDirLookupValidation,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    let mut cache = session_dir_lookup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (home.to_path_buf(), session_id.to_string());
+    if cache.len() >= SESSION_DIR_LOOKUP_CACHE_LIMIT && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        SessionDirLookupEntry {
+            dir: dir.to_path_buf(),
+            validation,
+        },
+    );
+}
+
 fn lock_open_session_log_dirs() -> StdMutexGuard<'static, HashSet<PathBuf>> {
     match open_session_log_dirs().lock() {
         Ok(guard) => guard,
@@ -552,24 +650,59 @@ impl SessionLog {
             return Some(direct);
         }
 
-        // Scan for prefix match or meta match
         if !logs_dir.is_dir() {
             return None;
         }
-        if let Ok(entries) = fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
+
+        // Memoized resolution: this lookup used to scan every session dir
+        // AND read every session_meta.json per call — repeated resolutions
+        // of the same id (MCP event routing, launch paths) paid a full
+        // store scan each time. A hit is re-validated against the live
+        // filesystem before it is trusted; misses fall through to the
+        // scan. Negative results are never cached (the session may be
+        // created a moment later).
+        if let Some(dir) = cached_session_dir_for_id(home, session_id) {
+            return Some(dir);
+        }
+
+        // Pass 1 — directory names only (no file reads): prefix match.
+        // The legacy single pass interleaved meta reads with the name
+        // scan, so an id resolvable by name could still pay meta reads
+        // for every dir readdir happened to yield first.
+        let mut entries: Vec<PathBuf> = Vec::new();
+        if let Ok(dir_entries) = fs::read_dir(&logs_dir) {
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(session_id) && entry.path().is_dir() {
-                    return Some(entry.path());
+                if name.starts_with(session_id) && path.is_dir() {
+                    store_cached_session_dir_for_id(
+                        home,
+                        session_id,
+                        &path,
+                        SessionDirLookupValidation::NamePrefix,
+                    );
+                    return Some(path);
                 }
-                // Also check inside session_meta.json for session_id match
-                let meta_path = entry.path().join("session_meta.json");
-                if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                        if meta.session_id == session_id || meta.session_id.starts_with(session_id)
-                        {
-                            return Some(entry.path());
-                        }
+                entries.push(path);
+            }
+        }
+
+        // Pass 2 — the expensive primitive: read each session_meta.json
+        // for an exact or prefix session_id match.
+        for path in entries {
+            let meta_path = path.join("session_meta.json");
+            if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+                    if meta.session_id == session_id || meta.session_id.starts_with(session_id) {
+                        store_cached_session_dir_for_id(
+                            home,
+                            session_id,
+                            &path,
+                            meta_fingerprint(&meta_path)
+                                .map(SessionDirLookupValidation::MetaFingerprint)
+                                .unwrap_or(SessionDirLookupValidation::NamePrefix),
+                        );
+                        return Some(path);
                     }
                 }
             }
@@ -1811,5 +1944,84 @@ mod tests {
         assert_eq!(content_hash_hex16("hello"), content_hash_hex16("hello"));
         assert_ne!(content_hash_hex16("hello"), content_hash_hex16("hello!"));
         assert_eq!(content_hash_hex16("x").len(), 16);
+    }
+
+    #[test]
+    fn find_session_by_id_resolves_names_metas_and_survives_deletion() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+
+        // Dir whose NAME is the session id.
+        let named = logs.join("aaaa-1111-2222");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::write(
+            named.join("session_meta.json"),
+            serde_json::json!({"session_id": "aaaa-1111-2222", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+        // Dir whose name differs from its META session id (--log-file
+        // style custom dir).
+        let custom = logs.join("custom-dir");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "bbbb-3333-4444", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+
+        // Exact + prefix name matches; meta-only match; miss.
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "aaaa-1111-2222"),
+            Some(named.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "aaaa-1111"),
+            Some(named.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333"),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "zzzz-none"),
+            None
+        );
+
+        // Memoized hits are revalidated: a deleted dir must not be served
+        // from the cache (both lookups above primed it).
+        std::fs::remove_dir_all(&custom).unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            None
+        );
+        // A meta rewrite that changes the session id drops the memo too.
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "bbbb-3333-4444", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            Some(custom.clone())
+        );
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "cccc-5555-6666", "created_at": "later than t"})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            None
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "cccc-5555-6666"),
+            Some(custom)
+        );
     }
 }

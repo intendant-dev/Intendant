@@ -2629,19 +2629,18 @@ pub(crate) fn sessions_list_api_response(
     limit: Option<usize>,
     usage_view: bool,
 ) -> ApiResponse {
-    let body = match ids_filter {
-        Some(ids) => cached_list_sessions_for_ids(home, &ids),
+    // The limit/usage projections of a cached body are cached alongside
+    // it (keyed by its generation): re-parsing + re-serializing the full
+    // multi-megabyte list per request was measurably hot. The ids path
+    // keeps direct computation — its bodies are small and id-dependent.
+    let (body, generation) = match ids_filter {
+        Some(ids) => (cached_list_sessions_for_ids(home, &ids), None),
         None => match limit {
-            Some(limit) => cached_list_sessions_with_limit(limit),
-            None => cached_list_sessions(),
+            Some(limit) => cached_list_sessions_with_limit_and_generation(limit),
+            None => cached_list_sessions_with_generation(),
         },
     };
-    let body = limit_session_list_body(&body, limit);
-    let body = if usage_view {
-        session_list_body_usage_view(&body)
-    } else {
-        body
-    };
+    let body = projected_session_list_body(generation, &body, limit, usage_view);
     session_wildcard_json_response(200, body)
 }
 
@@ -3414,6 +3413,96 @@ pub(crate) async fn sessions_search_api_response(
     session_wildcard_json_response(200, body)
 }
 
+/// Whether the search request opted into the NDJSON progress stream
+/// (`stream=ndjson|1|true`). Absent/unknown values keep the legacy
+/// single-JSON-body response, so old clients are untouched.
+pub(crate) fn sessions_search_stream_requested(request_line: &str) -> bool {
+    query_param(request_line, "stream")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "ndjson" | "progress"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Streaming variant of the deep search (`GET
+/// /api/sessions/search?...&stream=ndjson`): zero or more
+/// `{"type":"deep_search_progress","scanned":N,"total":M,"matched":K}`
+/// lines (every [`DEEP_SEARCH_PROGRESS_EVERY`] candidate sessions), then
+/// exactly one final line carrying the legacy response body (or the
+/// legacy busy/error body). Shares the single-flight guard with the
+/// buffered shape; a client hangup cancels the scan via the pump's
+/// forward-progress rule.
+pub(crate) fn sessions_search_stream_api_response(
+    query: String,
+    source_filter: String,
+    mode: String,
+    project_filter: Vec<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> ApiResponse {
+    let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
+    let source = tokio::spawn(async move {
+        if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            let busy = serde_json::json!({
+                "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
+                "busy": true,
+            })
+            .to_string();
+            let _ = tx.send(busy + "\n").await;
+            return;
+        }
+        let progress_tx = tx.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let home_path = crate::platform::home_dir();
+            let mut on_progress = |progress: DeepSearchProgress| {
+                let line = serde_json::json!({
+                    "type": "deep_search_progress",
+                    "scanned": progress.scanned,
+                    "total": progress.total,
+                    "matched": progress.matched,
+                })
+                .to_string()
+                    + "\n";
+                if progress_tx.blocking_send(line).is_err() {
+                    // Receiver gone (client hung up): stop scanning.
+                    cancel.cancel();
+                }
+            };
+            session_log_search_from_home_with_progress(
+                &home_path,
+                &query,
+                &source_filter,
+                &mode,
+                &project_filter,
+                &cancel,
+                &mut on_progress,
+            )
+        })
+        .await;
+        SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        let body = match join {
+            Ok(body) => body,
+            Err(e) => serde_json::json!({
+                "error": format!("session search task failed: {e}")
+            })
+            .to_string(),
+        };
+        let _ = tx.send(body + "\n").await;
+    });
+    ApiResponse::Stream {
+        status: 200,
+        content_type: "application/x-ndjson".to_string(),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        stream: LineStream { lines, source },
+    }
+}
+
 pub(crate) async fn handle_sessions_search(
     stream: DemuxStream,
     request_line: &str,
@@ -3424,6 +3513,16 @@ pub(crate) async fn handle_sessions_search(
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
     let mode = query_param(request_line, "mode").unwrap_or_default();
     let project_filter = session_project_filter_from_request(request_line);
+    if sessions_search_stream_requested(request_line) {
+        let response = sessions_search_stream_api_response(
+            query,
+            source_filter,
+            mode,
+            project_filter,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        return write_api_response(stream, response, cors, fleet_origin).await;
+    }
     let response = sessions_search_api_response(
         query,
         source_filter,
@@ -3527,7 +3626,7 @@ pub(crate) async fn handle_worktrees_inspect(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = crate::platform::home_dir();
     let response = match tokio::task::spawn_blocking(move || {
         worktrees_inspect_api_response(&home, &body_text)
     })
@@ -3555,7 +3654,7 @@ pub(crate) async fn handle_worktrees_remove(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = crate::platform::home_dir();
     let response = match tokio::task::spawn_blocking(move || {
         worktrees_remove_api_response(&home, &body_text, &worktree_inventory_cache)
     })
@@ -3581,7 +3680,7 @@ pub(crate) async fn handle_worktrees_merge(
     body_text: String,
     worktree_inventory_cache: Arc<Mutex<Option<String>>>,
 ) {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = crate::platform::home_dir();
     let cache = worktree_inventory_cache.clone();
     let (status, body) = match tokio::task::spawn_blocking(move || {
         let result = merge_session_worktree_response(&home, &body_text);
@@ -3619,7 +3718,7 @@ pub(crate) async fn handle_worktrees_scan(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = crate::platform::home_dir();
     let response = match tokio::task::spawn_blocking(move || {
         worktrees_scan_api_response(&home, project_root.as_deref(), &worktree_inventory_cache)
     })

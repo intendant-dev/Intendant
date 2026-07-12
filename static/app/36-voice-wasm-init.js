@@ -120,6 +120,12 @@ function updateActivePassiveUI() {
 }
 
 // ── Audio Playback ──
+// Cap the decoded playback queue: a stalled/suspended AudioContext (or a
+// long-hidden tab) must not accumulate unbounded PCM buffers. At ~24kHz
+// mono chunks this bound stays well under a minute of buffered speech.
+const AUDIO_QUEUE_MAX_DEPTH = 120;
+let audioQueueOverflowWarned = false;
+
 function playAudioChunk(b64data) {
   if (!audioCtx) return;
   const outRate = gatewayConfig ? gatewayConfig.output_sample_rate : 24000;
@@ -134,11 +140,22 @@ function playAudioChunk(b64data) {
   const buffer = audioCtx.createBuffer(1, resampled.length, nativeRate);
   buffer.copyToChannel(resampled, 0);
   audioQueue.push(buffer);
+  while (audioQueue.length > AUDIO_QUEUE_MAX_DEPTH) {
+    audioQueue.shift(); // drop-oldest: keep playback near-live
+    if (!audioQueueOverflowWarned) {
+      audioQueueOverflowWarned = true;
+      console.warn(`[voice] playback queue exceeded ${AUDIO_QUEUE_MAX_DEPTH} buffers — dropping oldest audio`);
+    }
+  }
   if (!isPlaying) playNext();
 }
 
 function playNext() {
-  if (audioQueue.length === 0) { isPlaying = false; return; }
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    audioQueueOverflowWarned = false; // drained: re-arm the one-shot diagnostic
+    return;
+  }
   isPlaying = true;
   const buffer = audioQueue.shift();
   const src = audioCtx.createBufferSource();
@@ -200,6 +217,14 @@ function stopMic() {
     workletNode.port.postMessage({ type: 'mute' });
     workletNode.disconnect();
     workletNode = null;
+  }
+  // Privacy: actually stop the capture tracks so the browser's recording
+  // indicator goes out — disconnecting the worklet alone leaves the mic
+  // hot. Drop the cached stream; startMic re-acquires on next use (same
+  // model as stopVideo).
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
   }
   hideVoiceStatus();
 }
@@ -302,6 +327,53 @@ function hasVoiceCredentials() {
   return !!voiceApiKeyGet();
 }
 
+// ── Voice auto-reconnect ──
+// A provider close/error while a session was live (and the user did not
+// stop it) schedules up to three backed-off reconnect attempts. The
+// existing "[System: Voice session reconnected…]" grounding in
+// set_on_voice_ready covers the fresh session; attempts reset there.
+// Deliberate teardowns (passive switch, force-disconnect handoff) set the
+// suppress flag so they never trigger retries.
+const VOICE_AUTO_RECONNECT_MAX_ATTEMPTS = 3;
+let voiceReconnectAttempts = 0;
+let voiceReconnectTimer = null;
+let voiceSuppressAutoReconnect = false;
+
+function cancelVoiceAutoReconnect() {
+  if (voiceReconnectTimer) {
+    clearTimeout(voiceReconnectTimer);
+    voiceReconnectTimer = null;
+  }
+}
+
+// User-initiated (re)connect: clear suppression and the attempt budget so
+// automatic recovery is available again for the new session.
+function voiceConnectRequestedByUser() {
+  voiceSuppressAutoReconnect = false;
+  voiceReconnectAttempts = 0;
+  cancelVoiceAutoReconnect();
+}
+
+function maybeScheduleVoiceReconnect() {
+  if (voiceSuppressAutoReconnect || voiceReconnectTimer) return;
+  if (!voiceHadPriorSession) return; // nothing was live — nothing to restore
+  if (!isActiveBrowser) return; // passive browsers don't own voice
+  if (!hasVoiceCredentials()) return; // a retry would only pop the key dialog
+  if (voiceReconnectAttempts >= VOICE_AUTO_RECONNECT_MAX_ATTEMPTS) {
+    showVoiceStatus('Voice reconnect failed — click the mic to retry', true);
+    return;
+  }
+  voiceReconnectAttempts += 1;
+  const attempt = voiceReconnectAttempts;
+  const delayMs = Math.round(1000 * Math.pow(2, attempt - 1) * (0.85 + Math.random() * 0.3));
+  showVoiceStatus(`Voice disconnected — reconnecting (attempt ${attempt}/${VOICE_AUTO_RECONNECT_MAX_ATTEMPTS})...`);
+  voiceReconnectTimer = setTimeout(() => {
+    voiceReconnectTimer = null;
+    if (voiceSuppressAutoReconnect || modelConnected || voiceConnecting || !isActiveBrowser) return;
+    connectVoice();
+  }, delayMs);
+}
+
 // ── Voice Connection ──
 async function connectVoice() {
   if (!app || voiceConnecting || !isActiveBrowser) return;
@@ -355,9 +427,41 @@ async function connectVoice() {
 }
 
 // ── Dialogs ──
+// One honest line about custody: where a key entered in these dialogs is
+// actually stored. Mirrors voiceApiKeySet's decision exactly — vault entry
+// when the passkey vault is unlocked for this provider, otherwise this
+// browser's per-origin localStorage.
+function voiceKeyStorageHint() {
+  const storageKey = getStorageKey();
+  const vaultActive =
+    typeof vaultState === 'object' && vaultState && vaultState.status === 'unlocked' &&
+    typeof VAULT_VOICE_STORAGE_PROVIDERS !== 'undefined' && !!VAULT_VOICE_STORAGE_PROVIDERS[storageKey];
+  return vaultActive
+    ? 'This key is stored in your unlocked vault (encrypted, follows your account) — not in this browser.'
+    : `This key is stored only in this browser's localStorage for ${location.origin} (vault locked or unavailable).`;
+}
+
+// The dialog markup ships without the hint element; create it lazily so
+// the text can reflect the custody path active at open time.
+function ensureVoiceKeyStorageNote(inputId, noteId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  let note = document.getElementById(noteId);
+  if (!note) {
+    note = document.createElement('p');
+    note.id = noteId;
+    note.style.fontSize = '11px';
+    note.style.color = 'var(--subtext0)';
+    note.style.margin = '6px 0 0';
+    input.insertAdjacentElement('afterend', note);
+  }
+  note.textContent = voiceKeyStorageHint();
+}
+
 function showFirstRunDialog() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   document.getElementById('firstRunKeyLabel').textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' API Key';
+  ensureVoiceKeyStorageNote('firstRunKeyInput', 'firstRunKeyStorageNote');
   document.getElementById('firstRunDialog').classList.remove('hidden');
 }
 
@@ -365,6 +469,7 @@ function showSettingsDialog() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   document.getElementById('apiKeyLabel').textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' API Key';
   document.getElementById('apiKeyInput').value = voiceApiKeyGet() || '';
+  ensureVoiceKeyStorageNote('apiKeyInput', 'settingsKeyStorageNote');
   document.getElementById('passiveModeCheckbox').checked = localStorage.getItem('passive_mode') === 'true';
   document.getElementById('settingsDialog').classList.remove('hidden');
 }
@@ -375,6 +480,20 @@ async function main() {
   app = new PresenceWeb();
   installDashboardControlServerSender();
 
+  // Per-branch isolation for the server-message router below: one
+  // throwing handler must not silently kill the remaining routing for the
+  // same message (the old whole-dispatcher catch(_){} did exactly that —
+  // and let a throwing early-return branch fall through to the WASM
+  // handoff it meant to skip). Each case runs inside its own guard that
+  // logs and moves on.
+  const serverMsgStep = (d, label, fn) => {
+    try {
+      return fn();
+    } catch (e) {
+      console.warn('[server-msg]', label || d?.event || d?.t || 'unknown', e);
+      return undefined;
+    }
+  };
   // Intercept all server messages for AppState routing.
   // The WebRTC dashboard-control dev path reuses this same dispatcher for
   // DataChannel event frames so both transports exercise identical UI code.
@@ -386,350 +505,420 @@ async function main() {
       if (dashboardShouldDropDuplicateServerMessage(d)) return;
       // Attention center (57-attention-notifications.js): tab badge +
       // hidden-tab notifications for pending approvals/questions.
-      try { attentionObserveServerMessage(d); } catch (_) {}
+      serverMsgStep(d, 'attention', () => attentionObserveServerMessage(d));
       if (d.t === 'ws_denied') {
-        const frame = String(d.frame || '');
-        if (!wsDeniedToastShown.has(frame)) {
-          wsDeniedToastShown.add(frame);
-          showControlToast?.('error', 'Not allowed by your access grant: ' + (d.permission || frame || 'operation'));
-        }
+        serverMsgStep(d, 'ws_denied', () => {
+          const frame = String(d.frame || '');
+          if (!wsDeniedToastShown.has(frame)) {
+            wsDeniedToastShown.add(frame);
+            showControlToast?.('error', 'Not allowed by your access grant: ' + (d.permission || frame || 'operation'));
+          }
+        });
+        return;
+      }
+      if (d.t === 'event_gap' || d.event === 'event_gap') {
+        // The /ws lane's dropped-events marker. The daemon tags it like
+        // every /ws line ({"event":"event_gap","skipped":N}); the t-form
+        // is accepted too so both lanes share one shape family
+        // (50-control-transport.js handles the tunnel's t-frame side).
+        serverMsgStep(d, 'event_gap', () => dashboardHandleEventGap(d, 'ws'));
         return;
       }
       if (d.event === 'context_snapshot') {
-        const contextSid = sessionWindowTargetForLogSession(d.session_id);
-        if (contextSid) markSessionWindowPendingActive(contextSid);
-        handleContextSnapshot(d);
-        scheduleExternalSessionWindowTranscriptSync(d.session_id, 700);
+        serverMsgStep(d, 'context_snapshot', () => {
+          const contextSid = sessionWindowTargetForLogSession(d.session_id);
+          if (contextSid) markSessionWindowPendingActive(contextSid);
+          handleContextSnapshot(d);
+          scheduleExternalSessionWindowTranscriptSync(d.session_id, 700);
+        });
         return;
       }
       if (d.event === 'shared_view') {
-        handleSharedViewEvent(d);
+        serverMsgStep(d, 'shared_view', () => handleSharedViewEvent(d));
         return;
       }
       if (d.event === 'session_note') {
         // Display-only transcript note: rendered end to end in JS (the
         // WASM presence layer does not know this event).
-        handleSessionNoteEvent(d);
+        serverMsgStep(d, 'session_note', () => handleSessionNoteEvent(d));
         return;
       }
       if (d.event === 'display_request_raised') {
         // User-display doorbell: rendered end to end in JS
         // (58-display-request.js); the attention center already saw it
         // via attentionObserveServerMessage above.
-        handleDisplayRequestRaised(d);
+        serverMsgStep(d, 'display_request_raised', () => handleDisplayRequestRaised(d));
         return;
       }
       if (d.event === 'display_request_resolved') {
-        handleDisplayRequestResolved(d);
+        serverMsgStep(d, 'display_request_resolved', () => handleDisplayRequestResolved(d));
         return;
       }
       if (d.event === 'user_notification') {
         // Agent→user notification: toast + transcript row, end to end in
         // JS like session notes (the attention center already saw it via
         // attentionObserveServerMessage above).
-        handleUserNotificationEvent(d);
+        serverMsgStep(d, 'user_notification', () => handleUserNotificationEvent(d));
         return;
       }
       if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
-        handleBrowserWorkspaceMessage(d);
+        serverMsgStep(d, 'browser_workspace', () => handleBrowserWorkspaceMessage(d));
         return;
       }
       if (d.t === 'log_replay' && Array.isArray(d.entries)) {
-        resetChangesPane();
-        const snapshots = d.entries
-          .filter(entry => entry && entry.event === 'context_snapshot');
-        handleContextReplaySnapshots(snapshots);
-        const filtered = {
-          ...d,
-          entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
-        };
-        applySessionIdentitiesFromReplayEntries(filtered.entries);
-        applyExternalIdentitiesFromLogEntries(filtered.entries);
-        applySessionGoalsFromReplayEntries(filtered.entries);
-        applySessionVitalsFromReplayEntries(filtered.entries);
-        resetSessionWindowsForReplay(filtered.entries);
-        const wasProcessingLogReplay = processingLogReplay;
-        processingLogReplay = true;
-        try {
-          // session_note / user_notification entries ride the WASM
-          // pipeline as styled log_entry rows (see
-          // sessionNoteReplayEntryToLogEntry and its notification twin) so
-          // the replayed transcript keeps chronological order.
-          const cmds = app.handle_server_message({
-            ...filtered,
-            entries: filtered.entries
-              .map(sessionNoteReplayEntryToLogEntry)
-              .map(userNotificationReplayEntryToLogEntry),
-          });
-          if (cmds) processCommands(cmds);
-        } finally {
-          processingLogReplay = wasProcessingLogReplay;
-        }
-        finalizeActiveCommandOutputGroup();
-        // Historical replay can emit lifecycle commands such as session_ended
-        // that move the live dashboard to Sessions. The URL remains the
-        // navigation source of truth, so re-apply it after replay settles.
-        applyCurrentRoute();
-        reconcileRecordingStreams();
+        serverMsgStep(d, 'log_replay', () => {
+          resetChangesPane();
+          const snapshots = d.entries
+            .filter(entry => entry && entry.event === 'context_snapshot');
+          handleContextReplaySnapshots(snapshots);
+          const filtered = {
+            ...d,
+            entries: d.entries.filter(entry => !entry || entry.event !== 'context_snapshot'),
+          };
+          applySessionIdentitiesFromReplayEntries(filtered.entries);
+          applyExternalIdentitiesFromLogEntries(filtered.entries);
+          applySessionGoalsFromReplayEntries(filtered.entries);
+          applySessionVitalsFromReplayEntries(filtered.entries);
+          resetSessionWindowsForReplay(filtered.entries);
+          const wasProcessingLogReplay = processingLogReplay;
+          processingLogReplay = true;
+          try {
+            // session_note / user_notification entries ride the WASM
+            // pipeline as styled log_entry rows (see
+            // sessionNoteReplayEntryToLogEntry and its notification twin) so
+            // the replayed transcript keeps chronological order.
+            const cmds = app.handle_server_message({
+              ...filtered,
+              entries: filtered.entries
+                .map(sessionNoteReplayEntryToLogEntry)
+                .map(userNotificationReplayEntryToLogEntry),
+            });
+            if (cmds) processCommands(cmds);
+          } finally {
+            processingLogReplay = wasProcessingLogReplay;
+          }
+          finalizeActiveCommandOutputGroup();
+          // Historical replay can emit lifecycle commands such as session_ended
+          // that move the live dashboard to Sessions. The URL remains the
+          // navigation source of truth, so re-apply it after replay settles.
+          applyCurrentRoute();
+          reconcileRecordingStreams();
+        });
         return;
       }
       if (d.t === 'state_snapshot' && d.session_id) {
-        setDaemonSessionId(d.session_id);
+        serverMsgStep(d, 'state_snapshot', () => setDaemonSessionId(d.session_id));
       }
       if (d.event === 'session_identity') {
-        applySessionIdentity(d);
-        scheduleExternalSessionWindowTranscriptSync(d.backend_session_id || d.backendSessionId || d.session_id, 600);
-        // `session_identity` arrives before the external worker subscribes for
-        // thread actions; queued detached actions wait for `session_attached`.
+        serverMsgStep(d, 'session_identity', () => {
+          applySessionIdentity(d);
+          scheduleExternalSessionWindowTranscriptSync(d.backend_session_id || d.backendSessionId || d.session_id, 600);
+          // `session_identity` arrives before the external worker subscribes for
+          // thread actions; queued detached actions wait for `session_attached`.
+        });
       }
       if (
         (d.event === 'done_signal' || d.event === 'round_complete' || d.event === 'task_complete') &&
         d.session_id
       ) {
-        scheduleExternalSessionWindowTranscriptSync(d.session_id, 300);
+        serverMsgStep(d, 'transcript_sync', () => scheduleExternalSessionWindowTranscriptSync(d.session_id, 300));
       }
-      applyExternalIdentityFromLogEntry(d);
+      serverMsgStep(d, 'external_identity', () => applyExternalIdentityFromLogEntry(d));
       if (d.event === 'session_relationship') {
-        applySessionRelationship(d);
-        stationPushSessionRelationshipActivity(d, { renderLog: false });
+        serverMsgStep(d, 'session_relationship', () => {
+          applySessionRelationship(d);
+          stationPushSessionRelationshipActivity(d, { renderLog: false });
+        });
       }
       if (d.event === 'session_capabilities') {
-        applySessionCapabilities(d);
+        serverMsgStep(d, 'session_capabilities', () => applySessionCapabilities(d));
       }
       if (d.event === 'session_attached') {
-        const sid = String(d.session_id || d.sessionId || '').trim();
-        if (sid) {
-          setSessionWindowDetached(sid, false);
-          flushPendingDetachedCodexThreadActions(sid);
-        }
+        serverMsgStep(d, 'session_attached', () => {
+          const sid = String(d.session_id || d.sessionId || '').trim();
+          if (sid) {
+            setSessionWindowDetached(sid, false);
+            flushPendingDetachedCodexThreadActions(sid);
+          }
+        });
       }
       if (d.event === 'status' && d.session_id && d.phase) {
-        recordRecentSessionStatusPhase(d.session_id, d.phase);
-        const sid = statusSessionWindowTarget(d.session_id);
-        if (sid && shouldMaterializeStatusSessionWindow(sid)) {
-          updateSessionWindow(sid, { phase: d.phase, ended: false });
-        }
+        serverMsgStep(d, 'status', () => {
+          recordRecentSessionStatusPhase(d.session_id, d.phase);
+          const sid = statusSessionWindowTarget(d.session_id);
+          if (sid && shouldMaterializeStatusSessionWindow(sid)) {
+            updateSessionWindow(sid, { phase: d.phase, ended: false });
+          }
+        });
       }
       if (d.event === 'session_goal') {
-        applySessionGoal(d);
+        serverMsgStep(d, 'session_goal', () => applySessionGoal(d));
       }
       if (d.event === 'session_vitals') {
-        applySessionVitals(d);
+        serverMsgStep(d, 'session_vitals', () => applySessionVitals(d));
       }
       if (d.event === 'session_agent_config_result') {
-        handleSessionConfigResult(d);
+        serverMsgStep(d, 'session_agent_config_result', () => handleSessionConfigResult(d));
       }
       if (d.event === 'user_message_edit_status') {
-        handleUserMessageEditStatus(d);
+        serverMsgStep(d, 'user_message_edit_status', () => handleUserMessageEditStatus(d));
       }
       if (d.event === 'user_message_rewind') {
-        handleUserMessageRewind(d);
+        serverMsgStep(d, 'user_message_rewind', () => handleUserMessageRewind(d));
       }
       if (d.event === 'codex_thread_action_requested') {
-        handleCodexThreadActionRequested(d);
+        serverMsgStep(d, 'codex_thread_action_requested', () => handleCodexThreadActionRequested(d));
       }
       if (d.event === 'follow_up_status') {
-        handleFollowUpStatusUpdate(d);
+        serverMsgStep(d, 'follow_up_status', () => handleFollowUpStatusUpdate(d));
         return;
       }
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
-        approvalSessionIds.set(String(d.id), d.session_id);
+        serverMsgStep(d, 'approval_required', () => approvalSessionIds.set(String(d.id), d.session_id));
       }
       if (d.event === 'user_question' && d.id !== undefined && d.session_id) {
-        approvalSessionIds.set(String(d.id), d.session_id);
+        serverMsgStep(d, 'user_question', () => approvalSessionIds.set(String(d.id), d.session_id));
       }
       if (d.event === 'approval_resolved' && d.id !== undefined
           && typeof pendingQuestion !== 'undefined' && pendingQuestion
           && String(pendingQuestion.id) === String(d.id)
           && (!d.session_id || !pendingQuestion.sessionId || d.session_id === pendingQuestion.sessionId)) {
         // Another frontend answered/dismissed this question — drop our panel.
-        clearPendingQuestion();
-        hidePanel('question-panel');
+        serverMsgStep(d, 'approval_resolved', () => {
+          clearPendingQuestion();
+          hidePanel('question-panel');
+        });
       }
       if (d.event === 'autonomy_changed') {
-        updateStatusBar({ autonomy: d.autonomy });
+        serverMsgStep(d, 'autonomy_changed', () => updateStatusBar({ autonomy: d.autonomy }));
         return;
       }
       if (d.t === 'annotation_saved' && d.path) {
-        showAnnotationResult(d.path);
+        serverMsgStep(d, 'annotation_saved', () => showAnnotationResult(d.path));
         return;
       }
       if (d.t === 'annotation_attached') {
         // Server confirmed the attach landed in the registry. Our local
         // pending list was already populated optimistically — nothing to do
         // unless registration failed, in which case the chip would lie.
-        if (d.ok === false) {
-          removePendingAttachment(d.frame_id);
-        }
+        serverMsgStep(d, 'annotation_attached', () => {
+          if (d.ok === false) {
+            removePendingAttachment(d.frame_id);
+          }
+        });
         return;
       }
       if (d.t === 'clip_saved') {
-        const el = document.getElementById('clip-status');
-        if (el) {
-          const verb = d.injected ? 'Sent' : 'Saved';
-          el.textContent = `${verb} ${d.frames_registered} frames`;
-          el.style.color = 'var(--green)';
-          setTimeout(() => { el.textContent = ''; el.style.color = ''; }, 5000);
-        }
+        serverMsgStep(d, 'clip_saved', () => {
+          const el = document.getElementById('clip-status');
+          if (el) {
+            const verb = d.injected ? 'Sent' : 'Saved';
+            el.textContent = `${verb} ${d.frames_registered} frames`;
+            el.style.color = 'var(--green)';
+            setTimeout(() => { el.textContent = ''; el.style.color = ''; }, 5000);
+          }
+        });
         return;
       }
       // WebRTC signaling — intercept before WASM (not a UiCommand)
       if (d.t === 'display_answer') {
-        const s = displaySlots.get(Number(d.display_id));
-        if (s) s.handleAnswer(d.sdp);
+        serverMsgStep(d, 'display_answer', () => {
+          const s = displaySlots.get(Number(d.display_id));
+          if (s) s.handleAnswer(d.sdp);
+        });
         return;
       }
       if (d.t === 'display_ice') {
-        const s = displaySlots.get(Number(d.display_id));
-        if (s) s.handleIceCandidate(d.candidate);
+        serverMsgStep(d, 'display_ice', () => {
+          const s = displaySlots.get(Number(d.display_id));
+          if (s) s.handleIceCandidate(d.candidate);
+        });
         return;
       }
       if (d.t === 'dashboard_control_answer') {
-        if (dashboardControlTransport) {
-          dashboardControlTransport
-            .handleAnswer(d)
-            .catch(err => dashboardControlTransport.handleError(err?.message || String(err)));
-        }
+        serverMsgStep(d, 'dashboard_control_answer', () => {
+          if (dashboardControlTransport) {
+            dashboardControlTransport
+              .handleAnswer(d)
+              .catch(err => dashboardControlTransport.handleError(err?.message || String(err)));
+          }
+        });
         return;
       }
       if (d.t === 'dashboard_control_ice') {
-        if (dashboardControlTransport) dashboardControlTransport.handleIceCandidate(d.candidate);
+        serverMsgStep(d, 'dashboard_control_ice', () => {
+          if (dashboardControlTransport) dashboardControlTransport.handleIceCandidate(d.candidate);
+        });
         return;
       }
       if (d.t === 'dashboard_control_error') {
-        if (dashboardControlTransport) dashboardControlTransport.handleError(d.error || 'unknown');
+        serverMsgStep(d, 'dashboard_control_error', () => {
+          if (dashboardControlTransport) dashboardControlTransport.handleError(d.error || 'unknown');
+        });
         return;
       }
       // Standalone shell fallback for older WASM bundles. Current bundles
       // dispatch these through set_on_terminal_output/exited below so they
       // don't take the generic raw-message bridge.
       if (d.t === 'terminal_output') {
-        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellOutput(d.data);
-        }
+        serverMsgStep(d, 'terminal_output', () => {
+          if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+            handleShellOutput(d.data);
+          }
+        });
         return;
       }
       if (d.t === 'terminal_exited') {
-        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellExited(d.status);
-        }
+        serverMsgStep(d, 'terminal_exited', () => {
+          if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+            handleShellExited(d.status);
+          }
+        });
         return;
       }
       if (d.t === 'terminal_opened') {
-        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellOpened(d);
-        }
+        serverMsgStep(d, 'terminal_opened', () => {
+          if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+            handleShellOpened(d);
+          }
+        });
         return;
       }
       if (d.t === 'terminal_shared') {
-        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellShared(d);
-        }
+        serverMsgStep(d, 'terminal_shared', () => {
+          if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+            handleShellShared(d);
+          }
+        });
         return;
       }
       if (d.t === 'terminal_error') {
-        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
-          handleShellError(d.error);
-        }
+        serverMsgStep(d, 'terminal_error', () => {
+          if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
+            handleShellError(d.error);
+          }
+        });
         return;
       }
       // Display resize — update stored dimensions and status text
       if (d.t === 'display_resize' || d.event === 'display_resize') {
-        const slot = displaySlots.get(Number(d.display_id));
-        if (slot) {
-          slot.width = Number(d.width);
-          slot.height = Number(d.height);
-          if (slot.statusEl) {
-            const res = slot.width > 0 ? ` ${slot.width}x${slot.height}` : '';
-            const mode = slot.interactive ? 'interactive' : 'view-only';
-            slot.statusEl.textContent = slot.connected
-              ? `Connected (${mode})${res}`
-              : `Connecting...${res}`;
+        serverMsgStep(d, 'display_resize', () => {
+          const slot = displaySlots.get(Number(d.display_id));
+          if (slot) {
+            slot.width = Number(d.width);
+            slot.height = Number(d.height);
+            if (slot.statusEl) {
+              const res = slot.width > 0 ? ` ${slot.width}x${slot.height}` : '';
+              const mode = slot.interactive ? 'interactive' : 'view-only';
+              slot.statusEl.textContent = slot.connected
+                ? `Connected (${mode})${res}`
+                : `Connecting...${res}`;
+            }
           }
-        }
+        });
       }
       // Track user display grant/revoke events. `agent_visible` is
       // absent on wires older than the private-view split; absent
       // means the classic agent share.
       if (d.event === 'user_display_granted') {
-        grantedDisplayId = Number(d.display_id || 0);
-        const agentVisible = d.agent_visible !== false;
-        userDisplayIds.add(grantedDisplayId);
-        setDisplayAgentVisibility(grantedDisplayId, agentVisible);
-        setUserDisplayState(true, agentVisible);
+        serverMsgStep(d, 'user_display_granted', () => {
+          grantedDisplayId = Number(d.display_id || 0);
+          const agentVisible = d.agent_visible !== false;
+          userDisplayIds.add(grantedDisplayId);
+          setDisplayAgentVisibility(grantedDisplayId, agentVisible);
+          setUserDisplayState(true, agentVisible);
+        });
       } else if (d.event === 'user_display_revoked') {
-        const revokedId = Number(d.display_id || 0);
-        if (Number(grantedDisplayId) === revokedId) setUserDisplayState(false);
-        clearDisplayAgentVisibility(revokedId);
-        removeDisplaySlot(revokedId);
-        const banner = document.getElementById('display-approval-banner');
-        if (banner) banner.classList.add('hidden');
+        serverMsgStep(d, 'user_display_revoked', () => {
+          const revokedId = Number(d.display_id || 0);
+          if (Number(grantedDisplayId) === revokedId) setUserDisplayState(false);
+          clearDisplayAgentVisibility(revokedId);
+          removeDisplaySlot(revokedId);
+          const banner = document.getElementById('display-approval-banner');
+          if (banner) banner.classList.add('hidden');
+        });
       }
       // Handle display capture lost — disconnect but keep slot for possible re-grant
       if (d.event === 'display_capture_lost') {
-        const id = Number(d.display_id || 0);
-        const reason = d.reason || 'capture ended';
-        const slot = displaySlots.get(id);
-        if (slot) {
-          slot.disconnect();
-          slot.statusEl.textContent = 'Display lost: ' + reason;
-          slot.statusEl.className = 'display-status error';
-        } else {
-          // Capture died before any slot existed — a grant that failed
-          // immediately, e.g. "Your display" on a headless box with no
-          // display server. Without this branch the failure is invisible:
-          // the toggle stays on and no tile ever appears (the daemon-side
-          // reason lands only in its journal).
-          if (Number(grantedDisplayId) === id && typeof setUserDisplayState === 'function') {
-            setUserDisplayState(false);
+        serverMsgStep(d, 'display_capture_lost', () => {
+          const id = Number(d.display_id || 0);
+          const reason = d.reason || 'capture ended';
+          const slot = displaySlots.get(id);
+          if (slot) {
+            slot.disconnect();
+            slot.statusEl.textContent = 'Display lost: ' + reason;
+            slot.statusEl.className = 'display-status error';
+          } else {
+            // Capture died before any slot existed — a grant that failed
+            // immediately, e.g. "Your display" on a headless box with no
+            // display server. Without this branch the failure is invisible:
+            // the toggle stays on and no tile ever appears (the daemon-side
+            // reason lands only in its journal).
+            if (Number(grantedDisplayId) === id && typeof setUserDisplayState === 'function') {
+              setUserDisplayState(false);
+            }
+            if (typeof showControlToast === 'function') {
+              showControlToast('error', 'Display unavailable: ' + reason);
+            }
           }
-          if (typeof showControlToast === 'function') {
-            showControlToast('error', 'Display unavailable: ' + reason);
-          }
-        }
-        // Hide the approval banner — capture lost supersedes any pending grant.
-        const banner = document.getElementById('display-approval-banner');
-        if (banner) banner.classList.add('hidden');
+          // Hide the approval banner — capture lost supersedes any pending grant.
+          const banner = document.getElementById('display-approval-banner');
+          if (banner) banner.classList.add('hidden');
+        });
       }
       // Approval pending: server has raised the OS portal dialog and is
       // waiting for the user to click Allow on the guest desktop.
       if (d.event === 'display_approval_pending') {
-        const banner = document.getElementById('display-approval-banner');
-        if (banner) banner.classList.remove('hidden');
+        serverMsgStep(d, 'display_approval_pending', () => {
+          const banner = document.getElementById('display-approval-banner');
+          if (banner) banner.classList.remove('hidden');
+        });
       }
       // DisplayReady (or add_display via processCommands) clears the banner.
       if (d.event === 'display_ready') {
-        const banner = document.getElementById('display-approval-banner');
-        if (banner) banner.classList.add('hidden');
-        // Record the display's agent-visibility mode for the tile chip
-        // (live events and the gateway's bootstrap replay both carry it).
-        if (d.agent_visible !== undefined) {
-          setDisplayAgentVisibility(Number(d.display_id || 0), d.agent_visible !== false);
-        }
+        serverMsgStep(d, 'display_ready', () => {
+          const banner = document.getElementById('display-approval-banner');
+          if (banner) banner.classList.add('hidden');
+          // Record the display's agent-visibility mode for the tile chip
+          // (live events and the gateway's bootstrap replay both carry it).
+          if (d.agent_visible !== undefined) {
+            setDisplayAgentVisibility(Number(d.display_id || 0), d.agent_visible !== false);
+          }
+        });
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {
-        const slot = slotForRecordingStream(d.stream_name);
-        if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
-        handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
+        serverMsgStep(d, 'recording_started', () => {
+          const slot = slotForRecordingStream(d.stream_name);
+          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+          handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
+        });
       } else if (d.event === 'recording_stopped' && d.stream_name) {
-        const slot = slotForRecordingStream(d.stream_name);
-        if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
-        handleDebugRecordingEvent(d);
+        serverMsgStep(d, 'recording_stopped', () => {
+          const slot = slotForRecordingStream(d.stream_name);
+          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+          handleDebugRecordingEvent(d);
+        });
       } else if (d.event === 'recording_deleted' && d.stream_name) {
-        const slot = slotForRecordingStream(d.stream_name);
-        if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
-        deleteRecordingStream(d.stream_name);
+        serverMsgStep(d, 'recording_deleted', () => {
+          const slot = slotForRecordingStream(d.stream_name);
+          if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+          deleteRecordingStream(d.stream_name);
+        });
       }
       // Display transport metrics (per-display sections)
       if (d.event === 'display_metrics') {
-        updateDisplayMetrics(d);
+        serverMsgStep(d, 'display_metrics', () => updateDisplayMetrics(d));
       }
       if (eventRefreshesSessionMetadata(d.event)) {
-        scheduleSessionsMetadataRefresh();
+        serverMsgStep(d, 'sessions_metadata_refresh', () => scheduleSessionsMetadataRefresh());
       }
-      maybeHandleDashboardTunneledServerMessage(d);
-    } catch(_) {}
+      serverMsgStep(d, 'tunneled_server_message', () => maybeHandleDashboardTunneledServerMessage(d));
+    } catch (e) {
+      // Backstop for the pre-branch steps (parse, dedupe key building) —
+      // per-branch failures are already isolated and logged above.
+      console.warn('[server-msg]', 'dispatch', e);
+    }
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
   };
@@ -773,6 +962,10 @@ async function main() {
     const isReconnect = voiceHadPriorSession;
     voiceHadPriorSession = false;
     modelConnected = true;
+    // Live again: reset the auto-reconnect budget and drop any pending
+    // retry timer (a late timer would double-connect).
+    voiceReconnectAttempts = 0;
+    cancelVoiceAutoReconnect();
     if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
     document.getElementById('sb-voice').className = 'voice-dot ok';
     document.getElementById('videoBtn').classList.remove('is-disabled');
@@ -833,6 +1026,13 @@ async function main() {
       document.getElementById('sb-voice').className = 'voice-dot err';
       if (videoActive) stopVideo();
       document.getElementById('videoBtn').classList.add('is-disabled');
+      showVoiceStatus(msg, true);
+      sendDashboardVoiceDiagnostic('error', msg);
+      // Provider-side close/error with a session that was live and not
+      // user-stopped: try to restore it (≤3 backed-off attempts; the
+      // status line above is immediately replaced by the retry notice).
+      maybeScheduleVoiceReconnect();
+      return;
     }
     showVoiceStatus(msg, true);
     sendDashboardVoiceDiagnostic('error', msg);
@@ -850,6 +1050,9 @@ async function main() {
       if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       document.getElementById('sb-voice').className = 'voice-dot err';
       document.getElementById('videoBtn').classList.add('is-disabled');
+      // Deliberate same-turn reconnect: refresh the auto-reconnect budget
+      // so the NEW session keeps its own recovery attempts.
+      voiceConnectRequestedByUser();
       connectVoice();
     }
   });
@@ -930,6 +1133,9 @@ async function main() {
 
   app.set_on_force_disconnect((reason) => {
     sendDashboardVoiceDiagnostic('make_active_force_disconnect_client', 'reason=' + reason);
+    // Another browser took voice over — never fight it with auto-retries.
+    voiceSuppressAutoReconnect = true;
+    cancelVoiceAutoReconnect();
     if (modelConnected) {
       if (videoActive) stopVideo();
       disconnectDashboardVoice();
@@ -953,6 +1159,7 @@ async function main() {
       'make_active_granted_client',
       'handover=' + (handoverContext ? 'yes' : 'no') + ', conversation=' + (conversationContext ? 'yes' : 'no'),
     );
+    voiceConnectRequestedByUser();
     isActiveBrowser = true;
     document.getElementById('makeActiveBtn').disabled = false;
     updateActivePassiveUI();
@@ -1004,6 +1211,7 @@ async function main() {
     // so the legacy event stream can never connect — the WebRTC control
     // transport, whose signaling rides the proxy, carries events instead.
     console.info('[app] mTLS bundle: skipping legacy WebSocket; events flow through the control transport');
+    setConnectEventStatus('warn', 'Connecting dashboard events through the control tunnel');
     try {
       const [cfg, card] = await Promise.all([
         fetch('/config').then(r => r.json()).catch(() => ({})),
@@ -1012,7 +1220,16 @@ async function main() {
       applyGatewayConfig(cfg);
       applyAgentCardIdentity(card);
     } catch {}
-    maybeStartDashboardControlTransport();
+    // The tunnel is the ONLY event lane in this posture: a failed initial
+    // start must enter the same reconnect loop a mid-session drop does
+    // (success flips the chip from subscribe_events in the transport).
+    maybeStartDashboardControlTransport().then(started => {
+      if (started === false) {
+        scheduleDashboardConnectReconnect('dashboard control transport failed to start', { delayMs: 1000 });
+      }
+    }).catch(err => {
+      scheduleDashboardConnectReconnect(err?.message || 'dashboard control transport failed to start', { delayMs: 1000 });
+    });
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
     const wsUrl = buildWsUrl();
@@ -1081,6 +1298,7 @@ async function main() {
     if (!isActiveBrowser) return;
     if (!modelConnected) {
       if (!hasVoiceCredentials()) { showFirstRunDialog(); return; }
+      voiceConnectRequestedByUser();
       connectVoice();
     }
     micActive = !micActive;
@@ -1114,7 +1332,10 @@ async function main() {
   // Active/Passive badge in status bar — click to toggle
   document.getElementById('sb-active-badge').addEventListener('click', () => {
     if (isActiveBrowser) {
-      // Switch to passive: enable passive mode and disconnect voice
+      // Switch to passive: enable passive mode and disconnect voice.
+      // Explicit user stop — no auto-reconnect afterwards.
+      voiceSuppressAutoReconnect = true;
+      cancelVoiceAutoReconnect();
       localStorage.setItem('passive_mode', 'true');
       app.set_passive_mode(true);
       if (modelConnected) {
@@ -1142,6 +1363,7 @@ async function main() {
     if (key) {
       voiceApiKeySet(key);
       document.getElementById('firstRunDialog').classList.add('hidden');
+      voiceConnectRequestedByUser();
       connectVoice();
     }
   });
@@ -1163,6 +1385,8 @@ async function main() {
 
   // Clean up on unload
   window.addEventListener('beforeunload', () => {
+    voiceSuppressAutoReconnect = true;
+    cancelVoiceAutoReconnect();
     if (modelConnected && app) disconnectDashboardVoice();
   });
 }

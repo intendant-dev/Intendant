@@ -359,18 +359,65 @@ const CONTEXT_CATEGORY_ORDER = [
   'config',
   'other',
 ];
+/* Category colors resolve from the ui-v2 design tokens
+   (16-styles-v2-tokens.css) — the visualizer paints into WebGL and canvas
+   sprites, where CSS custom properties cannot cascade in, so they are
+   resolved here at init and re-resolved on every data-theme flip (the
+   terminal's ui2ShellTheme pattern in 44-shell-frames.js). `fallback`
+   carries the dark-theme value for a token-less document; `color` is the
+   resolved value every consumer reads. */
 const CONTEXT_CATEGORY_DEFS = {
-  instructions: { label: 'Instructions', color: '#89b4fa' },
-  user: { label: 'User', color: '#a6e3a1' },
-  assistant: { label: 'Assistant', color: '#cba6f7' },
-  tool_call: { label: 'Tool calls', color: '#f9e2af' },
-  tool_output: { label: 'Tool output', color: '#fab387' },
-  reasoning: { label: 'Reasoning', color: '#f5c2e7' },
-  media: { label: 'Media', color: '#94e2d5' },
-  schema: { label: 'Tool schema', color: '#74c7ec' },
-  config: { label: 'Request config', color: '#b4befe' },
-  other: { label: 'Other', color: '#bac2de' },
+  instructions: { label: 'Instructions', token: '--iris', fallback: '#7E8CFA', color: '#7E8CFA' },
+  user: { label: 'User', token: '--green', fallback: '#58C08C', color: '#58C08C' },
+  assistant: { label: 'Assistant', token: '--violet', fallback: '#9B7CF2', color: '#9B7CF2' },
+  tool_call: { label: 'Tool calls', token: '--amber', fallback: '#E4A85B', color: '#E4A85B' },
+  tool_output: { label: 'Tool output', token: '--rose', fallback: '#EC6A85', color: '#EC6A85' },
+  reasoning: { label: 'Reasoning', token: '--iris-2', fallback: '#A6AEFF', color: '#A6AEFF' },
+  media: { label: 'Media', token: '--sky', fallback: '#5DA9E6', color: '#5DA9E6' },
+  schema: { label: 'Tool schema', token: '--viz-ramp-3', fallback: '#6470D0', color: '#6470D0' },
+  config: { label: 'Request config', token: '--viz-ramp-2', fallback: '#454C86', color: '#454C86' },
+  other: { label: 'Other', token: '--neutral-dot', fallback: '#6c7086', color: '#6c7086' },
 };
+
+/* Chrome colors of the 3D scene (label sprites, lanes, reservoir frame,
+   pressure ladder), resolved alongside the categories. The pressure
+   ladder follows the v2 semantic triple green/amber/rose — the alias
+   layer itself collapsed the old yellow/peach split into --amber. */
+const CONTEXT_VIZ_THEME = {
+  labelBg: 'rgba(14, 16, 21, .7)',
+  labelText: '#EAECF2',
+  laneBase: '#232834',
+  frame: '#6c7086',
+  railLabel: '#A7AEBE',
+  selected: '#EAECF2',
+  pressure: { high: '#EC6A85', mid: '#E4A85B', ok: '#58C08C' },
+};
+
+function contextResolveVizTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = (name, fallback) => (styles.getPropertyValue(name) || '').trim() || fallback;
+  for (const def of Object.values(CONTEXT_CATEGORY_DEFS)) {
+    def.color = token(def.token, def.fallback);
+  }
+  CONTEXT_VIZ_THEME.labelBg = token('--glass', 'rgba(14, 16, 21, .7)');
+  CONTEXT_VIZ_THEME.labelText = token('--text', '#EAECF2');
+  CONTEXT_VIZ_THEME.laneBase = token('--surface-3', '#232834');
+  CONTEXT_VIZ_THEME.frame = token('--neutral-dot', '#6c7086');
+  CONTEXT_VIZ_THEME.railLabel = token('--text-2', '#A7AEBE');
+  CONTEXT_VIZ_THEME.selected = token('--text', '#EAECF2');
+  CONTEXT_VIZ_THEME.pressure = {
+    high: token('--rose', '#EC6A85'),
+    mid: token('--amber', '#E4A85B'),
+    ok: token('--green', '#58C08C'),
+  };
+}
+contextResolveVizTheme();
+// Live theme flips re-resolve and, when the Context pane is on screen,
+// rebuild the scene so light mode never keeps dark-theme geometry.
+new MutationObserver(() => {
+  contextResolveVizTheme();
+  if (contextPaneVisible()) scheduleContextPaneRender();
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 const contextViz = {
   canvas: null,
@@ -1492,7 +1539,7 @@ function contextSetThreeSize() {
   }
 }
 
-function contextLabelSprite(text, color = '#cdd6f4', scale = 1) {
+function contextLabelSprite(text, color = CONTEXT_VIZ_THEME.labelText, scale = 1) {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
   const fontSize = 44;
@@ -1501,7 +1548,7 @@ function contextLabelSprite(text, color = '#cdd6f4', scale = 1) {
   canvas.width = Math.ceil(metrics.width + 28);
   canvas.height = 72;
   ctx.font = `600 ${fontSize}px system-ui, sans-serif`;
-  ctx.fillStyle = 'rgba(17,17,26,0.78)';
+  ctx.fillStyle = CONTEXT_VIZ_THEME.labelBg;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = color;
   ctx.textBaseline = 'middle';
@@ -1523,10 +1570,9 @@ function contextClearThreeRoot() {
 }
 
 function contextPressureColor(pct) {
-  if (pct >= 0.92) return '#f38ba8';
-  if (pct >= 0.75) return '#fab387';
-  if (pct >= 0.55) return '#f9e2af';
-  return '#a6e3a1';
+  if (pct >= 0.92) return CONTEXT_VIZ_THEME.pressure.high;
+  if (pct >= 0.55) return CONTEXT_VIZ_THEME.pressure.mid;
+  return CONTEXT_VIZ_THEME.pressure.ok;
 }
 
 function contextBuildThree(analysis, snapshot) {
@@ -1544,7 +1590,7 @@ function contextBuildThree(analysis, snapshot) {
   const laneMap = new Map(categories.map((category, idx) => [category, (idx - (categories.length - 1) / 2) * laneSpacing]));
   const zSpread = 24;
   const maxTokens = Math.max(1, ...analysis.parts.map(part => part.tokens));
-  const baseMaterial = new THREE.MeshStandardMaterial({ color: 0x313244, transparent: true, opacity: 0.28, roughness: 0.84, metalness: 0.05 });
+  const baseMaterial = new THREE.MeshStandardMaterial({ color: new THREE.Color(CONTEXT_VIZ_THEME.laneBase), transparent: true, opacity: 0.28, roughness: 0.84, metalness: 0.05 });
   for (const category of categories) {
     const x = laneMap.get(category) || 0;
     const lane = new THREE.Mesh(new THREE.BoxGeometry(4.3, 0.08, zSpread + 4), baseMaterial.clone());
@@ -1598,7 +1644,7 @@ function contextBuildThree(analysis, snapshot) {
   const reservoirHeight = 10;
   const frame = new THREE.LineSegments(
     new THREE.EdgesGeometry(new THREE.BoxGeometry(2.4, reservoirHeight, 2.4)),
-    new THREE.LineBasicMaterial({ color: 0x6c7086, transparent: true, opacity: 0.72 })
+    new THREE.LineBasicMaterial({ color: new THREE.Color(CONTEXT_VIZ_THEME.frame), transparent: true, opacity: 0.72 })
   );
   frame.position.set(reservoirX, reservoirHeight / 2, 0);
   root.add(frame);
@@ -1613,7 +1659,7 @@ function contextBuildThree(analysis, snapshot) {
   usageLabel.position.set(reservoirX, reservoirHeight + 1.1, 0);
   root.add(usageLabel);
   if (hardWindow && hardWindow !== effectiveWindow) {
-    const hardLabel = contextLabelSprite('hard limit tracked', '#f38ba8', 0.9);
+    const hardLabel = contextLabelSprite('hard limit tracked', CONTEXT_VIZ_THEME.pressure.high, 0.9);
     hardLabel.position.set(reservoirX, -0.2, 2.7);
     root.add(hardLabel);
   }
@@ -1630,7 +1676,7 @@ function contextBuildThree(analysis, snapshot) {
       const entryPct = entryWindow > 0 ? Math.min(1.1, entryTokens / entryWindow) : (idx + 1) / timeline.length;
       const barHeight = 0.25 + entryPct * 4.6;
       const x = timeline.length <= 1 ? 0 : (idx / (timeline.length - 1) - 0.5) * railWidth;
-      const color = idx === selectedIdx ? '#ffffff' : contextPressureColor(entryPct);
+      const color = idx === selectedIdx ? CONTEXT_VIZ_THEME.selected : contextPressureColor(entryPct);
       const bar = new THREE.Mesh(
         new THREE.BoxGeometry(0.22, barHeight, 0.55),
         new THREE.MeshStandardMaterial({ color: new THREE.Color(color), transparent: true, opacity: idx === selectedIdx ? 0.95 : 0.5 })
@@ -1638,7 +1684,7 @@ function contextBuildThree(analysis, snapshot) {
       bar.position.set(x, barHeight / 2, zSpread / 2 + 3.6);
       root.add(bar);
     });
-    const railLabel = contextLabelSprite('session replay timeline', '#bac2de', 1.0);
+    const railLabel = contextLabelSprite('session replay timeline', CONTEXT_VIZ_THEME.railLabel, 1.0);
     railLabel.position.set(0, 5.6, zSpread / 2 + 3.6);
     root.add(railLabel);
   }

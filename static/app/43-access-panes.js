@@ -714,6 +714,16 @@ function renderAccessFleetStrip() {
     card.addEventListener('click', () => routeTo('access', 'daemons'));
     mount.appendChild(card);
   }
+  // Hosted fleet-sync health (42-usage-terminal.js sets the flag after a
+  // write kept failing through the CSRF-refresh retry): silence here cost
+  // real debugging time — records looked synced and simply were not.
+  if (accessFleetHostedSyncEnabled() && accessFleetHostedSyncFailing) {
+    const warn = document.createElement('span');
+    warn.className = 'acc-chip route-danger acc-fleet-sync-warn';
+    warn.textContent = 'hosted sync failing';
+    warn.title = 'Pushing fleet records to the hosted store keeps failing (even after refreshing the session token). Local records are intact and sync retries on the next change — check the hosted sign-in and network.';
+    mount.appendChild(warn);
+  }
   const add = document.createElement('button');
   add.type = 'button';
   add.className = 'acc-fleet-add';
@@ -952,6 +962,10 @@ function renderAccessTierCard() {
     select.appendChild(opt);
   }
   select.addEventListener('change', () => {
+    // The change is committed immediately — re-baseline the shared render
+    // guard so the picked value no longer reads as unsaved work (which
+    // would freeze this section against future rebuilds).
+    select.dataset.accessGuardBase = select.value;
     if (select.value) accessSetHostedCeiling(select.value);
   });
   capRow.appendChild(select);
@@ -1751,6 +1765,14 @@ function renderAccessOrganizations() {
         max_peer_profile: document.getElementById('access-org-trust-peer-cap')?.value || '',
       });
       showControlToast?.('success', `Org @${handle} trusted`);
+      // Consumed on success: clear the inputs and re-baseline this form
+      // (cap selects included) so the shared render guard lets the
+      // trusted-orgs list rebuild with the new entry.
+      const handleInput = document.getElementById('access-org-trust-handle');
+      const keyInput = document.getElementById('access-org-trust-key');
+      if (handleInput) handleInput.value = '';
+      if (keyInput) keyInput.value = '';
+      accessGuardStamp(form);
     } catch (err) {
       showControlToast?.('error', err?.message || 'Org trust failed');
     }
@@ -2235,6 +2257,13 @@ function renderAccessOrganizations() {
           certificate: cert,
         });
         showControlToast?.('success', 'Issuer certificate installed \u2014 this daemon can now issue for the org');
+        // Ceremony complete: the pasted certificate and displayed key are
+        // consumed. Clearing them also releases the shared render guard so
+        // the section can rebuild with the issuance flows unlocked.
+        certIn.value = '';
+        keyOut.value = '';
+        handleInput.value = '';
+        accessGuardStamp(foldBody);
         await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
         renderAccessAdminSummaries();
       } catch (err) {
@@ -2291,6 +2320,9 @@ function renderAccessOrganizations() {
             ? `Applied @${applied.org_handle} revocations seq ${applied.seq} — ${applied.revoked_grants} grant${applied.revoked_grants === 1 ? '' : 's'} revoked`
             : `Already at seq ${applied.seq} — nothing to do`
         );
+        // The pasted list is consumed; clearing it releases the shared
+        // render guard so the section can rebuild.
+        applyInput.value = '';
       } catch (err) {
         showControlToast?.('error', err?.message || 'Apply failed');
       }
@@ -2388,27 +2420,112 @@ function renderAccessAdminSummaries() {
     renderOrDefer('access', 'admin-summaries', renderAccessAdminSummaries);
     return;
   }
-  renderAccessAttention();
-  renderAccessIdentityHero();
-  renderAccessTierCard();
-  renderAccessConnectCard();
-  renderAccessFleetStrip();
+  // Every section rebuilds through the shared guard (42-usage-terminal.js
+  // accessGuardedRender): a rebuild is skipped while its mount holds the
+  // user's work (focus, edited fields, an output textarea carrying a
+  // freshly signed document), and skipped outright when the section's
+  // state fingerprint matches the last rebuild — the enrollments
+  // refresher's change-gate, applied per section. Shared fp inputs are
+  // computed once per fanout run; each section folds in what it reads.
+  const overview = accessOverviewModel();
+  const overviewFp = accessSectionFp(overview);
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: dashboardControlTransportEnabled(), connected: false };
+  const summary = dashboardTransportStatusSummary(status);
+  const transportFp = accessSectionFp([
+    summary.kind, summary.label, String(status.lastError || ''),
+    Boolean(status.reconnecting), String(status.reconnectReason || ''),
+    Boolean(status.eventsActive), dashboardControlLastError, dashboardControlLastErrorKind,
+  ]);
+  const daemonsFp = accessSectionFp(daemons.map(d =>
+    [d.host_id, d.label, d.connected !== false, d.profile || '', d.url || '']));
+  const peersFp = accessSectionFp(Array.from(
+    peerDashboardControlConnectionsByHost,
+    ([host, conn]) => [host, Boolean(conn?.canUseRpc?.())]
+  ));
+  const targetsFp = accessSectionFp([
+    dashboardAccessTargets,
+    Array.from(accessFleetProvenance),
+    accessFleetHostedSyncFailing,
+  ]);
+  const principalFp = accessSectionFp([
+    dashboardControlTransport?.lastStatus?.access_principal || null,
+    clientIdentityCache?.fingerprint || '',
+    accessCurrentRouteInfo().kind,
+    selfPeerId || '', selfHostLabel || '',
+  ]);
+  const avail = method => daemonApi.availability(method).ok;
+  // Relative-time texts ("expires in 2h") go stale without a model change;
+  // a minute bucket re-renders them at a sane cadence.
+  const minuteFp = String(Math.floor(Date.now() / 60_000));
+
+  accessGuardedRender('access-attention',
+    accessSectionFp([transportFp, overviewFp, accessPendingEnrollments.length, accessOwnDeviceFingerprint]),
+    renderAccessAttention);
+  accessGuardedRender('access-identity-hero',
+    accessSectionFp([overviewFp, principalFp, targetsFp, daemonsFp]),
+    renderAccessIdentityHero);
+  accessGuardedRender('access-tier-card',
+    accessSectionFp([overviewFp, avail('api_access_set_tier'), avail('api_access_set_hosted_ceiling')]),
+    renderAccessTierCard);
+  accessGuardedRender('access-connect-card',
+    accessSectionFp([
+      accessConnectStatus, accessConnectRevealed,
+      accessConnectRevealed ? minuteFp : '',
+      avail('api_access_connect_config'), avail('api_access_connect_claim_code'),
+      avail('api_access_connect_unclaim'), avail('api_fleet_cert_request'),
+    ]),
+    renderAccessConnectCard);
+  accessGuardedRender('access-fleet-strip',
+    accessSectionFp([targetsFp, daemonsFp, transportFp, peersFp]),
+    renderAccessFleetStrip);
   renderAccessExplainer();
-  renderAccessTargetsSurface();
-  renderAccessPeopleCurrent();
-  renderAccessEnrollmentRequests();
+  accessGuardedRender('access-target-overview',
+    accessSectionFp([overviewFp, targetsFp, daemonsFp, transportFp, peersFp]),
+    renderAccessTargetsSurface);
+  accessGuardedRender('access-people-current',
+    accessSectionFp([overviewFp, principalFp]),
+    renderAccessPeopleCurrent);
+  accessGuardedRender('access-enrollment-requests',
+    accessSectionFp([accessPendingEnrollments, overviewFp, avail('api_access_enrollment_decide')]),
+    renderAccessEnrollmentRequests);
+  // The grant form keeps its bespoke guard (submit-cycle bypass) and no
+  // fingerprint — its render also refreshes the ceiling note in place.
   renderAccessUserClientGrantForm();
-  renderAccessPeopleGrants();
-  renderAccessPeerSummary();
-  accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards());
-  accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
+  accessGuardedRender('access-people-grants',
+    accessSectionFp([overviewFp, avail('api_access_iam_update_grant'),
+      Array.from(accessGrantLifecycleSubmitting), minuteFp]),
+    renderAccessPeopleGrants);
+  accessGuardedRender('access-peer-summary',
+    accessSectionFp([overviewFp]),
+    renderAccessPeerSummary);
+  accessGuardedRender('access-peer-details',
+    accessSectionFp([overviewFp, daemonsFp, transportFp]),
+    () => accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards()));
+  accessGuardedRender('access-diagnostics-overview',
+    accessSectionFp([transportFp, daemonsFp]),
+    () => accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards()));
+  // Time-driven (lease countdowns) and self-guarded: renders every tick.
   renderAccessVaultSection();
-  renderAccessRoleCatalog();
-  renderAccessOrganizations();
-  renderAccessPermissionMatrix();
-  accessRenderDetailCards('access-grant-details', accessAuditGrantCards());
-  renderAccessIamStateCard();
-  renderAccessModelDetails();
+  accessGuardedRender('access-role-catalog',
+    accessSectionFp([overviewFp]),
+    renderAccessRoleCatalog);
+  accessGuardedRender('access-organizations',
+    accessSectionFp([overviewFp, avail('api_access_org_trust')]),
+    renderAccessOrganizations);
+  accessGuardedRender('access-permission-matrix',
+    accessSectionFp([overviewFp]),
+    renderAccessPermissionMatrix);
+  accessGuardedRender('access-grant-details',
+    accessSectionFp([overviewFp]),
+    () => accessRenderDetailCards('access-grant-details', accessAuditGrantCards()));
+  accessGuardedRender('access-iam-state-card',
+    accessSectionFp([overviewFp]),
+    renderAccessIamStateCard);
+  accessGuardedRender('access-model-details',
+    accessSectionFp([overviewFp]),
+    renderAccessModelDetails);
 }
 
 function setShellHostStatus(text = '', kind = '') {

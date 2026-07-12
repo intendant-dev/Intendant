@@ -239,6 +239,21 @@ html.ui-v2 .display-status.error {
   font-size: 11.5px;
 }
 html.ui-v2 .display-status.error::before { background: var(--rose); }
+/* transient degradation ('disconnected' — usually self-heals): amber,
+   informational, deliberately calmer than the rose error pill */
+html.ui-v2 .display-status.warn {
+  padding: 3px 10px;
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
+  font-weight: 700;
+  font-size: 11.5px;
+}
+html.ui-v2 .display-status.warn::before {
+  background: var(--amber);
+  animation: ui2-pulse 1.4s infinite;
+}
 
 /* input-authority chip — the three real states, honestly labeled:
    you (green) / another viewer (amber, the displacement-aware third
@@ -440,6 +455,120 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::before 
   animation: ui2-pulse 1.4s infinite;
   pointer-events: none;
 }
+/* ── in-stage status overlay (items 1/5): staged connect copy + error
+      states with a Reconnect/Retry action. Reuses the MSE loading-
+      overlay pattern (dark wash + centered inner) but with a pill card,
+      spinner, and an actionable button. pointer-events stay off except
+      on the button so view-only interactions pass through. ── */
+html.ui-v2 .display-stage-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: rgba(7, 8, 16, .55);
+}
+html.ui-v2 .display-stage-overlay.error { background: rgba(7, 8, 16, .78); }
+html.ui-v2 .stage-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 78%;
+  padding: 14px 18px;
+  text-align: center;
+  border-radius: 12px;
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--line-2);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+html.ui-v2 .stage-overlay-text {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--rose); }
+html.ui-v2 .stage-overlay-spinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid var(--line-2);
+  border-top-color: var(--iris);
+  animation: ui2-stage-spin .8s linear infinite;
+}
+@keyframes ui2-stage-spin { to { transform: rotate(360deg); } }
+html.ui-v2 .stage-overlay-retry {
+  pointer-events: auto;
+  min-height: 0;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  transition: filter var(--t-med);
+}
+html.ui-v2 .stage-overlay-retry:hover { filter: brightness(1.08); }
+
+/* ── live metrics chip (item 6): "LIVE · fps · kbps · relay", fed by the
+      3s getStats sampler. Same placement/backdrop recipe as the pure-CSS
+      LIVE pill; when it carries data (.active) it SUPERSEDES that pill
+      (rule below) so the corner never shows two badges. ── */
+html.ui-v2 .display-live-metrics {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--line-2);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .03em;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+html.ui-v2 .display-live-metrics::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--rose);
+  animation: ui2-pulse 1.4s infinite;
+}
+html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::after,
+html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::before {
+  content: none;
+}
+
+/* Take Control while the authority request is in flight (item 7b) */
+html.ui-v2 .display-toolbar .take-control-btn.is-pending,
+html.ui-v2 .peer-display-controls .take-control-btn.is-pending {
+  opacity: .6;
+  filter: none;
+  cursor: default;
+  transform: none;
+}
+
 /* shared-view focus ring on the stage instead of a square slot outline */
 html.ui-v2 .display-slot.shared-view-active { outline: 0; }
 html.ui-v2 .display-slot.shared-view-active .display-canvas {
@@ -482,6 +611,13 @@ html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas 
 html.ui-v2 .activity-display-thumb > .display-canvas {
   border-radius: 3px;
   box-shadow: none;
+}
+/* thumbs are glanceable mini-views — the status overlay and metrics chip
+   would swallow them; both stay slot-only. (Higher specificity than the
+   base rules, so this wins whenever JS clears the inline display.) */
+html.ui-v2 .activity-display-thumb .display-stage-overlay,
+html.ui-v2 .activity-display-thumb .display-live-metrics {
+  display: none;
 }
 html.ui-v2 .display-slot.display-fullscreen { background: var(--bg); }
 html.ui-v2 .display-slot.display-fullscreen .display-canvas {
@@ -944,6 +1080,23 @@ html.ui-v2 .peer-display-controls { gap: 8px; padding: 4px 0; }
 html.ui-v2 .peer-display-status { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
 html.ui-v2 .peer-display-status.connected { color: var(--green); }
 html.ui-v2 .peer-display-status.error { color: var(--rose); }
+html.ui-v2 .peer-display-status.warn { color: var(--amber); }
+/* peer pane hosts the same overlay/chip elements as the local stage,
+   but as a top-anchored banner (the pane is a video+controls column —
+   an inset-0 wash would cover the Close button) */
+html.ui-v2 .peer-display-pane { position: relative; }
+html.ui-v2 .peer-display-pane > .display-stage-overlay {
+  inset: auto 8px auto 8px;
+  top: 8px;
+  background: transparent;
+}
+html.ui-v2 .peer-display-pane > .display-stage-overlay .stage-overlay-inner {
+  flex-direction: row;
+  padding: 8px 12px;
+  gap: 8px;
+  text-align: left;
+}
+html.ui-v2 .peer-display-pane > .display-live-metrics { top: 8px; left: 8px; }
 html.ui-v2 .peer-display-controls .take-control-btn,
 html.ui-v2 .peer-display-controls .release-control-btn,
 html.ui-v2 .peer-display-close {

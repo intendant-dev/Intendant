@@ -565,8 +565,7 @@ impl AppEventUpcaster {
     pub fn upcast(&mut self, event: &AppEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Dropped internal events ----
-            AppEvent::Resize(_, _)
-            | AppEvent::Tick
+            AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::ContextSnapshot { .. }
@@ -1599,11 +1598,6 @@ impl AppEventUpcaster {
             AppEvent::UserMessageLog { content, .. } => {
                 vec![log_event(LogLevel::Info, "User", content.clone())]
             }
-
-            // ---- Terminal ----
-            AppEvent::Quit => vec![PeerEvent::Disconnected {
-                reason: "quit".to_string(),
-            }],
 
             // ---- Interruption ----
             AppEvent::InterruptRequested { .. } => vec![log_event(
@@ -3165,7 +3159,6 @@ mod tests {
     fn internal_events_are_dropped() {
         let mut u = AppEventUpcaster::new();
         assert!(u.upcast(&AppEvent::Tick).is_empty());
-        assert!(u.upcast(&AppEvent::Resize(80, 24)).is_empty());
         // ControlCommand carries arbitrary ControlMsg variants; Status is
         // a trivially-constructable one.
         assert!(u

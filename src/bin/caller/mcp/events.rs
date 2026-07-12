@@ -149,7 +149,6 @@ pub fn spawn_event_listener(
                 // Exhaustive match — no wildcard. Adding a new AppEvent variant
                 // will cause a compile error here, enforcing parity.
                 match event {
-                    AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
                     | AppEvent::SessionNote { .. }
                     | AppEvent::UserNotification { .. }
@@ -332,11 +331,6 @@ pub fn spawn_event_listener(
                         }
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::Quit => {
-                        s.should_quit = true;
-                        break;
-                    }
-
                     AppEvent::TurnStarted {
                         turn,
                         budget_pct,

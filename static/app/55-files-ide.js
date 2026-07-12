@@ -569,7 +569,7 @@ async function filesIdeCommitCreate(rawName) {
     renderFilesIdeTree();
     return;
   }
-  const path = creating.dir.replace(/\/+$/, '') + '/' + name;
+  const path = filesIdeJoinPath(creating.dir, name);
   if (creating.kind === 'folder') {
     try {
       const resp = await filesIdeMkdir(hostId, path);
@@ -587,10 +587,65 @@ async function filesIdeCommitCreate(rawName) {
   filesIdeOpenFile(hostId, path, { createNew: true });
 }
 
-function filesIdeParentDir(path) {
-  const trimmed = String(path || '').replace(/\/+$/, '');
+/* ── Separator-aware path math ──
+   The daemon serializes native paths: a Windows peer hands this UI
+   `C:\Users\...` while Unix daemons hand `/home/...`. Every join/dirname
+   below keys off the path's own separator (presence of a backslash or a
+   drive prefix) instead of assuming POSIX. */
+function filesIdePathSeparator(path) {
+  const text = String(path || '');
+  return (text.includes('\\') || /^[A-Za-z]:/.test(text)) ? '\\' : '/';
+}
+
+function filesIdeDirname(path) {
+  const text = String(path || '');
+  if (filesIdePathSeparator(text) === '\\') {
+    const trimmed = text.replace(/[\\/]+$/, '');
+    // A bare drive letter is drive-relative — keep the root form.
+    const rootForm = value => (/^[A-Za-z]:$/.test(value) ? value + '\\' : value);
+    const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+    if (idx <= 0) return rootForm(trimmed) || '\\';
+    return rootForm(trimmed.slice(0, idx));
+  }
+  const trimmed = text.replace(/\/+$/, '');
   const idx = trimmed.lastIndexOf('/');
   return idx > 0 ? trimmed.slice(0, idx) : '/';
+}
+
+function filesIdeJoinPath(dir, name) {
+  const base = String(dir || '');
+  const sep = filesIdePathSeparator(base);
+  const trimmed = base.replace(sep === '\\' ? /[\\/]+$/ : /\/+$/, '');
+  if (!trimmed) return (base.startsWith('/') ? '/' : '') + name; // unix root
+  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed + '\\' + name; // drive root
+  return trimmed + sep + name;
+}
+
+/* "Everything under `path`": the prefix descendants start with, in the
+   path's own separator (rename/delete retargeting, subtree drops). */
+function filesIdeChildPrefix(path) {
+  const text = String(path || '');
+  const sep = filesIdePathSeparator(text);
+  return text.replace(sep === '\\' ? /[\\/]+$/ : /\/+$/, '') + sep;
+}
+
+// Legacy name kept for readability at the call sites that grew up with it.
+function filesIdeParentDir(path) {
+  return filesIdeDirname(path);
+}
+
+/// Forget cached tree state under a renamed or deleted directory: its own
+/// listing, every descendant listing, and their expansion flags. (Called
+/// from the rename/delete flows; without it a stale child listing
+/// resurrects rows for paths that no longer exist.)
+function filesIdeDropSubtreeState(state, path) {
+  const prefix = filesIdeChildPrefix(path);
+  for (const key of Array.from(state.listings.keys())) {
+    if (key === path || key.startsWith(prefix)) state.listings.delete(key);
+  }
+  for (const key of Array.from(state.expanded)) {
+    if (key === path || key.startsWith(prefix)) state.expanded.delete(key);
+  }
 }
 
 function filesIdeBeginRename(path, isDir) {
@@ -631,14 +686,14 @@ async function filesIdeCommitRename(rawName) {
     return;
   }
   const from = renaming.path;
-  const to = renaming.dir.replace(/\/+$/, '') + '/' + name;
+  const to = filesIdeJoinPath(renaming.dir, name);
   try {
     const resp = await filesIdeRename(hostId, from, to);
     if (!resp.ok) throw new Error(resp.body.error || `Rename failed (${resp.status})`);
     const finalPath = typeof resp.body.path === 'string' && resp.body.path ? resp.body.path : to;
     filesIdeRetargetBuffers(hostId, from, finalPath, renaming.isDir);
     if (renaming.isDir) filesIdeDropSubtreeState(state, from);
-    if (state.contextDir === from || (renaming.isDir && state.contextDir.startsWith(from + '/'))) {
+    if (state.contextDir === from || (renaming.isDir && state.contextDir.startsWith(filesIdeChildPrefix(from)))) {
       state.contextDir = renaming.dir;
     }
     state.listings.delete(renaming.dir);
@@ -698,7 +753,7 @@ async function filesIdeExecuteDelete(path, isDir, recursive) {
     }
     filesIdeOrphanOrCloseBuffers(hostId, path, isDir);
     if (isDir) filesIdeDropSubtreeState(state, path);
-    if (state.contextDir === path || (isDir && state.contextDir.startsWith(path + '/'))) {
+    if (state.contextDir === path || (isDir && state.contextDir.startsWith(filesIdeChildPrefix(path)))) {
       state.contextDir = dir;
     }
     state.listings.delete(dir);
@@ -714,14 +769,13 @@ async function filesIdeExecuteDelete(path, isDir, recursive) {
 /// key/path/name. Directory renames retarget every buffer underneath.
 function filesIdeRetargetBuffers(hostId, oldPath, newPath, isDir) {
   const host = hostId || '';
-  const prefix = oldPath.replace(/\/+$/, '') + '/';
-  const newBase = newPath.replace(/\/+$/, '');
+  const prefix = filesIdeChildPrefix(oldPath);
   for (const buffer of Array.from(filesIdeBuffers.values())) {
     if ((buffer.host || '') !== host) continue;
     if (buffer.path === oldPath) {
       filesIdeRekeyBuffer(buffer, newPath);
     } else if (isDir && buffer.path.startsWith(prefix)) {
-      filesIdeRekeyBuffer(buffer, newBase + '/' + buffer.path.slice(prefix.length));
+      filesIdeRekeyBuffer(buffer, filesIdeJoinPath(newPath, buffer.path.slice(prefix.length)));
     }
   }
 }
@@ -729,6 +783,14 @@ function filesIdeRetargetBuffers(hostId, oldPath, newPath, isDir) {
 function filesIdeRekeyBuffer(buffer, newPath) {
   const oldKey = buffer.key;
   const newKey = filesIdeBufferKey(buffer.host, newPath);
+  // Carry any persisted draft along to the new identity.
+  const draft = filesIdeDraftRead(oldKey);
+  if (draft) {
+    filesIdeDraftClear(oldKey);
+    try {
+      localStorage.setItem(filesIdeDraftStorageKey(newKey), JSON.stringify(draft));
+    } catch (_) { /* best-effort */ }
+  }
   buffer.key = newKey;
   buffer.path = newPath;
   buffer.name = String(newPath).split(/[\\/]/).filter(Boolean).pop() || newPath;
@@ -754,7 +816,7 @@ function filesIdeRekeyBuffer(buffer, newPath) {
 /// recreates the file from the buffer.
 function filesIdeOrphanOrCloseBuffers(hostId, path, isDir) {
   const host = hostId || '';
-  const prefix = path.replace(/\/+$/, '') + '/';
+  const prefix = filesIdeChildPrefix(path);
   for (const buffer of Array.from(filesIdeBuffers.values())) {
     if ((buffer.host || '') !== host) continue;
     const hit = buffer.path === path || (isDir && buffer.path.startsWith(prefix));
@@ -786,6 +848,87 @@ function filesIdeModeSpecFor(name) {
   const info = CM.findModeByFileName(String(name || ''));
   if (!info) return null;
   return info.mime && info.mime !== 'null' ? info.mime : info.mode || null;
+}
+
+/* ── Dirty-buffer drafts ──
+   Unsaved edits persist to localStorage (debounced on change) so a tab
+   crash or accidental navigation loses nothing the beforeunload guard
+   could not stop. On reopening a file with a draft present: disk still
+   at the draft's baseline sha → offer "Restore draft"; disk moved on →
+   restore the draft and route through the existing conflict banner
+   (Reload / Overwrite). Cleared on save and on close-clean/discard.
+   Best-effort by design: storage failures never block editing. */
+const FILES_IDE_DRAFT_PREFIX = 'intendant.ui2.draft.';
+const FILES_IDE_DRAFT_MAX_CHARS = 200 * 1024; // ~200 KB per draft
+
+function filesIdeDraftStorageKey(bufferKey) {
+  return FILES_IDE_DRAFT_PREFIX + bufferKey;
+}
+
+function filesIdeDraftRead(bufferKey) {
+  try {
+    const raw = localStorage.getItem(filesIdeDraftStorageKey(bufferKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.text === 'string' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function filesIdeDraftClear(bufferKey) {
+  try { localStorage.removeItem(filesIdeDraftStorageKey(bufferKey)); } catch (_) {}
+}
+
+function filesIdeDraftWrite(buffer) {
+  const text = buffer.doc.getValue('\n');
+  if (text.length > FILES_IDE_DRAFT_MAX_CHARS) {
+    // Too large to keep: drop any older (smaller) draft so a stale copy
+    // can never masquerade as the current buffer, and say so once.
+    filesIdeDraftClear(buffer.key);
+    if (buffer.key === filesIdeActiveKey && !buffer.draftCapNoted) {
+      buffer.draftCapNoted = true;
+      filesIdeSetSaveStatus('', 'Draft not kept — buffer exceeds the 200 KB draft cap');
+    }
+    return;
+  }
+  try {
+    localStorage.setItem(filesIdeDraftStorageKey(buffer.key), JSON.stringify({
+      text,
+      baseSha: buffer.baselineSha || '',
+      eol: buffer.eol,
+      savedAt: Date.now(),
+    }));
+  } catch (_) { /* storage full or blocked — drafts stay best-effort */ }
+}
+
+function filesIdeDraftSchedule(buffer) {
+  clearTimeout(buffer._draftTimer);
+  buffer._draftTimer = setTimeout(() => {
+    buffer._draftTimer = null;
+    if (filesIdeBuffers.get(buffer.key) !== buffer) return; // closed / re-keyed
+    if (filesIdeBufferDirty(buffer)) filesIdeDraftWrite(buffer);
+    else filesIdeDraftClear(buffer.key);
+  }, 800);
+}
+
+function filesIdeRestoreDraftActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer || !buffer.draftOffer) return;
+  const draft = buffer.draftOffer;
+  buffer.draftOffer = null;
+  if (draft.eol === '\r\n' || draft.eol === '\n') buffer.eol = draft.eol;
+  buffer.doc.setValue(draft.text); // change event marks dirty + re-schedules
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
+}
+
+function filesIdeDiscardDraftActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer || !buffer.draftOffer) return;
+  buffer.draftOffer = null;
+  filesIdeDraftClear(buffer.key);
+  filesIdeRenderChrome();
 }
 
 async function filesIdeOpenFile(hostId, path, options = {}) {
@@ -828,7 +971,8 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
       sha = read.sha256 || '';
     }
     const eol = filesIdeDetectEol(text);
-    const doc = window.CodeMirror.Doc(text.replace(/\r\n/g, '\n'), filesIdeModeSpecFor(name));
+    const normalized = text.replace(/\r\n/g, '\n');
+    const doc = window.CodeMirror.Doc(normalized, filesIdeModeSpecFor(name));
     const buffer = {
       key,
       host: hostId || '',
@@ -840,9 +984,32 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
       isNew: Boolean(options.createNew),
       saving: false,
       conflict: null,
+      draftOffer: null,
       lastError: '',
       cleanGeneration: doc.changeGeneration(),
     };
+    // Draft recovery: a persisted dirty buffer for this exact file.
+    if (!options.createNew) {
+      const draft = filesIdeDraftRead(key);
+      if (draft && draft.text === normalized) {
+        filesIdeDraftClear(key); // stale leftover — disk already matches
+      } else if (draft) {
+        if (sha && (draft.baseSha || '') === sha) {
+          buffer.draftOffer = draft; // disk unchanged: offer to restore
+        } else {
+          // Disk moved on (or no verifiable baseline): restore the draft
+          // and route through the existing conflict banner. setValue after
+          // cleanGeneration was captured marks the buffer dirty, and the
+          // save baseline becomes the DRAFT's baseline so a plain Save
+          // 409s into the banner instead of silently clobbering the newer
+          // disk content — Overwrite stays the explicit click it is today.
+          if (draft.eol === '\r\n' || draft.eol === '\n') buffer.eol = draft.eol;
+          doc.setValue(draft.text);
+          buffer.baselineSha = draft.baseSha || '';
+          buffer.conflict = { code: 'conflict', currentSha: sha || '' };
+        }
+      }
+    }
     filesIdeBuffers.set(key, buffer);
     // Keystroke-frequency handler: only touch the DOM when the dirty flag
     // actually flips (the tab strip re-render re-attaches listeners).
@@ -854,6 +1021,7 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
         if (saveBtn && !buffer.saving) saveBtn.disabled = !dirty && !buffer.conflict;
         filesIdeFindOnDocChange();
       }
+      filesIdeDraftSchedule(buffer);
     });
     filesIdeSetSaveStatus('', '');
     filesIdeActivate(key);
@@ -908,8 +1076,7 @@ function filesIdeActivate(key) {
         },
       },
     });
-    // Ln/Col statusbar indicator (ui-v2 design add; span is hidden and
-    // stays empty under v1).
+    // Ln/Col statusbar indicator (filesIdeUpdateLnCol reads the cursor).
     filesIdeCm.on('cursorActivity', filesIdeUpdateLnCol);
   }
   if (empty) empty.classList.add('hidden');
@@ -945,6 +1112,11 @@ function filesIdeCloseTab(key, confirmed) {
     }, 3000);
     return;
   }
+  // Close is clean or an explicit "Discard?" confirmation — either way
+  // the persisted draft's job is over.
+  clearTimeout(buffer._draftTimer);
+  buffer._draftTimer = null;
+  filesIdeDraftClear(key);
   filesIdeBuffers.delete(key);
   if (filesIdeActiveKey === key) {
     filesIdeActiveKey = '';
@@ -1005,9 +1177,9 @@ function filesIdeSetSaveStatus(kind, text) {
   el.className = 'files-ide-save-status' + (kind ? ` ${kind}` : '');
 }
 
-// Ln/Col cursor indicator, ui-v2 only: the design statusbar reads
-// `host · Language · LF · Ln 8, Col 24`. Under v1 the span is display:none
-// and kept empty so the flex gap contributes nothing.
+// Ln/Col cursor indicator in the editor statusbar (`host · Language ·
+// LF · Ln 8, Col 24`), fed by CodeMirror's cursorActivity events; kept
+// empty while no buffer is open so the flex gap contributes nothing.
 function filesIdeUpdateLnCol() {
   const el = document.getElementById('files-ide-status-lncol');
   if (!el) return;
@@ -1069,6 +1241,14 @@ function filesIdeRenderChrome() {
         `<span>${escapeHtml(message)}</span>` +
         `<button type="button" class="ui-btn" onclick="filesIdeReloadActive()">Reload from disk</button>` +
         `<button type="button" class="ui-btn" onclick="filesIdeOverwriteActive()">Overwrite</button>`;
+    } else if (buffer?.draftOffer) {
+      const savedAt = Number(buffer.draftOffer.savedAt || 0);
+      const when = savedAt ? ` from ${new Date(savedAt).toLocaleString()}` : '';
+      banner.className = 'files-ide-banner';
+      banner.innerHTML =
+        `<span>${escapeHtml(`An unsaved draft of this file${when} is stored in this browser.`)}</span>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeRestoreDraftActive()">Restore draft</button>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeDiscardDraftActive()">Discard draft</button>`;
     } else if (buffer?.lastError) {
       banner.className = 'files-ide-banner error';
       banner.innerHTML = `<span>${escapeHtml(buffer.lastError)}</span>`;
@@ -1120,12 +1300,17 @@ async function filesIdeSaveActive(saveOptions = {}) {
     buffer.baselineSha = resp.body.sha256 || '';
     buffer.isNew = false;
     buffer.conflict = null;
+    buffer.draftOffer = null;
     // Compare against the generation captured before serialize: keystrokes
     // that landed while the save was in flight keep the buffer dirty.
     buffer.cleanGeneration = generation;
+    // The disk now holds this content — the browser draft is obsolete. A
+    // still-pending draft timer is left alone: it re-checks dirtiness at
+    // fire time, so keystrokes that landed mid-save re-draft themselves.
+    filesIdeDraftClear(buffer.key);
     filesIdeSetSaveStatus('ok', `Saved ${new Date().toLocaleTimeString()}`);
     const state = filesIdeTreeState(buffer.host);
-    const dir = buffer.path.slice(0, buffer.path.lastIndexOf('/')) || '/';
+    const dir = filesIdeDirname(buffer.path);
     if (state.listings.has(dir)) {
       filesIdeLoadListing(buffer.host, dir).then(() => renderFilesIdeTree()).catch(() => {});
     }
@@ -1217,6 +1402,10 @@ function onFilesIdeHostChanged() {
 // -- find in file (vendored searchcursor addon; smart case, live count)
 
 const FILES_IDE_FIND_MARK_CAP = 300;
+const FILES_IDE_FIND_MATCH_CAP = 10000;
+// True when the last scan hit FILES_IDE_FIND_MATCH_CAP — the count pill
+// must say "first N shown" instead of implying completeness.
+let filesIdeFindTruncated = false;
 
 function filesIdeFindInput() {
   return document.getElementById('files-ide-find-input');
@@ -1243,6 +1432,7 @@ function filesIdeCloseFind(focusEditor = true) {
   filesIdeFindClearMarks();
   filesIdeFindMatches = [];
   filesIdeFindIndex = -1;
+  filesIdeFindTruncated = false;
   filesIdeFindSetCount();
   if (focusEditor && filesIdeCm && filesIdeActiveBuffer()) filesIdeCm.focus();
 }
@@ -1260,13 +1450,22 @@ function filesIdeFindSetCount() {
   const query = filesIdeFindInput()?.value || '';
   if (!filesIdeFindOpen || !query) {
     el.textContent = '';
+    el.title = '';
     el.classList.remove('none');
     return;
   }
-  el.textContent = filesIdeFindMatches.length
-    ? `${filesIdeFindIndex + 1} / ${filesIdeFindMatches.length}`
-    : 'No matches';
-  el.classList.toggle('none', !filesIdeFindMatches.length);
+  // Honest caps: the scan stops at FILES_IDE_FIND_MATCH_CAP matches and
+  // only the first FILES_IDE_FIND_MARK_CAP are highlighted — a bare
+  // "1 / 10000" would imply a complete count and full highlighting.
+  const total = filesIdeFindMatches.length;
+  const suffix = filesIdeFindTruncated ? `+ (first ${total} shown)` : '';
+  el.textContent = total ? `${filesIdeFindIndex + 1} / ${total}${suffix}` : 'No matches';
+  el.title = filesIdeFindTruncated
+    ? `Search stopped after the first ${total} matches; refine the query to see the rest.`
+    : (total > FILES_IDE_FIND_MARK_CAP
+      ? `Highlighting the first ${FILES_IDE_FIND_MARK_CAP} matches; stepping still reaches all ${total}.`
+      : '');
+  el.classList.toggle('none', !total);
 }
 
 function filesIdeFindRecompute(options = {}) {
@@ -1274,6 +1473,7 @@ function filesIdeFindRecompute(options = {}) {
   filesIdeFindClearMarks();
   filesIdeFindMatches = [];
   filesIdeFindIndex = -1;
+  filesIdeFindTruncated = false;
   const query = filesIdeFindInput()?.value || '';
   if (!query) {
     filesIdeFindSetCount();
@@ -1285,7 +1485,10 @@ function filesIdeFindRecompute(options = {}) {
   const cursor = filesIdeCm.getSearchCursor(query, CM.Pos(0, 0), { caseFold });
   while (cursor.findNext()) {
     filesIdeFindMatches.push({ from: cursor.from(), to: cursor.to() });
-    if (filesIdeFindMatches.length >= 10000) break;
+    if (filesIdeFindMatches.length >= FILES_IDE_FIND_MATCH_CAP) {
+      filesIdeFindTruncated = true;
+      break;
+    }
   }
   const markCount = Math.min(filesIdeFindMatches.length, FILES_IDE_FIND_MARK_CAP);
   for (let i = 0; i < markCount; i++) {
@@ -1369,10 +1572,15 @@ let fsPickerMultiSelect = false;
 let fsPickerSelectedPaths = [];
 let fsPickerAnchorPath = '';
 let fsPickerUseLabelBase = 'Use path';
+// Whose disk the picker lists: '' = this daemon, a host id = that peer's
+// dashboard-control tunnel (the same daemonApi lane the IDE tree browses
+// peers through). Set per-open by configureFsPicker.
+let fsPickerHostId = '';
 
-function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect }) {
+function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect, hostId }) {
   fsPickerMode = mode || 'directory';
   fsPickerTarget = target || 'project';
+  fsPickerHostId = String(hostId || '');
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
   fsPickerMultiSelect = fsPickerMode === 'file' && !!multiSelect;
@@ -1555,7 +1763,7 @@ async function resolveFsPickerListTarget(target) {
   if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
     return { listPath: target, selectedPath: '' };
   }
-  const resp = await filesIdeStat('', target);
+  const resp = await filesIdeStat(fsPickerHostId, target);
   const status = resp.body;
   if (!resp.ok) return { listPath: target, selectedPath: '' };
   if (status.exists && status.is_file && status.parent) {
@@ -1589,7 +1797,7 @@ async function loadFsPicker(path) {
     fsPickerSelectedPath = resolved.selectedPath || '';
     fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
     fsPickerAnchorPath = fsPickerSelectedPath;
-    const resp = await filesIdeList('', resolved.listPath);
+    const resp = await filesIdeList(fsPickerHostId, resolved.listPath);
     const data = resp.body;
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
@@ -1658,15 +1866,27 @@ function openDownloadFilePicker() {
   loadFsPicker(dashboardProjectRoot || '~');
 }
 
+/* Peer browsing rides the same daemonApi fs lane the IDE tree already
+   proves out (api_fs_list/api_fs_stat with target: hostId); 'never' is
+   the only truly-unreachable availability — 'transport-down' means the
+   request itself will dial the peer tunnel, exactly like the tree. The
+   manual-path input stays as the escape hatch either way. */
+function filesDownloadPeerBrowsable(peerId) {
+  const availability = daemonApi.availability('api_fs_list', peerId);
+  return availability.ok || availability.reason === 'transport-down';
+}
+
 function openFilesDownloadPicker() {
-  if (filesDownloadSelectedPeerId()) {
-    setFilesDownloadStatus('warn', 'Peer browsing is not available yet; enter a full path');
+  const peerId = filesDownloadSelectedPeerId();
+  if (peerId && !filesDownloadPeerBrowsable(peerId)) {
+    setFilesDownloadStatus('warn', `Browsing ${filesDownloadPeerLabel(peerId)} is unavailable from this dashboard; enter a full path`);
     return;
   }
   configureFsPicker({
     mode: 'file',
     target: 'filesDownload',
-    title: 'Choose files to download',
+    hostId: peerId,
+    title: peerId ? `Choose files on ${filesDownloadPeerLabel(peerId)}` : 'Choose files to download',
     placeholder: '/path/to/file',
     useLabel: 'Download',
     showCreate: false,
@@ -1674,8 +1894,14 @@ function openFilesDownloadPicker() {
   });
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'flex';
-  loadFsPicker(filesDownloadPathValue() || dashboardProjectRoot || '~');
+  // dashboardProjectRoot is this daemon's disk — a peer starts at its
+  // own home instead.
+  loadFsPicker(filesDownloadPathValue() || (peerId ? '~' : (dashboardProjectRoot || '~')));
 }
+
+/* 54's transfer gates (onFilesDownloadHostChanged / setFilesDownloadBusy)
+   now consult filesDownloadPeerBrowsable directly, so peer selection no
+   longer force-disables Browse; no reconciliation needed here. */
 
 function openFilesUploadDestinationPicker() {
   configureFsPicker({
@@ -1845,7 +2071,7 @@ async function createPickerDirectory() {
   setFsPickerStatus('', 'Creating directory...');
   // api_fs_mkdir is a POST twin: the facade's no-replay policy covers the
   // fallbackAfterRpcFailure:false this call used to pass by hand.
-  const resp = await filesIdeMkdir('', path);
+  const resp = await filesIdeMkdir(fsPickerHostId, path);
   const data = resp.body;
   if (!resp.ok) {
     setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);
@@ -2017,6 +2243,8 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 	window.filesIdeSaveActive = filesIdeSaveActive;
 	window.filesIdeReloadActive = filesIdeReloadActive;
 	window.filesIdeOverwriteActive = filesIdeOverwriteActive;
+	window.filesIdeRestoreDraftActive = filesIdeRestoreDraftActive;
+	window.filesIdeDiscardDraftActive = filesIdeDiscardDraftActive;
 	window.filesIdeFindOnInput = filesIdeFindOnInput;
 	window.filesIdeFindStep = filesIdeFindStep;
 	window.filesIdeCloseFind = filesIdeCloseFind;
@@ -2765,9 +2993,11 @@ function newSessionAddKeysAction() {
   return { label: 'Add API keys', onClick: () => focusSettingsApiKeys() };
 }
 
+// Leads with the immediate fix (the paired newSessionAddKeysAction deep
+// link lands on that card); .env and vault leases stay as secondary paths.
 const NEW_SESSION_UNFUELED_MESSAGE =
-  'This daemon has no model credentials, so the internal agent can’t start. ' +
-  'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
+  'No model credentials for the internal agent yet — add a key in Settings → API Keys (applies immediately, no restart). ' +
+  'A .env key on the daemon or a vault credential lease works too; external agents (Codex, Claude Code) sign in with their own accounts.';
 
 // ── Projectless preflight ──
 // A daemon launched outside any project reports project_root: null and has

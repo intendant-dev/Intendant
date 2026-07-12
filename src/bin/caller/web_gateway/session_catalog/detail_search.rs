@@ -64,11 +64,15 @@ pub(crate) fn get_session_detail_from_home_with_page(
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
-    let mut entries = session_log_replay_entries_from_dir(&session_dir)
+    // Cached full conversion (fingerprint-keyed, already compacted):
+    // paging back through a session detail re-used to re-convert the
+    // whole log per page; now page N is a slice of the cached entries.
+    let entries = cached_session_log_replay_entries(&session_dir)
         .map(|(entries, _)| entries)
         .unwrap_or_default();
-    compact_context_snapshot_entries_for_replay(&mut entries);
-    let page = session_detail_page_entries(entries, limit, before);
+    // Entries come out of the cache already compacted (replay_cache
+    // compacts before admission), so no per-request compaction pass.
+    let page = session_detail_page_entries_ref(&entries, limit, before);
     native_session_detail_body(&session_dir, page, None)
 }
 
@@ -458,6 +462,40 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
     project_filter: &[String],
     cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
+    session_log_search_from_home_with_progress(
+        home,
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        cancel,
+        &mut |_progress| {},
+    )
+}
+
+/// Deep-search scan progress: how far through the candidate list the
+/// scan is. `scanned` counts candidate sessions the loop has passed
+/// (filtered-out ones included, so it reaches `total`), `matched` counts
+/// result rows so far.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeepSearchProgress {
+    pub(crate) scanned: usize,
+    pub(crate) total: usize,
+    pub(crate) matched: usize,
+}
+
+/// How often the scan reports progress, in candidate sessions.
+pub(crate) const DEEP_SEARCH_PROGRESS_EVERY: usize = 250;
+
+pub(crate) fn session_log_search_from_home_with_progress(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+    project_filter: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: &mut dyn FnMut(DeepSearchProgress),
+) -> String {
     let mode = SessionLogSearchMode::from_query(mode);
     let terms = session_log_search_terms(query);
     if !mode.has_search_input(query, &terms) {
@@ -480,10 +518,11 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
     let deleted_external_sessions = read_deleted_external_sessions(home);
     let source_filter = normalize_session_source_filter(source_filter);
     let project_filter = normalize_session_project_filter(project_filter);
+    let total = sessions.len();
     let mut results = Vec::new();
     let mut searched = 0usize;
 
-    for session in sessions {
+    for (index, session) in sessions.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return serde_json::json!({
                 "query": query,
@@ -497,6 +536,13 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
                 "results": results,
             })
             .to_string();
+        }
+        if index > 0 && index % DEEP_SEARCH_PROGRESS_EVERY == 0 {
+            progress(DeepSearchProgress {
+                scanned: index,
+                total,
+                matched: results.len(),
+            });
         }
         let source = session
             .get("source")

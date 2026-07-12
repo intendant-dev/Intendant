@@ -85,7 +85,6 @@ function buildWsUrl(path) {
 }
 
 // ── Constants (rendering only — all logic in WASM) ──
-const SPINNER_FRAMES = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f'];
 const LEVEL_ICONS = {
   info: '\u2139', model: '\u2726', agent: '\u25B6', error: '\u2716', warn: '\u26A0',
   subagent: '\u2726', detail: '\u00B7', debug: '\u2022', presence: '\u25C9',
@@ -404,8 +403,19 @@ function applyUnfueledEmptyState(unfueled) {
     }
   } else {
     hint.textContent = 'The daemon found no provider API key for the built-in agent. '
-      + 'Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — '
-      + 'or claim it through a rendezvous and grant a lease from your vault.';
+      + 'Add a provider key in Settings → API Keys — it applies immediately, '
+      + 'no restart. (A .env key on the daemon or a vault credential lease works too.)';
+    if (!document.getElementById('log-empty-fuel')) {
+      const btn = document.createElement('button');
+      btn.id = 'log-empty-fuel';
+      btn.className = 'ui-empty-btn';
+      btn.textContent = 'Add API keys';
+      btn.addEventListener('click', () => {
+        if (typeof focusSettingsApiKeys === 'function') focusSettingsApiKeys();
+        else routeTo('settings');
+      });
+      hint.insertAdjacentElement('afterend', btn);
+    }
   }
   applyUnfueledExternalAgentNote(empty);
 }
@@ -551,8 +561,6 @@ let followUpCounter = 0;
 const pendingFollowUpsById = new Map();
 let editMessageDraft = null;
 const approvalSessionIds = new Map();
-let spinnerIdx = 0;
-let spinnerInterval = null;
 
 // Terminal (lazy)
 

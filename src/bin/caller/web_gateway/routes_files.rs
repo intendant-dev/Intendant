@@ -460,6 +460,23 @@ pub(crate) fn dashboard_local_file_response(
     }
 }
 
+/// [`dashboard_local_file_response`] off the reactor: the source-viewer
+/// fallback probes the decoded URL path with `fs::metadata` /
+/// `canonicalize` (and reads the file when it matches) for every
+/// otherwise-unmatched GET — blocking syscalls that can stall the accept
+/// loop on slow filesystems (network mounts). URL semantics are
+/// unchanged; a failed join answers as "no local file" and the request
+/// falls through to the SPA shell exactly like a non-matching path.
+pub(crate) async fn dashboard_local_file_response_blocking(
+    request_line: &str,
+) -> Option<DashboardLocalFileResponse> {
+    let request_line = request_line.to_string();
+    tokio::task::spawn_blocking(move || dashboard_local_file_response(&request_line))
+        .await
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn effective_upload_destination(
     requested: crate::upload_store::UploadDestination,
     _has_active_session: bool,

@@ -274,14 +274,24 @@ async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
   return resp.body;
 }
 
-class VisualFreshnessSampler {
-  constructor(videoEl, hostId, displayId) {
-    this.videoEl = videoEl;
+// Shared base for the two marker-freshness samplers (video + canvas
+// sources). Owns everything that doesn't depend on the sampled surface:
+// marker geometry, the offscreen scratch canvas, transition bookkeeping,
+// the NDJSON record buffer + 5s flush loop, marker decode, the summary
+// percentiles, and stop(). Subclasses provide the frame scheduler
+// (`_scheduleFrame`), the source readiness check (`_sourceReady`), the
+// draw into the scratch canvas (`_drawSource`), and the session_start
+// record (`_sessionStartRecord`). This is the pure dedupe of the two
+// previously copy-pasted implementations — record shapes, timing, and
+// log tags are unchanged.
+class FreshnessSamplerBase {
+  constructor(hostId, displayId, idPrefix, logTag) {
     this.hostId = hostId;
     this.displayId = displayId;
     this.browserSessionId = (window.crypto && window.crypto.randomUUID)
       ? window.crypto.randomUUID()
-      : `vf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      : `${idPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    this._logTag = logTag;
 
     // Marker geometry -- MUST match the peer-side visual_marker
     // module's TILE_PX / COLS / ROWS / THRESHOLD constants.
@@ -293,8 +303,8 @@ class VisualFreshnessSampler {
     this.THRESHOLD = 128;
 
     // Offscreen canvas sized exactly to the marker patch. We draw only
-    // the top-left region of the source video into it so getImageData
-    // is bounded to ~32 KB per sample regardless of source resolution.
+    // the top-left region of the source into it so getImageData is
+    // bounded to ~32 KB per sample regardless of source resolution.
     // willReadFrequently asks the browser to keep the backing buffer
     // CPU-side rather than GPU-side; getImageData is then cheap.
     this.canvas = document.createElement('canvas');
@@ -307,10 +317,9 @@ class VisualFreshnessSampler {
     this.lastTransitionMs = this.startMs;
     this.firstTransitionAt = null;
 
-    // Buffered records. Flushed every FLUSH_INTERVAL_MS (5s) and on
-    // stop(); each flush also synthesizes a cumulative summary record
-    // so the transcript captures rolling stats even if the browser
-    // crashes before stop() runs.
+    // Buffered records. Flushed every 5s and on stop(); each flush also
+    // synthesizes a cumulative summary record so the transcript captures
+    // rolling stats even if the browser crashes before stop() runs.
     this.records = [];
     this.transitions = 0;
     this.gaps = []; // for percentile computation across the session
@@ -318,45 +327,17 @@ class VisualFreshnessSampler {
 
     this.flushTimer = null;
     this.stopped = false;
-
-    // Use rVFC where available (Safari 16+, Chrome 83+) so the
-    // callback fires once per actually-rendered frame instead of
-    // once per display refresh. On rVFC-less browsers we fall back to
-    // requestAnimationFrame which is good enough for Phase 0.
-    this._useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
   }
 
   start() {
-    this._enqueue({
-      t: 'session_start',
-      browser_ms: 0,
-      browser_session_id: this.browserSessionId,
-      host_id: this.hostId,
-      display_id: this.displayId,
-      video_width: this.videoEl.videoWidth || 0,
-      video_height: this.videoEl.videoHeight || 0,
-      ua: navigator.userAgent,
-      uses_rvfc: this._useRVFC,
-      source: 'video',
-    });
+    this._enqueue(this._sessionStartRecord());
     this._scheduleFrame();
     this.flushTimer = setInterval(() => this._flush(), 5000);
   }
 
-  _scheduleFrame() {
+  _onFrame() {
     if (this.stopped) return;
-    if (this._useRVFC) {
-      this.videoEl.requestVideoFrameCallback((now, meta) => this._onFrame(now, meta));
-    } else {
-      requestAnimationFrame(() => this._onFrame(performance.now(), null));
-    }
-  }
-
-  _onFrame(_now, _meta) {
-    if (this.stopped) return;
-    const w = this.videoEl.videoWidth || 0;
-    const h = this.videoEl.videoHeight || 0;
-    if (w < this.MARKER_W || h < this.MARKER_H) {
+    if (!this._sourceReady()) {
       // Source too small -- peer-side stamp is also a no-op at these
       // dims (see visual_marker::stamp_y_plane bounds check). Try
       // again next frame.
@@ -364,16 +345,12 @@ class VisualFreshnessSampler {
       return;
     }
     try {
-      // Source rect: top-left MARKER_W x MARKER_H of the video frame
+      // Source rect: top-left MARKER_W x MARKER_H of the source frame
       // in *frame* (not displayed) coordinates. Dest rect: full
-      // canvas (also MARKER_W x MARKER_H). One-to-one pixel copy --
-      // no scaling, so tile centers in the canvas match tile centers
-      // in the source frame exactly.
-      this.ctx.drawImage(
-        this.videoEl,
-        0, 0, this.MARKER_W, this.MARKER_H,
-        0, 0, this.MARKER_W, this.MARKER_H,
-      );
+      // scratch canvas (also MARKER_W x MARKER_H). One-to-one pixel
+      // copy -- no scaling, so tile centers in the canvas match tile
+      // centers in the source frame exactly.
+      this._drawSource();
       const img = this.ctx.getImageData(0, 0, this.MARKER_W, this.MARKER_H);
       const value = this._decode(img);
       if (this.lastValue !== null && value !== this.lastValue) {
@@ -406,11 +383,11 @@ class VisualFreshnessSampler {
       }
       this.lastValue = value;
     } catch (e) {
-      // CORS-tainted canvas would throw on getImageData. The video
-      // element is same-origin (intendant:// scheme handler proxies
-      // to local backend), so this shouldn't happen in production --
-      // but log loudly if it does.
-      console.warn('[diag-vf] sample failed:', e);
+      // CORS-tainted canvas would throw on getImageData. The sources
+      // are same-origin (intendant:// scheme handler proxies to local
+      // backend), so this shouldn't happen in production -- but log
+      // loudly if it does.
+      console.warn(`${this._logTag} sample failed:`, e);
     }
     this._scheduleFrame();
   }
@@ -482,7 +459,7 @@ class VisualFreshnessSampler {
     const ndjson = this.records.map(r => JSON.stringify(r)).join('\n') + '\n';
     this.records = [];
     postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
-      .catch(err => console.warn('[diag-vf] upload failed:', err));
+      .catch(err => console.warn(`${this._logTag} upload failed:`, err));
   }
 
   stop() {
@@ -502,6 +479,56 @@ class VisualFreshnessSampler {
   }
 }
 
+class VisualFreshnessSampler extends FreshnessSamplerBase {
+  constructor(videoEl, hostId, displayId) {
+    super(hostId, displayId, 'vf', '[diag-vf]');
+    this.videoEl = videoEl;
+    // Use rVFC where available (Safari 16+, Chrome 83+) so the
+    // callback fires once per actually-rendered frame instead of
+    // once per display refresh. On rVFC-less browsers we fall back to
+    // requestAnimationFrame which is good enough for Phase 0.
+    this._useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  }
+
+  _sessionStartRecord() {
+    return {
+      t: 'session_start',
+      browser_ms: 0,
+      browser_session_id: this.browserSessionId,
+      host_id: this.hostId,
+      display_id: this.displayId,
+      video_width: this.videoEl.videoWidth || 0,
+      video_height: this.videoEl.videoHeight || 0,
+      ua: navigator.userAgent,
+      uses_rvfc: this._useRVFC,
+      source: 'video',
+    };
+  }
+
+  _scheduleFrame() {
+    if (this.stopped) return;
+    if (this._useRVFC) {
+      this.videoEl.requestVideoFrameCallback(() => this._onFrame());
+    } else {
+      requestAnimationFrame(() => this._onFrame());
+    }
+  }
+
+  _sourceReady() {
+    const w = this.videoEl.videoWidth || 0;
+    const h = this.videoEl.videoHeight || 0;
+    return w >= this.MARKER_W && h >= this.MARKER_H;
+  }
+
+  _drawSource() {
+    this.ctx.drawImage(
+      this.videoEl,
+      0, 0, this.MARKER_W, this.MARKER_H,
+      0, 0, this.MARKER_W, this.MARKER_H,
+    );
+  }
+}
+
 // True when the dashboard URL has `?diag=1` (or `?...&diag=1`). The
 // peer-display sampler activates automatically on connect when this
 // is true; otherwise no canvas / rVFC / fetch overhead. The flag is
@@ -516,26 +543,19 @@ function diagModeEnabled() {
 }
 
 // =====================================================================
-// D-2: tile compositor + synthetic stream + canvas freshness sampler.
+// D-2: tile wire parsing + compositor + freshness samplers.
 //
-// Browser-only synthetic harness for #82 dirty-region/tile streaming.
-// Activated via `?tile-test=1` query param OR `localStorage.tileTest='1'`
-// (set via console + reload). NO real WebRTC tile transport here — the
-// SyntheticTileStream calls compositor methods directly, simulating
-// what D-3 will deliver over WebRTC datachannels. NO Rust integration.
+// Everything from here through CanvasFreshnessSampler is LIVE peer-
+// display machinery: 52-peer-display.js drives TileWireReader /
+// parseTileWireFrame / TileCompositor on the real WebRTC tile
+// datachannels (D-3b+), and the two freshness samplers under `?diag=1`.
 //
-// What this exercises:
-// - SnapshotChunk reassembly + epoch/snapshot_id tracking
-// - TileUpdate per-tile staleness check (drops out-of-order tiles)
-// - Resize → epoch advance → snapshot reseed
-// - raw_bgra and rle_bgra payload decoding
-// - requestAnimationFrame-based marker freshness sampling on canvas
-//
-// What it deliberately does NOT exercise (per D-2 scope):
-// - WebRTC data-channel transport (D-3)
-// - Backpressure / chunked snapshot pacing on the wire (D-3 / D-4)
-// - Real X11 capture → tile encoder pipeline (D-3)
-// - Fallback-to-VP8 policy (D-4)
+// The browser-only SYNTHETIC harness for #82 (SyntheticTileStream +
+// startTileTestHarness, activated via `?tile-test=1` OR
+// `localStorage.tileTest='1'`) was relocated verbatim to
+// static/tile-test-harness.js and is injected on demand by the loader
+// at the bottom of this file — see that file's header for what it
+// exercises and the window-global glue contract.
 //
 // See docs/design-tile-streaming.md for the full architecture.
 // =====================================================================
@@ -1141,381 +1161,21 @@ class TileCompositor {
   }
 }
 
-// SyntheticTileStream — generates a tile stream that exercises every
-// compositor codepath. Drives at the configured fps. Includes:
-// - Initial chunked snapshot (covers all tiles + cursor + marker).
-// - Per-tick TileUpdate with cursor erase/redraw + marker bit-pattern.
-// - Periodic stale TileUpdate (older seq) to verify per-tile staleness.
-// - Periodic resize event (every ~30s) to verify epoch reset + snapshot.
-class SyntheticTileStream {
-  constructor(compositor, opts = {}) {
-    this.compositor = compositor;
-    this.tileSize = opts.tileSize ?? 64;
-    this.gridW = opts.gridW ?? 24;
-    this.gridH = opts.gridH ?? 14;
-    this.fps = opts.fps ?? 30;
-    this.epoch = 1;
-    this.seq = 0;
-    this.snapshotIdCounter = 1;
-    this.cursorPos = { x: 200, y: 200 };
-    this.cursorVel = { x: 7, y: 5 };
-    this.markerValue = 0;
-    this.timer = null;
-    this.frameCount = 0;
-    this.metrics = {
-      framesEmitted: 0,
-      stalesInjected: 0,
-      resizesEmitted: 0,
-      snapshotsEmitted: 0,
-      snapshotsChunked: 0,
-    };
-  }
-
-  start() {
-    this._emitSnapshot();
-    const intervalMs = 1000 / this.fps;
-    this.timer = setInterval(() => this._tick(), intervalMs);
-  }
-
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  _emitSnapshot() {
-    const snapshotId = this.snapshotIdCounter++;
-    const records = [];
-    // Background: checkerboard of two greys so individual tiles are
-    // visually distinguishable.
-    for (let ty = 0; ty < this.gridH; ty++) {
-      for (let tx = 0; tx < this.gridW; tx++) {
-        const dark = (tx + ty) % 2 === 0;
-        records.push({
-          tile_x: tx,
-          tile_y: ty,
-          encoding: 0,
-          payload: this._solidTileBgra(dark ? [40, 40, 50] : [60, 60, 75]),
-        });
-      }
-    }
-    // Cursor area.
-    for (const rec of this._cursorTileRecords(this.cursorPos)) {
-      records.push(rec);
-    }
-    // Marker tiles.
-    for (const rec of this._markerTileRecords()) {
-      records.push(rec);
-    }
-
-    // Chunk: cap each chunk at 32 records so the compositor's
-    // snapshot reassembly path actually sees multiple chunks per
-    // logical snapshot. Real D-3 will cap by byte size; for D-2,
-    // by-record is good enough to exercise the assembly logic.
-    const chunkSize = 32;
-    const chunkCount = Math.ceil(records.length / chunkSize);
-    for (let i = 0; i < chunkCount; i++) {
-      const chunkRecords = records.slice(i * chunkSize, (i + 1) * chunkSize);
-      this.compositor.onSnapshotChunk({
-        epoch: this.epoch,
-        snapshot_id: snapshotId,
-        chunk_index: i,
-        chunk_count: chunkCount,
-        grid_w_tiles: this.gridW,
-        grid_h_tiles: this.gridH,
-        tile_size_px: this.tileSize,
-        records: chunkRecords,
-      });
-      this.metrics.snapshotsChunked++;
-    }
-    this.metrics.snapshotsEmitted++;
-  }
-
-  _tick() {
-    this.frameCount++;
-    this.seq++;
-
-    const records = [];
-
-    // Cursor motion: bounce off canvas edges.
-    const oldCursor = { x: this.cursorPos.x, y: this.cursorPos.y };
-    this.cursorPos.x += this.cursorVel.x;
-    this.cursorPos.y += this.cursorVel.y;
-    const margin = 20;
-    if (this.cursorPos.x < margin || this.cursorPos.x > this.gridW * this.tileSize - margin) {
-      this.cursorVel.x *= -1;
-      this.cursorPos.x = Math.max(margin, Math.min(this.gridW * this.tileSize - margin, this.cursorPos.x));
-    }
-    if (this.cursorPos.y < margin || this.cursorPos.y > this.gridH * this.tileSize - margin) {
-      this.cursorVel.y *= -1;
-      this.cursorPos.y = Math.max(margin, Math.min(this.gridH * this.tileSize - margin, this.cursorPos.y));
-    }
-
-    // Erase the old cursor area (paint background tiles).
-    for (const rec of this._cursorTileRecords(oldCursor, /*erase*/ true)) {
-      records.push(rec);
-    }
-    // Paint the new cursor area.
-    for (const rec of this._cursorTileRecords(this.cursorPos)) {
-      records.push(rec);
-    }
-
-    // Marker tile bits change every frame so the freshness sampler
-    // sees a transition per tick.
-    this.markerValue = (this.markerValue + 1) >>> 0;
-    for (const rec of this._markerTileRecords()) {
-      records.push(rec);
-    }
-
-    this.compositor.onTileUpdate({
-      epoch: this.epoch,
-      seq: this.seq,
-      records,
-    });
-    this.metrics.framesEmitted++;
-
-    // Stale-check: every 100 frames, send an out-of-order TileUpdate
-    // touching a far-away tile. The compositor's per-tile staleness
-    // check should drop this against the most recent same-tile seq;
-    // it would otherwise paint a bright red square at bottom-left.
-    if (this.frameCount % 100 === 50) {
-      this.compositor.onTileUpdate({
-        epoch: this.epoch,
-        seq: Math.max(1, this.seq - 50),
-        records: [
-          {
-            tile_x: 0,
-            tile_y: this.gridH - 1,
-            encoding: 0,
-            payload: this._solidTileBgra([255, 0, 0]),
-          },
-        ],
-      });
-      // Then immediately a current-seq update for the same tile so
-      // the stale-vs-current contrast is visible if staleness check
-      // breaks (red would appear) vs working (background restored).
-      this.compositor.onTileUpdate({
-        epoch: this.epoch,
-        seq: this.seq + 1,
-        records: [
-          {
-            tile_x: 0,
-            tile_y: this.gridH - 1,
-            encoding: 0,
-            payload: this._solidTileBgra([60, 60, 75]),
-          },
-        ],
-      });
-      this.seq += 1; // keep our next emission ahead of this overwrite
-      this.metrics.stalesInjected++;
-    }
-
-    // Resize every 30s: bump epoch + emit snapshot for new grid.
-    // Toggle between 24x14 and 20x12 to exercise both shrinking and
-    // re-growing the canvas.
-    if (this.frameCount % (this.fps * 30) === 0) {
-      const newGridW = this.gridW === 24 ? 20 : 24;
-      const newGridH = this.gridH === 14 ? 12 : 14;
-      this.gridW = newGridW;
-      this.gridH = newGridH;
-      this.epoch += 1;
-      this.compositor.onResize({
-        new_epoch: this.epoch,
-        grid_w_tiles: this.gridW,
-        grid_h_tiles: this.gridH,
-        tile_size_px: this.tileSize,
-      });
-      this._emitSnapshot();
-      this.metrics.resizesEmitted++;
-      // Reset cursor inside new canvas bounds in case it was off-grid.
-      this.cursorPos = { x: 200, y: 200 };
-    }
-
-    // Periodic snapshot every 30s INDEPENDENT of resize, on a phase
-    // offset so they don't always coincide. Mirrors D-3 design's
-    // SNAPSHOT_PERIOD.
-    if (this.frameCount % (this.fps * 30) === Math.floor(this.fps * 15)) {
-      this._emitSnapshot();
-    }
-  }
-
-  // Cursor area is the set of tiles whose bounds intersect a 24-px
-  // box around the cursor center. erase=true paints background only
-  // (no cursor pixel). erase=false paints background + cursor.
-  _cursorTileRecords({ x, y }, erase = false) {
-    const radius = 16;
-    const x0 = Math.max(0, Math.floor((x - radius) / this.tileSize));
-    const y0 = Math.max(0, Math.floor((y - radius) / this.tileSize));
-    const x1 = Math.min(this.gridW - 1, Math.floor((x + radius) / this.tileSize));
-    const y1 = Math.min(this.gridH - 1, Math.floor((y + radius) / this.tileSize));
-    const out = [];
-    for (let ty = y0; ty <= y1; ty++) {
-      for (let tx = x0; tx <= x1; tx++) {
-        const dark = (tx + ty) % 2 === 0;
-        const bg = dark ? [40, 40, 50] : [60, 60, 75];
-        // Cursor over the marker tiles (0,0) and (1,0) is annoying
-        // for the freshness sampler — skip cursor draw there. The
-        // erase path also skips, so the marker tiles remain marker-
-        // owned for the duration.
-        if (ty === 0 && (tx === 0 || tx === 1)) continue;
-        out.push({
-          tile_x: tx,
-          tile_y: ty,
-          encoding: 0,
-          payload: erase
-            ? this._solidTileBgra(bg)
-            : this._cursorTileBgra(tx, ty, { x, y }, [255, 200, 80], bg),
-        });
-      }
-    }
-    return out;
-  }
-
-  // Marker tiles render the visual-freshness marker pattern across
-  // tiles (0,0) and (1,0) — together they form a 128×64 patch
-  // matching VisualFreshnessSampler's MARKER_W / MARKER_H. Same
-  // 16×16 sub-tile grid (TILE_PX=16, COLS=8, ROWS=4) as the video
-  // marker so CanvasFreshnessSampler can use byte-identical decode
-  // logic.
-  _markerTileRecords() {
-    const TILE_PX = 16;
-    const COLS = 8;
-    const ROWS = 4;
-    const ts = this.tileSize;
-    const out = [];
-    for (let tileX = 0; tileX < 2; tileX++) {
-      const buf = new Uint8ClampedArray(ts * ts * 4);
-      // Fill background dark.
-      for (let i = 0; i < buf.length; i += 4) {
-        buf[i] = 35; buf[i + 1] = 30; buf[i + 2] = 30; buf[i + 3] = 255;
-      }
-      // Each marker tile carries 4 cols × 4 rows of sub-tiles.
-      // Left tile (tileX=0): cols 0..3 of the 8-col marker.
-      // Right tile (tileX=1): cols 4..7.
-      const colOffset = tileX * 4;
-      for (let row = 0; row < ROWS; row++) {
-        for (let col = 0; col < 4; col++) {
-          const globalCol = colOffset + col;
-          const bit = row * COLS + globalCol;
-          const set = ((this.markerValue >>> bit) & 1) === 1;
-          if (!set) continue;
-          // Fill the 16×16 sub-tile with bright pixels.
-          for (let dy = 0; dy < TILE_PX; dy++) {
-            for (let dx = 0; dx < TILE_PX; dx++) {
-              const px = col * TILE_PX + dx;
-              const py = row * TILE_PX + dy;
-              const idx = (py * ts + px) * 4;
-              buf[idx] = 230;
-              buf[idx + 1] = 230;
-              buf[idx + 2] = 230;
-              buf[idx + 3] = 255;
-            }
-          }
-        }
-      }
-      out.push({
-        tile_x: tileX,
-        tile_y: 0,
-        encoding: 0,
-        payload: this._rgbaToBgra(buf),
-      });
-    }
-    return out;
-  }
-
-  // Solid color BGRA tile of `[R, G, B]` color (caller-friendly RGB
-  // order; we swap to BGRA inside).
-  _solidTileBgra([r, g, b]) {
-    const ts = this.tileSize;
-    const buf = new Uint8ClampedArray(ts * ts * 4);
-    for (let i = 0; i < buf.length; i += 4) {
-      buf[i] = b;
-      buf[i + 1] = g;
-      buf[i + 2] = r;
-      buf[i + 3] = 255;
-    }
-    return buf;
-  }
-
-  // Cursor tile: background fill + amber cursor disc within radius
-  // of the cursor center. Returns BGRA bytes.
-  _cursorTileBgra(tileX, tileY, cursor, [cR, cG, cB], [bR, bG, bB]) {
-    const ts = this.tileSize;
-    const buf = new Uint8ClampedArray(ts * ts * 4);
-    const tx0 = tileX * ts;
-    const ty0 = tileY * ts;
-    for (let dy = 0; dy < ts; dy++) {
-      const py = ty0 + dy;
-      for (let dx = 0; dx < ts; dx++) {
-        const px = tx0 + dx;
-        const inCursor = Math.hypot(px - cursor.x, py - cursor.y) < 12;
-        const idx = (dy * ts + dx) * 4;
-        if (inCursor) {
-          buf[idx] = cB; buf[idx + 1] = cG; buf[idx + 2] = cR;
-        } else {
-          buf[idx] = bB; buf[idx + 1] = bG; buf[idx + 2] = bR;
-        }
-        buf[idx + 3] = 255;
-      }
-    }
-    return buf;
-  }
-
-  _rgbaToBgra(rgba) {
-    const out = new Uint8ClampedArray(rgba.length);
-    for (let i = 0; i < rgba.length; i += 4) {
-      out[i] = rgba[i + 2];
-      out[i + 1] = rgba[i + 1];
-      out[i + 2] = rgba[i];
-      out[i + 3] = rgba[i + 3];
-    }
-    return out;
-  }
-}
 
 // CanvasFreshnessSampler — reads the freshness marker off a canvas
 // instead of a video element. Same marker geometry / decode / record
-// schema as VisualFreshnessSampler so the transcript is consumable
-// by the same `/api/diagnostics/visual-freshness` sink. Uses
-// requestAnimationFrame instead of requestVideoFrameCallback.
-//
-// This is intentional duplication of the VisualFreshnessSampler
-// methods that don't depend on the video element; a refactor to a
-// shared base class could come later but is out of scope for D-2.
-class CanvasFreshnessSampler {
+// schema as VisualFreshnessSampler (both via FreshnessSamplerBase) so
+// the transcript is consumable by the same
+// `/api/diagnostics/visual-freshness` sink. Uses requestAnimationFrame
+// instead of requestVideoFrameCallback.
+class CanvasFreshnessSampler extends FreshnessSamplerBase {
   constructor(sourceCanvas, hostId, displayId) {
+    super(hostId, displayId, 'vf-canvas', '[diag-vf canvas]');
     this.sourceCanvas = sourceCanvas;
-    this.hostId = hostId;
-    this.displayId = displayId;
-    this.browserSessionId = (window.crypto && window.crypto.randomUUID)
-      ? window.crypto.randomUUID()
-      : `vf-canvas-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-
-    // Marker geometry — same constants as VisualFreshnessSampler.
-    this.MARKER_W = 128;
-    this.MARKER_H = 64;
-    this.TILE_PX = 16;
-    this.COLS = 8;
-    this.ROWS = 4;
-    this.THRESHOLD = 128;
-
-    this.scratch = document.createElement('canvas');
-    this.scratch.width = this.MARKER_W;
-    this.scratch.height = this.MARKER_H;
-    this.scratchCtx = this.scratch.getContext('2d', { willReadFrequently: true });
-
-    this.startMs = performance.now();
-    this.lastValue = null;
-    this.lastTransitionMs = this.startMs;
-    this.records = [];
-    this.transitions = 0;
-    this.gaps = [];
-    this.longestFreezeMs = 0;
-    this.flushTimer = null;
-    this.stopped = false;
   }
 
-  start() {
-    this._enqueue({
+  _sessionStartRecord() {
+    return {
       t: 'session_start',
       browser_ms: 0,
       browser_session_id: this.browserSessionId,
@@ -1526,9 +1186,7 @@ class CanvasFreshnessSampler {
       ua: navigator.userAgent,
       uses_rvfc: false, // canvas path is rAF-only by construction
       source: 'canvas',
-    });
-    this._scheduleFrame();
-    this.flushTimer = setInterval(() => this._flush(), 5000);
+    };
   }
 
   _scheduleFrame() {
@@ -1536,121 +1194,17 @@ class CanvasFreshnessSampler {
     requestAnimationFrame(() => this._onFrame());
   }
 
-  _onFrame() {
-    if (this.stopped) return;
-    if (this.sourceCanvas.width < this.MARKER_W || this.sourceCanvas.height < this.MARKER_H) {
-      this._scheduleFrame();
-      return;
-    }
-    try {
-      this.scratchCtx.drawImage(
-        this.sourceCanvas,
-        0, 0, this.MARKER_W, this.MARKER_H,
-        0, 0, this.MARKER_W, this.MARKER_H,
-      );
-      const img = this.scratchCtx.getImageData(0, 0, this.MARKER_W, this.MARKER_H);
-      const value = this._decode(img);
-      if (this.lastValue !== null && value !== this.lastValue) {
-        const nowMs = performance.now();
-        const gap = nowMs - this.lastTransitionMs;
-        this.transitions += 1;
-        this.gaps.push(gap);
-        if (gap > this.longestFreezeMs) this.longestFreezeMs = gap;
-        this._enqueue({
-          t: 'transition',
-          browser_ms: nowMs - this.startMs,
-          value,
-          gap_ms: Math.round(gap),
-        });
-        this.lastTransitionMs = nowMs;
-      } else if (this.lastValue === null) {
-        // Anchor at first decoded value (matches VisualFreshnessSampler
-        // 5387d90 fix — first transition reports steady-state cadence,
-        // not init-to-first-frame interval).
-        this.lastTransitionMs = performance.now();
-      }
-      this.lastValue = value;
-    } catch (e) {
-      console.warn('[diag-vf canvas] sample failed:', e);
-    }
-    this._scheduleFrame();
+  _sourceReady() {
+    return this.sourceCanvas.width >= this.MARKER_W
+      && this.sourceCanvas.height >= this.MARKER_H;
   }
 
-  // Same decode as VisualFreshnessSampler — bit_idx = row * COLS + col,
-  // BT.601 luma, threshold 128.
-  _decode(imageData) {
-    const { data, width } = imageData;
-    let v = 0;
-    for (let row = 0; row < this.ROWS; row++) {
-      const cy = row * this.TILE_PX + (this.TILE_PX >> 1);
-      for (let col = 0; col < this.COLS; col++) {
-        const cx = col * this.TILE_PX + (this.TILE_PX >> 1);
-        const idx = (cy * width + cx) * 4;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
-        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (luma >= this.THRESHOLD) {
-          v |= 1 << (row * this.COLS + col);
-        }
-      }
-    }
-    return v >>> 0;
-  }
-
-  _enqueue(record) {
-    this.records.push(record);
-  }
-
-  _flush(options = {}) {
-    if (this.stopped && !options.allowStopped) return;
-    this._enqueue(this._buildSummary());
-    this._postBatch();
-  }
-
-  _buildSummary() {
-    const sorted = [...this.gaps].sort((a, b) => a - b);
-    const percentile = (q) => {
-      if (sorted.length === 0) return 0;
-      const idx = Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q));
-      return Math.round(sorted[idx]);
-    };
-    const elapsedMs = performance.now() - this.startMs;
-    const fps = elapsedMs > 0
-      ? Math.round((this.transitions * 100000 / elapsedMs)) / 100
-      : 0;
-    return {
-      t: 'summary',
-      browser_ms: Math.round(elapsedMs),
-      transitions: this.transitions,
-      p50_gap_ms: percentile(0.5),
-      p95_gap_ms: percentile(0.95),
-      max_gap_ms: sorted.length ? Math.round(sorted[sorted.length - 1]) : 0,
-      longest_freeze_ms: Math.round(this.longestFreezeMs),
-      effective_fps: fps,
-    };
-  }
-
-  _postBatch() {
-    if (this.records.length === 0) return;
-    const ndjson = this.records.map((r) => JSON.stringify(r)).join('\n') + '\n';
-    this.records = [];
-    postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
-      .catch((err) => console.warn('[diag-vf canvas] upload failed:', err));
-  }
-
-  stop() {
-    if (this.stopped) return;
-    this.stopped = true;
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this._enqueue({
-      t: 'session_end',
-      browser_ms: Math.round(performance.now() - this.startMs),
-    });
-    this._flush({ allowStopped: true });
+  _drawSource() {
+    this.ctx.drawImage(
+      this.sourceCanvas,
+      0, 0, this.MARKER_W, this.MARKER_H,
+      0, 0, this.MARKER_W, this.MARKER_H,
+    );
   }
 }
 
@@ -1692,64 +1246,29 @@ function federationH264TestEnabled() {
   return false;
 }
 
-// Bootstrap the synthetic harness — appended to body as a fixed-
-// position pane so it doesn't collide with the existing dashboard
-// chrome. CanvasFreshnessSampler activates only if `?diag=1` is also
-// set, mirroring the existing video-path gating.
-function startTileTestHarness() {
-  const container = document.createElement('div');
-  container.id = 'tile-test-harness';
-  container.style.cssText =
-    'position:fixed; right:16px; bottom:16px; background:#16161e;' +
-    ' border:1px solid #444; padding:8px; border-radius:4px;' +
-    ' font:11px ui-monospace,monospace; color:#ddd; z-index:99999;';
-
-  const header = document.createElement('div');
-  header.textContent = 'D-2 tile-test compositor (synthetic)';
-  header.style.cssText = 'margin-bottom:6px; color:#8c8;';
-  container.appendChild(header);
-
-  const opts = { tileSize: 64, gridW: 24, gridH: 14, fps: 30 };
-  const compositor = new TileCompositor(container, opts);
-  const stream = new SyntheticTileStream(compositor, opts);
-
-  document.body.appendChild(container);
-  stream.start();
-
-  let sampler = null;
-  if (diagModeEnabled()) {
-    sampler = new CanvasFreshnessSampler(compositor.canvas, 'tile-test', 0);
-    sampler.start();
-  }
-
-  const metricsEl = document.createElement('pre');
-  metricsEl.style.cssText = 'margin:6px 0 0; color:#aaa; font-size:10px; white-space:pre;';
-  container.appendChild(metricsEl);
-  setInterval(() => {
-    const obj = {
-      compositor: compositor.metrics,
-      stream: stream.metrics,
-    };
-    if (sampler) {
-      obj.sampler = {
-        transitions: sampler.transitions,
-        last_max_freeze_ms: Math.round(sampler.longestFreezeMs),
-        gaps_buffered: sampler.gaps.length,
-      };
-    }
-    metricsEl.textContent = JSON.stringify(obj, null, 2);
-  }, 1000);
-
-  return { compositor, stream, sampler };
-}
-
+// D-2 tile-test harness loader. The harness itself (SyntheticTileStream
+// + startTileTestHarness + its auto-start) lives VERBATIM in
+// static/tile-test-harness.js — a deliberately parked seed relocated out
+// of this fragment so its ~450 lines stop shipping in every page load.
+// Injected on demand only when the flag is active.
+//
+// Glue contract: the harness file is a plain classic script while this
+// SPA is one module script, so the module-scoped pieces it drives are
+// exported on window right before injection. Keep this list in sync
+// with the header of static/tile-test-harness.js.
+//
+// Cache-busting note: dynamically injected embedded assets follow the
+// /xterm.min.js and /codemirror-bundle.js convention — a bare path, with
+// freshness handled by the gateway's ETag revalidation (`no-cache,
+// must-revalidate` for unversioned asset requests). The server-side
+// `?v=` rewrite applies only to URLs inside app.html.
 if (tileTestEnabled()) {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      window.__tileTest = startTileTestHarness();
-    });
-  } else {
-    window.__tileTest = startTileTestHarness();
-  }
+  window.TileCompositor = TileCompositor;
+  window.CanvasFreshnessSampler = CanvasFreshnessSampler;
+  window.diagModeEnabled = diagModeEnabled;
+  const tileTestScript = document.createElement('script');
+  tileTestScript.src = '/tile-test-harness.js';
+  tileTestScript.onerror = () => console.error(
+    '[tile-test] failed to load /tile-test-harness.js — the daemon build must embed it (web_gateway/static_assets.rs)');
+  document.head.appendChild(tileTestScript);
 }
-

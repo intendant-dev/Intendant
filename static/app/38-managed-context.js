@@ -1783,7 +1783,11 @@ function resetSessionWindowLog(win) {
   win.logHistory = [];
   win.renderStart = 0;
   win.renderEnd = 0;
-  win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  if (typeof renderSessionWindowLogPlaceholder === 'function') {
+    renderSessionWindowLogPlaceholder(win);
+  } else {
+    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  }
   win.followOutput = true;
   win.pendingOutput = false;
   updateSessionWindowJumpButton(win);

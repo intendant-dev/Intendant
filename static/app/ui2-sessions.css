@@ -1634,3 +1634,81 @@ html.ui-v2 #tab-sessions .session-detail .empty-state {
 /* Session ids ride the design mono, not the UA's ui-monospace stack
    (chrome-audit cross-surface sweep). */
 html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
+
+/* ── Phase spinner: pure CSS (was an 80ms JS interval doing DOM writes).
+   Braille frames step through ::after content — discrete `content`
+   animation, the steps() idiom for glyph cyclers. setPhase toggles
+   .phase-spinner-live; terminal phases write a static glyph instead. */
+@keyframes ui-braille-spin {
+  0%   { content: '⠋'; }
+  10%  { content: '⠙'; }
+  20%  { content: '⠹'; }
+  30%  { content: '⠸'; }
+  40%  { content: '⠼'; }
+  50%  { content: '⠴'; }
+  60%  { content: '⠦'; }
+  70%  { content: '⠧'; }
+  80%  { content: '⠇'; }
+  90%  { content: '⠏'; }
+  100% { content: '⠋'; }
+}
+#phase-spinner.phase-spinner-live::after {
+  content: '⠋';
+  animation: ui-braille-spin 0.8s steps(1, end) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  #phase-spinner.phase-spinner-live::after { animation: none; content: '·'; }
+}
+
+/* ── Session-window log placeholder states (three-state contract) ── */
+.session-window-empty.session-window-empty-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--red, #f38ba8);
+}
+.session-window-empty-retry {
+  border: 1px solid var(--line, rgba(127,127,127,.35));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.session-window-empty-retry:hover { border-color: var(--red, #f38ba8); }
+.session-window-empty.session-window-empty-loading { opacity: .75; }
+
+/* ── Deep-search progress line (newer daemons stream it; absent = no bar) ── */
+.sessions-deep-search-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.sessions-deep-search-progress-text { white-space: nowrap; }
+.sessions-deep-search-progress-track {
+  flex: 1;
+  max-width: 340px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line, rgba(127,127,127,.25));
+  overflow: hidden;
+}
+.sessions-deep-search-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--iris, var(--blue, #89b4fa));
+  transition: width .3s ease;
+}
+
+/* ── Keyboard access: cards are role=button — show it when tabbed to ── */
+.session-card:focus-visible {
+  outline: 2px solid var(--iris, var(--blue, #89b4fa));
+  outline-offset: 2px;
+}
+
+/* New Session project status: the outside-project-root note carries its
+   own quiet warn tint; the status text keeps its ok/warn/error tone. */
+.sessions-project-status .sessions-project-outside-note { color: var(--yellow, #f9e2af); }

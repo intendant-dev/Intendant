@@ -81,6 +81,82 @@ function sendDisplayInputForSlot(displayId, msg) {
   return Boolean(dashboardTransport?.displayInput?.(displayId, msg));
 }
 
+// Item 8: remote-clipboard write failures were fully silent (nested empty
+// catches). Success stays quiet; the FIRST write failure per page session
+// raises one actionable toast, then the path goes quiet again.
+let displayClipboardToastShown = false;
+function noteDisplayClipboardWriteFailure() {
+  if (displayClipboardToastShown) return;
+  displayClipboardToastShown = true;
+  if (typeof showControlToast === 'function') {
+    showControlToast('error', "Remote clipboard couldn't sync — click the page and retry");
+  }
+}
+
+// Shared getStats() summarizer for the live metrics chip ("LIVE · fps ·
+// kbps · relay"). Used by both the local DisplaySlot and the federated
+// PeerDisplayConnection samplers so the two chips can't drift. `prev` is
+// the snapshot returned by the previous call (or null on the first
+// sample); rates are computed from deltas against it. kbps reads the
+// selected candidate-pair's bytesReceived so it covers the tile
+// datachannel lane as well as RTP video; `relay` is true when the local
+// selected candidate is a TURN relay.
+function summarizeRtcStats(stats, prev) {
+  let inbound = null;
+  let pair = null;
+  let transport = null;
+  const byId = new Map();
+  stats.forEach((r) => {
+    byId.set(r.id, r);
+    if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.mediaType === 'video')) {
+      inbound = r;
+    } else if (
+      r.type === 'candidate-pair' &&
+      (r.selected || (r.nominated && r.state === 'succeeded'))
+    ) {
+      pair = r;
+    } else if (r.type === 'transport') {
+      transport = r;
+    }
+  });
+  // Chrome never sets `selected`; resolve through the transport's pair id.
+  if (!pair && transport && transport.selectedCandidatePairId) {
+    pair = byId.get(transport.selectedCandidatePairId) || null;
+  }
+  const now = (inbound && inbound.timestamp) || (pair && pair.timestamp) || performance.now();
+  const snapshot = {
+    t: now,
+    frames: inbound ? Number(inbound.framesDecoded || 0) : null,
+    bytes: pair ? Number(pair.bytesReceived || 0)
+      : (inbound ? Number(inbound.bytesReceived || 0) : null),
+  };
+  let fps = (inbound && inbound.framesPerSecond !== undefined)
+    ? Math.round(inbound.framesPerSecond)
+    : null;
+  let kbps = null;
+  if (prev && now > prev.t) {
+    const dt = (now - prev.t) / 1000;
+    if (fps === null && snapshot.frames !== null && prev.frames !== null) {
+      fps = Math.max(0, Math.round((snapshot.frames - prev.frames) / dt));
+    }
+    if (snapshot.bytes !== null && prev.bytes !== null) {
+      kbps = Math.max(0, Math.round(((snapshot.bytes - prev.bytes) * 8) / dt / 1000));
+    }
+  }
+  let relay = false;
+  if (pair) {
+    const local = byId.get(pair.localCandidateId);
+    relay = !!(local && local.candidateType === 'relay');
+  }
+  const parts = ['LIVE'];
+  if (fps !== null) parts.push(`${fps} fps`);
+  if (kbps !== null) parts.push(`${kbps} kbps`);
+  if (relay) parts.push('relay');
+  // Nothing but "LIVE" to say yet (first sample, no rates): don't render.
+  const text = parts.length > 1 ? parts.join(' · ') : null;
+  return { text, snapshot };
+}
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -122,6 +198,17 @@ class DisplaySlot {
     this._closedByUser = false;
     this._streamIntervalId = null;
     this._streamFrameCounter = 0;
+    // Negotiation epoch: incremented on every connect() and disconnect()
+    // so stale async callbacks (first-frame hooks, watchdogs) from a
+    // previous RTCPeerConnection can detect they are outdated and bail.
+    this._connectEpoch = 0;
+    // True once the current pc has rendered a real frame; gates the
+    // no-track watchdog and the "Waiting for first frame…" overlay stage.
+    this._firstFrameSeen = false;
+    this._noTrackTimer = null;      // no-video watchdog (ported from peer path)
+    this._statsTimer = null;        // live metrics chip sampler
+    this._statsPrev = null;
+    this._takePendingTimer = null;  // Take Control 5s no-answer timeout
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
@@ -172,6 +259,23 @@ class DisplaySlot {
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.canvasEl.appendChild(this.videoEl);
+    // In-stage connection status overlay (time-to-first-frame): staged
+    // copy while negotiating ("Negotiating…" → "Waiting for first
+    // frame…"), and a visible error state with a Reconnect button on
+    // dead ends. Lives inside canvasEl so it follows the stage through
+    // thumb/fullscreen reparenting.
+    this.overlayEl = document.createElement('div');
+    this.overlayEl.className = 'display-stage-overlay';
+    this.overlayEl.style.display = 'none';
+    this.canvasEl.appendChild(this.overlayEl);
+    // Live metrics chip ("LIVE · fps · kbps · relay"), fed by the
+    // getStats sampler while connected. Replaces the pure-CSS LIVE pill
+    // whenever it has data (see ui2-live.css `:has(.display-live-metrics
+    // .active)` rule).
+    this.metricsEl = document.createElement('div');
+    this.metricsEl.className = 'display-live-metrics';
+    this.metricsEl.style.display = 'none';
+    this.canvasEl.appendChild(this.metricsEl);
     const rerenderSharedFocus = () => {
       if (!sharedViewState.visible) return;
       if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
@@ -195,6 +299,10 @@ class DisplaySlot {
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
     this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
   }
+
+  // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — keep the
+  // two paths' patience identical.
+  static NO_TRACK_TIMEOUT_MS = 10000;
 
   toggleFullscreen(force) {
     const want = force === undefined
@@ -371,6 +479,17 @@ class DisplaySlot {
   }
 
   connect() {
+    // Fresh negotiation: reset the answer/candidate bookkeeping (retries
+    // used to inherit the previous session's `_answerApplied = true` and
+    // feed early candidates into a pc with no remote description) and
+    // bump the epoch so stale first-frame/watchdog callbacks bail.
+    const epoch = ++this._connectEpoch;
+    this._answerApplied = false;
+    this._pendingCandidates = [];
+    this._firstFrameSeen = false;
+    this.statusEl.textContent = 'Connecting...';
+    this.statusEl.className = 'display-status';
+    this._setStageOverlay('progress', 'Negotiating…');
     // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
     // default empty for local LAN deployments. Goes through the shared
     // helper so the peer-display path (PeerDisplayConnection.connect) can't
@@ -430,10 +549,10 @@ class DisplaySlot {
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
               const blob = new Blob([bytes], { type: mime });
               const item = new ClipboardItem({ [mime]: blob });
-              navigator.clipboard.write([item]).catch(() => {});
-            } catch {}
+              navigator.clipboard.write([item]).catch(noteDisplayClipboardWriteFailure);
+            } catch { noteDisplayClipboardWriteFailure(); }
           } else if (d.text !== undefined) {
-            navigator.clipboard.writeText(d.text).catch(() => {});
+            navigator.clipboard.writeText(d.text).catch(noteDisplayClipboardWriteFailure);
           }
         }
       } catch {}
@@ -450,6 +569,17 @@ class DisplaySlot {
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
       this.statusEl.className = 'display-status connected';
+      // Track arrived, frames haven't: keep the stage honest until the
+      // first frame actually renders, then drop the overlay and the
+      // no-video watchdog together.
+      if (!this._firstFrameSeen) {
+        this._setStageOverlay('progress', 'Waiting for first frame…');
+      }
+      this._onFirstFrame(epoch, () => {
+        this._firstFrameSeen = true;
+        this._clearNoTrackWatchdog();
+        this._setStageOverlay(null);
+      });
     };
 
     // ICE candidates — prefer the verified dashboard-control tunnel, falling
@@ -471,6 +601,7 @@ class DisplaySlot {
         const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
+        this._startStatsSampler();
       } else if (state === 'failed') {
         // ICE negotiation failed — tear down and create a fresh
         // offer/answer exchange.  The server-side DisplaySession stays
@@ -490,21 +621,35 @@ class DisplaySlot {
         this._reconnectAttempts = attempts;
         if (attempts <= 5) {
           const delay = Math.min(2000 * attempts, 10000);
+          // disconnect() first: it clears watchdogs/samplers and hides
+          // the overlay, so set the retry copy AFTER it runs.
+          this.disconnect();
           this.statusEl.textContent = `Connection failed, reconnecting in ${delay/1000}s (attempt ${attempts})...`;
           this.statusEl.className = 'display-status error';
-          this.disconnect();
+          this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of 5)…`);
           setTimeout(() => {
             if (this._closedByUser) return;
             this.connect();
           }, delay);
         } else {
+          // Dead end used to be terminal with no control; now it alarms
+          // and offers a manual Reconnect that restarts the retry budget.
           this.statusEl.textContent = 'Connection failed after 5 attempts';
           this.statusEl.className = 'display-status error';
+          this._stopStatsSampler();
+          this._setStageOverlay('error', 'Connection failed after 5 attempts.', {
+            retryLabel: 'Reconnect',
+            onRetry: () => this.manualReconnect(),
+          });
         }
       } else if (state === 'disconnected') {
+        // 'disconnected' is transient more often than not (ICE keeps
+        // probing and usually recovers) — don't alarm, don't tear down.
+        // 'failed' is the alarming state with the Reconnect offer.
         this.connected = false;
-        this.statusEl.textContent = 'Connection disconnected';
-        this.statusEl.className = 'display-status error';
+        this._stopStatsSampler();
+        this.statusEl.textContent = 'Connection interrupted — recovering…';
+        this.statusEl.className = 'display-status warn';
       }
     };
 
@@ -548,7 +693,139 @@ class DisplaySlot {
     }).catch(err => {
       this.statusEl.textContent = 'Offer FAILED: ' + err.message;
       this.statusEl.className = 'display-status error';
+      // Offer/signaling failure used to be a quiet toolbar note on a dark
+      // stage; surface it where the user is looking, with a way out.
+      this._setStageOverlay('error', 'Connection setup failed: ' + err.message, {
+        retryLabel: 'Reconnect',
+        onRetry: () => this.manualReconnect(),
+      });
     });
+  }
+
+  // ── In-stage status overlay + reconnect helpers ─────────────────────
+
+  // Render the stage overlay. `mode` is 'progress' (spinner + copy),
+  // 'error' (alarming copy + optional retry button), or null to hide.
+  // All dynamic text goes through textContent — never innerHTML.
+  _setStageOverlay(mode, text, { retryLabel = null, onRetry = null } = {}) {
+    const el = this.overlayEl;
+    if (!el) return;
+    if (!mode) {
+      el.style.display = 'none';
+      el.classList.remove('error');
+      el.textContent = '';
+      return;
+    }
+    el.textContent = '';
+    el.classList.toggle('error', mode === 'error');
+    const inner = document.createElement('div');
+    inner.className = 'stage-overlay-inner';
+    if (mode !== 'error') {
+      const spinner = document.createElement('span');
+      spinner.className = 'stage-overlay-spinner';
+      inner.appendChild(spinner);
+    }
+    const label = document.createElement('span');
+    label.className = 'stage-overlay-text';
+    label.textContent = text || '';
+    inner.appendChild(label);
+    if (retryLabel && typeof onRetry === 'function') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'stage-overlay-retry';
+      btn.textContent = retryLabel;
+      btn.addEventListener('click', onRetry);
+      inner.appendChild(btn);
+    }
+    el.appendChild(inner);
+    el.style.display = '';
+  }
+
+  // Run `cb` once the <video> renders its first frame for THIS
+  // negotiation epoch. rVFC where available (fires per decoded frame),
+  // 'loadeddata' otherwise.
+  _onFirstFrame(epoch, cb) {
+    const vid = this.videoEl;
+    const fire = () => {
+      if (epoch !== this._connectEpoch) return; // stale negotiation
+      cb();
+    };
+    if (typeof vid.requestVideoFrameCallback === 'function') {
+      vid.requestVideoFrameCallback(() => fire());
+    } else if (vid.readyState >= 2) {
+      fire();
+    } else {
+      vid.addEventListener('loadeddata', fire, { once: true });
+    }
+  }
+
+  // User-facing recovery entry point (overlay Reconnect button, revived
+  // slots). Resets the bounded-retry budget and renegotiates from scratch.
+  manualReconnect() {
+    if (this._closedByUser) return;
+    this._reconnectAttempts = 0;
+    this.disconnect();
+    this.connect();
+  }
+
+  // No-video watchdog, ported from the peer path: armed when the answer
+  // applies, cleared by the first rendered frame. Catches the "answer
+  // accepted, ICE/DTLS fine, but no frames ever arrive" black-stage case.
+  _armNoTrackWatchdog() {
+    this._clearNoTrackWatchdog();
+    this._noTrackTimer = window.setTimeout(() => {
+      this._noTrackTimer = null;
+      if (this._firstFrameSeen || this._closedByUser) return;
+      this.statusEl.textContent = 'No video received';
+      this.statusEl.className = 'display-status error';
+      this._setStageOverlay('error',
+        'No video within 10s — the server accepted the connection but sent no frames. The capture may have stalled; reconnecting usually fixes it.', {
+          retryLabel: 'Reconnect',
+          onRetry: () => this.manualReconnect(),
+        });
+    }, DisplaySlot.NO_TRACK_TIMEOUT_MS);
+  }
+
+  _clearNoTrackWatchdog() {
+    if (this._noTrackTimer !== null && this._noTrackTimer !== undefined) {
+      window.clearTimeout(this._noTrackTimer);
+      this._noTrackTimer = null;
+    }
+  }
+
+  // ── Live metrics chip (getStats sampler) ────────────────────────────
+
+  _startStatsSampler() {
+    if (this._statsTimer) return;
+    this._statsPrev = null;
+    this._statsTimer = window.setInterval(() => {
+      this._sampleStats().catch(() => {});
+    }, 3000);
+    this._sampleStats().catch(() => {});
+  }
+
+  _stopStatsSampler() {
+    if (this._statsTimer) {
+      window.clearInterval(this._statsTimer);
+      this._statsTimer = null;
+    }
+    this._statsPrev = null;
+    if (this.metricsEl) {
+      this.metricsEl.style.display = 'none';
+      this.metricsEl.classList.remove('active');
+      this.metricsEl.textContent = '';
+    }
+  }
+
+  async _sampleStats() {
+    if (!this.pc || this.pc.connectionState !== 'connected') return;
+    const stats = await this.pc.getStats();
+    const summary = summarizeRtcStats(stats, this._statsPrev);
+    this._statsPrev = summary.snapshot;
+    if (!summary.text || !this.metricsEl) return;
+    this.metricsEl.textContent = summary.text;
+    this.metricsEl.style.display = '';
+    this.metricsEl.classList.add('active');
   }
 
   handleAnswer(sdp) {
@@ -582,8 +859,19 @@ class DisplaySlot {
         this.pc.addIceCandidate(c).catch(() => {});
       }
       this._pendingCandidates = [];
+      // Answer accepted: the only thing left is media. Stage the copy
+      // and arm the no-video watchdog (cleared by the first frame).
+      if (!this._firstFrameSeen) {
+        this._setStageOverlay('progress', 'Waiting for first frame…');
+      }
+      this._armNoTrackWatchdog();
     }).catch(err => {
       this.statusEl.textContent = `Answer FAILED: ${err.message}`;
+      this.statusEl.className = 'display-status error';
+      this._setStageOverlay('error', 'Answer failed: ' + err.message, {
+        retryLabel: 'Reconnect',
+        onRetry: () => this.manualReconnect(),
+      });
       console.error('Failed to set remote description:', err);
     });
   }
@@ -615,10 +903,37 @@ class DisplaySlot {
     // Otherwise request authority and wait for the `'you'` notification
     // to arrive via `setAuthority`.  Marker so `setAuthority('you')` knows
     // to promote us into interactive mode rather than just rendering the
-    // chip.  No UI change here yet — the chip still renders the current
-    // (other / unclaimed / unknown) state until the server answers.
-    this._takeControlPending = true;
+    // chip.  The button shows a pending state while the request is in
+    // flight; a 5s no-answer timeout resets it with a toast instead of
+    // leaving a silently armed flag.
+    this._setTakeControlPending(true);
     requestDisplayInputAuthorityForSlot(this.displayId);
+  }
+
+  // Item 7b: single writer for the Take Control pending state — flag,
+  // button spinner/disabled state, and the 5s no-answer timeout that
+  // resets everything with a toast.
+  _setTakeControlPending(pending) {
+    this._takeControlPending = pending;
+    if (this._takePendingTimer) {
+      window.clearTimeout(this._takePendingTimer);
+      this._takePendingTimer = null;
+    }
+    if (this.takeBtn) {
+      this.takeBtn.disabled = pending;
+      this.takeBtn.classList.toggle('is-pending', pending);
+      this.takeBtn.textContent = pending ? 'Requesting…' : 'Take Control';
+    }
+    if (pending) {
+      this._takePendingTimer = window.setTimeout(() => {
+        this._takePendingTimer = null;
+        if (!this._takeControlPending) return;
+        this._setTakeControlPending(false);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', 'No response to the input-control request — try again');
+        }
+      }, 5000);
+    }
   }
 
   // Phase 5c: enter interactive mode (UI + listeners).  Called from
@@ -646,7 +961,11 @@ class DisplaySlot {
     const vid = this.videoEl;
     vid.tabIndex = 0;
     vid.focus();
-    this._heldModifiers = new Set();
+    // Item 3: track EVERY held key code (not just the 8 modifiers) so
+    // blur and demotion can release everything the remote side thinks
+    // is down. A latched non-modifier (e.g. a held arrow key when the
+    // server demotes us) otherwise auto-repeats remotely forever.
+    this._heldKeys = new Set();
 
     const normalize = (e) => {
       const rect = vid.getBoundingClientRect();
@@ -693,6 +1012,19 @@ class DisplaySlot {
       }
     };
 
+    // Flush synthetic keyups for every currently-held key. Stored on the
+    // instance so `_exitInteractive` (which runs outside this closure)
+    // can release held keys BEFORE the listeners are removed — a
+    // server-side authority demotion otherwise latches keys down
+    // remotely. Cleared by `_exitInteractive`.
+    this._flushHeldKeys = () => {
+      if (!this._heldKeys) return;
+      for (const code of this._heldKeys) {
+        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+      }
+      this._heldKeys.clear();
+    };
+
     // NOTE: Both `code` (physical key position) and `key` (logical character) are sent
     // in KeyDown/KeyUp events. Backends currently use `code` only for physical key
     // injection (xdotool key / CGEvent keycode). Using `key` for character-based text
@@ -703,9 +1035,7 @@ class DisplaySlot {
         return;
       }
       e.preventDefault();
-      if (['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight'].includes(e.code)) {
-        this._heldModifiers.add(e.code);
-      }
+      this._heldKeys.add(e.code);
       sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.keyup = (e) => {
@@ -714,7 +1044,7 @@ class DisplaySlot {
         return;
       }
       e.preventDefault();
-      this._heldModifiers.delete(e.code);
+      this._heldKeys.delete(e.code);
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
@@ -768,14 +1098,11 @@ class DisplaySlot {
     };
     this._boundHandlers.contextmenu = (e) => e.preventDefault();
 
-    // Release all held modifier keys when the video element loses focus
-    // (e.g. Alt+Tab away). Without this, the remote side thinks modifiers
-    // are still held because no keyup event fires for them.
+    // Release ALL held keys when the video element loses focus (e.g.
+    // Alt+Tab away). Without this, the remote side thinks they are still
+    // held because no keyup event ever fires for them.
     this._boundHandlers.blur = () => {
-      for (const code of this._heldModifiers) {
-        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
-      }
-      this._heldModifiers.clear();
+      this._flushHeldKeys?.();
     };
 
     // Re-focus the video element when the pointer enters it while interactive.
@@ -841,7 +1168,7 @@ class DisplaySlot {
     releaseDisplayInputAuthorityForSlot(this.displayId);
     // Cancel any pending take so a server `'you'` answer arriving after
     // the release doesn't re-promote into interactive.
-    this._takeControlPending = false;
+    this._setTakeControlPending(false);
   }
 
   // Phase 5c: user-intent release of interactive control via the Release
@@ -855,8 +1182,13 @@ class DisplaySlot {
   // `_releaseAuthority`.  Server demotion (someone else takes over) goes
   // through `_exitInteractive(false)` from `setAuthority` instead.
   releaseControl() {
-    this._releaseAuthority();
+    // Exit interactive FIRST: `_exitInteractive` flushes synthetic keyups
+    // for every held key, and those must reach the server while this
+    // connection still holds input authority (the release below removes
+    // our slot at the server gate, after which held-key keyups would be
+    // dropped and the keys would stay latched down remotely).
     this._exitInteractive(true);
+    this._releaseAuthority();
   }
 
   // Phase 5c: exit interactive mode (UI + listeners).  `userInitiated`
@@ -870,7 +1202,16 @@ class DisplaySlot {
   _exitInteractive(userInitiated) {
     if (!this.interactive) return;
     this.interactive = false;
-    if (this._heldModifiers) this._heldModifiers.clear();
+    // Item 3: flush synthetic keyups for every held key BEFORE the
+    // listeners are removed. Server-driven demotion never fires blur, so
+    // without this any held key (modifier or not) stays latched down on
+    // the remote display. Best-effort: on a demotion the gate may already
+    // have dropped us, but the flush is the only recovery available.
+    if (this._flushHeldKeys) {
+      try { this._flushHeldKeys(); } catch (_) {}
+      this._flushHeldKeys = null;
+    }
+    if (this._heldKeys) this._heldKeys.clear();
     const vid = this.videoEl;
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
       if (evt === 'paste') {
@@ -947,7 +1288,7 @@ class DisplaySlot {
     // confirms we hold it.  Without this, the user would click Take
     // Control and see the chip flip but the listeners would not install.
     if (state === 'you' && this._takeControlPending) {
-      this._takeControlPending = false;
+      this._setTakeControlPending(false);
       this._enterInteractive();
     }
 
@@ -1122,6 +1463,12 @@ class DisplaySlot {
   //   The WS-close cleanup at the gateway is the safety net for
   //   genuinely-dropped connections.
   disconnect({ userInitiated = false } = {}) {
+    // Invalidate in-flight async callbacks (first-frame hooks) and stop
+    // every per-connection timer — no leaked intervals across teardowns.
+    this._connectEpoch++;
+    this._clearNoTrackWatchdog();
+    this._stopStatsSampler();
+    this._setStageOverlay(null);
     this.stopStreaming();
     if (userInitiated) {
       this._releaseAuthority();
@@ -1421,7 +1768,28 @@ function addDisplaySlot(displayId, width, height) {
   // `display_ready`. The "different dims for the same display_id"
   // case therefore only fires on a real grant cycle, which the
   // explicit revoke / capture-lost handlers above already serialize.
+  //
+  // Item 1b exception: a duplicate `display_ready` is only benign when
+  // the existing slot is actually alive. After `display_capture_lost`
+  // (slot kept, pc torn down → pc === null) or after the bounded ICE
+  // retry gave up (pc stuck at 'failed'), this `display_ready` IS the
+  // re-grant — early-returning here made revival impossible: the slot
+  // sat disconnected forever and the only recovery was closing it by
+  // hand. Revive the slot in place instead of spawning a second one
+  // (which the server would treat as a second viewer).
   if (displaySlots.has(displayId)) {
+    const existing = displaySlots.get(displayId);
+    const state = existing.pc ? existing.pc.connectionState : null;
+    if (!existing.pc || state === 'failed' || state === 'closed') {
+      existing._closedByUser = false;
+      existing._reconnectAttempts = 0;
+      if (width > 0) {
+        existing.width = width;
+        existing.height = height;
+      }
+      existing.disconnect();
+      existing.connect();
+    }
     return;
   }
   const slot = new DisplaySlot(displayId, width, height);

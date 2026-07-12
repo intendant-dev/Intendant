@@ -66,6 +66,10 @@ class RecordingPlayer {
     this._hlsObjectUrls = [];
     this._hlsFallbackHandler = null;
     this._hlsLoadGeneration = 0;
+    // Live-recording segment poll — owned by the instance so destroy()
+    // covers every teardown path (an externally attached interval leaked
+    // one 5s timer per stream switch/delete).
+    this._refreshTimer = null;
 
     // Bound handlers — stored so destroy() can remove them
     this._onEnded = () => this._onSegmentEnd();
@@ -282,10 +286,35 @@ class RecordingPlayer {
     }
   }
 
+  /* Poll the segment list while this stream is actively recording (no
+     per-segment event flows from the daemon — segments just land on
+     disk). No-op for finished/session recordings: their stream is not in
+     the live `recordingStreams` registry, so the timer never starts. */
+  _startRefreshTimer() {
+    this._stopRefreshTimer();
+    // Live lane only: session-replay players (a session recordings
+    // baseUrl) look at finished streams whose names can collide with the
+    // live registry's — never poll those.
+    if (this.baseUrl !== '/recordings') return;
+    if (!recordingStreams.has(this.streamName)) return;
+    this._refreshTimer = setInterval(() => {
+      const info = recordingStreams.get(this.streamName);
+      if (info && info.active) this.refresh();
+    }, 5000);
+  }
+
+  _stopRefreshTimer() {
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+  }
+
   async load(streamName) {
     this.streamName = streamName;
     this.useMSE = false;
     this._mseReady = false;
+    this._startRefreshTimer();
     try {
       this.segments = await this._loadSegmentsList();
     } catch { this.segments = []; }
@@ -570,6 +599,7 @@ class RecordingPlayer {
 
   destroy() {
     this._stopAnimLoop();
+    this._stopRefreshTimer();
     this.video.pause();
     // Remove event listeners to prevent stale handlers on the shared video element
     this.video.removeEventListener('ended', this._onEnded);
@@ -717,11 +747,20 @@ function fmtTime(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+/// Short human-readable file-size string, matches the server's formatter.
+/// The one canonical bytes formatter for the dashboard (this fragment is
+/// the earliest that needs it); `_fmtBytes` below is a legacy alias kept
+/// for its many call sites (stats disk usage, station diff, debug,
+/// session replay).
+function humanBytes(n) {
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
 function _fmtBytes(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  return humanBytes(bytes);
 }
 
 function _getOrCreateOptgroup(select, label) {
@@ -828,9 +867,14 @@ function removeRecordingStream(streamName) {
   const info = recordingStreams.get(streamName);
   if (info) info.active = false;
   document.getElementById('rec-status').textContent = 'Stopped';
-  // Refresh segments after recording stops — the final segment is now available
+  // Refresh segments after recording stops — the final segment is now
+  // available. Capture the instance: the player can be destroyed and
+  // replaced (stream switch/delete) inside the 500ms window.
   if (recPlayer && activeRecordingStream === streamName) {
-    setTimeout(() => recPlayer.refresh(), 500);
+    const player = recPlayer;
+    setTimeout(() => {
+      if (recPlayer === player) player.refresh();
+    }, 500);
   }
 }
 
@@ -889,14 +933,9 @@ function switchRecordingStream(streamName) {
   speedSelect.value = '1';
   speedSelect.onchange = () => recPlayer.setSpeed(parseFloat(speedSelect.value));
 
+  // load() also starts the instance-owned segment poll for active
+  // recordings; destroy() (every switch/delete/reset path) clears it.
   recPlayer.load(streamName);
-
-  // Periodically refresh segment list for active recordings
-  if (recPlayer._refreshInterval) clearInterval(recPlayer._refreshInterval);
-  recPlayer._refreshInterval = setInterval(() => {
-    const info = recordingStreams.get(streamName);
-    if (info && info.active) recPlayer.refresh();
-  }, 5000);
 }
 
 // ── Displays collapse toggle ──

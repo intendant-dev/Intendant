@@ -101,6 +101,65 @@ function appendSessionWindowActionMenuItem(parent, action, codex = false) {
   return item;
 }
 
+// ── Session-window log placeholder (three states) ─────────────────────
+// Renders into an empty window log; removed by the first real entry (the
+// append paths drop `.session-window-empty`). States:
+//   error   — win.hydrateError holds a message (CONTRACT: the hydration
+//             owner in fragment 39 sets/clears it); shows a Retry button
+//             that re-runs hydrateSessionWindowIfEmpty by name.
+//   loading — hydration in flight (restore-in-flight set, or win.metaStale
+//             per the same contract).
+//   empty   — hydration settled and found nothing: "No output yet".
+// Callable by name from other fragments after they flip the contract
+// fields; a no-op once real entries exist.
+function renderSessionWindowLogPlaceholder(win) {
+  if (!win || !win.log) return;
+  const existing = win.log.querySelector('.session-window-empty');
+  // Real entries present: never stomp them (placeholder is gone already).
+  if (win.log.childElementCount > (existing ? 1 : 0)) return;
+  const sid = String(win.sessionId || '').trim();
+  const hydrating = (typeof sessionWindowRestoreIsInFlightFor === 'function'
+    && sid && sessionWindowRestoreIsInFlightFor(sid)) || !!win.metaStale;
+  const errorText = String(win.hydrateError || '').trim();
+  const stateSig = errorText ? `error:${errorText}` : hydrating ? 'loading' : 'empty';
+  if (existing && existing.dataset.phState === stateSig) return;
+
+  const box = document.createElement('div');
+  box.className = 'session-window-empty';
+  box.dataset.phState = stateSig;
+  if (errorText) {
+    box.classList.add('session-window-empty-error');
+    const line = document.createElement('span');
+    line.textContent = 'Transcript failed to load';
+    line.title = errorText;
+    box.appendChild(line);
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'session-window-empty-retry';
+    retry.textContent = 'Retry';
+    retry.title = errorText;
+    retry.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      win.hydrateError = '';
+      renderSessionWindowLogPlaceholder(win);
+      if (typeof hydrateSessionWindowIfEmpty === 'function' && sid) {
+        Promise.resolve(hydrateSessionWindowIfEmpty(sid))
+          .catch(() => {})
+          .finally(() => renderSessionWindowLogPlaceholder(win));
+      }
+    });
+    box.appendChild(retry);
+  } else if (hydrating) {
+    box.classList.add('session-window-empty-loading');
+    box.textContent = 'Loading transcript…';
+  } else {
+    box.textContent = 'No output yet';
+  }
+  if (existing) existing.replaceWith(box);
+  else win.log.appendChild(box);
+}
+
 function ensureSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
@@ -167,7 +226,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   title.appendChild(task);
   const status = document.createElement('span');
   status.className = 'session-window-status';
-  status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  status.textContent = sessionPhaseLabel(normalizeSessionPhase(meta.phase || 'idle'));
   const goal = document.createElement('span');
   goal.className = 'session-window-goal hidden';
   const goalText = document.createElement('span');
@@ -239,7 +298,6 @@ function ensureSessionWindow(sessionId, meta = {}) {
 
   const log = document.createElement('div');
   log.className = 'session-window-log';
-  log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
   const jumpBottom = document.createElement('button');
   jumpBottom.className = 'session-window-jump-bottom hidden';
   jumpBottom.type = 'button';
@@ -352,6 +410,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     headerCollapsed: startHeaderCollapsed,
   };
   sessionWindows.set(sid, win);
+  renderSessionWindowLogPlaceholder(win);
   updateSessionWindowHeaderCollapseState(sid);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
@@ -432,10 +491,12 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
       win.pendingActiveUntil = 0;
     }
-    win.status.textContent = win.phase;
+    win.status.textContent = sessionPhaseLabel(win.phase);
+    win.status.title = sessionPhaseLabel(win.phase);
     win.status.className = 'session-window-status';
     const cls = sessionPhaseClass(win.phase);
     if (cls) win.status.classList.add(cls);
+    maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
   }
   renderSessionWindowGoal(win, meta.goal || null);
   renderSessionWindowTier(win);
@@ -446,6 +507,12 @@ function updateSessionWindow(sessionId, meta = {}) {
   updateSessionRelationshipBadges(sid);
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
+  // Keep the empty-log placeholder truthful (loading / error / "No output
+  // yet") while no real entries have arrived — 39's hydration owner flips
+  // win.hydrateError / win.metaStale and metadata ticks land here.
+  if (win.log && win.log.firstElementChild?.classList?.contains('session-window-empty')) {
+    renderSessionWindowLogPlaceholder(win);
+  }
   persistSessionWindowState();
 }
 
@@ -605,8 +672,22 @@ function focusSessionWindow(sessionId) {
   updateTaskTargetChip();
   renderForegroundSessionUsage();
   renderContextPane();
-  if (win.phase) setPhase(win.phase);
-  hydrateSessionWindowIfEmpty(sid);
+  if (win.phase) {
+    // Focus-origin phase injection re-paints the banner from the clicked
+    // window; it is NOT wire truth and must not confirm an in-flight
+    // approval send (see maybeConfirmApprovalSendFromPhase).
+    _setPhaseFromWindowFocus = true;
+    try { setPhase(win.phase); } finally { _setPhaseFromWindowFocus = false; }
+  }
+  // Placeholder lifecycle around hydration: the in-flight flag is set in
+  // hydrate's first synchronous chunk, so the immediate repaint shows
+  // "Loading transcript…"; the settle repaint covers the zero-entry
+  // success (error/success-with-entries repaint via 39's contract calls).
+  const hydration = hydrateSessionWindowIfEmpty(sid);
+  renderSessionWindowLogPlaceholder(sessionWindows.get(sid));
+  Promise.resolve(hydration).catch(() => {}).finally(() => {
+    renderSessionWindowLogPlaceholder(sessionWindows.get(sid));
+  });
 }
 
 window.focusForegroundSessionWindow = function() {
@@ -2388,7 +2469,16 @@ function applyMainBackendStatus() {
   modelEl.textContent = '--';
 }
 
-function updateStatusBar(d) {
+// Autonomy source of truth for the cycling control: the last level the
+// DAEMON reported (status frames / autonomy_changed echoes), not whatever
+// text happens to sit in the DOM chip. cycleAutonomy (fragment 58) writes
+// optimistically with {optimisticAutonomy:true} and reverts to this value
+// if no echo confirms within its timeout.
+let lastConfirmedAutonomy = '';
+let autonomyPendingLevel = '';
+let autonomyRevertTimer = null;
+
+function updateStatusBar(d, opts = {}) {
   // Status events are session-scoped: only the explicitly focused session
   // may drive the session-scoped header chips (provider, model, turn,
   // context meter). Unscoped ticks (daemon primary) apply only while no
@@ -2419,6 +2509,17 @@ function updateStatusBar(d) {
     el.textContent = autonomy;
     const colors = { Low: 'var(--red)', Medium: 'var(--yellow)', High: 'var(--teal)', Full: 'var(--green)' };
     el.style.color = colors[autonomy] || 'var(--yellow)';
+    if (!opts.optimisticAutonomy) {
+      // Wire-driven: the daemon's word. Confirm (or overrule) any pending
+      // optimistic cycle — matching echo retires the revert timer; a
+      // different echo just painted the daemon's truth over the guess.
+      lastConfirmedAutonomy = autonomy;
+      if (autonomyPendingLevel === autonomy) autonomyPendingLevel = '';
+      if (autonomyRevertTimer && !autonomyPendingLevel) {
+        clearTimeout(autonomyRevertTimer);
+        autonomyRevertTimer = null;
+      }
+    }
   }
   if (d.session_id) {
     const sid = String(d.session_id || '').trim();
@@ -2488,6 +2589,33 @@ function normalizeAutonomyLabel(raw) {
   return 'Medium';
 }
 
+// Human labels for the phase vocabulary, shared by the phase banner and
+// the per-window status chips (keys are the collapsed "np" form: waiting_*
+// \u2192 waiting*, running_* \u2192 running*). Extracted from setPhase so the chips
+// stop rendering raw keys like `waiting_approval`.
+const PHASE_LABELS = {
+  idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
+  waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
+  waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
+  orchestrating: 'Orchestrating', done: 'Done',
+  interrupting: 'Interrupting...', interrupted: 'Interrupted',
+};
+
+// Collapse a phase key to the PHASE_LABELS lookup form.
+function phaseLabelKey(key) {
+  return isWaitingFollowUpPhase(key)
+    ? 'waitingfollowup'
+    : phaseKey(key).replace('waiting_', 'waiting').replace('running_', 'running');
+}
+
+// Label for any phase value; unknown phases humanize (underscores \u2192 spaces)
+// instead of leaking raw keys into the UI.
+function sessionPhaseLabel(phase) {
+  const key = phaseKey(phase);
+  const np = phaseLabelKey(key);
+  return PHASE_LABELS[np] || PHASE_LABELS[key] || key.replace(/_/g, ' ');
+}
+
 function setPhase(phase) {
   const key = phaseKey(phase);
   currentPhase = key;
@@ -2496,37 +2624,31 @@ function setPhase(phase) {
   const banner = document.getElementById('phase-banner');
   const text = document.getElementById('phase-text');
   banner.className = 'phase-banner';
-  const np = isWaitingFollowUpPhase(key)
-    ? 'waitingfollowup'
-    : key.replace('waiting_', 'waiting').replace('running_', 'running');
-  const labels = {
-    idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
-    waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
-    waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
-    orchestrating: 'Orchestrating', done: 'Done',
-    interrupting: 'Interrupting...', interrupted: 'Interrupted',
-  };
+  const np = phaseLabelKey(key);
   const cat = np.startsWith('waiting') ? 'waiting' : np.startsWith('running') ? 'running' :
     np === 'orchestrating' ? 'thinking' :
     np === 'interrupting' ? 'waiting' :
     np === 'interrupted' ? 'done' : np;
   banner.classList.add('phase-' + cat);
-  text.textContent = labels[np] || labels[key] || key;
+  text.textContent = PHASE_LABELS[np] || PHASE_LABELS[key] || key;
 
-  if (key === 'idle' || key === 'done' || key === 'interrupted') {
-    if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
-    const spinnerEl = document.getElementById('phase-spinner');
-    spinnerEl.textContent = key === 'done' ? '\u2713'
-      : key === 'interrupted' ? '\u25A0'
-      : '';
-  } else if (!spinnerInterval) {
-    const el = document.getElementById('phase-spinner');
-    spinnerInterval = setInterval(() => {
-      spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
-      el.textContent = SPINNER_FRAMES[spinnerIdx];
-    }, 80);
+  // The activity spinner is pure CSS (ui2-sessions.css keyframes stepping
+  // braille glyphs through ::after content) \u2014 no 80ms JS interval doing
+  // DOM writes. Terminal phases swap in a static glyph instead.
+  const spinnerEl = document.getElementById('phase-spinner');
+  if (spinnerEl) {
+    if (key === 'idle' || key === 'done' || key === 'interrupted') {
+      spinnerEl.classList.remove('phase-spinner-live');
+      spinnerEl.textContent = key === 'done' ? '\u2713'
+        : key === 'interrupted' ? '\u25A0'
+        : '';
+    } else {
+      spinnerEl.textContent = '';
+      spinnerEl.classList.add('phase-spinner-live');
+    }
   }
   updateStopButtonVisibility(key);
+  maybeConfirmApprovalSendFromPhase(key);
   // Flip the submit button between "Send" (start task / follow-up) and
   // "↗ Steer" (inject mid-turn) so the user sees which action will fire
   // on the next click. Interrupting is intentionally Send/queue, not Steer.
@@ -2567,12 +2689,202 @@ function _swapFavicon(href) {
   document.head.appendChild(link);
 }
 
+// ── Approval delivery tracking (fragment 58's sendApproval drives this) ──
+// sendApproval no longer clears the panel optimistically: the panel goes
+// into a disabled "Sending…" state and clears only on evidence the daemon
+// consumed the approval — the attention set dropping the item (fed by the
+// approval_resolved wire event in 57-attention-notifications.js), a phase
+// transition out of the waiting state, or an external panel clear
+// (hide_all_panels on task_complete/interrupted, another frontend's
+// resolution). A 5s timeout re-enables the buttons and warns instead.
+let approvalSendPending = null; // { id, sessionId, attnKey, timer, poll }
+// Approvals that arrived while one was on screen (item: they used to swap
+// silently). Shown in arrival order as the current one resolves.
+const approvalDisplayQueue = [];
+let approvalShowNextTimer = null;
+
+function setApprovalPanelSending(sending) {
+  const panel = document.getElementById('approval-panel');
+  if (!panel) return;
+  panel.classList.toggle('approval-sending', !!sending);
+  panel.querySelectorAll('.approval-actions button').forEach(btn => { btn.disabled = !!sending; });
+  let note = panel.querySelector('.approval-sending-note');
+  if (sending) {
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'approval-sending-note';
+      panel.querySelector('.approval-actions')?.insertAdjacentElement('afterend', note);
+    }
+    note.textContent = 'Sending…';
+  } else if (note) {
+    note.remove();
+  }
+}
+
+// The attention-center key for an approval, when the center tracks it
+// (read-only cross-fragment access at event time; both live in this page).
+function attentionApprovalKeyFor(id, sessionId) {
+  if (typeof attentionItems === 'undefined' || typeof attentionKey !== 'function') return null;
+  const withSession = attentionKey('approval', sessionId || '', id);
+  if (attentionItems.has(withSession)) return withSession;
+  const bare = attentionKey('approval', '', id);
+  if (attentionItems.has(bare)) return bare;
+  return null;
+}
+
+function approvalEventStreamLooksLive() {
+  // #sb-conn carries the primary event-lane state on both transports
+  // (ws + connect events). Used as a soft veto: a dead stream clears the
+  // attention set wholesale, which must not read as "approval resolved".
+  return document.getElementById('sb-conn')?.classList.contains('ok') === true;
+}
+
+function beginApprovalSend(id, sessionId) {
+  if (approvalSendPending) {
+    clearTimeout(approvalSendPending.timer);
+    if (approvalSendPending.poll) clearInterval(approvalSendPending.poll);
+  }
+  const pending = {
+    id: String(id),
+    sessionId: String(sessionId || ''),
+    attnKey: attentionApprovalKeyFor(id, sessionId),
+    timer: null,
+    poll: null,
+  };
+  pending.timer = setTimeout(() => {
+    // Identity check: a later send must never be killed by this timer.
+    if (approvalSendPending !== pending) return;
+    if (pending.poll) clearInterval(pending.poll);
+    approvalSendPending = null;
+    setApprovalPanelSending(false);
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'Approval may not have reached the daemon — retry');
+    }
+  }, 5000);
+  if (pending.attnKey) {
+    pending.poll = setInterval(() => {
+      if (!approvalSendPending || approvalSendPending !== pending) return;
+      if (!approvalEventStreamLooksLive()) return;
+      if (typeof attentionItems !== 'undefined' && !attentionItems.has(pending.attnKey)) {
+        confirmApprovalSendDelivered();
+      }
+    }, 250);
+  }
+  approvalSendPending = pending;
+  setApprovalPanelSending(true);
+}
+
+// Ack observed or moot: stop timers and restore the panel's idle state.
+function resolveApprovalSend() {
+  if (!approvalSendPending) return;
+  clearTimeout(approvalSendPending.timer);
+  if (approvalSendPending.poll) clearInterval(approvalSendPending.poll);
+  approvalSendPending = null;
+  setApprovalPanelSending(false);
+}
+
+function confirmApprovalSendDelivered() {
+  if (!approvalSendPending) return;
+  approvalSessionIds.delete(String(approvalSendPending.id));
+  resolveApprovalSend();
+  // hidePanel → clearPendingApproval → the queued-approval pump. No
+  // optimistic phase write here: the confirmation came from (or rides
+  // just ahead of) real phase traffic.
+  hidePanel('approval-panel');
+}
+
+// Any phase outside the waiting family means the loop moved on — the
+// pending approval was consumed (approve/deny/skip, here or elsewhere).
+function approvalPhaseMeansConsumed(phase) {
+  const k = phaseKey(phase);
+  return !!k && !k.startsWith('waiting');
+}
+
+// Global phase covers main-session (sessionless) approvals only — a
+// session-scoped send must not be confirmed by an unrelated window focus
+// flipping the global banner, and a focus-origin injection (the user
+// clicking a window mid-send) is not wire truth either.
+let _setPhaseFromWindowFocus = false;
+function maybeConfirmApprovalSendFromPhase(key) {
+  if (!approvalSendPending || approvalSendPending.sessionId) return;
+  if (_setPhaseFromWindowFocus) return;
+  if (approvalPhaseMeansConsumed(key)) confirmApprovalSendDelivered();
+}
+
+// Per-window phase covers session-scoped approvals (live status events
+// land in updateSessionWindow).
+function maybeConfirmApprovalSendFromWindowPhase(sid, phase) {
+  if (!approvalSendPending || !approvalSendPending.sessionId) return;
+  if (String(sid) !== approvalSendPending.sessionId) return;
+  if (approvalPhaseMeansConsumed(phase)) confirmApprovalSendDelivered();
+}
+
+// "1 of N" over the panel title while more approvals wait. N reads the
+// attention center's pending set (the approval_resolved-fed truth) with
+// the local queue as the floor.
+function updateApprovalPendingCount() {
+  const titleEl = document.querySelector('#approval-panel .approval-title');
+  if (!titleEl) return;
+  let badge = document.getElementById('approval-pending-count');
+  let count = 0;
+  if (typeof attentionItems !== 'undefined' && attentionItems && attentionItems.size) {
+    for (const item of attentionItems.values()) {
+      if (item && item.kind === 'approval') count += 1;
+    }
+  }
+  count = Math.max(count, 1 + approvalDisplayQueue.length);
+  if (count <= 1) {
+    if (badge) badge.remove();
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.id = 'approval-pending-count';
+    badge.className = 'approval-pending-count';
+    titleEl.appendChild(badge);
+  }
+  badge.textContent = `1 of ${count}`;
+  badge.title = `${count} approvals are waiting — this is the oldest; resolving it reveals the next.`;
+}
+
+// Show the next queued approval once the panel is free. Deferred a tick so
+// the clear that triggered it finishes first; entries the attention set no
+// longer tracks are dropped (resolved elsewhere / loop returned — a WS
+// flap re-delivers still-pending approvals as fresh events).
+function scheduleShowNextQueuedApproval() {
+  if (approvalShowNextTimer || !approvalDisplayQueue.length) return;
+  approvalShowNextTimer = setTimeout(() => {
+    approvalShowNextTimer = null;
+    if (pendingApprovalId !== null || approvalSendPending) return;
+    // Another bottom panel (question / human input / display request) owns
+    // the surface — keep the queue intact; hidePanel pumps again when it
+    // clears.
+    if (document.querySelector('.bottom-panel.visible')) return;
+    const next = approvalDisplayQueue.shift();
+    if (!next) return;
+    if (typeof attentionItems !== 'undefined' && typeof attentionKey === 'function') {
+      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id))
+        || attentionItems.has(attentionKey('approval', '', next.id));
+      if (!tracked) {
+        scheduleShowNextQueuedApproval();
+        return;
+      }
+    }
+    showApproval(next.id, next.command, next.category, next.sessionId);
+  }, 0);
+}
+
 function clearPendingApproval() {
   pendingApprovalId = null;
   pendingApprovalSessionId = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
   setApprovalIndicator(false);
+  // Any path that clears the pending approval while a send is in flight is
+  // resolution evidence (external hide, task_complete/interrupted panels
+  // sweep, another frontend) — retire the "Sending…" state with it.
+  resolveApprovalSend();
+  scheduleShowNextQueuedApproval();
 }
 
 function revealActivityLogPanel() {
@@ -2583,6 +2895,21 @@ function revealActivityLogPanel() {
 
 function showApproval(id, command, category, sessionId) {
   if (processingLogReplay) return;
+  // Concurrent approvals: keep the one on screen, queue the newcomer, and
+  // badge the count — a second approval used to silently replace the first.
+  if (pendingApprovalId !== null && String(pendingApprovalId) !== String(id)) {
+    const qid = String(id);
+    if (!approvalDisplayQueue.some(q => String(q.id) === qid)) {
+      approvalDisplayQueue.push({
+        id,
+        command,
+        category,
+        sessionId: sessionId || approvalSessionIds.get(qid) || '',
+      });
+    }
+    updateApprovalPendingCount();
+    return;
+  }
   hideAllPanels();
   pendingApprovalId = id;
   pendingApprovalSessionId =
@@ -2606,8 +2933,12 @@ function showApproval(id, command, category, sessionId) {
   };
   stationScheduleUpdate();
   revealActivityLogPanel();
+  // A re-show of the same approval (bootstrap replay) lands here with the
+  // sending state already retired by hideAllPanels — render actionable.
+  setApprovalPanelSending(false);
   document.getElementById('approval-panel').classList.add('visible');
   setApprovalIndicator(true);
+  updateApprovalPendingCount();
 }
 
 function showHumanInput(question) {
@@ -2783,6 +3114,9 @@ function hidePanel(id) {
     stationScheduleUpdate();
   }
   document.getElementById(id).classList.remove('visible');
+  // Any panel clearing frees the surface for a queued approval (the pump
+  // defers itself while another bottom panel is visible).
+  scheduleShowNextQueuedApproval();
 }
 function hideAllPanels() {
   clearPendingApproval();

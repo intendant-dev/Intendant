@@ -1355,7 +1355,7 @@ pub(crate) async fn serve_http_request(
             .into_string();
         use tokio::io::AsyncWriteExt;
         let _ = stream.write_all(response.as_bytes()).await;
-    } else if let Some(response) = dashboard_local_file_response(request_line) {
+    } else if let Some(response) = dashboard_local_file_response_blocking(request_line).await {
         use tokio::io::AsyncWriteExt;
         match response {
             DashboardLocalFileResponse::Html { status, body } => {
@@ -1412,6 +1412,7 @@ pub(crate) async fn serve_http_request(
             "/three.module.min.js",
             "/codemirror-bundle.js",
             "/codemirror-bundle.css",
+            "/tile-test-harness.js",
             "/audio-processor.js",
             "/xterm.min.js",
             "/xterm-addon-fit.min.js",
