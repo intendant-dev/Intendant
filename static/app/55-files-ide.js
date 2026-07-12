@@ -2435,6 +2435,7 @@ function renderNewSessionAgentControls(options = {}) {
   const select = document.getElementById('new-session-agent');
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
+  const codexModelInp = document.getElementById('new-session-codex-model');
   const sandboxSel = document.getElementById('new-session-codex-sandbox');
   const approvalSel = document.getElementById('new-session-codex-approval-policy');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
@@ -2495,6 +2496,11 @@ function renderNewSessionAgentControls(options = {}) {
   const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
   const claudeEffortSel = document.getElementById('new-session-claude-effort');
   const appliesToClaude = effectiveAgent === 'claude-code';
+  const appliesToCodex = effectiveAgent === 'codex';
+  if (codexModelInp) {
+    codexModelInp.disabled = !appliesToCodex;
+    if (!appliesToCodex) codexModelInp.value = '';
+  }
   if (claudeModelSel) {
     claudeModelSel.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeModelSel.value = '';
@@ -2513,27 +2519,22 @@ function renderNewSessionAgentControls(options = {}) {
     if (!appliesToClaude) claudeEffortSel.value = '';
   }
   if (managedContextSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
     managedContextSel.value = newSessionCodexManagedContext;
   }
   if (sandboxSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
     sandboxSel.disabled = !appliesToCodex;
     sandboxSel.value = normalizeCodexSandbox(newSessionCodexSandbox);
   }
   if (approvalSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
     approvalSel.disabled = !appliesToCodex;
     approvalSel.value = normalizeCodexApprovalPolicy(newSessionCodexApprovalPolicy);
   }
   if (contextArchiveSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
     contextArchiveSel.disabled = !appliesToCodex;
     contextArchiveSel.value = normalizeContextArchiveMode(newSessionCodexContextArchive);
   }
   if (fastToggle) {
-    const appliesToCodex = effectiveAgent === 'codex';
     fastToggle.disabled = !appliesToCodex;
     fastToggle.checked = appliesToCodex && !!newSessionCodexFastMode;
     if (fastWrap) {
@@ -2549,7 +2550,6 @@ function renderNewSessionAgentControls(options = {}) {
   }
   if (managedContextNote) {
     const mode = managedContextSel?.value || newSessionCodexManagedContext;
-    const appliesToCodex = effectiveAgent === 'codex';
     managedContextNote.classList.toggle('warn', appliesToCodex && mode === 'managed');
     managedContextNote.textContent = appliesToCodex && mode === 'managed'
       ? 'Managed requires a patched Codex binary with the managed app-server protocol.'
@@ -3059,6 +3059,8 @@ async function startNewSession() {
     if (effort) msg.claude_effort = effort;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
+    const model = document.getElementById('new-session-codex-model')?.value.trim() || '';
+    if (model) msg.codex_model = model;
     if (newSessionCodexLaunchDefaultsLoaded) {
       msg.codex_sandbox = normalizeCodexSandbox(
         document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox

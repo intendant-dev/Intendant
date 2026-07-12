@@ -1437,6 +1437,10 @@
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
+                      <label class="sessions-new-session-field" for="new-session-codex-model">
+                        Codex model
+                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="Global setting (e.g. gpt-5.5)" disabled>
+                      </label>
                       <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model
                         <select id="new-session-claude-model-select" onchange="onNewSessionClaudeModelSelectChange()" disabled>
@@ -1711,4 +1715,3 @@
       </div>
 
       <div class="subtab-panes">
-

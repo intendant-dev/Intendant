@@ -627,6 +627,13 @@ mod tests {
     }
 
     #[test]
+    fn new_session_codex_model_override_is_wired() {
+        assert!(APP_HTML.contains(r#"id="new-session-codex-model""#));
+        assert!(APP_HTML.contains("codexModelInp.disabled = !appliesToCodex;"));
+        assert!(APP_HTML.contains("if (model) msg.codex_model = model;"));
+    }
+
+    #[test]
     fn api_request_mentioning_asset_path_in_query_is_not_shadowed() {
         // Regression: the old `request_line.contains(...)` routing served
         // the station wasm for *any* request line containing its path —

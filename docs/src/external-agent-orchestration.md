@@ -794,8 +794,9 @@ shared state (when driven over MCP) → config default → native.
   root, and logs later `thread/settings/updated` cwd notifications so harness
   runs do not silently display a requested root as if Codex had accepted it.
 - **Per-session launch config beats global defaults.** Dashboard-created and
-  dashboard-configured external sessions persist their binary command and, for
-  Codex, `managed_context` mode. Both resume paths — daemon resume/attach and
+  dashboard-configured external sessions persist their binary command and
+  backend-specific launch fields, including a launch-time Codex model pin. Both
+  resume paths — daemon resume/attach and
   CLI `--resume` — rehydrate that persisted per-session config with the same
   precedence: explicit overrides (dashboard launch options or CLI flags), then
   the persisted per-session config, then the global Settings pane /

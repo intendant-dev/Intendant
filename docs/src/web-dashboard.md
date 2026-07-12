@@ -467,12 +467,14 @@ directory is safe to delete; it rebuilds on the next scan.
   banner explains why the internal agent can't start (external agents
   sign in with their own accounts and still work) and deep-links to
   Settings → API Keys — which applies immediately, no restart.
-  External Codex sessions can choose both the binary path and the
-  `managed_context` mode (`vanilla` or `managed`) for that session; the
-  external-agent options sit in a fold that opens when an external
-  backend is selected. Claude Code sessions get per-launch dropdowns for
-  the model (version-safe aliases — `fable`, `opus`, `sonnet`, `haiku` —
-  that the CLI resolves to the latest release, with a Custom-id escape
+  External Codex sessions can choose the binary path, an exact model id,
+  sandbox and approval policies, `managed_context` mode (`vanilla` or
+  `managed`), context replay mode, and Fast service tier for that session.
+  The free-text model field is intentionally account-agnostic; blank inherits
+  the global/Codex default. The external-agent options sit in a fold that opens
+  when an external backend is selected. Claude Code sessions get per-launch
+  dropdowns for the model (version-safe aliases — `fable`, `opus`, `sonnet`,
+  `haiku` — that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
   (`low` … `max`).
 
