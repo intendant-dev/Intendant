@@ -703,21 +703,10 @@ class DisplaySlot {
   }
 
   // Run `cb` once the <video> renders its first frame for THIS
-  // negotiation epoch. rVFC where available (fires per decoded frame),
-  // 'loadeddata' otherwise.
+  // negotiation epoch (shared cascade in 45-display-viewer-core; the
+  // epoch comparison is this class's staleness guard).
   _onFirstFrame(epoch, cb) {
-    const vid = this.videoEl;
-    const fire = () => {
-      if (epoch !== this._connectEpoch) return; // stale negotiation
-      cb();
-    };
-    if (typeof vid.requestVideoFrameCallback === 'function') {
-      vid.requestVideoFrameCallback(() => fire());
-    } else if (vid.readyState >= 2) {
-      fire();
-    } else {
-      vid.addEventListener('loadeddata', fire, { once: true });
-    }
+    displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
   }
 
   // User-facing recovery entry point (overlay Reconnect button, revived
@@ -812,40 +801,35 @@ class DisplaySlot {
         `[DisplaySlot ${this.displayId}] answer negotiated codec: ${negotiated}; ${simulcast}`
       );
     }
-    this.pc.setRemoteDescription({ type: 'answer', sdp }).then(() => {
-      this._answerApplied = true;
-      this.statusEl.textContent = `Answer applied, ICE: ${this.pc.iceConnectionState}, flushing ${this._pendingCandidates.length} candidates`;
-      // Flush any ICE candidates that arrived before the answer.
-      for (const c of this._pendingCandidates) {
-        this.pc.addIceCandidate(c).catch(() => {});
-      }
-      this._pendingCandidates = [];
-      // Answer accepted: the only thing left is media. Stage the copy
-      // and arm the no-video watchdog (cleared by the first frame).
-      if (!this._firstFrameSeen) {
-        this._setStageOverlay('progress', 'Waiting for first frame…');
-      }
-      this._armNoTrackWatchdog();
-    }).catch(err => {
-      this.statusEl.textContent = `Answer FAILED: ${err.message}`;
-      this.statusEl.className = 'display-status error';
-      this._setStageOverlay('error', 'Answer failed: ' + err.message, {
-        retryLabel: 'Reconnect',
-        onRetry: () => this.manualReconnect(),
-      });
-      console.error('Failed to set remote description:', err);
+    displayViewerApplyRemoteAnswer(this, sdp, {
+      beforeFlush: (count) => {
+        this.statusEl.textContent = `Answer applied, ICE: ${this.pc.iceConnectionState}, flushing ${count} candidates`;
+      },
+      afterFlush: () => {
+        // Answer accepted: the only thing left is media. Stage the copy
+        // and arm the no-video watchdog (cleared by the first frame).
+        if (!this._firstFrameSeen) {
+          this._setStageOverlay('progress', 'Waiting for first frame…');
+        }
+        this._armNoTrackWatchdog();
+      },
+      onError: (err) => {
+        this.statusEl.textContent = `Answer FAILED: ${err.message}`;
+        this.statusEl.className = 'display-status error';
+        this._setStageOverlay('error', 'Answer failed: ' + err.message, {
+          retryLabel: 'Reconnect',
+          onRetry: () => this.manualReconnect(),
+        });
+        console.error('Failed to set remote description:', err);
+      },
     });
   }
 
   handleIceCandidate(candidate) {
     if (!this.pc) return;
-    if (!this._answerApplied) {
-      // Queue until setRemoteDescription(answer) completes.
-      this._pendingCandidates.push(candidate);
-      return;
-    }
-    this.pc.addIceCandidate(candidate).catch(err => {
-      console.error('Failed to add ICE candidate:', err);
+    // Queue until setRemoteDescription(answer) completes (shared scaffold).
+    displayViewerIngestRemoteIceCandidate(this, candidate, {
+      onAddError: (err) => console.error('Failed to add ICE candidate:', err),
     });
   }
 

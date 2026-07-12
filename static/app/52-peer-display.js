@@ -794,19 +794,12 @@ class PeerDisplayConnection {
       if (!this._firstFrameSeen) {
         this._setStageOverlay('progress', 'Waiting for first frame…');
       }
-      const markFirstFrame = () => {
-        if (!this.pc) return; // closed before the first frame
+      // Shared first-frame cascade (45-display-viewer-core); `!this.pc`
+      // is this class's staleness guard — closed before the first frame.
+      displayViewerOnFirstFrame(videoEl, () => !this.pc, () => {
         this._firstFrameSeen = true;
         this._setStageOverlay(null);
-      };
-      if (videoEl && typeof videoEl.requestVideoFrameCallback === 'function') {
-        videoEl.requestVideoFrameCallback(() => markFirstFrame());
-      } else if (videoEl) {
-        if (videoEl.readyState >= 2) markFirstFrame();
-        else videoEl.addEventListener('loadeddata', markFirstFrame, { once: true });
-      } else {
-        markFirstFrame();
-      }
+      });
       if (videoEl) {
         stationRegisterVideoSource(
           `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
@@ -979,26 +972,22 @@ class PeerDisplayConnection {
       return;
     }
     this._log('info', `answer received (sdp_len=${sdp.length})`);
-    this.pc
-      .setRemoteDescription({ type: 'answer', sdp })
-      .then(() => {
-        this._answerApplied = true;
-        this._log('debug', `answer applied, flushing ${this._pendingCandidates.length} buffered ICE candidate(s)`);
-        for (const c of this._pendingCandidates) {
-          this.pc.addIceCandidate(c).catch(err =>
-            this._log('warn', `buffered addIceCandidate failed: ${err.message}`)
-          );
-        }
-        this._pendingCandidates = [];
+    displayViewerApplyRemoteAnswer(this, sdp, {
+      beforeFlush: (count) =>
+        this._log('debug', `answer applied, flushing ${count} buffered ICE candidate(s)`),
+      onFlushCandidateError: (err) =>
+        this._log('warn', `buffered addIceCandidate failed: ${err.message}`),
+      afterFlush: () => {
         if (!this._firstFrameSeen && !this.stream) {
           this._setStageOverlay('progress', 'Waiting for first frame…');
         }
-      })
-      .catch((err) => {
+      },
+      onError: (err) => {
         this._log('error', `setRemoteDescription(answer) failed: ${err.message}`);
         this.setStatus(`Answer failed: ${err.message}`, 'error');
         this._setStageOverlay('error', `Answer failed: ${err.message}`, true);
-      });
+      },
+    });
   }
 
   handleIceCandidate(candidateJson) {
@@ -1013,18 +1002,17 @@ class PeerDisplayConnection {
       this._log('warn', `remote ICE candidate JSON parse failed: ${err.message}`);
       return;
     }
-    if (this._answerApplied) {
-      this._log('debug', `remote ICE candidate: ${this._describeCandidate(candidate)}`);
-      this.pc.addIceCandidate(candidate).catch(err =>
-        this._log('warn', `addIceCandidate failed: ${err.message}`)
-      );
-    } else {
-      // Buffer candidates that arrive before the answer is applied.
-      // Mirrors the local display flow; the peer-side ICE forwarder
-      // can produce candidates as soon as handle_offer returns.
-      this._log('debug', `buffering remote ICE candidate (answer not yet applied): ${this._describeCandidate(candidate)}`);
-      this._pendingCandidates.push(candidate);
-    }
+    // Buffer candidates that arrive before the answer is applied (shared
+    // scaffold). Mirrors the local display flow; the peer-side ICE
+    // forwarder can produce candidates as soon as handle_offer returns.
+    displayViewerIngestRemoteIceCandidate(this, candidate, {
+      onQueued: (c) =>
+        this._log('debug', `buffering remote ICE candidate (answer not yet applied): ${this._describeCandidate(c)}`),
+      onAdd: (c) =>
+        this._log('debug', `remote ICE candidate: ${this._describeCandidate(c)}`),
+      onAddError: (err) =>
+        this._log('warn', `addIceCandidate failed: ${err.message}`),
+    });
   }
 
   async _handleTileWireMessage(label, event) {
@@ -1599,26 +1587,13 @@ class PeerDisplayConnection {
   // one shot. Mirrors the server-side `source: "webrtc-peer"` tag
   // so cross-side investigations match up by text.
   _log(level, message) {
-    const prefix = `[webrtc-peer ${this.hostId}]`;
-    const fn = level === 'error' ? console.error
-             : level === 'warn'  ? console.warn
-             : level === 'info'  ? console.info
-             :                     console.debug;
-    fn(`${prefix} ${message}`);
+    displayViewerScopedConsoleLog(`[webrtc-peer ${this.hostId}]`, level, message);
   }
 
-  // Internal: one-line summary of an RTCIceCandidate / candidate-JSON
-  // for logs. `candidate` is the SDP line and already carries
-  // address + port + protocol + type — extract and format so we
-  // don't dump the full JSON every tick.
+  // Internal: one-line ICE-candidate summary for logs (shared formatter
+  // in 45-display-viewer-core).
   _describeCandidate(cand) {
-    const s = cand && (cand.candidate || JSON.stringify(cand));
-    if (!s) return '(empty)';
-    // SDP candidate lines look like:
-    //   candidate:1 1 udp 2113937151 192.168.1.10 5000 typ host ...
-    const m = s.match(/candidate:\S+\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)\s+typ\s+(\S+)/);
-    if (m) return `${m[4]} ${m[1]} ${m[2]}:${m[3]}`;
-    return s;
+    return describePeerIceCandidateForLog(cand);
   }
 
   async close() {
@@ -1947,21 +1922,16 @@ class PeerFileTransferConnection {
   handleAnswer(sdp) {
     if (!this.pc) return;
     this._log('debug', 'answer received');
-    this.pc.setRemoteDescription({ type: 'answer', sdp: String(sdp || '') })
-      .then(() => {
-        this._answerApplied = true;
-        this._log('debug', `answer applied, flushing ${this._pendingCandidates.length} buffered ICE candidate(s)`);
-        for (const candidate of this._pendingCandidates) {
-          this.pc.addIceCandidate(candidate).catch((err) =>
-            this._log('warn', `buffered addIceCandidate failed: ${err.message}`)
-          );
-        }
-        this._pendingCandidates = [];
-      })
-      .catch((err) => {
+    displayViewerApplyRemoteAnswer(this, String(sdp || ''), {
+      beforeFlush: (count) =>
+        this._log('debug', `answer applied, flushing ${count} buffered ICE candidate(s)`),
+      onFlushCandidateError: (err) =>
+        this._log('warn', `buffered addIceCandidate failed: ${err.message}`),
+      onError: (err) => {
         this._readyReject?.(err);
         this._rejectAll(err);
-      });
+      },
+    });
   }
 
   handleIceCandidate(candidateJson) {
@@ -1973,15 +1943,14 @@ class PeerFileTransferConnection {
       this._log('warn', `remote ICE JSON parse failed: ${err.message}`);
       return;
     }
-    if (!this._answerApplied) {
-      this._log('debug', `buffering remote ICE candidate: ${this._describeCandidate(candidate)}`);
-      this._pendingCandidates.push(candidate);
-      return;
-    }
-    this._log('debug', `remote ICE candidate: ${this._describeCandidate(candidate)}`);
-    this.pc.addIceCandidate(candidate).catch((err) =>
-      this._log('warn', `addIceCandidate failed: ${err.message}`)
-    );
+    displayViewerIngestRemoteIceCandidate(this, candidate, {
+      onQueued: (c) =>
+        this._log('debug', `buffering remote ICE candidate: ${this._describeCandidate(c)}`),
+      onAdd: (c) =>
+        this._log('debug', `remote ICE candidate: ${this._describeCandidate(c)}`),
+      onAddError: (err) =>
+        this._log('warn', `addIceCandidate failed: ${err.message}`),
+    });
   }
 
   async readRange(path, offset, length, options = {}) {
@@ -2134,20 +2103,13 @@ class PeerFileTransferConnection {
   }
 
   _log(level, message) {
-    const prefix = `[peer-file-transfer ${this.hostId}/${this.sessionId}]`;
-    const fn = level === 'error' ? console.error
-      : level === 'warn' ? console.warn
-      : level === 'info' ? console.info
-      : console.debug;
-    fn(`${prefix} ${message}`);
+    displayViewerScopedConsoleLog(
+      `[peer-file-transfer ${this.hostId}/${this.sessionId}]`, level, message,
+    );
   }
 
   _describeCandidate(candidate) {
-    const s = candidate && (candidate.candidate || JSON.stringify(candidate));
-    if (!s) return '(empty)';
-    const m = s.match(/candidate:\S+\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)\s+typ\s+(\S+)/);
-    if (m) return `${m[4]} ${m[1]} ${m[2]}:${m[3]}`;
-    return s;
+    return describePeerIceCandidateForLog(candidate);
   }
 }
 

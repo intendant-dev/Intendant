@@ -97,3 +97,99 @@ function summarizeRtcStats(stats, prev) {
   const text = parts.length > 1 ? parts.join(' · ') : null;
   return { text, snapshot };
 }
+
+// ── Signaling scaffold (offer/answer + pending-ICE buffering) ───────────
+// The invariant all three WebRTC lanes (local display, peer display, peer
+// file transfer) share: remote ICE candidates that arrive before the
+// answer is applied are queued on `viewer._pendingCandidates`, and
+// `setRemoteDescription(answer)` flips `viewer._answerApplied` then
+// flushes the queue exactly once. Status text, log copy, and post-apply
+// staging are per-class UX and arrive through the hooks:
+//   beforeFlush(count)          — after the answer applies, before the queue
+//                                 flushes (local: status line with count;
+//                                 peer: debug log)
+//   onFlushCandidateError(err)  — per queued candidate addIceCandidate
+//                                 rejection (default: swallow, the local
+//                                 path's historical behavior)
+//   afterFlush()                — queue drained (overlay staging, watchdog)
+//   onError(err)                — setRemoteDescription rejected (or a hook
+//                                 above threw inside the .then chain —
+//                                 same coverage as the original per-class
+//                                 promise chains)
+function displayViewerApplyRemoteAnswer(viewer, sdp, hooks = {}) {
+  return viewer.pc.setRemoteDescription({ type: 'answer', sdp }).then(() => {
+    viewer._answerApplied = true;
+    if (hooks.beforeFlush) hooks.beforeFlush(viewer._pendingCandidates.length);
+    for (const c of viewer._pendingCandidates) {
+      viewer.pc.addIceCandidate(c).catch(hooks.onFlushCandidateError || (() => {}));
+    }
+    viewer._pendingCandidates = [];
+    if (hooks.afterFlush) hooks.afterFlush();
+  }).catch((err) => {
+    if (hooks.onError) hooks.onError(err);
+  });
+}
+
+// Queue-or-add for a remote ICE candidate (the receive half of the
+// scaffold). Hooks keep the per-class log copy byte-identical:
+//   onQueued(candidate) — about to buffer (answer not applied yet)
+//   onAdd(candidate)    — about to addIceCandidate on the live pc
+//   onAddError(err)     — addIceCandidate rejected
+function displayViewerIngestRemoteIceCandidate(viewer, candidate, hooks = {}) {
+  if (!viewer._answerApplied) {
+    if (hooks.onQueued) hooks.onQueued(candidate);
+    viewer._pendingCandidates.push(candidate);
+    return;
+  }
+  if (hooks.onAdd) hooks.onAdd(candidate);
+  viewer.pc.addIceCandidate(candidate).catch(hooks.onAddError || (() => {}));
+}
+
+// One-line summary of an RTCIceCandidate / candidate-JSON for logs.
+// `candidate` is the SDP line and already carries address + port +
+// protocol + type — extract and format so we don't dump the full JSON
+// every tick. (Was duplicated verbatim on PeerDisplayConnection and
+// PeerFileTransferConnection as `_describeCandidate`.)
+function describePeerIceCandidateForLog(cand) {
+  const s = cand && (cand.candidate || JSON.stringify(cand));
+  if (!s) return '(empty)';
+  // SDP candidate lines look like:
+  //   candidate:1 1 udp 2113937151 192.168.1.10 5000 typ host ...
+  const m = s.match(/candidate:\S+\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)\s+typ\s+(\S+)/);
+  if (m) return `${m[4]} ${m[1]} ${m[2]}:${m[3]}`;
+  return s;
+}
+
+// Scoped console logger shared by the peer-side `_log` methods: the
+// prefix (`[webrtc-peer <host>]`, `[peer-file-transfer <host>/<sid>]`)
+// keeps Safari Web Inspector filters one-shot per connection and matches
+// the server-side source tags for cross-side investigations.
+function displayViewerScopedConsoleLog(prefix, level, message) {
+  const fn = level === 'error' ? console.error
+           : level === 'warn'  ? console.warn
+           : level === 'info'  ? console.info
+           :                     console.debug;
+  fn(`${prefix} ${message}`);
+}
+
+// Run `cb` once the <video> renders its first frame. rVFC where available
+// (fires per decoded frame), 'loadeddata' otherwise; no element at all
+// fires immediately (the peer path's tile-only panes). `isStale` is the
+// connect-epoch guard: the local slot passes an epoch comparison so
+// callbacks from a previous RTCPeerConnection bail; the peer path passes
+// a `pc` liveness check (each retry is a whole fresh connection object,
+// so object identity is its epoch).
+function displayViewerOnFirstFrame(videoEl, isStale, cb) {
+  const fire = () => {
+    if (isStale && isStale()) return; // stale negotiation
+    cb();
+  };
+  if (videoEl && typeof videoEl.requestVideoFrameCallback === 'function') {
+    videoEl.requestVideoFrameCallback(() => fire());
+  } else if (videoEl) {
+    if (videoEl.readyState >= 2) fire();
+    else videoEl.addEventListener('loadeddata', fire, { once: true });
+  } else {
+    fire();
+  }
+}
