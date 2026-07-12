@@ -12,8 +12,12 @@ use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
 use crate::callbacks::Callbacks;
 
-/// Reconnect delay in milliseconds.
+/// Base reconnect delay in milliseconds.
 const RECONNECT_DELAY_MS: i32 = 3000;
+
+/// Random jitter (0..750 ms) added to each reconnect delay so a fleet of
+/// tabs that lost the same daemon doesn't reconnect in lockstep.
+const RECONNECT_JITTER_MS: f64 = 750.0;
 
 /// Server connection state.
 pub struct ServerConnection {
@@ -188,8 +192,10 @@ impl ServerConnection {
         let onclose = Closure::wrap(Box::new(move |_e: CloseEvent| {
             *connected_close.borrow_mut() = false;
             callbacks_close.invoke_server_state(false);
-            // Schedule reconnect
+            // Schedule reconnect (base delay + jitter against thundering herd)
             let url_rc = url_clone.clone();
+            let delay_ms =
+                RECONNECT_DELAY_MS + (js_sys::Math::random() * RECONNECT_JITTER_MS) as i32;
             let _ = web_sys::window().map(|w| {
                 // We can't call self.connect() from a closure, so we just
                 // signal the disconnection. The main module handles reconnect.
@@ -198,7 +204,7 @@ impl ServerConnection {
                         "if (window.__presenceWeb) window.__presenceWeb.reconnect_server('{}')",
                         url_rc.replace('\'', "\\'")
                     )),
-                    RECONNECT_DELAY_MS,
+                    delay_ms,
                 );
             });
         }) as Box<dyn FnMut(CloseEvent)>);
