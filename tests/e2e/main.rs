@@ -3109,6 +3109,131 @@ async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
     );
 }
 
+/// A steer WITHOUT an id delivered to a parked session must still start
+/// the next round (regression: nothing consumed SteerRequested for a
+/// parked session — the supervisor's queue-as-follow-up fallback only
+/// arms for id-carrying steers, and the round watcher dies with its
+/// round — so id-less steers, the API/MCP default, vanished silently;
+/// the parked drain now picks them up directly). Also covers the
+/// round-boundary acceptance race: a steer arriving as the round dies
+/// may be "accepted" by the doomed watcher, and the drain must deliver
+/// it anyway.
+#[tokio::test]
+async fn parked_session_delivers_an_id_less_steer() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Round one answer.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Steered onward.",
+                  "expect_transcript_contains": "quiet steer text",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the sibling tests.
+    let mut completed = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "run the first round",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        completed = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+        })
+        .await;
+        if completed.is_some() {
+            break;
+        }
+    }
+    let completed = completed.unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = completed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("round_complete carries its session id")
+        .to_string();
+
+    // The id-less steer (API/MCP default shape) to the parked session.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "text": "quiet steer text",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "id-less steered round never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    let _ = child.kill().await;
+
+    // The steer text entered the message lane with steer provenance.
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+    let steer_row = user_message_row(&messages, "quiet steer text");
+    assert_eq!(msg_field(steer_row, "provenance").as_str(), Some("steer"));
+}
+
 /// Message-lane wire contract, rollback half: the HEADLESS shape (task on
 /// argv) is the one execution shape whose outer loop (run_with_presence)
 /// handles `ConversationRollbackRequested`, so the round-rollback rail —

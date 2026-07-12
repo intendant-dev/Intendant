@@ -2597,6 +2597,66 @@ Proceed with explicit assumptions and continue without additional questions."
     Ok((loop_stats, exit_reason))
 }
 
+/// Claim (remove and return) pending user-steer injections targeted at
+/// this session, optionally narrowed to one steer id. The parked
+/// follow-up drain uses this to rescue steers a dying round's watcher
+/// accepted into `context_injection` — acceptance promised "the next
+/// model checkpoint", and when the round ends first, the parked drain IS
+/// that checkpoint (it starts the round that delivers them). Also the
+/// dedup for the acceptance race: a steer both claimed here and queued
+/// by the watcher's corpse must not deliver twice.
+fn claim_steer_injections(
+    context_injection: &event::ContextInjectionQueue,
+    local_session_id: &Option<String>,
+    steer_id: Option<&str>,
+) -> Vec<event::ContextInjection> {
+    let Ok(mut queue) = context_injection.lock() else {
+        return Vec::new();
+    };
+    let mut claimed = Vec::new();
+    let mut index = 0;
+    while index < queue.len() {
+        let injection = &queue[index];
+        let is_steer = injection.steer_id.is_some();
+        let targets_here = injection
+            .target_session_id
+            .as_deref()
+            .is_none_or(|target| Some(target) == local_session_id.as_deref());
+        let id_matches = steer_id.is_none_or(|want| {
+            injection
+                .steer_id
+                .as_deref()
+                .is_some_and(|have| have == want)
+        });
+        if is_steer && targets_here && id_matches {
+            claimed.push(queue.remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    claimed
+}
+
+/// The parked drain's exit when a steer reaches a between-rounds session:
+/// the synthesized next-round follow-up plus the acceptance the steer
+/// protocol expects (empty ids skip the ack — nothing correlates on "").
+fn steer_follow_up(
+    bus: &EventBus,
+    local_session_id: &Option<String>,
+    text: String,
+    steer_id: String,
+) -> FollowUpMessage {
+    if !steer_id.trim().is_empty() {
+        bus.send(AppEvent::SteerAccepted {
+            session_id: local_session_id.clone(),
+            id: steer_id.clone(),
+            reason: "Delivered to the parked session as the next round".to_string(),
+        });
+    }
+    FollowUpMessage::steer(text, UserAttachments::default(), steer_id)
+        .for_target(local_session_id.clone())
+}
+
 /// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
 /// between rounds. The session continues until the user closes the channel,
 /// budget is exhausted, safety cap is reached, or a non-recoverable exit occurs.
@@ -2687,62 +2747,127 @@ pub(crate) async fn run_round_loop(
                     native_message_count,
                 });
 
-                // Wait for follow-up message, while accepting queued
-                // cancellation requests before the next turn consumes them.
-                let Some(message) = (loop {
-                    while let Ok(AppEvent::FollowUpCancelRequested {
-                        session_id,
-                        id,
-                        reason,
-                    }) = follow_up_cancel_rx.try_recv()
-                    {
-                        if event_targets_session(&session_id, &local_session_id) {
-                            record_cancelled_follow_up_id(
-                                &mut cancelled_follow_ups,
-                                bus,
-                                local_session_id.as_deref(),
-                                id,
-                                &reason,
-                            );
+                // Parked-steer pickup, half 1 (see claim_steer_injections):
+                // a steer accepted by the dying round's watcher sits in
+                // `context_injection` with no next checkpoint — deliver it
+                // as the next round now. The fresh subscription below is
+                // created BEFORE the sweep so a steer cannot land between
+                // sweep and subscribe: it is either already in the queue
+                // (the sweep finds it) or observable on the subscription
+                // (the select arm finds it). It must be fresh — the
+                // round-long `follow_up_cancel_rx` backlog replays
+                // mid-round SteerRequested events the live watcher already
+                // handled.
+                let mut parked_steer_rx = bus.subscribe();
+                let mut orphaned =
+                    claim_steer_injections(context_injection, &local_session_id, None);
+                // One steer round per drain pass: deliver the first, put
+                // the rest back for the next pass (each delivery loops
+                // back through this drain).
+                if orphaned.len() > 1 {
+                    if let Ok(mut queue) = context_injection.lock() {
+                        for injection in orphaned.drain(1..).rev() {
+                            queue.insert(0, injection);
                         }
                     }
-                    tokio::select! {
-                        biased;
-                        bus_event = follow_up_cancel_rx.recv() => {
-                            match bus_event {
-                                Ok(AppEvent::FollowUpCancelRequested { session_id, id, reason })
-                                    if event_targets_session(&session_id, &local_session_id) =>
-                                {
-                                    record_cancelled_follow_up_id(
-                                        &mut cancelled_follow_ups,
-                                        bus,
-                                        local_session_id.as_deref(),
-                                        id,
-                                        &reason,
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+
+                // Wait for follow-up message, while accepting queued
+                // cancellation requests before the next turn consumes them.
+                let Some(message) = (if let Some(injection) = orphaned.into_iter().next() {
+                    let steer_id = injection.steer_id.clone().unwrap_or_default();
+                    Some(steer_follow_up(
+                        bus,
+                        &local_session_id,
+                        injection.text,
+                        steer_id,
+                    ))
+                } else {
+                    loop {
+                        while let Ok(AppEvent::FollowUpCancelRequested {
+                            session_id,
+                            id,
+                            reason,
+                        }) = follow_up_cancel_rx.try_recv()
+                        {
+                            if event_targets_session(&session_id, &local_session_id) {
+                                record_cancelled_follow_up_id(
+                                    &mut cancelled_follow_ups,
+                                    bus,
+                                    local_session_id.as_deref(),
+                                    id,
+                                    &reason,
+                                );
                             }
                         }
-                        maybe_message = follow_up_rx.recv() => {
-                            match maybe_message {
-                                Some(message) => {
-                                    if follow_up_message_was_cancelled(
-                                        &mut cancelled_follow_ups,
-                                        &message,
-                                    ) {
-                                        slog(&session_log, |l| {
-                                            l.info("Skipped cancelled queued follow-up")
-                                        });
-                                        continue;
+                        tokio::select! {
+                            biased;
+                            bus_event = follow_up_cancel_rx.recv() => {
+                                match bus_event {
+                                    Ok(AppEvent::FollowUpCancelRequested { session_id, id, reason })
+                                        if event_targets_session(&session_id, &local_session_id) =>
+                                    {
+                                        record_cancelled_follow_up_id(
+                                            &mut cancelled_follow_ups,
+                                            bus,
+                                            local_session_id.as_deref(),
+                                            id,
+                                            &reason,
+                                        );
                                     }
-                                    break Some(message);
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                                 }
-                                None => {
-                                    // Channel closed — user quit or sender dropped
-                                    break None;
+                            }
+                            steer_event = parked_steer_rx.recv() => {
+                                match steer_event {
+                                    Ok(AppEvent::SteerRequested { session_id, text, id })
+                                        if event_targets_session(&session_id, &local_session_id) =>
+                                    {
+                                        // Parked-steer pickup, half 2: this
+                                        // drain is the steer's checkpoint.
+                                        // Claim any same-id injection the
+                                        // dying watcher's corpse pushed so it
+                                        // cannot deliver a second time at the
+                                        // next round's turn-top drain.
+                                        if !id.trim().is_empty() {
+                                            let _ = claim_steer_injections(
+                                                context_injection,
+                                                &local_session_id,
+                                                Some(id.as_str()),
+                                            );
+                                        }
+                                        break Some(steer_follow_up(
+                                            bus,
+                                            &local_session_id,
+                                            text,
+                                            id,
+                                        ));
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                                }
+                            }
+                            maybe_message = follow_up_rx.recv() => {
+                                match maybe_message {
+                                    Some(message) => {
+                                        if follow_up_message_was_cancelled(
+                                            &mut cancelled_follow_ups,
+                                            &message,
+                                        ) {
+                                            slog(&session_log, |l| {
+                                                l.info("Skipped cancelled queued follow-up")
+                                            });
+                                            continue;
+                                        }
+                                        break Some(message);
+                                    }
+                                    None => {
+                                        // Channel closed — user quit or sender dropped
+                                        break None;
+                                    }
                                 }
                             }
                         }
@@ -2765,6 +2890,17 @@ pub(crate) async fn run_round_loop(
                         }
                     ))
                 });
+                // Acceptance-race dedup: if the dying watcher's corpse
+                // pushed this steer's injection AFTER the drain arm looked,
+                // claim it now — the text is about to enter the
+                // conversation through this follow-up.
+                if let Some(id) = message
+                    .steer_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    let _ = claim_steer_injections(context_injection, &local_session_id, Some(id));
+                }
                 // A between-rounds steer is delivered through this path
                 // (steer_id set); classify it as such rather than follow_up.
                 let followup_provenance = if message.steer_id.is_some() {
