@@ -1194,6 +1194,7 @@ pub(crate) async fn run_cu_task(
     // Inject reference frames
     if !reference_images.is_empty() {
         conv.add_user_with_images(
+            MessageProvenance::SystemInjection,
             "The user was looking at this screen when they made their request:".to_string(),
             reference_images,
         );
@@ -1204,12 +1205,16 @@ pub(crate) async fn run_cu_task(
 
     // Inject context images
     if !context_images.is_empty() {
-        conv.add_user_with_images("Additional context:".to_string(), context_images);
+        conv.add_user_with_images(
+            MessageProvenance::SystemInjection,
+            "Additional context:".to_string(),
+            context_images,
+        );
         conv.add_assistant("Noted.".to_string());
     }
 
     // Add the task
-    conv.add_user(task.to_string());
+    conv.add_user(MessageProvenance::Task, task.to_string());
 
     slog(session_log, |l| {
         l.cu_task_start(

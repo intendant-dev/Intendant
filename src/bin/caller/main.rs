@@ -123,7 +123,7 @@ mod display_glue;
 pub(crate) use display_glue::*;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
-use conversation::Conversation;
+use conversation::{Conversation, MessageProvenance};
 use error::CallerError;
 use event::{AppEvent, ControlMsg, EventBus};
 use project::Project;
@@ -1522,11 +1522,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_drop_turns() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"drop_turns":[1,2]}}"#;
@@ -1544,11 +1544,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_summarize() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"summarize":{"turns":[1,2,3,4],"summary":"Setup phase"}}}"#;
@@ -1563,11 +1563,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_context_only() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[],"context":{"drop_turns":[1,2]}}"#;
@@ -1579,7 +1579,7 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_no_context() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
@@ -1592,7 +1592,7 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_empty_commands_no_context() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
 
         let json = r#"{"commands":[]}"#;
@@ -2692,18 +2692,21 @@ Also: {"source": "bare"}"#;
 /// Used by both `setup_fresh_conversation` and the persistent presence conversation.
 fn setup_fresh_conversation_no_task(conv: &mut Conversation, project: &Project) {
     // Inject project root so the model knows which directory to work in
-    conv.add_user(format!(
-        "Working directory: {}\nThis is the project you should examine and modify. \
+    conv.add_user(
+        MessageProvenance::SystemInjection,
+        format!(
+            "Working directory: {}\nThis is the project you should examine and modify. \
 All relative paths and commands execute from this directory.",
-        project.root.display()
-    ));
+            project.root.display()
+        ),
+    );
     conv.add_assistant(
         "Understood. I will work within the specified project directory.".to_string(),
     );
 
     // Inject INTENDANT.md instructions
     if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
-        conv.add_user(instructions);
+        conv.add_user(MessageProvenance::SystemInjection, instructions);
         conv.add_assistant("Acknowledged. I will follow the project instructions.".to_string());
     }
 
@@ -2713,7 +2716,7 @@ All relative paths and commands execute from this directory.",
             let refs: Vec<&_> = kstore.entries.iter().collect();
             let msg = knowledge::format_for_injection(&refs);
             if !msg.is_empty() {
-                conv.add_user(msg);
+                conv.add_user(MessageProvenance::SystemInjection, msg);
                 conv.add_assistant(
                     "Acknowledged. I have loaded the project knowledge.".to_string(),
                 );
@@ -2725,7 +2728,7 @@ All relative paths and commands execute from this directory.",
     let discovered_skills = skills::discover_skills(Some(&project.root));
     if !discovered_skills.is_empty() {
         let catalog = skills::format_skill_catalog(&discovered_skills);
-        conv.add_user(catalog);
+        conv.add_user(MessageProvenance::SystemInjection, catalog);
         conv.add_assistant("Acknowledged. I see the available skills.".to_string());
     }
 }
@@ -2734,7 +2737,7 @@ All relative paths and commands execute from this directory.",
 #[allow(dead_code)]
 fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
     setup_fresh_conversation_no_task(conv, project);
-    conv.add_user(task.to_string());
+    conv.add_user(MessageProvenance::Task, task.to_string());
 }
 
 /// Set up a fresh conversation with project context, memory, skills, task, and
@@ -2748,9 +2751,9 @@ fn setup_fresh_conversation_with_attachments(
 ) {
     setup_fresh_conversation_no_task(conv, project);
     if images.is_empty() {
-        conv.add_user(task.to_string());
+        conv.add_user(MessageProvenance::Task, task.to_string());
     } else {
-        conv.add_user_with_images(task.to_string(), images);
+        conv.add_user_with_images(MessageProvenance::Task, task.to_string(), images);
     }
 }
 

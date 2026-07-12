@@ -1,4 +1,4 @@
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, MessageProvenance};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::knowledge::{self, KnowledgeQuery};
@@ -190,7 +190,8 @@ impl PresenceLayer {
             return Ok(String::new());
         }
         self.turn += 1;
-        self.conversation.add_user(input.to_string());
+        self.conversation
+            .add_user(MessageProvenance::FollowUp, input.to_string());
         let result = self.run_model_loop().await;
         self.emit_usage_update();
         result
@@ -253,8 +254,10 @@ impl PresenceLayer {
         }
         self.turn += 1;
         let event_text = format_event(&event);
-        self.conversation
-            .add_user(format!("[Event] {}", event_text));
+        self.conversation.add_user(
+            MessageProvenance::SystemInjection,
+            format!("[Event] {}", event_text),
+        );
         let response = self.run_model_loop().await?;
         if response.trim().is_empty() {
             Ok(None)

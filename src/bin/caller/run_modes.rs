@@ -2723,12 +2723,15 @@ pub(crate) async fn run_with_presence(
 
                 // Frame directory awareness
                 let frames_dir = log_dir.join("frames");
-                conv.add_user(format!(
-                    "[System] Video frames from the user's camera are stored at: {}\n\
+                conv.add_user(
+                    MessageProvenance::SystemInjection,
+                    format!(
+                        "[System] Video frames from the user's camera are stored at: {}\n\
                      Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
                      When you receive frame references, you can read them from this path.",
-                    frames_dir.display()
-                ));
+                        frames_dir.display()
+                    ),
+                );
                 conv.add_assistant("Understood.".to_string());
 
                 // Add task with optional frame images. Combine context-hint
@@ -2738,9 +2741,13 @@ pub(crate) async fn run_with_presence(
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
                 if combined_images.is_empty() {
-                    conv.add_user(task_text.clone());
+                    conv.add_user(MessageProvenance::Task, task_text.clone());
                 } else {
-                    conv.add_user_with_images(task_text.clone(), combined_images);
+                    conv.add_user_with_images(
+                        MessageProvenance::Task,
+                        task_text.clone(),
+                        combined_images,
+                    );
                 }
 
                 persistent_project = Some(proj);
@@ -2765,9 +2772,16 @@ pub(crate) async fn run_with_presence(
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
                 if combined_images.is_empty() {
-                    conv.add_user(format!("[New Task] {}", task_text));
+                    conv.add_user(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                    );
                 } else {
-                    conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
+                    conv.add_user_with_images(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                        combined_images,
+                    );
                 }
             }
 
@@ -2976,9 +2990,13 @@ pub(crate) async fn run_direct_mode(
                 let resume_msg = attachments
                     .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
                 if attachment_images.is_empty() {
-                    conv.add_user(resume_msg);
+                    conv.add_user(MessageProvenance::ResumeTask, resume_msg);
                 } else {
-                    conv.add_user_with_images(resume_msg, attachment_images.clone());
+                    conv.add_user_with_images(
+                        MessageProvenance::ResumeTask,
+                        resume_msg,
+                        attachment_images.clone(),
+                    );
                 }
                 conv
             }
@@ -3019,7 +3037,7 @@ pub(crate) async fn run_direct_mode(
             let refs: Vec<&_> = kstore.entries.iter().collect();
             let msg = knowledge::format_for_injection(&refs);
             if !msg.is_empty() {
-                conversation.add_user(msg);
+                conversation.add_user(MessageProvenance::SystemInjection, msg);
                 conversation.add_assistant(
                     "Acknowledged. I have loaded the project knowledge.".to_string(),
                 );

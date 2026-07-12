@@ -5,6 +5,7 @@
 //! submit_result).
 
 use crate::conversation;
+use crate::conversation::MessageProvenance;
 use crate::external_agent;
 use crate::provider;
 use crate::{ExternalToolFailureLogLimiter, ExternalToolOutputLimiter};
@@ -975,16 +976,16 @@ pub(crate) async fn run_agent_loop(
         // always used.
         if let Ok(mut q) = context_injection.lock() {
             for inj in q.drain(..) {
-                let prefix = if inj.steer_id.is_some() {
-                    "User"
+                let (prefix, provenance) = if inj.steer_id.is_some() {
+                    ("User", MessageProvenance::Steer)
                 } else {
-                    "System"
+                    ("System", MessageProvenance::SystemInjection)
                 };
                 let text = format!("[{}] {}", prefix, inj.text);
                 if inj.images.is_empty() {
-                    conversation.add_user(text.clone());
+                    conversation.add_user(provenance, text.clone());
                 } else {
-                    conversation.add_user_with_images(text.clone(), inj.images);
+                    conversation.add_user_with_images(provenance, text.clone(), inj.images);
                 }
                 slog(&session_log, |l| {
                     l.info(&format!("Context injected: {}", inj.text))
@@ -2126,7 +2127,10 @@ pub(crate) async fn run_agent_loop(
                         l.debug(&format!("Turn {}: context management only", turn))
                     });
                     bus.send(AppEvent::ContextManagement { turn });
-                    conversation.add_user("Context updated.".to_string());
+                    conversation.add_user(
+                        MessageProvenance::SystemInjection,
+                        "Context updated.".to_string(),
+                    );
                     continue;
                 } else {
                     empty_command_streak += 1;
@@ -2153,6 +2157,7 @@ pub(crate) async fn run_agent_loop(
                         )
                     });
                     conversation.add_user(
+                        MessageProvenance::SystemInjection,
                         "No commands were produced. If the task is complete, respond with JSON containing done=true. Otherwise provide commands.".to_string(),
                     );
                     continue;
@@ -2169,6 +2174,7 @@ pub(crate) async fn run_agent_loop(
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
                 conversation.add_user(
+                    MessageProvenance::SystemInjection,
                     "askHuman is unavailable in headless mode (--no-tui or non-interactive stdin). \
 Proceed with explicit assumptions and continue without additional questions."
                         .to_string(),
@@ -2212,13 +2218,17 @@ Proceed with explicit assumptions and continue without additional questions."
                 };
                 if answer.trim().is_empty() {
                     conversation.add_user(
+                        MessageProvenance::SystemInjection,
                         "The user dismissed the question without answering. Proceed with \
                          your best judgment; you can re-ask later if it is still relevant."
                             .to_string(),
                     );
                 } else {
                     slog(&session_log, |l| l.human_response_sent());
-                    conversation.add_user(format!("The user's answer to your question: {answer}"));
+                    conversation.add_user(
+                        MessageProvenance::AskHumanAnswer,
+                        format!("The user's answer to your question: {answer}"),
+                    );
                 }
                 continue;
             }
@@ -2459,7 +2469,10 @@ Proceed with explicit assumptions and continue without additional questions."
             }
 
             if should_skip {
-                conversation.add_user("Command skipped by user.".to_string());
+                conversation.add_user(
+                    MessageProvenance::SystemInjection,
+                    "Command skipped by user.".to_string(),
+                );
                 continue;
             }
 
@@ -2503,7 +2516,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
             }
             user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
-            conversation.add_user(user_msg);
+            conversation.add_user(MessageProvenance::ToolOutput, user_msg);
         } // end tool_calls vs text branch
 
         // Auto-save conversation for resume capability
@@ -2696,9 +2709,13 @@ pub(crate) async fn run_round_loop(
                     ))
                 });
                 if followup_images.is_empty() {
-                    conversation.add_user(followup_text);
+                    conversation.add_user(MessageProvenance::FollowUp, followup_text);
                 } else {
-                    conversation.add_user_with_images(followup_text, followup_images);
+                    conversation.add_user_with_images(
+                        MessageProvenance::FollowUp,
+                        followup_text,
+                        followup_images,
+                    );
                 }
                 if let Some(id) = message.steer_id {
                     bus.send(AppEvent::SteerDelivered {
