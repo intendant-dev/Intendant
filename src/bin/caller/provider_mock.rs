@@ -83,6 +83,12 @@ struct MockStep {
     /// limit gauges keyless.
     #[serde(default)]
     limit_used_pct: Option<u8>,
+    /// Scripted think-time before this step answers. E2e rigs use it to
+    /// hold a boot-started task's first step until their dashboard
+    /// connection is up — nothing replays missed rail events (e.g.
+    /// `user_question`) to late-joining websockets.
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,42 +174,53 @@ impl ChatProvider for MockProvider {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let mut cursor = self.cursor.lock().expect("mock cursor poisoned");
-        let (profile_index, step_index) = match *cursor {
-            Some(state) => state,
-            None => {
-                let profile = self.select_profile(&transcript).ok_or_else(|| {
-                    CallerError::Config(
-                        "mock script has no profile matching this conversation and no \
-                         fallback profile (empty match)"
-                            .to_string(),
-                    )
-                })?;
-                (profile, 0)
-            }
-        };
+        // The guard protects only the cursor, and it must not live across
+        // the think-time await below — scope it (async-Send analysis does
+        // not credit an explicit drop).
+        let (profile_index, step_index) = {
+            let mut cursor = self.cursor.lock().expect("mock cursor poisoned");
+            let (profile_index, step_index) = match *cursor {
+                Some(state) => state,
+                None => {
+                    let profile = self.select_profile(&transcript).ok_or_else(|| {
+                        CallerError::Config(
+                            "mock script has no profile matching this conversation and no \
+                             fallback profile (empty match)"
+                                .to_string(),
+                        )
+                    })?;
+                    (profile, 0)
+                }
+            };
 
-        let profile = &self.script.profiles[profile_index];
-        let Some(step) = profile.steps.get(step_index) else {
-            return Err(CallerError::Config(format!(
-                "mock script exhausted: profile {profile_index} (match {:?}) has only {} steps \
-                 but the loop asked for step {} — scripts must end in signal_done/submit_result",
-                profile.match_text,
-                profile.steps.len(),
-                step_index + 1,
-            )));
-        };
-
-        if let Some(expected) = &step.expect_transcript_contains {
-            if !transcript.contains(expected) {
+            let profile = &self.script.profiles[profile_index];
+            let Some(step) = profile.steps.get(step_index) else {
                 return Err(CallerError::Config(format!(
-                    "mock expectation failed at profile {profile_index} step {step_index}: \
-                     transcript does not contain {expected:?}"
+                    "mock script exhausted: profile {profile_index} (match {:?}) has only {} steps \
+                     but the loop asked for step {} — scripts must end in signal_done/submit_result",
+                    profile.match_text,
+                    profile.steps.len(),
+                    step_index + 1,
                 )));
-            }
-        }
+            };
 
-        *cursor = Some((profile_index, step_index + 1));
+            if let Some(expected) = &step.expect_transcript_contains {
+                if !transcript.contains(expected) {
+                    return Err(CallerError::Config(format!(
+                        "mock expectation failed at profile {profile_index} step {step_index}: \
+                         transcript does not contain {expected:?}"
+                    )));
+                }
+            }
+
+            *cursor = Some((profile_index, step_index + 1));
+            (profile_index, step_index)
+        };
+        let profile = &self.script.profiles[profile_index];
+        let step = &profile.steps[step_index];
+        if step.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(step.delay_ms)).await;
+        }
 
         // Plausible non-zero usage so budget and usage accounting run.
         // Cache counters emulate a warm prompt cache (first request writes,

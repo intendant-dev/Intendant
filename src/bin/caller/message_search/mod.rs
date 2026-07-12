@@ -21,10 +21,12 @@
 
 mod cursor;
 mod extract_codex;
+mod extract_intendant;
 mod record;
 mod store;
 
 pub(crate) use cursor::{read_complete_lines_from, CursorCheck, SourceCursor};
+pub(crate) use extract_intendant::{extract_intendant_session, IntendantExtraction};
 pub(crate) use record::{
     cap_text, derive_active, Locator, MessageRecord, Role, Source, SupersessionMark,
     MESSAGE_TEXT_CAP_BYTES, PARSER_VERSION,
