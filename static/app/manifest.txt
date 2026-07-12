@@ -71,6 +71,7 @@ ui2-activity.js
 46-recording-replay.js
 47-annotation-clips.js
 48-router-settings.js
+48b-context-viz.js
 49-daemons-multihost.js
 
 50-control-transport.js
