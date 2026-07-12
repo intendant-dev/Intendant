@@ -1707,20 +1707,144 @@ pub(crate) fn fleet_access_origin_allowed(
             }
         }
     }
-    if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
-        let now_unix = crate::access::client_key::now_unix_ms() / 1000;
-        for identity in identities {
-            if !identity.is_active(now_unix) {
-                continue;
-            }
-            if let Some(card_url) = identity.card_url.as_deref() {
-                if normalized_origin(card_url).as_deref() == Some(&normalized) {
-                    return true;
-                }
-            }
+    let now_unix = crate::access::client_key::now_unix_ms() / 1000;
+    for identity_origin in fleet_identity_origins(cert_dir).iter() {
+        // Expiry stays a per-request check (the record's approval status
+        // is baked into the cached set — the fingerprint catches status
+        // rewrites — but time passes without touching the files).
+        let unexpired = identity_origin
+            .expires_at_unix
+            .map(|expires| expires > now_unix)
+            .unwrap_or(true);
+        if unexpired && identity_origin.origin == normalized {
+            return true;
         }
     }
     false
+}
+
+/// One approved peer identity's contribution to the fleet-CORS origin
+/// allowlist: its card URL's normalized origin, plus the expiry the
+/// per-request check still evaluates against "now".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FleetIdentityOrigin {
+    origin: String,
+    expires_at_unix: Option<i64>,
+}
+
+struct FleetIdentityOriginsCacheEntry {
+    fingerprint: String,
+    origins: Arc<Vec<FleetIdentityOrigin>>,
+}
+
+fn fleet_identity_origins_cache() -> &'static Mutex<HashMap<PathBuf, FleetIdentityOriginsCacheEntry>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, FleetIdentityOriginsCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Static fallback for `access_policy`'s private `POLICY_DIR`. The
+/// `fleet_origin_cache_tracks_identity_writes` test pins this mirror by
+/// driving the real identity writers and asserting the cached gate
+/// follows — a moved store fails the suite instead of shipping as a
+/// permanently-stale fingerprint.
+const PEER_IDENTITIES_DIR_NAME: &str = "peer-access-identities";
+
+/// Stat-level fingerprint of the peer-identities store: the dir's own
+/// mtime plus every record's (name, len, mtime). Approvals add files (dir
+/// mtime + entry set move), revocations rewrite a record IN PLACE (only
+/// that file's len/mtime moves — the dir mtime does not), so the
+/// per-file stats are load-bearing for prompt revocation, not a nicety.
+fn peer_identities_fingerprint(cert_dir: &std::path::Path) -> String {
+    let dir = cert_dir.join(PEER_IDENTITIES_DIR_NAME);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return "missing".to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let (len, mtime_nanos) = entry
+            .metadata()
+            .map(|metadata| {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                (metadata.len(), mtime)
+            })
+            .unwrap_or((0, 0));
+        parts.push(format!("{name}\0{len}\0{mtime_nanos}"));
+    }
+    parts.sort();
+    let dir_mtime = std::fs::metadata(&dir)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{dir_mtime}\x1f{}", parts.join("\x1f"))
+}
+
+/// The derived fleet-CORS origin set, cached against the identity store's
+/// stat fingerprint. Before this cache the gate re-read and re-parsed
+/// every peer-identity record from disk on each API request AND each
+/// OPTIONS preflight; now an unchanged store costs one readdir + stats.
+pub(crate) fn fleet_identity_origins(cert_dir: &std::path::Path) -> Arc<Vec<FleetIdentityOrigin>> {
+    let fingerprint = peer_identities_fingerprint(cert_dir);
+    {
+        let cache = fleet_identity_origins_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache
+            .get(cert_dir)
+            .filter(|entry| entry.fingerprint == fingerprint)
+        {
+            return entry.origins.clone();
+        }
+    }
+    let mut origins = Vec::new();
+    if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
+        for identity in identities {
+            // Approved-only, like `is_active` — but expiry is evaluated
+            // by the caller at request time, so an identity crossing its
+            // expiry needs no file change to stop authenticating.
+            if !matches!(
+                identity.status,
+                crate::peer::access_policy::PeerIdentityStatus::Approved
+            ) {
+                continue;
+            }
+            let Some(origin) = identity.card_url.as_deref().and_then(normalized_origin) else {
+                continue;
+            };
+            origins.push(FleetIdentityOrigin {
+                origin,
+                expires_at_unix: identity.expires_at_unix,
+            });
+        }
+    }
+    let origins = Arc::new(origins);
+    let mut cache = fleet_identity_origins_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 8 && !cache.contains_key(cert_dir) {
+        cache.clear();
+    }
+    cache.insert(
+        cert_dir.to_path_buf(),
+        FleetIdentityOriginsCacheEntry {
+            fingerprint,
+            origins: origins.clone(),
+        },
+    );
+    origins
 }
 
 /// The agent-card names this gateway adds to the shared org-grant target
@@ -2395,7 +2519,11 @@ pub(crate) fn load_local_iam_state_for_request(
     if !path.exists() {
         return Ok(None);
     }
-    crate::access::iam::load_state(cert_dir)
+    // Cached by stat fingerprint: this runs per HTTP request (including
+    // statics) under browser mTLS, and the raw load re-reads + re-parses
+    // the file every time. The cache re-checks the fingerprint on every
+    // call, so out-of-process writers are still picked up immediately.
+    crate::access::iam::load_state_cached(cert_dir)
         .map(Some)
         .map_err(|e| format!("local IAM state is invalid: {e}"))
 }
@@ -2768,6 +2896,64 @@ mod tests {
             None,
             cert_dir.path(),
         ));
+    }
+
+    /// Pins the fleet-origin cache (and its mirrored identities-dir name)
+    /// against the real identity writers: an approval must open the gate,
+    /// and a revocation — an IN-PLACE record rewrite that does not move
+    /// the directory mtime — must close it on the very next request.
+    #[test]
+    fn fleet_origin_cache_tracks_identity_writes() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let headers = "GET /api/access/overview HTTP/1.1\r\nHost: daemon.local:8765\r\n";
+        let fleet_origin = "https://peer-box.local:9900";
+        let allowed = |cert_dir: &std::path::Path| {
+            fleet_access_origin_allowed(fleet_origin, true, headers, None, cert_dir)
+        };
+
+        // Unknown origin on an empty store (this call also primes the
+        // cache, so the approval below must invalidate it to pass).
+        assert!(!allowed(cert_dir.path()));
+
+        let fp = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            fp,
+            "peer-d",
+            "peer-operator",
+            Some("https://peer-box.local:9900/.well-known/agent-card.json"),
+            Some("req-d"),
+        )
+        .unwrap();
+        assert!(allowed(cert_dir.path()), "approval must open the gate");
+        // Second call rides the cache; same answer.
+        assert!(allowed(cert_dir.path()));
+
+        crate::peer::access_policy::revoke_identity(cert_dir.path(), fp).unwrap();
+        assert!(
+            !allowed(cert_dir.path()),
+            "revocation (in-place rewrite) must close the gate immediately"
+        );
+
+        // Deleting the record entirely also invalidates.
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            fp,
+            "peer-d",
+            "peer-operator",
+            Some("https://peer-box.local:9900/.well-known/agent-card.json"),
+            Some("req-d"),
+        )
+        .unwrap();
+        assert!(allowed(cert_dir.path()));
+        let dir = cert_dir.path().join(PEER_IDENTITIES_DIR_NAME);
+        let record = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+            .expect("identity record on disk (pins the mirrored dir name)");
+        std::fs::remove_file(record.path()).unwrap();
+        assert!(!allowed(cert_dir.path()));
     }
 
     #[test]
