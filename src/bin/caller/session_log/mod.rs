@@ -1,5 +1,5 @@
 use crate::types::truncate_str;
-use chrono::Local;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +20,11 @@ mod bus_events;
 #[derive(Serialize)]
 struct LogEvent {
     ts: String,
+    /// Epoch milliseconds (UTC) captured alongside `ts`. `ts` is local
+    /// time-of-day only — without this field an event's calendar date must
+    /// be reconstructed from `session_meta.json` plus midnight-wrap
+    /// inference, which breaks across DST folds and multi-day sessions.
+    ts_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn: Option<usize>,
     event: String,
@@ -58,6 +63,13 @@ pub struct AgentOutputChunk {
 pub struct SessionMeta {
     pub session_id: String,
     pub created_at: String,
+    /// Epoch milliseconds (UTC) captured with `created_at` — the
+    /// machine-readable timestamp (`created_at` is local and offset-less).
+    /// Additive: metas written before 2026-07 lack it. Mirrors
+    /// `created_at`'s existing rewrite semantics (re-stamped on every meta
+    /// write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +331,7 @@ impl SessionLog {
         };
         log.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_start".to_string(),
             level: Some("info".to_string()),
@@ -380,6 +393,7 @@ impl SessionLog {
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            created_at_ms: Some(Self::ts_ms()),
             project_root: project_root.map(|p| p.to_string_lossy().to_string()),
             name: name.map(|n| n.to_string()).or(existing_name),
             task: task.map(|t| t.to_string()),
@@ -563,6 +577,10 @@ impl SessionLog {
         Local::now().format("%H:%M:%S%.3f").to_string()
     }
 
+    fn ts_ms() -> i64 {
+        Utc::now().timestamp_millis()
+    }
+
     fn emit(&mut self, event: LogEvent) {
         if let Ok(json) = serde_json::to_string(&event) {
             if let Err(e) = writeln!(self.writer, "{}", json) {
@@ -597,6 +615,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_start".to_string(),
             level: Some("info".to_string()),
@@ -629,6 +648,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = turn;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_turn".to_string(),
             level: Some("info".to_string()),
@@ -664,6 +684,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_complete".to_string(),
             level: Some("info".to_string()),
@@ -687,6 +708,7 @@ impl SessionLog {
         });
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_error".to_string(),
             level: Some("warn".to_string()),
@@ -718,6 +740,7 @@ impl SessionLog {
         });
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -895,6 +918,7 @@ impl SessionLog {
     pub fn info(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -912,6 +936,7 @@ impl SessionLog {
     pub fn warn(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -930,6 +955,7 @@ impl SessionLog {
     pub fn voice_log(&mut self, text: &str, seq: u64, tool_context: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "voice_log".to_string(),
             level: Some("info".to_string()),
@@ -954,6 +980,7 @@ impl SessionLog {
         self.flush_voice_utterance();
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "user_transcript".to_string(),
             level: Some("info".to_string()),
@@ -975,6 +1002,7 @@ impl SessionLog {
     pub fn presence_checkpoint(&mut self, summary: &str, last_event_seq: u64) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_checkpoint".to_string(),
             level: Some("info".to_string()),
@@ -998,6 +1026,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_connected".to_string(),
             level: Some("info".to_string()),
@@ -1019,6 +1048,7 @@ impl SessionLog {
     pub fn presence_disconnected(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_disconnected".to_string(),
             level: Some("info".to_string()),
@@ -1238,6 +1268,7 @@ impl SessionLog {
     fn emit_voice(&mut self, event: &str, level: &str, kind: &str, detail: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: event.to_string(),
             level: Some(level.to_string()),
@@ -1322,6 +1353,7 @@ mod tests {
         let meta = SessionMeta {
             session_id: "test-session-123".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: None,
             name: None,
             task: None,
@@ -1430,6 +1462,7 @@ mod tests {
         let meta1 = SessionMeta {
             session_id: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp/project".to_string()),
             name: None,
             task: Some("task 1".to_string()),
@@ -1450,6 +1483,7 @@ mod tests {
         let meta2 = SessionMeta {
             session_id: "session-2".to_string(),
             created_at: "2026-01-02T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp/project".to_string()),
             name: None,
             task: Some("task 2".to_string()),
@@ -1511,6 +1545,7 @@ mod tests {
         let meta = SessionMeta {
             session_id: "session".to_string(),
             created_at: "2026-05-29T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp".to_string()),
             name: None,
             task: Some("task".to_string()),
@@ -1646,5 +1681,43 @@ mod tests {
             .into_iter()
             .last()
             .unwrap_or_else(|| panic!("no {} event found", event_type))
+    }
+
+    #[test]
+    fn events_carry_epoch_ms_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.info("hello");
+        drop(log);
+
+        let before = Utc::now().timestamp_millis();
+        let event = read_last_event(dir.path(), "session_start");
+        let ts_ms = event["ts_ms"].as_i64().expect("ts_ms is an i64");
+        assert!(
+            ts_ms > before - 60_000 && ts_ms <= before,
+            "ts_ms {} not within a minute before {}",
+            ts_ms,
+            before
+        );
+        assert!(
+            event["ts"].as_str().is_some(),
+            "time-of-day ts still present"
+        );
+    }
+
+    #[test]
+    fn meta_carries_epoch_ms_and_reads_legacy_metas() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.write_meta(None, Some("task"));
+        let raw = fs::read_to_string(dir.path().join("session_meta.json")).unwrap();
+        let meta: SessionMeta = serde_json::from_str(&raw).unwrap();
+        let ms = meta.created_at_ms.expect("created_at_ms stamped");
+        assert!(ms > 0);
+
+        // Metas written before the field existed must still parse.
+        let legacy = r#"{"session_id":"old","created_at":"2026-01-01T00:00:00"}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(meta.created_at_ms, None);
     }
 }

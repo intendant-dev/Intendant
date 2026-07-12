@@ -66,6 +66,7 @@ Turn files are named `turn_{NNN}_{suffix}` with `NNN` zero-padded to three digit
 {
   "session_id": "a1b2c3d4-...",
   "created_at": "2026-05-24T10:30:00",
+  "created_at_ms": 1782808200123,
   "project_root": "/home/user/myproject",
   "name": "Fix auth bug",
   "task": "Fix the authentication bug",
@@ -85,14 +86,16 @@ drives `--continue` (most-recent session for the project) and `--resume <id>`
 ## The `session.jsonl` Event Stream
 
 `session.jsonl` is the spine: one `LogEvent` JSON object per line. Each event
-carries a timestamp, an optional turn number, the event name, an optional level,
-an optional human message, optional structured `data`, and optional `file` /
-`file2` references pointing at the full-content turn files (so the line stays
-small and the bulk lives in `turns/`).
+carries a local time-of-day timestamp plus a machine-readable epoch-ms UTC
+timestamp (`ts_ms`; events written before 2026-07 lack it — recover their date
+from `session_meta.json`), an optional turn number, the event name, an optional
+level, an optional human message, optional structured `data`, and optional
+`file` / `file2` references pointing at the full-content turn files (so the
+line stays small and the bulk lives in `turns/`).
 
 ```rust
 struct LogEvent {
-    ts: String, turn: Option<usize>, event: String,
+    ts: String, ts_ms: i64, turn: Option<usize>, event: String,
     level: Option<String>, message: Option<String>,
     data: Option<serde_json::Value>,
     file: Option<String>, file2: Option<String>,
