@@ -52,27 +52,22 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Spawn a background task that subscribes to the bus and routes task
-    /// dispatch commands. The handle is aborted on session end.
+    /// Spawn a background task that consumes the bus's lossless intent lane
+    /// ([`EventBus::subscribe_intents`]) and routes task dispatch commands.
+    /// The handle is aborted on session end.
+    ///
+    /// The lane — not the lossy broadcast ring — because a dropped
+    /// `StartTask`/`FollowUp`/`Interrupt` is an unrecoverable lost user
+    /// action: the dispatcher is the only consumer that acts on it.
     pub fn spawn(self, bus: EventBus) -> JoinHandle<()> {
-        let mut rx = bus.subscribe();
+        let mut intent_rx = bus.subscribe_intents();
         let bus_for_log = bus.clone();
         let arc = Arc::new(self);
 
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if let AppEvent::ControlCommand(msg) = event {
-                            arc.route(msg, &bus_for_log).await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Bus lagged — continue; the dispatcher is idempotent
-                        // per event and cannot recover lost ones.
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            while let Some(event) = intent_rx.recv().await {
+                if let AppEvent::ControlCommand(msg) = event {
+                    arc.route(msg, &bus_for_log).await;
                 }
             }
         })

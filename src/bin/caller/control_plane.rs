@@ -68,32 +68,37 @@ pub struct ControlPlaneState {
 }
 
 /// Spawn the control plane as a background task. Returns a JoinHandle.
-pub fn spawn(
-    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
-    state: ControlPlaneState,
-) -> tokio::task::JoinHandle<()> {
+///
+/// Consumes the bus's lossless intent lane
+/// ([`EventBus::subscribe_intents`]), not the lossy broadcast ring: every
+/// event this loop acts on — user intents plus the session-end /
+/// display-revoke hygiene — rides that lane, in emission order, immune to
+/// `RecvError::Lagged` drops during model-stream floods.
+pub fn spawn(state: ControlPlaneState) -> tokio::task::JoinHandle<()> {
+    let mut intent_rx = state.bus.subscribe_intents();
     tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(AppEvent::ControlCommand(msg)) => {
+        while let Some(event) = intent_rx.recv().await {
+            match event {
+                AppEvent::ControlCommand(msg) => {
                     handle_control_msg(&msg, &state).await;
                 }
                 // Display-request rail hygiene (single-writer side effects):
                 // a session's end cancels its pending doorbell request and
                 // auto-revokes a this-session grant it originated; any
                 // revoke ends the rail's timed/this-session arrangement.
-                Ok(AppEvent::SessionEnded { session_id, .. }) => {
+                AppEvent::SessionEnded { session_id, .. } => {
                     apply_display_request_session_end(
                         crate::display_requests::registry(),
                         &session_id,
                         &state.bus,
                     );
                 }
-                Ok(AppEvent::UserDisplayRevoked { .. }) => {
+                AppEvent::UserDisplayRevoked { .. } => {
                     crate::display_requests::registry().note_revoked();
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                _ => {} // Other events, lagged -- ignore
+                // Other intent-lane events (identity/relationship
+                // bookkeeping) belong to the session supervisor.
+                _ => {}
             }
         }
     })
@@ -1588,17 +1593,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let mut events = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Verify initial state
         assert_eq!(autonomy.read().await.level, AutonomyLevel::Medium);
@@ -1634,17 +1636,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // tool_call defaults to Auto.
         assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Auto);
@@ -1667,17 +1666,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Verify initial state
         assert!(external_agent.read().await.is_none());
@@ -1712,17 +1708,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // AutonomyLevel::from_str_loose returns Medium for unknown strings
         bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
@@ -1743,17 +1736,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(Some(external_agent::AgentBackend::Codex)));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Send SetExternalAgent with empty string -- should clear
         bus.send(AppEvent::ControlCommand(ControlMsg::SetExternalAgent {
@@ -1774,17 +1764,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
             command: Some("  /opt/bin/codex  ".to_string()),
@@ -1808,17 +1795,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         assert_eq!(codex_config.read().await.sandbox, "workspace-write");
 
@@ -1845,17 +1829,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexApprovalPolicy {
@@ -1875,17 +1856,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexModel {
             model: Some("gpt-5".to_string()),
@@ -1910,17 +1888,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexReasoningEffort {
@@ -1952,17 +1927,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
             service_tier: Some("fast".to_string()),
@@ -1998,17 +1970,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
             enabled: true,
@@ -2041,17 +2010,14 @@ mod tests {
         // Subscribe BEFORE spawning so we don't miss the broadcast.
         let mut rx = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config,
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config,
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
             session_id: Some("sess-action".to_string()),
@@ -2097,17 +2063,14 @@ mod tests {
 
         let mut rx = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config,
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config,
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
             session_id: None,
@@ -2154,17 +2117,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexWritableRoots {
@@ -2191,17 +2151,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexManagedContext {
@@ -2229,17 +2186,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexContextArchive {

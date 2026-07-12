@@ -127,11 +127,22 @@ pub(crate) async fn api_session_log_replay_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let replay_log_dir = active_replay_log_dir(runtime).await;
-    let mut replay = replay_log_dir
-        .as_ref()
-        .and_then(|log_dir| {
-            crate::web_gateway::session_log_replay_payload_for_websocket_bootstrap(log_dir)
+    // The replay conversion reads and converts the whole tail-limited
+    // session log — blocking work, so it runs on the blocking pool
+    // instead of stalling a runtime worker (the request lane spawns these
+    // handlers as plain async tasks).
+    let converted = match replay_log_dir {
+        Some(log_dir) => tokio::task::spawn_blocking(move || {
+            crate::web_gateway::session_log_replay_payload_for_websocket_bootstrap(&log_dir)
         })
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[dashboard-control] session log replay task failed: {e}");
+            None
+        }),
+        None => None,
+    };
+    let mut replay = converted
         .and_then(|(payload, external_session_id)| {
             let mut value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
             if let (Some(external_session_id), Some(map)) =
@@ -200,10 +211,9 @@ pub(crate) async fn api_dashboard_bootstrap_response(
         }
         frames.push(frame);
     }
-    frames.extend(external_session_activity_replay_frames(
-        runtime,
-        &replayed_external_session_ids,
-    ));
+    frames.extend(
+        external_session_activity_replay_frames(runtime, &replayed_external_session_ids).await,
+    );
     frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
     let omitted = dashboard_bootstrap_omitted(runtime);
@@ -577,7 +587,7 @@ pub(crate) async fn api_external_session_activity_replay_response(
     id: String,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let frames = external_session_activity_replay_frames(runtime, &HashSet::new());
+    let frames = external_session_activity_replay_frames(runtime, &HashSet::new()).await;
     let frame_count = frames.len();
     serde_json::json!({
         "t": "response",
@@ -590,7 +600,7 @@ pub(crate) async fn api_external_session_activity_replay_response(
     })
 }
 
-pub(crate) fn external_session_activity_replay_frames(
+pub(crate) async fn external_session_activity_replay_frames(
     runtime: &ControlRuntime,
     skip_session_ids: &HashSet<String>,
 ) -> Vec<serde_json::Value> {
@@ -607,14 +617,30 @@ pub(crate) fn external_session_activity_replay_frames(
         })
         .unwrap_or_default();
     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
-    active_external_sessions
+    let to_convert: Vec<(String, String)> = active_external_sessions
         .into_iter()
         .filter(|(session_id, _)| !skip_session_ids.contains(session_id))
-        .filter_map(|(session_id, source)| {
-            crate::web_gateway::external_session_activity_replay_for_websocket(&source, &session_id)
+        .collect();
+    // Each conversion reads and converts a backend-native session file —
+    // blocking disk work, off the runtime workers (see
+    // api_session_log_replay_response).
+    tokio::task::spawn_blocking(move || {
+        to_convert
+            .into_iter()
+            .filter_map(|(session_id, source)| {
+                crate::web_gateway::external_session_activity_replay_for_websocket(
+                    &source,
+                    &session_id,
+                )
                 .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-        })
-        .collect()
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("[dashboard-control] external session replay task failed: {e}");
+        Vec::new()
+    })
 }
 
 pub(crate) fn response_result(response: serde_json::Value) -> Option<serde_json::Value> {
