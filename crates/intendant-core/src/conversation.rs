@@ -14,6 +14,49 @@ pub enum MessageLayer {
     SubAgent,
 }
 
+/// What kind of entry a [`Message`] is — the provenance axis, independent of
+/// [`MessageLayer`] (which is hierarchical identity / compaction protection).
+/// Drives the session log's `conversation_message` emit/skip decision and the
+/// message-search skip set; see `docs/src/session-logging.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageProvenance {
+    /// The session's initial task.
+    Task,
+    /// The continuation task of a resumed session.
+    ResumeTask,
+    /// An ordinary user follow-up (including `[New Task]` in persistent mode).
+    FollowUp,
+    /// A steer delivered into model context.
+    Steer,
+    /// An accepted askHuman answer.
+    AskHumanAnswer,
+    /// Controller-injected context (working dir, memory, skills, frame
+    /// preludes, nudges, acks) — never user-authored.
+    SystemInjection,
+    /// Tool or agent output, including external-agent stdout wrapped as a
+    /// user message and synthetic results from tool-call repair.
+    ToolOutput,
+    /// A compaction summary replacing dropped turns.
+    ContextSummary,
+    /// An assistant response.
+    Assistant,
+    /// Written before provenance existed (legacy files) — never assigned by
+    /// live code.
+    #[default]
+    Unknown,
+}
+
+impl MessageProvenance {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+fn seq_is_unassigned(seq: &u64) -> bool {
+    *seq == 0
+}
+
 /// Base64-encoded image data attached to a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageData {
@@ -59,6 +102,18 @@ pub struct Message {
     /// (e.g. `computer_call_output` for OpenAI, image content block for Anthropic).
     #[serde(skip_serializing_if = "is_false", default)]
     pub is_cu_result: bool,
+    /// Provenance of this message (see [`MessageProvenance`]). `unknown`
+    /// (the default) is skipped on write, so legacy files roundtrip
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "MessageProvenance::is_unknown")]
+    pub provenance: MessageProvenance,
+    /// Monotonic per-conversation ordinal assigned at append time. `0` means
+    /// "written before `seq` existed" until the resume-time epoch pass
+    /// ([`Conversation::ensure_seqs_assigned`]) renumbers the file. Seqs are
+    /// never reused — truncation does not rewind the counter — so a rewind
+    /// cut (`conversation_rewound.cut_after_seq`) is unambiguous.
+    #[serde(default, skip_serializing_if = "seq_is_unassigned")]
+    pub seq: u64,
     #[serde(skip)]
     pub layer: Option<MessageLayer>,
 }
@@ -69,6 +124,9 @@ pub struct Conversation {
     context_window: u64,
     turn: usize,
     protect_user_layer: bool,
+    /// The next seq to assign. Monotonic for the life of the conversation:
+    /// truncation/rewind never rewinds it (see [`Message::seq`]).
+    next_seq: u64,
 }
 
 impl Conversation {
@@ -77,12 +135,15 @@ impl Conversation {
             messages: vec![Message {
                 role: "system".to_string(),
                 content: system_prompt,
+                provenance: MessageProvenance::SystemInjection,
+                seq: 1,
                 ..Default::default()
             }],
             last_usage: None,
             context_window,
             turn: 0,
             protect_user_layer: false,
+            next_seq: 2,
         }
     }
 
@@ -91,15 +152,31 @@ impl Conversation {
         self.protect_user_layer = protect;
     }
 
-    pub fn add_user(&mut self, content: String) {
+    fn assign_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    pub fn add_user(&mut self, provenance: MessageProvenance, content: String) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "user".to_string(),
             content,
+            provenance,
+            seq,
             ..Default::default()
         });
+        seq
     }
 
-    pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageData>) {
+    pub fn add_user_with_images(
+        &mut self,
+        provenance: MessageProvenance,
+        content: String,
+        images: Vec<ImageData>,
+    ) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "user".to_string(),
             content,
@@ -108,27 +185,43 @@ impl Conversation {
             } else {
                 Some(images)
             },
+            provenance,
+            seq,
             ..Default::default()
         });
+        seq
     }
 
     #[allow(dead_code)]
-    pub fn add_user_with_layer(&mut self, content: String, layer: MessageLayer) {
+    pub fn add_user_with_layer(
+        &mut self,
+        provenance: MessageProvenance,
+        content: String,
+        layer: MessageLayer,
+    ) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "user".to_string(),
             content,
+            provenance,
+            seq,
             layer: Some(layer),
             ..Default::default()
         });
+        seq
     }
 
-    pub fn add_assistant(&mut self, content: String) {
+    pub fn add_assistant(&mut self, content: String) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "assistant".to_string(),
             content,
+            provenance: MessageProvenance::Assistant,
+            seq,
             layer: None,
             ..Default::default()
         });
+        seq
     }
 
     /// Add an assistant message that includes tool calls.
@@ -137,27 +230,35 @@ impl Conversation {
         content: String,
         tool_calls: Vec<ToolCallRef>,
         raw_output: Option<Vec<serde_json::Value>>,
-    ) {
+    ) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "assistant".to_string(),
             content,
             tool_calls: Some(tool_calls),
             raw_output,
+            provenance: MessageProvenance::Assistant,
+            seq,
             layer: None,
             ..Default::default()
         });
+        seq
     }
 
     /// Add a tool result message.
-    pub fn add_tool_result(&mut self, call_id: &str, name: &str, output: &str) {
+    pub fn add_tool_result(&mut self, call_id: &str, name: &str, output: &str) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "tool".to_string(),
             content: output.to_string(),
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some(name.to_string()),
+            provenance: MessageProvenance::ToolOutput,
+            seq,
             layer: None,
             ..Default::default()
         });
+        seq
     }
 
     /// Add a tool result message with attached images.
@@ -167,7 +268,8 @@ impl Conversation {
         name: &str,
         output: &str,
         images: Vec<ImageData>,
-    ) {
+    ) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "tool".to_string(),
             content: output.to_string(),
@@ -178,13 +280,17 @@ impl Conversation {
             } else {
                 Some(images)
             },
+            provenance: MessageProvenance::ToolOutput,
+            seq,
             layer: None,
             ..Default::default()
         });
+        seq
     }
 
     /// Add a native computer-use tool result with a screenshot image.
-    pub fn add_cu_result(&mut self, call_id: &str, output: &str, images: Vec<ImageData>) {
+    pub fn add_cu_result(&mut self, call_id: &str, output: &str, images: Vec<ImageData>) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "tool".to_string(),
             content: output.to_string(),
@@ -196,19 +302,46 @@ impl Conversation {
                 Some(images)
             },
             is_cu_result: true,
+            provenance: MessageProvenance::ToolOutput,
+            seq,
             layer: None,
             ..Default::default()
         });
+        seq
     }
 
     #[allow(dead_code)]
-    pub fn add_assistant_with_layer(&mut self, content: String, layer: MessageLayer) {
+    pub fn add_assistant_with_layer(&mut self, content: String, layer: MessageLayer) -> u64 {
+        let seq = self.assign_seq();
         self.messages.push(Message {
             role: "assistant".to_string(),
             content,
+            provenance: MessageProvenance::Assistant,
+            seq,
             layer: Some(layer),
             ..Default::default()
         });
+        seq
+    }
+
+    /// Resume-time epoch pass: if any loaded message predates `seq`
+    /// (`seq == 0`), renumber EVERY message `1..=N` in vector order and reset
+    /// the counter. Returns whether a renumber happened — the caller then
+    /// emits the `conversation_message_epoch` marker carrying the resulting
+    /// `(seq, role, content-hash)` mapping so historical extractors can
+    /// correlate. Deliberately a no-op when every seq is already assigned:
+    /// renumbering a pure new-era file would break prior event references.
+    pub fn ensure_seqs_assigned(&mut self) -> bool {
+        if self.messages.iter().all(|m| m.seq != 0) {
+            return false;
+        }
+        let mut seq = 0u64;
+        for msg in &mut self.messages {
+            seq += 1;
+            msg.seq = seq;
+        }
+        self.next_seq = seq + 1;
+        true
     }
 
     /// Resolve any dangling tool calls at the end of the conversation.
@@ -292,13 +425,23 @@ impl Conversation {
         // Unanswered (id, name) pairs from the most recent assistant
         // tool-call batch; any non-tool message closes the batch.
         let mut open: Vec<(String, String)> = Vec::new();
-        let synthetic = |call_id: &str, name: &str| Message {
-            role: "tool".to_string(),
-            content: "[dropped] The result of this tool call was removed by context management."
-                .to_string(),
-            tool_call_id: Some(call_id.to_string()),
-            tool_name: Some(name.to_string()),
-            ..Default::default()
+        // Synthetic repairs get fresh seqs from the same monotonic counter;
+        // the counter is written back after the pass.
+        let mut next_seq = self.next_seq;
+        let mut synthetic = |call_id: &str, name: &str| {
+            let seq = next_seq;
+            next_seq += 1;
+            Message {
+                role: "tool".to_string(),
+                content:
+                    "[dropped] The result of this tool call was removed by context management."
+                        .to_string(),
+                tool_call_id: Some(call_id.to_string()),
+                tool_name: Some(name.to_string()),
+                provenance: MessageProvenance::ToolOutput,
+                seq,
+                ..Default::default()
+            }
         };
         for msg in old {
             if msg.role == "tool" {
@@ -337,6 +480,7 @@ impl Conversation {
             out.push(synthetic(&id, &name));
             repaired += 1;
         }
+        self.next_seq = next_seq;
         self.messages = out;
         repaired
     }
@@ -534,6 +678,9 @@ impl Conversation {
     /// `target_len == 0`, we leave the system message alone and
     /// return `messages.len() - 1`. Callers should never request
     /// truncation below 1, but this is defensive.
+    /// Truncate to the first `target_len` messages (tail rollback). The seq
+    /// counter is deliberately NOT rewound — freed seqs are never reused, so
+    /// a `conversation_rewound { cut_after_seq }` marker stays unambiguous.
     pub fn truncate_to(&mut self, target_len: usize) -> usize {
         let current = self.messages.len();
         let target = target_len.max(1).min(current);
@@ -619,11 +766,14 @@ impl Conversation {
             self.messages.remove(i);
         }
 
+        let seq = self.assign_seq();
         self.messages.insert(
             insert_pos,
             Message {
                 role: "user".to_string(),
                 content: format!("[Context Summary] {}", summary),
+                provenance: MessageProvenance::ContextSummary,
+                seq,
                 ..Default::default()
             },
         );
@@ -667,6 +817,15 @@ impl Conversation {
 
         // Count non-system user+assistant pairs to estimate turn count
         let turn = messages.iter().filter(|m| m.role == "assistant").count();
+        // Resume the monotonic counter past the highest persisted seq
+        // (all-zero legacy files start at 1; `ensure_seqs_assigned` is the
+        // resume-time renumber pass for those).
+        let next_seq = messages
+            .iter()
+            .map(|m| m.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
 
         Ok(Self {
             messages,
@@ -674,6 +833,7 @@ impl Conversation {
             context_window,
             turn,
             protect_user_layer: false,
+            next_seq,
         })
     }
 }
@@ -709,7 +869,7 @@ mod tests {
     #[test]
     fn add_user_message() {
         let mut conv = Conversation::new("system".to_string(), 128_000);
-        conv.add_user("hello".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
         let msgs = conv.messages();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].role, "user");
@@ -729,9 +889,9 @@ mod tests {
     #[test]
     fn conversation_ordering() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("msg1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "msg1".to_string());
         conv.add_assistant("resp1".to_string());
-        conv.add_user("msg2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "msg2".to_string());
         let msgs = conv.messages();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
@@ -756,11 +916,11 @@ mod tests {
     #[test]
     fn drop_turns_protects_system_and_last_two() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string()); // 1
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
-        conv.add_user("u2".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string()); // 3
         conv.add_assistant("a2".to_string()); // 4
-        conv.add_user("u3".to_string()); // 5
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string()); // 5
         conv.add_assistant("a3".to_string()); // 6
 
         // Try to drop system (0), middle messages (1,2), and last two (5,6)
@@ -776,7 +936,7 @@ mod tests {
     #[test]
     fn drop_turns_empty_indices() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.drop_turns(&[]);
         assert_eq!(conv.len(), 2);
     }
@@ -784,9 +944,9 @@ mod tests {
     #[test]
     fn drop_turns_duplicate_indices() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
 
         conv.drop_turns(&[1, 1, 1]);
@@ -796,11 +956,11 @@ mod tests {
     #[test]
     fn summarize_turns_replaces_range() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string()); // 1
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
-        conv.add_user("u2".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string()); // 3
         conv.add_assistant("a2".to_string()); // 4
-        conv.add_user("u3".to_string()); // 5
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string()); // 5
         conv.add_assistant("a3".to_string()); // 6
 
         conv.summarize_turns(&[1, 2, 3, 4], "Set up the environment");
@@ -819,7 +979,7 @@ mod tests {
     #[test]
     fn summarize_turns_empty() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.summarize_turns(&[], "summary");
         assert_eq!(conv.len(), 2);
     }
@@ -827,9 +987,9 @@ mod tests {
     #[test]
     fn truncate_to_drops_tail() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string()); // 1
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
-        conv.add_user("u2".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string()); // 3
         conv.add_assistant("a2".to_string()); // 4
 
         // Truncate to first 3 messages (keep system + u1 + a1).
@@ -844,7 +1004,7 @@ mod tests {
     #[test]
     fn truncate_to_noop_when_already_shorter() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
 
         // Target longer than current — no-op.
         let removed = conv.truncate_to(100);
@@ -855,7 +1015,7 @@ mod tests {
     #[test]
     fn truncate_to_preserves_system_even_when_zero_requested() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
 
         // Caller passes 0 — we still preserve the system message.
@@ -871,7 +1031,7 @@ mod tests {
         // tool_calls (leaving the tool result behind), we must inject
         // synthetic tool results so the next API request isn't rejected.
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("do something".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "do something".to_string());
         conv.add_assistant_tool_calls(
             "calling tool".to_string(),
             vec![ToolCallRef {
@@ -900,7 +1060,7 @@ mod tests {
     #[test]
     fn summarize_turns_protects_system_and_last_two() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string()); // 1
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
 
         // Try to summarize all — system (0) and last two (1,2) are protected
@@ -927,7 +1087,11 @@ mod tests {
     #[test]
     fn add_user_with_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user_with_layer("hello".to_string(), MessageLayer::User);
+        conv.add_user_with_layer(
+            MessageProvenance::FollowUp,
+            "hello".to_string(),
+            MessageLayer::User,
+        );
         assert_eq!(conv.messages()[1].layer, Some(MessageLayer::User));
     }
 
@@ -942,11 +1106,15 @@ mod tests {
     fn drop_turns_protects_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         conv.set_protect_user_layer(true);
-        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User); // 1
+        conv.add_user_with_layer(
+            MessageProvenance::FollowUp,
+            "user msg".to_string(),
+            MessageLayer::User,
+        ); // 1
         conv.add_assistant("orch status".to_string()); // 2
-        conv.add_user("orch output".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "orch output".to_string()); // 3
         conv.add_assistant("more output".to_string()); // 4
-        conv.add_user("final".to_string()); // 5
+        conv.add_user(MessageProvenance::FollowUp, "final".to_string()); // 5
         conv.add_assistant("done".to_string()); // 6
 
         // Try to drop index 1 (User-layer) and 2 (no layer)
@@ -961,9 +1129,13 @@ mod tests {
     fn drop_turns_without_protection_removes_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         // protect_user_layer is false by default
-        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User); // 1
+        conv.add_user_with_layer(
+            MessageProvenance::FollowUp,
+            "user msg".to_string(),
+            MessageLayer::User,
+        ); // 1
         conv.add_assistant("response".to_string()); // 2
-        conv.add_user("msg".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "msg".to_string()); // 3
         conv.add_assistant("resp".to_string()); // 4
 
         conv.drop_turns(&[1]);
@@ -974,11 +1146,15 @@ mod tests {
     fn summarize_turns_protects_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         conv.set_protect_user_layer(true);
-        conv.add_user_with_layer("user task".to_string(), MessageLayer::User); // 1
+        conv.add_user_with_layer(
+            MessageProvenance::FollowUp,
+            "user task".to_string(),
+            MessageLayer::User,
+        ); // 1
         conv.add_assistant("status 1".to_string()); // 2
-        conv.add_user("agent output 1".to_string()); // 3
+        conv.add_user(MessageProvenance::FollowUp, "agent output 1".to_string()); // 3
         conv.add_assistant("status 2".to_string()); // 4
-        conv.add_user("latest".to_string()); // 5
+        conv.add_user(MessageProvenance::FollowUp, "latest".to_string()); // 5
         conv.add_assistant("done".to_string()); // 6
 
         conv.summarize_turns(&[1, 2, 3], "Early progress");
@@ -1187,9 +1363,9 @@ mod tests {
         let path = dir.path().join("conversation.jsonl");
 
         let mut conv = Conversation::new("You are a helper.".to_string(), 200_000);
-        conv.add_user("Hello".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "Hello".to_string());
         conv.add_assistant("Hi there!".to_string());
-        conv.add_user("What is 2+2?".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "What is 2+2?".to_string());
         conv.add_assistant("4".to_string());
         conv.increment_turn();
         conv.increment_turn();
@@ -1270,7 +1446,7 @@ mod tests {
     fn auto_compact_below_threshold_noop() {
         let mut conv = Conversation::new("sys".to_string(), 200_000);
         for i in 0..20 {
-            conv.add_user(format!("msg {}", i));
+            conv.add_user(MessageProvenance::FollowUp, format!("msg {}", i));
             conv.add_assistant(format!("resp {}", i));
         }
         // No usage set → 0% → no compaction
@@ -1282,10 +1458,10 @@ mod tests {
     fn auto_compact_triggers_at_90_percent() {
         let mut conv = Conversation::new("sys".to_string(), 100_000);
         // system + 2 context msgs + many middle msgs + 4 tail = need 8+
-        conv.add_user("working dir".to_string()); // 1 - context
+        conv.add_user(MessageProvenance::FollowUp, "working dir".to_string()); // 1 - context
         conv.add_assistant("ack".to_string()); // 2 - context
         for i in 0..10 {
-            conv.add_user(format!("msg {}", i));
+            conv.add_user(MessageProvenance::FollowUp, format!("msg {}", i));
             conv.add_assistant(format!("resp {}", i));
         }
         conv.increment_turn();
@@ -1317,15 +1493,15 @@ mod tests {
     #[test]
     fn auto_compact_preserves_system_and_tail() {
         let mut conv = Conversation::new("system prompt".to_string(), 10_000);
-        conv.add_user("ctx1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "ctx1".to_string());
         conv.add_assistant("ctx2".to_string());
         for _ in 0..8 {
-            conv.add_user("middle".to_string());
+            conv.add_user(MessageProvenance::FollowUp, "middle".to_string());
             conv.add_assistant("middle_resp".to_string());
         }
-        conv.add_user("tail1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "tail1".to_string());
         conv.add_assistant("tail2".to_string());
-        conv.add_user("tail3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "tail3".to_string());
         conv.add_assistant("tail4".to_string());
         conv.set_usage(TokenUsage {
             prompt_tokens: 9_500,
@@ -1348,9 +1524,9 @@ mod tests {
     #[test]
     fn auto_compact_too_few_messages_noop() {
         let mut conv = Conversation::new("sys".to_string(), 1_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
         conv.set_usage(TokenUsage {
             prompt_tokens: 950,
@@ -1454,10 +1630,10 @@ mod tests {
     fn auto_compact_at_custom_threshold() {
         let mut conv = Conversation::new("sys".to_string(), 100_000);
         // Build up enough messages (system + 2 context + middle + 4 tail = 8+ needed)
-        conv.add_user("ctx1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "ctx1".to_string());
         conv.add_assistant("ctx1-reply".to_string());
         for i in 0..10 {
-            conv.add_user(format!("middle-{}", i));
+            conv.add_user(MessageProvenance::FollowUp, format!("middle-{}", i));
             conv.add_assistant(format!("reply-{}", i));
         }
         // Set usage at 65% — above 0.60 threshold but below 0.90
@@ -1479,7 +1655,7 @@ mod tests {
     fn auto_compact_at_below_custom_threshold_noop() {
         let mut conv = Conversation::new("sys".to_string(), 100_000);
         for i in 0..10 {
-            conv.add_user(format!("u{}", i));
+            conv.add_user(MessageProvenance::FollowUp, format!("u{}", i));
             conv.add_assistant(format!("a{}", i));
         }
         conv.set_usage(crate::usage::TokenUsage {
@@ -1507,7 +1683,7 @@ mod tests {
     /// with a protected tail.
     fn conversation_with_two_tool_turns() -> Conversation {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("first task".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "first task".to_string());
         conv.add_assistant_tool_calls(
             "running one".to_string(),
             vec![tool_call_ref("call_1", "exec_command")],
@@ -1515,14 +1691,14 @@ mod tests {
         );
         conv.add_tool_result("call_1", "exec_command", "output one");
         conv.add_assistant("done one".to_string());
-        conv.add_user("second task".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "second task".to_string());
         conv.add_assistant_tool_calls(
             "running two".to_string(),
             vec![tool_call_ref("call_2", "write_file")],
             None,
         );
         conv.add_tool_result("call_2", "write_file", "output two");
-        conv.add_user("wrap up".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "wrap up".to_string());
         conv.add_assistant("all done".to_string());
         conv
     }
@@ -1620,7 +1796,7 @@ mod tests {
     #[test]
     fn resolve_dangling_tool_calls_adds_synthetic_results() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("do something".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "do something".to_string());
         conv.add_assistant_tool_calls(
             "I'll run two commands.".to_string(),
             vec![
@@ -1656,7 +1832,7 @@ mod tests {
     #[test]
     fn resolve_dangling_tool_calls_partial() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("do something".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "do something".to_string());
         conv.add_assistant_tool_calls(
             "Running.".to_string(),
             vec![
@@ -1696,7 +1872,7 @@ mod tests {
     #[test]
     fn resolve_dangling_tool_calls_noop_when_complete() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("do something".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "do something".to_string());
         conv.add_assistant_tool_calls(
             "Running.".to_string(),
             vec![ToolCallRef {
@@ -1716,10 +1892,99 @@ mod tests {
     #[test]
     fn resolve_dangling_tool_calls_noop_on_text_only() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("hello".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
         conv.add_assistant("hi there".to_string());
 
         let resolved = conv.resolve_dangling_tool_calls();
         assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn seqs_are_monotonic_across_message_kinds() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        let s1 = conv.add_user(MessageProvenance::Task, "task".to_string());
+        let s2 = conv.add_assistant("reply".to_string());
+        let s3 = conv.add_tool_result("c1", "exec", "out");
+        let s4 = conv.add_user(MessageProvenance::FollowUp, "next".to_string());
+        assert_eq!((s1, s2, s3, s4), (2, 3, 4, 5)); // system prompt took 1
+        let seqs: Vec<u64> = conv.messages().iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+        assert_eq!(conv.messages()[1].provenance, MessageProvenance::Task,);
+        assert_eq!(conv.messages()[2].provenance, MessageProvenance::Assistant,);
+        assert_eq!(conv.messages()[3].provenance, MessageProvenance::ToolOutput,);
+    }
+
+    #[test]
+    fn truncate_never_reuses_seqs() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user(MessageProvenance::Task, "task".to_string());
+        conv.add_assistant("a1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "f1".to_string());
+        conv.add_assistant("a2".to_string()); // seq 5
+        conv.truncate_to(3); // rewind to [system, task, a1]
+        let s = conv.add_user(MessageProvenance::FollowUp, "post-rewind".to_string());
+        assert!(s > 5, "seq {} reused after truncation", s);
+    }
+
+    #[test]
+    fn provenance_and_seq_roundtrip_and_legacy_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user(MessageProvenance::Task, "task".to_string());
+        conv.add_assistant("reply".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 128_000).unwrap();
+        assert_eq!(loaded.messages()[1].provenance, MessageProvenance::Task);
+        assert_eq!(loaded.messages()[2].seq, 3);
+        // Counter resumes past the highest persisted seq.
+        let mut loaded = loaded;
+        assert!(
+            !loaded.ensure_seqs_assigned(),
+            "new-era file must not renumber"
+        );
+        let s = loaded.add_user(MessageProvenance::FollowUp, "next".to_string());
+        assert_eq!(s, 4);
+
+        // Legacy file: no provenance/seq keys at all.
+        let legacy = concat!(
+            "{\"role\":\"system\",\"content\":\"sys\"}\n",
+            "{\"role\":\"user\",\"content\":\"old task\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"old reply\"}\n",
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let mut legacy = Conversation::load_from_file(&path, 128_000).unwrap();
+        assert_eq!(legacy.messages()[1].provenance, MessageProvenance::Unknown);
+        assert_eq!(legacy.messages()[1].seq, 0);
+        assert!(legacy.ensure_seqs_assigned(), "legacy file renumbers");
+        let seqs: Vec<u64> = legacy.messages().iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        let s = legacy.add_user(MessageProvenance::FollowUp, "resumed".to_string());
+        assert_eq!(s, 4);
+    }
+
+    #[test]
+    fn summary_and_repair_messages_get_provenance_and_seqs() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user(MessageProvenance::Task, "task".to_string());
+        conv.add_assistant("a1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "f1".to_string());
+        conv.add_assistant("a2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "f2".to_string());
+        conv.add_assistant("a3".to_string()); // len 7, protected tail = last 2
+        conv.summarize_turns(&[1, 2], "summary of early turns");
+        let summary = conv
+            .messages()
+            .iter()
+            .find(|m| m.content.starts_with("[Context Summary]"))
+            .expect("summary message present");
+        assert_eq!(summary.provenance, MessageProvenance::ContextSummary);
+        assert!(
+            summary.seq > 7,
+            "summary got a fresh seq, found {}",
+            summary.seq
+        );
     }
 }

@@ -43,10 +43,23 @@ struct LogEvent {
 }
 
 #[derive(Debug, Clone)]
-struct TurnFileSpan {
+pub(crate) struct TurnFileSpan {
     relative: String,
     offset: u64,
     len: u64,
+}
+
+/// First 16 hex chars of the SHA-256 of `text` — the content fingerprint the
+/// `conversation_message_epoch` mapping carries so historical extractors can
+/// correlate legacy-extracted messages with resume-time seq assignments.
+pub(crate) fn content_hash_hex16(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1719,5 +1732,84 @@ mod tests {
         let legacy = r#"{"session_id":"old","created_at":"2026-01-01T00:00:00"}"#;
         let meta: SessionMeta = serde_json::from_str(legacy).unwrap();
         assert_eq!(meta.created_at_ms, None);
+    }
+
+    #[test]
+    fn conversation_message_user_event_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        let id = log.conversation_message_user(
+            7,
+            crate::conversation::MessageProvenance::AskHumanAnswer,
+            "the raw answer",
+            Some(6),
+        );
+        drop(log);
+        let event = read_last_event(dir.path(), "conversation_message");
+        assert_eq!(event["data"]["message_id"].as_str(), Some(id.as_str()));
+        assert_eq!(event["data"]["message_seq"].as_u64(), Some(7));
+        assert_eq!(event["data"]["role"].as_str(), Some("user"));
+        assert_eq!(
+            event["data"]["provenance"].as_str(),
+            Some("ask_human_answer")
+        );
+        assert_eq!(event["data"]["text"].as_str(), Some("the raw answer"));
+        assert_eq!(event["data"]["ref_seq"].as_u64(), Some(6));
+        assert!(event["ts_ms"].as_i64().is_some());
+    }
+
+    #[test]
+    fn model_response_with_message_shares_one_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.model_response_with_message(3, "the full assistant text", 10, 5, 15, 0);
+        drop(log);
+
+        let diag = read_last_event(dir.path(), "model_response");
+        let canon = read_last_event(dir.path(), "conversation_message");
+        assert_eq!(canon["data"]["role"].as_str(), Some("assistant"));
+        assert_eq!(canon["data"]["provenance"].as_str(), Some("assistant"));
+        assert_eq!(canon["data"]["message_seq"].as_u64(), Some(3));
+        // Both events reference the SAME sidecar bytes — one write.
+        assert_eq!(canon["file"], diag["file"]);
+        assert_eq!(canon["data"]["model_offset"], diag["data"]["model_offset"]);
+        assert_eq!(canon["data"]["model_bytes"], diag["data"]["model_bytes"]);
+        // And the span resolves to the full text.
+        let relative = canon["file"].as_str().expect("sidecar file recorded");
+        let bytes = fs::read(dir.path().join(relative)).unwrap();
+        let offset = canon["data"]["model_offset"].as_u64().unwrap() as usize;
+        let len = canon["data"]["model_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(&bytes[offset..offset + len], b"the full assistant text");
+    }
+
+    #[test]
+    fn conversation_rewound_and_epoch_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.conversation_rewound(5, "tail_rollback");
+        log.conversation_message_epoch(&[
+            (1, "system".to_string(), "aaaa".to_string()),
+            (2, "user".to_string(), "bbbb".to_string()),
+        ]);
+        drop(log);
+
+        let rewound = read_last_event(dir.path(), "conversation_rewound");
+        assert_eq!(rewound["data"]["cut_after_seq"].as_u64(), Some(5));
+        assert_eq!(rewound["data"]["kind"].as_str(), Some("tail_rollback"));
+        assert!(rewound["data"]["superseded_at_ms"].as_i64().is_some());
+
+        let epoch = read_last_event(dir.path(), "conversation_message_epoch");
+        let mapping = epoch["data"]["mapping"].as_array().unwrap();
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(mapping[1][0].as_u64(), Some(2));
+        assert_eq!(mapping[1][1].as_str(), Some("user"));
+        assert_eq!(mapping[1][2].as_str(), Some("bbbb"));
+    }
+
+    #[test]
+    fn content_hash_hex16_is_stable() {
+        assert_eq!(content_hash_hex16("hello"), content_hash_hex16("hello"));
+        assert_ne!(content_hash_hex16("hello"), content_hash_hex16("hello!"));
+        assert_eq!(content_hash_hex16("x").len(), 16);
     }
 }

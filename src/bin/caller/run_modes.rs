@@ -1559,7 +1559,22 @@ pub(crate) async fn run_with_presence(
                     // emit a 0-turn event so the dashboard clears the
                     // pending state.
                     let removed = match target_native_message_count {
-                        Some(n) => conv.truncate_to(n as usize),
+                        Some(n) => {
+                            // Capture the surviving tail's seq BEFORE the
+                            // truncate: truncate_to appends synthetic
+                            // dangling-call repairs with fresh (higher)
+                            // seqs that must not shift the cut.
+                            let clamped = (n as usize).max(1).min(conv.len());
+                            let cut_after_seq =
+                                conv.messages().get(clamped - 1).map(|m| m.seq).unwrap_or(0);
+                            let removed = conv.truncate_to(n as usize);
+                            if removed > 0 {
+                                slog(&session_log, |l| {
+                                    l.conversation_rewound(cut_after_seq, "tail_rollback")
+                                });
+                            }
+                            removed
+                        }
                         None => 0,
                     };
                     bus.send(AppEvent::ConversationRolledBack {
@@ -2723,12 +2738,15 @@ pub(crate) async fn run_with_presence(
 
                 // Frame directory awareness
                 let frames_dir = log_dir.join("frames");
-                conv.add_user(format!(
-                    "[System] Video frames from the user's camera are stored at: {}\n\
+                conv.add_user(
+                    MessageProvenance::SystemInjection,
+                    format!(
+                        "[System] Video frames from the user's camera are stored at: {}\n\
                      Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
                      When you receive frame references, you can read them from this path.",
-                    frames_dir.display()
-                ));
+                        frames_dir.display()
+                    ),
+                );
                 conv.add_assistant("Understood.".to_string());
 
                 // Add task with optional frame images. Combine context-hint
@@ -2737,11 +2755,23 @@ pub(crate) async fn run_with_presence(
                 // image content the model should see alongside the task.
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
-                if combined_images.is_empty() {
-                    conv.add_user(task_text.clone());
+                let task_seq = if combined_images.is_empty() {
+                    conv.add_user(MessageProvenance::Task, task_text.clone())
                 } else {
-                    conv.add_user_with_images(task_text.clone(), combined_images);
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::Task,
+                        task_text.clone(),
+                        combined_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        task_seq,
+                        MessageProvenance::Task,
+                        &task_text,
+                        None,
+                    );
+                });
 
                 persistent_project = Some(proj);
                 persistent_provider = Some(task_provider);
@@ -2764,11 +2794,26 @@ pub(crate) async fn run_with_presence(
 
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
-                if combined_images.is_empty() {
-                    conv.add_user(format!("[New Task] {}", task_text));
+                let task_seq = if combined_images.is_empty() {
+                    conv.add_user(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                    )
                 } else {
-                    conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                        combined_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        task_seq,
+                        MessageProvenance::FollowUp,
+                        &task_text,
+                        None,
+                    );
+                });
             }
 
             if let Some(id) = envelope.steer_id.as_deref() {
@@ -2965,6 +3010,23 @@ pub(crate) async fn run_direct_mode(
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
+                // Mixed-version cutover: a legacy file (no seqs) gets them
+                // assigned once, and the epoch marker records the mapping so
+                // extractors can correlate (message-search plan §4).
+                if conv.ensure_seqs_assigned() {
+                    let mapping: Vec<(u64, String, String)> = conv
+                        .messages()
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.seq,
+                                m.role.clone(),
+                                session_log::content_hash_hex16(&m.content),
+                            )
+                        })
+                        .collect();
+                    slog(&session_log, |l| l.conversation_message_epoch(&mapping));
+                }
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Resumed conversation ({} messages, turn {})",
@@ -2975,11 +3037,23 @@ pub(crate) async fn run_direct_mode(
                 // Append the new task as a continuation message
                 let resume_msg = attachments
                     .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
-                if attachment_images.is_empty() {
-                    conv.add_user(resume_msg);
+                let resume_seq = if attachment_images.is_empty() {
+                    conv.add_user(MessageProvenance::ResumeTask, resume_msg)
                 } else {
-                    conv.add_user_with_images(resume_msg, attachment_images.clone());
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::ResumeTask,
+                        resume_msg,
+                        attachment_images.clone(),
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        resume_seq,
+                        MessageProvenance::ResumeTask,
+                        &task,
+                        None,
+                    );
+                });
                 conv
             }
             Err(e) => {
@@ -2991,24 +3065,31 @@ pub(crate) async fn run_direct_mode(
                 });
                 fresh_conversation = true;
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
-                setup_fresh_conversation_with_attachments(
+                let task_seq = setup_fresh_conversation_with_attachments(
                     &mut conv,
                     &project,
                     &attachments.text_with_file_prelude(&task),
                     attachment_images.clone(),
                 );
+                slog(&session_log, |l| {
+                    let _ =
+                        l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+                });
                 conv
             }
         }
     } else {
         fresh_conversation = true;
         let mut conv = Conversation::new(system_prompt, provider.context_window());
-        setup_fresh_conversation_with_attachments(
+        let task_seq = setup_fresh_conversation_with_attachments(
             &mut conv,
             &project,
             &attachments.text_with_file_prelude(&task),
             attachment_images.clone(),
         );
+        slog(&session_log, |l| {
+            let _ = l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+        });
         conv
     };
 
@@ -3019,7 +3100,7 @@ pub(crate) async fn run_direct_mode(
             let refs: Vec<&_> = kstore.entries.iter().collect();
             let msg = knowledge::format_for_injection(&refs);
             if !msg.is_empty() {
-                conversation.add_user(msg);
+                conversation.add_user(MessageProvenance::SystemInjection, msg);
                 conversation.add_assistant(
                     "Acknowledged. I have loaded the project knowledge.".to_string(),
                 );
