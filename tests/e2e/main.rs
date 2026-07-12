@@ -2781,3 +2781,623 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
 
     let _ = child.kill().await;
 }
+
+/// Shared assertions for the message-search wire contract (plan §4/§11):
+/// the intendant extractor consumes exactly these `session.jsonl` shapes,
+/// and its unit tests use fixtures of them — these helpers pin the shapes
+/// to the real binary so schema drift fails here instead of silently
+/// unindexing. Returns the parsed `conversation_message` rows.
+fn canonical_message_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let messages: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_message"))
+        .collect();
+    for row in &messages {
+        assert!(
+            msg_field(row, "message_id")
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "conversation_message without a message_id: {row}"
+        );
+        assert!(
+            msg_field(row, "message_seq").as_u64().is_some(),
+            "conversation_message without a message_seq: {row}"
+        );
+        assert!(
+            row.get("ts_ms").and_then(|v| v.as_i64()).is_some(),
+            "conversation_message without ts_ms: {row}"
+        );
+    }
+    let seqs: Vec<u64> = messages
+        .iter()
+        .filter_map(|row| msg_field(row, "message_seq").as_u64())
+        .collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        seqs.len(),
+        sorted.len(),
+        "message seqs must be unique: {seqs:?}"
+    );
+    messages
+}
+
+fn msg_field(row: &serde_json::Value, name: &str) -> serde_json::Value {
+    row.pointer(&format!("/data/{name}"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The user-side row with exactly this RAW text (no attachment preludes,
+/// no tool-result envelopes, no delivery wrappers).
+fn user_message_row<'rows>(
+    messages: &[&'rows serde_json::Value],
+    text: &str,
+) -> &'rows serde_json::Value {
+    messages
+        .iter()
+        .find(|row| {
+            msg_field(row, "role").as_str() == Some("user")
+                && msg_field(row, "text").as_str() == Some(text)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no user conversation_message with raw text {text:?}; rows:\n{}",
+                messages
+                    .iter()
+                    .map(|row| row.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+}
+
+/// Resolve an assistant row's sidecar span byte-for-byte, exactly like
+/// the extractor does.
+fn resolve_assistant_span(log_dir: &std::path::Path, row: &serde_json::Value) -> String {
+    let file = row
+        .get("file")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("assistant row without a sidecar file: {row}"));
+    let offset = msg_field(row, "model_offset")
+        .as_u64()
+        .unwrap_or_else(|| panic!("assistant row without model_offset: {row}"));
+    let len = msg_field(row, "model_bytes")
+        .as_u64()
+        .unwrap_or_else(|| panic!("assistant row without model_bytes: {row}"));
+    let bytes = std::fs::read(log_dir.join(file)).expect("read sidecar");
+    String::from_utf8_lossy(&bytes[offset as usize..(offset + len) as usize]).into_owned()
+}
+
+fn assert_assistant_spans_resolve(
+    log_dir: &std::path::Path,
+    messages: &[&serde_json::Value],
+    expected: &[&str],
+) {
+    let assistant_texts: Vec<String> = messages
+        .iter()
+        .filter(|row| msg_field(row, "role").as_str() == Some("assistant"))
+        .map(|row| resolve_assistant_span(log_dir, row))
+        .collect();
+    for text in expected {
+        assert!(
+            assistant_texts.iter().any(|resolved| resolved == text),
+            "no assistant span resolved to {text:?}; got {assistant_texts:?}"
+        );
+    }
+}
+
+fn parsed_session_rows(log_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let log = std::fs::read_to_string(log_dir.join("session.jsonl")).expect("read session.jsonl");
+    log.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Message-lane wire contract, supervised-session half: a create_session
+/// child run through task → askHuman answer → between-rounds steer writes
+/// canonical `conversation_message` rows with RAW user text (provenances
+/// `task` / `ask_human_answer` / `steer`), the askHuman projection's
+/// `ref_seq`, and assistant sidecar spans that resolve byte-for-byte. The
+/// steer rides the supervisor's parked-delivery fallback (`route_steer`
+/// queues an id-carrying steer as a follow-up when no active turn acks
+/// it) — the shape the dashboard uses. Conversation rollback deliberately
+/// lives in the OTHER half: a child parks in `run_round_loop`'s follow-up
+/// drain, which never sees `ConversationRollbackRequested`.
+#[tokio::test]
+async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Need input before charting.",
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 1, "question": "Which payload?" } }] },
+                { "content": "Round one done, payload chosen.",
+                  "expect_transcript_contains": "the emerald payload",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Steered round two.",
+                  "expect_transcript_contains": "steer toward the vault",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the askHuman e2e above.
+    let mut question = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "chart the payload course",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        question = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+        })
+        .await;
+        if question.is_some() {
+            break;
+        }
+    }
+    let question = question.unwrap_or_else(|| {
+        panic!(
+            "no user_question from the session's askHuman; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = question
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries its session id")
+        .to_string();
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .expect("user_question carries an id");
+    let question_text = question
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries the question text")
+        .to_string();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": session_id,
+            "id": question_id,
+            "answers": { question_text: "the emerald payload" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send answer_question");
+
+    // Round 1 completes (the transcript gate proved the answer landed).
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // A between-rounds steer. The id is load-bearing: only an id-carrying
+    // steer arms route_steer's no-active-turn fallback that delivers to a
+    // parked session, and the dashboard always sends one.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "steer-e2e-1",
+            "text": "steer toward the vault",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "steered round 2 never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Both rounds are already consumed above — only the stop half of the
+    // usual completion ritual remains (the session parks by design).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "action": "stop_session", "session_id": session_id })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send stop_session");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "stopped session never ended; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let _ = child.kill().await;
+
+    // ---- The wire contract the extractor consumes ----
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+
+    let task_row = user_message_row(&messages, "chart the payload course");
+    assert_eq!(msg_field(task_row, "provenance").as_str(), Some("task"));
+    let answer_row = user_message_row(&messages, "the emerald payload");
+    assert_eq!(
+        msg_field(answer_row, "provenance").as_str(),
+        Some("ask_human_answer")
+    );
+    assert!(
+        msg_field(answer_row, "ref_seq").as_u64().is_some(),
+        "the native-tool askHuman projection must reference its tool result: {answer_row}"
+    );
+    let steer_row = user_message_row(&messages, "steer toward the vault");
+    assert_eq!(msg_field(steer_row, "provenance").as_str(), Some("steer"));
+
+    assert_assistant_spans_resolve(
+        &log_dir,
+        &messages,
+        &[
+            "Need input before charting.",
+            "Round one done, payload chosen.",
+            "Steered round two.",
+        ],
+    );
+}
+
+/// Message-lane wire contract, rollback half: the HEADLESS shape (task on
+/// argv) is the one execution shape whose outer loop (run_with_presence)
+/// handles `ConversationRollbackRequested`, so the round-rollback rail —
+/// `GET /api/session/current/history` + `POST
+/// /api/session/current/rollback` — runs here. Two rounds (boot task with
+/// an askHuman answer, then a second task into the same primary session),
+/// then a conversation-only revert to round 1 must write a
+/// `conversation_rewound` row whose cut keeps round 1 and supersedes
+/// round 2 — exactly the SeqCut semantics the extractor derives
+/// supersession from.
+#[tokio::test]
+async fn headless_rollback_writes_a_conversation_rewound_cut() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                // The boot task starts before any websocket can connect,
+                // and rail events do not replay to late joiners — the
+                // scripted think-time holds the question back until this
+                // test's connection is up.
+                { "content": "Need input before charting.",
+                  "delay_ms": 8_000,
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 1, "question": "Which payload?" } }] },
+                { "content": "Round one done, payload chosen.",
+                  "expect_transcript_contains": "the emerald payload",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Second round response.",
+                  "expect_transcript_contains": "chase the decoy",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    // The rollback rail needs the file watcher's round history, which a
+    // projectless run turns off — mark the rig project.
+    std::fs::write(rig.project.path().join("intendant.toml"), "").expect("project marker");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script).args([
+        "--no-tls",
+        "--web",
+        "0",
+        "--direct",
+        "chart the payload course",
+    ]);
+    let mut child = cmd.spawn().expect("spawn intendant with a boot task");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+    // The primary (boot) session announces its id and log dir at startup.
+    let primary_id = stderr_so_far
+        .lines()
+        .find_map(|line| line.strip_prefix("Session ID: "))
+        .expect("parse the primary session id from the startup lines")
+        .trim()
+        .to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "no user_question from the boot task's askHuman; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = question
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&primary_id)
+        .to_string();
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .expect("user_question carries an id");
+    let question_text = question
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries the question text")
+        .to_string();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": session_id,
+            "id": question_id,
+            "answers": { question_text: "the emerald payload" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send answer_question");
+
+    let round_complete_for_primary = |json: &serde_json::Value, session_id: &str| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| id == session_id)
+    };
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        round_complete_for_primary(json, &session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // Round 2: a second task into the SAME primary session (the dispatcher
+    // claims start_task for the primary id; the supervisor would claim an
+    // id-less one as a fresh child session).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "start_task",
+            "session_id": primary_id,
+            "task": "chase the decoy",
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send start_task");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        round_complete_for_primary(json, &session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 2 never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Conversation-only revert to the first recorded round, through the
+    // dashboard's route (the production `conversation_rewound` path).
+    // Idle-state and history-visibility race the round_complete event, so
+    // poll both.
+    let client = reqwest::Client::new();
+    let stderr_ctx = stderr_buf.clone();
+    let first_round_id = poll_until(
+        "the session history to list its first round",
+        Duration::from_secs(30),
+        || {
+            let client = client.clone();
+            async move {
+                let history = http_get_json(
+                    &client,
+                    &format!("http://127.0.0.1:{port}/api/session/current/history"),
+                )
+                .await?;
+                history
+                    .get("rounds")?
+                    .as_array()?
+                    .first()?
+                    .get("id")?
+                    .as_u64()
+            }
+        },
+        move || stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default(),
+    )
+    .await;
+    let stderr_ctx = stderr_buf.clone();
+    poll_until(
+        "the rollback route to accept the revert",
+        Duration::from_secs(30),
+        || {
+            let client = client.clone();
+            async move {
+                let response = client
+                    .post(format!(
+                        "http://127.0.0.1:{port}/api/session/current/rollback"
+                    ))
+                    .json(&serde_json::json!({
+                        "round_id": first_round_id,
+                        "revert_conversation": true,
+                        "revert_files": false,
+                    }))
+                    .send()
+                    .await
+                    .ok()?;
+                response.status().is_success().then_some(())
+            }
+        },
+        move || stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default(),
+    )
+    .await;
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("conversation_rolled_back")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "conversation rollback never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Every event row is flushed per write; killing the daemon loses
+    // nothing, and the primary session is not user-stoppable anyway.
+    let _ = child.kill().await;
+
+    // ---- The wire contract the extractor consumes ----
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+
+    let task_row = user_message_row(&messages, "chart the payload course");
+    assert_eq!(msg_field(task_row, "provenance").as_str(), Some("task"));
+    let answer_row = user_message_row(&messages, "the emerald payload");
+    assert_eq!(
+        msg_field(answer_row, "provenance").as_str(),
+        Some("ask_human_answer")
+    );
+    assert!(
+        msg_field(answer_row, "ref_seq").as_u64().is_some(),
+        "the native-tool askHuman projection must reference its tool result: {answer_row}"
+    );
+    let round2_row = user_message_row(&messages, "chase the decoy");
+    assert_assistant_spans_resolve(
+        &log_dir,
+        &messages,
+        &[
+            "Need input before charting.",
+            "Round one done, payload chosen.",
+            "Second round response.",
+        ],
+    );
+
+    // The rollback cut partitions round 2 strictly after the cut, with
+    // all of round 1 surviving — the SeqCut semantics the extractor
+    // derives supersession from.
+    let rewound = rows
+        .iter()
+        .find(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_rewound"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no conversation_rewound row; session log:\n{}",
+                tail(&rig.session_logs(), 6000)
+            )
+        });
+    assert_eq!(msg_field(rewound, "kind").as_str(), Some("tail_rollback"));
+    assert!(
+        msg_field(rewound, "superseded_at_ms").as_i64().is_some(),
+        "conversation_rewound must stamp superseded_at_ms: {rewound}"
+    );
+    let cut_after_seq = msg_field(rewound, "cut_after_seq")
+        .as_u64()
+        .expect("conversation_rewound carries cut_after_seq");
+    let round1_max = ["chart the payload course", "the emerald payload"]
+        .iter()
+        .map(|text| {
+            msg_field(user_message_row(&messages, text), "message_seq")
+                .as_u64()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    let round2_seq = msg_field(round2_row, "message_seq").as_u64().unwrap();
+    assert!(
+        round1_max <= cut_after_seq && cut_after_seq < round2_seq,
+        "cut_after_seq {cut_after_seq} must keep round 1 (max seq {round1_max}) and \
+         supersede round 2 (seq {round2_seq})"
+    );
+}
