@@ -513,41 +513,12 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
         tunnel: false,
         note: "ICE leg of display_offer",
     },
-    // ---- /ws only: legacy web-TUI lane (dead, preserved verbatim) ----
-    // The embedded web TUI's frame handlers were removed when the TUI was
-    // gutted (84afe9d8); nothing consumes these kinds on /ws anymore, and
-    // no tunnel twin ever existed. The gate rows survive verbatim because
-    // dropping a frame kind changes observable behavior for scoped
-    // clients (denial frame vs silence) — an owner decision, not
-    // refactor fallout.
-    FrameLaneSpec {
-        frame: "key",
-        op: Some(PeerOperation::RuntimeControl),
-        ws: true,
-        tunnel: false,
-        note: "legacy web-TUI keystroke into the daemon's own runtime (handlers gone; see above)",
-    },
-    FrameLaneSpec {
-        frame: "resize",
-        op: Some(PeerOperation::RuntimeControl),
-        ws: true,
-        tunnel: false,
-        note: "legacy web-TUI terminal resize (handlers gone; see above)",
-    },
-    FrameLaneSpec {
-        frame: "term_subscribe",
-        op: Some(PeerOperation::RuntimeControl),
-        ws: true,
-        tunnel: false,
-        note: "legacy web-TUI output subscription (handlers gone; see above)",
-    },
-    FrameLaneSpec {
-        frame: "term_unsubscribe",
-        op: Some(PeerOperation::RuntimeControl),
-        ws: true,
-        tunnel: false,
-        note: "legacy web-TUI output unsubscription (handlers gone; see above)",
-    },
+    // The legacy web-TUI lane (`key`, `resize`, `term_subscribe`,
+    // `term_unsubscribe`) lived here until the owner dropped it
+    // (2026-07-11). Its /ws handlers died when the TUI was gutted
+    // (84afe9d8) and no tunnel twin ever existed; the kinds now take the
+    // unknown-frame path — no denial frame, /ws silence. The golden
+    // mapping pins them at `None` so a merge can't resurrect the rows.
     // ---- /ws only: live voice/media presence machinery ----
     // The tunnel carries this family wrapped in a single presence_frame
     // envelope (its own row below); /ws speaks the kinds raw. Method-lane
@@ -1326,13 +1297,16 @@ mod tests {
             ("set_diagnostics_visual_marker",  Some(DisplayInput),   None),
             ("display_offer",                  Some(DisplayView),    None),
             ("display_ice",                    Some(DisplayView),    None),
-            // -- /ws only: legacy web-TUI lane (handlers gutted with the
-            //    TUI, 84afe9d8; the gate rows survive verbatim — dropping
-            //    the kinds is an owner decision, not refactor fallout) --
-            ("key",                            Some(RuntimeControl), None),
-            ("resize",                         Some(RuntimeControl), None),
-            ("term_subscribe",                 Some(RuntimeControl), None),
-            ("term_unsubscribe",               Some(RuntimeControl), None),
+            // -- dropped: the legacy web-TUI lane (owner decision,
+            //    2026-07-11). Handlers were gutted with the TUI
+            //    (84afe9d8); the gate rows are now gone too, so these
+            //    kinds answer like any unknown kind — no blanket
+            //    authority, no denial frame, /ws unknown-frame silence.
+            //    Pinned at `None` so a merge can't resurrect the rows. --
+            ("key",                            None,                 None),
+            ("resize",                         None,                 None),
+            ("term_subscribe",                 None,                 None),
+            ("term_unsubscribe",               None,                 None),
             // -- /ws only: live voice/media presence machinery --
             ("presence_connect",               Some(RuntimeControl), None),
             ("presence_disconnect",            Some(RuntimeControl), None),
