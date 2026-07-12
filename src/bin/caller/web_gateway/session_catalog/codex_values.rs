@@ -3,30 +3,19 @@
 
 use super::*;
 
-pub(crate) fn value_str(v: &serde_json::Value, key: &str) -> Option<String> {
-    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
-}
-
-pub(crate) fn codex_exec_command_workdir(payload: &serde_json::Value) -> Option<String> {
-    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call")
-        || payload.get("name").and_then(|v| v.as_str()) != Some("exec_command")
-    {
-        return None;
-    }
-
-    let arguments = payload.get("arguments")?;
-    let parsed_arguments;
-    let arguments = if let Some(raw) = arguments.as_str() {
-        parsed_arguments = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-        &parsed_arguments
-    } else {
-        arguments
-    };
-
-    value_str(arguments, "workdir")
-        .or_else(|| value_str(arguments, "cwd"))
-        .filter(|value| !value.trim().is_empty())
-}
+// Pure-move shims (message-search F3 phase 1): the rollout-line shapes and
+// shared transcript-text vocabulary now live under `external_agent`; every
+// existing catalog-side path keeps compiling through these re-exports.
+// Phase 2 consolidates the remaining duplicate parsers onto those modules.
+pub(crate) use crate::external_agent::codex::rollout::{
+    codex_event_message_text, codex_exec_command_workdir, codex_function_call_command,
+    codex_function_call_id, codex_function_call_output, codex_line_may_affect_replay,
+    codex_line_may_affect_session_list, codex_payload_text, codex_response_item_id,
+    codex_thread_rollback_anchor, is_codex_injected_user_text, value_str, ExternalJsonLineKind,
+};
+pub(crate) use crate::external_agent::transcript_text::{
+    is_injected_external_user_text, message_content_text, message_prose_text,
+};
 
 pub(crate) fn compact_text(s: &str, max: usize) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -49,52 +38,6 @@ pub(crate) fn preview_text(s: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
-}
-
-pub(crate) fn message_content_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|item| {
-                    item.get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Prose-only variant of [`message_content_text`] for row previews: string
-/// content passes through, but array content contributes only explicit
-/// `type == "text"` blocks — tool_use/tool_result blocks (whose `content`
-/// can be a plain string) must never leak into a conversation preview.
-pub(crate) fn message_prose_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<&str> = items
-                .iter()
-                .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("text"))
-                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Compact conversation preview carried on session list rows: the first
@@ -181,129 +124,6 @@ impl SessionPreviewBuilder {
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct ExternalJsonLineKind<'a> {
-    #[serde(rename = "type", borrow)]
-    pub(crate) kind: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    pub(crate) payload: Option<ExternalJsonPayloadKind<'a>>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ExternalJsonPayloadKind<'a> {
-    #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
-}
-
-pub(crate) fn codex_line_may_affect_replay(line: &str) -> bool {
-    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
-        return true;
-    };
-    let payload_kind = kind
-        .payload
-        .as_ref()
-        .and_then(|payload| payload.kind.as_deref());
-    match (kind.kind.as_deref(), payload_kind) {
-        (Some("session_meta"), _) => true,
-        (
-            _,
-            Some(
-                "thread_rolled_back"
-                | "thread_goal_updated"
-                | "thread_goal_cleared"
-                | "user_message"
-                | "agent_message"
-                | "message",
-            ),
-        ) => true,
-        // All response items must reach the parser so item-anchor rewinds can locate
-        // their anchor — including non-message items (function_call, reasoning) that
-        // render no transcript entry but are the usual targets of a noise-trim rewind.
-        (Some("response_item"), _) => true,
-        (Some("event_msg"), None) => true,
-        (None, _) => true,
-        _ => false,
-    }
-}
-
-/// Item id carried by a `response_item` rollout line (the id an item-anchor rewind
-/// targets), or `None` for other line kinds / items without an id.
-pub(crate) fn codex_response_item_id(obj: &serde_json::Value) -> Option<String> {
-    if obj.get("type").and_then(|v| v.as_str()) != Some("response_item") {
-        return None;
-    }
-    obj.get("payload")
-        .and_then(|payload| payload.get("id"))
-        .or_else(|| obj.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-pub(crate) fn codex_line_may_affect_session_list(line: &str) -> bool {
-    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
-        return true;
-    };
-    let payload_kind = kind
-        .payload
-        .as_ref()
-        .and_then(|payload| payload.kind.as_deref());
-    matches!(
-        (kind.kind.as_deref(), payload_kind),
-        (Some("session_meta" | "turn_context"), _)
-            | (Some("event_msg"), _)
-            | (Some("response_item"), Some("message" | "function_call"))
-            | (Some("response_item"), None)
-            | (None, _)
-    )
-}
-
-pub(crate) fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
-    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
-        return None;
-    }
-    let role = payload
-        .get("role")
-        .and_then(|v| v.as_str())
-        .unwrap_or("message")
-        .to_string();
-    let content = payload.get("content")?;
-    message_content_text(content).map(|text| (role, text))
-}
-
-pub(crate) fn codex_function_call_id(payload: &serde_json::Value) -> Option<String> {
-    value_str(payload, "call_id")
-        .or_else(|| value_str(payload, "callId"))
-        .or_else(|| value_str(payload, "id"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-pub(crate) fn codex_function_call_arguments(
-    payload: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let arguments = payload.get("arguments")?;
-    if let Some(raw) = arguments.as_str() {
-        serde_json::from_str::<serde_json::Value>(raw).ok()
-    } else {
-        Some(arguments.clone())
-    }
-}
-
-pub(crate) fn codex_function_call_command(payload: &serde_json::Value) -> Option<String> {
-    let name = value_str(payload, "name")?;
-    if name != "exec_command" {
-        return Some(name);
-    }
-    let arguments = codex_function_call_arguments(payload)?;
-    value_str(&arguments, "cmd")
-        .or_else(|| value_str(&arguments, "command"))
-        .or_else(|| value_str(&arguments, "script"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or(Some(name))
-}
-
 pub(crate) fn codex_function_call_projection(
     payload: &serde_json::Value,
     response_item_id: Option<&str>,
@@ -332,21 +152,6 @@ pub(crate) fn codex_function_call_projection(
             "turn_id": turn_id,
         }),
     ))
-}
-
-pub(crate) fn codex_function_call_output(
-    payload: &serde_json::Value,
-) -> Option<(Option<String>, String)> {
-    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call_output") {
-        return None;
-    }
-    let raw_output = value_str(payload, "output")?;
-    let output = crate::external_agent::codex::strip_codex_tool_output_envelope(&raw_output);
-    if output.trim().is_empty() {
-        return None;
-    }
-    let output_id = codex_function_call_id(payload);
-    Some((output_id, output))
 }
 
 pub(crate) fn codex_session_goal_from_value(goal: &serde_json::Value) -> Option<SessionGoal> {
@@ -415,59 +220,6 @@ pub(crate) fn codex_session_goal_entry(
             "goal": goal,
         },
     })
-}
-
-pub(crate) fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, String)> {
-    match payload.get("type").and_then(|v| v.as_str())? {
-        "user_message" => value_str(payload, "message").map(|text| ("user".to_string(), text)),
-        "agent_message" => {
-            value_str(payload, "message").map(|text| ("assistant".to_string(), text))
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn codex_thread_rollback_anchor(
-    payload: &serde_json::Value,
-) -> Option<(String, String)> {
-    let anchor = payload.get("anchor")?;
-    let item_id = value_str(anchor, "itemId")
-        .or_else(|| value_str(anchor, "item_id"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
-    let position = value_str(anchor, "position")
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s == "before" || s == "after")
-        .unwrap_or_else(|| "after".to_string());
-    Some((item_id, position))
-}
-
-/// Harness-injected "user" text no human actually typed — Codex wrappers,
-/// Claude Code local-command plumbing, notification envelopes. One shared
-/// vocabulary for every external-transcript surface (Codex history, Codex
-/// catalog rows, Claude Code transcript replay): rendering these verbatim
-/// puts `<local-command-caveat>` rows in the Activity log.
-pub(crate) fn is_injected_external_user_text(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("# AGENTS.md instructions for ")
-        || trimmed.starts_with("<turn_aborted>")
-        || trimmed.starts_with("<subagent_notification>")
-        || trimmed.starts_with("<environment_context>")
-        || trimmed.starts_with("<task-notification>")
-        || trimmed.starts_with("<command-name>")
-        || trimmed.starts_with("<command-message>")
-        || trimmed.starts_with("<command-args>")
-        || trimmed.starts_with("<local-command-caveat>")
-        || trimmed.starts_with("<local-command-stdout>")
-        || trimmed.starts_with("<local-command-stderr>")
-        || trimmed.starts_with("<bash-input>")
-        || trimmed.starts_with("<bash-stdout>")
-        || trimmed.starts_with("<bash-stderr>")
-        || trimmed.starts_with("<user_shell_command>")
-}
-
-pub(crate) fn is_codex_injected_user_text(text: &str) -> bool {
-    is_injected_external_user_text(text)
 }
 
 pub(crate) fn codex_thread_display_name(value: Option<String>) -> Option<String> {

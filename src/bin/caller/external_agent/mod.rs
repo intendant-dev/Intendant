@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
+pub(crate) mod transcript_text;
 
 /// Backend-neutral side-conversation contract: what a `/side`/`/btw` child
 /// may and may not do with the parent's inherited history. Codex injects it
