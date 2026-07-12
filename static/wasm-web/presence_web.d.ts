@@ -179,7 +179,17 @@ export class PresenceWeb {
      * need to go through the WASM state machine or serde conversion.
      */
     send_raw(json_str: string): boolean;
-    send_server_action(action: any): void;
+    /**
+     * Send a ControlMsg action (or transport frame) to the server.
+     * Returns true when the message was handed to an OPEN server
+     * WebSocket (or accepted by the installed custom sender); false
+     * when the socket is missing/not-open, the send threw, or the
+     * value failed to deserialize. Callers use false to fail fast
+     * (e.g. the dashboard's control-tunnel signaling) instead of
+     * waiting on a reply that can never arrive; callers that ignore
+     * the return keep working.
+     */
+    send_server_action(action: any): boolean;
     /**
      * Inject a user message into the currently running turn. Sends
      * ControlMsg::Steer via the WebSocket with a client-generated id so
@@ -398,7 +408,7 @@ export interface InitOutput {
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_question_answers: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_raw: (a: number, b: number, c: number) => number;
-    readonly presenceweb_send_server_action: (a: number, b: any) => void;
+    readonly presenceweb_send_server_action: (a: number, b: any) => number;
     readonly presenceweb_send_steer: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_text_passive: (a: number, b: number, c: number) => void;

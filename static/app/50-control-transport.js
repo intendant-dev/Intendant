@@ -934,8 +934,14 @@ class DashboardControlTransport {
 
   sendWsSignal(frame) {
     if (app && app.send_server_action) {
-      app.send_server_action(frame);
-      return true;
+      // send_server_action reports whether the frame was handed to an OPEN
+      // legacy /ws socket (false: socket missing, not open, or the send
+      // threw). In the macOS-app mTLS posture that socket never connects,
+      // so a refused send must fail the handshake immediately instead of
+      // letting the caller wait out the 30 s readiness poll on an offer
+      // that never left the browser. QA probes stub send_server_action
+      // with undefined-returning counters; only an explicit false refuses.
+      return app.send_server_action(frame) !== false;
     }
     return false;
   }
@@ -1008,6 +1014,11 @@ class DashboardControlTransport {
         dashboardUpdateTransportStatus();
         return null;
       }
+      // Both signaling lanes refused (local HTTP failed, no open /ws for
+      // the fallback): the offer never left the browser. Classify as a
+      // signaling failure — connect() rejects, startControl resolves
+      // false, and the reconnect runner fails the cycle right away.
+      if (!err.controlErrorKind) err.controlErrorKind = 'signaling';
       throw err;
     }
   }

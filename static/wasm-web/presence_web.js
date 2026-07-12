@@ -429,10 +429,20 @@ export class PresenceWeb {
         return ret !== 0;
     }
     /**
+     * Send a ControlMsg action (or transport frame) to the server.
+     * Returns true when the message was handed to an OPEN server
+     * WebSocket (or accepted by the installed custom sender); false
+     * when the socket is missing/not-open, the send threw, or the
+     * value failed to deserialize. Callers use false to fail fast
+     * (e.g. the dashboard's control-tunnel signaling) instead of
+     * waiting on a reply that can never arrive; callers that ignore
+     * the return keep working.
      * @param {any} action
+     * @returns {boolean}
      */
     send_server_action(action) {
-        wasm.presenceweb_send_server_action(this.__wbg_ptr, action);
+        const ret = wasm.presenceweb_send_server_action(this.__wbg_ptr, action);
+        return ret !== 0;
     }
     /**
      * Inject a user message into the currently running turn. Sends
@@ -1161,6 +1171,10 @@ function __wbg_get_imports() {
         },
         __wbg_push_8ffdcb2063340ba5: function(arg0, arg1) {
             const ret = arg0.push(arg1);
+            return ret;
+        },
+        __wbg_random_912284dbf636f269: function() {
+            const ret = Math.random();
             return ret;
         },
         __wbg_readyState_1bb73ec7b8a54656: function(arg0) {

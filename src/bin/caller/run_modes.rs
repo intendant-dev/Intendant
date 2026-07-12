@@ -400,14 +400,19 @@ pub(crate) async fn run_with_presence(
                     }
                 }
                 Ok(AppEvent::ConversationRollbackRequested {
+                    session_id,
                     round_id,
                     target_native_message_count,
                     turns_to_drop,
-                }) => OuterSignal::ConversationRollback {
-                    round_id,
-                    target_native_message_count,
-                    turns_to_drop,
-                },
+                }) if session_id.is_none()
+                    || event_targets_session(&session_id, &local_session_id) =>
+                {
+                    OuterSignal::ConversationRollback {
+                        round_id,
+                        target_native_message_count,
+                        turns_to_drop,
+                    }
+                }
                 Ok(AppEvent::InterruptRequested { session_id })
                     if event_targets_session(&session_id, &local_session_id) =>
                 {
@@ -1519,6 +1524,7 @@ pub(crate) async fn run_with_presence(
                     match agent.rollback_turns(turns_to_drop).await {
                         Ok(()) => {
                             bus.send(AppEvent::ConversationRolledBack {
+                                session_id: local_session_id.clone(),
                                 round_id,
                                 turns_removed: turns_to_drop,
                                 backend: backend_name,
@@ -1545,6 +1551,7 @@ pub(crate) async fn run_with_presence(
                             persistent_codex_config = None;
                             persistent_claude_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
+                                session_id: local_session_id.clone(),
                                 round_id,
                                 turns_removed: turns_to_drop,
                                 backend: backend_name,
@@ -1579,6 +1586,7 @@ pub(crate) async fn run_with_presence(
                         None => 0,
                     };
                     bus.send(AppEvent::ConversationRolledBack {
+                        session_id: local_session_id.clone(),
                         round_id,
                         turns_removed: removed as u32,
                         backend: "native".into(),
@@ -1588,6 +1596,7 @@ pub(crate) async fn run_with_presence(
                     // No conversation to revert — emit completion
                     // anyway so the dashboard doesn't wait forever.
                     bus.send(AppEvent::ConversationRolledBack {
+                        session_id: local_session_id.clone(),
                         round_id,
                         turns_removed: 0,
                         backend: "native".into(),
