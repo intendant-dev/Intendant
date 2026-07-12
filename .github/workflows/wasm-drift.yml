@@ -41,16 +41,6 @@ jobs:
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
     timeout-minutes: 30
-    # Serialize the rebuild repo-wide: both Mac listeners share the
-    # account's ~/Library/Caches/.wasm-pack, and two cold jobs
-    # cargo-installing wasm-bindgen concurrently race the final rename
-    # ("Directory not empty", seen live 2026-07-11 when a probe PR and
-    # another PR's gate ran side by side). Warm caches don't race, but
-    # every wasm-bindgen/wasm-opt version bump re-opens the cold window
-    # — queue the jobs instead (they are minutes; skips are seconds).
-    concurrency:
-      group: wasm-drift-rebuild
-      cancel-in-progress: false
     strategy:
       matrix:
         include:
@@ -104,27 +94,44 @@ jobs:
       # The pinned wasm-pack, installed on first use per runner account
       # (~/.cargo/bin persists on the fleet; hosted runners pay the
       # install only when a fork PR actually touches wasm inputs).
-      - name: Install pinned wasm-pack (if missing)
+      #
+      # Install + rebuild run under ONE flock on the account's cache dir:
+      # both Mac listeners share ~/Library/Caches/.wasm-pack, and two cold
+      # jobs cargo-installing wasm-bindgen concurrently race the final
+      # rename into that cache ("Directory not empty", live 2026-07-11).
+      # This was first serialized with a repo-wide job concurrency group —
+      # WRONG: GitHub keeps only ONE pending job per group, so each newly
+      # arriving gate job CANCELS the previously pending one, and a
+      # cancelled required check fails innocent PRs (live 2026-07-12). An
+      # flock queues honestly: concurrent jobs wait (minutes at worst),
+      # nothing is cancelled, and single-tenant hosted runners sail
+      # through uncontended.
+      - name: Install pinned wasm-pack + rebuild artifacts (serialized)
         if: steps.relevance.outputs.relevant == 'true'
         shell: bash
         run: |
+          python3 - <<'PYLOCK'
+          import fcntl, os, subprocess, sys
+          lockpath = os.path.expanduser("~/.cache/intendant-ci/wasm-rebuild.lock")
+          os.makedirs(os.path.dirname(lockpath), exist_ok=True)
+          fh = open(lockpath, "w")
+          fcntl.flock(fh, fcntl.LOCK_EX)
+          body = '''
+          set -euo pipefail
           want=$(cat .wasm-pack-version)
           have=$(wasm-pack --version 2>/dev/null | awk '{print $2}' || true)
           if [ "$have" != "$want" ]; then
             cargo install wasm-pack --version "$want" --locked
           fi
           wasm-pack --version
+          bash scripts/build-wasm.sh
+          '''
+          sys.exit(subprocess.call(["bash", "-c", body]))
+          PYLOCK
 
-      # Through the canonical builder so the gate's flags can never
-      # drift from the producers' (scripts/build-wasm.sh carries the
-      # registry-path remap that makes artifact bytes
-      # account-independent — without it, dependency panic-locations
-      # embed the building account's cargo registry path and the CI
-      # account's rebuild can never byte-match dev-built artifacts).
-      - name: Rebuild WASM artifacts
-        if: steps.relevance.outputs.relevant == 'true'
-        shell: bash
-        run: bash scripts/build-wasm.sh
+      # (The rebuild itself goes through scripts/build-wasm.sh inside the
+      # serialized step above — the canonical builder carries the
+      # registry-path remap that makes artifact bytes account-independent.)
 
       - name: Committed artifacts must match the rebuild
         if: steps.relevance.outputs.relevant == 'true'
