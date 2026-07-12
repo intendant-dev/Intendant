@@ -26,16 +26,42 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Ceiling for a `--web` daemon to bind its port and serve the agent card
-/// on a cold CI runner.
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
+/// on a cold CI runner. The deadline guards a daemon that comes up wedged —
+/// alive but never serving its gateway — a permanent failure class that any
+/// bound catches; a *crashed* daemon is caught immediately by the boot
+/// poll's child-exit check regardless of this value, and a healthy boot
+/// returns on its first successful poll, so headroom costs green runs
+/// nothing. 60s was blown once by a healthy debug-build boot on the fleet
+/// Mac leg at load >20 on 12 cores (2026-07-12), so 180s — the same scale
+/// as RUN_TIMEOUT's one-shot ceiling — shrugs off runner load without
+/// weakening the guard.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Deadline for the load-sensitive cross-daemon waits in the federated peer
 /// test (the A->B connection forming, the delegated task completing on B).
 /// A 90s ceiling was blown twice by a healthy tree on a loaded CI box —
 /// debug binaries, several daemons, and concurrent jobs stack up — and the
 /// suite's wall-clock cost is bounded by how fast the waits *succeed*, not
-/// by this deadline, so be generous.
+/// by this deadline, so be generous. (The Windows leg blew even 240s on the
+/// task-completion wait on 2026-07-12; that incident's likely mechanism — a
+/// lost fire-and-forget StartTask — is addressed structurally with an
+/// arrival gate plus one re-delegation, see [`PEER_TASK_ARRIVAL_GRACE`],
+/// rather than by inflating this bound.)
 const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// Grace window for a delegated peer task to *arrive* on the receiving
+/// daemon: session launch writes "[runtime] Task dispatched: <task>" into
+/// its session.jsonl before any model turn runs, so arrival needs only the
+/// StartTask frame crossing loopback plus a session launch — much less than
+/// the full scripted run [`PEER_WAIT_TIMEOUT`] budgets for. When this
+/// window closes with no trace of the task on the peer, the delegation is
+/// treated as lost in flight (the /ws control plane is fire-and-forget; the
+/// task id `ctl peer task` prints is minted by the *sender* after the WS
+/// write, so it never proves receipt) and the test re-delegates once.
+/// Guessing wrong on a merely-slow runner is harmless: the mock provider
+/// matches profiles per session, so a duplicate delegation just runs the
+/// same scripted steps in a second session.
+const PEER_TASK_ARRIVAL_GRACE: Duration = Duration::from_secs(60);
 
 fn intendant_bin() -> &'static str {
     // Referencing the runtime binary's env var makes Cargo build it too —
@@ -222,6 +248,24 @@ impl DaemonRig {
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
         tail(&contents, 4000)
     }
+
+    /// Tail of the daemon's durable federated peer-event record
+    /// (`.intendant/logs/peers.jsonl` under the isolated home; see
+    /// `peer::spawn_peer_log_writer`), for failure context: connection
+    /// transitions and delegation-time activity live here, on the
+    /// *sending* daemon, where a lost cross-daemon message leaves its
+    /// only trace.
+    fn peer_log_tail(&self) -> String {
+        let path = self
+            .rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("peers.jsonl");
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        tail(&contents, 4000)
+    }
 }
 
 /// Spawn an idle daemon (no task) with the given mock script and wait until
@@ -376,6 +420,26 @@ async fn connected_peer(client: &reqwest::Client, port: u16) -> Option<serde_jso
         .cloned()
 }
 
+/// [`poll_until`]'s non-panicking core: poll `probe` every 250 ms until it
+/// yields `Some`, or return `None` once `timeout` elapses — for
+/// opportunistic waits where the caller has a recovery move on a miss
+/// (e.g. re-delegating a possibly-lost peer task) rather than a verdict.
+async fn try_poll_until<T, Fut>(timeout: Duration, mut probe: impl FnMut() -> Fut) -> Option<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(found) = probe().await {
+            return Some(found);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Poll `probe` every 250 ms until it yields `Some`, panicking after
 /// `timeout` — the suite's polling convention for daemon-shaped tests
 /// (one-shot runs use [`TestRig::run`]'s hard timeout instead). On timeout
@@ -385,24 +449,18 @@ async fn connected_peer(client: &reqwest::Client, port: u16) -> Option<serde_jso
 async fn poll_until<T, Fut>(
     what: &str,
     timeout: Duration,
-    mut probe: impl FnMut() -> Fut,
+    probe: impl FnMut() -> Fut,
     context: impl Fn() -> String,
 ) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(found) = probe().await {
-            return found;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out after {timeout:?} waiting for {what}:\n{}",
-                context()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    match try_poll_until(timeout, probe).await {
+        Some(found) => found,
+        None => panic!(
+            "timed out after {timeout:?} waiting for {what}:\n{}",
+            context()
+        ),
     }
 }
 
@@ -2049,6 +2107,26 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     let mut a = spawn_daemon(&client, &idle_script, port_a).await;
     let mut b = spawn_daemon(&client, &peer_script, port_b).await;
 
+    // Failure forensics shared by every cross-daemon wait below. Always
+    // dump BOTH sides: the narrative of a delegation lost in flight lives
+    // on A (connection transitions in its daemon log, the durable
+    // peer-event record in its peers.jsonl), while only session activity
+    // shows on B — a B-only dump cannot distinguish "B is slow" from "B
+    // never received the task" (the blind spot of the 2026-07-12 Windows
+    // timeout, which dumped B alone).
+    let dump_daemons = || {
+        format!(
+            "--- daemon A log tail ---\n{}\n\
+             --- daemon A peers.jsonl tail ---\n{}\n\
+             --- daemon B log tail ---\n{}\n\
+             --- daemon B session logs (tail) ---\n{}",
+            a.log_tail(),
+            a.peer_log_tail(),
+            b.log_tail(),
+            tail(&b.rig.session_logs(), 4000),
+        )
+    };
+
     // Zero peers: a fresh daemon lists an empty registry.
     let empty = ctl(&a, &["peer", "list"]).await;
     assert!(empty.status.success(), "{}", text_of(&empty));
@@ -2084,13 +2162,7 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
             let client = client.clone();
             async move { connected_peer(&client, port_a).await }
         },
-        || {
-            format!(
-                "--- daemon A log tail ---\n{}\n--- daemon B log tail ---\n{}",
-                a.log_tail(),
-                b.log_tail()
-            )
-        },
+        &dump_daemons,
     )
     .await;
     let peer_id = peer
@@ -2153,6 +2225,51 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         text_of(&task)
     );
 
+    // That task_id proves less than it looks like: it is minted on A
+    // *after* the StartTask frame enters A's socket (the /ws control plane
+    // is fire-and-forget — nothing echoes back from B; see
+    // `IntendantWsTransport::send` in src/bin/caller/peer/transport/
+    // intendant.rs). If the connection dies before B reads the frame, A's
+    // actor quietly reconnects with backoff but nothing re-sends the
+    // delegation — the completion wait below would then run out its whole
+    // deadline against a daemon that was never asked to do anything
+    // (Windows CI 2026-07-12: 240s blown by a tree that passes locally in
+    // ~6s). B's session launch writes "[runtime] Task dispatched: <task>"
+    // into session.jsonl before any model turn, so use that as the arrival
+    // signal: if it hasn't appeared within the grace window, re-confirm the
+    // connection and re-delegate once (harmless if the first delegation
+    // was merely slow — see PEER_TASK_ARRIVAL_GRACE).
+    let arrived = try_poll_until(PEER_TASK_ARRIVAL_GRACE, || {
+        let logs = b.rig.session_logs();
+        async move { logs.contains(TASK_MARK).then_some(()) }
+    })
+    .await
+    .is_some();
+    if !arrived {
+        eprintln!(
+            "delegated task shows no trace on daemon B after \
+             {PEER_TASK_ARRIVAL_GRACE:?}; treating the fire-and-forget \
+             StartTask as lost and re-delegating once"
+        );
+        poll_until(
+            "daemon A reporting peer B connected before re-delegating",
+            PEER_WAIT_TIMEOUT,
+            || {
+                let client = client.clone();
+                async move { connected_peer(&client, port_a).await }
+            },
+            &dump_daemons,
+        )
+        .await;
+        let retry = ctl(&a, &["peer", "task", &peer_id, &instructions]).await;
+        assert!(
+            retry.status.success(),
+            "re-delegating the peer task failed:\n{}\n{}",
+            text_of(&retry),
+            dump_daemons()
+        );
+    }
+
     // B really ran it: only the TASK_MARK-matched profile emits the done
     // message, and the mock releases it only after the runtime's echo
     // reached the transcript — instructions crossed, session ran, exec
@@ -2164,13 +2281,7 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
             let logs = b.rig.session_logs();
             async move { logs.contains(DONE_MESSAGE).then_some(()) }
         },
-        || {
-            format!(
-                "--- daemon B log tail ---\n{}\n--- daemon B session logs (tail) ---\n{}",
-                b.log_tail(),
-                tail(&b.rig.session_logs(), 4000)
-            )
-        },
+        &dump_daemons,
     )
     .await;
     let artifacts = b.rig.turn_artifacts();
