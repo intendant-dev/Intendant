@@ -1446,13 +1446,20 @@ pub fn spawn_web_gateway(
                                 })
                             });
                     let mut replayed_external_session_ids: HashSet<String> = HashSet::new();
-                    if let Some(ref log_dir) = replay_log_dir {
-                        if let Some((replay, external_session_id)) =
+                    if let Some(log_dir) = replay_log_dir.clone() {
+                        // Cache-fast after the first connect, but still file IO on a
+                        // miss — keep it off the reactor (single-flight in the cache
+                        // coalesces concurrent connects).
+                        let replay_result = tokio::task::spawn_blocking(move || {
                             session_log_replay_payload_from_dir_with_limit(
-                                log_dir,
+                                &log_dir,
                                 Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
                             )
-                        {
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some((replay, external_session_id)) = replay_result {
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
                             }

@@ -516,10 +516,11 @@ async function main() {
         });
         return;
       }
-      if (d.t === 'event_gap') {
-        // The /ws lane's dropped-events marker (shape matches the
-        // tunnel's {"t":"event_gap","skipped":N} frame, which
-        // 50-control-transport.js handles on the tunnel side).
+      if (d.t === 'event_gap' || d.event === 'event_gap') {
+        // The /ws lane's dropped-events marker. The daemon tags it like
+        // every /ws line ({"event":"event_gap","skipped":N}); the t-form
+        // is accepted too so both lanes share one shape family
+        // (50-control-transport.js handles the tunnel's t-frame side).
         serverMsgStep(d, 'event_gap', () => dashboardHandleEventGap(d, 'ws'));
         return;
       }

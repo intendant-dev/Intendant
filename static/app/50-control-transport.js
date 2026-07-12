@@ -1816,6 +1816,13 @@ async function fetchSessionsSearchPayload(options = {}) {
   const projects = Array.isArray(options.projects)
     ? options.projects.map(value => String(value || '').trim()).filter(Boolean)
     : [];
+  // Progress lane first: the HTTP route streams NDJSON progress lines
+  // when asked (stream=ndjson) — one {"type":"deep_search_progress",...}
+  // every ~250 scanned sessions, then the legacy body as the final line.
+  // Hosted/tunnel-only dashboards have no direct HTTP origin: the fetch
+  // fails before any bytes and we fall through to the buffered lane.
+  const streamed = await fetchSessionsSearchStreaming({ query, source, mode, projects, signal: options.signal });
+  if (streamed) return streamed;
   // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
   // fallback policy; the descriptor JSON-encodes `projects` on the HTTP
   // lane exactly as the hand-built fallback did.
@@ -1827,6 +1834,57 @@ async function fetchSessionsSearchPayload(options = {}) {
   }, { signal: options.signal });
   if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
   return resp.body;
+}
+
+async function fetchSessionsSearchStreaming({ query, source, mode, projects, signal }) {
+  if (typeof fetch !== 'function' || !/^https?:$/.test(location.protocol)) return null;
+  const params = new URLSearchParams({ q: query, stream: 'ndjson' });
+  if (source) params.set('source', source);
+  if (mode) params.set('mode', mode);
+  if (projects && projects.length) params.set('projects', JSON.stringify(projects));
+  let resp;
+  try {
+    resp = await fetch('/api/sessions/search?' + params.toString(), {
+      signal,
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/x-ndjson' },
+    });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    return null; // no direct HTTP lane — buffered fallback
+  }
+  if (!resp.ok || !resp.body) return null;
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let finalPayload = null;
+  const consumeLine = (line) => {
+    const text = line.trim();
+    if (!text) return;
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { return; }
+    if (parsed && parsed.type === 'deep_search_progress') {
+      if (typeof applySessionDeepSearchProgress === 'function') {
+        try { applySessionDeepSearchProgress(parsed); } catch (err) { console.warn('[deep-search] progress render failed', err); }
+      }
+      return;
+    }
+    finalPayload = parsed;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      consumeLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  buf += decoder.decode();
+  if (buf.trim()) consumeLine(buf);
+  if (finalPayload === null) throw new Error('/api/sessions/search stream ended without a result');
+  return finalPayload;
 }
 
 // The F3 settings/keys-family reads (below): daemonApi — tunnel first,

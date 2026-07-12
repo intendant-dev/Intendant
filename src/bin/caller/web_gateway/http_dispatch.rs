@@ -1403,6 +1403,7 @@ pub(crate) async fn serve_http_request(
             "/three.module.min.js",
             "/codemirror-bundle.js",
             "/codemirror-bundle.css",
+            "/tile-test-harness.js",
             "/audio-processor.js",
             "/xterm.min.js",
             "/xterm-addon-fit.min.js",

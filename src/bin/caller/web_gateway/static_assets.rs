@@ -55,6 +55,11 @@ pub(crate) const CODEMIRROR_BUNDLE_CSS: &str =
 // bytes hash-match the exact SRI digests the CDN loader pinned.
 pub(crate) const XTERM_JS: &str = include_str!("../../../../static/xterm.min.js");
 
+// D-2 tile-test harness (parked seed): fetched by the dashboard only
+// when ?tile-test=1 / localStorage.tileTest is set.
+pub(crate) const TILE_TEST_HARNESS_JS: &str =
+    include_str!("../../../../static/tile-test-harness.js");
+
 pub(crate) const XTERM_ADDON_FIT_JS: &str =
     include_str!("../../../../static/xterm-addon-fit.min.js");
 
@@ -205,6 +210,12 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             "/vault-kernel.js",
             "application/javascript",
             VAULT_KERNEL_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/tile-test-harness.js",
+            "application/javascript",
+            TILE_TEST_HARNESS_JS.as_bytes(),
             true,
         );
         insert(
