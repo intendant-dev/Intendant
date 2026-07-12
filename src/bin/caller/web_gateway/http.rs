@@ -49,10 +49,16 @@ pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
 }
 
 /// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
+///
+/// `Compression::best()`: every caller compresses once and caches the
+/// result (embedded static assets once per process, app.html once per
+/// gateway spawn — the `INTENDANT_APP_HTML_PATH` dev override serves
+/// uncompressed), so the one-time CPU cost buys smaller transfers on
+/// every subsequent request.
 pub(crate) fn gzip_compress(data: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::default());
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::best());
     // Writing to a Vec cannot fail.
     let _ = encoder.write_all(data);
     encoder.finish().unwrap_or_default()
