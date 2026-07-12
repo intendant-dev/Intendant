@@ -95,7 +95,11 @@ pub(crate) async fn run_daemon(
     // retention window so the store cannot grow unbounded across restarts.
     tokio::task::spawn_blocking(global_store::prune_at_daemon_startup);
     let bus = EventBus::new();
-    let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+    // No tick timer here: `AppEvent::Tick` is consumed only by the stdio
+    // MCP event listener (stuck-phase warnings), which daemon mode never
+    // runs — the daemon's `/mcp` gateway surface observes state through
+    // `spawn_http_observation_listener`, which ignores Tick. A 1 Hz tick
+    // would only wake every bus subscriber for nothing.
     let _session_listeners = startup::wiring::spawn_session_listeners(
         &bus,
         &recording_registry,
@@ -160,17 +164,14 @@ pub(crate) async fn run_daemon(
 
     let shared_codex_config = shared_codex_config_from_project(project);
     let shared_claude_config = shared_claude_config_from_project(project);
-    let _control_plane_handle = control_plane::spawn(
-        bus.subscribe(),
-        control_plane::ControlPlaneState {
-            autonomy: autonomy.clone(),
-            external_agent: shared_external_agent.clone(),
-            codex_config: shared_codex_config.clone(),
-            claude_config: shared_claude_config.clone(),
-            bus: bus.clone(),
-            project_root: project_root.clone(),
-        },
-    );
+    let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
+        autonomy: autonomy.clone(),
+        external_agent: shared_external_agent.clone(),
+        codex_config: shared_codex_config.clone(),
+        claude_config: shared_claude_config.clone(),
+        bus: bus.clone(),
+        project_root: project_root.clone(),
+    });
 
     // Session vitals: cache/limits are usage-driven and cover every
     // session on any backend, so the producer always runs. The git segment

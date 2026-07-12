@@ -451,17 +451,14 @@ pub(crate) async fn run_headless_mode(
     let agent_backend = initial_agent_backend.clone();
     let shared_codex_config = shared_codex_config_from_project(&project);
     let shared_claude_config = shared_claude_config_from_project(&project);
-    let _control_plane_handle = control_plane::spawn(
-        bus.subscribe(),
-        control_plane::ControlPlaneState {
-            autonomy: autonomy.clone(),
-            external_agent: shared_external_agent.clone(),
-            codex_config: shared_codex_config.clone(),
-            claude_config: shared_claude_config.clone(),
-            bus: bus.clone(),
-            project_root: Some(project.root.clone()),
-        },
-    );
+    let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
+        autonomy: autonomy.clone(),
+        external_agent: shared_external_agent.clone(),
+        codex_config: shared_codex_config.clone(),
+        claude_config: shared_claude_config.clone(),
+        bus: bus.clone(),
+        project_root: Some(project.root.clone()),
+    });
 
     // Session vitals: cache/limits are usage-driven and always produced;
     // the git segment probes the live target registry (primary session

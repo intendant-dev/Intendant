@@ -427,96 +427,98 @@ impl SessionSupervisor {
             .unwrap_or_else(crate::platform::home_dir)
     }
 
-    pub fn spawn(self) -> JoinHandle<()> {
-        let mut rx = self.config.bus.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        self.observe_lifecycle_event(&event).await;
-                        match event {
-                            AppEvent::ControlCommand(msg) => {
-                                self.handle_control_msg(msg).await;
-                            }
-                            AppEvent::SessionIdentity {
-                                session_id,
-                                source,
-                                backend_session_id,
-                            } => {
-                                self.apply_session_identity(session_id, source, backend_session_id)
-                                    .await;
-                            }
-                            AppEvent::SessionRelationship {
-                                parent_session_id,
-                                child_session_id,
-                                relationship,
-                                ..
-                            } => {
-                                self.apply_session_relationship(
-                                    parent_session_id,
-                                    child_session_id,
-                                    relationship,
-                                )
-                                .await;
-                            }
-                            AppEvent::SessionEnded { session_id, .. } => {
-                                self.remove_session_alias(&session_id).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    /// Act on one intent-lane event. Split from the receive loops so the
+    /// primary supervisor and the resume listener share exactly one
+    /// action path; `filter_session_control` is the resume listener's
+    /// `should_handle_session_control` gate.
+    async fn handle_intent_lane_event(&self, event: AppEvent, filter_session_control: bool) {
+        match event {
+            AppEvent::ControlCommand(msg) => {
+                if !filter_session_control || self.should_handle_session_control(&msg).await {
+                    self.handle_control_msg(msg).await;
                 }
             }
-        })
+            AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            } => {
+                self.apply_session_identity(session_id, source, backend_session_id)
+                    .await;
+            }
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ..
+            } => {
+                self.apply_session_relationship(parent_session_id, child_session_id, relationship)
+                    .await;
+            }
+            AppEvent::SessionEnded { session_id, .. } => {
+                self.remove_session_alias(&session_id).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The supervisor's receive loop, shared by [`Self::spawn`] and
+    /// [`Self::spawn_resume_listener`].
+    ///
+    /// Two lanes, one loop:
+    /// - the lossless intent lane ([`EventBus::subscribe_intents`]) carries
+    ///   everything the supervisor ACTS on — `ControlCommand` dispatch plus
+    ///   the identity/relationship/end bookkeeping that routes future
+    ///   commands. Losing one of these corrupts routing state, so they must
+    ///   never drop to `RecvError::Lagged`.
+    /// - the broadcast ring still feeds `observe_lifecycle_event` (phase
+    ///   chips): best-effort by design — a lagged phase update is cosmetic
+    ///   and the next status event heals it.
+    ///
+    /// `biased` drains intents first so a user command is never queued
+    /// behind an observation backlog. Cross-lane skew is tolerable because
+    /// the observation side is display-only; intent-lane events are NOT
+    /// re-observed here (they'd double-apply phase updates when the
+    /// broadcast copy arrives).
+    ///
+    /// Receivers are subscribed by the caller BEFORE the task is spawned:
+    /// daemon startup sends `ResumeSession` immediately after `spawn()`
+    /// returns and relies on the subscription already existing.
+    async fn run_event_loop(
+        self,
+        mut intent_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+        mut rx: tokio::sync::broadcast::Receiver<AppEvent>,
+        filter_session_control: bool,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                intent = intent_rx.recv() => match intent {
+                    Some(event) => {
+                        self.handle_intent_lane_event(event, filter_session_control)
+                            .await;
+                    }
+                    None => break,
+                },
+                event = rx.recv() => match event {
+                    Ok(event) => self.observe_lifecycle_event(&event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    }
+
+    pub fn spawn(self) -> JoinHandle<()> {
+        let intent_rx = self.config.bus.subscribe_intents();
+        let rx = self.config.bus.subscribe();
+        tokio::spawn(self.run_event_loop(intent_rx, rx, false))
     }
 
     pub fn spawn_resume_listener(self) -> JoinHandle<()> {
-        let mut rx = self.config.bus.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        self.observe_lifecycle_event(&event).await;
-                        match event {
-                            AppEvent::ControlCommand(msg) => {
-                                if self.should_handle_session_control(&msg).await {
-                                    self.handle_control_msg(msg).await;
-                                }
-                            }
-                            AppEvent::SessionIdentity {
-                                session_id,
-                                source,
-                                backend_session_id,
-                            } => {
-                                self.apply_session_identity(session_id, source, backend_session_id)
-                                    .await;
-                            }
-                            AppEvent::SessionRelationship {
-                                parent_session_id,
-                                child_session_id,
-                                relationship,
-                                ..
-                            } => {
-                                self.apply_session_relationship(
-                                    parent_session_id,
-                                    child_session_id,
-                                    relationship,
-                                )
-                                .await;
-                            }
-                            AppEvent::SessionEnded { session_id, .. } => {
-                                self.remove_session_alias(&session_id).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
+        let intent_rx = self.config.bus.subscribe_intents();
+        let rx = self.config.bus.subscribe();
+        tokio::spawn(self.run_event_loop(intent_rx, rx, true))
     }
 
     pub async fn run(self) {

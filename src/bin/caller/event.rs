@@ -122,9 +122,6 @@ pub type ApprovalRegistry =
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    #[allow(dead_code)]
-    Resize(u16, u16),
-
     // Agent loop lifecycle
     TurnStarted {
         session_id: Option<String>,
@@ -948,10 +945,10 @@ pub enum AppEvent {
         method: String,
     },
 
-    // TUI internal
+    /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
+    /// listener consumes it (stuck-phase detection), and only MCP mode
+    /// spawns the timer.
     Tick,
-    #[allow(dead_code)]
-    Quit,
 }
 
 fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
@@ -1938,11 +1935,14 @@ pub enum ControlMsg {
 /// subscribe independently. Normal subscribers receive best-effort future
 /// events and must tolerate `RecvError::Lagged`;
 /// [`EventBus::subscribe_session_log`] is the lossless path for the
-/// low-volume event subset persisted to `session.jsonl`.
+/// low-volume event subset persisted to `session.jsonl`, and
+/// [`EventBus::subscribe_intents`] is the lossless path for user intents
+/// (`ControlCommand`) and the session-bookkeeping events that route them.
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
     session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
 }
 
 impl EventBus {
@@ -1951,12 +1951,18 @@ impl EventBus {
         Self {
             tx,
             session_log_sinks: Arc::new(Mutex::new(Vec::new())),
+            intent_sinks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn send(&self, event: AppEvent) {
         if app_event_writes_to_session_log(&event) {
             if let Ok(mut sinks) = self.session_log_sinks.lock() {
+                sinks.retain(|sink| sink.send(event.clone()).is_ok());
+            }
+        }
+        if app_event_rides_intent_lane(&event) {
+            if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
             }
         }
@@ -1985,6 +1991,47 @@ impl EventBus {
         }
         rx
     }
+
+    /// Create a lossless intent subscriber.
+    ///
+    /// User intents (`AppEvent::ControlCommand`) share the bounded broadcast
+    /// ring with per-token `ModelResponseDelta`s and multi-MB
+    /// `ContextSnapshot`s, so a flooded ring could silently drop a user's
+    /// click (approve, interrupt, start task) — consumers that ACT on
+    /// intents must never lose one. This lane mirrors the session-log
+    /// fan-out: an unbounded mpsc fed at the emit point, carrying only the
+    /// low-volume [`app_event_rides_intent_lane`] subset, delivered in
+    /// emission order. Intents are human-scale, so the unbounded queue is
+    /// bounded in practice by what a person can click; the failure mode of a
+    /// wedged consumer is memory growth, never a silently dropped intent.
+    ///
+    /// The broadcast copy of every intent still exists for display-only
+    /// consumers (waiters, UIs) that tolerate loss.
+    pub fn subscribe_intents(&self) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut sinks) = self.intent_sinks.lock() {
+            sinks.push(tx);
+        }
+        rx
+    }
+}
+
+/// The event subset carried by the lossless intent lane
+/// ([`EventBus::subscribe_intents`]): the user intents themselves plus the
+/// low-volume session-bookkeeping events the intent-acting consumers
+/// (control plane, task dispatcher, session supervisor) fold into the same
+/// ordered stream — alias/relationship mapping that routes FUTURE intents,
+/// and the end-of-session / display-revoke hygiene the control plane owns.
+/// Everything here is rare; nothing high-frequency may join this list.
+pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::ControlCommand(_)
+            | AppEvent::SessionIdentity { .. }
+            | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionEnded { .. }
+            | AppEvent::UserDisplayRevoked { .. }
+    )
 }
 
 /// Convert an AppEvent to an OutboundEvent for external consumers.
@@ -2767,9 +2814,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,
         // Internal events — not broadcast to external consumers
-        AppEvent::Resize(_, _)
-        | AppEvent::Tick
-        | AppEvent::Quit
+        AppEvent::Tick
         | AppEvent::JsonExtracted { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
@@ -2785,26 +2830,102 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
     }
 }
 
+/// How long buffered `ModelResponseDelta` text may wait before the outbound
+/// broadcaster flushes it (see [`spawn_outbound_broadcaster`]).
+const DELTA_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Safety flush: once this much delta text is buffered across sessions,
+/// flush immediately instead of waiting for the tick — bounds worst-case
+/// buffering (and the size of a single outbound line) under a sustained
+/// flood that keeps the event receiver permanently ready.
+const DELTA_COALESCE_MAX_BUFFERED_BYTES: usize = 64 * 1024;
+
+/// Per-session buffered delta text, insertion-ordered so a flush emits
+/// sessions in first-arrival order (per-session text order is exact).
+#[derive(Default)]
+struct DeltaCoalesceBuffer {
+    pending: Vec<(Option<String>, String)>,
+    buffered_bytes: usize,
+}
+
+impl DeltaCoalesceBuffer {
+    fn push(&mut self, session_id: &Option<String>, text: &str) {
+        self.buffered_bytes += text.len();
+        if let Some((_, buffered)) = self
+            .pending
+            .iter_mut()
+            .find(|(pending_session, _)| pending_session == session_id)
+        {
+            buffered.push_str(text);
+            return;
+        }
+        self.pending.push((session_id.clone(), text.to_string()));
+    }
+
+    fn should_flush_early(&self) -> bool {
+        self.buffered_bytes >= DELTA_COALESCE_MAX_BUFFERED_BYTES
+    }
+
+    /// Emit one merged `model_response_delta` line per buffered session.
+    /// Payload shape is identical to an uncoalesced delta — only the text
+    /// spans are concatenated — so consumers that append deltas observe
+    /// the same byte stream.
+    fn flush(&mut self, outbound_tx: &tokio::sync::broadcast::Sender<String>) {
+        for (session_id, text) in self.pending.drain(..) {
+            let outbound = crate::types::OutboundEvent::ModelResponseDelta { session_id, text };
+            if let Ok(json) = serde_json::to_string(&outbound) {
+                let _ = outbound_tx.send(json);
+            }
+        }
+        self.buffered_bytes = 0;
+    }
+}
+
 /// Spawn a task that converts AppEvents to OutboundEvents and broadcasts them.
 ///
 /// This is the single point where AppEvents are converted to the external
 /// format used by the control socket, web gateway, and JSON stdout.
+///
+/// Per-token `ModelResponseDelta` events are coalesced here — the single
+/// outbound choke point — instead of fanning one wire line (and one WS
+/// message per connection) out per token: delta text buffers per session
+/// and flushes on a ~40ms tick, when the buffer crosses a size cap, or
+/// IMMEDIATELY before any non-delta event is forwarded, so deltas never
+/// reorder against other events and per-session text order is preserved.
 pub fn spawn_outbound_broadcaster(
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     outbound_tx: tokio::sync::broadcast::Sender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut deltas = DeltaCoalesceBuffer::default();
+        let mut flush_tick = tokio::time::interval(DELTA_COALESCE_INTERVAL);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    if let Some(outbound) = app_event_to_outbound(&event) {
-                        if let Ok(json) = serde_json::to_string(&outbound) {
-                            let _ = outbound_tx.send(json);
+            tokio::select! {
+                recv = event_rx.recv() => match recv {
+                    Ok(AppEvent::ModelResponseDelta { session_id, text }) => {
+                        deltas.push(&session_id, &text);
+                        if deltas.should_flush_early() {
+                            deltas.flush(&outbound_tx);
                         }
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(event) => {
+                        // Ordering barrier: buffered deltas were emitted
+                        // before this event — flush them first.
+                        deltas.flush(&outbound_tx);
+                        if let Some(outbound) = app_event_to_outbound(&event) {
+                            if let Ok(json) = serde_json::to_string(&outbound) {
+                                let _ = outbound_tx.send(json);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        deltas.flush(&outbound_tx);
+                        break;
+                    }
+                },
+                _ = flush_tick.tick() => deltas.flush(&outbound_tx),
             }
         }
     })
@@ -3338,7 +3459,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         // point of origin.
         //
         // ---- Terminal-only / internal / high-frequency events ----
-        // Key, Resize, Tick, Quit, ControlCommand, SessionDirChanged,
+        // Tick, ControlCommand, SessionDirChanged,
         // ModelResponseDelta (too chatty), StatusUpdate (every tick),
         // UsageSnapshot (periodic, mainly for UI), LogEntry (meta/circular).
         _ => {}
@@ -3413,15 +3534,15 @@ mod tests {
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             bus.send(AppEvent::Tick);
-            bus.send(AppEvent::Quit);
+            bus.send(AppEvent::PresenceReady);
 
             match rx.recv().await.unwrap() {
                 AppEvent::Tick => {}
                 _ => panic!("expected Tick"),
             }
             match rx.recv().await.unwrap() {
-                AppEvent::Quit => {}
-                _ => panic!("expected Quit"),
+                AppEvent::PresenceReady => {}
+                _ => panic!("expected PresenceReady"),
             }
         });
     }
@@ -3437,17 +3558,228 @@ mod tests {
             let mut rx = bus.subscribe();
             let bus2 = bus.clone();
             bus.send(AppEvent::Tick);
-            bus2.send(AppEvent::Quit);
+            bus2.send(AppEvent::PresenceReady);
 
             match rx.recv().await.unwrap() {
                 AppEvent::Tick => {}
                 _ => panic!("expected Tick"),
             }
             match rx.recv().await.unwrap() {
-                AppEvent::Quit => {}
-                _ => panic!("expected Quit"),
+                AppEvent::PresenceReady => {}
+                _ => panic!("expected PresenceReady"),
             }
         });
+    }
+
+    /// B1: user intents must survive a delta flood that laps the broadcast
+    /// ring. The intent lane is fed at the emit point, so every
+    /// `ControlCommand` arrives, in order, even though a plain broadcast
+    /// subscriber provably lagged over the same window.
+    #[tokio::test]
+    async fn intent_lane_is_lossless_and_ordered_under_delta_flood() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        let mut lossy = bus.subscribe();
+
+        const FLOOD: usize = 10_000;
+        const INTENTS: usize = 100;
+        let deltas_per_intent = FLOOD / INTENTS;
+        for batch in 0..INTENTS {
+            for _ in 0..deltas_per_intent {
+                bus.send(AppEvent::ModelResponseDelta {
+                    session_id: Some("flood".to_string()),
+                    text: "x".to_string(),
+                });
+            }
+            bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+                level: format!("level-{batch}"),
+            }));
+        }
+
+        for expected in 0..INTENTS {
+            let event = intents.recv().await.expect("intent lane closed early");
+            match event {
+                AppEvent::ControlCommand(ControlMsg::SetAutonomy { level }) => {
+                    assert_eq!(level, format!("level-{expected}"), "intents reordered");
+                }
+                other => panic!("unexpected event on intent lane: {other:?}"),
+            }
+        }
+        assert!(
+            intents.try_recv().is_err(),
+            "intent lane must carry exactly the sent intents"
+        );
+
+        // The same window overflowed the plain broadcast ring (10_100 sends
+        // against a 4096-slot buffer with no interleaved recv), so the lossy
+        // subscriber's first recv reports the lag the intent lane is immune to.
+        match lossy.recv().await {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                assert!(skipped > 0);
+            }
+            other => panic!("expected broadcast lag, got {other:?}"),
+        }
+    }
+
+    /// B1: the intent lane carries the session-bookkeeping events its
+    /// consumers act on, interleaved in emission order with the commands.
+    #[tokio::test]
+    async fn intent_lane_orders_bookkeeping_with_commands() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+            level: "high".to_string(),
+        }));
+        bus.send(AppEvent::SessionEnded {
+            session_id: "s1".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        // Not on the lane: high-frequency stream events.
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: None,
+            text: "ignored".to_string(),
+        });
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "s2".to_string(),
+            source: "codex".to_string(),
+            backend_session_id: "thread-1".to_string(),
+        });
+
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::ControlCommand(ControlMsg::SetAutonomy { .. }))
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::SessionEnded { .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::SessionIdentity { .. })
+        ));
+        assert!(intents.try_recv().is_err());
+    }
+
+    /// B5, deterministic core: the coalesce buffer concatenates per
+    /// session (insertion-ordered across sessions) and one flush emits one
+    /// wire line per session with the payload shape unchanged.
+    #[test]
+    fn delta_coalesce_buffer_merges_per_session_in_order() {
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut buffer = DeltaCoalesceBuffer::default();
+        let s1 = Some("s1".to_string());
+        let s2 = Some("s2".to_string());
+        buffer.push(&s1, "a");
+        buffer.push(&s2, "z");
+        buffer.push(&s1, "b");
+        buffer.push(&s1, "c");
+        buffer.flush(&outbound_tx);
+
+        let first: serde_json::Value =
+            serde_json::from_str(&outbound_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["event"], "model_response_delta");
+        assert_eq!(first["session_id"], "s1");
+        assert_eq!(
+            first["text"], "abc",
+            "per-session text concatenates in order"
+        );
+        let second: serde_json::Value =
+            serde_json::from_str(&outbound_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(second["session_id"], "s2");
+        assert_eq!(second["text"], "z");
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "one line per session per flush"
+        );
+
+        // Flushing again emits nothing (buffer drained).
+        buffer.flush(&outbound_tx);
+        assert!(outbound_rx.try_recv().is_err());
+    }
+
+    /// B5: no delta may be reordered past a later non-delta event, and no
+    /// delta text may be lost, regardless of where the 40ms tick lands.
+    #[tokio::test]
+    async fn outbound_broadcaster_flushes_deltas_before_later_events() {
+        let bus = EventBus::new();
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(64);
+        let _handle = spawn_outbound_broadcaster(bus.subscribe(), outbound_tx);
+
+        for text in ["a", "b", "c"] {
+            bus.send(AppEvent::ModelResponseDelta {
+                session_id: Some("s1".to_string()),
+                text: text.to_string(),
+            });
+        }
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: Some("s2".to_string()),
+            text: "z".to_string(),
+        });
+        // Non-delta event: every delta sent above must flush before it.
+        bus.send(AppEvent::DoneSignal {
+            session_id: Some("s1".to_string()),
+            message: None,
+        });
+
+        // A tick may split the merged run on a loaded machine, so assert
+        // the invariants rather than one exact framing: concatenated text
+        // per session is exact and complete BEFORE the done event arrives.
+        let mut s1_text = String::new();
+        let mut s2_text = String::new();
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), outbound_rx.recv())
+                .await
+                .expect("timed out waiting for outbound line")
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match json["event"].as_str() {
+                Some("model_response_delta") => {
+                    let text = json["text"].as_str().unwrap();
+                    match json["session_id"].as_str() {
+                        Some("s1") => s1_text.push_str(text),
+                        Some("s2") => s2_text.push_str(text),
+                        other => panic!("unexpected delta session {other:?}"),
+                    }
+                }
+                Some("done_signal") => break,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(s1_text, "abc", "all s1 delta text flushed before done");
+        assert_eq!(s2_text, "z", "all s2 delta text flushed before done");
+    }
+
+    /// B5: deltas buffered AFTER a non-delta event flush after it — the
+    /// barrier works in both directions across a flush boundary.
+    #[tokio::test]
+    async fn outbound_broadcaster_delta_after_event_stays_after_it() {
+        let bus = EventBus::new();
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(64);
+        let _handle = spawn_outbound_broadcaster(bus.subscribe(), outbound_tx);
+
+        bus.send(AppEvent::DoneSignal {
+            session_id: Some("s1".to_string()),
+            message: None,
+        });
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: Some("s1".to_string()),
+            text: "after".to_string(),
+        });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("timed out waiting for done signal")
+            .unwrap();
+        assert!(first.contains("\"event\":\"done_signal\""));
+        // The trailing delta arrives on the 40ms tick.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("timed out waiting for tick-flushed delta")
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second_json["event"], "model_response_delta");
+        assert_eq!(second_json["text"], "after");
     }
 
     #[test]
@@ -4871,11 +5203,6 @@ mod tests {
     #[test]
     fn outbound_skips_tick() {
         assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
-    }
-
-    #[test]
-    fn outbound_skips_resize() {
-        assert!(app_event_to_outbound(&AppEvent::Resize(80, 24)).is_none());
     }
 
     #[test]
