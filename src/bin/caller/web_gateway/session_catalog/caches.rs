@@ -167,7 +167,9 @@ pub(crate) fn persisted_namespace_schema(namespace: &str) -> u32 {
         // v1: summaries persist `first_usage_event` instead of the full
         // `usage_events` history; pre-v1 entries would deserialize with a
         // defaulted first event and mis-baseline forked sessions.
-        "codex" => 1,
+        // v2: usage includes GPT-5.6 cache writes; v1 would deserialize the
+        // new bucket as zero and preserve an understated historical cost.
+        "codex" => 2,
         _ => 0,
     }
 }
@@ -920,9 +922,8 @@ mod tests {
     }
 
     /// Pre-schema "codex" entries carried the full usage_events history and
-    /// no schema stamp; they must read as misses (a defaulted
-    /// first_usage_event would mis-baseline forked sessions), while
-    /// current-schema entries round-trip.
+    /// no schema stamp; schema-v1 entries predate cache-write accounting.
+    /// Both must read as misses, while current-schema entries round-trip.
     #[test]
     fn persisted_codex_entry_schema_mismatch_is_a_miss() {
         let dir = tempfile::tempdir().unwrap();
@@ -962,6 +963,13 @@ mod tests {
             session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
+        );
+
+        let mut previous_schema = legacy.clone();
+        previous_schema["schema"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&previous_schema).unwrap()).unwrap();
         assert!(
             load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
         );

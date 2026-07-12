@@ -995,6 +995,7 @@ pub struct AgentUsageSnapshot {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_creation_tokens: u64,
     /// Latest request's prompt-cache sample (reads / writes / uncached) —
     /// the cache-vitals hit-receipt inputs. Zero-all when the backend
     /// reports no per-request split.
@@ -1025,6 +1026,7 @@ impl AgentUsageSnapshot {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             cached_tokens: self.cached_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
             last_cache_read_tokens: self.last_cache_read_tokens,
             last_cache_creation_tokens: self.last_cache_creation_tokens,
             last_uncached_input_tokens: self.last_uncached_input_tokens,

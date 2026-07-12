@@ -1997,7 +1997,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join(".intendant").join("logs").join("session-1");
         let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
-        log.model_response("internal history", 0, 0, 0, 0, None);
+        log.model_response("internal history", 0, 0, 0, 0, 0, None);
         drop(log);
 
         let replay = resume_session_activity_replay_from_home(
@@ -2022,7 +2022,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let log_dir = outside.path().join("session-escape");
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
-        log.model_response("outside history", 0, 0, 0, 0, None);
+        log.model_response("outside history", 0, 0, 0, 0, 0, None);
         drop(log);
 
         assert!(resume_session_activity_replay_from_home(

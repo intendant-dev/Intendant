@@ -127,10 +127,12 @@ pub struct PresenceLayer {
     paused: Arc<AtomicUsize>,
     /// Shared context injection queue for mid-task interjections into the agent loop.
     context_injection: crate::event::ContextInjectionQueue,
-    /// Cumulative prompt/completion/cached tokens across all presence turns.
+    /// Cumulative prompt/completion/cache-read/cache-write tokens across all
+    /// presence turns.
     cumulative_prompt: u64,
     cumulative_completion: u64,
     cumulative_cached: u64,
+    cumulative_cache_creation: u64,
 }
 
 impl PresenceLayer {
@@ -168,6 +170,7 @@ impl PresenceLayer {
             cumulative_prompt: 0,
             cumulative_completion: 0,
             cumulative_cached: 0,
+            cumulative_cache_creation: 0,
         }
     }
 
@@ -209,6 +212,7 @@ impl PresenceLayer {
             prompt_tokens: self.cumulative_prompt,
             completion_tokens: self.cumulative_completion,
             cached_tokens: self.cumulative_cached,
+            cache_creation_tokens: self.cumulative_cache_creation,
         }
     }
 
@@ -232,6 +236,7 @@ impl PresenceLayer {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
         });
     }
 
@@ -297,6 +302,7 @@ impl PresenceLayer {
             self.cumulative_prompt += response.usage.prompt_tokens;
             self.cumulative_completion += response.usage.completion_tokens;
             self.cumulative_cached += response.usage.cached_tokens;
+            self.cumulative_cache_creation += response.usage.cache_creation_tokens;
             self.conversation.set_usage(response.usage.clone());
             self.conversation.auto_compact();
 

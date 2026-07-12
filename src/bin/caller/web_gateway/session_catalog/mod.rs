@@ -1488,11 +1488,12 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
 /// next list pass.
 pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    // Format v3: rows carry the conversation `preview`. Bumping the layout
-    // invalidates every persisted row once, so cached rows without the new
-    // field rebuild on the next list pass instead of lingering until their
-    // dir changes. (v2 moved `updated_at` to transcript activity.)
-    ctx.update(&[3u8]);
+    // Format v4: native rows carry cumulative cache-write usage and price it
+    // separately. Bumping the layout invalidates persisted v3 rows once, so
+    // their old zero-write cost does not linger until the session dir changes.
+    // (v3 added conversation `preview`; v2 moved `updated_at` to transcript
+    // activity.)
+    ctx.update(&[4u8]);
     for entry in entries {
         ctx.update(entry.rel.as_bytes());
         ctx.update(&[0]);
@@ -1557,6 +1558,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut cached_tokens: u64 = 0;
+    let mut cache_creation_tokens: u64 = 0;
     let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
     let mut role: Option<String> = None;
     let mut external_resume_id: Option<String> = None;
@@ -1731,6 +1733,10 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
                             cached_tokens += cached;
                             event_usage.cached_tokens = cached;
+                        }
+                        if let Some(created) = tok.get("cache_creation").and_then(|v| v.as_u64()) {
+                            cache_creation_tokens += created;
+                            event_usage.cache_creation_tokens = created;
                         }
                         if event_usage.total_tokens == 0 {
                             event_usage.total_tokens =
@@ -1914,7 +1920,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
             prompt_tokens,
             completion_tokens,
             cached_tokens,
-            0,
+            cache_creation_tokens,
         )
     });
 
@@ -1944,7 +1950,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
-        "cache_creation_tokens": 0,
+        "cache_creation_tokens": cache_creation_tokens,
         "estimated_cost": estimated_cost.unwrap_or(0.0),
         "pricing_known": estimated_cost.is_some(),
         "role": role,
@@ -2876,6 +2882,45 @@ mod tests {
         let body = list_sessions_from_home_with_limit(home.path(), Some(2));
         let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn intendant_row_prices_gpt_5_6_cache_writes_from_native_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let events = [
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:00Z",
+                "event": "info",
+                "message": "Provider: openai"
+            }),
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:01Z",
+                "event": "info",
+                "message": "Model: gpt-5.6-sol"
+            }),
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:02Z",
+                "event": "model_response",
+                "turn": 1,
+                "message": "done",
+                "data": {"tokens": {
+                    "prompt": 3_000_000,
+                    "completion": 1_000_000,
+                    "total": 4_000_000,
+                    "cached": 1_000_000,
+                    "cache_creation": 1_000_000
+                }}
+            }),
+        ];
+        let jsonl: String = events.iter().map(|event| format!("{event}\n")).collect();
+        std::fs::write(log_dir.join("session.jsonl"), jsonl).unwrap();
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["cache_creation_tokens"].as_u64(), Some(1_000_000));
+        assert_eq!(row["cached_tokens"].as_u64(), Some(1_000_000));
+        assert!((row["estimated_cost"].as_f64().unwrap() - 41.75).abs() < 1e-12);
     }
 
     #[test]

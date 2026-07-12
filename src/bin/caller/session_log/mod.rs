@@ -1762,7 +1762,7 @@ mod tests {
     fn model_response_with_message_shares_one_span() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
-        log.model_response_with_message(3, "the full assistant text", 10, 5, 15, 0);
+        log.model_response_with_message(3, "the full assistant text", 10, 5, 15, 0, 0);
         drop(log);
 
         let diag = read_last_event(dir.path(), "model_response");

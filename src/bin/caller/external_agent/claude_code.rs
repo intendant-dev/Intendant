@@ -468,6 +468,7 @@ fn usage_snapshot_from_api_usage(
         prompt_tokens,
         completion_tokens: output,
         cached_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
         last_cache_read_tokens: cache_read,
         last_cache_creation_tokens: cache_creation,
         last_uncached_input_tokens: input,

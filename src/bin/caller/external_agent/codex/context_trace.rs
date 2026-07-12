@@ -1457,6 +1457,20 @@ pub(crate) fn codex_usage_cached_tokens(value: &serde_json::Value) -> Option<u64
     )
 }
 
+pub(crate) fn codex_usage_cache_write_tokens(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(
+        value,
+        &[
+            "/cacheWriteTokens",
+            "/cache_write_tokens",
+            "/cacheCreationTokens",
+            "/cache_creation_tokens",
+            "/inputTokensDetails/cacheWriteTokens",
+            "/input_tokens_details/cache_write_tokens",
+        ],
+    )
+}
+
 pub(crate) fn codex_usage_snapshot(
     value: &serde_json::Value,
     model: &str,
@@ -1471,6 +1485,7 @@ pub(crate) fn codex_usage_snapshot(
     let prompt_tokens = codex_usage_input_tokens(total)?;
     let completion_tokens = codex_usage_output_tokens(total).unwrap_or(0);
     let cached_tokens = codex_usage_cached_tokens(total).unwrap_or(0);
+    let cache_creation_tokens = codex_usage_cache_write_tokens(total).unwrap_or(0);
     let total_tokens = first_u64_at(total, &["/totalTokens", "/total_tokens"])
         .unwrap_or_else(|| prompt_tokens + completion_tokens);
     let tokens_used = last
@@ -1485,13 +1500,14 @@ pub(crate) fn codex_usage_snapshot(
     };
 
     // Latest-request cache sample from the `last` bucket, for the vitals
-    // hit receipt. OpenAI has no cache-write concept and an undocumented
-    // TTL, so creation stays 0 and no flavor is stated.
+    // hit receipt. GPT-5.6+ may report cache writes as a separate billed
+    // subset of input tokens.
     let last_cache_read_tokens = last.and_then(codex_usage_cached_tokens).unwrap_or(0);
+    let last_cache_creation_tokens = last.and_then(codex_usage_cache_write_tokens).unwrap_or(0);
     let last_uncached_input_tokens = last
         .and_then(codex_usage_input_tokens)
         .unwrap_or(0)
-        .saturating_sub(last_cache_read_tokens);
+        .saturating_sub(last_cache_read_tokens.saturating_add(last_cache_creation_tokens));
 
     Some(AgentUsageSnapshot {
         provider: "openai".to_string(),
@@ -1503,10 +1519,11 @@ pub(crate) fn codex_usage_snapshot(
         prompt_tokens,
         completion_tokens,
         cached_tokens,
+        cache_creation_tokens,
         last_cache_read_tokens,
-        last_cache_creation_tokens: 0,
+        last_cache_creation_tokens,
         last_uncached_input_tokens,
-        cache_ttl_seconds: None,
+        cache_ttl_seconds: (last_cache_creation_tokens > 0).then_some(30 * 60),
         // Attached by the notification pump from its rate-limit state.
         limits: Vec::new(),
     })
@@ -1894,10 +1911,11 @@ mod tests {
             "total": {
                 "inputTokens": 1000,
                 "cachedInputTokens": 300,
+                "cacheWriteTokens": 150,
                 "outputTokens": 200,
                 "totalTokens": 1200
             },
-            "last": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 25, "totalTokens": 125},
+            "last": {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteTokens": 15, "outputTokens": 25, "totalTokens": 125},
             "modelContextWindow": 128000,
             "modelHardContextWindow": 272000
         });
@@ -1917,13 +1935,14 @@ mod tests {
         assert_eq!(snapshot.prompt_tokens, 1000);
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
+        assert_eq!(snapshot.cache_creation_tokens, 150);
         assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
-        // Cache-vitals sample comes from the `last` bucket; OpenAI states
-        // no TTL flavor.
+        // Cache-vitals sample comes from the `last` bucket, including the
+        // GPT-5.6 cache-write dimension.
         assert_eq!(snapshot.last_cache_read_tokens, 60);
-        assert_eq!(snapshot.last_uncached_input_tokens, 40);
-        assert_eq!(snapshot.last_cache_creation_tokens, 0);
-        assert_eq!(snapshot.cache_ttl_seconds, None);
+        assert_eq!(snapshot.last_uncached_input_tokens, 25);
+        assert_eq!(snapshot.last_cache_creation_tokens, 15);
+        assert_eq!(snapshot.cache_ttl_seconds, Some(1800));
     }
 
     #[test]

@@ -54,6 +54,7 @@ struct SessionCounters {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    cache_creation_tokens: u64,
     budget_pct: f64,
     last: Option<TokenUsage>,
 }
@@ -102,6 +103,7 @@ impl UsageRailState {
             prompt_tokens: counters.prompt_tokens,
             completion_tokens: counters.completion_tokens,
             cached_tokens: counters.cached_tokens,
+            cache_creation_tokens: counters.cache_creation_tokens,
             last_cache_read_tokens: last.map(|u| u.cached_tokens).unwrap_or(0),
             last_cache_creation_tokens: last.map(|u| u.cache_creation_tokens).unwrap_or(0),
             last_uncached_input_tokens: last
@@ -164,7 +166,8 @@ impl UsageRailState {
                 let has_usage = usage.total_tokens > 0
                     || usage.prompt_tokens > 0
                     || usage.completion_tokens > 0
-                    || usage.cached_tokens > 0;
+                    || usage.cached_tokens > 0
+                    || usage.cache_creation_tokens > 0;
                 if !has_usage {
                     return None;
                 }
@@ -177,6 +180,7 @@ impl UsageRailState {
                 counters.prompt_tokens += usage.prompt_tokens;
                 counters.completion_tokens += usage.completion_tokens;
                 counters.cached_tokens += usage.cached_tokens;
+                counters.cache_creation_tokens += usage.cache_creation_tokens;
                 counters.last = Some(usage.clone());
                 let main = Self::snapshot(&self.identity, counters);
                 self.evict_over_cap();

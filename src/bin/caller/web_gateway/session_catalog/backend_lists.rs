@@ -1608,7 +1608,7 @@ mod tests {
                     "id": id,
                     "timestamp": "2026-05-17T21:10:00Z",
                     "cwd": "/Users/vm/projects/intendant",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.6",
                     "model_provider": "openai"
                 }
             }),
@@ -1631,6 +1631,7 @@ mod tests {
                         "total_token_usage": {
                             "input_tokens": 1000,
                             "cached_input_tokens": 400,
+                            "cache_write_tokens": 200,
                             "output_tokens": 250,
                             "total_tokens": 1250
                         },
@@ -1664,9 +1665,10 @@ mod tests {
         assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
         assert_eq!(session["completion_tokens"].as_u64(), Some(250));
         assert_eq!(session["cached_tokens"].as_u64(), Some(400));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(200));
         assert_eq!(session["total_tokens"].as_u64(), Some(1250));
         let cost = session["estimated_cost"].as_f64().unwrap();
-        assert!((cost - 0.00535).abs() < 1e-12, "unexpected cost {cost}");
+        assert!((cost - 0.01095).abs() < 1e-12, "unexpected cost {cost}");
     }
 
     #[test]

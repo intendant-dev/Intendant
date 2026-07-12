@@ -455,6 +455,7 @@ pub struct QueuedSteer {
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     pub input: f64,
+    pub cache_write: f64,
     pub cached: f64,
     pub output: f64,
 }
@@ -463,9 +464,46 @@ pub struct ModelPricing {
 const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // OpenAI
     (
+        "gpt-5.6",
+        ModelPricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-sol",
+        ModelPricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-terra",
+        ModelPricing {
+            input: 2.5e-6,
+            cache_write: 3.125e-6,
+            cached: 0.25e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-luna",
+        ModelPricing {
+            input: 1.0e-6,
+            cache_write: 1.25e-6,
+            cached: 0.1e-6,
+            output: 6.0e-6,
+        },
+    ),
+    (
         "gpt-5.5",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 5.0e-6,
             cached: 0.5e-6,
             output: 30.0e-6,
         },
@@ -474,6 +512,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4",
         ModelPricing {
             input: 2.5e-6,
+            cache_write: 2.5e-6,
             cached: 0.25e-6,
             output: 15.0e-6,
         },
@@ -482,6 +521,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4-mini",
         ModelPricing {
             input: 0.75e-6,
+            cache_write: 0.75e-6,
             cached: 0.075e-6,
             output: 4.5e-6,
         },
@@ -490,6 +530,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4-nano",
         ModelPricing {
             input: 0.2e-6,
+            cache_write: 0.2e-6,
             cached: 0.02e-6,
             output: 1.25e-6,
         },
@@ -498,6 +539,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.2",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -506,6 +548,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.2-codex",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -514,6 +557,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.3-codex",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -522,6 +566,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5",
         ModelPricing {
             input: 1.25e-6,
+            cache_write: 1.25e-6,
             cached: 0.125e-6,
             output: 10.0e-6,
         },
@@ -530,6 +575,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5-mini",
         ModelPricing {
             input: 0.25e-6,
+            cache_write: 0.25e-6,
             cached: 0.025e-6,
             output: 2.0e-6,
         },
@@ -538,6 +584,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1",
         ModelPricing {
             input: 2.0e-6,
+            cache_write: 2.0e-6,
             cached: 0.5e-6,
             output: 8.0e-6,
         },
@@ -546,6 +593,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-mini",
         ModelPricing {
             input: 0.4e-6,
+            cache_write: 0.4e-6,
             cached: 0.1e-6,
             output: 1.6e-6,
         },
@@ -554,6 +602,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-nano",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.025e-6,
             output: 0.4e-6,
         },
@@ -562,6 +611,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o3",
         ModelPricing {
             input: 2.0e-6,
+            cache_write: 2.0e-6,
             cached: 1.0e-6,
             output: 8.0e-6,
         },
@@ -570,6 +620,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o3-pro",
         ModelPricing {
             input: 150.0e-6,
+            cache_write: 150.0e-6,
             cached: 75.0e-6,
             output: 600.0e-6,
         },
@@ -578,6 +629,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o4-mini",
         ModelPricing {
             input: 1.1e-6,
+            cache_write: 1.1e-6,
             cached: 0.55e-6,
             output: 4.4e-6,
         },
@@ -587,6 +639,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-8",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -595,6 +648,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-fable-5",
         ModelPricing {
             input: 10.0e-6,
+            cache_write: 12.5e-6,
             cached: 1.0e-6,
             output: 50.0e-6,
         },
@@ -603,6 +657,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-6",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -611,6 +666,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-7",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -619,6 +675,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-sonnet-4-6",
         ModelPricing {
             input: 3.0e-6,
+            cache_write: 3.75e-6,
             cached: 0.3e-6,
             output: 15.0e-6,
         },
@@ -627,6 +684,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-sonnet-4-5-20250929",
         ModelPricing {
             input: 3.0e-6,
+            cache_write: 3.75e-6,
             cached: 0.3e-6,
             output: 15.0e-6,
         },
@@ -635,6 +693,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-5-20250929",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -643,6 +702,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-haiku-4-5",
         ModelPricing {
             input: 1.0e-6,
+            cache_write: 1.25e-6,
             cached: 0.1e-6,
             output: 5.0e-6,
         },
@@ -652,6 +712,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-3-flash",
         ModelPricing {
             input: 0.5e-6,
+            cache_write: 0.5e-6,
             cached: 0.05e-6,
             output: 3.0e-6,
         },
@@ -660,6 +721,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-3.1-flash",
         ModelPricing {
             input: 0.5e-6,
+            cache_write: 0.5e-6,
             cached: 0.05e-6,
             output: 3.0e-6,
         },
@@ -668,6 +730,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-pro",
         ModelPricing {
             input: 1.25e-6,
+            cache_write: 1.25e-6,
             cached: 0.125e-6,
             output: 10.0e-6,
         },
@@ -676,6 +739,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-flash",
         ModelPricing {
             input: 0.3e-6,
+            cache_write: 0.3e-6,
             cached: 0.03e-6,
             output: 2.5e-6,
         },
@@ -684,6 +748,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-flash-lite",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.01e-6,
             output: 0.4e-6,
         },
@@ -692,6 +757,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.0-flash",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.01e-6,
             output: 0.4e-6,
         },
@@ -722,10 +788,15 @@ pub fn calculate_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    cache_creation_tokens: u64,
     pricing: &ModelPricing,
 ) -> CostBreakdown {
-    let uncached = prompt_tokens.saturating_sub(cached_tokens);
-    let input_cost = uncached as f64 * pricing.input + cached_tokens as f64 * pricing.cached;
+    let uncached = prompt_tokens
+        .saturating_sub(cached_tokens)
+        .saturating_sub(cache_creation_tokens);
+    let input_cost = uncached as f64 * pricing.input
+        + cache_creation_tokens as f64 * pricing.cache_write
+        + cached_tokens as f64 * pricing.cached;
     let output_cost = completion_tokens as f64 * pricing.output;
     CostBreakdown {
         input_cost,
@@ -902,6 +973,7 @@ pub fn calculate_live_cost(usage: &LiveUsageSnapshot) -> Option<CostBreakdown> {
             usage.input_tokens,
             usage.output_tokens + usage.thinking_tokens,
             usage.cached_tokens,
+            0,
             &pricing,
         )
     })
@@ -931,6 +1003,8 @@ pub struct UsageSnapshot {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2484,6 +2558,7 @@ impl AppState {
                     prompt_tokens: msg["prompt_tokens"].as_u64().unwrap_or(0),
                     completion_tokens: msg["completion_tokens"].as_u64().unwrap_or(0),
                     cached_tokens: msg["cached_tokens"].as_u64().unwrap_or(0),
+                    cache_creation_tokens: msg["cache_creation_tokens"].as_u64().unwrap_or(0),
                 };
                 self.presence_usage = Some(u);
                 cmds.push(self.build_usage_command());
@@ -3072,6 +3147,7 @@ impl AppState {
                         u.prompt_tokens,
                         u.completion_tokens,
                         u.cached_tokens,
+                        u.cache_creation_tokens,
                         &pricing,
                     );
                     summary.total += cost.total;
@@ -3090,6 +3166,7 @@ impl AppState {
                         u.prompt_tokens,
                         u.completion_tokens,
                         u.cached_tokens,
+                        u.cache_creation_tokens,
                         &pricing,
                     );
                     summary.total += cost.total;
@@ -3669,6 +3746,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn pricing_gpt_5_6_variants_use_longest_provider_aware_prefix() {
+        let cases = [
+            ("gpt-5.6", 5.0e-6, 6.25e-6, 0.5e-6, 30.0e-6),
+            (
+                "openai/gpt-5.6-sol-20260711",
+                5.0e-6,
+                6.25e-6,
+                0.5e-6,
+                30.0e-6,
+            ),
+            ("gpt-5.6-terra-preview", 2.5e-6, 3.125e-6, 0.25e-6, 15.0e-6),
+            ("gpt-5.6-luna-20260711", 1.0e-6, 1.25e-6, 0.1e-6, 6.0e-6),
+        ];
+
+        for (model, input, cache_write, cached, output) in cases {
+            let pricing = find_pricing(model).unwrap();
+            assert!(
+                (pricing.input - input).abs() < 1e-12,
+                "unexpected {model} input rate"
+            );
+            assert!(
+                (pricing.cache_write - cache_write).abs() < 1e-12,
+                "unexpected {model} cache-write rate"
+            );
+            assert!(
+                (pricing.cached - cached).abs() < 1e-12,
+                "unexpected {model} cached rate"
+            );
+            assert!(
+                (pricing.output - output).abs() < 1e-12,
+                "unexpected {model} output rate"
+            );
+        }
+    }
+
+    #[test]
     fn pricing_exact_match() {
         let p = find_pricing("claude-opus-4-8").unwrap();
         assert!((p.input - 5.0e-6).abs() < 1e-12);
@@ -3700,15 +3813,16 @@ mod tests {
     fn cost_calculation() {
         let pricing = ModelPricing {
             input: 1.0e-6,
+            cache_write: 1.25e-6,
             cached: 0.1e-6,
             output: 2.0e-6,
         };
-        let cost = calculate_cost(1000, 500, 200, &pricing);
-        // uncached = 800, input_cost = 800*1e-6 + 200*0.1e-6 = 0.00082
+        let cost = calculate_cost(1000, 500, 200, 100, &pricing);
+        // uncached = 700, input_cost = 700*1e-6 + 100*1.25e-6 + 200*0.1e-6
         // output_cost = 500*2e-6 = 0.001
-        assert!((cost.input_cost - 0.00082).abs() < 1e-10);
+        assert!((cost.input_cost - 0.000845).abs() < 1e-10);
         assert!((cost.output_cost - 0.001).abs() < 1e-10);
-        assert!((cost.total - 0.00182).abs() < 1e-10);
+        assert!((cost.total - 0.001845).abs() < 1e-10);
     }
 
     #[test]
@@ -4998,12 +5112,14 @@ mod tests {
             prompt_tokens: 4000,
             completion_tokens: 1000,
             cached_tokens: 500,
+            cache_creation_tokens: 250,
         };
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains("hard_context_window"));
         let back: UsageSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tokens_used, 5000);
         assert_eq!(back.hard_context_window, Some(272000));
+        assert_eq!(back.cache_creation_tokens, 250);
     }
 
     #[test]
@@ -5014,10 +5130,12 @@ mod tests {
             "provider": "gemini", "model": "gemini-2.5-flash",
             "total_tokens": 2000, "context_window": 1048576,
             "usage_pct": 0.2, "prompt_tokens": 1500,
-            "completion_tokens": 500, "cached_tokens": 100
+            "completion_tokens": 500, "cached_tokens": 100,
+            "cache_creation_tokens": 50
         });
         let cmds = s.handle_message(&msg);
         assert!(s.presence_usage.is_some());
+        assert_eq!(s.presence_usage.as_ref().unwrap().cache_creation_tokens, 50);
         assert!(cmds
             .iter()
             .any(|c| matches!(c, UiCommand::UpdateUsage { .. })));

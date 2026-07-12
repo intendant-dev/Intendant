@@ -792,6 +792,7 @@ pub fn spawn_event_listener(
                         s.session_prompt_tokens = 0;
                         s.session_completion_tokens = 0;
                         s.session_cached_tokens = 0;
+                        s.session_cache_creation_tokens = 0;
                         s.active_session_source = s.session_sources.get(session_id).cloned();
                         if s.is_active_codex_session() {
                             let enabled = s
@@ -1147,6 +1148,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             s.session_prompt_tokens = 0;
             s.session_completion_tokens = 0;
             s.session_cached_tokens = 0;
+            s.session_cache_creation_tokens = 0;
             s.active_session_source = s.session_sources.get(session_id).cloned();
             if s.is_active_codex_session() {
                 let enabled = s
@@ -1475,6 +1477,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     let session_prompt_tokens = s.session_prompt_tokens;
     let session_completion_tokens = s.session_completion_tokens;
     let session_cached_tokens = s.session_cached_tokens;
+    let session_cache_creation_tokens = s.session_cache_creation_tokens;
     let context_window = s.context_window;
     let hard_context_window = s.hard_context_window;
     let active_session_id = s.session_id.clone();
@@ -1509,6 +1512,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     s.session_prompt_tokens = session_prompt_tokens;
     s.session_completion_tokens = session_completion_tokens;
     s.session_cached_tokens = session_cached_tokens;
+    s.session_cache_creation_tokens = session_cache_creation_tokens;
     s.context_window = context_window;
     s.hard_context_window = hard_context_window;
     s.session_id = active_session_id;

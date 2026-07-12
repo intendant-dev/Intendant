@@ -405,13 +405,25 @@ pub(crate) fn codex_session_usage_from_payload_bucket(
         ],
     )
     .unwrap_or(0);
+    let cache_creation_tokens = value_u64_at(
+        total,
+        &[
+            "/cache_write_tokens",
+            "/cacheWriteTokens",
+            "/cache_creation_tokens",
+            "/cacheCreationTokens",
+            "/input_tokens_details/cache_write_tokens",
+            "/inputTokensDetails/cacheWriteTokens",
+        ],
+    )
+    .unwrap_or(0);
     let total_tokens = value_u64_at(total, &["/total_tokens", "/totalTokens"])
         .unwrap_or_else(|| prompt_tokens + completion_tokens);
     Some(SessionUsage {
         total_tokens,
         prompt_tokens,
         completion_tokens,
-        cache_creation_tokens: 0,
+        cache_creation_tokens,
         cached_tokens,
     })
 }
@@ -590,6 +602,11 @@ pub(crate) fn codex_usage_from_compact_total_bucket(bucket: &str) -> Option<Sess
         .or_else(|| json_compact_u64_field(bucket, "cached_tokens"))
         .or_else(|| json_compact_u64_field(bucket, "cachedTokens"))
         .unwrap_or(0);
+    let cache_creation_tokens = json_compact_u64_field(bucket, "cache_write_tokens")
+        .or_else(|| json_compact_u64_field(bucket, "cacheWriteTokens"))
+        .or_else(|| json_compact_u64_field(bucket, "cache_creation_tokens"))
+        .or_else(|| json_compact_u64_field(bucket, "cacheCreationTokens"))
+        .unwrap_or(0);
     let total_tokens = json_compact_u64_field(bucket, "total_tokens")
         .or_else(|| json_compact_u64_field(bucket, "totalTokens"))
         .unwrap_or_else(|| prompt_tokens + completion_tokens);
@@ -597,7 +614,7 @@ pub(crate) fn codex_usage_from_compact_total_bucket(bucket: &str) -> Option<Sess
         total_tokens,
         prompt_tokens,
         completion_tokens,
-        cache_creation_tokens: 0,
+        cache_creation_tokens,
         cached_tokens,
     })
 }

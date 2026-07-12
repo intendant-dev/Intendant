@@ -1334,6 +1334,7 @@ impl SessionLog {
     }
 
     /// Log the full model response. Content is written to a per-turn file.
+    #[allow(clippy::too_many_arguments)] // token billing buckets remain explicit in the log schema
     pub fn model_response(
         &mut self,
         content: &str,
@@ -1341,6 +1342,7 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
         source: Option<&str>,
     ) -> Option<TurnFileSpan> {
         self.model_response_for_session(
@@ -1350,6 +1352,7 @@ impl SessionLog {
             completion_tokens,
             total_tokens,
             cached_tokens,
+            cache_creation_tokens,
             source,
         )
     }
@@ -1367,6 +1370,7 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
         source: Option<&str>,
     ) -> Option<TurnFileSpan> {
         self.summary_builder.total_tokens += total_tokens;
@@ -1383,6 +1387,7 @@ impl SessionLog {
                 "completion": completion_tokens,
                 "total": total_tokens,
                 "cached": cached_tokens,
+                "cache_creation": cache_creation_tokens,
             },
             "content_length": content.len(),
         });
@@ -1417,6 +1422,7 @@ impl SessionLog {
     /// acceptance-point only; external wrappers keep plain `model_response`
     /// (their messages are canonical in the NATIVE backend logs, and the
     /// intendant extractor skips wrapper sessions to avoid duplicates).
+    #[allow(clippy::too_many_arguments)] // token billing buckets remain explicit in the log schema
     pub fn model_response_with_message(
         &mut self,
         seq: u64,
@@ -1425,6 +1431,7 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
     ) -> String {
         let span = self.model_response_for_session(
             None,
@@ -1433,6 +1440,7 @@ impl SessionLog {
             completion_tokens,
             total_tokens,
             cached_tokens,
+            cache_creation_tokens,
             None,
         );
         let message_id = Uuid::new_v4().to_string();
@@ -1951,6 +1959,7 @@ mod tests {
             50,
             150,
             0,
+            0,
             None,
         );
         drop(log);
@@ -2076,12 +2085,12 @@ mod tests {
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
 
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Response 1", 100, 50, 150, 0, None);
+        log.model_response("Response 1", 100, 50, 150, 0, 0, None);
         log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#);
         log.agent_output("out1", "", None);
 
         log.turn_start(2, 5.0, 190_000);
-        log.model_response("Response 2", 200, 100, 300, 0, None);
+        log.model_response("Response 2", 200, 100, 300, 0, 0, None);
         log.agent_input(r#"{"commands":[{"function":"writeFile","nonce":2}]}"#);
         log.agent_output("out2", "err2", None);
 

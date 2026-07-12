@@ -1002,6 +1002,36 @@ let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionCodexLaunchDefaultsLoaded = false;
+// Projectless daemons cannot serve /api/settings until the user chooses a
+// project, so New Session needs an embedded offline catalog. A daemon-side
+// parity test pins this JSON fallback to project::CODEX_MODEL_CATALOG; a
+// successful settings fetch replaces it with the daemon-owned payload.
+const NEW_SESSION_CODEX_MODEL_FALLBACK = Object.freeze(
+/* codex-model-catalog:start */
+[
+  {"id":"gpt-5.6","display_name":"GPT-5.6 (Sol alias)","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max"]},
+  {"id":"gpt-5.5","display_name":"GPT-5.5","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark","default_reasoning_effort":"high","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4","display_name":"GPT-5.4","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4-mini","display_name":"GPT-5.4-Mini","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]}
+]
+/* codex-model-catalog:end */
+);
+const NEW_SESSION_CODEX_REASONING_FALLBACK = Object.freeze(
+/* codex-reasoning-efforts:start */
+["none","minimal","low","medium","high","xhigh","max","ultra"]
+/* codex-reasoning-efforts:end */
+);
+let newSessionCodexModelCatalog = NEW_SESSION_CODEX_MODEL_FALLBACK.map(entry => ({
+  ...entry,
+  reasoning_efforts: [...entry.reasoning_efforts],
+}));
+let newSessionCodexReasoningEfforts = [...NEW_SESSION_CODEX_REASONING_FALLBACK];
+let newSessionCodexGlobalModel = '';
+let newSessionCodexGlobalReasoningEffort = '';
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -2273,4 +2303,3 @@ if (document.readyState === 'loading') {
 } else {
   wireControlPaneListeners();
 }
-

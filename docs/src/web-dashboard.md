@@ -320,9 +320,11 @@ Token-consumption and cost tracking:
 
 - A KPI tile row up top: today / this-week / all-time cost, lifetime
   tokens, active days (skeleton tiles while session stats stream in)
-- Per-model breakdown for the main and presence models (prompt, completion, and
-  cached token counts), with a token-pressure meter per card
-- Cost estimates from a built-in pricing table (OpenAI, Anthropic, Gemini)
+- Per-model breakdown for the main and presence models (prompt, completion,
+  cache-read, and cache-write token counts), with a token-pressure meter per card
+- Cost estimates from a built-in pricing table (OpenAI, Anthropic, Gemini),
+  including the distinct GPT-5.6 Sol/Terra/Luna input, cache-write, cached-read,
+  and output rates
 - Token activity: a daily skyline and a GitHub-style year heatmap on the
   validated single-hue `--viz-*` ramp, filterable by agent and period
 - All-sessions cumulative usage and disk usage
@@ -467,12 +469,16 @@ directory is safe to delete; it rebuilds on the next scan.
   banner explains why the internal agent can't start (external agents
   sign in with their own accounts and still work) and deep-links to
   Settings → API Keys — which applies immediately, no restart.
-  External Codex sessions can choose the binary path, an exact model id,
-  sandbox and approval policies, `managed_context` mode (`vanilla` or
-  `managed`), context replay mode, and Fast service tier for that session.
-  The free-text model field is intentionally account-agnostic; blank inherits
-  the global/Codex default. The external-agent options sit in a fold that opens
-  when an external backend is selected. Claude Code sessions get per-launch
+  External Codex sessions can choose the binary path, a model, a compatible
+  reasoning effort, sandbox and approval policies, `managed_context` mode
+  (`vanilla` or `managed`), context replay mode, and Fast service tier for that
+  session. The model picker includes the current GPT-5.6 Sol/Terra/Luna family,
+  GPT-5.5, GPT-5.3-Codex-Spark, GPT-5.4, and GPT-5.4-Mini, with a Custom-id
+  escape for staged or account-specific models. Blank inherits the global/Codex
+  default; when a selected model cannot inherit the global effort, the picker
+  explicitly selects that model's advertised default instead. Model and effort
+  pins persist across attach/resume. The external-agent options sit in a fold
+  that opens when an external backend is selected. Claude Code sessions get per-launch
   dropdowns for the model (version-safe aliases — `fable`, `opus`, `sonnet`,
   `haiku` — that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort

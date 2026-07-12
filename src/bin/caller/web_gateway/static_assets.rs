@@ -629,8 +629,52 @@ mod tests {
     #[test]
     fn new_session_codex_model_override_is_wired() {
         assert!(APP_HTML.contains(r#"id="new-session-codex-model""#));
-        assert!(APP_HTML.contains("codexModelInp.disabled = !appliesToCodex;"));
+        assert!(APP_HTML.contains(r#"id="new-session-codex-model-select""#));
+        assert!(APP_HTML.contains(r#"id="new-session-codex-reasoning-effort""#));
+        assert!(APP_HTML.contains("codexModelSel.disabled = !appliesToCodex;"));
+        assert!(APP_HTML.contains("const model = selection || newSessionCodexGlobalModel;"));
         assert!(APP_HTML.contains("if (model) msg.codex_model = model;"));
+        assert!(APP_HTML.contains("msg.codex_reasoning_effort = reasoningEffort;"));
+    }
+
+    #[test]
+    fn embedded_codex_picker_fallback_matches_daemon_catalog() {
+        fn marker_json(start: &str, end: &str) -> serde_json::Value {
+            let json = APP_HTML
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(json, _)| json.trim()))
+                .unwrap_or_else(|| panic!("missing embedded catalog markers {start} / {end}"));
+            serde_json::from_str(json).expect("embedded catalog marker body is JSON")
+        }
+
+        let actual_models = marker_json(
+            "/* codex-model-catalog:start */",
+            "/* codex-model-catalog:end */",
+        );
+        let expected_models = serde_json::Value::Array(
+            crate::project::CODEX_MODEL_CATALOG
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "id": entry.id,
+                        "display_name": entry.display_name,
+                        "default_reasoning_effort": entry.default_reasoning_effort,
+                        "reasoning_efforts": entry.reasoning_efforts,
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(actual_models, expected_models);
+
+        let actual_efforts = marker_json(
+            "/* codex-reasoning-efforts:start */",
+            "/* codex-reasoning-efforts:end */",
+        );
+        let expected_efforts = serde_json::json!(crate::project::CODEX_REASONING_EFFORTS
+            .iter()
+            .filter(|effort| !effort.is_empty())
+            .collect::<Vec<_>>());
+        assert_eq!(actual_efforts, expected_efforts);
     }
 
     #[test]

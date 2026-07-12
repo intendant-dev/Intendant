@@ -21,6 +21,8 @@ pub struct SessionAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_approval_policy: Option<String>,
@@ -70,6 +72,7 @@ impl SessionAgentConfig {
             && self.project_root.is_none()
             && self.agent_command.is_none()
             && self.codex_model.is_none()
+            && self.codex_reasoning_effort.is_none()
             && self.codex_sandbox.is_none()
             && self.codex_approval_policy.is_none()
             && self.codex_managed_context.is_none()
@@ -96,6 +99,9 @@ impl SessionAgentConfig {
         }
         if self.codex_model.is_none() {
             self.codex_model = fallback.codex_model;
+        }
+        if self.codex_reasoning_effort.is_none() {
+            self.codex_reasoning_effort = fallback.codex_reasoning_effort;
         }
         if self.codex_sandbox.is_none() {
             self.codex_sandbox = fallback.codex_sandbox;
@@ -158,6 +164,16 @@ pub fn normalize_codex_model(model: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+/// Per-session Codex reasoning-effort pin. Empty and the explicit inherit
+/// sentinels clear the pin; known values share the project-level normalizer.
+pub fn normalize_codex_reasoning_effort(effort: Option<&str>) -> Option<String> {
+    let trimmed = effort.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    crate::project::normalize_reasoning_effort(Some(trimmed))
 }
 
 pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
@@ -278,6 +294,7 @@ pub struct WireSessionAgentFields<'a> {
     pub source: Option<&'a str>,
     pub agent_command: Option<&'a str>,
     pub codex_model: Option<&'a str>,
+    pub codex_reasoning_effort: Option<&'a str>,
     pub codex_sandbox: Option<&'a str>,
     pub codex_approval_policy: Option<&'a str>,
     pub codex_managed_context: Option<&'a str>,
@@ -324,6 +341,9 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         codex_model: is_codex
             .then(|| normalize_codex_model(fields.codex_model))
             .flatten(),
+        codex_reasoning_effort: is_codex
+            .then(|| normalize_codex_reasoning_effort(fields.codex_reasoning_effort))
+            .flatten(),
         codex_sandbox: is_codex
             .then(|| normalize_codex_sandbox(fields.codex_sandbox))
             .flatten(),
@@ -364,6 +384,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.codex.command.clone()),
             codex_model: normalize_codex_model(project.config.agent.codex.model.as_deref()),
+            codex_reasoning_effort: normalize_codex_reasoning_effort(
+                project.config.agent.codex.reasoning_effort.as_deref(),
+            ),
             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
                 &project.config.agent.codex.sandbox,
             )),
@@ -394,6 +417,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
                 agent_command: Some(claude.command.clone()),
                 codex_model: None,
+                codex_reasoning_effort: None,
                 codex_sandbox: None,
                 codex_approval_policy: None,
                 codex_managed_context: None,
@@ -428,6 +452,9 @@ pub fn apply_to_project(
             }
             if let Some(model) = config.codex_model.clone() {
                 project.config.agent.codex.model = Some(model);
+            }
+            if let Some(effort) = config.codex_reasoning_effort.clone() {
+                project.config.agent.codex.reasoning_effort = Some(effort);
             }
             if let Some(mode) = config.codex_sandbox.clone() {
                 project.config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(&mode);
@@ -513,6 +540,9 @@ fn normalize_session_agent_config(
     }
     if let Some(model) = config.codex_model.take() {
         config.codex_model = normalize_codex_model(Some(&model));
+    }
+    if let Some(effort) = config.codex_reasoning_effort.take() {
+        config.codex_reasoning_effort = normalize_codex_reasoning_effort(Some(&effort));
     }
     if let Some(mode) = config.codex_sandbox.take() {
         config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
@@ -806,6 +836,12 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     }
     if let Some(model) = config.codex_model.as_deref() {
         obj.insert("codex_model".to_string(), Value::String(model.to_string()));
+    }
+    if let Some(effort) = config.codex_reasoning_effort.as_deref() {
+        obj.insert(
+            "codex_reasoning_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
     }
     if let Some(model) = config.claude_model.as_deref() {
         obj.insert("claude_model".to_string(), Value::String(model.to_string()));
@@ -1443,6 +1479,52 @@ mod tests {
         });
         assert!(cross.claude_model.is_none());
         assert!(cross.claude_effort.is_none());
+    }
+
+    #[test]
+    fn codex_reasoning_effort_round_trips_applies_and_gates_on_source() {
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            codex_model: Some("gpt-5.6-sol"),
+            codex_reasoning_effort: Some(" ultra "),
+            ..Default::default()
+        });
+        assert_eq!(cfg.codex_reasoning_effort.as_deref(), Some("ultra"));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_log_dir_config(dir.path(), &cfg).unwrap();
+        let loaded = read_log_dir_config(dir.path()).expect("reasoning pin round-trips");
+        assert_eq!(loaded.codex_reasoning_effort.as_deref(), Some("ultra"));
+        let mut merged = SessionAgentConfig {
+            source: Some("codex".to_string()),
+            ..Default::default()
+        };
+        merged.merge_missing_from(loaded.clone());
+        assert_eq!(merged.codex_reasoning_effort.as_deref(), Some("ultra"));
+
+        std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
+        apply_to_project(&mut project, &AgentBackend::Codex, &loaded);
+        assert_eq!(
+            project.config.agent.codex.reasoning_effort.as_deref(),
+            Some("ultra")
+        );
+
+        let mut session = serde_json::json!({"source": "codex", "session_id": "sess-1"});
+        apply_config_to_session_json(&mut session, &loaded);
+        assert_eq!(
+            session
+                .get("codex_reasoning_effort")
+                .and_then(|value| value.as_str()),
+            Some("ultra")
+        );
+
+        let cross = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            codex_reasoning_effort: Some("max"),
+            ..Default::default()
+        });
+        assert!(cross.codex_reasoning_effort.is_none());
     }
 
     #[test]

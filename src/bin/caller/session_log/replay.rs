@@ -345,6 +345,10 @@ pub fn session_log_entry_to_app_event(
                     .and_then(|t| t.get("cached"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
+                cache_creation_tokens: tokens
+                    .and_then(|t| t.get("cache_creation"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 ..Default::default()
             };
             let source = data
@@ -1021,6 +1025,7 @@ pub fn session_log_entry_to_app_event(
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         }),
         "live_usage_update" => Some(AppEvent::LiveUsageUpdate {
             provider: data
@@ -1400,6 +1405,7 @@ mod tests {
             50,
             150,
             10,
+            5,
             Some("Codex"),
         );
         drop(log);
@@ -1423,6 +1429,7 @@ mod tests {
                 assert_eq!(usage.completion_tokens, 50);
                 assert_eq!(usage.total_tokens, 150);
                 assert_eq!(usage.cached_tokens, 10);
+                assert_eq!(usage.cache_creation_tokens, 5);
                 assert!(reasoning.is_none());
                 assert_eq!(source.as_deref(), Some("Codex"));
             }
@@ -1436,8 +1443,8 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(7, 0.5, 100_000);
-        log.model_response("first response", 1, 2, 3, 0, Some("Codex"));
-        log.model_response("second response", 4, 5, 6, 0, Some("Codex"));
+        log.model_response("first response", 1, 2, 3, 0, 0, Some("Codex"));
+        log.model_response("second response", 4, 5, 6, 0, 0, Some("Codex"));
         drop(log);
 
         let entries = read_events(&log_dir, "model_response");
@@ -1506,6 +1513,7 @@ mod tests {
             1,
             2,
             3,
+            0,
             0,
             Some("Codex"),
         );

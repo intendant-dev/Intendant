@@ -21647,11 +21647,6 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                   <label for="control-codex-reasoning">Reasoning effort</label>
                   <select id="control-codex-reasoning">
                     <option value="">(default)</option>
-                    <option value="minimal">minimal</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="xhigh">xhigh</option>
                   </select>
                 </div>
                 <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
@@ -22379,9 +22374,22 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
-                      <label class="sessions-new-session-field" for="new-session-codex-model">
+                      <label class="sessions-new-session-field" for="new-session-codex-model-select">
                         Codex model
-                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="Global setting (e.g. gpt-5.5)" disabled>
+                        <select id="new-session-codex-model-select" onchange="onNewSessionCodexModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-codex-model" id="new-session-codex-model-custom-row">
+                        Custom model id
+                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. staged-model-id" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-reasoning-effort">
+                        Reasoning effort
+                        <select id="new-session-codex-reasoning-effort" disabled>
+                          <option value="">Model / global default</option>
+                        </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model
@@ -39762,6 +39770,36 @@ let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionCodexLaunchDefaultsLoaded = false;
+// Projectless daemons cannot serve /api/settings until the user chooses a
+// project, so New Session needs an embedded offline catalog. A daemon-side
+// parity test pins this JSON fallback to project::CODEX_MODEL_CATALOG; a
+// successful settings fetch replaces it with the daemon-owned payload.
+const NEW_SESSION_CODEX_MODEL_FALLBACK = Object.freeze(
+/* codex-model-catalog:start */
+[
+  {"id":"gpt-5.6","display_name":"GPT-5.6 (Sol alias)","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max"]},
+  {"id":"gpt-5.5","display_name":"GPT-5.5","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark","default_reasoning_effort":"high","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4","display_name":"GPT-5.4","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4-mini","display_name":"GPT-5.4-Mini","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]}
+]
+/* codex-model-catalog:end */
+);
+const NEW_SESSION_CODEX_REASONING_FALLBACK = Object.freeze(
+/* codex-reasoning-efforts:start */
+["none","minimal","low","medium","high","xhigh","max","ultra"]
+/* codex-reasoning-efforts:end */
+);
+let newSessionCodexModelCatalog = NEW_SESSION_CODEX_MODEL_FALLBACK.map(entry => ({
+  ...entry,
+  reasoning_efforts: [...entry.reasoning_efforts],
+}));
+let newSessionCodexReasoningEfforts = [...NEW_SESSION_CODEX_REASONING_FALLBACK];
+let newSessionCodexGlobalModel = '';
+let newSessionCodexGlobalReasoningEffort = '';
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -41033,7 +41071,6 @@ if (document.readyState === 'loading') {
 } else {
   wireControlPaneListeners();
 }
-
 /* ── static/app/38-managed-context.js ── */
 // ── Managed context dashboard ──
 let sessionsLoaded = false;
@@ -51790,7 +51827,8 @@ function renderUsageCard(label, data) {
   const prompt = data.prompt_tokens || 0;
   const completion = data.completion_tokens || 0;
   const cached = data.cached_tokens || 0;
-  const uncachedInput = Math.max(0, prompt - cached);
+  const cacheCreated = data.cache_creation_tokens || 0;
+  const uncachedInput = Math.max(0, prompt - cached - cacheCreated);
   const effectiveWindow = data.context_window || 0;
   const hardWindow = data.hard_context_window || data.hardContextWindow || null;
   const effectivePct = pctForWindow(data.tokens_used, effectiveWindow);
@@ -51821,6 +51859,7 @@ function renderUsageCard(label, data) {
       <span class="label">Input tokens</span><span class="value">${prompt.toLocaleString()}</span>
       <span class="label sub">Cached</span>
       <span class="value">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
+      ${cacheCreated > 0 ? `<span class="label sub">Cache writes</span><span class="value">${cacheCreated.toLocaleString()}</span>` : ''}
       <span class="label sub">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
       <span class="label">Output tokens</span><span class="value">${completion.toLocaleString()}</span>
       ${hardLine}
@@ -54896,7 +54935,6 @@ function accessDiagnosticsCards() {
     },
   ];
 }
-
 /* ── static/app/43-access-panes.js ── */
 /* ── Access redesign: role metadata, chips, and pane renderers ──
    One vocabulary everywhere: a PRINCIPAL acts, a ROUTE carries the
@@ -83290,6 +83328,117 @@ window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 
+function selectedNewSessionCodexCatalogEntry() {
+  const selection = document.getElementById('new-session-codex-model-select')?.value || '';
+  if (selection === '__custom__') return null;
+  const model = selection || newSessionCodexGlobalModel;
+  return newSessionCodexModelCatalog
+    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
+    .sort((a, b) => b.id.length - a.id.length)[0] || null;
+}
+
+function populateNewSessionCodexReasoningEfforts() {
+  const select = document.getElementById('new-session-codex-reasoning-effort');
+  if (!select) return;
+  const previous = select.value || '';
+  const model = selectedNewSessionCodexCatalogEntry();
+  const efforts = model?.reasoning_efforts?.length
+    ? model.reasoning_efforts
+    : newSessionCodexReasoningEfforts;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  const globalSupported = !model || !newSessionCodexGlobalReasoningEffort ||
+    efforts.includes(newSessionCodexGlobalReasoningEffort);
+  inherit.textContent = newSessionCodexGlobalReasoningEffort && globalSupported
+    ? `Global setting (${newSessionCodexGlobalReasoningEffort})`
+    : (model?.default_reasoning_effort
+      ? `Model default (${model.default_reasoning_effort})`
+      : 'Model / global default');
+  select.appendChild(inherit);
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = efforts.includes(previous) ? previous : '';
+  if (model && !globalSupported && !select.value && efforts.includes(model.default_reasoning_effort)) {
+    // A selected model must not inherit an incompatible global effort (for
+    // example Luna under an Ultra global pin). Make its advertised default
+    // explicit on the create-session wire instead.
+    select.value = model.default_reasoning_effort;
+  }
+}
+
+function populateControlCodexReasoningEfforts() {
+  const select = document.getElementById('control-codex-reasoning');
+  if (!select) return;
+  const previous = select.value || controlCodexConfig.reasoning_effort || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = '(default)';
+  select.appendChild(inherit);
+  for (const effort of newSessionCodexReasoningEfforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = newSessionCodexReasoningEfforts.includes(previous) ? previous : '';
+}
+
+function populateNewSessionCodexModelSelect() {
+  const select = document.getElementById('new-session-codex-model-select');
+  if (!select) return;
+  const previous = select.value || '';
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = newSessionCodexGlobalModel
+    ? `Global setting (${newSessionCodexGlobalModel})`
+    : 'Global / Codex default';
+  select.appendChild(inherit);
+  for (const entry of newSessionCodexModelCatalog) {
+    const option = document.createElement('option');
+    option.value = entry.id;
+    option.textContent = `${entry.display_name} — ${entry.id}`;
+    select.appendChild(option);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  select.value = previous === '__custom__' || newSessionCodexModelCatalog.some(entry => entry.id === previous)
+    ? previous
+    : '';
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+
+function updateNewSessionCodexCustomModelRow() {
+  const select = document.getElementById('new-session-codex-model-select');
+  const row = document.getElementById('new-session-codex-model-custom-row');
+  const input = document.getElementById('new-session-codex-model');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+  if (input) input.disabled = !custom;
+}
+
+function onNewSessionCodexModelSelectChange() {
+  updateNewSessionCodexCustomModelRow();
+  populateNewSessionCodexReasoningEfforts();
+}
+window.onNewSessionCodexModelSelectChange = onNewSessionCodexModelSelectChange;
+populateControlCodexReasoningEfforts();
+populateNewSessionCodexModelSelect();
+
 // The Claude model picker offers version-safe aliases (the CLI resolves
 // them to the latest model); the free-text id input only appears behind
 // the explicit "Custom model id…" choice.
@@ -83836,6 +83985,27 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
   newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
+  newSessionCodexGlobalModel = String(settings.codex_model || '').trim();
+  newSessionCodexGlobalReasoningEffort = String(settings.codex_reasoning_effort || '').trim();
+  const configuredCatalog = Array.isArray(settings.codex_models)
+    ? settings.codex_models
+      .map(entry => ({
+        id: String(entry?.id || '').trim(),
+        display_name: String(entry?.display_name || entry?.id || '').trim(),
+        default_reasoning_effort: String(entry?.default_reasoning_effort || '').trim(),
+        reasoning_efforts: Array.isArray(entry?.reasoning_efforts)
+          ? entry.reasoning_efforts.map(value => String(value || '').trim()).filter(Boolean)
+          : [],
+      }))
+      .filter(entry => entry.id)
+    : [];
+  if (configuredCatalog.length) newSessionCodexModelCatalog = configuredCatalog;
+  const configuredEfforts = Array.isArray(settings.codex_reasoning_efforts)
+    ? settings.codex_reasoning_efforts.map(value => String(value || '').trim()).filter(Boolean)
+    : [];
+  if (configuredEfforts.length) newSessionCodexReasoningEfforts = configuredEfforts;
+  populateControlCodexReasoningEfforts();
+  populateNewSessionCodexModelSelect();
   newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
@@ -83861,7 +84031,9 @@ function renderNewSessionAgentControls(options = {}) {
   const select = document.getElementById('new-session-agent');
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
+  const codexModelSel = document.getElementById('new-session-codex-model-select');
   const codexModelInp = document.getElementById('new-session-codex-model');
+  const codexReasoningSel = document.getElementById('new-session-codex-reasoning-effort');
   const sandboxSel = document.getElementById('new-session-codex-sandbox');
   const approvalSel = document.getElementById('new-session-codex-approval-policy');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
@@ -83923,9 +84095,17 @@ function renderNewSessionAgentControls(options = {}) {
   const claudeEffortSel = document.getElementById('new-session-claude-effort');
   const appliesToClaude = effectiveAgent === 'claude-code';
   const appliesToCodex = effectiveAgent === 'codex';
+  if (codexModelSel) {
+    codexModelSel.disabled = !appliesToCodex;
+    if (!appliesToCodex) codexModelSel.value = '';
+  }
   if (codexModelInp) {
-    codexModelInp.disabled = !appliesToCodex;
     if (!appliesToCodex) codexModelInp.value = '';
+  }
+  updateNewSessionCodexCustomModelRow();
+  if (codexReasoningSel) {
+    codexReasoningSel.disabled = !appliesToCodex;
+    if (!appliesToCodex) codexReasoningSel.value = '';
   }
   if (claudeModelSel) {
     claudeModelSel.disabled = !appliesToClaude;
@@ -84485,8 +84665,13 @@ async function startNewSession() {
     if (effort) msg.claude_effort = effort;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
-    const model = document.getElementById('new-session-codex-model')?.value.trim() || '';
+    const modelChoice = document.getElementById('new-session-codex-model-select')?.value || '';
+    const model = modelChoice === '__custom__'
+      ? (document.getElementById('new-session-codex-model')?.value.trim() || '')
+      : modelChoice;
     if (model) msg.codex_model = model;
+    const reasoningEffort = document.getElementById('new-session-codex-reasoning-effort')?.value || '';
+    if (reasoningEffort) msg.codex_reasoning_effort = reasoningEffort;
     if (newSessionCodexLaunchDefaultsLoaded) {
       msg.codex_sandbox = normalizeCodexSandbox(
         document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
@@ -84557,7 +84742,6 @@ function onNewSessionWorktreeToggle() {
   document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
 }
 window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
-
 /* ── static/app/56-debug-sessions.js ── */
 // ── Debug Screen ──
 let debugScreenActive = false;

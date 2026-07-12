@@ -1221,6 +1221,7 @@ pub(crate) async fn run_agent_loop(
                     response.usage.completion_tokens,
                     response.usage.total_tokens,
                     response.usage.cached_tokens,
+                    response.usage.cache_creation_tokens,
                     None,
                 );
             } else {
@@ -1231,6 +1232,7 @@ pub(crate) async fn run_agent_loop(
                     response.usage.completion_tokens,
                     response.usage.total_tokens,
                     response.usage.cached_tokens,
+                    response.usage.cache_creation_tokens,
                 );
             }
         });

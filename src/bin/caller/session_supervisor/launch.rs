@@ -27,6 +27,7 @@ impl SessionSupervisor {
         claude_permission_mode: Option<String>,
         claude_effort: Option<String>,
         codex_model: Option<String>,
+        codex_reasoning_effort: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -273,6 +274,26 @@ impl SessionSupervisor {
                 return;
             };
             if let Err(e) = apply_session_codex_model(&mut project, backend, model.to_string()) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(effort) = codex_reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| {
+                !effort.is_empty() && !matches!(*effort, "inherit" | "default" | "global")
+            })
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: codex_reasoning_effort requires Codex".to_string(),
+                );
+                return;
+            };
+            if let Err(e) =
+                apply_session_codex_reasoning_effort(&mut project, backend, effort.to_string())
+            {
                 self.loop_error(format!("Session create failed: {}", e));
                 return;
             }
