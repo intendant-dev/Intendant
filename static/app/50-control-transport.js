@@ -161,7 +161,14 @@ class DashboardControlTransport {
   }
 
   scheduleReconnect(reason, options = {}) {
-    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardConnectModeEnabled()) return;
+    // Reconnect whenever this tunnel is the PRIMARY event lane: hosted
+    // Connect dashboards and the macOS-app mTLS posture (where the legacy
+    // WebSocket can never connect, so a dropped tunnel would otherwise
+    // kill events until app relaunch). The localStorage webrtc-control
+    // opt-in keeps the legacy /ws lane as primary and stays out of this
+    // path. suppressReconnect marks explicit closes (user disable,
+    // deliberate teardown before a replacement connect).
+    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardControlTunnelIsPrimaryEventLane()) return;
     scheduleDashboardConnectReconnect(reason, options);
   }
 
@@ -205,6 +212,13 @@ class DashboardControlTransport {
         dashboardControlEventsActive = true;
         dashboardRecentServerMessageKeys.clear();
         console.info('[dashboard-control] event stream subscribed');
+        // In the macOS-app mTLS posture nothing else drives the primary
+        // event chip (the legacy WS callbacks never fire); mark the lane
+        // live here. Connect mode owns its own chip transitions in the
+        // bootstrap/reconnect paths.
+        if (this.primaryDashboardControl && !dashboardConnectModeEnabled() && dashboardControlTunnelIsPrimaryEventLane()) {
+          setConnectEventStatus('ok', 'Dashboard events are live through the control tunnel');
+        }
         dashboardUpdateTransportStatus();
       }
     }).catch(err => console.warn('[dashboard-control] event subscribe failed', err));
@@ -273,7 +287,13 @@ class DashboardControlTransport {
       return;
     }
     if (msg.t === 'event_gap') {
-      console.warn('[dashboard-control] event gap', msg.skipped || 0);
+      // Only the primary transport's gaps drive the recovery UX; a peer
+      // tunnel's gap is that peer pane's concern, not the local chip's.
+      if (this.primaryDashboardControl) {
+        dashboardHandleEventGap(msg, 'tunnel');
+      } else {
+        console.warn('[dashboard-control] peer event gap', msg.skipped || 0);
+      }
       dashboardUpdateTransportStatus();
       return;
     }
@@ -1096,6 +1116,20 @@ class DashboardControlTransport {
 
   debugStatus() {
     const connected = this.pc?.connectionState === 'connected';
+    // Availability booleans, derived by iterating the daemon's status
+    // frame instead of hand-copying every `*_available` flag (browser-side
+    // "derive, don't mirror"): each snake_case `*_available` key the
+    // daemon reports appears as its camelCase twin (dashboardControlCamelKey
+    // preserves the historical `WebRtc` hump). Keys the daemon does not
+    // report simply don't appear — consumers already treat missing and
+    // null alike as "unknown".
+    const availability = {};
+    if (this.lastStatus && typeof this.lastStatus === 'object') {
+      for (const [key, value] of Object.entries(this.lastStatus)) {
+        if (!key.endsWith('_available')) continue;
+        availability[dashboardControlCamelKey(key)] = value ?? null;
+      }
+    }
     return {
       enabled: dashboardControlTransportEnabled(),
       mode: connected && this.verifiedBinding ? 'webrtc-control' : 'checking',
@@ -1118,100 +1152,7 @@ class DashboardControlTransport {
       grantKind: this.lastStatus?.grant_kind ?? null,
       grantLabel: this.lastStatus?.grant_label ?? null,
       accessPrincipal: this.lastStatus?.access_principal ?? null,
-      apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
-      apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
-      apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
-      apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
-      apiDisplayBootstrapAvailable: this.lastStatus?.api_display_bootstrap_available ?? null,
-      apiDisplayInputAuthorityAvailable: this.lastStatus?.api_display_input_authority_available ?? null,
-      apiDisplayWebRtcSignalAvailable: this.lastStatus?.api_display_webrtc_signal_available ?? null,
-      apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
-      apiExternalSessionActivityReplayAvailable: this.lastStatus?.api_external_session_activity_replay_available ?? null,
-      apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,
-      apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
-      apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
-      apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
-      byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
-      uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
-      terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
-      presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
-      presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
-      presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
-      accessInspectAvailable: this.lastStatus?.access_inspect_available ?? null,
-      accessManageAvailable: this.lastStatus?.access_manage_available ?? null,
-      apiAccessIamUpsertUserClientGrantAvailable: this.lastStatus?.api_access_iam_upsert_user_client_grant_available ?? null,
-      apiAccessIamUpdateGrantAvailable: this.lastStatus?.api_access_iam_update_grant_available ?? null,
-      peerInspectAvailable: this.lastStatus?.peer_inspect_available ?? null,
-      peerManageAvailable: this.lastStatus?.peer_manage_available ?? null,
-      apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
-      apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
-      apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
-      apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
-      apiSessionAgentOutputAvailable: this.lastStatus?.api_session_agent_output_available ?? null,
-      apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
-      apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
-      apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
-      apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
-      apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
-      apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
-      apiSessionContextSnapshotAvailable: this.lastStatus?.api_session_context_snapshot_available ?? null,
-      apiSessionCurrentUploadAvailable: this.lastStatus?.api_session_current_upload_available ?? null,
-      apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
-      apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
-      apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
-      apiTransferJobsAvailable: this.lastStatus?.api_transfer_jobs_available ?? null,
-      apiTransferJobCreateAvailable: this.lastStatus?.api_transfer_job_create_available ?? null,
-      apiTransferJobDeleteAvailable: this.lastStatus?.api_transfer_job_delete_available ?? null,
-      apiTransferDownloadReadAvailable: this.lastStatus?.api_transfer_download_read_available ?? null,
-      apiTransferUploadChunkAvailable: this.lastStatus?.api_transfer_upload_chunk_available ?? null,
-      apiTransferUploadCommitAvailable: this.lastStatus?.api_transfer_upload_commit_available ?? null,
-      apiMediaEditorAvailable: this.lastStatus?.api_media_editor_available ?? null,
-      apiMediaAnnotationAttachAvailable: this.lastStatus?.api_media_annotation_attach_available ?? null,
-      apiMediaAnnotationSubmitAvailable: this.lastStatus?.api_media_annotation_submit_available ?? null,
-      apiMediaClipStartAvailable: this.lastStatus?.api_media_clip_start_available ?? null,
-      apiMediaClipFrameAvailable: this.lastStatus?.api_media_clip_frame_available ?? null,
-      apiMediaClipEndAvailable: this.lastStatus?.api_media_clip_end_available ?? null,
-      apiMediaClipCancelAvailable: this.lastStatus?.api_media_clip_cancel_available ?? null,
-      apiFsStatAvailable: this.lastStatus?.api_fs_stat_available ?? null,
-      apiFsListAvailable: this.lastStatus?.api_fs_list_available ?? null,
-      apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
-      apiFsReadAvailable: this.lastStatus?.api_fs_read_available ?? null,
-      apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
-      apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
-      apiSettingsSaveAvailable: this.lastStatus?.api_settings_save_available ?? null,
-      apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
-      apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
-      apiDashboardActionMsgAvailable: this.lastStatus?.api_dashboard_action_msg_available ?? null,
-      apiDiagnosticsVisualFreshnessAvailable: this.lastStatus?.api_diagnostics_visual_freshness_available ?? null,
-      apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
-      apiApiKeysSaveAvailable: this.lastStatus?.api_api_keys_save_available ?? null,
-      apiVoiceSessionAvailable: this.lastStatus?.api_voice_session_available ?? null,
-      apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
-      apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
-      apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
-      apiRecordingAssetAvailable: this.lastStatus?.api_recording_asset_available ?? null,
-      apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
-      apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
-      apiSessionFrameAssetAvailable: this.lastStatus?.api_session_frame_asset_available ?? null,
-      apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
-      apiWorktreesInspectAvailable: this.lastStatus?.api_worktrees_inspect_available ?? null,
-      apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
-      apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
-      apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
-      apiMcpToolCallAvailable: this.lastStatus?.api_mcp_tool_call_available ?? null,
-      apiPeerMutationsAvailable: this.lastStatus?.api_peer_mutations_available ?? null,
-      apiPeerPairingAvailable: this.lastStatus?.api_peer_pairing_available ?? null,
-      apiPeerPairingInviteAvailable: this.lastStatus?.api_peer_pairing_invite_available ?? null,
-      apiPeerPairingJoinAvailable: this.lastStatus?.api_peer_pairing_join_available ?? null,
-      apiPeerPairingRequestAccessAvailable: this.lastStatus?.api_peer_pairing_request_access_available ?? null,
-      apiPeerPairingRequestDecisionAvailable: this.lastStatus?.api_peer_pairing_request_decision_available ?? null,
-      apiPeerPairingRequestsAvailable: this.lastStatus?.api_peer_pairing_requests_available ?? null,
-      apiPeerPairingIdentitiesAvailable: this.lastStatus?.api_peer_pairing_identities_available ?? null,
-      apiPeerPairingIdentityRevokeAvailable: this.lastStatus?.api_peer_pairing_identity_revoke_available ?? null,
-      apiPeerWebRtcSignalAvailable: this.lastStatus?.api_peer_webrtc_signal_available ?? null,
-      apiPeerFileTransferSignalAvailable: this.lastStatus?.api_peer_file_transfer_signal_available ?? null,
-      apiPeerDashboardControlSignalAvailable: this.lastStatus?.api_peer_dashboard_control_signal_available ?? null,
-      apiCoordinatorAvailable: this.lastStatus?.api_coordinator_available ?? null,
+      ...availability,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
       pendingByteStreams: this.byteStreams.size,
@@ -1530,6 +1471,78 @@ function handlePeerDashboardControlSignal(hostId, sessionId, signal) {
   } else {
     console.debug(`[peer-dashboard-control ${hostId}] unknown signal kind=${kind || '(none)'} for session ${sessionId}`);
   }
+}
+
+// snake_case → camelCase for status-frame keys (debugStatus derive).
+// `webrtc` keeps its historical `WebRtc` hump: the QA harnesses
+// (validate-dashboard-control-local-signaling.cjs) assert
+// `apiPeerWebRtcSignalAvailable` by that exact name.
+function dashboardControlCamelKey(key) {
+  return String(key || '')
+    .replace(/_([a-z0-9])/g, (_, ch) => ch.toUpperCase())
+    .replace(/Webrtc/g, 'WebRtc');
+}
+
+// ── event_gap recovery ──
+// Both event lanes can report dropped events: the dashboard-control tunnel
+// emits {"t":"event_gap","skipped":N} when its outbound event queue
+// overflows, and the /ws lane is gaining a frame with the same shape. One
+// coalescing window (from the FIRST gap) turns any burst into: a pulse on
+// the lane's status chip, a single "Recovering N missed events…" toast,
+// and one state refresh (sessions metadata + timeline re-pull, plus a
+// rate-limited full bootstrap re-pull over the tunnel when it is up).
+const DASHBOARD_EVENT_GAP_COALESCE_MS = 1500;
+const DASHBOARD_EVENT_GAP_HYDRATE_MIN_INTERVAL_MS = 30000;
+let dashboardEventGapPendingSkipped = 0;
+let dashboardEventGapToastTimer = null;
+let dashboardEventGapLastHydrateAt = 0;
+
+// Visual pulse on the status chip for the lane that reported the gap —
+// Web Animations API only, so no stylesheet dependency.
+function dashboardPulseEventLaneChip(lane) {
+  const id = lane === 'ws' ? 'sb-conn-group' : 'sb-dashboard-transport';
+  const el = document.getElementById(id) || document.getElementById('sb-conn-group');
+  if (!el || typeof el.animate !== 'function') return;
+  try {
+    el.animate(
+      [{ opacity: 1 }, { opacity: 0.25 }, { opacity: 1 }],
+      { duration: 380, iterations: 3, easing: 'ease-in-out' }
+    );
+  } catch (_) {}
+}
+
+function dashboardHandleEventGap(msg, lane = 'tunnel') {
+  const skipped = Math.max(0, Number(msg?.skipped) || 0);
+  dashboardEventGapPendingSkipped += skipped;
+  console.warn('[server-msg] event_gap', lane, skipped || '(count unknown)');
+  dashboardPulseEventLaneChip(lane);
+  if (dashboardEventGapToastTimer) return;
+  dashboardEventGapToastTimer = window.setTimeout(() => {
+    dashboardEventGapToastTimer = null;
+    const n = dashboardEventGapPendingSkipped;
+    dashboardEventGapPendingSkipped = 0;
+    const what = n > 0 ? `${n} missed event${n === 1 ? '' : 's'}` : 'missed events';
+    if (typeof showControlToast === 'function') {
+      showControlToast('info', `Recovering ${what}…`);
+    }
+    if (typeof scheduleSessionsMetadataRefresh === 'function') {
+      scheduleSessionsMetadataRefresh();
+    }
+    if (typeof refreshHistory === 'function') {
+      try { refreshHistory(); } catch (err) { console.warn('[server-msg] event_gap history refresh failed', err); }
+    }
+    const now = Date.now();
+    if (
+      typeof hydrateDashboardFromControl === 'function' &&
+      dashboardTransport?.canUseRpc?.() &&
+      now - dashboardEventGapLastHydrateAt > DASHBOARD_EVENT_GAP_HYDRATE_MIN_INTERVAL_MS
+    ) {
+      dashboardEventGapLastHydrateAt = now;
+      hydrateDashboardFromControl().catch(err => {
+        console.warn('[server-msg] event_gap bootstrap re-pull failed', err);
+      });
+    }
+  }, DASHBOARD_EVENT_GAP_COALESCE_MS);
 }
 
 function dashboardControlAbortError(message = 'dashboard control request aborted') {
