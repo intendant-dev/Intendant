@@ -35,8 +35,12 @@ const SESSION_MSG_SEARCH_TIMEOUT_MS = 15000;
 
 function messageSearchFlagEnabled() {
   if (_msgSearchFlagMemo === null) {
+    // Default ON since the 2026-07-12 soak (real-corpus acceptance +
+    // browser QA green); `?message_search=off` is the escape hatch. The
+    // runtime availability precheck still gates the lane per daemon, so
+    // old daemons degrade to the honest "unavailable" note.
     const raw = new URLSearchParams(window.location.search).get('message_search');
-    _msgSearchFlagMemo = raw === 'on' || raw === '1';
+    _msgSearchFlagMemo = raw !== 'off' && raw !== '0';
   }
   return _msgSearchFlagMemo;
 }
