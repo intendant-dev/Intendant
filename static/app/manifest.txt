@@ -67,6 +67,10 @@ ui2-activity.js
 42b-access-model.js
 43-access-panes.js
 44-shell-frames.js
+# 45-display-viewer-core.js must stay BEFORE 45-displays-webrtc.js and
+# 52-peer-display.js: both viewer classes' static initializers and policy
+# objects read its top-level consts at class-evaluation time.
+45-display-viewer-core.js
 45-displays-webrtc.js
 46-recording-replay.js
 47-annotation-clips.js

@@ -81,81 +81,106 @@ function sendDisplayInputForSlot(displayId, msg) {
   return Boolean(dashboardTransport?.displayInput?.(displayId, msg));
 }
 
-// Item 8: remote-clipboard write failures were fully silent (nested empty
-// catches). Success stays quiet; the FIRST write failure per page session
-// raises one actionable toast, then the path goes quiet again.
-let displayClipboardToastShown = false;
-function noteDisplayClipboardWriteFailure() {
-  if (displayClipboardToastShown) return;
-  displayClipboardToastShown = true;
-  if (typeof showControlToast === 'function') {
-    showControlToast('error', "Remote clipboard couldn't sync — click the page and retry");
-  }
-}
+// The clipboard-failure toast (`noteDisplayClipboardWriteFailure`) and the
+// shared getStats() summarizer (`summarizeRtcStats`) moved verbatim to
+// 45-display-viewer-core.js — the shared viewer core both this class and
+// PeerDisplayConnection (52-peer-display.js) compose over.
 
-// Shared getStats() summarizer for the live metrics chip ("LIVE · fps ·
-// kbps · relay"). Used by both the local DisplaySlot and the federated
-// PeerDisplayConnection samplers so the two chips can't drift. `prev` is
-// the snapshot returned by the previous call (or null on the first
-// sample); rates are computed from deltas against it. kbps reads the
-// selected candidate-pair's bytesReceived so it covers the tile
-// datachannel lane as well as RTP video; `relay` is true when the local
-// selected candidate is a TURN relay.
-function summarizeRtcStats(stats, prev) {
-  let inbound = null;
-  let pair = null;
-  let transport = null;
-  const byId = new Map();
-  stats.forEach((r) => {
-    byId.set(r.id, r);
-    if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.mediaType === 'video')) {
-      inbound = r;
-    } else if (
-      r.type === 'candidate-pair' &&
-      (r.selected || (r.nominated && r.state === 'succeeded'))
-    ) {
-      pair = r;
-    } else if (r.type === 'transport') {
-      transport = r;
-    }
-  });
-  // Chrome never sets `selected`; resolve through the transport's pair id.
-  if (!pair && transport && transport.selectedCandidatePairId) {
-    pair = byId.get(transport.selectedCandidatePairId) || null;
-  }
-  const now = (inbound && inbound.timestamp) || (pair && pair.timestamp) || performance.now();
-  const snapshot = {
-    t: now,
-    frames: inbound ? Number(inbound.framesDecoded || 0) : null,
-    bytes: pair ? Number(pair.bytesReceived || 0)
-      : (inbound ? Number(inbound.bytesReceived || 0) : null),
-  };
-  let fps = (inbound && inbound.framesPerSecond !== undefined)
-    ? Math.round(inbound.framesPerSecond)
-    : null;
-  let kbps = null;
-  if (prev && now > prev.t) {
-    const dt = (now - prev.t) / 1000;
-    if (fps === null && snapshot.frames !== null && prev.frames !== null) {
-      fps = Math.max(0, Math.round((snapshot.frames - prev.frames) / dt));
-    }
-    if (snapshot.bytes !== null && prev.bytes !== null) {
-      kbps = Math.max(0, Math.round(((snapshot.bytes - prev.bytes) * 8) / dt / 1000));
-    }
-  }
-  let relay = false;
-  if (pair) {
-    const local = byId.get(pair.localCandidateId);
-    relay = !!(local && local.candidateType === 'relay');
-  }
-  const parts = ['LIVE'];
-  if (fps !== null) parts.push(`${fps} fps`);
-  if (kbps !== null) parts.push(`${kbps} kbps`);
-  if (relay) parts.push('relay');
-  // Nothing but "LIVE" to say yet (first sample, no rates): don't render.
-  const text = parts.length > 1 ? parts.join(' · ') : null;
-  return { text, snapshot };
-}
+// ── LOCAL display viewer policy ─────────────────────────────────────────
+// The named home for every deliberate difference between this class and
+// the federated PeerDisplayConnection (whose counterpart is
+// PEER_DISPLAY_POLICY in 52-peer-display.js). The shared mechanics live
+// in 45-display-viewer-core; each field below cites the decision it
+// carries. Pure consolidation: each method's behavior is byte-identical
+// to the inline code it replaced.
+const DISPLAY_SLOT_POLICY = {
+  name: 'local-display-slot',
+
+  // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
+  // default empty for local LAN deployments. Goes through the shared
+  // helper so the peer-display path can't drift in what it hands to the
+  // browser's ICE agent. NO relay pinning here — that is the FEDERATED
+  // policy (#41–#45): local display must never be forced through TURN.
+  buildRtcConfig() {
+    return { iceServers: buildIceServersFromGatewayConfig(gatewayConfig) };
+  },
+
+  // **#58**: NO `setCodecPreferences` reorder. WKWebView's default
+  // codec order puts H.264 PTs (96/98/100) before VP8 (107) — let
+  // it. On macOS the server then negotiates H.264, which spawns a
+  // hardware-accelerated VideoToolbox encoder
+  // ([`crate::display::encode::h264_macos`]) — single-encoding,
+  // single thread, ~5-10 % CPU at full resolution.
+  //
+  // Pre-#58 this path force-reordered VP8 first because the local
+  // DisplaySlot also injected `a=simulcast:recv f;h;q` for
+  // multi-encoding receive, and rtc 0.9's SDP writer mishandles
+  // multi-RID H.264 (single SSRC covering all RIDs → browser
+  // chokes). #58 also drops to `a=simulcast:recv f` (single-RID
+  // receive — see `DISPLAY_SIMULCAST_RIDS`), so the rtc 0.9
+  // multi-RID-H.264 bug is no longer reachable: with single-RID
+  // receive the answer is plain sendonly, identical for VP8 and
+  // H.264. Restoring default codec order = restoring the
+  // hardware-accelerated path the macOS UTM guest needs to stay
+  // usable. Pre-#58 idle dashboard pegged the guest at 245 %+
+  // CPU on three software VP8 encoders for one viewer.
+  //
+  // Chrome viewers on macOS still default VP8 first; they get
+  // single-encoding VP8 (libvpx software, 1 encoder) at ~80 % CPU
+  // — also a substantial drop from ~245 %, just less dramatic
+  // than WKWebView's hardware H.264 path.
+  //
+  // (The FEDERATED policy is the opposite: an explicit VP8 pin, #67.)
+  applyCodecPreferences(_videoTransceiver) {},
+
+  // **#58** (LOCAL ONLY): inject `a=rid:<rid> recv` lines +
+  // `a=simulcast:recv <rids>` into the m=video section before
+  // setLocalDescription. `<rids>` is `DISPLAY_SIMULCAST_RIDS` (default
+  // `['f']` — single-RID receive post-#58; opt-in `['f','h','q']` for
+  // the experimental multi-encoding adaptive-bandwidth path). The
+  // federated path deliberately SKIPS this injection (#46: rtc 0.9
+  // answers a recv-simulcast hint on a single-encoding track with a
+  // malformed multi-RID/single-SSRC shape the browser refuses to
+  // decode).
+  mungeOfferSdp(sdp) {
+    return injectRecvSimulcastIntoVideoOffer(sdp, DISPLAY_SIMULCAST_RIDS);
+  },
+
+  // Retry semantics: renegotiate IN PLACE on the same slot — the
+  // server-side DisplaySession survives an ICE failure, so disconnect()
+  // + connect() issues a fresh offer the same session answers. The
+  // attempt counter lives on the instance (`_reconnectAttempts`). The
+  // peer path instead re-opens with a fresh session id (its WebRtcPeer
+  // lifecycle cannot re-offer). Budget/backoff/dead-end copy are the
+  // shared DISPLAY_VIEWER_RETRY_* constants.
+  retrySemantics: 'renegotiate-in-place',
+
+  // Signaling transport: the verified dashboard-control tunnel
+  // (displayWebRtcSignal) first, legacy /ws lane frames
+  // (display_offer / display_ice / display_answer) as the direct-origin
+  // fallback — see sendDisplayOffer / sendDisplayIceCandidate. The peer
+  // path signals through the daemon HTTP/tunnel facade
+  // (api_peer_webrtc_signal) instead.
+  signalingLane: 'dashboard-control-or-ws',
+
+  // Container resolution: a fixed stage — the slot owns its DOM for its
+  // whole life (canvasEl/overlayEl/metricsEl created once in the
+  // constructor and reparented as a unit). The peer path re-resolves
+  // Station-aware containers on every render because its pane DOM is
+  // rebuilt by daemons-list re-renders.
+  containerResolution: 'fixed-stage',
+
+  // Clipboard sync: LOCAL ONLY today (paste interceptor + remote
+  // clipboard_update applier). Federated clipboard is a follow-up.
+  clipboardSync: true,
+
+  // Attach/annotation stream naming: `display_<id>` (byte-identical to
+  // the pre-provider strings; the peer path namespaces by host —
+  // `peer_<safeHost>_display_<id>` — so ids stay unique across hosts).
+  streamBase(slot) {
+    return 'display_' + slot.displayId;
+  },
+};
 
 class DisplaySlot {
   constructor(displayId, width, height) {
@@ -303,9 +328,11 @@ class DisplaySlot {
     this.calloutBtn.addEventListener('click', () => this.toggleCallout());
   }
 
-  // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — keep the
-  // two paths' patience identical.
-  static NO_TRACK_TIMEOUT_MS = 10000;
+  // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — both are
+  // the shared viewer-core constant, so the two paths' patience can't
+  // drift. The static stays public (QA overrides keep working: the
+  // watchdog arms with the static, not the constant).
+  static NO_TRACK_TIMEOUT_MS = DISPLAY_VIEWER_NO_TRACK_TIMEOUT_MS;
 
   toggleFullscreen(force) {
     const want = force === undefined
@@ -352,18 +379,15 @@ class DisplaySlot {
     const logicalResolution = options.logicalResolution === true;
     const w = logicalResolution ? Math.round(sw / dpr) : sw;
     const h = logicalResolution ? Math.round(sh / dpr) : sh;
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    c.getContext('2d').drawImage(this.videoEl, 0, 0, w, h);
-    const dataUrl = c.toDataURL('image/jpeg', quality);
-    const b64 = dataUrl.split(',')[1];
-    return { canvas: c, dataUrl, b64, width: w, height: h };
+    return displayViewerRasterizeSurface(this.videoEl, w, h, quality);
   }
 
   /// Capture the currently-rendered video frame and queue it as a pending
   /// attachment. Works whether or not the display is currently streaming —
   /// just rasterizes whatever the <video> element is showing right now.
+  /// The frame-id scheme and upload live in the shared attach lane
+  /// (45-display-viewer-core); the stream name is the LOCAL policy
+  /// (`display_<id>`).
   async attachCurrentFrame() {
     const frame = this.captureCurrentFrame(0.85, { logicalResolution: true });
     if (!frame) {
@@ -371,40 +395,8 @@ class DisplaySlot {
       setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
       return;
     }
-    const dataUrl = frame.dataUrl;
-    const b64 = dataUrl.split(',')[1];
-    // Use a deterministic frame_id scheme so attachments are distinguishable
-    // from streamed frames in the registry.
-    if (!this._attachCounter) this._attachCounter = 0;
-    this._attachCounter++;
-    const stream = 'display_' + this.displayId + '_attach';
-    const frameId = stream + '-f' + String(this._attachCounter).padStart(5, '0');
-    const payload = {
-      t: 'annotation_attach',
-      frame_id: frameId,
-      stream: stream,
-      data: b64,
-      note: '',
-    };
-    try {
-      await sendDashboardMediaUpload(
-        'api_media_annotation_attach',
-        { frame_id: frameId, stream, note: '' },
-        dashboardControlBase64ToBytes(b64),
-        payload,
-        'annotation attach'
-      );
-    } catch (err) {
-      dashboardMediaTransferFailed(err, 'annotation attach');
+    if (!(await displayViewerUploadAttachFrame(this, DISPLAY_SLOT_POLICY.streamBase(this), frame))) {
       return;
-    }
-    if (typeof addPendingAttachment === 'function') {
-      addPendingAttachment({
-        frameId,
-        stream,
-        note: '',
-        dataUrl,
-      });
     }
     // Brief visual confirmation
     const orig = this.attachBtn.innerHTML;
@@ -421,7 +413,7 @@ class DisplaySlot {
     return {
       owner: this,
       displayId: this.displayId,
-      streamBase: 'display_' + this.displayId,
+      streamBase: DISPLAY_SLOT_POLICY.streamBase(this),
       stageEl: () => this.canvasEl,
       liveSurfaceEl: () => this.videoEl,
       annotateBtn: () => this.annotateBtn,
@@ -440,15 +432,11 @@ class DisplaySlot {
   }
 
   // Toolbar-armed Callout: one-shot region flag shipped through the
-  // annotation-attach lane. Shared machinery lives in 47-annotation-clips
-  // (toggleLiveCallout); armable only while input authority is 'you'
-  // (button disabled otherwise, disarmed on authority loss).
+  // annotation-attach lane (shared wiring in 45-display-viewer-core;
+  // machinery in 47-annotation-clips). Armable only while input
+  // authority is 'you' (button disabled otherwise, disarmed on loss).
   toggleCallout() {
-    toggleLiveCallout({
-      provider: this._annotationSurfaceProvider(),
-      button: this.calloutBtn,
-      captureFrame: (q) => this.captureCurrentFrame(q),
-    });
+    displayViewerToggleCallout(this, this.calloutBtn);
   }
 
   sendLegacyDisplaySignal(payload) {
@@ -522,42 +510,19 @@ class DisplaySlot {
     this.statusEl.textContent = 'Connecting...';
     this.statusEl.className = 'display-status';
     this._setStageOverlay('progress', 'Negotiating…');
-    // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
-    // default empty for local LAN deployments. Goes through the shared
-    // helper so the peer-display path (PeerDisplayConnection.connect) can't
-    // drift in what it hands to the browser's ICE agent.
-    const config = { iceServers: buildIceServersFromGatewayConfig(gatewayConfig) };
-    this.pc = new RTCPeerConnection(config);
+    // ICE config: DISPLAY_SLOT_POLICY.buildRtcConfig — no relay pinning
+    // on the local path (that's the federated policy).
+    this.pc = new RTCPeerConnection(DISPLAY_SLOT_POLICY.buildRtcConfig());
 
     // Add a recvonly video transceiver so the SDP offer includes a video
     // media section. Without this, the server can't attach its video track
     // because the answerer can't introduce new media lines.
     const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
 
-    // **#58**: NO `setCodecPreferences` reorder. WKWebView's default
-    // codec order puts H.264 PTs (96/98/100) before VP8 (107) — let
-    // it. On macOS the server then negotiates H.264, which spawns a
-    // hardware-accelerated VideoToolbox encoder
-    // ([`crate::display::encode::h264_macos`]) — single-encoding,
-    // single thread, ~5-10 % CPU at full resolution.
-    //
-    // Pre-#58 this path force-reordered VP8 first because the local
-    // DisplaySlot also injected `a=simulcast:recv f;h;q` for
-    // multi-encoding receive, and rtc 0.9's SDP writer mishandles
-    // multi-RID H.264 (single SSRC covering all RIDs → browser
-    // chokes). #58 also drops to `a=simulcast:recv f` (single-RID
-    // receive — see `DISPLAY_SIMULCAST_RIDS`), so the rtc 0.9
-    // multi-RID-H.264 bug is no longer reachable: with single-RID
-    // receive the answer is plain sendonly, identical for VP8 and
-    // H.264. Restoring default codec order = restoring the
-    // hardware-accelerated path the macOS UTM guest needs to stay
-    // usable. Pre-#58 idle dashboard pegged the guest at 245 %+
-    // CPU on three software VP8 encoders for one viewer.
-    //
-    // Chrome viewers on macOS still default VP8 first; they get
-    // single-encoding VP8 (libvpx software, 1 encoder) at ~80 % CPU
-    // — also a substantial drop from ~245 %, just less dramatic
-    // than WKWebView's hardware H.264 path.
+    // Codec order: **#58** — deliberately a no-op (browser default order;
+    // WKWebView lands hardware H.264). Full rationale on
+    // DISPLAY_SLOT_POLICY.applyCodecPreferences.
+    DISPLAY_SLOT_POLICY.applyCodecPreferences(videoTransceiver);
 
     // Create data channels BEFORE offer (browser is the offerer)
     this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
@@ -567,25 +532,14 @@ class DisplaySlot {
     });
     this.clipboardChannel = this.pc.createDataChannel('clipboard', { ordered: true });
 
-    // Handle incoming clipboard updates from the remote display
+    // Handle incoming clipboard updates from the remote display.
+    // Clipboard sync is a LOCAL-ONLY policy today (federated clipboard is
+    // a follow-up); the applier itself is shared viewer-core code.
     this.clipboardChannel.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
         if (d.t === 'clipboard_update' && this.interactive) {
-          const mime = d.mime || 'text/plain';
-          if (mime.startsWith('image/') && d.data) {
-            // Image clipboard: decode base64 and write as ClipboardItem.
-            try {
-              const binary = atob(d.data);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-              const blob = new Blob([bytes], { type: mime });
-              const item = new ClipboardItem({ [mime]: blob });
-              navigator.clipboard.write([item]).catch(noteDisplayClipboardWriteFailure);
-            } catch { noteDisplayClipboardWriteFailure(); }
-          } else if (d.text !== undefined) {
-            navigator.clipboard.writeText(d.text).catch(noteDisplayClipboardWriteFailure);
-          }
+          displayViewerApplyRemoteClipboardUpdate(d);
         }
       } catch {}
     };
@@ -651,14 +605,14 @@ class DisplaySlot {
         this.connected = false;
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
-        if (attempts <= 5) {
-          const delay = Math.min(2000 * attempts, 10000);
+        if (attempts <= DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
+          const delay = displayViewerRetryDelayMs(attempts);
           // disconnect() first: it clears watchdogs/samplers and hides
           // the overlay, so set the retry copy AFTER it runs.
           this.disconnect();
           this.statusEl.textContent = `Connection failed, reconnecting in ${delay/1000}s (attempt ${attempts})...`;
           this.statusEl.className = 'display-status error';
-          this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of 5)…`);
+          this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS})…`);
           setTimeout(() => {
             if (this._closedByUser) return;
             this.connect();
@@ -666,10 +620,10 @@ class DisplaySlot {
         } else {
           // Dead end used to be terminal with no control; now it alarms
           // and offers a manual Reconnect that restarts the retry budget.
-          this.statusEl.textContent = 'Connection failed after 5 attempts';
+          this.statusEl.textContent = DISPLAY_VIEWER_RETRY_DEAD_END_STATUS;
           this.statusEl.className = 'display-status error';
           this._stopStatsSampler();
-          this._setStageOverlay('error', 'Connection failed after 5 attempts.', {
+          this._setStageOverlay('error', DISPLAY_VIEWER_RETRY_DEAD_END_OVERLAY, {
             retryLabel: 'Reconnect',
             onRetry: () => this.manualReconnect(),
           });
@@ -687,19 +641,16 @@ class DisplaySlot {
 
     // Create offer and send to server.
     //
-    // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
-    // the m=video section before setLocalDescription. `<rids>` is
-    // `DISPLAY_SIMULCAST_RIDS` (default `['f']` — single-RID receive
-    // post-#58; opt-in `['f','h','q']` for the experimental
-    // multi-encoding adaptive-bandwidth path). Munge BEFORE
-    // setLocalDescription so the localDescription matches what's sent
-    // on the wire — server-side SDP-validation tests parse the
+    // Simulcast injection is the LOCAL-ONLY munge policy (#58 single-RID
+    // receive; rationale on DISPLAY_SLOT_POLICY.mungeOfferSdp). Munge
+    // BEFORE setLocalDescription so the localDescription matches what's
+    // sent on the wire — server-side SDP-validation tests parse the
     // received offer/local-description and assume the recv-RID list
     // matches the configured constant.
     this.pc.createOffer().then(offer => {
       const munged = {
         type: offer.type,
-        sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
+        sdp: DISPLAY_SLOT_POLICY.mungeOfferSdp(offer.sdp),
       };
       // Diagnostic: log the first video codec in the emitted offer.
       // Codec order is intentionally left to the browser — WKWebView
@@ -738,57 +689,20 @@ class DisplaySlot {
 
   // Render the stage overlay. `mode` is 'progress' (spinner + copy),
   // 'error' (alarming copy + optional retry button), or null to hide.
-  // All dynamic text goes through textContent — never innerHTML.
+  // Shared DOM builder in 45-display-viewer-core; this slot renders into
+  // its single fixed overlayEl (the peer path re-applies per container —
+  // its pane DOM is rebuilt on daemons-list re-renders, ours is not).
   _setStageOverlay(mode, text, { retryLabel = null, onRetry = null } = {}) {
     const el = this.overlayEl;
     if (!el) return;
-    if (!mode) {
-      el.style.display = 'none';
-      el.classList.remove('error');
-      el.textContent = '';
-      return;
-    }
-    el.textContent = '';
-    el.classList.toggle('error', mode === 'error');
-    const inner = document.createElement('div');
-    inner.className = 'stage-overlay-inner';
-    if (mode !== 'error') {
-      const spinner = document.createElement('span');
-      spinner.className = 'stage-overlay-spinner';
-      inner.appendChild(spinner);
-    }
-    const label = document.createElement('span');
-    label.className = 'stage-overlay-text';
-    label.textContent = text || '';
-    inner.appendChild(label);
-    if (retryLabel && typeof onRetry === 'function') {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'stage-overlay-retry';
-      btn.textContent = retryLabel;
-      btn.addEventListener('click', onRetry);
-      inner.appendChild(btn);
-    }
-    el.appendChild(inner);
-    el.style.display = '';
+    displayViewerRenderStageOverlayInto(el, mode ? { mode, text, retryLabel, onRetry } : null);
   }
 
   // Run `cb` once the <video> renders its first frame for THIS
-  // negotiation epoch. rVFC where available (fires per decoded frame),
-  // 'loadeddata' otherwise.
+  // negotiation epoch (shared cascade in 45-display-viewer-core; the
+  // epoch comparison is this class's staleness guard).
   _onFirstFrame(epoch, cb) {
-    const vid = this.videoEl;
-    const fire = () => {
-      if (epoch !== this._connectEpoch) return; // stale negotiation
-      cb();
-    };
-    if (typeof vid.requestVideoFrameCallback === 'function') {
-      vid.requestVideoFrameCallback(() => fire());
-    } else if (vid.readyState >= 2) {
-      fire();
-    } else {
-      vid.addEventListener('loadeddata', fire, { once: true });
-    }
+    displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
   }
 
   // User-facing recovery entry point (overlay Reconnect button, revived
@@ -800,13 +714,12 @@ class DisplaySlot {
     this.connect();
   }
 
-  // No-video watchdog, ported from the peer path: armed when the answer
-  // applies, cleared by the first rendered frame. Catches the "answer
-  // accepted, ICE/DTLS fine, but no frames ever arrive" black-stage case.
+  // No-video watchdog, ported from the peer path (shared driver in
+  // 45-display-viewer-core): armed when the answer applies, cleared by
+  // the first rendered frame. Catches the "answer accepted, ICE/DTLS
+  // fine, but no frames ever arrive" black-stage case.
   _armNoTrackWatchdog() {
-    this._clearNoTrackWatchdog();
-    this._noTrackTimer = window.setTimeout(() => {
-      this._noTrackTimer = null;
+    displayViewerArmNoTrackWatchdog(this, () => {
       if (this._firstFrameSeen || this._closedByUser) return;
       this.statusEl.textContent = 'No video received';
       this.statusEl.className = 'display-status error';
@@ -819,29 +732,19 @@ class DisplaySlot {
   }
 
   _clearNoTrackWatchdog() {
-    if (this._noTrackTimer !== null && this._noTrackTimer !== undefined) {
-      window.clearTimeout(this._noTrackTimer);
-      this._noTrackTimer = null;
-    }
+    displayViewerClearNoTrackWatchdog(this);
   }
 
   // ── Live metrics chip (getStats sampler) ────────────────────────────
+  // Shared cadence + summarizer (45-display-viewer-core); only where the
+  // text lands is ours: the slot's single fixed metricsEl.
 
   _startStatsSampler() {
-    if (this._statsTimer) return;
-    this._statsPrev = null;
-    this._statsTimer = window.setInterval(() => {
-      this._sampleStats().catch(() => {});
-    }, 3000);
-    this._sampleStats().catch(() => {});
+    displayViewerStartStatsSampler(this);
   }
 
   _stopStatsSampler() {
-    if (this._statsTimer) {
-      window.clearInterval(this._statsTimer);
-      this._statsTimer = null;
-    }
-    this._statsPrev = null;
+    displayViewerStopStatsSampler(this);
     if (this.metricsEl) {
       this.metricsEl.style.display = 'none';
       this.metricsEl.classList.remove('active');
@@ -850,14 +753,12 @@ class DisplaySlot {
   }
 
   async _sampleStats() {
-    if (!this.pc || this.pc.connectionState !== 'connected') return;
-    const stats = await this.pc.getStats();
-    const summary = summarizeRtcStats(stats, this._statsPrev);
-    this._statsPrev = summary.snapshot;
-    if (!summary.text || !this.metricsEl) return;
-    this.metricsEl.textContent = summary.text;
-    this.metricsEl.style.display = '';
-    this.metricsEl.classList.add('active');
+    await displayViewerSampleRtcStats(this, (text) => {
+      if (!this.metricsEl) return;
+      this.metricsEl.textContent = text;
+      this.metricsEl.style.display = '';
+      this.metricsEl.classList.add('active');
+    });
   }
 
   handleAnswer(sdp) {
@@ -883,40 +784,35 @@ class DisplaySlot {
         `[DisplaySlot ${this.displayId}] answer negotiated codec: ${negotiated}; ${simulcast}`
       );
     }
-    this.pc.setRemoteDescription({ type: 'answer', sdp }).then(() => {
-      this._answerApplied = true;
-      this.statusEl.textContent = `Answer applied, ICE: ${this.pc.iceConnectionState}, flushing ${this._pendingCandidates.length} candidates`;
-      // Flush any ICE candidates that arrived before the answer.
-      for (const c of this._pendingCandidates) {
-        this.pc.addIceCandidate(c).catch(() => {});
-      }
-      this._pendingCandidates = [];
-      // Answer accepted: the only thing left is media. Stage the copy
-      // and arm the no-video watchdog (cleared by the first frame).
-      if (!this._firstFrameSeen) {
-        this._setStageOverlay('progress', 'Waiting for first frame…');
-      }
-      this._armNoTrackWatchdog();
-    }).catch(err => {
-      this.statusEl.textContent = `Answer FAILED: ${err.message}`;
-      this.statusEl.className = 'display-status error';
-      this._setStageOverlay('error', 'Answer failed: ' + err.message, {
-        retryLabel: 'Reconnect',
-        onRetry: () => this.manualReconnect(),
-      });
-      console.error('Failed to set remote description:', err);
+    displayViewerApplyRemoteAnswer(this, sdp, {
+      beforeFlush: (count) => {
+        this.statusEl.textContent = `Answer applied, ICE: ${this.pc.iceConnectionState}, flushing ${count} candidates`;
+      },
+      afterFlush: () => {
+        // Answer accepted: the only thing left is media. Stage the copy
+        // and arm the no-video watchdog (cleared by the first frame).
+        if (!this._firstFrameSeen) {
+          this._setStageOverlay('progress', 'Waiting for first frame…');
+        }
+        this._armNoTrackWatchdog();
+      },
+      onError: (err) => {
+        this.statusEl.textContent = `Answer FAILED: ${err.message}`;
+        this.statusEl.className = 'display-status error';
+        this._setStageOverlay('error', 'Answer failed: ' + err.message, {
+          retryLabel: 'Reconnect',
+          onRetry: () => this.manualReconnect(),
+        });
+        console.error('Failed to set remote description:', err);
+      },
     });
   }
 
   handleIceCandidate(candidate) {
     if (!this.pc) return;
-    if (!this._answerApplied) {
-      // Queue until setRemoteDescription(answer) completes.
-      this._pendingCandidates.push(candidate);
-      return;
-    }
-    this.pc.addIceCandidate(candidate).catch(err => {
-      console.error('Failed to add ICE candidate:', err);
+    // Queue until setRemoteDescription(answer) completes (shared scaffold).
+    displayViewerIngestRemoteIceCandidate(this, candidate, {
+      onAddError: (err) => console.error('Failed to add ICE candidate:', err),
     });
   }
 
@@ -964,7 +860,7 @@ class DisplaySlot {
         if (typeof showControlToast === 'function') {
           showControlToast('error', 'No response to the input-control request — try again');
         }
-      }, 5000);
+      }, DISPLAY_VIEWER_TAKE_PENDING_TIMEOUT_MS);
     }
   }
 
@@ -999,38 +895,10 @@ class DisplaySlot {
     // server demotes us) otherwise auto-repeats remotely forever.
     this._heldKeys = new Set();
 
-    const normalize = (e) => {
-      const rect = vid.getBoundingClientRect();
-      // Account for letterboxing: the video element preserves aspect ratio,
-      // so the actual video content occupies a sub-rectangle inside the
-      // element bounds. Compute that content rect from the video's intrinsic
-      // dimensions, then normalize the cursor relative to it (not the element).
-      const vW = vid.videoWidth || rect.width;
-      const vH = vid.videoHeight || rect.height;
-      const videoAspect = vW / vH;
-      const elAspect = rect.width / rect.height;
-      let contentW, contentH, offsetX, offsetY;
-      if (elAspect > videoAspect) {
-        // Element is wider than video -> pillarbox (black bars left/right)
-        contentH = rect.height;
-        contentW = contentH * videoAspect;
-        offsetX = (rect.width - contentW) / 2;
-        offsetY = 0;
-      } else {
-        // Element is taller than video -> letterbox (black bars top/bottom)
-        contentW = rect.width;
-        contentH = contentW / videoAspect;
-        offsetX = 0;
-        offsetY = (rect.height - contentH) / 2;
-      }
-      const relX = (e.clientX - rect.left - offsetX) / contentW;
-      const relY = (e.clientY - rect.top - offsetY) / contentH;
-      return {
-        x: Math.max(0, Math.min(relX, 0.9999)),
-        y: Math.max(0, Math.min(relY, 0.9999))
-      };
-    };
-
+    // Input transport — the LOCAL policy: prefer the verified
+    // dashboard-control input lane (sendDisplayInputForSlot), fall back
+    // to this pc's data channels. The federated path sends over its
+    // data channels only.
     const sendControl = (msg) => {
       if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
@@ -1044,147 +912,23 @@ class DisplaySlot {
       }
     };
 
-    // Flush synthetic keyups for every currently-held key. Stored on the
-    // instance so `_exitInteractive` (which runs outside this closure)
-    // can release held keys BEFORE the listeners are removed — a
-    // server-side authority demotion otherwise latches keys down
-    // remotely. Cleared by `_exitInteractive`.
-    this._flushHeldKeys = () => {
-      if (!this._heldKeys) return;
-      for (const code of this._heldKeys) {
-        sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
-      }
-      this._heldKeys.clear();
-    };
+    // Held-key flusher, stored on the instance so `_exitInteractive`
+    // (which runs outside this closure) can release held keys BEFORE the
+    // listeners are removed — a server-side authority demotion otherwise
+    // latches keys down remotely. Cleared by `_exitInteractive`.
+    this._flushHeldKeys = displayViewerMakeHeldKeyFlusher(this, sendControl);
+    // The shared capture stack (letterbox normalize, kd/ku/md/mu/mm/sc,
+    // blur flush, pointerenter refocus) — 45-display-viewer-core.
+    this._boundHandlers = displayViewerBuildInputHandlers({
+      owner: this,
+      target: vid,
+      sendControl,
+      sendPointer,
+    });
 
-    // NOTE: Both `code` (physical key position) and `key` (logical character) are sent
-    // in KeyDown/KeyUp events. Backends currently use `code` only for physical key
-    // injection (xdotool key / CGEvent keycode). Using `key` for character-based text
-    // input (e.g. xdotool type, CGEvent character input) is a follow-up.
-    this._boundHandlers.keydown = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.add(e.code);
-      sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.keyup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      this._heldKeys.delete(e.code);
-      sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
-    };
-    this._boundHandlers.pointerdown = (e) => {
-      // Annotation editing suppresses everything; an armed callout
-      // suppresses only the drag's md/mm/mu (keyboard + wheel keep
-      // flowing — the arm overlay swallows most of these already, this
-      // catches pointer events on the letterbox bars).
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      vid.focus();
-      vid.setPointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'md', x, y, b: e.button });
-    };
-    this._boundHandlers.pointerup = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      vid.releasePointerCapture(e.pointerId);
-      const { x, y } = normalize(e);
-      sendControl({ t: 'mu', x, y, b: e.button });
-    };
-    this._boundHandlers.pointermove = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this) || liveCalloutArmedFor(this)) {
-        e.preventDefault();
-        return;
-      }
-      const { x, y } = normalize(e);
-      sendPointer({ t: 'mm', x, y, buttons: e.buttons });
-    };
-    this._boundHandlers.wheel = (e) => {
-      if (shouldSuppressDisplayInputForAnnotation(this)) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      const { x, y } = normalize(e);
-      // Normalize pixel deltas to discrete scroll notches.
-      // DOM_DELTA_PIXEL (0): divide by 100 to approximate notches.
-      // DOM_DELTA_LINE (1): use as-is (already logical lines).
-      // DOM_DELTA_PAGE (2): multiply by 3 (approximate lines per page).
-      let dx = e.deltaX, dy = e.deltaY;
-      if (e.deltaMode === 0) {
-        dx = Math.round(dx / 100) || (dx > 0 ? 1 : dx < 0 ? -1 : 0);
-        dy = Math.round(dy / 100) || (dy > 0 ? 1 : dy < 0 ? -1 : 0);
-      } else if (e.deltaMode === 2) {
-        dx *= 3; dy *= 3;
-      }
-      sendPointer({ t: 'sc', x, y, dx, dy });
-    };
-    this._boundHandlers.contextmenu = (e) => e.preventDefault();
-
-    // Release ALL held keys when the video element loses focus (e.g.
-    // Alt+Tab away). Without this, the remote side thinks they are still
-    // held because no keyup event ever fires for them.
-    this._boundHandlers.blur = () => {
-      this._flushHeldKeys?.();
-    };
-
-    // Re-focus the video element when the pointer enters it while interactive.
-    // This restores keyboard input after Alt+Tab back to the dashboard.
-    this._boundHandlers.pointerenter = () => {
-      if (this.interactive) vid.focus();
-    };
-
-    // Clipboard: intercept paste events and send to remote display
-    this._boundHandlers.paste = (e) => {
-      if (this.clipboardChannel?.readyState !== 'open') return;
-      // Check for image content first.
-      if (e.clipboardData?.items) {
-        for (const item of e.clipboardData.items) {
-          if (item.type.startsWith('image/')) {
-            const blob = item.getAsFile();
-            if (!blob) continue;
-            // 5 MB size limit.
-            if (blob.size > 5 * 1024 * 1024) {
-              console.warn('[clipboard] skipping image paste: exceeds 5 MB limit');
-              e.preventDefault();
-              return;
-            }
-            const mime = item.type;
-            const reader = new FileReader();
-            reader.onload = () => {
-              const base64 = reader.result.split(',')[1];
-              if (base64 && this.clipboardChannel?.readyState === 'open') {
-                this.clipboardChannel.send(JSON.stringify({
-                  t: 'clipboard_set', mime, data: base64
-                }));
-              }
-            };
-            reader.readAsDataURL(blob);
-            e.preventDefault();
-            return;
-          }
-        }
-      }
-      // Fall back to text.
-      const text = e.clipboardData?.getData('text');
-      if (text !== undefined) {
-        this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', mime: 'text/plain', text}));
-        e.preventDefault();
-      }
-    };
+    // Clipboard: intercept paste events and send to remote display.
+    // LOCAL-ONLY policy (federated clipboard is a follow-up).
+    this._boundHandlers.paste = displayViewerBuildPasteHandler(() => this.clipboardChannel);
     document.addEventListener('paste', this._boundHandlers.paste);
 
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
@@ -1312,7 +1056,7 @@ class DisplaySlot {
   }
 
   setAuthority(state) {
-    if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
+    if (!isDisplayInputAuthorityState(state)) {
       // Forward-compat: future state strings (we don't expect any) leave
       // the chip on its previous value rather than blanking it.
       return;
@@ -1346,53 +1090,17 @@ class DisplaySlot {
   // Phase 5c: render the chip + take/release button visibility from the
   // current `authorityState`.  Single-source UI projection so any code
   // that mutates state goes through `setAuthority` and never has to
-  // remember to update DOM directly.
+  // remember to update DOM directly.  Chip text/classes and the button
+  // toggle are the shared renderers in 45-display-viewer-core — the same
+  // vocabulary the federated chip renders.  Button visibility tracks
+  // state, not the `interactive` flag, so the user can click Take
+  // Control even before listeners install (the request flow handles
+  // waiting for the `'you'` callback).
   _renderAuthority() {
-    const e = this.authorityEl;
-    if (e) {
-      switch (this.authorityState) {
-        case 'you':
-          e.style.display = '';
-          e.textContent = 'Input: you';
-          e.className = 'display-input-authority you';
-          break;
-        case 'other':
-          e.style.display = '';
-          e.textContent = 'Input: another viewer';
-          e.className = 'display-input-authority other';
-          break;
-        case 'unclaimed':
-          e.style.display = '';
-          e.textContent = 'Input: shared';
-          e.className = 'display-input-authority unclaimed';
-          break;
-        default:
-          // 'unknown' — server hasn't told us yet.  Hide the chip rather
-          // than show "shared" speculatively, per phase 5c spec: "do not
-          // show 'unclaimed' unless the server has actually told this
-          // browser the display is unclaimed."
-          e.style.display = 'none';
-          e.textContent = '';
-          e.className = 'display-input-authority';
-          break;
-      }
-    }
-    // Button visibility tracks state, not the `interactive` flag, so the
-    // user can click Take Control even before listeners install (the
-    // request flow handles waiting for the `'you'` callback).
-    if (this.authorityState === 'you') {
-      this.takeBtn.style.display = 'none';
-      this.releaseBtn.style.display = '';
-    } else {
-      this.takeBtn.style.display = '';
-      this.releaseBtn.style.display = 'none';
-    }
-    // Callout is armable only while this browser holds input authority
-    // (the drag would otherwise be view-only theater; the arm/suppress
-    // semantics assume our pointer stream is what the remote receives).
-    if (this.calloutBtn) {
-      this.calloutBtn.disabled = this.authorityState !== 'you';
-    }
+    displayViewerRenderAuthorityChip(
+      this.authorityEl, this.authorityState, 'display-input-authority');
+    displayViewerApplyAuthorityButtons(
+      this.takeBtn, this.releaseBtn, this.calloutBtn, this.authorityState);
   }
 
   toggleStreaming() {
