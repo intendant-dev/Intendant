@@ -783,6 +783,15 @@
   padding: 12px 16px;
   margin: 0 0 16px;
 }
+/* One-shot attention pulse for deep links that land on a panel
+   (openConnectionDiagnostics); removed by the caller after it plays. */
+@keyframes ui-attention-flash {
+  0% { box-shadow: 0 0 0 3px var(--blue); }
+  100% { box-shadow: 0 0 0 3px transparent; }
+}
+.ui-attention-flash {
+  animation: ui-attention-flash 1.6s ease-out;
+}
 .settings-group legend {
   color: var(--blue);
   font-size: 13px;

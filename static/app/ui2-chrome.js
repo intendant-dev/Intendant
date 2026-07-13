@@ -159,7 +159,7 @@ function ui2WireMirrors() {
     conn.dataset.state = /err|fail/.test(cls) ? 'err' : /warn|reconnect|checking|relay/i.test(cls) ? 'warn' : /ok|ready/i.test(cls) ? 'ok' : '';
   });
   const conn = document.getElementById('ui2-conn');
-  if (conn) conn.addEventListener('click', () => routeTo('access', 'diagnostics'));
+  if (conn) conn.addEventListener('click', () => openConnectionDiagnostics());
 
   // Autonomy chip: level text mirrored (+ the truthful short tag); click
   // opens Settings → Autonomy & approvals (the design's behavior —
