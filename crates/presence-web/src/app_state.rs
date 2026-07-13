@@ -5823,7 +5823,10 @@ mod tests {
                     if id == "in-flight" && status == "failed" && text == "switch to SQLite"
             )
         });
-        assert!(saw_update, "expected failed SteerStatusUpdate, got {cmds:?}");
+        assert!(
+            saw_update,
+            "expected failed SteerStatusUpdate, got {cmds:?}"
+        );
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, level, .. }
