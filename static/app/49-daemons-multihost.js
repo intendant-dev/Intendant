@@ -192,6 +192,26 @@ function dashboardConnectModeEnabled() {
   return DASHBOARD_CONNECT_MODE;
 }
 
+// The explicit localStorage opt-in on its own: an opt-in tunnel is a lane
+// the user asked for, so it self-heals like a primary lane even while the
+// legacy /ws carries events (a dead optional lane that never comes back
+// is how the transport chip gets stuck red forever).
+function dashboardControlUserOptInEnabled() {
+  if (dashboardConnectModeEnabled()) return false;
+  try {
+    return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
+  } catch {
+    return false;
+  }
+}
+
+// "Should a dead tunnel be brought back?" — yes when it is the primary
+// event lane (events depend on it) or explicitly opted in (the user asked
+// for it). Gate for the reconnect machinery.
+function dashboardControlTunnelWanted() {
+  return dashboardControlTunnelIsPrimaryEventLane() || dashboardControlUserOptInEnabled();
+}
+
 // True when the dashboard-control tunnel is the PRIMARY event lane — the
 // postures where losing the tunnel means losing events entirely:
 //   - hosted Connect dashboards (?connect=1),
@@ -408,6 +428,29 @@ function dashboardTransportStatusSummary(status = {}) {
     };
   }
 
+  // Lane-aware framing: this chip reports dashboard ACCESS, not one
+  // transport's health. While the legacy /ws carries events (and the
+  // tunnel is not the primary lane), access is fine regardless of the
+  // optional tunnel's condition — report Ready and relegate the tunnel
+  // state to the detail title instead of alarming over a lane nothing
+  // depends on right now. A healthy connected tunnel falls through to
+  // the richer connected arm below.
+  if (dashboardLegacyWsConnected
+      && !dashboardControlTunnelIsPrimaryEventLane()
+      && !(status.connected && status.verifiedBinding?.ok)) {
+    const pcNow = String(status.pcState || '').toLowerCase();
+    const tunnelNote = status.reconnecting
+      ? 'the optional control tunnel is reconnecting'
+      : (String(status.lastError || status.error || '').trim() || pcNow === 'failed' || pcNow === 'closed')
+        ? 'the optional control tunnel is down'
+        : 'the optional control tunnel is idle';
+    return {
+      kind: 'ok',
+      label: 'Ready',
+      title: `Dashboard access is ready — events ride the WebSocket; ${tunnelNote}. Open Connection Diagnostics for transport details.`,
+    };
+  }
+
   const pcState = String(status.pcState || '').toLowerCase();
   const channelState = String(status.channelState || '').toLowerCase();
   const lastError = String(status.lastError || status.error || '').trim();
@@ -530,6 +573,23 @@ function connectHealthState(statusArg = null, summaryArg = null) {
       { label: 'Events', value: status.eventsActive ? 'active' : 'inactive', kind: connectHealthKindForBoolean(status.eventsActive) },
     ],
   };
+}
+
+// Chip-click affordance: land the user ON the diagnostics panel — a bare
+// routeTo leaves the panel below the fold with nothing announcing itself,
+// which reads as "clicking did nothing".
+function openConnectionDiagnostics() {
+  routeTo('access', 'diagnostics');
+  // The pane switch may render-defer the panel mount; give it a beat.
+  setTimeout(() => {
+    const panel = document.getElementById('connect-health-panel');
+    if (!panel) return;
+    try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    panel.classList.remove('ui-attention-flash');
+    void panel.offsetWidth;
+    panel.classList.add('ui-attention-flash');
+    setTimeout(() => panel.classList.remove('ui-attention-flash'), 1800);
+  }, 250);
 }
 
 function renderConnectHealthPanel(statusArg = null, summaryArg = null) {
@@ -1200,7 +1260,7 @@ function dashboardConnectReconnectStatus() {
 // (±25%) keeps a fleet of tabs from thundering-herding a daemon that just
 // came back; the attempt counter resets on a successful reconnect.
 function scheduleDashboardConnectReconnect(reason = 'dashboard transport disconnected', options = {}) {
-  if (!dashboardControlTunnelIsPrimaryEventLane()) return;
+  if (!dashboardControlTunnelWanted()) return;
   if (dashboardConnectReconnectTimer) return;
   const attempt = dashboardConnectReconnectAttempt;
   const backoffBaseMs = Math.min(
@@ -1216,7 +1276,12 @@ function scheduleDashboardConnectReconnect(reason = 'dashboard transport disconn
   dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
   dashboardConnectReconnectNextUnixMs = Date.now() + delayMs;
   dashboardSetControlLastError('');
-  setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  // The primary-event chip belongs to whichever lane carries events: only
+  // narrate this reconnect there when the tunnel IS that lane — an opt-in
+  // tunnel healing beside a healthy /ws must not stomp the ws status.
+  if (dashboardControlTunnelIsPrimaryEventLane()) {
+    setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  }
   dashboardUpdateTransportStatus();
   dashboardConnectReconnectTimer = window.setTimeout(() => {
     dashboardConnectReconnectTimer = null;
@@ -1228,7 +1293,7 @@ function scheduleDashboardConnectReconnect(reason = 'dashboard transport disconn
 }
 
 async function runDashboardConnectReconnect(reason = 'dashboard transport disconnected') {
-  if (!dashboardControlTunnelIsPrimaryEventLane() || dashboardConnectReconnectInFlight) return;
+  if (!dashboardControlTunnelWanted() || dashboardConnectReconnectInFlight) return;
   // The transport healed while the retry timer was pending (ICE
   // `disconnected` is often a transient blip that recovers on its own) —
   // tearing it down now would drop a healthy tunnel. Treat as success.
@@ -1237,9 +1302,11 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
     dashboardConnectReconnectReason = '';
     dashboardConnectReconnectNextUnixMs = 0;
     dashboardSetControlLastError('');
-    setConnectEventStatus('ok', dashboardConnectModeEnabled()
-      ? 'Dashboard events are live through verified Hosted Connect'
-      : 'Dashboard events are live through the control tunnel');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('ok', dashboardConnectModeEnabled()
+        ? 'Dashboard events are live through verified Hosted Connect'
+        : 'Dashboard events are live through the control tunnel');
+    }
     dashboardUpdateTransportStatus();
     return;
   }
@@ -1247,7 +1314,9 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
   dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
   let retryReason = '';
   dashboardSetControlLastError('');
-  setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  if (dashboardControlTunnelIsPrimaryEventLane()) {
+    setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  }
   dashboardUpdateTransportStatus();
   try {
     const previous = dashboardControlTransport;
@@ -1277,16 +1346,20 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
     dashboardConnectReconnectReason = '';
     dashboardConnectReconnectNextUnixMs = 0;
     dashboardSetControlLastError('');
-    setConnectEventStatus('ok', dashboardConnectModeEnabled()
-      ? 'Dashboard events are live through verified Hosted Connect'
-      : 'Dashboard events are live through the control tunnel');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('ok', dashboardConnectModeEnabled()
+        ? 'Dashboard events are live through verified Hosted Connect'
+        : 'Dashboard events are live through the control tunnel');
+    }
   } catch (err) {
     retryReason = err?.message || String(err);
     console.warn('[dashboard-control] event-lane reconnect failed', err);
     dashboardSetControlLastError(retryReason, err?.controlErrorKind || '');
-    setConnectEventStatus('err', dashboardConnectModeEnabled()
-      ? 'Hosted Connect dashboard reconnect failed'
-      : 'Dashboard control tunnel reconnect failed');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('err', dashboardConnectModeEnabled()
+        ? 'Hosted Connect dashboard reconnect failed'
+        : 'Dashboard control tunnel reconnect failed');
+    }
   } finally {
     dashboardConnectReconnectInFlight = false;
     dashboardUpdateTransportStatus();
