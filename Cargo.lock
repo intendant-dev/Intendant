@@ -2702,6 +2702,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "core-foundation",
  "core-graphics",
  "env-libvpx-sys",
  "futures-util",
@@ -4723,8 +4724,6 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ad674f106cbd819204801702f157c48f338df393926bfc7bc835a82af7ad945"
 dependencies = [
  "bytes",
  "crc",
