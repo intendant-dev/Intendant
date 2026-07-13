@@ -386,7 +386,24 @@ pub(crate) async fn run_with_presence(
                     .as_ref()
                     .map(|thread| thread.thread_id.as_str()),
             );
-        let signal = if queued_steer_flush {
+        // Before flushing, drain any event the backend already buffered
+        // while idle: the flush writes to the backend's stdin, and a
+        // buffered turn start (Claude Code's spontaneous task-notification
+        // round) means that write lands MID-TURN — CC 2.1.2xx discards it,
+        // while `drain_steer_queue_as_followup` has already emitted
+        // `SteerDelivered`. Processing the buffered event first routes a
+        // turn start through the spontaneous-round drain (queued steers
+        // then deliver at the real boundary); housekeeping events simply
+        // re-loop and the flush happens next iteration.
+        let buffered_idle_event = if queued_steer_flush {
+            try_buffered_idle_agent_event(&mut persistent_event_rx)
+                .map(|event| OuterSignal::IdleAgentEvent(Box::new(event)))
+        } else {
+            None
+        };
+        let signal = if let Some(signal) = buffered_idle_event {
+            signal
+        } else if queued_steer_flush {
             OuterSignal::Task(presence::TaskEnvelope {
                 task: String::new(),
                 force_direct: true,
@@ -471,19 +488,37 @@ pub(crate) async fn run_with_presence(
                         &persistent_open_side_threads,
                     ) && persistent_agent.is_some()
                         && !steer_id_has_been_handled(&persistent_handled_steer_ids, &id) => {
+                        // Resolve to the same (target, kind) the turn drain
+                        // uses, and queue with the RESOLVED target: the old
+                        // handler rewrote every target to `local_session_id`,
+                        // so a side-thread steer flushed into the parent
+                        // conversation. Side-targeted entries stay queued for
+                        // the side conversation's next turn instead of riding
+                        // the parent's empty-turn flush below.
+                        let Some((target_session_id, target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
+                                Some(&persistent_open_side_threads),
+                            )
+                        else {
+                            // Unreachable given the guard matched, but a
+                            // resolution miss must leave the steer for its
+                            // owner rather than mis-deliver it.
+                            continue;
+                        };
                         mark_steer_id_handled(&mut persistent_handled_steer_ids, &id);
-                        if let Ok(mut queue) = context_injection.lock() {
-                            queue.push(crate::event::ContextInjection::text_with_steer_id_for_target(
-                                text,
-                                id.clone(),
-                                local_session_id.clone(),
-                            ));
-                        }
-                        bus.send(AppEvent::SteerQueued {
-                            session_id: session_id.or_else(|| local_session_id.clone()),
+                        queue_idle_external_steer(
+                            &context_injection,
+                            &bus,
+                            target_session_id,
+                            target_kind,
+                            text,
                             id,
-                            reason: "session is idle — sending as its own message now".to_string(),
-                        });
+                        );
                         continue;
                     }
                     Ok(AppEvent::SteerCancelRequested {
@@ -496,24 +531,45 @@ pub(crate) async fn run_with_presence(
                         &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
                         &persistent_open_side_threads,
                     ) => {
+                        // Resolve like the drain and the external CLI idle
+                        // loop do: idle steers queue with their RESOLVED
+                        // target (side steers keep the side id), so the
+                        // cancel sweep must address the same target or a
+                        // still-queued side steer would falsely report
+                        // "nothing pending to clear".
+                        let Some((target_session_id, _target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
+                                Some(&persistent_open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
                         let cancelled = cancel_queued_steers_for_session(
                             &context_injection,
                             &bus,
-                            local_session_id.as_deref(),
-                            persistent_thread
-                                .as_ref()
-                                .map(|thread| thread.thread_id.as_str()),
+                            target_session_id.as_deref(),
+                            if target_session_id == local_session_id {
+                                persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.as_str())
+                            } else {
+                                None
+                            },
                             id.as_deref(),
                             &reason,
                         );
                         if cancelled == 0 {
-                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                bus.send(AppEvent::SteerCancelFailed {
-                                    session_id: session_id.or_else(|| local_session_id.clone()),
-                                    id,
-                                    reason: "nothing pending to clear — the message already delivered or converted to a follow-up".to_string(),
-                                });
-                            }
+                            emit_steer_cancel_failed_for_unmatched(
+                                &bus,
+                                target_session_id.or_else(|| local_session_id.clone()),
+                                id,
+                                STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+                            );
                         }
                         continue;
                     }

@@ -125,6 +125,9 @@ impl SessionLog {
             "steer_cancelled" => reason
                 .map(|reason| format!("Steer cancelled: {reason}"))
                 .unwrap_or_else(|| "Steer cancelled".to_string()),
+            "steer_cancel_failed" => reason
+                .map(|reason| format!("Steer cancel failed: {reason}"))
+                .unwrap_or_else(|| "Steer cancel failed".to_string()),
             _ => format!("Steer {status}"),
         };
 
@@ -206,6 +209,24 @@ impl SessionLog {
             None,
             Some(reason),
             "cancelled",
+            None,
+        );
+    }
+
+    /// A cancel found nothing to clear (`AppEvent::SteerCancelFailed`) —
+    /// terminal like `steer_cancelled`, but the message reached or will
+    /// reach the model. Structured so replay retires the pending row as a
+    /// failed clear instead of resurrecting it (or worse, a fabricated
+    /// successful one) on reload.
+    pub fn steer_cancel_failed(&mut self, session_id: Option<&str>, id: &str, reason: &str) {
+        self.steer_event(
+            "steer_cancel_failed",
+            "warn",
+            session_id,
+            id,
+            None,
+            Some(reason),
+            "failed",
             None,
         );
     }

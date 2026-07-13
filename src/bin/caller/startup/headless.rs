@@ -296,10 +296,20 @@ pub(crate) async fn run_headless_mode(
         // Backend task dispatcher: listens on the bus for
         // ControlCommand(StartTask | FollowUp) from the dashboard and
         // routes to the presence layer or the follow-up channel.
+        //
+        // `follow_up_tx` only when something will read the other end:
+        // `follow_up_rx` is consumed by `run_external_agent_mode` /
+        // `run_direct_mode` — the `!use_presence` branches below.
+        // `run_with_presence` never reads it, so handing the dispatcher a
+        // sender in the presence shape made `try_send` "succeed" into a
+        // never-drained channel and emit phantom `SteerQueued` receipts
+        // (and silently ate task/follow-up fallbacks) for messages nothing
+        // would ever deliver. With `None`, those fallbacks reach the
+        // explicit warn+drop instead.
         task_dispatch::Dispatcher {
             presence_tx: presence_tx_for_dispatch,
             task_tx: task_tx.clone(),
-            follow_up_tx: Some(follow_up_tx.clone()),
+            follow_up_tx: (!use_presence).then(|| follow_up_tx.clone()),
             primary_session_id: session_log_id(&session_log),
         }
         .spawn(bus.clone());

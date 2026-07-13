@@ -189,6 +189,14 @@ fn emit_task_dispatched_log(
     task: &str,
     attachment_count: usize,
 ) {
+    // Synthesized empty envelopes (the persistent lane's idle queued-steer
+    // flush) are delivery plumbing, not task acceptance: logging them
+    // printed a contentless "[runtime] Task dispatched: " row per flush.
+    // The external CLI lane's flush logs nothing — match it. A task that is
+    // only attachments still logs (the attachment suffix carries meaning).
+    if task.trim().is_empty() && attachment_count == 0 {
+        return;
+    }
     let suffix = if attachment_count > 0 {
         format!(
             " with {} attachment{}",
@@ -1392,6 +1400,43 @@ fn normalize_command_batch(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle queued-steer flush synthesizes an EMPTY task envelope per
+    /// flush; logging it produced spurious "[runtime] Task dispatched: "
+    /// rows. Empty task + no attachments is plumbing, not acceptance —
+    /// while an attachments-only task still logs.
+    #[test]
+    fn task_dispatched_log_skips_empty_synthesized_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        emit_task_dispatched_log(&bus, &session_log, "", 0);
+        emit_task_dispatched_log(&bus, &session_log, "   ", 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty synthesized envelope must not log a dispatch row"
+        );
+
+        emit_task_dispatched_log(&bus, &session_log, "", 2);
+        match rx.try_recv().expect("attachment-only dispatch logs") {
+            AppEvent::LogEntry { content, .. } => {
+                assert!(content.contains("with 2 attachments"), "{content}");
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        emit_task_dispatched_log(&bus, &session_log, "real task", 0);
+        match rx.try_recv().expect("real dispatch logs") {
+            AppEvent::LogEntry { content, .. } => {
+                assert!(content.contains("real task"), "{content}");
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+    }
 
     #[test]
     fn extract_json_from_json_fence() {
