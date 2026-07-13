@@ -19017,6 +19017,30 @@ html.ui-v2[data-theme="light"] .session-window-id {
    Station peer chips, and the user-display grant without replacing focused
    controls on every metrics update. */
 
+/* Semantic ink is separate from tint RGB. The base design tokens work on
+   dark surfaces; light mode needs darker foregrounds to keep small status
+   text above WCAG AA against the same 10–14% semantic fills. */
+html.ui-v2 {
+  --cu-green-ink: var(--green);
+  --cu-amber-ink: var(--amber);
+  --cu-rose-ink: var(--rose);
+  --cu-sky-ink: var(--sky);
+  --cu-control-outline: #5c6474;
+  --cu-stage-text: #eaecf2;
+  --cu-stage-text-2: #a7aebe;
+  --cu-stage-rose: #ec6a85;
+  --cu-stage-green: #58c08c;
+  --cu-stage-amber: #e4a85b;
+  --cu-stage-line: rgba(230, 236, 247, .14);
+}
+html.ui-v2[data-theme="light"] {
+  --cu-green-ink: #0d633b;
+  --cu-amber-ink: #774000;
+  --cu-rose-ink: #a01f3b;
+  --cu-sky-ink: #15568c;
+  --cu-control-outline: #818899;
+}
+
 /* ── tab scaffold: stage/recording column + semantic right rail ── */
 html.ui-v2 #tab-displays.active {
   display: grid;
@@ -19059,7 +19083,7 @@ html.ui-v2 .display-approval-banner .icon {
 html.ui-v2 .display-approval-banner .title {
   font-size: 13px;
   font-weight: 800;
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   margin-bottom: 3px;
 }
 html.ui-v2 .display-approval-banner .subtitle { font-size: 12px; color: var(--text-2); }
@@ -19075,7 +19099,7 @@ html.ui-v2 .shared-view-banner {
   font-size: 12.5px;
 }
 html.ui-v2 .shared-view-kicker {
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .08em;
@@ -19099,9 +19123,9 @@ html.ui-v2 .shared-view-action:hover {
   filter: brightness(1.08);
 }
 html.ui-v2 .shared-view-close {
-  width: 26px;
-  min-height: 26px;
-  border: 1px solid var(--line);
+  width: 36px;
+  min-height: 36px;
+  border: 1px solid var(--cu-control-outline);
   border-radius: 8px;
   background: transparent;
   color: var(--text-2);
@@ -19110,7 +19134,7 @@ html.ui-v2 .shared-view-close {
 }
 html.ui-v2 .shared-view-close:hover {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   background: rgba(var(--rose-rgb), .08);
 }
 /* compact variant docks flush inside the activity strip */
@@ -19190,10 +19214,11 @@ html.ui-v2 .display-toolbar {
   border-bottom: 0;
   padding: 14px 16px 10px;
   gap: 14px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
 }
 html.ui-v2 .display-toolbar-meta {
+  flex: 1 1 260px;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -19201,14 +19226,15 @@ html.ui-v2 .display-toolbar-meta {
   gap: 7px 10px;
 }
 html.ui-v2 .display-toolbar-actions {
+  flex: 1 1 680px;
   min-width: 0;
   margin-left: auto;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 7px;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  scrollbar-width: thin;
+  overflow-x: visible;
 }
 /* Display selection lives in the real rail. The stage label is therefore
    an honest heading, not a non-interactive span styled as a dropdown. */
@@ -19252,7 +19278,7 @@ html.ui-v2 .display-status.error {
   border: 1px solid rgba(var(--rose-rgb), .26);
   border-radius: var(--r-pill);
   background: rgba(var(--rose-rgb), .10);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
   font-size: 11.5px;
 }
@@ -19264,7 +19290,7 @@ html.ui-v2 .display-status.warn {
   border: 1px solid rgba(var(--amber-rgb), .26);
   border-radius: var(--r-pill);
   background: rgba(var(--amber-rgb), .12);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
   font-size: 11.5px;
 }
@@ -19293,12 +19319,12 @@ html.ui-v2 .display-input-authority {
 html.ui-v2 .display-input-authority.you {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
-  color: var(--green);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .display-input-authority.other {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .26);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-input-authority.unclaimed {
   background: var(--surface-3);
@@ -19318,12 +19344,12 @@ html.ui-v2 .display-visibility {
   white-space: nowrap;
 }
 html.ui-v2 .display-visibility.private {
-  color: var(--green);
+  color: var(--cu-green-ink);
   border-color: rgba(var(--green-rgb), .26);
   background: rgba(var(--green-rgb), .1);
 }
 html.ui-v2 .display-visibility.agent {
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   border-color: rgba(var(--amber-rgb), .28);
   background: rgba(var(--amber-rgb), .11);
 }
@@ -19333,7 +19359,7 @@ html.ui-v2 .display-toolbar button {
   flex: 0 0 auto;
   min-height: 0;
   padding: 6px 11px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
@@ -19343,17 +19369,18 @@ html.ui-v2 .display-toolbar button {
   transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
 }
 html.ui-v2 .display-toolbar-actions .take-control-btn { margin-left: 0; }
+html.ui-v2 .display-toolbar-actions .display-fullscreen-btn { margin-left: 6px; }
 html.ui-v2 .display-toolbar button:hover {
   background: var(--surface-2);
-  border-color: var(--line-2);
+  border-color: var(--text-2);
   color: var(--text);
 }
 /* streaming to the presence model = sky (live/info) while active */
-html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--sky); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
+html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--cu-sky-ink); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
 html.ui-v2 .display-toolbar .stream-btn.active {
   background: rgba(var(--sky-rgb), .14);
   border-color: rgba(var(--sky-rgb), .32);
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .annotate-btn:hover,
@@ -19367,13 +19394,13 @@ html.ui-v2 .display-toolbar .annotate-btn.active {
    dot would double it.) */
 html.ui-v2 .display-toolbar .record-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .record-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .record-btn.active {
   background: var(--rose);
@@ -19389,7 +19416,7 @@ html.ui-v2 .display-toolbar .display-close-btn {
 html.ui-v2 .display-toolbar .display-close-btn:hover {
   background: rgba(var(--rose-rgb), .08);
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 /* Take control — the design's iris primary. The verb is honest: it takes
    (displacing any other viewer), it does not request. */
@@ -19413,27 +19440,27 @@ html.ui-v2 .display-toolbar .take-control-btn:hover {
 html.ui-v2 .display-toolbar .release-control-btn {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .32);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .release-control-btn:hover {
   background: rgba(var(--amber-rgb), .2);
   border-color: rgba(var(--amber-rgb), .45);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-toolbar .delete-recording-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-size: 11.5px;
 }
 html.ui-v2 .display-toolbar .delete-recording-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .release-note {
   flex: 0 0 150px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-control-outline);
   border-radius: 9px;
   background: var(--surface-2);
   color: var(--text);
@@ -19460,7 +19487,7 @@ html.ui-v2 .display-canvas {
   overflow: hidden;
   background: radial-gradient(120% 120% at 30% 0%, #10131b, #070810 70%);
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(0, 0, 0, .5);
 }
@@ -19490,7 +19517,7 @@ html.ui-v2 .display-control-banner {
   box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--green);
+  color: var(--cu-stage-green);
   font-size: 11px;
   font-weight: 700;
   line-height: 1.25;
@@ -19508,7 +19535,7 @@ html.ui-v2 .display-control-banner::before {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--green);
+  background: var(--cu-stage-green);
   transform: translateY(-50%);
   box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
 }
@@ -19524,10 +19551,10 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::after {
   padding: 5px 11px 5px 24px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--rose);
+  color: var(--cu-stage-rose);
   font-family: var(--sans);
   font-size: 11px;
   font-weight: 700;
@@ -19544,7 +19571,7 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::before 
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--rose);
+  background: var(--cu-stage-rose);
   animation: ui2-pulse 1.4s infinite;
   pointer-events: none;
 }
@@ -19574,7 +19601,7 @@ html.ui-v2 .stage-overlay-inner {
   text-align: center;
   border-radius: 12px;
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
 }
@@ -19583,15 +19610,15 @@ html.ui-v2 .stage-overlay-text {
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.5;
-  color: var(--text-2);
+  color: var(--cu-stage-text-2);
 }
-html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--rose); }
+html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--cu-stage-rose); }
 html.ui-v2 .stage-overlay-spinner {
   width: 16px;
   height: 16px;
   flex: 0 0 auto;
   border-radius: 50%;
-  border: 2px solid var(--line-2);
+  border: 2px solid var(--cu-stage-line);
   border-top-color: var(--iris);
   animation: ui2-stage-spin .8s linear infinite;
 }
@@ -19627,10 +19654,10 @@ html.ui-v2 .display-live-metrics {
   padding: 5px 11px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--text-2);
+  color: var(--cu-stage-text-2);
   font-family: var(--mono);
   font-size: 10.5px;
   font-weight: 600;
@@ -19645,7 +19672,7 @@ html.ui-v2 .display-live-metrics::before {
   height: 7px;
   flex: 0 0 auto;
   border-radius: 50%;
-  background: var(--rose);
+  background: var(--cu-stage-rose);
   animation: ui2-pulse 1.4s infinite;
 }
 html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::after,
@@ -19672,7 +19699,7 @@ html.ui-v2 .display-slot.shared-view-active .display-canvas {
 }
 html.ui-v2 .shared-view-focus-box {
   border-radius: 6px;
-  border-color: var(--amber);
+  border-color: var(--cu-stage-amber);
   background: rgba(var(--amber-rgb), .06);
   box-shadow:
     0 0 0 1px rgba(7, 8, 16, .72),
@@ -19681,14 +19708,15 @@ html.ui-v2 .shared-view-focus-box {
 html.ui-v2 .shared-view-focus-box::after {
   border-radius: 8px;
   background: rgba(11, 13, 18, .92);
-  border-color: rgba(var(--amber-rgb), .5);
+  border-color: rgba(228, 168, 91, .5);
+  color: var(--cu-stage-text);
   font-family: var(--sans);
 }
 /* light theme: the stage stays a dark viewport, but its .5-black drop
    shadow is dark-tuned — soften toward the light elevation vocabulary. */
 html.ui-v2[data-theme="light"] .display-canvas {
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(23, 28, 50, .22);
 }
@@ -19720,6 +19748,21 @@ html.ui-v2 .display-slot.display-fullscreen .display-canvas {
   box-shadow: none;
 }
 html.ui-v2 .display-slot.display-fullscreen .display-toolbar { padding: 10px 14px; }
+/* Interaction focus outranks the shared-view/fullscreen state rings above. */
+html.ui-v2 .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2 .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2[data-theme="light"] .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
 
 /* ── collapse bar + split handles ── */
 html.ui-v2 .displays-collapse-bar {
@@ -20170,6 +20213,7 @@ html.ui-v2 .display-picker-item {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
+  min-height: 44px;
   padding: 8px 11px;
 }
 html.ui-v2 .display-picker-item:hover { background: rgba(var(--iris-rgb), .1); }
@@ -20271,13 +20315,13 @@ html.ui-v2 .display-toolbar .callout-btn:hover,
 html.ui-v2 .peer-display-controls .callout-btn:hover {
   background: rgba(var(--amber-rgb), .10);
   border-color: rgba(var(--amber-rgb), .45);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-toolbar .callout-btn[aria-pressed="true"],
 html.ui-v2 .peer-display-controls .callout-btn[aria-pressed="true"] {
   background: rgba(var(--amber-rgb), .16);
   border-color: rgba(var(--amber-rgb), .5);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
   box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .12);
 }
@@ -20310,7 +20354,7 @@ html.ui-v2 .callout-arm-overlay {
 }
 html.ui-v2 .callout-arm-rect {
   position: absolute;
-  border: 2px solid var(--amber);
+  border: 2px solid var(--cu-stage-amber);
   background: rgba(var(--amber-rgb), .12);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
   pointer-events: none;
@@ -20324,8 +20368,8 @@ html.ui-v2 .callout-arm-hint {
   padding: 4px 10px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
-  color: var(--amber);
+  border: 1px solid var(--cu-stage-line);
+  color: var(--cu-stage-amber);
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
@@ -20419,7 +20463,7 @@ html.ui-v2 .ui2-live-row {
   width: 100%;
   min-height: 50px;
   padding: 10px 11px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   border-radius: 11px;
   background: var(--surface);
   color: var(--text);
@@ -20500,7 +20544,9 @@ html.ui-v2 .ui2-live-row-tag {
   font-weight: 800;
   letter-spacing: .05em;
 }
-html.ui-v2 .ui2-live-row-privacy { color: var(--green); }
+html.ui-v2 .ui2-live-row-privacy { color: var(--cu-green-ink); }
+html.ui-v2 .ui2-live-row-media.streaming { color: var(--cu-sky-ink); }
+html.ui-v2 .ui2-live-row-media.recording { color: var(--cu-rose-ink); }
 html.ui-v2 .ui2-live-row-chev {
   flex: 0 0 auto;
   color: var(--text-3);
@@ -20584,19 +20630,19 @@ html.ui-v2 .ui2-live-state-pill {
 html.ui-v2 .ui2-live-state-pill.you {
   border-color: rgba(var(--green-rgb), .26);
   background: rgba(var(--green-rgb), .12);
-  color: var(--green);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .ui2-live-state-pill.other {
   border-color: rgba(var(--amber-rgb), .26);
   background: rgba(var(--amber-rgb), .14);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .ui2-live-card-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
-  min-height: 38px;
+  min-height: 44px;
   margin-top: 9px;
   padding: 9px;
   border: 0;
@@ -20610,6 +20656,7 @@ html.ui-v2 .ui2-live-card-btn {
   transition: filter var(--t-med), background var(--t-fast), border-color var(--t-fast);
 }
 html.ui-v2 .ui2-live-card-btn:hover { filter: brightness(1.08); }
+html.ui-v2 .ui2-live-card-btn[hidden] { display: none; }
 html.ui-v2 .ui2-live-card-btn:disabled {
   opacity: .55;
   cursor: wait;
@@ -20619,10 +20666,10 @@ html.ui-v2 .ui2-live-card-btn.release {
   border: 1px solid rgba(var(--amber-rgb), .32);
   background: rgba(var(--amber-rgb), .14);
   box-shadow: none;
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .ui2-live-card-btn.secondary {
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   background: var(--surface-2);
   box-shadow: none;
   color: var(--text);
@@ -20637,7 +20684,7 @@ html.ui-v2 .ui2-live-card-btn.danger {
   border: 1px solid rgba(var(--rose-rgb), .4);
   background: transparent;
   box-shadow: none;
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
 }
 html.ui-v2 .ui2-live-card-btn.danger:hover {
@@ -20662,6 +20709,9 @@ html.ui-v2 .ui2-live-activity {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  max-height: 190px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 html.ui-v2 .ui2-live-activity-row {
   display: grid;
@@ -20737,9 +20787,9 @@ html.ui-v2 .ui2-live-activity-time {
   }
   html.ui-v2 .ui2-live-rail-toggle {
     flex: 0 0 auto;
-    min-height: 36px;
+    min-height: 44px;
     padding: 7px 12px;
-    border: 1px solid var(--line-2);
+    border: 1px solid var(--cu-control-outline);
     border-radius: var(--r-ctl);
     background: var(--surface);
     color: var(--text);
@@ -20766,9 +20816,9 @@ html.ui-v2 .ui2-live-activity-time {
   html.ui-v2 .ui2-live-rail-close {
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 34px;
-    border: 1px solid var(--line);
+    width: 44px;
+    height: 44px;
+    border: 1px solid var(--cu-control-outline);
     border-radius: var(--r-ctl);
     background: var(--surface);
     color: var(--text-2);
@@ -20810,22 +20860,24 @@ html.ui-v2 .ui2-live-activity-time {
     min-height: 30px;
   }
   html.ui-v2 .display-toolbar-actions {
+    flex: 0 0 auto;
     width: 100%;
     margin-left: 0;
     padding: 1px 0 4px;
   }
-  html.ui-v2 .display-toolbar-actions .take-control-btn,
-  html.ui-v2 .display-toolbar-actions .release-control-btn {
-    order: -2;
-  }
   html.ui-v2 .display-toolbar button {
-    min-height: 36px;
+    min-height: 44px;
     padding: 7px 11px;
   }
   html.ui-v2 .display-toolbar .release-note {
     flex-basis: 145px;
-    min-height: 36px;
+    min-height: 44px;
   }
+  html.ui-v2 .display-toolbar .display-fullscreen-btn,
+  html.ui-v2 .display-toolbar .display-close-btn { width: 44px; }
+  html.ui-v2 .shared-view-action,
+  html.ui-v2 .shared-view-close { min-height: 44px; }
+  html.ui-v2 .shared-view-close { width: 44px; }
   html.ui-v2 .display-canvas { margin: 0 10px 10px; }
   html.ui-v2 .display-control-banner {
     top: auto;
@@ -22252,12 +22304,14 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
               <button class="strip-minimize-btn" id="strip-minimize" type="button" title="Minimize displays" aria-label="Minimize displays" aria-pressed="false">&minus;</button>
               <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
             </div>
-            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
+            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner"
+                 data-shared-view-banner role="status" aria-live="polite" aria-atomic="true">
               <span class="shared-view-kicker">Shared view</span>
               <span class="shared-view-message" data-shared-view-message></span>
               <span class="shared-view-actions">
                 <button class="shared-view-action" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-                <button class="shared-view-close" type="button" data-shared-view-close title="Hide shared view">&times;</button>
+                <button class="shared-view-close" type="button" data-shared-view-close
+                        aria-label="Hide shared view" title="Hide shared view">&times;</button>
               </span>
             </div>
             <div class="activity-display-row" id="activity-display-row"></div>
@@ -23042,19 +23096,21 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
           Displays &amp; input
         </button>
       </div>
-      <div class="display-approval-banner hidden" id="display-approval-banner">
+      <div class="display-approval-banner hidden" id="display-approval-banner" role="alert" aria-atomic="true">
         <div class="icon">&#x26A0;</div>
         <div class="text">
           <div class="title">Screen sharing approval needed</div>
           <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
         </div>
       </div>
-      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner>
+      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner
+           role="status" aria-live="polite" aria-atomic="true">
         <span class="shared-view-kicker">Shared view</span>
         <span class="shared-view-message" id="shared-view-message" data-shared-view-message></span>
         <span class="shared-view-actions">
           <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close title="Hide shared view">&times;</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close
+                  aria-label="Hide shared view" title="Hide shared view">&times;</button>
         </span>
       </div>
       <div class="displays-container" id="displays-container">
@@ -23189,7 +23245,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
         </section>
         <section aria-labelledby="ui2-live-authority-heading">
           <h3 class="ui2-live-rail-eyebrow" id="ui2-live-authority-heading">Input authority</h3>
-          <div id="ui2-live-authority-card" aria-live="polite" aria-atomic="true"></div>
+          <div id="ui2-live-authority-card"></div>
         </section>
         <section aria-labelledby="ui2-live-activity-heading">
           <h3 class="ui2-live-rail-eyebrow" id="ui2-live-activity-heading">Display activity</h3>
@@ -26660,7 +26716,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '6a47fd04d68d454e';
+const INTENDANT_APP_BUILD = 'f0423bced4ed7ce0';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40461,20 +40517,26 @@ async function main() {
       if (d.event === 'recording_started' && d.stream_name) {
         serverMsgStep(d, 'recording_started', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.recordBtn.setAttribute('aria-pressed', 'true'); slot.deleteRecBtn.style.display = 'none'; }
+          if (slot) slot.applyRecordingState(true, d.stream_name);
           handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
         });
       } else if (d.event === 'recording_stopped' && d.stream_name) {
         serverMsgStep(d, 'recording_stopped', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.recordBtn.setAttribute('aria-pressed', 'false'); slot.deleteRecBtn.style.display = ''; }
+          if (slot) slot.applyRecordingState(false, d.stream_name);
           handleDebugRecordingEvent(d);
         });
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         serverMsgStep(d, 'recording_deleted', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.recordBtn.setAttribute('aria-pressed', 'false'); slot.deleteRecBtn.style.display = 'none'; }
+          if (slot) slot.applyRecordingState(false, d.stream_name, true);
           deleteRecordingStream(d.stream_name);
+        });
+      } else if (d.event === 'recording_error' && d.stream_name) {
+        serverMsgStep(d, 'recording_error', () => {
+          const slot = slotForRecordingStream(d.stream_name);
+          if (slot) slot._failRecordingCommand(d.message || 'Recording failed');
+          handleDebugRecordingEvent(d);
         });
       }
       // Display transport metrics (per-display sections)
@@ -62663,6 +62725,11 @@ class DisplaySlot {
     this.connected = false;
     this.streaming = false;
     this.recordingStreamName = null;
+    this._recordingPendingAction = null;
+    this._recordingPendingTimer = null;
+    this._recordingDeletePending = false;
+    this._recordingDeleteStream = null;
+    this._recordingDeleteTimer = null;
     this._answerApplied = false;     // true after setRemoteDescription completes
     this._pendingCandidates = [];    // queued until answer is applied
     this._reconnectAttempts = 0;     // ICE failure reconnect counter
@@ -62690,6 +62757,8 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
+    this._fullscreenInertRecords = [];
+    this._fullscreenReturnFocus = null;
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
     const label = displayLabel(displayId);
@@ -62699,20 +62768,20 @@ class DisplaySlot {
           <span class="display-label"></span>
           <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
           <span class="display-status" id="ds-status-${displayId}" role="status" aria-live="polite" aria-atomic="true">Connecting...</span>
-          <span class="display-input-authority" id="ds-authority-${displayId}" role="status" aria-live="polite" aria-atomic="true" style="display:none" title="Input authority for this display: who can drive keyboard and pointer input."></span>
+          <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard and pointer input."></span>
         </div>
         <div class="display-toolbar-actions">
+          <button class="take-control-btn" id="ds-take-${displayId}" type="button" title="Take interactive control of this display (keyboard and mouse)">Take control</button>
+          <button class="release-control-btn" id="ds-release-${displayId}" type="button" style="display:none" title="Release control and return display to view-only mode">Release</button>
           <input class="release-note" id="ds-note-${displayId}" aria-label="Note to the agent when releasing this display" placeholder="Note (optional)" style="display:none">
           <button class="stream-btn" id="ds-stream-${displayId}" type="button" aria-pressed="false" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
           <button class="ann-attach-btn" id="ds-attach-${displayId}" type="button" title="Capture current frame and attach to next task">Attach</button>
           <button class="annotate-btn" id="ds-annotate-${displayId}" type="button" aria-pressed="false" title="Freeze current frame and annotate it">&#9998; Annotate</button>
           <button class="callout-btn" id="ds-callout-${displayId}" type="button" aria-pressed="false" disabled title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
           <button class="record-btn" id="ds-record-${displayId}" type="button" aria-pressed="false" title="Record this display (ffmpeg)">Record</button>
-          <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" type="button" aria-label="Open display full screen" title="Full screen">&#x26F6;</button>
-          <button class="display-close-btn" id="ds-close-${displayId}" type="button" aria-label="Close this display stream" title="Close this display stream">&times;</button>
-          <button class="take-control-btn" id="ds-take-${displayId}" type="button" title="Take interactive control of this display (keyboard and mouse)">Take control</button>
-          <button class="release-control-btn" id="ds-release-${displayId}" type="button" style="display:none" title="Release control and return display to view-only mode">Release</button>
           <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" type="button" style="display:none" title="Delete recording files for this display">Delete</button>
+          <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" type="button" aria-label="Open display full screen" aria-pressed="false" title="Full screen">&#x26F6;</button>
+          <button class="display-close-btn" id="ds-close-${displayId}" type="button" aria-label="Close this display stream" title="Close this display stream">&times;</button>
           <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0)"></span>
         </div>
       </div>
@@ -62770,8 +62839,6 @@ class DisplaySlot {
     this.canvasEl.appendChild(this.metricsEl);
     this.controlBannerEl = document.createElement('div');
     this.controlBannerEl.className = 'display-control-banner';
-    this.controlBannerEl.setAttribute('role', 'status');
-    this.controlBannerEl.setAttribute('aria-live', 'polite');
     this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
     this.canvasEl.appendChild(this.controlBannerEl);
     const rerenderSharedFocus = () => {
@@ -62797,6 +62864,7 @@ class DisplaySlot {
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
     this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
     this.calloutBtn.addEventListener('click', () => this.toggleCallout());
+    this.el.addEventListener('keydown', event => this._handleFullscreenKeydown(event));
   }
 
   // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — both are
@@ -62812,12 +62880,13 @@ class DisplaySlot {
     if (want) {
       for (const slot of displaySlots.values()) {
         if (slot === this) continue;
-        slot.el.classList.remove('display-fullscreen');
-        if (slot.fullscreenBtn) {
-          slot.fullscreenBtn.innerHTML = '&#x26F6;';
-          slot.fullscreenBtn.title = 'Full screen';
-        }
+        if (slot.el.classList.contains('display-fullscreen')) slot.toggleFullscreen(false);
       }
+    }
+    if (want && !this.el.classList.contains('display-fullscreen')) {
+      this._enterFullscreenA11y();
+    } else if (!want && this.el.classList.contains('display-fullscreen')) {
+      this._exitFullscreenA11y();
     }
     this.el.classList.toggle('display-fullscreen', want);
     const anyFullscreen = want || Array.from(displaySlots.values()).some(slot =>
@@ -62829,6 +62898,78 @@ class DisplaySlot {
       this.fullscreenBtn.title = want ? 'Exit full screen' : 'Full screen';
       this.fullscreenBtn.setAttribute('aria-label', want ? 'Exit display full screen' : 'Open display full screen');
       this.fullscreenBtn.setAttribute('aria-pressed', want ? 'true' : 'false');
+    }
+    if (want && this.fullscreenBtn) this.fullscreenBtn.focus();
+  }
+
+  _enterFullscreenA11y() {
+    this._fullscreenReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    this._fullscreenInertRecords = [];
+    let branch = this.el;
+    while (branch && branch.parentElement) {
+      const parent = branch.parentElement;
+      for (const sibling of parent.children) {
+        if (sibling === branch || !(sibling instanceof HTMLElement)) continue;
+        this._fullscreenInertRecords.push({
+          element: sibling,
+          inert: sibling.inert,
+          ariaHidden: sibling.getAttribute('aria-hidden'),
+        });
+        sibling.inert = true;
+        sibling.setAttribute('aria-hidden', 'true');
+      }
+      branch = parent;
+      if (parent === document.body) break;
+    }
+    this.el.setAttribute('role', 'dialog');
+    this.el.setAttribute('aria-modal', 'true');
+  }
+
+  _exitFullscreenA11y() {
+    for (const record of this._fullscreenInertRecords) {
+      record.element.inert = record.inert;
+      if (record.ariaHidden === null) record.element.removeAttribute('aria-hidden');
+      else record.element.setAttribute('aria-hidden', record.ariaHidden);
+    }
+    this._fullscreenInertRecords = [];
+    this.el.removeAttribute('role');
+    this.el.removeAttribute('aria-modal');
+    // A responsive breakpoint may have changed while fullscreen owned the
+    // background. Re-project the drawer's current media-query state instead
+    // of leaving stale inert/aria-hidden snapshots on its rail or stage.
+    if (typeof window.syncLiveDisplayDrawerState === 'function') {
+      window.syncLiveDisplayDrawerState();
+    }
+    const returnFocus = this._fullscreenReturnFocus;
+    this._fullscreenReturnFocus = null;
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+      requestAnimationFrame(() => returnFocus.focus());
+    }
+  }
+
+  _handleFullscreenKeydown(event) {
+    if (!this.el.classList.contains('display-fullscreen')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      this.toggleFullscreen(false);
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(this.el.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), video[tabindex], [tabindex]:not([tabindex="-1"])'
+    )).filter(element => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -63350,6 +63491,13 @@ class DisplaySlot {
   // entry into interactive mode.
   _enterInteractive() {
     if (this.interactive) return;
+    // Activity thumbnails and hidden single-stage projections are
+    // deliberately view-only. A late authority reply must never bind
+    // keyboard/pointer/paste listeners after navigation hid its surface.
+    if (activeTab !== 'displays' || this.el.classList.contains('ui2-live-inactive')) {
+      this._releaseAuthority();
+      return;
+    }
     this.interactive = true;
     this.el.classList.add('is-interactive');
     this.noteInput.style.display = '';
@@ -63645,28 +63793,113 @@ class DisplaySlot {
     this.frameIdEl.textContent = '';
   }
   toggleRecording() {
-    if (!app) return;
+    if (!app || this._recordingPendingAction || this._recordingDeletePending) return;
     const baseStream = 'display_' + this.displayId;
     const stream = this.recordingStreamName || baseStream;
-    if (this.recording) {
-      dispatchDashboardActionMsg({ action: 'stop_recording', stream_name: stream });
-      this.recording = false;
-      this.recordBtn.innerHTML = '&#x23FA; Record';
-      this.recordBtn.classList.remove('active');
-      this.recordBtn.setAttribute('aria-pressed', 'false');
-      this.deleteRecBtn.style.display = '';
-    } else {
-      dispatchDashboardActionMsg({ action: 'start_recording', stream_name: baseStream });
-      this.recordingStreamName = baseStream;
-      this.recording = true;
-      this.recordBtn.innerHTML = '&#x23F9; Stop';
-      this.recordBtn.classList.add('active');
-      this.recordBtn.setAttribute('aria-pressed', 'true');
-      this.deleteRecBtn.style.display = 'none';
+    const action = this.recording ? 'stop_recording' : 'start_recording';
+    const targetStream = this.recording ? stream : baseStream;
+    this._setRecordingPending(action);
+    const fail = error => {
+      // A late RPC failure must not roll back or toast over a newer server
+      // event that already confirmed and cleared this exact command.
+      if (this._recordingPendingAction !== action) return;
+      this._failRecordingCommand(
+        error?.message || `Could not ${this.recording ? 'stop' : 'start'} recording`
+      );
+    };
+    const sent = dispatchDashboardActionMsg(
+      { action, stream_name: targetStream },
+      { onError: fail }
+    );
+    if (!sent) {
+      fail(new Error('Dashboard control connection is unavailable'));
+      return;
     }
+    this._recordingPendingTimer = window.setTimeout(() => {
+      this._recordingPendingTimer = null;
+      if (!this._recordingPendingAction) return;
+      this._failRecordingCommand('No recording confirmation arrived — check the display activity and retry.');
+    }, 10000);
+  }
+
+  _setRecordingPending(action) {
+    this._recordingPendingAction = action;
+    this._renderRecordingControls();
+  }
+
+  _clearRecordingPending(render = true) {
+    if (this._recordingPendingTimer) {
+      window.clearTimeout(this._recordingPendingTimer);
+      this._recordingPendingTimer = null;
+    }
+    this._recordingPendingAction = null;
+    if (render) this._renderRecordingControls();
+  }
+
+  _clearRecordingDeletePending(render = true) {
+    if (this._recordingDeleteTimer) {
+      window.clearTimeout(this._recordingDeleteTimer);
+      this._recordingDeleteTimer = null;
+    }
+    this._recordingDeletePending = false;
+    this._recordingDeleteStream = null;
+    if (render) this._renderRecordingControls();
+  }
+
+  _renderRecordingControls() {
+    const action = this._recordingPendingAction;
+    const deleting = this._recordingDeletePending;
+    this.recordBtn.disabled = Boolean(action || deleting);
+    this.recordBtn.setAttribute('aria-busy', action ? 'true' : 'false');
+    this.recordBtn.innerHTML = action
+      ? (action === 'stop_recording' ? 'Stopping…' : 'Starting…')
+      : (this.recording ? '&#x23F9; Stop' : '&#x23FA; Record');
+    this.recordBtn.classList.toggle('active', this.recording);
+    this.recordBtn.setAttribute('aria-pressed', this.recording ? 'true' : 'false');
+    this.deleteRecBtn.disabled = Boolean(deleting || action);
+    this.deleteRecBtn.setAttribute('aria-busy', deleting ? 'true' : 'false');
+    this.deleteRecBtn.textContent = deleting ? 'Deleting…' : 'Delete';
+    this.deleteRecBtn.style.display = this.recording || !this.recordingStreamName ? 'none' : '';
+  }
+
+  applyRecordingState(recording, streamName, deleted = false) {
+    const sameAsCurrent = !this.recordingStreamName || !streamName ||
+      this.recordingStreamName === streamName;
+    // Recording events are base-mapped to slots, so a late stop/delete for
+    // an older suffixed stream must not turn off a newer active recording.
+    // Likewise, a negative event cannot confirm an in-flight Start.
+    if ((!recording && this.recordingStreamName && !sameAsCurrent) ||
+        (!recording && this._recordingPendingAction === 'start_recording')) {
+      if (deleted && this._recordingDeletePending &&
+          this._recordingDeleteStream === streamName) {
+        this._clearRecordingDeletePending();
+      }
+      return false;
+    }
+
+    const confirmsRecordingCommand = recording
+      ? this._recordingPendingAction === 'start_recording'
+      : this._recordingPendingAction === 'stop_recording';
+    if (confirmsRecordingCommand) this._clearRecordingPending(false);
+    if (deleted && this._recordingDeletePending &&
+        this._recordingDeleteStream === streamName) {
+      this._clearRecordingDeletePending(false);
+    }
+    this.recording = Boolean(recording);
+    this.recordingStreamName = deleted ? null : (streamName || this.recordingStreamName);
+    this._renderRecordingControls();
+    return true;
+  }
+
+  _failRecordingCommand(message) {
+    this._clearRecordingPending(false);
+    this._clearRecordingDeletePending(false);
+    // The last server-confirmed state remains authoritative.
+    this._renderRecordingControls();
+    if (typeof showControlToast === 'function') showControlToast('error', message);
   }
   async deleteRecording() {
-    if (!app) return;
+    if (!app || this._recordingDeletePending || this._recordingPendingAction || this.recording) return;
     const stream = this.recordingStreamName || ('display_' + this.displayId);
     const ok = await showDashboardConfirm({
       title: 'Delete recording',
@@ -63675,9 +63908,29 @@ class DisplaySlot {
       confirmLabel: 'Delete',
     });
     if (!ok) return;
-    dispatchDashboardActionMsg({ action: 'delete_recording', stream_name: stream });
-    this.deleteRecBtn.style.display = 'none';
-    this.recordingStreamName = null;
+    // State can change while the confirmation dialog is open.
+    if (this._recordingDeletePending || this._recordingPendingAction || this.recording ||
+        this.recordingStreamName !== stream) return;
+    this._recordingDeletePending = true;
+    this._recordingDeleteStream = stream;
+    this._renderRecordingControls();
+    const fail = error => {
+      if (!this._recordingDeletePending) return;
+      this._failRecordingCommand(error?.message || 'Could not delete the recording');
+    };
+    const sent = dispatchDashboardActionMsg(
+      { action: 'delete_recording', stream_name: stream },
+      { onError: fail }
+    );
+    if (!sent) {
+      fail(new Error('Dashboard control connection is unavailable'));
+      return;
+    }
+    this._recordingDeleteTimer = window.setTimeout(() => {
+      this._recordingDeleteTimer = null;
+      if (!this._recordingDeletePending) return;
+      this._failRecordingCommand('No delete confirmation arrived — the recording is still listed.');
+    }, 10000);
   }
   // Phase 5c: teardown.  `userInitiated` separates the user-close path
   // (display toggled off, `removeDisplaySlot`, etc.) from transient
@@ -63705,10 +63958,9 @@ class DisplaySlot {
     this._clearNoTrackWatchdog();
     this._stopStatsSampler();
     this._setStageOverlay(null);
+    this._clearRecordingPending();
+    this._clearRecordingDeletePending();
     this.stopStreaming();
-    if (userInitiated) {
-      this._releaseAuthority();
-    }
     // Flip `connected` BEFORE `_exitInteractive` so its status-text
     // ternary writes 'Disconnected' (not the stale 'Connected (view-
     // only)') on the way out — otherwise the chip flickers through
@@ -63716,6 +63968,12 @@ class DisplaySlot {
     // assignment overwrote it.
     this.connected = false;
     this._exitInteractive(userInitiated);
+    if (userInitiated) {
+      // Held-key keyups from `_exitInteractive` must cross the input gate
+      // before the authority release closes it. This is the same ordering
+      // as releaseControl(); close/remove paths cannot safely reverse it.
+      this._releaseAuthority();
+    }
     if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
@@ -63746,6 +64004,9 @@ function removeDisplaySlot(displayId) {
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  if (typeof window.retireLiveDisplayWorkspaceSlot === 'function') {
+    window.retireLiveDisplayWorkspaceSlot(displayId);
+  }
   if (sharedViewState.displayId === displayId) {
     clearSharedViewDecorations();
   }
@@ -63906,19 +64167,27 @@ function updateSharedViewBanner() {
 
 function applySharedViewToSlot(slot) {
   if (!sharedViewState.visible || !slot) return;
+  // Current daemons resolve auto-detect to a concrete target. A legacy null
+  // event is only safe to bind when handleSharedViewEvent saw exactly one
+  // existing stream; never guess here while bootstrap slots are still arriving.
+  if (sharedViewState.displayId === null) return;
   if (sharedViewState.displayId !== null && Number(slot.displayId) !== sharedViewState.displayId) {
     return;
   }
-  // The Live workspace is a selected-display stage. Agent-requested
-  // shared views must foreground their real target rather than leaving
-  // the focus box mounted on a hidden slot.
+  // The Live workspace is a selected-display stage. Foreground a new
+  // advisory target only when doing so will not discard active human work;
+  // the banner and row decoration still make a deferred target discoverable.
+  let foregrounded = true;
   if (typeof window.selectLiveDisplay === 'function') {
-    window.selectLiveDisplay(slot.displayId, { source: 'shared-view' });
+    foregrounded = window.selectLiveDisplay(slot.displayId, {
+      source: 'shared-view',
+      advisory: true,
+    });
   }
   updateSharedViewBanner();
   slot.el.classList.add('shared-view-active');
   renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
-  if (activeTab === 'displays') {
+  if (activeTab === 'displays' && foregrounded) {
     requestAnimationFrame(() => {
       try { slot.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
     });
@@ -63946,7 +64215,21 @@ function hideSharedView() {
 function takeSharedViewInput() {
   if (sharedViewState.displayId === null) return;
   const slot = displaySlots.get(sharedViewState.displayId);
-  if (slot) slot.takeControl();
+  if (!slot) return;
+  // This click is an explicit human decision, unlike the agent's advisory
+  // shared-view event: select the requested surface (safely releasing the
+  // previous one) before asking for its input authority.
+  if (activeTab !== 'displays' && typeof routeTo === 'function') {
+    if (routeTo('displays') === false) return;
+  }
+  if (typeof window.selectLiveDisplay === 'function') {
+    const selected = window.selectLiveDisplay(slot.displayId, {
+      source: 'shared-view-input',
+      focusStage: true,
+    });
+    if (!selected) return;
+  }
+  slot.takeControl();
 }
 
 function handleSharedViewEvent(evt) {
@@ -63968,6 +64251,14 @@ function handleSharedViewEvent(evt) {
   sharedViewState.note = String(evt.note || '');
   sharedViewState.region = evt.region || null;
 
+  const slot = sharedViewState.displayId !== null
+    ? displaySlots.get(sharedViewState.displayId)
+    : displaySlots.size === 1
+      ? displaySlots.values().next().value
+      : null;
+  if (slot && sharedViewState.displayId === null) {
+    sharedViewState.displayId = Number(slot.displayId);
+  }
   clearSharedViewDecorations();
   updateSharedViewBanner();
   if (activeTab !== 'displays' && (activeTab !== 'activity' || activeActivitySubtab !== 'log')) {
@@ -63977,9 +64268,6 @@ function handleSharedViewEvent(evt) {
   if (activeTab === 'activity' && activeActivitySubtab === 'log' && activityStrip) {
     activityStrip.classList.remove('hidden');
   }
-  const slot = sharedViewState.displayId !== null
-    ? displaySlots.get(sharedViewState.displayId)
-    : displaySlots.values().next().value;
   if (slot) applySharedViewToSlot(slot);
 }
 
@@ -64077,7 +64365,11 @@ function addDisplayThumb(displayId) {
 
   const thumb = document.createElement('div');
   thumb.className = 'activity-display-thumb';
-  thumb.innerHTML = `<span class="thumb-label">${displayLabel(displayId, true)}</span>`;
+  const thumbLabel = document.createElement('span');
+  thumbLabel.className = 'thumb-label';
+  // Window titles come from the OS and are not trusted markup.
+  thumbLabel.textContent = displayLabel(displayId, true);
+  thumb.appendChild(thumbLabel);
   thumb.addEventListener('click', (e) => { e.stopPropagation(); toggleDisplayStrip(); }, true);
 
   displayThumbs.set(displayId, thumb);
@@ -64246,6 +64538,7 @@ function applyDisplayStripState() {
 // down through the existing provider lifecycle before that slot is hidden.
 (() => {
   const tab = document.getElementById('tab-displays');
+  const main = document.getElementById('ui2-live-main');
   const container = document.getElementById('displays-container');
   const rail = document.getElementById('ui2-live-rail');
   const displaysList = document.getElementById('ui2-live-displays-list');
@@ -64271,11 +64564,13 @@ function applyDisplayStripState() {
   const peerSources = new Map();
   const slotSnapshots = new Map();
   const activityByDisplay = new Map();
+  const activityRows = new Map();
   const drawerMedia = window.matchMedia('(max-width: 1279px)');
   let selectedDisplayId = null;
   let railOpen = false;
   let railRaf = 0;
   let activitySeq = 0;
+  let activityRenderedDisplayId = null;
   let lastActivitySignature = '';
   let lastAuthoritySignature = '';
   let lastScreenSignature = '';
@@ -64287,6 +64582,39 @@ function applyDisplayStripState() {
 
   function selectedSlot() {
     return selectedDisplayId === null ? null : displaySlots.get(selectedDisplayId) || null;
+  }
+
+  function slotHasActiveUserWork(slot) {
+    if (!slot) return false;
+    return Boolean(
+      slot.interactive ||
+      slot._takeControlPending ||
+      slot.authorityState === 'you' ||
+      slot.el?.classList.contains('display-fullscreen') ||
+      slot.el?.contains(document.activeElement) ||
+      rail.contains(document.activeElement) ||
+      (typeof shouldSuppressDisplayInputForAnnotation === 'function' &&
+        shouldSuppressDisplayInputForAnnotation(slot)) ||
+      (typeof liveCalloutArmedFor === 'function' && liveCalloutArmedFor(slot))
+    );
+  }
+
+  function slotHasBlockingSurfaceWork(slot) {
+    if (!slot) return false;
+    return Boolean(
+      (typeof shouldSuppressDisplayInputForAnnotation === 'function' &&
+        shouldSuppressDisplayInputForAnnotation(slot)) ||
+      (typeof liveCalloutArmedFor === 'function' && liveCalloutArmedFor(slot))
+    );
+  }
+
+  function announceBlockedSurfaceSwitch() {
+    if (typeof showControlToast === 'function') {
+      showControlToast(
+        'info',
+        'Finish or close the current annotation/callout before changing displays.'
+      );
+    }
   }
 
   function emptyHint(textValue) {
@@ -64313,8 +64641,18 @@ function applyDisplayStripState() {
   function teardownSelectedSurface(slot) {
     if (!slot) return;
     // releaseControl is the only safe ordering: held-key keyups are sent
-    // before the server-side authority release closes the input gate.
-    if (slot.interactive) slot.releaseControl();
+    // before the server-side authority release closes the input gate. A
+    // pending Take must also be cancelled: its late `you` reply would
+    // otherwise install document-level paste and input listeners on the
+    // display after this projection has hidden it. Releasing an already-
+    // held but locally unbound authority is idempotent and avoids leaving
+    // a hidden display reserved during the server round trip.
+    if (slot.interactive || slot._takeControlPending || slot.authorityState === 'you') {
+      slot.releaseControl();
+    }
+    if (slot.el?.classList.contains('display-fullscreen')) {
+      slot.toggleFullscreen(false);
+    }
     if (typeof teardownLiveSurfaceForOwner === 'function') {
       teardownLiveSurfaceForOwner(slot);
     }
@@ -64326,7 +64664,13 @@ function applyDisplayStripState() {
     const next = Number.isFinite(id) ? displaySlots.get(id) : null;
     if (!next) return false;
     if (selectedDisplayId !== id) {
-      teardownSelectedSurface(selectedSlot());
+      const current = selectedSlot();
+      if (opts.advisory && slotHasActiveUserWork(current)) return false;
+      if (slotHasBlockingSurfaceWork(current)) {
+        announceBlockedSurfaceSwitch();
+        return false;
+      }
+      teardownSelectedSurface(current);
       selectedDisplayId = id;
     }
     setSelectedProjection();
@@ -64339,18 +64683,53 @@ function applyDisplayStripState() {
     return true;
   }
   window.selectLiveDisplay = selectLiveDisplay;
+  window.retireLiveDisplayWorkspaceSlot = function(displayId) {
+    const id = Number(displayId);
+    const record = displayRows.get(id);
+    if (record) record.row.remove();
+    displayRows.delete(id);
+    slotSnapshots.delete(id);
+    activityByDisplay.delete(id);
+    if (selectedDisplayId === id) selectedDisplayId = null;
+    lastActivitySignature = '';
+    lastAuthoritySignature = '';
+    scheduleWorkspace();
+  };
+  window.canDeactivateLiveDisplayWorkspace = function(options) {
+    const blocking = Array.from(displaySlots.values()).find(slotHasBlockingSurfaceWork);
+    if (!blocking) return true;
+    if (!options || options.announce !== false) announceBlockedSurfaceSwitch();
+    return false;
+  };
+  window.deactivateLiveDisplayWorkspace = function() {
+    if (!window.canDeactivateLiveDisplayWorkspace()) return false;
+    for (const slot of displaySlots.values()) {
+      if (slot.interactive || slot._takeControlPending || slot.authorityState === 'you') {
+        slot.releaseControl();
+      }
+      if (slot.el?.classList.contains('display-fullscreen')) {
+        slot.toggleFullscreen(false);
+      }
+      if (typeof teardownLiveSurfaceForOwner === 'function') {
+        teardownLiveSurfaceForOwner(slot);
+      }
+    }
+    scheduleWorkspace();
+    return true;
+  };
 
   function reconcileSelectedDisplay(slots) {
-    const shared = slots.find(slot => slot.el && slot.el.classList.contains('shared-view-active'));
-    if (shared && Number(shared.displayId) !== selectedDisplayId) {
-      selectLiveDisplay(shared.displayId, { source: 'shared-view' });
-      return;
-    }
     if (selectedDisplayId !== null && displaySlots.has(selectedDisplayId)) {
       setSelectedProjection();
       return;
     }
-    selectedDisplayId = slots.length ? Number(slots[0].displayId) : null;
+    // applySharedViewToSlot selects a newly requested shared-view target
+    // once. If the workspace initializes after that event, prefer its
+    // decorated slot only for this initial/fallback choice. Never force it
+    // again: the user must remain free to inspect another live display.
+    const shared = slots.find(slot => slot.el && slot.el.classList.contains('shared-view-active'));
+    const fallback = shared || slots[0];
+    selectedDisplayId = fallback ? Number(fallback.displayId) : null;
     setSelectedProjection();
   }
 
@@ -64367,17 +64746,19 @@ function applyDisplayStripState() {
       '</span>' +
       '<span class="ui2-live-row-tags" aria-hidden="true">' +
         '<span class="ui2-live-row-tag ui2-live-row-privacy"></span>' +
+        '<span class="ui2-live-row-tag ui2-live-row-media"></span>' +
         '<span class="ui2-live-row-tag ui2-live-row-current"></span>' +
       '</span>';
     row.addEventListener('click', () => {
-      selectLiveDisplay(id, { focusStage: true, source: 'rail' });
-      if (drawerMedia.matches) setRailOpen(false, true);
+      const selected = selectLiveDisplay(id, { focusStage: true, source: 'rail' });
+      if (selected && drawerMedia.matches) setRailOpen(false, true);
     });
     return {
       row,
       title: row.querySelector('.ui2-live-row-title'),
       meta: row.querySelector('.ui2-live-row-meta'),
       privacy: row.querySelector('.ui2-live-row-privacy'),
+      media: row.querySelector('.ui2-live-row-media'),
       current: row.querySelector('.ui2-live-row-current'),
     };
   }
@@ -64423,6 +64804,25 @@ function applyDisplayStripState() {
       const error = Boolean(slot.statusEl && slot.statusEl.classList.contains('error'));
       const active = id === selectedDisplayId;
       const privateView = displayAgentVisibility.get(id) === false;
+      const presenceStreaming = Boolean(slot.streaming);
+      const recording = Boolean(slot.recording);
+      const current = selectedSlot();
+      const releasesControl = !active && Boolean(
+        current && (current.interactive || current._takeControlPending || current.authorityState === 'you')
+      );
+      const blocksForEdit = !active && slotHasBlockingSurfaceWork(current);
+      const visibilityLabel = privateView
+        ? 'private dashboard view; agent cannot see it'
+        : (displayAgentVisibility.get(id) === true && userDisplayIds.has(id))
+          ? 'shared with the agent'
+          : 'agent workspace';
+      const stateLabels = [
+        visibilityLabel,
+        presenceStreaming ? 'streaming frames to the presence model' : '',
+        recording ? 'recording' : '',
+        releasesControl ? 'switching here releases current input control' : '',
+        blocksForEdit ? 'finish the current annotation or callout before switching' : '',
+      ].filter(Boolean);
 
       record.row.classList.toggle('ok', Boolean(slot.connected));
       record.row.classList.toggle('err', error);
@@ -64431,13 +64831,23 @@ function applyDisplayStripState() {
       record.row.setAttribute('aria-pressed', active ? 'true' : 'false');
       if (active) record.row.setAttribute('aria-current', 'true');
       else record.row.removeAttribute('aria-current');
-      record.row.title = active ? label + ' is shown on the stage' : 'Show ' + label + ' on the stage';
+      record.row.title = active
+        ? label + ' is shown on the stage'
+        : blocksForEdit
+          ? 'Finish the current annotation or callout before showing ' + label
+          : 'Show ' + label + ' on the stage' +
+            (releasesControl ? ' and release current input control' : '');
       record.row.setAttribute('aria-label',
-        label + ', ' + status + ', input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown));
+        label + ', ' + status + ', input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown) +
+        ', ' + stateLabels.join(', '));
       record.title.textContent = label;
       record.meta.textContent = status + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
       record.privacy.textContent = privateView ? 'PRIVATE' : '';
       record.privacy.title = privateView ? 'The agent cannot see this private view' : '';
+      record.media.textContent = [presenceStreaming ? 'STREAM' : '', recording ? 'REC' : '']
+        .filter(Boolean).join(' · ');
+      record.media.classList.toggle('streaming', presenceStreaming);
+      record.media.classList.toggle('recording', recording);
       record.current.textContent = active ? 'VIEWING' : (slot.connected ? 'LIVE' : '');
       ordered.push(record);
     }
@@ -64473,10 +64883,12 @@ function applyDisplayStripState() {
       // authority round-trip (or after a failed release), let the holder
       // safely re-bind listeners instead of trapping it behind a Release-
       // only toolbar state.
+      if (drawerMedia.matches) setRailOpen(false, true);
       slot.takeControl();
       return;
     }
     const source = slot.authorityState === 'you' ? slot.releaseBtn : slot.takeBtn;
+    if (source === slot.takeBtn && drawerMedia.matches) setRailOpen(false, true);
     if (source && !source.disabled) source.click();
   });
 
@@ -64563,17 +64975,16 @@ function applyDisplayStripState() {
 
   function snapshotSlot(slot) {
     const statusEl = slot.statusEl;
-    const mode = slot.interactive
-      ? 'interactive'
-      : slot.connected
-        ? 'connected'
-        : statusEl && statusEl.classList.contains('error')
-          ? 'error'
-          : statusEl && statusEl.classList.contains('warn')
-            ? 'warn'
-            : 'connecting';
+    const connection = slot.connected
+      ? 'connected'
+      : statusEl && statusEl.classList.contains('error')
+        ? 'error'
+        : statusEl && statusEl.classList.contains('warn')
+          ? 'warn'
+          : 'connecting';
     return {
-      mode,
+      connection,
+      interactive: Boolean(slot.interactive),
       authority: slot.authorityState || 'unknown',
       streaming: Boolean(slot.streaming),
       recording: Boolean(slot.recording),
@@ -64605,9 +65016,9 @@ function applyDisplayStripState() {
     const prev = slotSnapshots.get(id);
     if (!prev) {
       addDisplayActivity(id, 'neutral', 'Display became available');
-      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
-      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
-      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      if (next.connection === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.connection === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      if (next.interactive) addDisplayActivity(id, 'control', 'Interactive input is active');
       if (next.visibility === 'private') addDisplayActivity(id, 'private', 'Private dashboard view started');
       if (next.visibility === 'agent') addDisplayActivity(id, 'share', 'Display shared with the agent');
       if (next.authority === 'you') addDisplayActivity(id, 'control', 'This dashboard holds input authority');
@@ -64617,12 +65028,15 @@ function applyDisplayStripState() {
       return;
     }
 
-    if (prev.mode !== next.mode) {
-      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
-      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
-      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
-      else if (next.mode === 'warn') addDisplayActivity(id, 'attention', 'The stream is reconnecting');
+    if (prev.connection !== next.connection) {
+      if (next.connection === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.connection === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      else if (next.connection === 'warn') addDisplayActivity(id, 'attention', 'The stream is reconnecting');
       else addDisplayActivity(id, 'neutral', 'Connecting to the display');
+    }
+    if (prev.interactive !== next.interactive) {
+      addDisplayActivity(id, next.interactive ? 'control' : 'neutral',
+        next.interactive ? 'Interactive input is active' : 'Interactive input ended');
     }
     if (prev.authority !== next.authority) {
       if (next.authority === 'you') addDisplayActivity(id, 'control', 'You took input control');
@@ -64666,16 +65080,32 @@ function applyDisplayStripState() {
       entries.map(entry => String(entry.seq)).join(',');
     if (signature === lastActivitySignature) return;
     lastActivitySignature = signature;
-    activityList.replaceChildren();
+    if (activityRenderedDisplayId !== selectedDisplayId) {
+      activityRenderedDisplayId = selectedDisplayId;
+      activityRows.clear();
+      activityList.replaceChildren();
+    }
     if (!entries.length) {
-      activityList.appendChild(emptyHint(
-        selectedDisplayId === null
-          ? 'Select a display to see its connection, authority, sharing, and recording events.'
-          : 'Display events will appear here as its real state changes.'));
+      if (!activityList.querySelector('.ui2-live-rail-empty')) {
+        activityList.appendChild(emptyHint(
+          selectedDisplayId === null
+            ? 'Select a display to see its connection, authority, sharing, and recording events.'
+            : 'Display events will appear here as its real state changes.'));
+      }
       return;
     }
-
-    for (const entry of entries.slice().reverse()) {
+    activityList.querySelector('.ui2-live-rail-empty')?.remove();
+    const liveSeqs = new Set(entries.map(entry => entry.seq));
+    for (const [seq, row] of activityRows) {
+      if (liveSeqs.has(seq)) continue;
+      row.remove();
+      activityRows.delete(seq);
+    }
+    // role=log expects chronological DOM order so only the newly appended
+    // row is announced. Rebuilding newest-first made every state change
+    // sound like ten new events to screen readers.
+    for (const entry of entries) {
+      if (activityRows.has(entry.seq)) continue;
       const row = document.createElement('div');
       row.className = 'ui2-live-activity-row kind-' + entry.kind;
       const dot = document.createElement('span');
@@ -64692,6 +65122,7 @@ function applyDisplayStripState() {
       row.appendChild(textEl);
       row.appendChild(time);
       activityList.appendChild(row);
+      activityRows.set(entry.seq, row);
     }
   }
 
@@ -64817,7 +65248,8 @@ function applyDisplayStripState() {
       if (!chip || chip.disabled) return;
       const hostId = chip.dataset.hostId || '';
       const displayId = Number(chip.dataset.displayId || 0);
-      if (typeof routeTo === 'function') routeTo('station');
+      if (typeof routeTo === 'function' && routeTo('station') === false) return;
+      if (drawerMedia.matches) setRailOpen(false, false);
       if (hostId && typeof stationOpenDisplay === 'function') {
         stationOpenDisplay(hostId, displayId);
       } else {
@@ -64879,7 +65311,17 @@ function applyDisplayStripState() {
       return;
     }
     const state = slot.authorityState || 'unknown';
-    mobileSummary.textContent = slotLabel(slot) + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
+    const slots = Array.from(displaySlots.values());
+    const streamingCount = slots.filter(item => item.streaming).length;
+    const recordingCount = slots.filter(item => item.recording).length;
+    const parts = [
+      slotLabel(slot),
+      'input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown),
+      streamingCount ? streamingCount + ' presence stream' + (streamingCount === 1 ? '' : 's') : '',
+      recordingCount ? recordingCount + ' recording' + (recordingCount === 1 ? '' : 's') : '',
+    ].filter(Boolean);
+    mobileSummary.textContent = parts.join(' · ');
+    mobileSummary.title = parts.join(', ');
   }
 
   function drawerFocusable() {
@@ -64888,20 +65330,34 @@ function applyDisplayStripState() {
     )).filter(element => element.getClientRects().length > 0);
   }
 
-  function syncDrawerState(restoreFocus) {
+  function syncDrawerState(restoreFocus, force) {
+    if (!force && document.body.classList.contains('display-fullscreen-open')) return;
     const drawer = drawerMedia.matches;
     const visible = !drawer || railOpen;
     tab.classList.toggle('ui2-live-rail-open', drawer && railOpen);
     rail.inert = !visible;
     if (visible) rail.removeAttribute('aria-hidden');
     else rail.setAttribute('aria-hidden', 'true');
+    if (drawer) {
+      rail.setAttribute('role', 'dialog');
+      rail.setAttribute('aria-modal', railOpen ? 'true' : 'false');
+    } else {
+      rail.removeAttribute('role');
+      rail.removeAttribute('aria-modal');
+    }
+    if (main) {
+      main.inert = drawer && railOpen;
+      if (drawer && railOpen) main.setAttribute('aria-hidden', 'true');
+      else main.removeAttribute('aria-hidden');
+    }
     if (railToggle) railToggle.setAttribute('aria-expanded', drawer && railOpen ? 'true' : 'false');
     if (railScrim) {
-      railScrim.tabIndex = drawer && railOpen ? 0 : -1;
+      railScrim.tabIndex = -1;
       railScrim.setAttribute('aria-hidden', drawer && railOpen ? 'false' : 'true');
     }
     if (restoreFocus && railToggle && drawer) railToggle.focus();
   }
+  window.syncLiveDisplayDrawerState = () => syncDrawerState(false, true);
 
   function setRailOpen(open, restoreFocus) {
     railOpen = drawerMedia.matches && Boolean(open);
@@ -64933,13 +65389,22 @@ function applyDisplayStripState() {
   });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && drawerMedia.matches && railOpen) {
+      // The portalled display picker is above the drawer and owns the
+      // first Escape. Its later fragment closes it and restores focus;
+      // leave the underlying controls drawer in place.
+      if (document.getElementById('display-picker')?.classList.contains('visible')) return;
       event.preventDefault();
       setRailOpen(false, true);
     }
   });
   const onDrawerMediaChange = () => {
+    const focusWasInRail = rail.contains(document.activeElement);
+    if (typeof hideDisplayPicker === 'function' && displayPickerVisible) {
+      hideDisplayPicker(false);
+    }
     railOpen = false;
     syncDrawerState(false);
+    if (drawerMedia.matches && focusWasInRail && railToggle) railToggle.focus();
   };
   if (typeof drawerMedia.addEventListener === 'function') {
     drawerMedia.addEventListener('change', onDrawerMediaChange);
@@ -65923,9 +66388,7 @@ function deleteRecordingStream(streamName) {
     if (slot.recordingStreamName === streamName) {
       slot.recordingStreamName = null;
       slot.recording = false;
-      slot.recordBtn.innerHTML = '&#x23FA; Record';
-      slot.recordBtn.classList.remove('active');
-      slot.deleteRecBtn.style.display = 'none';
+      slot._renderRecordingControls();
     }
   }
 
@@ -66088,7 +66551,6 @@ async function reconcileRecordingStreams() {
     }
   } catch { /* no recordings available */ }
 }
-
 /* ── static/app/47-annotation-clips.js ── */
 // ── Annotation Drawing ──
 /** Draw an array of annotation shapes onto a canvas context.
@@ -68850,6 +69312,14 @@ function tabDomMatches(tab) {
 // is used (or preserved if it's already the active one).
 function routeTo(tab, subtab) {
   if (tab === 'access' && subtab) subtab = normalizeAccessSubtab(subtab);
+  // A live annotation/callout is editable state, not navigation chrome.
+  // Refuse the route before changing the URL so a tab click cannot silently
+  // discard it or leave the hash claiming a pane we did not open.
+  if (activeTab === 'displays' && tab !== 'displays' &&
+      typeof window.canDeactivateLiveDisplayWorkspace === 'function' &&
+      !window.canDeactivateLiveDisplayWorkspace()) {
+    return false;
+  }
   const target = subtab ? `${tab}/${subtab}` : tab;
   if (DASHBOARD_ACCESS_PAGE_MODE && tab !== 'access') {
     window.location.href = daemonDashboardHref(`#${target}`);
@@ -68880,6 +69350,7 @@ function routeTo(tab, subtab) {
   if (tab === 'stats' && !switched) {
     renderStatsForActiveHost({ forceSessions: true });
   }
+  return true;
 }
 
 // Apply the URL's current hash to the actual DOM. Called on initial
@@ -68897,7 +69368,13 @@ function applyCurrentRoute() {
   const switched = tab !== activeTab;
   const needsDomApply = !tabDomMatches(tab);
   if (switched || needsDomApply) {
-    switchTab(tab);
+    if (switchTab(tab) === false) {
+      // Back/forward or a manually edited hash can bypass routeTo's
+      // preflight. Keep the editable Live surface active and restore the
+      // URL without creating another history entry.
+      history.replaceState(null, '', '#displays');
+      return;
+    }
   }
   if (tab === 'activity' && subtab) {
     switchActivitySubtab(subtab);
@@ -68921,6 +69398,16 @@ window.addEventListener('popstate', applyCurrentRoute);
 window.addEventListener('hashchange', applyCurrentRoute);
 
 function switchTab(tabId) {
+  // Interactive display input includes a document-level paste handler.
+  // Never leave it bound to a stage that is about to become hidden on
+  // Station, Sessions, Settings, etc. Activity already moves the canvas
+  // into a thumbnail and historically released there; this single entry
+  // point makes every navigation path follow the same held-key-flush →
+  // authority-release ordering.
+  if (activeTab === 'displays' && tabId !== 'displays' &&
+      typeof window.deactivateLiveDisplayWorkspace === 'function') {
+    if (window.deactivateLiveDisplayWorkspace() === false) return false;
+  }
   activeTab = tabId;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
@@ -68986,6 +69473,7 @@ function switchTab(tabId) {
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
   flushPaneRenders(tabId);
+  return true;
 }
 
 // ── Settings sub-tabs ──
@@ -69160,6 +69648,7 @@ function switchActivitySubtab(name) {
   if (name === 'control') {
     refreshControlPane();
   }
+  return true;
 }
 
 let activeSessionsSubtab = 'recent';
@@ -69338,7 +69827,6 @@ if (document.readyState === 'loading') {
 } else {
   applyInitialRouteFromHash();
 }
-
 /* ── static/app/48b-context-viz.js ── */
 // ── Context visualizer (Activity → Context pane) ──
 // Snapshot store/replay, payload analysis, and the Three.js scene for
@@ -97486,21 +97974,72 @@ function updateDisplayMetrics(d) {
 // render against them at load time.)
 let displayPickerVisible = false;
 let displayPickerReturnFocus = null;
+let displayPickerPositionRaf = 0;
+let displayPickerDrawerModal = false;
 // Which action the open picker performs: 'share' (agent access) or
 // 'view' (private remote view; the agent cannot see the display).
 let displayPickerMode = 'share';
 var cachedDisplays = null;
 
-function hideDisplayPicker() {
+function hideDisplayPicker(restoreFocus = true) {
   const picker = document.getElementById('display-picker');
   picker.classList.remove('visible');
   picker.setAttribute('aria-hidden', 'true');
   displayPickerVisible = false;
+  if (displayPickerDrawerModal) {
+    const rail = document.getElementById('ui2-live-rail');
+    const railOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    if (rail) {
+      rail.inert = !railOpen;
+      if (railOpen) rail.removeAttribute('aria-hidden');
+      else rail.setAttribute('aria-hidden', 'true');
+      rail.setAttribute('aria-modal', railOpen ? 'true' : 'false');
+    }
+    displayPickerDrawerModal = false;
+  }
   const returnFocus = displayPickerReturnFocus;
   displayPickerReturnFocus = null;
-  if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+  if (restoreFocus && returnFocus && returnFocus.isConnected &&
+      typeof returnFocus.focus === 'function' && !returnFocus.closest('[inert]')) {
     returnFocus.focus();
   }
+}
+
+function positionDisplayPicker() {
+  const picker = document.getElementById('display-picker');
+  if (!displayPickerVisible || picker.parentElement !== document.body) return;
+  const anchor = document.getElementById('ui2-live-yourscreen');
+  const rect = anchor ? anchor.getBoundingClientRect() : null;
+  const margin = 12;
+  const gap = 8;
+  const width = picker.offsetWidth;
+  const height = picker.offsetHeight;
+  picker.style.position = 'fixed';
+  picker.style.zIndex = '95';
+  picker.style.right = 'auto';
+  picker.style.transform = 'none';
+  if (rect && rect.width) {
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const left = Math.min(Math.max(margin, rect.left), maxLeft);
+    let top = rect.bottom + gap;
+    if (top + height > window.innerHeight - margin && rect.top - height - gap >= margin) {
+      top = rect.top - height - gap;
+    }
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    picker.style.left = `${Math.round(left)}px`;
+    picker.style.top = `${Math.round(Math.min(Math.max(margin, top), maxTop))}px`;
+  } else {
+    picker.style.left = `${Math.round(Math.max(margin, (window.innerWidth - width) / 2))}px`;
+    picker.style.top = `${Math.round(Math.min(96, Math.max(margin, window.innerHeight - height - margin)))}px`;
+  }
+}
+
+function scheduleDisplayPickerPosition() {
+  if (!displayPickerVisible || displayPickerPositionRaf) return;
+  displayPickerPositionRaf = requestAnimationFrame(() => {
+    displayPickerPositionRaf = 0;
+    positionDisplayPicker();
+  });
 }
 
 function showDisplayPicker(displays, mode) {
@@ -97534,7 +98073,7 @@ function showDisplayPicker(displays, mode) {
     }
     item.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       if (!app) return;
       grantUserDisplayTarget(d, displayPickerMode !== 'view');
     });
@@ -97550,7 +98089,7 @@ function showDisplayPicker(displays, mode) {
     createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
     createItem.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       createVirtualDisplay();
     });
     picker.appendChild(createItem);
@@ -97564,25 +98103,22 @@ function showDisplayPicker(displays, mode) {
     document.body.appendChild(picker);
   }
   if (picker.parentElement === document.body) {
-    const anchor = document.getElementById('ui2-live-yourscreen');
-    const rect = anchor ? anchor.getBoundingClientRect() : null;
-    picker.style.position = 'fixed';
-    picker.style.zIndex = '95';
-    if (rect && rect.width) {
-      picker.style.left = `${Math.round(rect.left)}px`;
-      picker.style.top = `${Math.round(rect.bottom + 8)}px`;
-      picker.style.right = 'auto';
-      picker.style.transform = 'none';
-    } else {
-      picker.style.left = '50%';
-      picker.style.top = '96px';
-      picker.style.right = 'auto';
-      picker.style.transform = 'translateX(-50%)';
+    const drawerOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    picker.setAttribute('aria-modal', drawerOpen ? 'true' : 'false');
+    displayPickerDrawerModal = Boolean(drawerOpen);
+    if (displayPickerDrawerModal) {
+      const rail = document.getElementById('ui2-live-rail');
+      if (rail) {
+        rail.inert = true;
+        rail.setAttribute('aria-hidden', 'true');
+        rail.setAttribute('aria-modal', 'false');
+      }
     }
   }
   picker.classList.add('visible');
   picker.setAttribute('aria-hidden', 'false');
   displayPickerVisible = true;
+  positionDisplayPicker();
   requestAnimationFrame(() => picker.querySelector('.display-picker-item')?.focus());
 }
 
@@ -97758,11 +98294,35 @@ function setUserDisplayState(granted, agentVisible = true) {
 document.addEventListener('click', (e) => {
   if (!displayPickerVisible) return;
   const picker = document.getElementById('display-picker');
-  if (!picker.contains(e.target)) hideDisplayPicker();
+  if (!picker.contains(e.target)) hideDisplayPicker(false);
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
-});
+  if (!displayPickerVisible) return;
+  const picker = document.getElementById('display-picker');
+  if (e.key === 'Escape') {
+    // Capture owns the first Escape so annotation/callout/drawer layers
+    // underneath cannot consume the same keystroke.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    hideDisplayPicker(true);
+    return;
+  }
+  if (e.key !== 'Tab' || picker.getAttribute('aria-modal') !== 'true') return;
+  const focusable = Array.from(picker.querySelectorAll('button:not([disabled])'))
+    .filter(element => element.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    first.focus();
+  }
+}, true);
+window.addEventListener('resize', scheduleDisplayPickerPosition);
+document.addEventListener('scroll', scheduleDisplayPickerPosition, true);
 
 // Rollback modal: Escape closes, click on the backdrop (outside the
 // dialog) also closes — follows the same dismissal pattern as the

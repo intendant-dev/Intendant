@@ -691,6 +691,117 @@ mod tests {
     }
 
     #[test]
+    fn live_workspace_input_is_released_before_its_surface_is_hidden() {
+        fn section(start: &str, end: &str) -> &'static str {
+            APP_HTML
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("missing app.html section {start:?} .. {end:?}"))
+        }
+
+        fn assert_before(body: &str, first: &str, second: &str) {
+            let first_at = body
+                .find(first)
+                .unwrap_or_else(|| panic!("missing {first:?} in app.html section"));
+            let second_at = body
+                .find(second)
+                .unwrap_or_else(|| panic!("missing {second:?} in app.html section"));
+            assert!(
+                first_at < second_at,
+                "{first:?} must precede {second:?} in app.html section"
+            );
+        }
+
+        // Closing a display must flush held-key keyups while the input gate is
+        // still open, then release server-side authority.
+        let disconnect = section(
+            "  disconnect({ userInitiated = false } = {}) {",
+            "\n}\n\nfunction removeDisplaySlot",
+        );
+        assert_before(
+            disconnect,
+            "this._exitInteractive(userInitiated);",
+            "this._releaseAuthority();",
+        );
+
+        // Both ways a live projection can be hidden must release active input,
+        // cancel an in-flight Take, and relinquish authority already granted.
+        for body in [
+            section(
+                "  function teardownSelectedSurface(slot) {",
+                "\n  function selectLiveDisplay(",
+            ),
+            section(
+                "  window.deactivateLiveDisplayWorkspace = function() {",
+                "\n  function reconcileSelectedDisplay(",
+            ),
+        ] {
+            for required in [
+                "slot.interactive",
+                "slot._takeControlPending",
+                "slot.authorityState === 'you'",
+                "slot.releaseControl();",
+            ] {
+                assert!(
+                    body.contains(required),
+                    "live-surface teardown must contain {required:?}"
+                );
+            }
+        }
+
+        // Tab navigation must deactivate Live while it is still the active
+        // workspace, before the pane is hidden.
+        let switch_tab = section(
+            "function switchTab(tabId) {",
+            "\nfunction contextResolveVizTheme(",
+        );
+        assert_before(
+            switch_tab,
+            "window.deactivateLiveDisplayWorkspace()",
+            "activeTab = tabId;",
+        );
+
+        // A shared-view Take originating in Activity or Station must enter the
+        // Live workspace before selecting the target and requesting authority.
+        let shared_take = section(
+            "function takeSharedViewInput() {",
+            "\nfunction handleSharedViewEvent(",
+        );
+        assert_before(
+            shared_take,
+            "routeTo('displays')",
+            "window.selectLiveDisplay(",
+        );
+        assert_before(
+            shared_take,
+            "window.selectLiveDisplay(",
+            "slot.takeControl();",
+        );
+    }
+
+    #[test]
+    fn dashboard_validator_cachebuster_catalog_matches_the_daemon() {
+        const VALIDATOR: &str = include_str!("../../../../scripts/validate-dashboard.cjs");
+        let marker = "const APP_HTML_CACHEBUSTED_ASSET_PATHS = [";
+        let body = VALIDATOR
+            .split_once(marker)
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("validator cachebuster catalog");
+        let validator_paths = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| line.trim_end_matches(',').trim_matches('\'').to_string())
+            .collect::<Vec<_>>();
+        let daemon_paths = APP_HTML_VERSIONED_ASSETS
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(validator_paths, daemon_paths);
+    }
+
+    #[test]
     fn new_session_codex_model_override_is_wired() {
         assert!(APP_HTML.contains(r#"id="new-session-codex-model""#));
         assert!(APP_HTML.contains(r#"id="new-session-codex-model-select""#));

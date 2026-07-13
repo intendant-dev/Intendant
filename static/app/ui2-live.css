@@ -30,6 +30,30 @@
    Station peer chips, and the user-display grant without replacing focused
    controls on every metrics update. */
 
+/* Semantic ink is separate from tint RGB. The base design tokens work on
+   dark surfaces; light mode needs darker foregrounds to keep small status
+   text above WCAG AA against the same 10–14% semantic fills. */
+html.ui-v2 {
+  --cu-green-ink: var(--green);
+  --cu-amber-ink: var(--amber);
+  --cu-rose-ink: var(--rose);
+  --cu-sky-ink: var(--sky);
+  --cu-control-outline: #5c6474;
+  --cu-stage-text: #eaecf2;
+  --cu-stage-text-2: #a7aebe;
+  --cu-stage-rose: #ec6a85;
+  --cu-stage-green: #58c08c;
+  --cu-stage-amber: #e4a85b;
+  --cu-stage-line: rgba(230, 236, 247, .14);
+}
+html.ui-v2[data-theme="light"] {
+  --cu-green-ink: #0d633b;
+  --cu-amber-ink: #774000;
+  --cu-rose-ink: #a01f3b;
+  --cu-sky-ink: #15568c;
+  --cu-control-outline: #818899;
+}
+
 /* ── tab scaffold: stage/recording column + semantic right rail ── */
 html.ui-v2 #tab-displays.active {
   display: grid;
@@ -72,7 +96,7 @@ html.ui-v2 .display-approval-banner .icon {
 html.ui-v2 .display-approval-banner .title {
   font-size: 13px;
   font-weight: 800;
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   margin-bottom: 3px;
 }
 html.ui-v2 .display-approval-banner .subtitle { font-size: 12px; color: var(--text-2); }
@@ -88,7 +112,7 @@ html.ui-v2 .shared-view-banner {
   font-size: 12.5px;
 }
 html.ui-v2 .shared-view-kicker {
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .08em;
@@ -112,9 +136,9 @@ html.ui-v2 .shared-view-action:hover {
   filter: brightness(1.08);
 }
 html.ui-v2 .shared-view-close {
-  width: 26px;
-  min-height: 26px;
-  border: 1px solid var(--line);
+  width: 36px;
+  min-height: 36px;
+  border: 1px solid var(--cu-control-outline);
   border-radius: 8px;
   background: transparent;
   color: var(--text-2);
@@ -123,7 +147,7 @@ html.ui-v2 .shared-view-close {
 }
 html.ui-v2 .shared-view-close:hover {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   background: rgba(var(--rose-rgb), .08);
 }
 /* compact variant docks flush inside the activity strip */
@@ -203,10 +227,11 @@ html.ui-v2 .display-toolbar {
   border-bottom: 0;
   padding: 14px 16px 10px;
   gap: 14px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
 }
 html.ui-v2 .display-toolbar-meta {
+  flex: 1 1 260px;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -214,14 +239,15 @@ html.ui-v2 .display-toolbar-meta {
   gap: 7px 10px;
 }
 html.ui-v2 .display-toolbar-actions {
+  flex: 1 1 680px;
   min-width: 0;
   margin-left: auto;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 7px;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  scrollbar-width: thin;
+  overflow-x: visible;
 }
 /* Display selection lives in the real rail. The stage label is therefore
    an honest heading, not a non-interactive span styled as a dropdown. */
@@ -265,7 +291,7 @@ html.ui-v2 .display-status.error {
   border: 1px solid rgba(var(--rose-rgb), .26);
   border-radius: var(--r-pill);
   background: rgba(var(--rose-rgb), .10);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
   font-size: 11.5px;
 }
@@ -277,7 +303,7 @@ html.ui-v2 .display-status.warn {
   border: 1px solid rgba(var(--amber-rgb), .26);
   border-radius: var(--r-pill);
   background: rgba(var(--amber-rgb), .12);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
   font-size: 11.5px;
 }
@@ -306,12 +332,12 @@ html.ui-v2 .display-input-authority {
 html.ui-v2 .display-input-authority.you {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
-  color: var(--green);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .display-input-authority.other {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .26);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-input-authority.unclaimed {
   background: var(--surface-3);
@@ -331,12 +357,12 @@ html.ui-v2 .display-visibility {
   white-space: nowrap;
 }
 html.ui-v2 .display-visibility.private {
-  color: var(--green);
+  color: var(--cu-green-ink);
   border-color: rgba(var(--green-rgb), .26);
   background: rgba(var(--green-rgb), .1);
 }
 html.ui-v2 .display-visibility.agent {
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   border-color: rgba(var(--amber-rgb), .28);
   background: rgba(var(--amber-rgb), .11);
 }
@@ -346,7 +372,7 @@ html.ui-v2 .display-toolbar button {
   flex: 0 0 auto;
   min-height: 0;
   padding: 6px 11px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
@@ -356,17 +382,18 @@ html.ui-v2 .display-toolbar button {
   transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
 }
 html.ui-v2 .display-toolbar-actions .take-control-btn { margin-left: 0; }
+html.ui-v2 .display-toolbar-actions .display-fullscreen-btn { margin-left: 6px; }
 html.ui-v2 .display-toolbar button:hover {
   background: var(--surface-2);
-  border-color: var(--line-2);
+  border-color: var(--text-2);
   color: var(--text);
 }
 /* streaming to the presence model = sky (live/info) while active */
-html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--sky); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
+html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--cu-sky-ink); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
 html.ui-v2 .display-toolbar .stream-btn.active {
   background: rgba(var(--sky-rgb), .14);
   border-color: rgba(var(--sky-rgb), .32);
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .annotate-btn:hover,
@@ -380,13 +407,13 @@ html.ui-v2 .display-toolbar .annotate-btn.active {
    dot would double it.) */
 html.ui-v2 .display-toolbar .record-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .record-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .record-btn.active {
   background: var(--rose);
@@ -402,7 +429,7 @@ html.ui-v2 .display-toolbar .display-close-btn {
 html.ui-v2 .display-toolbar .display-close-btn:hover {
   background: rgba(var(--rose-rgb), .08);
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 /* Take control — the design's iris primary. The verb is honest: it takes
    (displacing any other viewer), it does not request. */
@@ -426,27 +453,27 @@ html.ui-v2 .display-toolbar .take-control-btn:hover {
 html.ui-v2 .display-toolbar .release-control-btn {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .32);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .release-control-btn:hover {
   background: rgba(var(--amber-rgb), .2);
   border-color: rgba(var(--amber-rgb), .45);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-toolbar .delete-recording-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-size: 11.5px;
 }
 html.ui-v2 .display-toolbar .delete-recording-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .release-note {
   flex: 0 0 150px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-control-outline);
   border-radius: 9px;
   background: var(--surface-2);
   color: var(--text);
@@ -473,7 +500,7 @@ html.ui-v2 .display-canvas {
   overflow: hidden;
   background: radial-gradient(120% 120% at 30% 0%, #10131b, #070810 70%);
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(0, 0, 0, .5);
 }
@@ -503,7 +530,7 @@ html.ui-v2 .display-control-banner {
   box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--green);
+  color: var(--cu-stage-green);
   font-size: 11px;
   font-weight: 700;
   line-height: 1.25;
@@ -521,7 +548,7 @@ html.ui-v2 .display-control-banner::before {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--green);
+  background: var(--cu-stage-green);
   transform: translateY(-50%);
   box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
 }
@@ -537,10 +564,10 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::after {
   padding: 5px 11px 5px 24px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--rose);
+  color: var(--cu-stage-rose);
   font-family: var(--sans);
   font-size: 11px;
   font-weight: 700;
@@ -557,7 +584,7 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::before 
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--rose);
+  background: var(--cu-stage-rose);
   animation: ui2-pulse 1.4s infinite;
   pointer-events: none;
 }
@@ -587,7 +614,7 @@ html.ui-v2 .stage-overlay-inner {
   text-align: center;
   border-radius: 12px;
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
 }
@@ -596,15 +623,15 @@ html.ui-v2 .stage-overlay-text {
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.5;
-  color: var(--text-2);
+  color: var(--cu-stage-text-2);
 }
-html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--rose); }
+html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--cu-stage-rose); }
 html.ui-v2 .stage-overlay-spinner {
   width: 16px;
   height: 16px;
   flex: 0 0 auto;
   border-radius: 50%;
-  border: 2px solid var(--line-2);
+  border: 2px solid var(--cu-stage-line);
   border-top-color: var(--iris);
   animation: ui2-stage-spin .8s linear infinite;
 }
@@ -640,10 +667,10 @@ html.ui-v2 .display-live-metrics {
   padding: 5px 11px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--text-2);
+  color: var(--cu-stage-text-2);
   font-family: var(--mono);
   font-size: 10.5px;
   font-weight: 600;
@@ -658,7 +685,7 @@ html.ui-v2 .display-live-metrics::before {
   height: 7px;
   flex: 0 0 auto;
   border-radius: 50%;
-  background: var(--rose);
+  background: var(--cu-stage-rose);
   animation: ui2-pulse 1.4s infinite;
 }
 html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::after,
@@ -685,7 +712,7 @@ html.ui-v2 .display-slot.shared-view-active .display-canvas {
 }
 html.ui-v2 .shared-view-focus-box {
   border-radius: 6px;
-  border-color: var(--amber);
+  border-color: var(--cu-stage-amber);
   background: rgba(var(--amber-rgb), .06);
   box-shadow:
     0 0 0 1px rgba(7, 8, 16, .72),
@@ -694,14 +721,15 @@ html.ui-v2 .shared-view-focus-box {
 html.ui-v2 .shared-view-focus-box::after {
   border-radius: 8px;
   background: rgba(11, 13, 18, .92);
-  border-color: rgba(var(--amber-rgb), .5);
+  border-color: rgba(228, 168, 91, .5);
+  color: var(--cu-stage-text);
   font-family: var(--sans);
 }
 /* light theme: the stage stays a dark viewport, but its .5-black drop
    shadow is dark-tuned — soften toward the light elevation vocabulary. */
 html.ui-v2[data-theme="light"] .display-canvas {
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(23, 28, 50, .22);
 }
@@ -733,6 +761,21 @@ html.ui-v2 .display-slot.display-fullscreen .display-canvas {
   box-shadow: none;
 }
 html.ui-v2 .display-slot.display-fullscreen .display-toolbar { padding: 10px 14px; }
+/* Interaction focus outranks the shared-view/fullscreen state rings above. */
+html.ui-v2 .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2 .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2[data-theme="light"] .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
 
 /* ── collapse bar + split handles ── */
 html.ui-v2 .displays-collapse-bar {
@@ -1183,6 +1226,7 @@ html.ui-v2 .display-picker-item {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
+  min-height: 44px;
   padding: 8px 11px;
 }
 html.ui-v2 .display-picker-item:hover { background: rgba(var(--iris-rgb), .1); }
@@ -1284,13 +1328,13 @@ html.ui-v2 .display-toolbar .callout-btn:hover,
 html.ui-v2 .peer-display-controls .callout-btn:hover {
   background: rgba(var(--amber-rgb), .10);
   border-color: rgba(var(--amber-rgb), .45);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-toolbar .callout-btn[aria-pressed="true"],
 html.ui-v2 .peer-display-controls .callout-btn[aria-pressed="true"] {
   background: rgba(var(--amber-rgb), .16);
   border-color: rgba(var(--amber-rgb), .5);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
   box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .12);
 }
@@ -1323,7 +1367,7 @@ html.ui-v2 .callout-arm-overlay {
 }
 html.ui-v2 .callout-arm-rect {
   position: absolute;
-  border: 2px solid var(--amber);
+  border: 2px solid var(--cu-stage-amber);
   background: rgba(var(--amber-rgb), .12);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
   pointer-events: none;
@@ -1337,8 +1381,8 @@ html.ui-v2 .callout-arm-hint {
   padding: 4px 10px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
-  color: var(--amber);
+  border: 1px solid var(--cu-stage-line);
+  color: var(--cu-stage-amber);
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
@@ -1432,7 +1476,7 @@ html.ui-v2 .ui2-live-row {
   width: 100%;
   min-height: 50px;
   padding: 10px 11px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   border-radius: 11px;
   background: var(--surface);
   color: var(--text);
@@ -1513,7 +1557,9 @@ html.ui-v2 .ui2-live-row-tag {
   font-weight: 800;
   letter-spacing: .05em;
 }
-html.ui-v2 .ui2-live-row-privacy { color: var(--green); }
+html.ui-v2 .ui2-live-row-privacy { color: var(--cu-green-ink); }
+html.ui-v2 .ui2-live-row-media.streaming { color: var(--cu-sky-ink); }
+html.ui-v2 .ui2-live-row-media.recording { color: var(--cu-rose-ink); }
 html.ui-v2 .ui2-live-row-chev {
   flex: 0 0 auto;
   color: var(--text-3);
@@ -1597,19 +1643,19 @@ html.ui-v2 .ui2-live-state-pill {
 html.ui-v2 .ui2-live-state-pill.you {
   border-color: rgba(var(--green-rgb), .26);
   background: rgba(var(--green-rgb), .12);
-  color: var(--green);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .ui2-live-state-pill.other {
   border-color: rgba(var(--amber-rgb), .26);
   background: rgba(var(--amber-rgb), .14);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .ui2-live-card-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
-  min-height: 38px;
+  min-height: 44px;
   margin-top: 9px;
   padding: 9px;
   border: 0;
@@ -1623,6 +1669,7 @@ html.ui-v2 .ui2-live-card-btn {
   transition: filter var(--t-med), background var(--t-fast), border-color var(--t-fast);
 }
 html.ui-v2 .ui2-live-card-btn:hover { filter: brightness(1.08); }
+html.ui-v2 .ui2-live-card-btn[hidden] { display: none; }
 html.ui-v2 .ui2-live-card-btn:disabled {
   opacity: .55;
   cursor: wait;
@@ -1632,10 +1679,10 @@ html.ui-v2 .ui2-live-card-btn.release {
   border: 1px solid rgba(var(--amber-rgb), .32);
   background: rgba(var(--amber-rgb), .14);
   box-shadow: none;
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .ui2-live-card-btn.secondary {
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   background: var(--surface-2);
   box-shadow: none;
   color: var(--text);
@@ -1650,7 +1697,7 @@ html.ui-v2 .ui2-live-card-btn.danger {
   border: 1px solid rgba(var(--rose-rgb), .4);
   background: transparent;
   box-shadow: none;
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
 }
 html.ui-v2 .ui2-live-card-btn.danger:hover {
@@ -1675,6 +1722,9 @@ html.ui-v2 .ui2-live-activity {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  max-height: 190px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 html.ui-v2 .ui2-live-activity-row {
   display: grid;
@@ -1750,9 +1800,9 @@ html.ui-v2 .ui2-live-activity-time {
   }
   html.ui-v2 .ui2-live-rail-toggle {
     flex: 0 0 auto;
-    min-height: 36px;
+    min-height: 44px;
     padding: 7px 12px;
-    border: 1px solid var(--line-2);
+    border: 1px solid var(--cu-control-outline);
     border-radius: var(--r-ctl);
     background: var(--surface);
     color: var(--text);
@@ -1779,9 +1829,9 @@ html.ui-v2 .ui2-live-activity-time {
   html.ui-v2 .ui2-live-rail-close {
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 34px;
-    border: 1px solid var(--line);
+    width: 44px;
+    height: 44px;
+    border: 1px solid var(--cu-control-outline);
     border-radius: var(--r-ctl);
     background: var(--surface);
     color: var(--text-2);
@@ -1823,22 +1873,24 @@ html.ui-v2 .ui2-live-activity-time {
     min-height: 30px;
   }
   html.ui-v2 .display-toolbar-actions {
+    flex: 0 0 auto;
     width: 100%;
     margin-left: 0;
     padding: 1px 0 4px;
   }
-  html.ui-v2 .display-toolbar-actions .take-control-btn,
-  html.ui-v2 .display-toolbar-actions .release-control-btn {
-    order: -2;
-  }
   html.ui-v2 .display-toolbar button {
-    min-height: 36px;
+    min-height: 44px;
     padding: 7px 11px;
   }
   html.ui-v2 .display-toolbar .release-note {
     flex-basis: 145px;
-    min-height: 36px;
+    min-height: 44px;
   }
+  html.ui-v2 .display-toolbar .display-fullscreen-btn,
+  html.ui-v2 .display-toolbar .display-close-btn { width: 44px; }
+  html.ui-v2 .shared-view-action,
+  html.ui-v2 .shared-view-close { min-height: 44px; }
+  html.ui-v2 .shared-view-close { width: 44px; }
   html.ui-v2 .display-canvas { margin: 0 10px 10px; }
   html.ui-v2 .display-control-banner {
     top: auto;

@@ -336,17 +336,37 @@ An embedded xterm.js terminal hosting an interactive **Shell** session on the
 daemon (or a selected peer). Session monitoring and control live in the
 Activity/Station tabs, not here.
 
-### Video
+### Live display
 
-WebRTC display viewers for the agent's graphical displays, with interactive
-control (see [Display Pipeline](./display-pipeline.md)):
+The Computer Use workspace combines a selected WebRTC stage with a live rail
+for displays, input authority, browser-observed display activity, peer
+launchers, and the user's own screen (see
+[Display Pipeline](./display-pipeline.md)):
 
 - **View mode** (default) — watch the agent's display in real time
 - **Take Control** — forward mouse and keyboard events to the agent's display
 - **Release** — relinquish control, with an optional note
-- **Display picker** — choose which monitor to view when several are present
+- **Selected display stage** — switch among active local displays without
+  recreating their capture sessions or video elements. A shared-view request
+  selects its target once unless that would interrupt active human input,
+  annotation, callout, or full-screen work; later manual selection is
+  respected.
+- **Input authority** — the toolbar and rail project the same server truth:
+  you, another viewer, available, or connecting. Hiding an interactive or
+  pending display releases it before input listeners are removed. Editable
+  annotation/callout work blocks navigation instead of being discarded.
+- **Display activity** — reports real connection, authority, visibility,
+  streaming, recording, annotation, callout, and shared-view transitions. It
+  does not invent agent click/type history that the display protocol does not
+  publish.
+- **Peer displays** — open on Station, whose viewer understands federated
+  display targets, rather than masquerading as local stages.
+- **Responsive controls** — below the desktop breakpoint the rail becomes a
+  keyboard-accessible **Displays & input** drawer; primary controls remain in
+  the stage toolbar.
 - **Recording replay** — browse and play back recorded sessions with timeline
-  seeking and speed control (1x / 2x / 4x)
+  seeking and speed control (1x / 2x / 4x). Live recording controls show a
+  pending command but change REC/activity state only on daemon confirmation.
 
 The live rail's **Your screen** card keeps the three screen-on-the-wire
 concepts separate (see

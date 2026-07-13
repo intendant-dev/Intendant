@@ -207,6 +207,44 @@ user-session target only for a granted or owner caller instead of flipping
 the grant themselves. Sharing an agent-owned virtual display never touches
 the user-display grant.
 
+### Dashboard Live workspace
+
+The dashboard's **Live** tab presents local Computer Use as one selected
+display stage. Every active `DisplaySlot` and its WebRTC connection remain
+alive, but only the selected slot is visible; the rail switches that
+projection without recreating the capture or video element. Agent-requested
+shared views select their target when the current stage has no active human
+work. They remain advisory when the user is controlling, awaiting input,
+annotating, calling out, or viewing full-screen; the banner and rail keep the
+requested target discoverable without discarding that work. Peer-display
+launchers are different: they route to the peer-aware **Station** surface
+before opening the stream rather than pretending a federated pane is local.
+
+Input authority in the stage and rail is always the browser-relative server
+state: **you**, **another viewer**, **available** (unclaimed), or connecting.
+Take is last-take-wins; no holder identity or approval ceremony is inferred.
+Only one hidden-input hazard is handled locally: selecting another display or
+leaving Live releases an actively bound slot after flushing held keys, then
+removes its keyboard, pointer, and document-level paste listeners. Annotation
+and armed-callout state is editable work, so display and tab navigation is
+blocked with a visible explanation until the user finishes or closes it.
+Pending Take requests and already-held-but-locally-unbound authority are also
+cancelled before a surface can be hidden. Activity's shared-view **Take input**
+returns to the full Live stage before requesting authority; thumbnails remain
+view-only.
+
+The rail's per-display activity is deliberately a browser-observed lifecycle
+feed (stream connection, authority, private/share mode, presence streaming,
+recording, annotation, and shared-view focus). It is not an agent action trace:
+the current wire protocol has no display-keyed click/type event, and typed text
+must never be reconstructed from general logs. Recording transitions enter the
+feed only after the daemon confirms them; Start, Stop, and Delete remain pending
+and retain the last confirmed state on transport error or timeout. At narrow
+widths the same rail becomes a keyboard-accessible modal drawer; the stage
+toolbar remains the fallback for primary controls. In-page full screen similarly
+contains focus, hides its background from assistive technology, supports Escape,
+and restores the invoking control.
+
 ### CU-First Routing
 
 > **Status note (vaulted 2026-07-04):** the all-tasks CU-first interception —

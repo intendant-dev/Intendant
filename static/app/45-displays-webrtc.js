@@ -210,6 +210,11 @@ class DisplaySlot {
     this.connected = false;
     this.streaming = false;
     this.recordingStreamName = null;
+    this._recordingPendingAction = null;
+    this._recordingPendingTimer = null;
+    this._recordingDeletePending = false;
+    this._recordingDeleteStream = null;
+    this._recordingDeleteTimer = null;
     this._answerApplied = false;     // true after setRemoteDescription completes
     this._pendingCandidates = [];    // queued until answer is applied
     this._reconnectAttempts = 0;     // ICE failure reconnect counter
@@ -237,6 +242,8 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
+    this._fullscreenInertRecords = [];
+    this._fullscreenReturnFocus = null;
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
     const label = displayLabel(displayId);
@@ -246,20 +253,20 @@ class DisplaySlot {
           <span class="display-label"></span>
           <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
           <span class="display-status" id="ds-status-${displayId}" role="status" aria-live="polite" aria-atomic="true">Connecting...</span>
-          <span class="display-input-authority" id="ds-authority-${displayId}" role="status" aria-live="polite" aria-atomic="true" style="display:none" title="Input authority for this display: who can drive keyboard and pointer input."></span>
+          <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard and pointer input."></span>
         </div>
         <div class="display-toolbar-actions">
+          <button class="take-control-btn" id="ds-take-${displayId}" type="button" title="Take interactive control of this display (keyboard and mouse)">Take control</button>
+          <button class="release-control-btn" id="ds-release-${displayId}" type="button" style="display:none" title="Release control and return display to view-only mode">Release</button>
           <input class="release-note" id="ds-note-${displayId}" aria-label="Note to the agent when releasing this display" placeholder="Note (optional)" style="display:none">
           <button class="stream-btn" id="ds-stream-${displayId}" type="button" aria-pressed="false" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
           <button class="ann-attach-btn" id="ds-attach-${displayId}" type="button" title="Capture current frame and attach to next task">Attach</button>
           <button class="annotate-btn" id="ds-annotate-${displayId}" type="button" aria-pressed="false" title="Freeze current frame and annotate it">&#9998; Annotate</button>
           <button class="callout-btn" id="ds-callout-${displayId}" type="button" aria-pressed="false" disabled title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
           <button class="record-btn" id="ds-record-${displayId}" type="button" aria-pressed="false" title="Record this display (ffmpeg)">Record</button>
-          <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" type="button" aria-label="Open display full screen" title="Full screen">&#x26F6;</button>
-          <button class="display-close-btn" id="ds-close-${displayId}" type="button" aria-label="Close this display stream" title="Close this display stream">&times;</button>
-          <button class="take-control-btn" id="ds-take-${displayId}" type="button" title="Take interactive control of this display (keyboard and mouse)">Take control</button>
-          <button class="release-control-btn" id="ds-release-${displayId}" type="button" style="display:none" title="Release control and return display to view-only mode">Release</button>
           <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" type="button" style="display:none" title="Delete recording files for this display">Delete</button>
+          <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" type="button" aria-label="Open display full screen" aria-pressed="false" title="Full screen">&#x26F6;</button>
+          <button class="display-close-btn" id="ds-close-${displayId}" type="button" aria-label="Close this display stream" title="Close this display stream">&times;</button>
           <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0)"></span>
         </div>
       </div>
@@ -317,8 +324,6 @@ class DisplaySlot {
     this.canvasEl.appendChild(this.metricsEl);
     this.controlBannerEl = document.createElement('div');
     this.controlBannerEl.className = 'display-control-banner';
-    this.controlBannerEl.setAttribute('role', 'status');
-    this.controlBannerEl.setAttribute('aria-live', 'polite');
     this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
     this.canvasEl.appendChild(this.controlBannerEl);
     const rerenderSharedFocus = () => {
@@ -344,6 +349,7 @@ class DisplaySlot {
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
     this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
     this.calloutBtn.addEventListener('click', () => this.toggleCallout());
+    this.el.addEventListener('keydown', event => this._handleFullscreenKeydown(event));
   }
 
   // Same budget as PeerDisplayConnection.NO_TRACK_TIMEOUT_MS — both are
@@ -359,12 +365,13 @@ class DisplaySlot {
     if (want) {
       for (const slot of displaySlots.values()) {
         if (slot === this) continue;
-        slot.el.classList.remove('display-fullscreen');
-        if (slot.fullscreenBtn) {
-          slot.fullscreenBtn.innerHTML = '&#x26F6;';
-          slot.fullscreenBtn.title = 'Full screen';
-        }
+        if (slot.el.classList.contains('display-fullscreen')) slot.toggleFullscreen(false);
       }
+    }
+    if (want && !this.el.classList.contains('display-fullscreen')) {
+      this._enterFullscreenA11y();
+    } else if (!want && this.el.classList.contains('display-fullscreen')) {
+      this._exitFullscreenA11y();
     }
     this.el.classList.toggle('display-fullscreen', want);
     const anyFullscreen = want || Array.from(displaySlots.values()).some(slot =>
@@ -376,6 +383,78 @@ class DisplaySlot {
       this.fullscreenBtn.title = want ? 'Exit full screen' : 'Full screen';
       this.fullscreenBtn.setAttribute('aria-label', want ? 'Exit display full screen' : 'Open display full screen');
       this.fullscreenBtn.setAttribute('aria-pressed', want ? 'true' : 'false');
+    }
+    if (want && this.fullscreenBtn) this.fullscreenBtn.focus();
+  }
+
+  _enterFullscreenA11y() {
+    this._fullscreenReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    this._fullscreenInertRecords = [];
+    let branch = this.el;
+    while (branch && branch.parentElement) {
+      const parent = branch.parentElement;
+      for (const sibling of parent.children) {
+        if (sibling === branch || !(sibling instanceof HTMLElement)) continue;
+        this._fullscreenInertRecords.push({
+          element: sibling,
+          inert: sibling.inert,
+          ariaHidden: sibling.getAttribute('aria-hidden'),
+        });
+        sibling.inert = true;
+        sibling.setAttribute('aria-hidden', 'true');
+      }
+      branch = parent;
+      if (parent === document.body) break;
+    }
+    this.el.setAttribute('role', 'dialog');
+    this.el.setAttribute('aria-modal', 'true');
+  }
+
+  _exitFullscreenA11y() {
+    for (const record of this._fullscreenInertRecords) {
+      record.element.inert = record.inert;
+      if (record.ariaHidden === null) record.element.removeAttribute('aria-hidden');
+      else record.element.setAttribute('aria-hidden', record.ariaHidden);
+    }
+    this._fullscreenInertRecords = [];
+    this.el.removeAttribute('role');
+    this.el.removeAttribute('aria-modal');
+    // A responsive breakpoint may have changed while fullscreen owned the
+    // background. Re-project the drawer's current media-query state instead
+    // of leaving stale inert/aria-hidden snapshots on its rail or stage.
+    if (typeof window.syncLiveDisplayDrawerState === 'function') {
+      window.syncLiveDisplayDrawerState();
+    }
+    const returnFocus = this._fullscreenReturnFocus;
+    this._fullscreenReturnFocus = null;
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+      requestAnimationFrame(() => returnFocus.focus());
+    }
+  }
+
+  _handleFullscreenKeydown(event) {
+    if (!this.el.classList.contains('display-fullscreen')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      this.toggleFullscreen(false);
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(this.el.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), video[tabindex], [tabindex]:not([tabindex="-1"])'
+    )).filter(element => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -897,6 +976,13 @@ class DisplaySlot {
   // entry into interactive mode.
   _enterInteractive() {
     if (this.interactive) return;
+    // Activity thumbnails and hidden single-stage projections are
+    // deliberately view-only. A late authority reply must never bind
+    // keyboard/pointer/paste listeners after navigation hid its surface.
+    if (activeTab !== 'displays' || this.el.classList.contains('ui2-live-inactive')) {
+      this._releaseAuthority();
+      return;
+    }
     this.interactive = true;
     this.el.classList.add('is-interactive');
     this.noteInput.style.display = '';
@@ -1192,28 +1278,113 @@ class DisplaySlot {
     this.frameIdEl.textContent = '';
   }
   toggleRecording() {
-    if (!app) return;
+    if (!app || this._recordingPendingAction || this._recordingDeletePending) return;
     const baseStream = 'display_' + this.displayId;
     const stream = this.recordingStreamName || baseStream;
-    if (this.recording) {
-      dispatchDashboardActionMsg({ action: 'stop_recording', stream_name: stream });
-      this.recording = false;
-      this.recordBtn.innerHTML = '&#x23FA; Record';
-      this.recordBtn.classList.remove('active');
-      this.recordBtn.setAttribute('aria-pressed', 'false');
-      this.deleteRecBtn.style.display = '';
-    } else {
-      dispatchDashboardActionMsg({ action: 'start_recording', stream_name: baseStream });
-      this.recordingStreamName = baseStream;
-      this.recording = true;
-      this.recordBtn.innerHTML = '&#x23F9; Stop';
-      this.recordBtn.classList.add('active');
-      this.recordBtn.setAttribute('aria-pressed', 'true');
-      this.deleteRecBtn.style.display = 'none';
+    const action = this.recording ? 'stop_recording' : 'start_recording';
+    const targetStream = this.recording ? stream : baseStream;
+    this._setRecordingPending(action);
+    const fail = error => {
+      // A late RPC failure must not roll back or toast over a newer server
+      // event that already confirmed and cleared this exact command.
+      if (this._recordingPendingAction !== action) return;
+      this._failRecordingCommand(
+        error?.message || `Could not ${this.recording ? 'stop' : 'start'} recording`
+      );
+    };
+    const sent = dispatchDashboardActionMsg(
+      { action, stream_name: targetStream },
+      { onError: fail }
+    );
+    if (!sent) {
+      fail(new Error('Dashboard control connection is unavailable'));
+      return;
     }
+    this._recordingPendingTimer = window.setTimeout(() => {
+      this._recordingPendingTimer = null;
+      if (!this._recordingPendingAction) return;
+      this._failRecordingCommand('No recording confirmation arrived — check the display activity and retry.');
+    }, 10000);
+  }
+
+  _setRecordingPending(action) {
+    this._recordingPendingAction = action;
+    this._renderRecordingControls();
+  }
+
+  _clearRecordingPending(render = true) {
+    if (this._recordingPendingTimer) {
+      window.clearTimeout(this._recordingPendingTimer);
+      this._recordingPendingTimer = null;
+    }
+    this._recordingPendingAction = null;
+    if (render) this._renderRecordingControls();
+  }
+
+  _clearRecordingDeletePending(render = true) {
+    if (this._recordingDeleteTimer) {
+      window.clearTimeout(this._recordingDeleteTimer);
+      this._recordingDeleteTimer = null;
+    }
+    this._recordingDeletePending = false;
+    this._recordingDeleteStream = null;
+    if (render) this._renderRecordingControls();
+  }
+
+  _renderRecordingControls() {
+    const action = this._recordingPendingAction;
+    const deleting = this._recordingDeletePending;
+    this.recordBtn.disabled = Boolean(action || deleting);
+    this.recordBtn.setAttribute('aria-busy', action ? 'true' : 'false');
+    this.recordBtn.innerHTML = action
+      ? (action === 'stop_recording' ? 'Stopping…' : 'Starting…')
+      : (this.recording ? '&#x23F9; Stop' : '&#x23FA; Record');
+    this.recordBtn.classList.toggle('active', this.recording);
+    this.recordBtn.setAttribute('aria-pressed', this.recording ? 'true' : 'false');
+    this.deleteRecBtn.disabled = Boolean(deleting || action);
+    this.deleteRecBtn.setAttribute('aria-busy', deleting ? 'true' : 'false');
+    this.deleteRecBtn.textContent = deleting ? 'Deleting…' : 'Delete';
+    this.deleteRecBtn.style.display = this.recording || !this.recordingStreamName ? 'none' : '';
+  }
+
+  applyRecordingState(recording, streamName, deleted = false) {
+    const sameAsCurrent = !this.recordingStreamName || !streamName ||
+      this.recordingStreamName === streamName;
+    // Recording events are base-mapped to slots, so a late stop/delete for
+    // an older suffixed stream must not turn off a newer active recording.
+    // Likewise, a negative event cannot confirm an in-flight Start.
+    if ((!recording && this.recordingStreamName && !sameAsCurrent) ||
+        (!recording && this._recordingPendingAction === 'start_recording')) {
+      if (deleted && this._recordingDeletePending &&
+          this._recordingDeleteStream === streamName) {
+        this._clearRecordingDeletePending();
+      }
+      return false;
+    }
+
+    const confirmsRecordingCommand = recording
+      ? this._recordingPendingAction === 'start_recording'
+      : this._recordingPendingAction === 'stop_recording';
+    if (confirmsRecordingCommand) this._clearRecordingPending(false);
+    if (deleted && this._recordingDeletePending &&
+        this._recordingDeleteStream === streamName) {
+      this._clearRecordingDeletePending(false);
+    }
+    this.recording = Boolean(recording);
+    this.recordingStreamName = deleted ? null : (streamName || this.recordingStreamName);
+    this._renderRecordingControls();
+    return true;
+  }
+
+  _failRecordingCommand(message) {
+    this._clearRecordingPending(false);
+    this._clearRecordingDeletePending(false);
+    // The last server-confirmed state remains authoritative.
+    this._renderRecordingControls();
+    if (typeof showControlToast === 'function') showControlToast('error', message);
   }
   async deleteRecording() {
-    if (!app) return;
+    if (!app || this._recordingDeletePending || this._recordingPendingAction || this.recording) return;
     const stream = this.recordingStreamName || ('display_' + this.displayId);
     const ok = await showDashboardConfirm({
       title: 'Delete recording',
@@ -1222,9 +1393,29 @@ class DisplaySlot {
       confirmLabel: 'Delete',
     });
     if (!ok) return;
-    dispatchDashboardActionMsg({ action: 'delete_recording', stream_name: stream });
-    this.deleteRecBtn.style.display = 'none';
-    this.recordingStreamName = null;
+    // State can change while the confirmation dialog is open.
+    if (this._recordingDeletePending || this._recordingPendingAction || this.recording ||
+        this.recordingStreamName !== stream) return;
+    this._recordingDeletePending = true;
+    this._recordingDeleteStream = stream;
+    this._renderRecordingControls();
+    const fail = error => {
+      if (!this._recordingDeletePending) return;
+      this._failRecordingCommand(error?.message || 'Could not delete the recording');
+    };
+    const sent = dispatchDashboardActionMsg(
+      { action: 'delete_recording', stream_name: stream },
+      { onError: fail }
+    );
+    if (!sent) {
+      fail(new Error('Dashboard control connection is unavailable'));
+      return;
+    }
+    this._recordingDeleteTimer = window.setTimeout(() => {
+      this._recordingDeleteTimer = null;
+      if (!this._recordingDeletePending) return;
+      this._failRecordingCommand('No delete confirmation arrived — the recording is still listed.');
+    }, 10000);
   }
   // Phase 5c: teardown.  `userInitiated` separates the user-close path
   // (display toggled off, `removeDisplaySlot`, etc.) from transient
@@ -1252,10 +1443,9 @@ class DisplaySlot {
     this._clearNoTrackWatchdog();
     this._stopStatsSampler();
     this._setStageOverlay(null);
+    this._clearRecordingPending();
+    this._clearRecordingDeletePending();
     this.stopStreaming();
-    if (userInitiated) {
-      this._releaseAuthority();
-    }
     // Flip `connected` BEFORE `_exitInteractive` so its status-text
     // ternary writes 'Disconnected' (not the stale 'Connected (view-
     // only)') on the way out — otherwise the chip flickers through
@@ -1263,6 +1453,12 @@ class DisplaySlot {
     // assignment overwrote it.
     this.connected = false;
     this._exitInteractive(userInitiated);
+    if (userInitiated) {
+      // Held-key keyups from `_exitInteractive` must cross the input gate
+      // before the authority release closes it. This is the same ordering
+      // as releaseControl(); close/remove paths cannot safely reverse it.
+      this._releaseAuthority();
+    }
     if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
@@ -1293,6 +1489,9 @@ function removeDisplaySlot(displayId) {
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  if (typeof window.retireLiveDisplayWorkspaceSlot === 'function') {
+    window.retireLiveDisplayWorkspaceSlot(displayId);
+  }
   if (sharedViewState.displayId === displayId) {
     clearSharedViewDecorations();
   }
@@ -1453,19 +1652,27 @@ function updateSharedViewBanner() {
 
 function applySharedViewToSlot(slot) {
   if (!sharedViewState.visible || !slot) return;
+  // Current daemons resolve auto-detect to a concrete target. A legacy null
+  // event is only safe to bind when handleSharedViewEvent saw exactly one
+  // existing stream; never guess here while bootstrap slots are still arriving.
+  if (sharedViewState.displayId === null) return;
   if (sharedViewState.displayId !== null && Number(slot.displayId) !== sharedViewState.displayId) {
     return;
   }
-  // The Live workspace is a selected-display stage. Agent-requested
-  // shared views must foreground their real target rather than leaving
-  // the focus box mounted on a hidden slot.
+  // The Live workspace is a selected-display stage. Foreground a new
+  // advisory target only when doing so will not discard active human work;
+  // the banner and row decoration still make a deferred target discoverable.
+  let foregrounded = true;
   if (typeof window.selectLiveDisplay === 'function') {
-    window.selectLiveDisplay(slot.displayId, { source: 'shared-view' });
+    foregrounded = window.selectLiveDisplay(slot.displayId, {
+      source: 'shared-view',
+      advisory: true,
+    });
   }
   updateSharedViewBanner();
   slot.el.classList.add('shared-view-active');
   renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
-  if (activeTab === 'displays') {
+  if (activeTab === 'displays' && foregrounded) {
     requestAnimationFrame(() => {
       try { slot.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
     });
@@ -1493,7 +1700,21 @@ function hideSharedView() {
 function takeSharedViewInput() {
   if (sharedViewState.displayId === null) return;
   const slot = displaySlots.get(sharedViewState.displayId);
-  if (slot) slot.takeControl();
+  if (!slot) return;
+  // This click is an explicit human decision, unlike the agent's advisory
+  // shared-view event: select the requested surface (safely releasing the
+  // previous one) before asking for its input authority.
+  if (activeTab !== 'displays' && typeof routeTo === 'function') {
+    if (routeTo('displays') === false) return;
+  }
+  if (typeof window.selectLiveDisplay === 'function') {
+    const selected = window.selectLiveDisplay(slot.displayId, {
+      source: 'shared-view-input',
+      focusStage: true,
+    });
+    if (!selected) return;
+  }
+  slot.takeControl();
 }
 
 function handleSharedViewEvent(evt) {
@@ -1515,6 +1736,14 @@ function handleSharedViewEvent(evt) {
   sharedViewState.note = String(evt.note || '');
   sharedViewState.region = evt.region || null;
 
+  const slot = sharedViewState.displayId !== null
+    ? displaySlots.get(sharedViewState.displayId)
+    : displaySlots.size === 1
+      ? displaySlots.values().next().value
+      : null;
+  if (slot && sharedViewState.displayId === null) {
+    sharedViewState.displayId = Number(slot.displayId);
+  }
   clearSharedViewDecorations();
   updateSharedViewBanner();
   if (activeTab !== 'displays' && (activeTab !== 'activity' || activeActivitySubtab !== 'log')) {
@@ -1524,9 +1753,6 @@ function handleSharedViewEvent(evt) {
   if (activeTab === 'activity' && activeActivitySubtab === 'log' && activityStrip) {
     activityStrip.classList.remove('hidden');
   }
-  const slot = sharedViewState.displayId !== null
-    ? displaySlots.get(sharedViewState.displayId)
-    : displaySlots.values().next().value;
   if (slot) applySharedViewToSlot(slot);
 }
 
@@ -1624,7 +1850,11 @@ function addDisplayThumb(displayId) {
 
   const thumb = document.createElement('div');
   thumb.className = 'activity-display-thumb';
-  thumb.innerHTML = `<span class="thumb-label">${displayLabel(displayId, true)}</span>`;
+  const thumbLabel = document.createElement('span');
+  thumbLabel.className = 'thumb-label';
+  // Window titles come from the OS and are not trusted markup.
+  thumbLabel.textContent = displayLabel(displayId, true);
+  thumb.appendChild(thumbLabel);
   thumb.addEventListener('click', (e) => { e.stopPropagation(); toggleDisplayStrip(); }, true);
 
   displayThumbs.set(displayId, thumb);
@@ -1793,6 +2023,7 @@ function applyDisplayStripState() {
 // down through the existing provider lifecycle before that slot is hidden.
 (() => {
   const tab = document.getElementById('tab-displays');
+  const main = document.getElementById('ui2-live-main');
   const container = document.getElementById('displays-container');
   const rail = document.getElementById('ui2-live-rail');
   const displaysList = document.getElementById('ui2-live-displays-list');
@@ -1818,11 +2049,13 @@ function applyDisplayStripState() {
   const peerSources = new Map();
   const slotSnapshots = new Map();
   const activityByDisplay = new Map();
+  const activityRows = new Map();
   const drawerMedia = window.matchMedia('(max-width: 1279px)');
   let selectedDisplayId = null;
   let railOpen = false;
   let railRaf = 0;
   let activitySeq = 0;
+  let activityRenderedDisplayId = null;
   let lastActivitySignature = '';
   let lastAuthoritySignature = '';
   let lastScreenSignature = '';
@@ -1834,6 +2067,39 @@ function applyDisplayStripState() {
 
   function selectedSlot() {
     return selectedDisplayId === null ? null : displaySlots.get(selectedDisplayId) || null;
+  }
+
+  function slotHasActiveUserWork(slot) {
+    if (!slot) return false;
+    return Boolean(
+      slot.interactive ||
+      slot._takeControlPending ||
+      slot.authorityState === 'you' ||
+      slot.el?.classList.contains('display-fullscreen') ||
+      slot.el?.contains(document.activeElement) ||
+      rail.contains(document.activeElement) ||
+      (typeof shouldSuppressDisplayInputForAnnotation === 'function' &&
+        shouldSuppressDisplayInputForAnnotation(slot)) ||
+      (typeof liveCalloutArmedFor === 'function' && liveCalloutArmedFor(slot))
+    );
+  }
+
+  function slotHasBlockingSurfaceWork(slot) {
+    if (!slot) return false;
+    return Boolean(
+      (typeof shouldSuppressDisplayInputForAnnotation === 'function' &&
+        shouldSuppressDisplayInputForAnnotation(slot)) ||
+      (typeof liveCalloutArmedFor === 'function' && liveCalloutArmedFor(slot))
+    );
+  }
+
+  function announceBlockedSurfaceSwitch() {
+    if (typeof showControlToast === 'function') {
+      showControlToast(
+        'info',
+        'Finish or close the current annotation/callout before changing displays.'
+      );
+    }
   }
 
   function emptyHint(textValue) {
@@ -1860,8 +2126,18 @@ function applyDisplayStripState() {
   function teardownSelectedSurface(slot) {
     if (!slot) return;
     // releaseControl is the only safe ordering: held-key keyups are sent
-    // before the server-side authority release closes the input gate.
-    if (slot.interactive) slot.releaseControl();
+    // before the server-side authority release closes the input gate. A
+    // pending Take must also be cancelled: its late `you` reply would
+    // otherwise install document-level paste and input listeners on the
+    // display after this projection has hidden it. Releasing an already-
+    // held but locally unbound authority is idempotent and avoids leaving
+    // a hidden display reserved during the server round trip.
+    if (slot.interactive || slot._takeControlPending || slot.authorityState === 'you') {
+      slot.releaseControl();
+    }
+    if (slot.el?.classList.contains('display-fullscreen')) {
+      slot.toggleFullscreen(false);
+    }
     if (typeof teardownLiveSurfaceForOwner === 'function') {
       teardownLiveSurfaceForOwner(slot);
     }
@@ -1873,7 +2149,13 @@ function applyDisplayStripState() {
     const next = Number.isFinite(id) ? displaySlots.get(id) : null;
     if (!next) return false;
     if (selectedDisplayId !== id) {
-      teardownSelectedSurface(selectedSlot());
+      const current = selectedSlot();
+      if (opts.advisory && slotHasActiveUserWork(current)) return false;
+      if (slotHasBlockingSurfaceWork(current)) {
+        announceBlockedSurfaceSwitch();
+        return false;
+      }
+      teardownSelectedSurface(current);
       selectedDisplayId = id;
     }
     setSelectedProjection();
@@ -1886,18 +2168,53 @@ function applyDisplayStripState() {
     return true;
   }
   window.selectLiveDisplay = selectLiveDisplay;
+  window.retireLiveDisplayWorkspaceSlot = function(displayId) {
+    const id = Number(displayId);
+    const record = displayRows.get(id);
+    if (record) record.row.remove();
+    displayRows.delete(id);
+    slotSnapshots.delete(id);
+    activityByDisplay.delete(id);
+    if (selectedDisplayId === id) selectedDisplayId = null;
+    lastActivitySignature = '';
+    lastAuthoritySignature = '';
+    scheduleWorkspace();
+  };
+  window.canDeactivateLiveDisplayWorkspace = function(options) {
+    const blocking = Array.from(displaySlots.values()).find(slotHasBlockingSurfaceWork);
+    if (!blocking) return true;
+    if (!options || options.announce !== false) announceBlockedSurfaceSwitch();
+    return false;
+  };
+  window.deactivateLiveDisplayWorkspace = function() {
+    if (!window.canDeactivateLiveDisplayWorkspace()) return false;
+    for (const slot of displaySlots.values()) {
+      if (slot.interactive || slot._takeControlPending || slot.authorityState === 'you') {
+        slot.releaseControl();
+      }
+      if (slot.el?.classList.contains('display-fullscreen')) {
+        slot.toggleFullscreen(false);
+      }
+      if (typeof teardownLiveSurfaceForOwner === 'function') {
+        teardownLiveSurfaceForOwner(slot);
+      }
+    }
+    scheduleWorkspace();
+    return true;
+  };
 
   function reconcileSelectedDisplay(slots) {
-    const shared = slots.find(slot => slot.el && slot.el.classList.contains('shared-view-active'));
-    if (shared && Number(shared.displayId) !== selectedDisplayId) {
-      selectLiveDisplay(shared.displayId, { source: 'shared-view' });
-      return;
-    }
     if (selectedDisplayId !== null && displaySlots.has(selectedDisplayId)) {
       setSelectedProjection();
       return;
     }
-    selectedDisplayId = slots.length ? Number(slots[0].displayId) : null;
+    // applySharedViewToSlot selects a newly requested shared-view target
+    // once. If the workspace initializes after that event, prefer its
+    // decorated slot only for this initial/fallback choice. Never force it
+    // again: the user must remain free to inspect another live display.
+    const shared = slots.find(slot => slot.el && slot.el.classList.contains('shared-view-active'));
+    const fallback = shared || slots[0];
+    selectedDisplayId = fallback ? Number(fallback.displayId) : null;
     setSelectedProjection();
   }
 
@@ -1914,17 +2231,19 @@ function applyDisplayStripState() {
       '</span>' +
       '<span class="ui2-live-row-tags" aria-hidden="true">' +
         '<span class="ui2-live-row-tag ui2-live-row-privacy"></span>' +
+        '<span class="ui2-live-row-tag ui2-live-row-media"></span>' +
         '<span class="ui2-live-row-tag ui2-live-row-current"></span>' +
       '</span>';
     row.addEventListener('click', () => {
-      selectLiveDisplay(id, { focusStage: true, source: 'rail' });
-      if (drawerMedia.matches) setRailOpen(false, true);
+      const selected = selectLiveDisplay(id, { focusStage: true, source: 'rail' });
+      if (selected && drawerMedia.matches) setRailOpen(false, true);
     });
     return {
       row,
       title: row.querySelector('.ui2-live-row-title'),
       meta: row.querySelector('.ui2-live-row-meta'),
       privacy: row.querySelector('.ui2-live-row-privacy'),
+      media: row.querySelector('.ui2-live-row-media'),
       current: row.querySelector('.ui2-live-row-current'),
     };
   }
@@ -1970,6 +2289,25 @@ function applyDisplayStripState() {
       const error = Boolean(slot.statusEl && slot.statusEl.classList.contains('error'));
       const active = id === selectedDisplayId;
       const privateView = displayAgentVisibility.get(id) === false;
+      const presenceStreaming = Boolean(slot.streaming);
+      const recording = Boolean(slot.recording);
+      const current = selectedSlot();
+      const releasesControl = !active && Boolean(
+        current && (current.interactive || current._takeControlPending || current.authorityState === 'you')
+      );
+      const blocksForEdit = !active && slotHasBlockingSurfaceWork(current);
+      const visibilityLabel = privateView
+        ? 'private dashboard view; agent cannot see it'
+        : (displayAgentVisibility.get(id) === true && userDisplayIds.has(id))
+          ? 'shared with the agent'
+          : 'agent workspace';
+      const stateLabels = [
+        visibilityLabel,
+        presenceStreaming ? 'streaming frames to the presence model' : '',
+        recording ? 'recording' : '',
+        releasesControl ? 'switching here releases current input control' : '',
+        blocksForEdit ? 'finish the current annotation or callout before switching' : '',
+      ].filter(Boolean);
 
       record.row.classList.toggle('ok', Boolean(slot.connected));
       record.row.classList.toggle('err', error);
@@ -1978,13 +2316,23 @@ function applyDisplayStripState() {
       record.row.setAttribute('aria-pressed', active ? 'true' : 'false');
       if (active) record.row.setAttribute('aria-current', 'true');
       else record.row.removeAttribute('aria-current');
-      record.row.title = active ? label + ' is shown on the stage' : 'Show ' + label + ' on the stage';
+      record.row.title = active
+        ? label + ' is shown on the stage'
+        : blocksForEdit
+          ? 'Finish the current annotation or callout before showing ' + label
+          : 'Show ' + label + ' on the stage' +
+            (releasesControl ? ' and release current input control' : '');
       record.row.setAttribute('aria-label',
-        label + ', ' + status + ', input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown));
+        label + ', ' + status + ', input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown) +
+        ', ' + stateLabels.join(', '));
       record.title.textContent = label;
       record.meta.textContent = status + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
       record.privacy.textContent = privateView ? 'PRIVATE' : '';
       record.privacy.title = privateView ? 'The agent cannot see this private view' : '';
+      record.media.textContent = [presenceStreaming ? 'STREAM' : '', recording ? 'REC' : '']
+        .filter(Boolean).join(' · ');
+      record.media.classList.toggle('streaming', presenceStreaming);
+      record.media.classList.toggle('recording', recording);
       record.current.textContent = active ? 'VIEWING' : (slot.connected ? 'LIVE' : '');
       ordered.push(record);
     }
@@ -2020,10 +2368,12 @@ function applyDisplayStripState() {
       // authority round-trip (or after a failed release), let the holder
       // safely re-bind listeners instead of trapping it behind a Release-
       // only toolbar state.
+      if (drawerMedia.matches) setRailOpen(false, true);
       slot.takeControl();
       return;
     }
     const source = slot.authorityState === 'you' ? slot.releaseBtn : slot.takeBtn;
+    if (source === slot.takeBtn && drawerMedia.matches) setRailOpen(false, true);
     if (source && !source.disabled) source.click();
   });
 
@@ -2110,17 +2460,16 @@ function applyDisplayStripState() {
 
   function snapshotSlot(slot) {
     const statusEl = slot.statusEl;
-    const mode = slot.interactive
-      ? 'interactive'
-      : slot.connected
-        ? 'connected'
-        : statusEl && statusEl.classList.contains('error')
-          ? 'error'
-          : statusEl && statusEl.classList.contains('warn')
-            ? 'warn'
-            : 'connecting';
+    const connection = slot.connected
+      ? 'connected'
+      : statusEl && statusEl.classList.contains('error')
+        ? 'error'
+        : statusEl && statusEl.classList.contains('warn')
+          ? 'warn'
+          : 'connecting';
     return {
-      mode,
+      connection,
+      interactive: Boolean(slot.interactive),
       authority: slot.authorityState || 'unknown',
       streaming: Boolean(slot.streaming),
       recording: Boolean(slot.recording),
@@ -2152,9 +2501,9 @@ function applyDisplayStripState() {
     const prev = slotSnapshots.get(id);
     if (!prev) {
       addDisplayActivity(id, 'neutral', 'Display became available');
-      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
-      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
-      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      if (next.connection === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.connection === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      if (next.interactive) addDisplayActivity(id, 'control', 'Interactive input is active');
       if (next.visibility === 'private') addDisplayActivity(id, 'private', 'Private dashboard view started');
       if (next.visibility === 'agent') addDisplayActivity(id, 'share', 'Display shared with the agent');
       if (next.authority === 'you') addDisplayActivity(id, 'control', 'This dashboard holds input authority');
@@ -2164,12 +2513,15 @@ function applyDisplayStripState() {
       return;
     }
 
-    if (prev.mode !== next.mode) {
-      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
-      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
-      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
-      else if (next.mode === 'warn') addDisplayActivity(id, 'attention', 'The stream is reconnecting');
+    if (prev.connection !== next.connection) {
+      if (next.connection === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.connection === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      else if (next.connection === 'warn') addDisplayActivity(id, 'attention', 'The stream is reconnecting');
       else addDisplayActivity(id, 'neutral', 'Connecting to the display');
+    }
+    if (prev.interactive !== next.interactive) {
+      addDisplayActivity(id, next.interactive ? 'control' : 'neutral',
+        next.interactive ? 'Interactive input is active' : 'Interactive input ended');
     }
     if (prev.authority !== next.authority) {
       if (next.authority === 'you') addDisplayActivity(id, 'control', 'You took input control');
@@ -2213,16 +2565,32 @@ function applyDisplayStripState() {
       entries.map(entry => String(entry.seq)).join(',');
     if (signature === lastActivitySignature) return;
     lastActivitySignature = signature;
-    activityList.replaceChildren();
+    if (activityRenderedDisplayId !== selectedDisplayId) {
+      activityRenderedDisplayId = selectedDisplayId;
+      activityRows.clear();
+      activityList.replaceChildren();
+    }
     if (!entries.length) {
-      activityList.appendChild(emptyHint(
-        selectedDisplayId === null
-          ? 'Select a display to see its connection, authority, sharing, and recording events.'
-          : 'Display events will appear here as its real state changes.'));
+      if (!activityList.querySelector('.ui2-live-rail-empty')) {
+        activityList.appendChild(emptyHint(
+          selectedDisplayId === null
+            ? 'Select a display to see its connection, authority, sharing, and recording events.'
+            : 'Display events will appear here as its real state changes.'));
+      }
       return;
     }
-
-    for (const entry of entries.slice().reverse()) {
+    activityList.querySelector('.ui2-live-rail-empty')?.remove();
+    const liveSeqs = new Set(entries.map(entry => entry.seq));
+    for (const [seq, row] of activityRows) {
+      if (liveSeqs.has(seq)) continue;
+      row.remove();
+      activityRows.delete(seq);
+    }
+    // role=log expects chronological DOM order so only the newly appended
+    // row is announced. Rebuilding newest-first made every state change
+    // sound like ten new events to screen readers.
+    for (const entry of entries) {
+      if (activityRows.has(entry.seq)) continue;
       const row = document.createElement('div');
       row.className = 'ui2-live-activity-row kind-' + entry.kind;
       const dot = document.createElement('span');
@@ -2239,6 +2607,7 @@ function applyDisplayStripState() {
       row.appendChild(textEl);
       row.appendChild(time);
       activityList.appendChild(row);
+      activityRows.set(entry.seq, row);
     }
   }
 
@@ -2364,7 +2733,8 @@ function applyDisplayStripState() {
       if (!chip || chip.disabled) return;
       const hostId = chip.dataset.hostId || '';
       const displayId = Number(chip.dataset.displayId || 0);
-      if (typeof routeTo === 'function') routeTo('station');
+      if (typeof routeTo === 'function' && routeTo('station') === false) return;
+      if (drawerMedia.matches) setRailOpen(false, false);
       if (hostId && typeof stationOpenDisplay === 'function') {
         stationOpenDisplay(hostId, displayId);
       } else {
@@ -2426,7 +2796,17 @@ function applyDisplayStripState() {
       return;
     }
     const state = slot.authorityState || 'unknown';
-    mobileSummary.textContent = slotLabel(slot) + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
+    const slots = Array.from(displaySlots.values());
+    const streamingCount = slots.filter(item => item.streaming).length;
+    const recordingCount = slots.filter(item => item.recording).length;
+    const parts = [
+      slotLabel(slot),
+      'input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown),
+      streamingCount ? streamingCount + ' presence stream' + (streamingCount === 1 ? '' : 's') : '',
+      recordingCount ? recordingCount + ' recording' + (recordingCount === 1 ? '' : 's') : '',
+    ].filter(Boolean);
+    mobileSummary.textContent = parts.join(' · ');
+    mobileSummary.title = parts.join(', ');
   }
 
   function drawerFocusable() {
@@ -2435,20 +2815,34 @@ function applyDisplayStripState() {
     )).filter(element => element.getClientRects().length > 0);
   }
 
-  function syncDrawerState(restoreFocus) {
+  function syncDrawerState(restoreFocus, force) {
+    if (!force && document.body.classList.contains('display-fullscreen-open')) return;
     const drawer = drawerMedia.matches;
     const visible = !drawer || railOpen;
     tab.classList.toggle('ui2-live-rail-open', drawer && railOpen);
     rail.inert = !visible;
     if (visible) rail.removeAttribute('aria-hidden');
     else rail.setAttribute('aria-hidden', 'true');
+    if (drawer) {
+      rail.setAttribute('role', 'dialog');
+      rail.setAttribute('aria-modal', railOpen ? 'true' : 'false');
+    } else {
+      rail.removeAttribute('role');
+      rail.removeAttribute('aria-modal');
+    }
+    if (main) {
+      main.inert = drawer && railOpen;
+      if (drawer && railOpen) main.setAttribute('aria-hidden', 'true');
+      else main.removeAttribute('aria-hidden');
+    }
     if (railToggle) railToggle.setAttribute('aria-expanded', drawer && railOpen ? 'true' : 'false');
     if (railScrim) {
-      railScrim.tabIndex = drawer && railOpen ? 0 : -1;
+      railScrim.tabIndex = -1;
       railScrim.setAttribute('aria-hidden', drawer && railOpen ? 'false' : 'true');
     }
     if (restoreFocus && railToggle && drawer) railToggle.focus();
   }
+  window.syncLiveDisplayDrawerState = () => syncDrawerState(false, true);
 
   function setRailOpen(open, restoreFocus) {
     railOpen = drawerMedia.matches && Boolean(open);
@@ -2480,13 +2874,22 @@ function applyDisplayStripState() {
   });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && drawerMedia.matches && railOpen) {
+      // The portalled display picker is above the drawer and owns the
+      // first Escape. Its later fragment closes it and restores focus;
+      // leave the underlying controls drawer in place.
+      if (document.getElementById('display-picker')?.classList.contains('visible')) return;
       event.preventDefault();
       setRailOpen(false, true);
     }
   });
   const onDrawerMediaChange = () => {
+    const focusWasInRail = rail.contains(document.activeElement);
+    if (typeof hideDisplayPicker === 'function' && displayPickerVisible) {
+      hideDisplayPicker(false);
+    }
     railOpen = false;
     syncDrawerState(false);
+    if (drawerMedia.matches && focusWasInRail && railToggle) railToggle.focus();
   };
   if (typeof drawerMedia.addEventListener === 'function') {
     drawerMedia.addEventListener('change', onDrawerMediaChange);

@@ -1483,22 +1483,29 @@ pub(crate) async fn handle_shared_view_calls(
             ))
         });
 
-        let resolved_target = mcp::shared_view_display_target(display_target, None);
-        let display_id = mcp::shared_view_display_id(resolved_target.as_deref(), None);
-        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
-
         // The user's own screen is an explicit opt-in path: require the
         // existing display grant instead of flipping it from a tool call.
         // Only display-exposing verbs gate — focus/input/hide operate on
         // whatever view is already shown.
         let user_display_granted = autonomy.read().await.user_display_granted;
+        let resolved =
+            mcp::resolve_concrete_shared_view_target(display_target, None).or_else(|| {
+                if action == "hide" {
+                    None
+                } else {
+                    Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
+                        user_display_granted,
+                    )))
+                }
+            });
+        let resolved_target = resolved.as_ref().map(|(target, _)| target.clone());
+        let display_id = resolved.map(|(_, id)| id);
+        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
+
         let effective_user_display = match display_id {
             Some(0) => true,
             Some(_) => false,
-            None => matches!(
-                resolve_cu_display_target(user_display_granted),
-                computer_use::DisplayTarget::UserSession
-            ),
+            None => false,
         };
         if matches!(action, "show" | "capture") && effective_user_display && !user_display_granted {
             conversation.add_tool_result(
@@ -1748,6 +1755,27 @@ pub(crate) async fn execute_cu_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DisplayEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl DisplayEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("DISPLAY");
+            std::env::set_var("DISPLAY", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for DisplayEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("DISPLAY", value),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn resolve_attachments_includes_uploaded_files_and_images() {
@@ -2052,6 +2080,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_view_calls_validate_and_gate_user_session() {
+        let _env_lock = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let _display = DisplayEnvGuard::set(":99");
         let tmp = tempfile::tempdir().unwrap();
         let session_log: SharedSessionLog = Arc::new(Mutex::new(
             session_log::SessionLog::open(tmp.path().to_path_buf()).unwrap(),
@@ -2132,10 +2162,16 @@ mod tests {
         }
         match rx.try_recv() {
             Ok(AppEvent::SharedView {
-                action, session_id, ..
+                action,
+                session_id,
+                display_target,
+                display_id,
+                ..
             }) => {
                 assert_eq!(action, "input_request");
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(display_target.as_deref(), Some(":99"));
+                assert_eq!(display_id, Some(99));
             }
             other => panic!("expected SharedView input_request event, got {other:?}"),
         }

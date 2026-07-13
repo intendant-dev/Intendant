@@ -886,9 +886,7 @@ function deleteRecordingStream(streamName) {
     if (slot.recordingStreamName === streamName) {
       slot.recordingStreamName = null;
       slot.recording = false;
-      slot.recordBtn.innerHTML = '&#x23FA; Record';
-      slot.recordBtn.classList.remove('active');
-      slot.deleteRecBtn.style.display = 'none';
+      slot._renderRecordingControls();
     }
   }
 
@@ -1051,4 +1049,3 @@ async function reconcileRecordingStreams() {
     }
   } catch { /* no recordings available */ }
 }
-

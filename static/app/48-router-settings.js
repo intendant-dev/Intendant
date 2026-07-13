@@ -181,6 +181,14 @@ function tabDomMatches(tab) {
 // is used (or preserved if it's already the active one).
 function routeTo(tab, subtab) {
   if (tab === 'access' && subtab) subtab = normalizeAccessSubtab(subtab);
+  // A live annotation/callout is editable state, not navigation chrome.
+  // Refuse the route before changing the URL so a tab click cannot silently
+  // discard it or leave the hash claiming a pane we did not open.
+  if (activeTab === 'displays' && tab !== 'displays' &&
+      typeof window.canDeactivateLiveDisplayWorkspace === 'function' &&
+      !window.canDeactivateLiveDisplayWorkspace()) {
+    return false;
+  }
   const target = subtab ? `${tab}/${subtab}` : tab;
   if (DASHBOARD_ACCESS_PAGE_MODE && tab !== 'access') {
     window.location.href = daemonDashboardHref(`#${target}`);
@@ -211,6 +219,7 @@ function routeTo(tab, subtab) {
   if (tab === 'stats' && !switched) {
     renderStatsForActiveHost({ forceSessions: true });
   }
+  return true;
 }
 
 // Apply the URL's current hash to the actual DOM. Called on initial
@@ -228,7 +237,13 @@ function applyCurrentRoute() {
   const switched = tab !== activeTab;
   const needsDomApply = !tabDomMatches(tab);
   if (switched || needsDomApply) {
-    switchTab(tab);
+    if (switchTab(tab) === false) {
+      // Back/forward or a manually edited hash can bypass routeTo's
+      // preflight. Keep the editable Live surface active and restore the
+      // URL without creating another history entry.
+      history.replaceState(null, '', '#displays');
+      return;
+    }
   }
   if (tab === 'activity' && subtab) {
     switchActivitySubtab(subtab);
@@ -252,6 +267,16 @@ window.addEventListener('popstate', applyCurrentRoute);
 window.addEventListener('hashchange', applyCurrentRoute);
 
 function switchTab(tabId) {
+  // Interactive display input includes a document-level paste handler.
+  // Never leave it bound to a stage that is about to become hidden on
+  // Station, Sessions, Settings, etc. Activity already moves the canvas
+  // into a thumbnail and historically released there; this single entry
+  // point makes every navigation path follow the same held-key-flush →
+  // authority-release ordering.
+  if (activeTab === 'displays' && tabId !== 'displays' &&
+      typeof window.deactivateLiveDisplayWorkspace === 'function') {
+    if (window.deactivateLiveDisplayWorkspace() === false) return false;
+  }
   activeTab = tabId;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
@@ -317,6 +342,7 @@ function switchTab(tabId) {
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
   flushPaneRenders(tabId);
+  return true;
 }
 
 // ── Settings sub-tabs ──
@@ -491,6 +517,7 @@ function switchActivitySubtab(name) {
   if (name === 'control') {
     refreshControlPane();
   }
+  return true;
 }
 
 let activeSessionsSubtab = 'recent';
@@ -669,4 +696,3 @@ if (document.readyState === 'loading') {
 } else {
   applyInitialRouteFromHash();
 }
-
