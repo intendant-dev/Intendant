@@ -138,6 +138,9 @@ function utf8ToBase64(s) {
 
 // Send a raw WS message object by going through the WASM app's send_raw.
 // Falls back to send_server_action if send_raw isn't available.
+// Returns whether the frame reached an open /ws (only an explicit false
+// from the wasm send refuses — QA stubs return undefined); a refused send
+// kicks the event-lane fallback so the tunnel comes up.
 function sendRawMessage(obj) {
   if (dashboardConnectModeEnabled()) {
     console.warn('[dashboard-control] legacy WebSocket message unavailable in Connect mode', obj?.t || obj);
@@ -145,15 +148,16 @@ function sendRawMessage(obj) {
   }
   if (!app) return false;
   const payload = JSON.stringify(obj);
+  let sent = false;
   if (app.send_raw) {
-    app.send_raw(payload);
-    return true;
+    sent = app.send_raw(payload) !== false;
+  } else if (app.send_server_action) {
+    sent = app.send_server_action(obj) !== false;
   }
-  if (app.send_server_action) {
-    app.send_server_action(obj);
-    return true;
+  if (!sent && typeof dashboardTriggerEventLaneFallback === 'function') {
+    dashboardTriggerEventLaneFallback('legacy /ws frame found no open event lane');
   }
-  return false;
+  return sent;
 }
 
 const dashboardPresenceWarned = new Set();

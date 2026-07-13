@@ -177,6 +177,10 @@ function dashboardControlTransportEnabled() {
   // path — always on (localStorage is also unreliable on the custom
   // intendant:// scheme, so this cannot be a stored preference there).
   if (window.__intendantPort && window.__intendantBackendTls) return true;
+  // Capability fallback: this browser proved unable to open the legacy
+  // /ws (see dashboardTriggerEventLaneFallback below) — the tunnel is
+  // the lane now. Derived state, never stored.
+  if (dashboardControlAutoFallback) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
@@ -190,16 +194,118 @@ function dashboardConnectModeEnabled() {
 
 // True when the dashboard-control tunnel is the PRIMARY event lane — the
 // postures where losing the tunnel means losing events entirely:
-//   - hosted Connect dashboards (?connect=1), and
+//   - hosted Connect dashboards (?connect=1),
 //   - the macOS-app mTLS bundle, where the legacy WebSocket can never
 //     present the client certificate (36-voice-wasm-init.js skips it), so
-//     the tunnel is the only event path.
+//     the tunnel is the only event path, and
+//   - the capability fallback below, for exactly as long as the /ws
+//     stays down: a plain browser whose /ws proved unable to open is in
+//     the same boat as the app bundle. If the /ws does open later it
+//     resumes event duty and the tunnel drops back to the opt-in role
+//     (kept, not torn down — dual delivery is the opt-in posture and the
+//     event dedup absorbs it).
 // The localStorage `webrtc-control` opt-in is deliberately excluded: there
 // the legacy /ws lane still carries events, and reload semantics own that
 // toggle. Gate for the event-lane reconnect machinery below.
 function dashboardControlTunnelIsPrimaryEventLane() {
   if (dashboardConnectModeEnabled()) return true;
-  return Boolean(window.__intendantPort && window.__intendantBackendTls);
+  if (window.__intendantPort && window.__intendantBackendTls) return true;
+  return dashboardControlAutoFallback && !dashboardLegacyWsConnected;
+}
+
+// ── Legacy /ws capability probe → tunnel fallback ──
+//
+// The plain-browser posture assumes the legacy /ws is the event lane, but
+// that assumption is not universally true: WebKit (Safari, and WKWebViews
+// outside the packaged app) never attaches an mTLS client certificate to
+// a WebSocket upgrade — against an mTLS daemon the socket hangs in
+// CONNECTING forever, firing neither open nor close nor error, while
+// fetch/XHR mTLS keeps working. The page looks healthy and every intent
+// send is refused. Rather than sniffing browsers, probe the capability:
+// if the /ws has not opened within DASHBOARD_LEGACY_WS_FALLBACK_MS of an
+// attempt (or an intent send reports no open lane), promote the control
+// tunnel to primary event lane — the posture the packaged macOS app runs
+// permanently — and let the existing event-lane reconnect machinery own
+// start, hydration (api_dashboard_bootstrap replay), retry, backoff, and
+// status. The promotion is derived, never stored: a browser that can
+// open the /ws never enters it; one that cannot re-derives it each load.
+const DASHBOARD_LEGACY_WS_FALLBACK_MS = 3000;
+let dashboardControlAutoFallback = false;
+let dashboardLegacyWsConnected = false;
+let dashboardLegacyWsWatchdog = null;
+
+// The posture where the /ws is attempted at all (36-voice-wasm-init.js
+// branch order): not hosted Connect, not the packaged-app bundle.
+function dashboardLegacyWsPostureApplies() {
+  if (dashboardConnectModeEnabled()) return false;
+  return !(window.__intendantPort && window.__intendantBackendTls);
+}
+
+// Fed from the wasm client's server-state callback (open/close); the boot
+// path arms the watchdog right after connect_server. Open clears the
+// watchdog; closed (re-)arms it.
+function dashboardNoteLegacyWsState(connected) {
+  dashboardLegacyWsConnected = !!connected;
+  if (connected) {
+    if (dashboardLegacyWsWatchdog) {
+      clearTimeout(dashboardLegacyWsWatchdog);
+      dashboardLegacyWsWatchdog = null;
+    }
+    if (typeof dashboardUpdateTransportStatus === 'function') dashboardUpdateTransportStatus();
+    return;
+  }
+  dashboardArmLegacyWsWatchdog('legacy WebSocket disconnected');
+}
+
+function dashboardArmLegacyWsWatchdog(reason) {
+  if (!dashboardLegacyWsPostureApplies()) return;
+  if (dashboardLegacyWsConnected || dashboardLegacyWsWatchdog) return;
+  dashboardLegacyWsWatchdog = window.setTimeout(() => {
+    dashboardLegacyWsWatchdog = null;
+    if (dashboardLegacyWsConnected) return;
+    dashboardTriggerEventLaneFallback(reason || 'legacy WebSocket did not connect');
+  }, DASHBOARD_LEGACY_WS_FALLBACK_MS);
+}
+
+// Promote the tunnel to event lane now (watchdog expiry, or an intent
+// send that found no open lane). Idempotent; safe to call eagerly.
+function dashboardTriggerEventLaneFallback(reason) {
+  if (!dashboardLegacyWsPostureApplies() || dashboardLegacyWsConnected) return false;
+  if (!window.RTCPeerConnection) {
+    setConnectEventStatus('err',
+      'No dashboard event lane: this browser could not open the WebSocket and has no WebRTC');
+    return false;
+  }
+  if (!dashboardControlAutoFallback) {
+    dashboardControlAutoFallback = true;
+    console.info('[dashboard-control] legacy /ws unavailable — promoting the control tunnel to event lane:', reason);
+  }
+  // Already carrying events (the localStorage opt-in started it at boot):
+  // nothing to start — the promotion above re-labels it primary.
+  if (dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive) {
+    setConnectEventStatus('ok', 'Dashboard events are live through the control tunnel');
+    return true;
+  }
+  scheduleDashboardConnectReconnect(reason || 'legacy WebSocket unavailable', { delayMs: 0 });
+  return true;
+}
+
+// One question, one answer: "can an intent sent right now reach the
+// daemon?" — either lane counts.
+function dashboardEventLaneUp() {
+  if (dashboardLegacyWsConnected) return true;
+  return Boolean(dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive);
+}
+
+// QA/debug readback (window.qa.daemonApi() and DashboardTransport.status()
+// fold this in).
+function dashboardEventLaneQa() {
+  return {
+    legacyWsConnected: dashboardLegacyWsConnected,
+    autoFallback: dashboardControlAutoFallback,
+    watchdogArmed: Boolean(dashboardLegacyWsWatchdog),
+    tunnelEventsActive: Boolean(dashboardControlEventsActive),
+  };
 }
 
 // Human wording for the active primary event lane, used by the reconnect
@@ -750,13 +856,14 @@ class DashboardTransport {
 
   status() {
     const reconnect = dashboardConnectReconnectStatus();
-    return dashboardControlTransport?.debugStatus() || {
+    const base = dashboardControlTransport?.debugStatus() || {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
       lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
+    return { ...base, lane: dashboardEventLaneQa() };
   }
 
   canUseRpc() {

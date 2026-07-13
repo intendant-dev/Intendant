@@ -441,13 +441,13 @@ class DisplaySlot {
 
   sendLegacyDisplaySignal(payload) {
     if (!app) return false;
+    // Refused-send contract (see sendRawMessage): only an explicit false
+    // means the frame never reached an open /ws.
     if (app.send_raw) {
-      app.send_raw(JSON.stringify(payload));
-      return true;
+      return app.send_raw(JSON.stringify(payload)) !== false;
     }
     if (app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      return app.send_server_action(payload) !== false;
     }
     return false;
   }

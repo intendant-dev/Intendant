@@ -722,8 +722,16 @@ function beginNewSessionSpawnNotice(task, text, name = '') {
     newSessionSpawnTask = '';
     newSessionSpawnName = '';
     setNewSessionStartButtonPending(false);
-    setNewSessionSpawnNotice('warn', 'No start confirmation yet. Check the Activity log before retrying.');
-    showControlToast('info', 'No new-session start confirmation yet.');
+    // Blame the transport when it is actually down — "check the Activity
+    // log" is a dead end while no event lane exists to have delivered
+    // anything to the daemon in the first place.
+    const laneDown = typeof dashboardEventLaneUp === 'function' && !dashboardEventLaneUp();
+    setNewSessionSpawnNotice('warn', laneDown
+      ? 'No start confirmation — the dashboard has no live event connection (reconnecting), so the request may not have reached the daemon. Retry once the connection is back.'
+      : 'No start confirmation yet. Check the Activity log before retrying.');
+    showControlToast('info', laneDown
+      ? 'No start confirmation — dashboard event connection is down.'
+      : 'No new-session start confirmation yet.');
   }, NEW_SESSION_SPAWN_TIMEOUT_MS);
 }
 

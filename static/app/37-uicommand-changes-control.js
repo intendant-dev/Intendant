@@ -1234,7 +1234,17 @@ function dispatchControlMsg(payload) {
     return;
   }
   if (app && app.send_server_action) {
-    app.send_server_action(payload);
+    // Refused-send contract (see dispatchSessionControlMsg): only an
+    // explicit false means the frame never reached an open /ws.
+    if (app.send_server_action(payload) === false) {
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'control'} intent found no open event lane`);
+      }
+      console.warn('control pane: no open event lane, refused', action || payload);
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Dashboard control connection is down — reconnecting. Retry in a moment.');
+      }
+    }
   } else {
     console.warn('control pane: no app connection, dropped', payload);
   }
