@@ -4,6 +4,59 @@ import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 import stationInit, { StationWeb } from '/wasm-station/station_web.js';
 import * as THREE from '/three.module.min.js';
 
+// ── Build stamp / stale-tab reload nudge ──
+//
+// Minted by app-html-assembler (sha256 over the manifest-ordered raw
+// fragment bytes, first 16 hex chars). The daemon extracts the same value
+// from its embedded artifact and serves it in /config, so a tab whose
+// stamp differs is a dashboard from an OLDER served bundle — after a
+// daemon upgrade, tabs left open would otherwise keep running old code
+// against the new daemon indefinitely (the "stale photograph" multi-tab
+// failure class).
+const INTENDANT_APP_BUILD = '__INTENDANT_APP_BUILD__';
+
+let staleBuildNudged = false;
+function maybeNudgeStaleBuild(serverBuild) {
+  const server = String(serverBuild || '').trim();
+  // No signal (stampless daemon or config fetch without the field) is
+  // never a mismatch; a placeholder-carrying page (fragment served raw in
+  // dev) can't compare either.
+  if (!server || INTENDANT_APP_BUILD.startsWith('__')) return;
+  if (server === INTENDANT_APP_BUILD || staleBuildNudged) return;
+  staleBuildNudged = true;
+  console.info(`[dashboard] daemon serves build ${server}; this tab runs ${INTENDANT_APP_BUILD} — reload to update`);
+  // A draft in the composer must never be reload-clobbered; hidden tabs
+  // with nothing in flight self-heal invisibly.
+  const reloadSafe = () =>
+    !(document.getElementById('new-session-input')?.value || '').trim();
+  if (document.hidden && reloadSafe()) {
+    location.reload();
+    return;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'ui-stale-build-banner';
+  const text = document.createElement('span');
+  text.textContent = 'The daemon updated — this dashboard is from an older build.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reload';
+  btn.addEventListener('click', () => location.reload());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && reloadSafe()) location.reload();
+  });
+}
+
+// QA readback (window.qa convention) + one explicit test hook: the build
+// stamp and nudge state are module-scoped, and the mismatch path can only
+// be exercised for real by building a second bundle — the hook lets the
+// lane-verify harness drive it with a synthetic server stamp instead.
+window.qa = Object.assign(window.qa || {}, {
+  buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
+});
+
 // ── Legacy federation auth compatibility ──
 //
 // When the daemon's `[server.auth] bearer_token` is set, federation

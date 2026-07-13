@@ -17,13 +17,18 @@ pub fn build_config(
     ice_config: crate::display::IceConfig,
     federation_allow_h264: bool,
 ) -> WebGatewayConfig {
-    build_config_inner(
+    let mut config = build_config_inner(
         live_provider,
         live_model,
         transcription_enabled,
         ice_config.ice_servers,
         federation_allow_h264,
-    )
+    );
+    // Stamped once here — the /config route and the tunnel `config` RPC both
+    // serve this instance, so every lane reports the same served-bundle
+    // build and stale tabs can nudge themselves to reload.
+    config.app_build = super::static_assets::app_build().to_string();
+    config
 }
 
 // ---------------------------------------------------------------------------

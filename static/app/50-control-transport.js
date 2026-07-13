@@ -161,14 +161,16 @@ class DashboardControlTransport {
   }
 
   scheduleReconnect(reason, options = {}) {
-    // Reconnect whenever this tunnel is the PRIMARY event lane: hosted
-    // Connect dashboards and the macOS-app mTLS posture (where the legacy
-    // WebSocket can never connect, so a dropped tunnel would otherwise
-    // kill events until app relaunch). The localStorage webrtc-control
-    // opt-in keeps the legacy /ws lane as primary and stays out of this
-    // path. suppressReconnect marks explicit closes (user disable,
+    // Reconnect whenever this tunnel is WANTED: the primary event lane
+    // (hosted Connect, the macOS-app mTLS posture, the capability
+    // fallback — losing the tunnel there means losing events entirely)
+    // or the explicit localStorage webrtc-control opt-in (the /ws still
+    // carries events, but a lane the user asked for must self-heal
+    // rather than sit dead behind a permanently red chip). Reconnect
+    // status only narrates on the primary-event chip when the tunnel is
+    // that lane. suppressReconnect marks explicit closes (user disable,
     // deliberate teardown before a replacement connect).
-    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardControlTunnelIsPrimaryEventLane()) return;
+    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardControlTunnelWanted()) return;
     scheduleDashboardConnectReconnect(reason, options);
   }
 

@@ -85,6 +85,14 @@ function setConnectEventStatus(kind, title) {
   if (kind === 'ok') clearServerWebSocketErrorStatus();
 }
 
+// Cross-fragment predicate for the visibility quiescence in
+// 49-daemons-multihost.js: a hidden tab with a live voice session is doing
+// real work and must keep its transports healing; `modelConnected` is
+// module-scoped here, so the closure exports the one bit that matters.
+function dashboardVoiceIsLive() {
+  return typeof modelConnected !== 'undefined' && !!modelConnected;
+}
+
 function hideVoiceStatus() {
   document.getElementById('voiceStatus').classList.add('hidden');
 }

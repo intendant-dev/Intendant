@@ -614,7 +614,7 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
   else window.location.href = accessHomeHref('daemons');
 });
 document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
-document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => routeTo('access', 'diagnostics'));
+document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => openConnectionDiagnostics());
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
