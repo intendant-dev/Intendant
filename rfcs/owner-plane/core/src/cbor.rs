@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 pub enum Value {
     /// E1: integers are unsigned unless a shape states otherwise.
     Uint(u64),
+    /// CDDL `bool` — simple values 20/21 (E4 excludes only
+    /// null/undefined/tags/floats).
+    Bool(bool),
     Bytes(Vec<u8>),
     Text(String),
     Array(Vec<Value>),
@@ -64,6 +67,7 @@ fn header(major: u8, arg: u64, out: &mut Vec<u8>) {
 fn encode_into(v: &Value, depth: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     match v {
         Value::Uint(n) => header(0, *n, out),
+        Value::Bool(b) => out.push(if *b { 0xf5 } else { 0xf4 }),
         Value::Bytes(b) => {
             header(2, b.len() as u64, out);
             out.extend_from_slice(b);
@@ -151,6 +155,13 @@ mod tests {
         ] {
             assert_eq!(hex(&encode(&Value::Uint(n)).unwrap()), want, "n={n}");
         }
+    }
+
+    #[test]
+    fn bools_pinned() {
+        // RFC 8949 appendix A: false = f4, true = f5.
+        assert_eq!(hex(&encode(&Value::Bool(false)).unwrap()), "f4");
+        assert_eq!(hex(&encode(&Value::Bool(true)).unwrap()), "f5");
     }
 
     #[test]
