@@ -100,6 +100,140 @@ pub mod ecdsa_p256 {
     }
 }
 
+/// HPKE recipient wrap `hpke-p256-v1` (§2.1): RFC 9180 base mode,
+/// DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
+///
+/// Deterministic minting: the ephemeral keypair derives from ONE named
+/// 32-byte vector draw via RFC 9180 `DeriveKeyPair` — `seal` feeds the
+/// draw through an adapter that panics on any other consumption
+/// pattern, so a dependency behavior change fails loudly instead of
+/// shipping unportable fixtures.
+pub mod hpke_wrap {
+    use hpke::aead::AesGcm256;
+    use hpke::kdf::HkdfSha256;
+    use hpke::kem::DhP256HkdfSha256;
+    use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
+
+    type Kem = DhP256HkdfSha256;
+
+    /// Serves exactly one pre-named draw to the hpke crate, then
+    /// panics — the drift alarm for the "seal = one 32-byte ephemeral
+    /// ikm draw" portability contract.
+    struct IkmRng {
+        bytes: Vec<u8>,
+        consumed: usize,
+    }
+
+    impl IkmRng {
+        fn new(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                consumed: 0,
+            }
+        }
+        fn fully_consumed(&self) -> bool {
+            self.consumed == self.bytes.len()
+        }
+    }
+
+    // rand_core 0.10: implementing infallible `TryRng` + the
+    // `TryCryptoRng` marker makes the `Rng`/`CryptoRng` blankets apply.
+    impl rand_core::TryRng for IkmRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut b = [0u8; 4];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut b = [0u8; 8];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            let end = self.consumed + dst.len();
+            assert!(
+                end <= self.bytes.len(),
+                "hpke drew more than the named ikm draw ({} > {} bytes): \
+                 the ephemeral-derivation contract changed",
+                end,
+                self.bytes.len()
+            );
+            dst.copy_from_slice(&self.bytes[self.consumed..end]);
+            self.consumed = end;
+            Ok(())
+        }
+    }
+    impl rand_core::TryCryptoRng for IkmRng {}
+
+    /// RFC 9180 `DeriveKeyPair` for DHKEM(P-256): 32-byte ikm →
+    /// (scalar bytes, SEC1-uncompressed public key).
+    pub fn derive_keypair(ikm: &[u8; 32]) -> ([u8; 32], [u8; 65]) {
+        let (sk, pk) = <Kem as KemTrait>::derive_keypair(ikm);
+        let sk: [u8; 32] = sk.to_bytes().as_slice().try_into().expect("32-byte scalar");
+        let pk: [u8; 65] = pk
+            .to_bytes()
+            .as_slice()
+            .try_into()
+            .expect("SEC1 uncompressed");
+        (sk, pk)
+    }
+
+    /// Base-mode single-shot seal; the ephemeral keypair =
+    /// `DeriveKeyPair(eph_ikm)`. Returns `(enc, ciphertext ‖ tag)` —
+    /// for a 32-byte KEK plaintext that is the kekwrap's
+    /// `(enc: 65 B, ct: 48 B)`. `None` = malformed recipient key
+    /// (`key-malformed`).
+    pub fn seal(
+        pk_recip_sec1: &[u8; 65],
+        info: &[u8],
+        aad: &[u8],
+        pt: &[u8],
+        eph_ikm: &[u8; 32],
+    ) -> Option<([u8; 65], Vec<u8>)> {
+        let pk = <Kem as KemTrait>::PublicKey::from_bytes(pk_recip_sec1).ok()?;
+        let mut rng = IkmRng::new(eph_ikm);
+        let (enc, ct) = hpke::single_shot_seal_with_rng::<AesGcm256, HkdfSha256, Kem>(
+            &OpModeS::Base,
+            &pk,
+            info,
+            pt,
+            aad,
+            &mut rng,
+        )
+        .ok()?;
+        assert!(
+            rng.fully_consumed(),
+            "hpke drew fewer bytes than the named ikm draw: \
+             the ephemeral-derivation contract changed"
+        );
+        let enc: [u8; 65] = enc.to_bytes().as_slice().try_into().expect("SEC1 enc");
+        Some((enc, ct))
+    }
+
+    /// Base-mode single-shot open. `None` covers malformed keys and
+    /// AEAD failure alike — shape code maps the outcome.
+    pub fn open(
+        sk_recip: &[u8; 32],
+        enc: &[u8],
+        info: &[u8],
+        aad: &[u8],
+        ct_and_tag: &[u8],
+    ) -> Option<Vec<u8>> {
+        let sk = <Kem as KemTrait>::PrivateKey::from_bytes(sk_recip).ok()?;
+        let enc = <Kem as KemTrait>::EncappedKey::from_bytes(enc).ok()?;
+        hpke::single_shot_open::<AesGcm256, HkdfSha256, Kem>(
+            &OpModeR::Base,
+            &sk,
+            &enc,
+            info,
+            ct_and_tag,
+            aad,
+        )
+        .ok()
+    }
+}
+
 /// AES-256-GCM content AEAD (`a256gcm`): 32-byte key, 12-byte nonce,
 /// detached use per the §3 shapes — this module returns/consumes
 /// `ciphertext ‖ tag(16)` as one buffer; shape code slices per CDDL.
@@ -285,6 +419,87 @@ mod tests {
         );
         // Tampered AAD fails closed.
         assert_eq!(aead::open(&key, &nonce, b"x", &sealed), None);
+    }
+
+    #[test]
+    fn rfc9180_p256_aes256gcm_base_mode_vector() {
+        // The official CFRG test vector for EXACTLY the suite-v1 wrap
+        // ciphersuite: mode 0 (base), kem 0x0010 DHKEM(P-256,
+        // HKDF-SHA256), kdf 0x0001, aead 0x0002 AES-256-GCM
+        // (draft-irtf-cfrg-hpke test-vectors.json; the RFC's appendix
+        // prints only the AES-128 member of this KEM family). Pins
+        // DeriveKeyPair, the one-draw ephemeral path, and the
+        // info/aad argument wiring.
+        let ikm_e: [u8; 32] =
+            unhex("a90d3417c3da9cb6c6ae19b4b5dd6cc9529a4cc24efb7ae0ace1f31887a8cd6c")
+                .try_into()
+                .unwrap();
+        let ikm_r: [u8; 32] =
+            unhex("a0ce15d49e28bd47a18a97e147582d814b08cbe00109fed5ec27d1b4e9f6f5e3")
+                .try_into()
+                .unwrap();
+        let info = unhex("4f6465206f6e2061204772656369616e2055726e");
+        let aad = unhex("436f756e742d30");
+        let pt = unhex("4265617574792069732074727574682c20747275746820626561757479");
+
+        let (sk_r, pk_r) = hpke_wrap::derive_keypair(&ikm_r);
+        assert_eq!(
+            hex(&sk_r),
+            "317f915db7bc629c48fe765587897e01e282d3e8445f79f27f65d031a88082b2"
+        );
+        assert_eq!(
+            hex(&pk_r),
+            "04abc7e49a4c6b3566d77d0304addc6ed0e98512ffccf505e6a8e3eb25c685136f\
+             853148544876de76c0f2ef99cdc3a05ccf5ded7860c7c021238f9e2073d2356c"
+        );
+
+        let (enc, ct) = hpke_wrap::seal(&pk_r, &info, &aad, &pt, &ikm_e).unwrap();
+        assert_eq!(
+            hex(&enc),
+            "04c06b4f6bebc7bb495cb797ab753f911aff80aefb86fd8b6fcc35525f3ab5f03e\
+             0b21bd31a86c6048af3cb2d98e0d3bf01da5cc4c39ff5370d331a4f1f7d5a4e0"
+        );
+        assert_eq!(
+            hex(&ct),
+            "58c61a45059d0c5704560e9d88b564a8b63f1364b8d1fcb3c4c6ddc1d2917424\
+             65e902cd216f8908da49f8f96f"
+        );
+        assert_eq!(
+            hpke_wrap::open(&sk_r, &enc, &info, &aad, &ct).as_deref(),
+            Some(&pt[..])
+        );
+    }
+
+    #[test]
+    fn hpke_wrap_kekwrap_shape_and_failure_modes() {
+        let (sk_r, pk_r) = hpke_wrap::derive_keypair(&[5u8; 32]);
+        let kek = [0x42u8; 32];
+        let (enc, ct) = hpke_wrap::seal(&pk_r, b"info", b"aad", &kek, &[6u8; 32]).unwrap();
+        // The kekwrap CDDL sizes: enc 65 B, ct 48 B (32-byte KEK + tag).
+        assert_eq!(enc.len(), 65);
+        assert_eq!(ct.len(), 48);
+        // Deterministic given the same draw; distinct under another.
+        let again = hpke_wrap::seal(&pk_r, b"info", b"aad", &kek, &[6u8; 32]).unwrap();
+        assert_eq!((enc, ct.clone()), again);
+        let other = hpke_wrap::seal(&pk_r, b"info", b"aad", &kek, &[7u8; 32]).unwrap();
+        assert_ne!(enc, other.0);
+        // Open fails closed on wrong aad/info/key or tampered bytes.
+        assert_eq!(
+            hpke_wrap::open(&sk_r, &enc, b"info", b"aad", &ct).as_deref(),
+            Some(&kek[..])
+        );
+        assert!(hpke_wrap::open(&sk_r, &enc, b"info", b"x", &ct).is_none());
+        assert!(hpke_wrap::open(&sk_r, &enc, b"x", b"aad", &ct).is_none());
+        let (sk_other, _) = hpke_wrap::derive_keypair(&[8u8; 32]);
+        assert!(hpke_wrap::open(&sk_other, &enc, b"info", b"aad", &ct).is_none());
+        let mut bad = ct.clone();
+        bad[0] ^= 1;
+        assert!(hpke_wrap::open(&sk_r, &enc, b"info", b"aad", &bad).is_none());
+        // Malformed recipient keys refuse to seal (key-malformed).
+        let mut off_curve = pk_r;
+        off_curve[64] ^= 1;
+        assert!(hpke_wrap::seal(&off_curve, b"info", b"aad", &kek, &[6u8; 32]).is_none());
+        assert!(hpke_wrap::seal(&[0u8; 65], b"info", b"aad", &kek, &[6u8; 32]).is_none());
     }
 
     #[test]
