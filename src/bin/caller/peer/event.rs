@@ -104,6 +104,19 @@ pub enum PeerEvent {
         update: TaskUpdate,
     },
 
+    /// Delivery receipt for a task delegated *to* this peer: the peer
+    /// accepted (dispatched) the delegation identified by
+    /// `delegation_id` and `task` is the peer's real local identity for
+    /// it (its session id, for Intendant peers). The per-peer actor
+    /// folds these into a bounded ledger that
+    /// [`crate::peer::handle::PeerHandle::delegate_task`] awaits to
+    /// resolve at-least-once delivery; repeats for the same
+    /// `delegation_id` (receiver-side dedup re-acks) are idempotent.
+    TaskReceipt {
+        delegation_id: String,
+        task: TaskId,
+    },
+
     // ---- Approval flow (federated) ----
     /// Peer wants to do something that requires approval. May be forwarded
     /// to a human via the local presence layer or auto-resolved by policy.

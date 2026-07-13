@@ -94,10 +94,23 @@ pub async fn delegate_task_json(
         client_correlation_id: None,
     };
     match handle.delegate_task(task).await {
-        Ok(task_id) => serde_json::json!({
+        Ok(delegation) => serde_json::json!({
             "ok": true,
-            "task_id": task_id.0,
-            "note": "the peer's agent executes this under its own autonomy and approval policy",
+            "task_id": delegation.task_id.0,
+            "delegation_id": delegation.delegation_id,
+            // "acknowledged": the peer confirmed acceptance and task_id
+            // is its real session id. "unconfirmed": fire-and-forget
+            // fallback (older peer build, or the link kept dropping
+            // before an ack) — task_id is a sender-side marker only.
+            "delivery": if delegation.confirmed { "acknowledged" } else { "unconfirmed" },
+            // StartTask frames written (>1 = re-sent across a reconnect).
+            "sends": delegation.sends,
+            "note": if delegation.confirmed {
+                "accepted by the peer; its agent executes this under its own autonomy and approval policy"
+            } else {
+                "the peer did not acknowledge receipt (pre-receipt build or unstable link); \
+                 delivery is fire-and-forget and the task id is a local marker"
+            },
         })
         .to_string(),
         Err(err) => error_json(err.to_string()),

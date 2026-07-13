@@ -283,7 +283,40 @@ shapes with identical semantics:
 label, connection state, capabilities, and the folded per-peer `sessions`
 and `displays` rails above. `peer_send_message` (`peer_id`, `message`, optional `session`)
 sends a message to the peer's agent. `peer_delegate_task` (`peer_id`,
-`instructions`, optional `context`) delegates a task and returns a `task_id`.
+`instructions`, optional `context`) delegates a task and returns a `task_id`
+plus a `delivery` verdict (below).
+
+### Delegation delivery receipts (at-least-once)
+
+A StartTask write proves only that the frame entered the sender's socket —
+the `/ws` control plane echoes nothing back — so delivery is resolved at the
+application level. Every delegation stamps its StartTask frame with a
+`delegation_id`; a receiving daemon that **dispatches** the task (not merely
+reads the frame) answers with a broadcast `task_received` event carrying that
+id and its real local session id, and the sender's `delegate_task` waits
+(bounded) for the correlated receipt:
+
+- **`delivery: "acknowledged"`** — the peer accepted: `task_id` is the peer's
+  real session id, so the id `ctl peer task` prints means "accepted by the
+  peer" and is actionable for follow-ups.
+- **Connection drops before an ack** — the sender re-sends the **same**
+  `delegation_id` a bounded number of times after the actor reconnects; the
+  receiver dedups by that id and re-acks with the *original* session instead
+  of starting a duplicate task (at-least-once with dedup).
+- **`delivery: "unconfirmed"`** — the connection stayed up for the whole
+  grace window with no ack: the old-receiver signature (pre-receipt builds
+  run the task but never ack). The sender falls back to the historical
+  fire-and-forget semantics — synthetic `task-out-{n}` id, clearly marked —
+  and deliberately does **not** re-send, because an old receiver has no
+  dedup and a re-send would duplicate the task.
+
+Responses also carry the `delegation_id` (pass it back as
+`client_correlation_id` to retry a delegation idempotently) and `sends` (how
+many StartTask frames were written; >1 means a reconnect re-send happened).
+Receipts are informational and carry no authority — the receiving daemon's
+IAM evaluates the StartTask exactly as before. The precise wire shapes and
+the old/new compatibility matrix live in the module docs of
+`peer/transport/intendant.rs`.
 
 Delegation keeps the sibling-not-subordinate contract: a delegated task
 executes on the peer's machine, by the peer's own agent, under the peer's own

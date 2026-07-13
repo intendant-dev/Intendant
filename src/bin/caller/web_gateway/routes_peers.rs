@@ -2248,7 +2248,20 @@ pub(crate) async fn peers_delegate_task(
         Err(resp) => return resp,
     };
     match handle.delegate_task(task).await {
-        Ok(task_id) => (200, serde_json::json!({"task_id": task_id.0}).to_string()),
+        // `delivery` distinguishes a peer-acknowledged dispatch
+        // ("acknowledged": task_id is the peer's real session id) from
+        // the fire-and-forget fallback ("unconfirmed": older peer or
+        // repeatedly dropped link; task_id is a sender-side marker).
+        Ok(delegation) => (
+            200,
+            serde_json::json!({
+                "task_id": delegation.task_id.0,
+                "delegation_id": delegation.delegation_id,
+                "delivery": if delegation.confirmed { "acknowledged" } else { "unconfirmed" },
+                "sends": delegation.sends,
+            })
+            .to_string(),
+        ),
         Err(e) => peer_error_response(e),
     }
 }
@@ -2407,6 +2420,8 @@ pub(crate) async fn coordinator_route(
             serde_json::json!({
                 "peer_id": routed.peer_id.as_str(),
                 "task_id": routed.task_id.0,
+                "delegation_id": routed.delegation_id,
+                "delivery": if routed.confirmed { "acknowledged" } else { "unconfirmed" },
             })
             .to_string(),
         ),

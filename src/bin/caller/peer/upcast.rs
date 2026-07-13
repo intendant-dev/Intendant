@@ -51,7 +51,7 @@ use crate::event::AppEvent;
 use crate::peer::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, Capability,
     LogLevel, MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
-    PeerStatus, SessionInfo, UsageSnapshot,
+    PeerStatus, SessionInfo, TaskId, UsageSnapshot,
 };
 use crate::types::OutboundEvent;
 
@@ -919,6 +919,24 @@ impl AppEventUpcaster {
                 LogLevel::Info,
                 "session",
                 format!("session attached: {} ({})", session_id, source),
+            )],
+
+            // This daemon acknowledged an inbound peer delegation.
+            // Narrate on the log rail only — the receipt's correlation
+            // job happens on the *delegating* side (its wire upcaster
+            // maps `OutboundEvent::TaskReceived` to
+            // `PeerEvent::TaskReceipt`); locally the accepted task
+            // already narrates itself via SessionStarted.
+            AppEvent::TaskReceived {
+                delegation_id,
+                session_id,
+            } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!(
+                    "accepted delegated task {} as session {}",
+                    delegation_id, session_id
+                ),
             )],
 
             AppEvent::SessionEnded {
@@ -2300,6 +2318,19 @@ impl WireEventUpcaster {
                 "session",
                 format!("session attached: {} ({})", session_id, source),
             )],
+
+            // Peer-delegation delivery receipt: the peer accepted a
+            // task this side delegated and names its local session for
+            // it. Upcast 1:1 so the per-peer actor can fold it into the
+            // bounded receipt ledger `PeerHandle::delegate_task` awaits
+            // (and so peers.jsonl keeps the durable acceptance record).
+            OutboundEvent::TaskReceived {
+                delegation_id,
+                session_id,
+            } => vec![PeerEvent::TaskReceipt {
+                delegation_id: delegation_id.clone(),
+                task: TaskId(session_id.clone()),
+            }],
 
             OutboundEvent::SessionEnded {
                 session_id, reason, ..

@@ -162,6 +162,7 @@ pub fn spawn_event_listener(
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
+                    | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionRenameResult { .. }

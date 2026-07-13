@@ -44,24 +44,12 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(180);
 /// suite's wall-clock cost is bounded by how fast the waits *succeed*, not
 /// by this deadline, so be generous. (The Windows leg blew even 240s on the
 /// task-completion wait on 2026-07-12; that incident's likely mechanism — a
-/// lost fire-and-forget StartTask — is addressed structurally with an
-/// arrival gate plus one re-delegation, see [`PEER_TASK_ARRIVAL_GRACE`],
-/// rather than by inflating this bound.)
+/// StartTask lost to a fire-and-forget wire — is now fixed at the product
+/// level: delegation resolves through an application delivery receipt with
+/// at-least-once re-send + receiver dedup, so by the time `ctl peer task`
+/// reports `delivery: "acknowledged"` the task is dispatched on B and this
+/// deadline only covers the scripted run itself.)
 const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
-
-/// Grace window for a delegated peer task to *arrive* on the receiving
-/// daemon: session launch writes "[runtime] Task dispatched: <task>" into
-/// its session.jsonl before any model turn runs, so arrival needs only the
-/// StartTask frame crossing loopback plus a session launch — much less than
-/// the full scripted run [`PEER_WAIT_TIMEOUT`] budgets for. When this
-/// window closes with no trace of the task on the peer, the delegation is
-/// treated as lost in flight (the /ws control plane is fire-and-forget; the
-/// task id `ctl peer task` prints is minted by the *sender* after the WS
-/// write, so it never proves receipt) and the test re-delegates once.
-/// Guessing wrong on a merely-slow runner is harmless: the mock provider
-/// matches profiles per session, so a duplicate delegation just runs the
-/// same scripted steps in a second session.
-const PEER_TASK_ARRIVAL_GRACE: Duration = Duration::from_secs(60);
 
 fn intendant_bin() -> &'static str {
     // Referencing the runtime binary's env var makes Cargo build it too —
@@ -250,21 +238,30 @@ impl DaemonRig {
     }
 
     /// Tail of the daemon's durable federated peer-event record
-    /// (`.intendant/logs/peers.jsonl` under the isolated home; see
-    /// `peer::spawn_peer_log_writer`), for failure context: connection
+    /// (`peers.jsonl`; see `peer::spawn_peer_log_writer`), for failure
+    /// context AND for the delivery-receipt assertion: connection
     /// transitions and delegation-time activity live here, on the
     /// *sending* daemon, where a lost cross-daemon message leaves its
-    /// only trace.
+    /// only trace. The file lives in the daemon's *session* log dir —
+    /// `build_and_hydrate_peer_registry(log_dir, …)` is called with the
+    /// daemon session's directory (startup/wiring.rs), not the logs
+    /// root — so scan every session dir like [`TestRig::session_logs`]
+    /// does. (This helper originally read a flat
+    /// `.intendant/logs/peers.jsonl` that nothing writes, so the
+    /// forensics rail dumped empty; the receipt assertion made that
+    /// visible.)
     fn peer_log_tail(&self) -> String {
-        let path = self
-            .rig
-            .home
-            .path()
-            .join(".intendant")
-            .join("logs")
-            .join("peers.jsonl");
-        let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        tail(&contents, 4000)
+        let logs_dir = self.rig.home.path().join(".intendant").join("logs");
+        let mut combined = String::new();
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                if let Ok(contents) = std::fs::read_to_string(entry.path().join("peers.jsonl")) {
+                    combined.push_str(&contents);
+                    combined.push('\n');
+                }
+            }
+        }
+        tail(&combined, 4000)
     }
 }
 
@@ -2210,7 +2207,15 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         text_of(&list)
     );
 
-    // Delegate a task to B through A; the command must print a task id.
+    // Delegate a task to B through A. Delegation now resolves through the
+    // application-level delivery receipt (`delegation_id` on the StartTask
+    // frame; B acks with `task_received` when it actually dispatches):
+    // `delivery: "acknowledged"` means the task is running on B and
+    // `task_id` is B's real session id — not the sender-minted
+    // `task-out-{n}` marker of the fire-and-forget era. A StartTask lost
+    // before B reads it is re-sent under the same delegation id and B
+    // dedups, so this test's former arrival gate + one-shot re-delegation
+    // is retired: the product owns the retry now.
     let instructions = format!("{TASK_MARK} - run the scripted delegated steps");
     let task = ctl(&a, &["peer", "task", &peer_id, &instructions]).await;
     assert!(task.status.success(), "{}", text_of(&task));
@@ -2218,57 +2223,67 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     let task_id = task_json
         .get("task_id")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !task_id.is_empty(),
         "ctl peer task did not print a task_id:\n{}",
         text_of(&task)
     );
-
-    // That task_id proves less than it looks like: it is minted on A
-    // *after* the StartTask frame enters A's socket (the /ws control plane
-    // is fire-and-forget — nothing echoes back from B; see
-    // `IntendantWsTransport::send` in src/bin/caller/peer/transport/
-    // intendant.rs). If the connection dies before B reads the frame, A's
-    // actor quietly reconnects with backoff but nothing re-sends the
-    // delegation — the completion wait below would then run out its whole
-    // deadline against a daemon that was never asked to do anything
-    // (Windows CI 2026-07-12: 240s blown by a tree that passes locally in
-    // ~6s). B's session launch writes "[runtime] Task dispatched: <task>"
-    // into session.jsonl before any model turn, so use that as the arrival
-    // signal: if it hasn't appeared within the grace window, re-confirm the
-    // connection and re-delegate once (harmless if the first delegation
-    // was merely slow — see PEER_TASK_ARRIVAL_GRACE).
-    let arrived = try_poll_until(PEER_TASK_ARRIVAL_GRACE, || {
-        let logs = b.rig.session_logs();
-        async move { logs.contains(TASK_MARK).then_some(()) }
-    })
-    .await
-    .is_some();
-    if !arrived {
-        eprintln!(
-            "delegated task shows no trace on daemon B after \
-             {PEER_TASK_ARRIVAL_GRACE:?}; treating the fire-and-forget \
-             StartTask as lost and re-delegating once"
-        );
-        poll_until(
-            "daemon A reporting peer B connected before re-delegating",
-            PEER_WAIT_TIMEOUT,
-            || {
-                let client = client.clone();
-                async move { connected_peer(&client, port_a).await }
-            },
-            &dump_daemons,
-        )
-        .await;
-        let retry = ctl(&a, &["peer", "task", &peer_id, &instructions]).await;
-        assert!(
-            retry.status.success(),
-            "re-delegating the peer task failed:\n{}\n{}",
-            text_of(&retry),
-            dump_daemons()
-        );
-    }
+    assert_eq!(
+        task_json.get("delivery").and_then(|v| v.as_str()),
+        Some("acknowledged"),
+        "peer delegation was not acknowledged by B:\n{}\n{}",
+        text_of(&task),
+        dump_daemons()
+    );
+    let delegation_id = task_json
+        .get("delegation_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !delegation_id.is_empty(),
+        "acknowledged delegation must report its delegation_id:\n{}",
+        text_of(&task)
+    );
+    assert!(
+        !task_id.starts_with("task-out-"),
+        "acknowledged delivery must carry B's session id, not the \
+         sender-side marker {task_id}:\n{}",
+        dump_daemons()
+    );
+    // The acknowledged id is real on B: its session log directory exists
+    // (created before dispatch, so by receipt time it must be on disk).
+    assert!(
+        b.rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(&task_id)
+            .join("session.jsonl")
+            .exists(),
+        "B has no session log for acknowledged session {task_id}:\n{}",
+        dump_daemons()
+    );
+    // And the receipt leaves a durable trace on A's federated peer-event
+    // record (`peers.jsonl`, the forensics rail dump_daemons reads). The
+    // actor writes it via the async log sink, so it may trail the ctl
+    // response by a beat — poll briefly.
+    poll_until(
+        "the task_receipt landing in daemon A's peers.jsonl",
+        Duration::from_secs(30),
+        || {
+            let tail = a.peer_log_tail();
+            let delegation_id = delegation_id.clone();
+            async move {
+                (tail.contains("task_receipt") && tail.contains(&delegation_id)).then_some(())
+            }
+        },
+        &dump_daemons,
+    )
+    .await;
 
     // B really ran it: only the TASK_MARK-matched profile emits the done
     // message, and the mock releases it only after the runtime's echo

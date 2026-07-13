@@ -113,7 +113,7 @@ pub use coordinator::{Coordinator, CoordinatorError, TaskRequest};
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
     MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent, PeerMessage,
-    PeerStatus, SessionInfo, UsageSnapshot, WebRtcSessionId, WebRtcSignal,
+    PeerStatus, SessionInfo, TaskId, UsageSnapshot, WebRtcSessionId, WebRtcSignal,
 };
 pub use handle::{ConnectionState, PeerHandle, PeerSnapshot};
 pub use id::PeerId;
