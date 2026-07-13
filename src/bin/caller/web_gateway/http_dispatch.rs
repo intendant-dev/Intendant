@@ -138,6 +138,7 @@ pub(crate) async fn serve_http_request(
                     && !is_fleet_cors_access_path(opt_path)
                     && !is_public_peer_access_request_path(request_line))
                     || opt_path == "/mcp"
+                    || is_connect_dashboard_signaling_path(opt_path)
             }
         };
         let fleet_scoped = matches!(
@@ -363,9 +364,10 @@ pub(crate) async fn serve_http_request(
     let request_origin = extract_origin_header(header_text);
     let mut fleet_cors_origin: Option<String> = None;
     if let Some(origin) = request_origin.as_deref().filter(|_| {
-        req_path.starts_with("/api/")
+        (req_path.starts_with("/api/")
             && !is_public_peer_access_request_path(request_line)
-            && !is_public_org_grant_path(request_line)
+            && !is_public_org_grant_path(request_line))
+            || is_connect_dashboard_signaling_path(req_path)
     }) {
         let own = is_own_or_app_origin(origin, is_tls, header_text);
         let fleet_allowed = !own
@@ -1201,6 +1203,15 @@ pub(crate) async fn serve_http_request(
             .await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
         use tokio::io::AsyncWriteExt;
+        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence or a verified mTLS client",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -1210,23 +1221,47 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response = with_public_cors(
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        let response = with_allowed_origin_cors(
             connect_dashboard_offer_response(
                 &dashboard_control,
                 &body_text,
                 &agent_card_value_for_targets,
+                grant,
             )
             .await,
+            request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
         use tokio::io::AsyncWriteExt;
+        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence or a verified mTLS client",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -1236,17 +1271,28 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response =
-            with_public_cors(connect_dashboard_ice_response(&dashboard_control, &body_text).await);
+        let response = with_allowed_origin_cors(
+            connect_dashboard_ice_response(&dashboard_control, &body_text).await,
+            request_origin.as_deref(),
+        );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
         use tokio::io::AsyncWriteExt;
+        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence or a verified mTLS client",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -1256,14 +1302,15 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response = with_public_cors(
+        let response = with_allowed_origin_cors(
             connect_dashboard_close_response(&dashboard_control, &body_text).await,
+            request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     // Route WASM binaries (need async write_all for large payloads)

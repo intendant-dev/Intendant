@@ -854,11 +854,9 @@ pub(crate) fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str
     false
 }
 
-/// The bootstrap surfaces that are *designed* for foreign-origin browsers:
-/// local Connect signaling (a page from a rendezvous origin negotiates a
-/// tunnel whose real authentication is the daemon-signed binding plus IAM)
-/// and the public peer-access doorbell. Their responses stay
-/// wildcard-readable; everything else is same-origin or fleet-echoed.
+/// Public doorbell responses stay wildcard-readable. Authority-bearing
+/// daemon signaling deliberately does not use this helper: those responses
+/// are same-origin (or signed-app-origin) only.
 pub(crate) fn with_public_cors(response: String) -> String {
     let Some(split) = response.find("\r\n\r\n") else {
         return response;
@@ -867,9 +865,22 @@ pub(crate) fn with_public_cors(response: String) -> String {
     format!("{head}\r\nAccess-Control-Allow-Origin: *{rest}")
 }
 
-/// Body cap for the public /connect/dashboard signaling arms (SDP offers
-/// and ICE batches stay far below this; the lane is reachable before any
-/// authentication, so it must never buffer unbounded input).
+/// Echo one already-validated browser origin on a hand-written response.
+/// Callers must run `is_own_or_app_origin` before passing an origin here.
+pub(crate) fn with_allowed_origin_cors(response: String, origin: Option<&str>) -> String {
+    let Some(origin) = origin else {
+        return response;
+    };
+    let Some(split) = response.find("\r\n\r\n") else {
+        return response;
+    };
+    let (head, rest) = response.split_at(split);
+    format!("{head}\r\nAccess-Control-Allow-Origin: {origin}\r\nVary: Origin{rest}")
+}
+
+/// Body cap for the direct /connect/dashboard signaling arms. SDP offers
+/// and ICE batches stay far below this; authentication must not turn a
+/// malformed request into an unbounded allocation.
 pub(crate) const CONNECT_SIGNALING_BODY_CAP_BYTES: usize = 256 * 1024;
 
 pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(

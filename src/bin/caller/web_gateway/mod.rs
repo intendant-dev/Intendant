@@ -2460,6 +2460,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn connect_dashboard_signaling_rejects_foreign_browser_origins() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = http_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed"),
+            "got: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "authority-bearing signaling must never be wildcard-CORS: {resp}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_dashboard_signaling_requires_client_cert_under_mtls() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = https_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("401 Unauthorized"), "got: {resp}");
+        assert!(
+            resp.contains("mTLS client certificate required"),
+            "got: {resp}"
+        );
+        handle.abort();
+    }
+
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
     // -----------------------------------------------------------------

@@ -147,13 +147,13 @@ pub(crate) fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
         return false;
     };
     let path = path.split('?').next().unwrap_or(path);
+    matches!(path, "/connect/bootstrap" | "/connect/status")
+}
+
+pub(crate) fn is_connect_dashboard_signaling_path(path: &str) -> bool {
     matches!(
         path,
-        "/connect/bootstrap"
-            | "/connect/status"
-            | "/connect/dashboard/offer"
-            | "/connect/dashboard/ice"
-            | "/connect/dashboard/close"
+        "/connect/dashboard/offer" | "/connect/dashboard/ice" | "/connect/dashboard/close"
     )
 }
 
@@ -537,13 +537,13 @@ mod tests {
         assert!(is_public_connect_bootstrap_path(
             "GET /connect/status?poll=1 HTTP/1.1"
         ));
-        assert!(is_public_connect_bootstrap_path(
+        assert!(!is_public_connect_bootstrap_path(
             "POST /connect/dashboard/offer HTTP/1.1"
         ));
-        assert!(is_public_connect_bootstrap_path(
+        assert!(!is_public_connect_bootstrap_path(
             "POST /connect/dashboard/ice HTTP/1.1"
         ));
-        assert!(is_public_connect_bootstrap_path(
+        assert!(!is_public_connect_bootstrap_path(
             "POST /connect/dashboard/close HTTP/1.1"
         ));
 
