@@ -608,3 +608,134 @@ html.ui-v2 #question-panel .question-free-text:focus {
 /* Inline command code rides the design mono, not the UA's generic
    monospace (chrome-audit cross-surface sweep). */
 html.ui-v2 code.log-command-code { font-family: var(--mono); }
+
+/* ── The working transcript: three tiers (overhaul 2026-07-13) ─────────
+   Prose (user + worker voice) keeps the base grammar. WORK (tool calls,
+   command output, diffs) gets a spine + mono so a glance separates what
+   the agent SAID from what it DID. META (session bookkeeping, steer
+   receipts) recedes to hairline annotations. Tags come from the entry's
+   own level/kind plus ui2TagEntriesIn — no DOM restructuring, so the
+   virtualizer, clone-and-rewire, and Station text readers are untouched. */
+
+/* — work tier: the spine — */
+html.ui-v2 .log-entry.level-agent,
+html.ui-v2 .log-entry.diff-log-entry {
+  position: relative;
+}
+html.ui-v2 .log-entry.level-agent::before,
+html.ui-v2 .log-entry.diff-log-entry::before {
+  content: '';
+  position: absolute;
+  left: 66px;               /* between the ts gutter (56px) and the dot column */
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--green) 32%, transparent);
+}
+/* tool-call rows read as commands: mono, quiet */
+html.ui-v2 .log-entry.level-agent:not(.command-output-group) .log-content {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+/* — command-output groups: named, chevroned, heartbeat — */
+html.ui-v2 .command-output-group .command-output-summary {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-command {
+  color: var(--text-2);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-detail { color: var(--text-3); }
+html.ui-v2 .command-output-group .command-output-summary .status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  align-self: center;
+  background: var(--green);
+  flex: none;
+}
+/* the live heartbeat: THE signal for "working right now" — one pulse,
+   nowhere else */
+html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+  background: var(--iris);
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+    animation: ui2-pulse 1.6s ease-in-out infinite;
+  }
+}
+html.ui-v2 .command-output-group .command-output-body {
+  display: block;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  overflow: hidden;
+}
+html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
+/* live groups are collapsible now too (v1 only ever hid finalized
+   bodies): a collapsed streaming group keeps receiving text off-screen */
+html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
+html.ui-v2 .command-output-group .command-output-pre {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* collapse affordances read as controls, not stray glyphs */
+html.ui-v2 .collapse-toggle {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 6px;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .log-entry:hover .collapse-toggle {
+  color: var(--text-2);
+  border-color: var(--line);
+  background: var(--hover-wash);
+}
+
+/* — meta tier: bookkeeping + steer receipts as hairline annotations — */
+html.ui-v2 .log-entry.ui2-meta {
+  padding: 1px 0;
+}
+html.ui-v2 .log-entry.ui2-meta .log-content {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  letter-spacing: .02em;
+}
+html.ui-v2 .log-entry.ui2-meta .log-icon { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-3); opacity: .55; }
+html.ui-v2 .log-entry.source-steer .log-level { color: var(--text-3); }
+
+/* the worker eyebrow names the backend (source string flows through
+   text-transform, so "Claude Code" reads CLAUDE CODE) — tint matches the
+   worker role */
+html.ui-v2 .log-entry.source-claude-code .log-level,
+html.ui-v2 .log-entry.source-codex .log-level,
+html.ui-v2 .log-entry.source-gemini .log-level { color: var(--iris-2); }
+html.ui-v2 .log-entry.source-claude-code.level-model .log-icon,
+html.ui-v2 .log-entry.source-codex.level-model .log-icon,
+html.ui-v2 .log-entry.source-gemini.level-model .log-icon { background: var(--iris); }

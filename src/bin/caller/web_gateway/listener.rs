@@ -1598,19 +1598,20 @@ pub fn spawn_web_gateway(
                             })
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
-                    let home_dir = crate::platform::home_dir();
                     for (session_id, source) in active_external_sessions {
-                        let wrapper_replay_is_current = replayed_external_session_ids
-                            .contains(&session_id)
-                            && replay_log_dir.as_ref().is_some_and(|log_dir| {
-                                !external_session_newer_than_wrapper(
-                                    &home_dir,
-                                    log_dir,
-                                    &source,
-                                    &session_id,
-                                )
-                            });
-                        if wrapper_replay_is_current {
+                        // Wrapper-covered sessions replay from the wrapper
+                        // log ONLY. The old mtime tiebreak re-sent the whole
+                        // external transcript whenever the backend's file
+                        // was momentarily newer — which is the steady state
+                        // (Claude Code flushes after the drain logs), so
+                        // every connect triple-rendered supervised sessions
+                        // (wrapper replay + external replay + hydration).
+                        // Pre-attach history for resumed sessions still
+                        // arrives via the window-hydration fetch, which
+                        // merges instead of re-replaying. This matches the
+                        // dashboard-control bootstrap lane, which never had
+                        // the mtime override.
+                        if replayed_external_session_ids.contains(&session_id) {
                             continue;
                         }
                         if let Some(replay) =

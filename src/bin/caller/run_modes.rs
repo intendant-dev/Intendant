@@ -371,100 +371,197 @@ pub(crate) async fn run_with_presence(
     }
 
     loop {
-        let signal = tokio::select! {
-            biased;
-            env = task_rx.recv() => match env {
-                Some(e) => OuterSignal::Task(e),
-                None => OuterSignal::Done,
-            },
-            msg = outer_bus_rx.recv() => match msg {
-                Ok(AppEvent::CodexThreadActionRequested {
-                    request_id,
-                    session_id,
-                    action,
-                    params,
-                    ..
-                }) if event_targets_external_session_or_side(
-                    &session_id,
-                    &local_session_id,
-                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
-                    &persistent_open_side_threads,
-                ) => {
-                    if !codex_thread_action_dedupe.mark_seen(&request_id) {
-                        continue;
-                    }
-                    OuterSignal::ThreadAction {
+        // Queued steers with no turn to ride (the backend finished before
+        // the queue drained, or a steer arrived while idle): synthesize an
+        // empty task — the send path prepends queued steers as `[User]`
+        // lines, so the flush IS the delivery. Mirrors
+        // run_external_agent_mode's idle-loop check; without it a queued
+        // steer sat in `context_injection` until the user happened to send
+        // another message.
+        let queued_steer_flush = persistent_agent.is_some()
+            && has_queued_steers_for_session(
+                &context_injection,
+                local_session_id.as_deref(),
+                persistent_thread
+                    .as_ref()
+                    .map(|thread| thread.thread_id.as_str()),
+            );
+        let signal = if queued_steer_flush {
+            OuterSignal::Task(presence::TaskEnvelope {
+                task: String::new(),
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+                steer_id: None,
+            })
+        } else {
+            tokio::select! {
+                biased;
+                env = task_rx.recv() => match env {
+                    Some(e) => OuterSignal::Task(e),
+                    None => OuterSignal::Done,
+                },
+                msg = outer_bus_rx.recv() => match msg {
+                    Ok(AppEvent::CodexThreadActionRequested {
+                        request_id,
                         session_id,
-                        op: action,
+                        action,
                         params,
+                        ..
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                            continue;
+                        }
+                        OuterSignal::ThreadAction {
+                            session_id,
+                            op: action,
+                            params,
+                        }
                     }
-                }
-                Ok(AppEvent::ConversationRollbackRequested {
-                    session_id,
-                    round_id,
-                    target_native_message_count,
-                    turns_to_drop,
-                }) if session_id.is_none()
-                    || event_targets_session(&session_id, &local_session_id) =>
-                {
-                    OuterSignal::ConversationRollback {
+                    Ok(AppEvent::ConversationRollbackRequested {
+                        session_id,
                         round_id,
                         target_native_message_count,
                         turns_to_drop,
+                    }) if session_id.is_none()
+                        || event_targets_session(&session_id, &local_session_id) =>
+                    {
+                        OuterSignal::ConversationRollback {
+                            round_id,
+                            target_native_message_count,
+                            turns_to_drop,
+                        }
                     }
-                }
-                Ok(AppEvent::InterruptRequested { session_id })
-                    if event_targets_session(&session_id, &local_session_id) =>
-                {
-                    // Drop idle interrupts so an old Stop action cannot
-                    // interrupt the next task that happens to start later.
-                    turn_bus_rx = bus.subscribe();
-                    continue;
-                }
-                Ok(AppEvent::FollowUpCancelRequested {
-                    session_id,
-                    id,
-                    reason,
-                }) if event_targets_external_session_or_side(
-                    &session_id,
-                    &local_session_id,
-                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
-                    &persistent_open_side_threads,
-                ) => {
-                    let status_session = session_id.as_deref().or(local_session_id.as_deref());
-                    record_cancelled_follow_up_id(
-                        &mut persistent_cancelled_follow_ups,
-                        &bus,
-                        status_session,
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_external_session_or_side(
+                            &session_id,
+                            &local_session_id,
+                            &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                            &persistent_open_side_threads,
+                        ) =>
+                    {
+                        // Drop idle interrupts so an old Stop action cannot
+                        // interrupt the next task that happens to start later.
+                        turn_bus_rx = bus.subscribe();
+                        continue;
+                    }
+                    // Idle steers: no turn to inject into, so queue for the
+                    // pre-select flush above — the steer becomes its own turn
+                    // immediately instead of vanishing into the `_` arm.
+                    // The handled-ids gate is load-bearing: this receiver is
+                    // SEPARATE from the turn drain's, so a steer the drain
+                    // already delivered mid-turn replays here at the next
+                    // idle select (broadcast fan-out) and would deliver
+                    // twice without it.
+                    Ok(AppEvent::SteerRequested {
+                        session_id,
+                        text,
                         id,
-                        &reason,
-                    );
-                    continue;
-                }
-                // Any other bus event: skip, keep selecting. Lagged /
-                // Closed also fall through — task_rx close is the
-                // authoritative "we're done" signal.
-                _ => continue,
-            },
-            // Agent events while idle: without this arm they would buffer
-            // until the next task's drain and complete it prematurely
-            // (async Claude Code sub-agents finish — and the CLI starts its
-            // notification turn — while the loop sits here).
-            maybe_event = async {
-                persistent_event_rx
-                    .as_mut()
-                    .expect("branch guarded by is_some")
-                    .recv()
-                    .await
-            }, if persistent_event_rx.is_some() => match maybe_event {
-                Some(event) => OuterSignal::IdleAgentEvent(Box::new(event)),
-                None => {
-                    // Reader task ended (agent process gone); disable the
-                    // arm — the next task recreates the agent.
-                    persistent_event_rx = None;
-                    continue;
-                }
-            },
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) && persistent_agent.is_some()
+                        && !steer_id_has_been_handled(&persistent_handled_steer_ids, &id) => {
+                        mark_steer_id_handled(&mut persistent_handled_steer_ids, &id);
+                        if let Ok(mut queue) = context_injection.lock() {
+                            queue.push(crate::event::ContextInjection::text_with_steer_id_for_target(
+                                text,
+                                id.clone(),
+                                local_session_id.clone(),
+                            ));
+                        }
+                        bus.send(AppEvent::SteerQueued {
+                            session_id: session_id.or_else(|| local_session_id.clone()),
+                            id,
+                            reason: "session is idle — sending as its own message now".to_string(),
+                        });
+                        continue;
+                    }
+                    Ok(AppEvent::SteerCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        let cancelled = cancel_queued_steers_for_session(
+                            &context_injection,
+                            &bus,
+                            local_session_id.as_deref(),
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str()),
+                            id.as_deref(),
+                            &reason,
+                        );
+                        if cancelled == 0 {
+                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                                bus.send(AppEvent::SteerCancelFailed {
+                                    session_id: session_id.or_else(|| local_session_id.clone()),
+                                    id,
+                                    reason: "nothing pending to clear — the message already delivered or converted to a follow-up".to_string(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(AppEvent::FollowUpCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        let status_session = session_id.as_deref().or(local_session_id.as_deref());
+                        record_cancelled_follow_up_id(
+                            &mut persistent_cancelled_follow_ups,
+                            &bus,
+                            status_session,
+                            id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    // Any other bus event: skip, keep selecting. Lagged /
+                    // Closed also fall through — task_rx close is the
+                    // authoritative "we're done" signal.
+                    _ => continue,
+                },
+                // Agent events while idle: without this arm they would buffer
+                // until the next task's drain and complete it prematurely
+                // (async Claude Code sub-agents finish — and the CLI starts its
+                // notification turn — while the loop sits here).
+                maybe_event = async {
+                    persistent_event_rx
+                        .as_mut()
+                        .expect("branch guarded by is_some")
+                        .recv()
+                        .await
+                }, if persistent_event_rx.is_some() => match maybe_event {
+                    Some(event) => OuterSignal::IdleAgentEvent(Box::new(event)),
+                    None => {
+                        // Reader task ended (agent process gone); disable the
+                        // arm — the next task recreates the agent.
+                        persistent_event_rx = None;
+                        continue;
+                    }
+                },
+            }
         };
         let envelope = match signal {
             OuterSignal::Task(e) => e,
@@ -1978,11 +2075,13 @@ pub(crate) async fn run_with_presence(
                     bus: &bus,
                     web_port,
                     session_id: session_log_id(&session_log),
-                    alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
-                        Some(thread_id_at_turn_start.clone())
-                    } else {
-                        None
-                    },
+                    // The backend-native thread id is a first-class address
+                    // for THIS session (SessionIdentity contract): steers,
+                    // interrupts, and cancels from the dashboard target it
+                    // after the identity upgrade. This used to be
+                    // Codex-only, which silently dropped every native-id
+                    // control for Claude Code sessions in the daemon lane.
+                    alias_session_id: Some(thread_id_at_turn_start.clone()),
                     backend_thread_id: Some(thread_id_at_turn_start.clone()),
                     autonomy: autonomy.clone(),
                     session_log: &session_log,

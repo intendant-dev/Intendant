@@ -3240,7 +3240,12 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 .get_mut(&child_thread_id)
             {
                 if let Some(stdout) = limiter.complete(&item_id) {
-                    emit_external_tool_output(config, Some(&child_thread_id), stdout, Some(&item_id));
+                    emit_external_tool_output(
+                        config,
+                        Some(&child_thread_id),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
             }
             if let external_agent::ToolCompletionStatus::Failed { message } = status {

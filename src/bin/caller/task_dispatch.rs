@@ -72,7 +72,10 @@ impl Dispatcher {
         let mut intent_rx = bus.subscribe_intents();
         let bus_for_log = bus.clone();
         let accepted = Arc::new(RwLock::new(
-            self.primary_session_id.iter().cloned().collect::<HashSet<String>>(),
+            self.primary_session_id
+                .iter()
+                .cloned()
+                .collect::<HashSet<String>>(),
         ));
         if self.primary_session_id.is_some() {
             // Identity listener: fold backend-native ids into the accepted

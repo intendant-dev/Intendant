@@ -828,30 +828,61 @@ function formatLimitReset(resetsAtEpoch) {
 }
 
 // The gauge shows the most-used window; the tooltip lists them all.
+// A window may arrive WITHOUT a percentage (Claude Code 2.1.2xx reports
+// status/reset only) — it still renders, as "label ok · ↻reset", with
+// severity derived from the provider status instead of the number.
+function limitStatusSeverity(status) {
+  const s = String(status || '').trim().toLowerCase();
+  if (!s || s === 'allowed') return '';
+  if (s === 'allowed_warning') return 'warn';
+  return 'crit'; // rejected / limited / queueing / anything non-allowed
+}
+
 function sessionVitalsLimitsSegment(limits) {
   if (!Array.isArray(limits) || !limits.length) return null;
   const windows = limits
-    .map((w) => ({
-      label: String(w?.label || '').trim() || 'window',
-      usedPct: Math.max(0, Math.min(100, Number(w?.usedPct) || 0)),
-      resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
-    }));
-  const top = windows.reduce((a, b) => (b.usedPct > a.usedPct ? b : a));
-  let text = `▮${top.usedPct}% ${top.label}`;
-  let cls = 'vit-limits';
-  let severity = '';
-  if (top.usedPct >= 90) {
-    severity = 'crit';
-    cls += ' limits-crit';
-    const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+    .map((w) => {
+      const rawPct = Number(w?.usedPct);
+      return {
+        label: String(w?.label || '').trim() || 'window',
+        usedPct: Number.isFinite(rawPct) && w?.usedPct !== null && w?.usedPct !== undefined
+          ? Math.max(0, Math.min(100, rawPct))
+          : null,
+        resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
+        status: String(w?.status || '').trim(),
+      };
+    });
+  const top = windows.reduce((a, b) => ((b.usedPct ?? -1) > (a.usedPct ?? -1) ? b : a));
+  const statusSeverity = windows
+    .map((w) => limitStatusSeverity(w.status))
+    .reduce((a, b) => (b === 'crit' || (b === 'warn' && a !== 'crit') ? b : a), '');
+  let severity = statusSeverity;
+  let text;
+  if (top.usedPct !== null) {
+    text = `▮${top.usedPct}% ${top.label}`;
+    if (top.usedPct >= 90) severity = 'crit';
+    else if (top.usedPct >= 70 && severity !== 'crit') severity = 'warn';
+  } else {
+    const worst = windows.find((w) => limitStatusSeverity(w.status) === statusSeverity) || top;
+    const state = statusSeverity === 'crit' ? 'limited' : statusSeverity === 'warn' ? 'high' : 'ok';
+    text = `${worst.label} ${state}`;
+    const reset = worst.resetsAtEpoch ? formatLimitReset(worst.resetsAtEpoch) : '';
     if (reset) text += ` ↻${reset}`;
-  } else if (top.usedPct >= 70) {
-    severity = 'warn';
+  }
+  let cls = 'vit-limits';
+  if (severity === 'crit') {
+    cls += ' limits-crit';
+    if (top.usedPct !== null) {
+      const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+      if (reset) text += ` ↻${reset}`;
+    }
+  } else if (severity === 'warn') {
     cls += ' limits-warn';
   }
   const titleLines = windows.map((w) => {
     const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
-    return `Rate limit ${w.label}: ${w.usedPct}% used${reset}`;
+    const used = w.usedPct !== null ? `${w.usedPct}% used` : (w.status || 'ok');
+    return `Rate limit ${w.label}: ${used}${reset}`;
   });
   return { text, titleLines, cls, severity };
 }
@@ -1664,14 +1695,16 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'agent_started') {
     content = String(entry.commands_preview || entry.commandsPreview || '').trim();
     if (!content) return null;
-    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind };
+    // kind tool_call = command announcement (parity with the live WASM
+    // path) — keeps replayed calls out of isCommandOutputLog's grouping.
+    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind: kind || 'tool_call' };
   }
   if (event === 'agent_output') {
     const stdout = String(entry.stdout || '').trim();
     const stderr = String(entry.stderr || '').trim();
     content = stdout || stderr;
     if (!content) return null;
-    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '' };
+    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '', item_id: entry.item_id || entry.itemId || '' };
   }
   if (event === 'presence_log') {
     if (!content) return null;
@@ -1732,6 +1765,13 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
     .map(entry => sessionWindowRecordFromReplayEntry(entry, fallbackSessionId))
     .filter(Boolean);
   if (!records.length) return 0;
+  // The emptiness the caller checked can be stale by now: the fetch
+  // awaited while the live replay/stream filled the window. Resetting
+  // here wiped the streamed rows and re-rendered the fetched copy NEXT
+  // TO their clones — merge into the streamed timeline instead.
+  if (sessionWindowHasStreamedHistory(win)) {
+    return appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId);
+  }
   resetSessionWindowLog(win);
   appendSessionWindowHistoryBatch(win, records, true);
   return records.length;
@@ -1830,7 +1870,10 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.eventId) signatures.push(['event', parts.sessionId, parts.eventId].join('\u001f'));
   if (parts.commandItemId) signatures.push(['command-item', parts.sessionId, parts.commandItemId].join('\u001f'));
-  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
+  // kind joins the item identity: a tool CALL row and its OUTPUT rows now
+  // share the tool_use id (output attribution), and an id-only signature
+  // would dedupe one against the other.
+  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.kind, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
   if (parts.turnId && parts.itemType && parts.itemId) {
     signatures.push(['thread-item', parts.sessionId, parts.turnId, parts.itemType, parts.itemId].join('\u001f'));
@@ -1993,10 +2036,14 @@ function sessionWindowTranscriptTimestampMs(value) {
   }
   const direct = Date.parse(raw);
   if (Number.isFinite(direct)) return direct;
-  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  // Fractional seconds ride the session log's HH:MM:SS.mmm stamps — an
+  // unmatched fraction made every replayed row timestamp-less, which
+  // broke ordered merges (hydration landed as a tail block).
+  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/);
   if (match) {
     const date = new Date();
-    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), 0);
+    const fraction = match[4] ? Number(('0.' + match[4])) * 1000 : 0;
+    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), Math.round(fraction));
     return date.getTime();
   }
   match = raw.match(/^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);

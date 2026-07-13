@@ -1462,25 +1462,6 @@ pub(crate) fn session_log_mtime(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::UNIX_EPOCH)
 }
 
-pub(crate) fn external_session_mtime(
-    home: &Path,
-    source: &str,
-    session_id: &str,
-) -> Option<std::time::SystemTime> {
-    let path = session_log_search_file_path(home, source, session_id, None)?;
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-pub(crate) fn external_session_newer_than_wrapper(
-    home: &Path,
-    wrapper_log_dir: &Path,
-    source: &str,
-    session_id: &str,
-) -> bool {
-    external_session_mtime(home, source, session_id)
-        .is_some_and(|external_mtime| external_mtime > session_log_mtime(wrapper_log_dir))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4312,8 +4312,8 @@ mod tests {
         assert!(snapshot.usage_pct <= 100.0, "pct {}", snapshot.usage_pct);
         assert_eq!(snapshot.context_window, 500_500);
         // A corrected window restores the honest ratio.
-        let corrected =
-            usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000).expect("snapshot");
+        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000)
+            .expect("snapshot");
         assert!((corrected.usage_pct - 50.05).abs() < 0.01);
     }
 

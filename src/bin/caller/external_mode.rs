@@ -669,6 +669,16 @@ pub(crate) async fn run_external_agent_mode(
                         }
                     }
                     bus_event = external_control_rx.recv() => {
+                        // Same identity normalization the turn drain applies:
+                        // post-upgrade frontends target the backend-native id,
+                        // which the launch-time live/alias snapshot can't match.
+                        let bus_event = bus_event.map(|event| {
+                            crate::external_events::normalize_native_session_target(
+                                event,
+                                &live_session_id,
+                                stats.announced_native_session_id.as_deref(),
+                            )
+                        });
                         match bus_event {
                             Ok(AppEvent::SessionStopRequested { session_id, reason })
                                 if event_targets_external_session_or_side(

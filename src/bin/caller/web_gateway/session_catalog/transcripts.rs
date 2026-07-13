@@ -795,11 +795,21 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
             entries.push(entry);
         };
         let content = obj.get("message").and_then(|m| m.get("content"));
+        // The wrapper appends its supervision addendum to the first prompt;
+        // the live UserMessageLog row shows the user's own text. Trim it so
+        // hydrated rows read (and dedupe) like the live ones.
+        let user_prose = |text: &str| -> String {
+            text.split(crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER)
+                .next()
+                .unwrap_or(text)
+                .trim()
+                .to_string()
+        };
 
         // Plain-string content: only user prompts use this shape.
         if let Some(text) = content.and_then(|c| c.as_str()) {
-            let text = text.trim();
-            if typ == "user" && !text.is_empty() && !is_injected_external_user_text(text) {
+            let text = user_prose(text);
+            if typ == "user" && !text.is_empty() && !is_injected_external_user_text(&text) {
                 push(serde_json::json!({
                     "level": "info",
                     "source": "User",
@@ -831,12 +841,15 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
                             "content": text,
                         }));
                     } else if !is_injected_external_user_text(text) {
-                        // Live shape: UserMessageLog → LogEntry.
-                        push(serde_json::json!({
-                            "level": "info",
-                            "source": "User",
-                            "content": text,
-                        }));
+                        let text = user_prose(text);
+                        if !text.is_empty() {
+                            // Live shape: UserMessageLog → LogEntry.
+                            push(serde_json::json!({
+                                "level": "info",
+                                "source": "User",
+                                "content": text,
+                            }));
+                        }
                     }
                 }
                 "thinking" if typ == "assistant" => {
@@ -871,6 +884,10 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
                     let mut entry = serde_json::json!({
                         "level": "agent",
                         "source": agent_source,
+                        // Command announcement, never command output — the
+                        // frontend's level-'agent' fallback groups untagged
+                        // rows into output groups.
+                        "kind": "tool_call",
                         "content": content,
                     });
                     if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
@@ -2575,7 +2592,7 @@ mod tests {
                 (
                     "agent".into(),
                     "Claude Code".into(),
-                    "".into(),
+                    "tool_call".into(),
                     "toolu_01".into(),
                     "Bash: cat README.md".into()
                 ),

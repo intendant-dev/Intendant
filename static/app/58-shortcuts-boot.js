@@ -133,8 +133,13 @@ function updateStopButtonVisibility(phase) {
   if (!btn) return;
   const key = phaseKey(phase);
   const targetSessionId = resolvePromptTargetSessionId();
+  // Trust the phase the user is LOOKING at: the per-window activity flag
+  // can lag the banner (identity re-keying, optimistic-expiry) and hid
+  // Stop during live turns — an unusable interrupt affordance mid-turn is
+  // the worst failure mode this button has.
   const show = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId) && sessionSupportsInterrupt(targetSessionId)
+    ? sessionSupportsInterrupt(targetSessionId)
+      && (isSessionWindowEffectivelyActive(targetSessionId) || isAgentActivePhase(key))
     : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.

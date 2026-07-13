@@ -1621,13 +1621,17 @@ impl AppState {
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
+                // kind tool_call: a command ANNOUNCEMENT row, never command
+                // output — without the kind, the level-'agent' fallback in
+                // isCommandOutputLog swallowed these into output groups
+                // (external tool calls showed no command line at all).
                 cmds.extend(self.add_log_with_metadata(
                     "agent",
                     preview,
                     None,
                     source,
                     Vec::new(),
-                    None,
+                    Some("tool_call"),
                     None,
                     item_id,
                     None,
@@ -1646,6 +1650,9 @@ impl AppState {
             "agent_output" => {
                 let source = msg["source"].as_str().unwrap_or("agent");
                 let output_id = msg["output_id"].as_str().map(str::to_string);
+                // Originating tool call — groups output under its command
+                // row instead of coalescing consecutive tools' output.
+                let item_id = msg["item_id"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
@@ -1658,7 +1665,7 @@ impl AppState {
                                 out.images,
                                 Some("agent_output"),
                                 output_id.clone(),
-                                None,
+                                item_id.clone(),
                                 None,
                                 None,
                                 false,
@@ -1677,7 +1684,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
-                            None,
+                            item_id.clone(),
                             None,
                             None,
                             false,

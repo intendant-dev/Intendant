@@ -40,7 +40,9 @@ pub(crate) fn external_steer_queue_reason(agent_name: &str, err: &CallerError) -
         _ => false,
     };
     if unsupported {
-        format!("{agent_name} doesn't support mid-turn steering ({err}); queued as follow-up")
+        // The expected path for backends without mid-turn injection
+        // (Claude Code) — say what happens next, not why it "failed".
+        format!("{agent_name} applies messages between turns — delivers when this turn ends")
     } else {
         format!("{agent_name} native mid-turn steering failed ({err}); queued as follow-up")
     }
@@ -415,8 +417,10 @@ mod tests {
             ),
         );
 
-        assert!(reason.contains("Claude Code doesn't support mid-turn steering"));
-        assert!(reason.contains("queued as follow-up"));
+        // The unsupported path is the EXPECTED path for turn-boundary
+        // backends: plain what-happens-next copy, no failure vocabulary.
+        assert!(reason.contains("delivers when this turn ends"), "{reason}");
+        assert!(!reason.to_lowercase().contains("failed"), "{reason}");
     }
 
     #[test]

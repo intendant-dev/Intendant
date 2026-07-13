@@ -936,11 +936,13 @@ function buildSessionWindowCommandOutputEntry(c) {
   wrap.appendChild(body);
   const stats = commandOutputRecordStats(c, content);
   const canFetchFull = commandOutputRecordHasFullFetch(c);
+  const itemId = String(c?.item_id || c?.itemId || '').trim();
   summary.innerHTML = commandOutputSummaryHtml({
     chunks: 1,
     lines: stats.lines,
     bytes: stats.bytes,
     warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
+    commandPreview: itemId ? (commandPreviewsByItemId.get(itemId) || '') : '',
   });
   if (content && !canFetchFull) {
     setDeferredCommandOutputText(entry, body, content, stats);
