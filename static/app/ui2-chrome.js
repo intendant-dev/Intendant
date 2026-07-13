@@ -222,8 +222,13 @@ function ui2WireMirrors() {
   const switcher = document.getElementById('ui2-session-switcher');
   const rebuildSwitcher = () => {
     if (!switcher || typeof sessionWindows === 'undefined') return;
-    const target = typeof resolvePromptTargetSessionId === 'function'
-      ? (resolvePromptTargetSessionId() || '') : '';
+    // Must be the SAME selector Focus promotes with (ui2ApplyFocusSurface),
+    // or the switcher reads "all sessions" while Focus is showing exactly one
+    // session's transcript.
+    const target = typeof ui2FocusSessionId === 'function'
+      ? (ui2FocusSessionId() || '')
+      : (typeof resolvePromptTargetSessionId === 'function'
+        ? (resolvePromptTargetSessionId() || '') : '');
     const options = [['', 'all sessions']];
     for (const [sid] of sessionWindows) {
       let label = sid.slice(0, 8);
@@ -255,7 +260,7 @@ function ui2WireMirrors() {
         if (current) discardPromptTargetReference(current);
         if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
       }
-      if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
+      if (typeof ui2ApplyFocusSurface === 'function') ui2ApplyFocusSurface();
     });
     ui2Mirror('task-target-chip', rebuildSwitcher);
     const grid = document.getElementById('session-window-grid');

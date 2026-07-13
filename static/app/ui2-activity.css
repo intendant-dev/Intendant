@@ -262,18 +262,32 @@ html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--
 /* the relabeled autonomy escape reads as the power action it is */
 html.ui-v2 #approval-panel .ui2-full-escape { font-size: 12px; color: var(--text-3); }
 
-/* — Focus layout (default): one centered timeline ──────────────────────
-   The session-window grid, its resize handle, and the "Concurrent view"
-   label disappear; the combined stream is the surface. JS keeps the
-   stream mounted (shouldDetachConcurrentLogStream returns false under
-   Focus) — these rules are the visual half of that contract. Grid mode
-   (html[data-ui2-layout="grid"]) leaves v1's machinery fully in charge. */
-html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid,
+/* — Focus layout (default): the FOREGROUND session's timeline ──────────
+   Two surfaces, selected by data-ui2-focus (stamped by ui2ApplyFocusSurface):
+
+     [data-ui2-focus="session"] — a session is targeted. Its session window
+       is promoted out of the grid and becomes the timeline. The window is
+       the ONLY place a resumed / external session's transcript exists —
+       hydration renders it there and never into the combined stream — so
+       promoting it is what makes Focus work at all after a resume, and it
+       reuses the window's live, deduped, virtualized renderer instead of
+       standing up a second copy of one.
+
+     [data-ui2-focus="all"] — nothing targeted. The combined stream is the
+       surface, as before; it also carries the idle / unfueled empty state,
+       which therefore now appears only when there is genuinely nothing to
+       read.
+
+   Grid mode (html[data-ui2-layout="grid"]) leaves v1's machinery fully in
+   charge in both cases. */
 html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid-resize-handle,
 html.ui-v2:not([data-ui2-layout="grid"]) #concurrent-log-label { display: none; }
-/* Focus must also neutralize the v1 minimized/maximized pane states —
-   they collapse or hide the very stream Focus promotes (the CSS half of
-   the shouldDetachConcurrentLogStream guard). */
+
+/* — all-sessions surface: the combined stream — */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="all"] #session-window-grid { display: none; }
+/* Neutralize the v1 minimized/maximized pane states — they collapse or
+   hide the very stream this surface promotes (the CSS half of the
+   shouldDetachConcurrentLogStream guard). */
 html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .log-stream { display: block; }
 html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-minimized .concurrent-log-region,
 html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-maximized .concurrent-log-region {
@@ -281,10 +295,62 @@ html.ui-v2:not([data-ui2-layout="grid"]) .subtab-pane.concurrent-log-maximized .
   min-height: 0;
   border-top: 0;
 }
-/* v1 hides these with !important while the grid is maximized; the grid
-   itself is gone under Focus, so counter at the same weight. */
-html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .concurrent-log-region { display: flex !important; }
-html.ui-v2:not([data-ui2-layout="grid"]) .session-window-grid.maximized ~ .scroll-bottom-btn.visible { display: flex !important; }
+/* v1 hides these with !important while the grid is maximized; on this
+   surface the grid is gone, so counter at the same weight. */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="all"] .session-window-grid.maximized ~ .concurrent-log-region { display: flex !important; }
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="all"] .session-window-grid.maximized ~ .scroll-bottom-btn.visible { display: flex !important; }
+
+/* — session surface: promote that window into the timeline column — */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] .concurrent-log-region,
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] #scroll-bottom { display: none; }
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] #session-window-grid {
+  display: flex;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  padding: 0;
+  border-bottom: 0;
+  background: transparent;
+  overflow: hidden;
+}
+/* Only the promoted window renders — this outranks v1's .maximized rules,
+   which would otherwise pick a different window. */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] #session-window-grid .session-window { display: none; }
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] #session-window-grid .session-window.ui2-focus-window {
+  display: flex;
+  flex: 1 1 auto;
+  align-self: stretch;
+  width: 100%;
+  min-height: 0;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+/* The window's log becomes the design's centered timeline column — the same
+   880px measure and padding #log-stream uses on the all-sessions surface.
+   The .log-entry grammar at the top of this file already styles both. */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] .session-window.ui2-focus-window .session-window-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  width: 100%;
+  max-width: 880px;
+  margin-inline: auto;
+  padding: 18px 24px 24px;
+}
+/* The card header keeps carrying session identity, phase, and the window
+   controls; it reads as the timeline's header bar, not as a card's. */
+html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] .session-window.ui2-focus-window .session-window-header {
+  width: 100%;
+  max-width: 880px;
+  margin-inline: auto;
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+}
 
 /* turn separators read as quiet time breaks */
 html.ui-v2 .log-turn-sep {
@@ -387,7 +453,6 @@ html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(-
 
 /* — Focus filter + raw-entry hygiene + hero identity (corrective batch,
      2026-07-08 product-owner review) — */
-html.ui-v2 .log-entry.hidden-by-focus { display: none; }
 html.ui-v2 .log-entry.ui2-stderr .log-content {
   font-family: var(--mono);
   font-size: 10.5px;
