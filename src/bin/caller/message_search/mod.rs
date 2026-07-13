@@ -29,11 +29,15 @@ mod store;
 // locate.rs, plan §7 C2) verifies locators exactly the way the extractors
 // mint them, so it consumes the frozen locator type and the legacy
 // follow-up line parser from here.
+#[cfg(test)]
+pub(crate) use cursor::SourceCursor;
 pub(crate) use extract_intendant::parse_round_follow_up;
 pub(crate) use indexer::{refresh_if_stale, spawn_indexer};
 pub(crate) use query::{parse_sources, run_message_search, MessageSearchParams};
 pub(crate) use record::{Locator, MESSAGE_TEXT_CAP_BYTES};
 pub(crate) use store::Store;
+#[cfg(test)]
+pub(crate) use store::{PublishOutcome, SessionShard};
 
 /// Boot-time retention GC over the production store root (plan §6):
 /// expired shards and tombstones must not accumulate before the first
