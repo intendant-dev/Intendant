@@ -835,6 +835,9 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'recording_stopped',
   'recording_deleted',
   'recording_error',
+  // Unique event_id per action: dual-lane duplicates dedupe by id while
+  // two real identical clicks (distinct ids) both render.
+  'cu_action',
   'external_agent_changed',
   'autonomy_changed',
   'codex_thread_action_requested',

@@ -233,17 +233,50 @@ cancelled before a surface can be hidden. Activity's shared-view **Take input**
 returns to the full Live stage before requesting authority; thumbnails remain
 view-only.
 
-The rail's per-display activity is deliberately a browser-observed lifecycle
-feed (stream connection, authority, private/share mode, presence streaming,
-recording, annotation, and shared-view focus). It is not an agent action trace:
-the current wire protocol has no display-keyed click/type event, and typed text
-must never be reconstructed from general logs. Recording transitions enter the
-feed only after the daemon confirms them; Start, Stop, and Delete remain pending
-and retain the last confirmed state on transport error or timeout. At narrow
-widths the same rail becomes a keyboard-accessible modal drawer; the stage
-toolbar remains the fallback for primary controls. In-page full screen similarly
-contains focus, hides its background from assistive technology, supports Escape,
-and restores the invoking control.
+The rail's per-display activity feed combines browser-observed lifecycle
+events (stream connection, authority, private/share mode, presence streaming,
+recording, annotation, and shared-view focus) with the daemon's **live action
+lane**: `computer_use::execute_actions` emits one `cu_action` event per
+successfully executed CU action (`CuActionObserver`), carrying the kind
+(`left_click`, `type`, `screenshot`, …), display id, driving session id,
+display-space coordinates plus their reference resolution, a short raw call
+string (`left_click(612, 233)`; embedded text truncated for presentation —
+the Activity log keeps the full trace), a unix-ms timestamp, and a dedupe
+`event_id`. The lane is deliberately **ephemeral**: it rides the outbound
+broadcast to the `/ws` and dashboard-control lanes only — never the session
+log, never replay — and mouse moves coalesce to 10 Hz. Failed actions never
+emit; the overlays must not show clicks that did not happen. Peer upcasters
+drop the event, so **federated (peer) displays render no action overlays**
+today — a known follow-up.
+
+Those events drive the stage's action overlays on the display they belong
+to: an agent cursor (white arrow + verb pill reading Look / Move / Click /
+Type / Scroll / Waiting) that eases toward each action point, dims while the
+dashboard user holds input authority, and fades out when idle; a click
+ripple; last-typed keypress chips (from the truncated raw call, space shown
+as `·`); and a full-stage screenshot flash. The concept's target-highlight
+box + role tag are deliberately not implemented — no element/role data
+exists on the wire (future AX integration). All overlays are
+`pointer-events: none`, `aria-hidden`, honor `prefers-reduced-motion`, and
+compute geometry from the letterboxed video rect — nothing touches the video
+element itself. Feed rows for actions use a two-line grammar (friendly
+sentence + seconds-precision timestamp, raw mono call below); the feed keeps
+the last 50 entries per display and follows the bottom only when already
+scrolled there.
+
+`cu_action` session attribution also feeds the rail's **approval card**:
+when a pending approval belongs to the session the daemon last reported
+driving the selected display, an amber card renders under Input authority
+whose Approve/Deny proxy the main approval panel's own session-scoped
+actions. No attribution, no card — it never guesses. Recording transitions
+enter the feed only after the daemon confirms them; Start, Stop, and Delete
+remain pending and retain the last confirmed state on transport error or
+timeout, and while recording the Record button ticks the elapsed time from
+the confirmation. At narrow widths the same rail becomes a
+keyboard-accessible modal drawer; the stage toolbar remains the fallback for
+primary controls. In-page full screen similarly contains focus, hides its
+background from assistive technology, supports Escape, and restores the
+invoking control.
 
 ### CU-First Routing
 

@@ -20854,31 +20854,46 @@ html.ui-v2 .ui2-live-activity-row {
   border-bottom: 1px solid var(--line);
 }
 html.ui-v2 .ui2-live-activity-row:last-child { border-bottom: 0; }
+/* Feed dots: 8px + 3px semantic halo (concept grammar). Color map:
+   sky = look/connect · iris = click/focus · violet = type · amber =
+   waiting/attention · green = control/grants · rose = stop/error/rec ·
+   neutral = scroll/move. */
 html.ui-v2 .ui2-live-activity-dot {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
   border-radius: 50%;
   background: var(--neutral-dot);
+  box-shadow: 0 0 0 3px rgba(var(--text-rgb), .06);
 }
 html.ui-v2 .ui2-live-activity-row.kind-live .ui2-live-activity-dot,
-html.ui-v2 .ui2-live-activity-row.kind-control .ui2-live-activity-dot {
+html.ui-v2 .ui2-live-activity-row.kind-control .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-private .ui2-live-activity-dot {
   background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
 }
 html.ui-v2 .ui2-live-activity-row.kind-attention .ui2-live-activity-dot {
   background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
 }
 html.ui-v2 .ui2-live-activity-row.kind-error .ui2-live-activity-dot,
 html.ui-v2 .ui2-live-activity-row.kind-recording .ui2-live-activity-dot {
   background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16);
 }
-html.ui-v2 .ui2-live-activity-row.kind-focus .ui2-live-activity-dot {
+html.ui-v2 .ui2-live-activity-row.kind-focus .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-click .ui2-live-activity-dot {
   background: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .16);
 }
-html.ui-v2 .ui2-live-activity-row.kind-share .ui2-live-activity-dot {
+html.ui-v2 .ui2-live-activity-row.kind-share .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-look .ui2-live-activity-dot {
   background: var(--sky);
+  box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16);
 }
-html.ui-v2 .ui2-live-activity-row.kind-private .ui2-live-activity-dot {
-  background: var(--green);
+html.ui-v2 .ui2-live-activity-row.kind-type .ui2-live-activity-dot {
+  background: var(--violet);
+  box-shadow: 0 0 0 3px rgba(var(--violet-rgb), .16);
 }
 html.ui-v2 .ui2-live-activity-text {
   min-width: 0;
@@ -20891,6 +20906,311 @@ html.ui-v2 .ui2-live-activity-time {
   font-family: var(--mono);
   font-size: 9.5px;
   font-variant-numeric: tabular-nums;
+}
+
+/* ── CU action rows: the concept's two-line grammar (friendly sentence +
+      seconds ts, raw mono call below). Lifecycle rows stay one-line. ── */
+html.ui-v2 .ui2-live-activity-row.cu-action-row {
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 0 10px;
+  padding: 6px 2px;
+}
+html.ui-v2 .cu-action-row .ui2-live-activity-dot {
+  justify-self: center;
+  margin-top: 5px;
+}
+html.ui-v2 .cu-action-main { min-width: 0; }
+html.ui-v2 .cu-action-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+html.ui-v2 .cu-action-friendly {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+html.ui-v2 .cu-action-head .ui2-live-activity-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+html.ui-v2 .cu-action-raw {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-word;
+}
+@keyframes cu-row-in {
+  from { opacity: 0; transform: translateX(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cu-chip-in {
+  from { opacity: 0; transform: translateY(4px) scale(.9); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .ui2-live-activity-row.cu-action-row { animation: cu-row-in .22s ease; }
+  html.ui-v2 .cu-key-chip { animation: cu-chip-in .16s ease; }
+}
+
+/* ── CU stage overlays (45b-cu-overlays.js) ───────────────────────────
+   Absolutely-positioned pointer-events:none children of .display-canvas;
+   JS drives all positions/opacities from letterboxed geometry
+   (surfaceContentBox). Inks are the pinned --cu-stage-* values: the stage
+   stays a dark viewport in both themes. z-order (inline from JS):
+   flash 9 < ripple 16 < keys 18 < cursor 20. */
+html.ui-v2 .cu-overlay-flash {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, .9);
+  opacity: 0;
+  pointer-events: none;
+}
+html.ui-v2 .cu-overlay-ripple {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--iris);
+  background: rgba(var(--iris-rgb), .14);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+html.ui-v2 .cu-overlay-keys {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 5px;
+  max-width: calc(100% - 24px);
+  overflow: hidden;
+  pointer-events: none;
+}
+html.ui-v2 .cu-key-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 26px;
+  padding: 0 7px;
+  border-radius: 7px;
+  background: rgba(11, 12, 16, .82);
+  border: 1px solid var(--cu-stage-line);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--cu-stage-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+}
+html.ui-v2 .cu-overlay-cursor {
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+  will-change: left, top, opacity;
+}
+html.ui-v2 .cu-overlay-cursor svg {
+  display: block;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .55));
+}
+html.ui-v2 .cu-cursor-pill {
+  position: absolute;
+  left: 17px;
+  top: 19px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  letter-spacing: .01em;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .4);
+}
+html.ui-v2 .cu-cursor-pill:empty { display: none; }
+
+/* Host identity chip: "{host} · {display}" + gradient identity square
+   (bottom-right stage chrome; text synced by the live workspace). */
+html.ui-v2 .cu-host-chip {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 28px);
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  background: rgba(8, 10, 16, .5);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, .08);
+  color: rgba(233, 236, 244, .72);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  pointer-events: none;
+}
+html.ui-v2 .cu-host-chip-mark {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  background: linear-gradient(145deg, #8b93ff, #6470d0);
+}
+html.ui-v2 .cu-host-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Thumbs are glanceable mini-views and fullscreen strips its chrome —
+   same contexts that hide the metrics chip / stage overlay above. */
+html.ui-v2 .activity-display-thumb .cu-host-chip,
+html.ui-v2 .activity-display-thumb .cu-overlay-flash,
+html.ui-v2 .activity-display-thumb .cu-overlay-ripple,
+html.ui-v2 .activity-display-thumb .cu-overlay-keys,
+html.ui-v2 .activity-display-thumb .cu-overlay-cursor,
+html.ui-v2 .display-slot.display-fullscreen .cu-host-chip {
+  display: none;
+}
+
+/* Authority-card holder avatar (concept): 24px dark circle + initials.
+   The disc is pinned dark in both themes, so the ink is the pinned
+   stage text, not var(--text). */
+html.ui-v2 .ui2-live-auth-avatar {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: linear-gradient(145deg, #3a4152, #20242f);
+  border: 1px solid var(--line-2);
+  color: var(--cu-stage-text);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+html.ui-v2 .ui2-live-auth-avatar[hidden] { display: none; }
+
+/* ── Session-attributed approval card (rail, 45b-cu-overlays.js) ── */
+html.ui-v2 #ui2-live-approval { margin-top: 14px; }
+html.ui-v2 #ui2-live-approval[hidden] { display: none; }
+html.ui-v2 .cu-approval-card {
+  padding: 14px 15px;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: var(--r-card);
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .12), rgba(var(--amber-rgb), .03));
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .cu-approval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+html.ui-v2 .cu-approval-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .18);
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .cu-approval-dot { animation: ui2-pulse 2s infinite; }
+}
+html.ui-v2 .cu-approval-eyebrow {
+  color: var(--cu-amber-ink);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+html.ui-v2 .cu-approval-title {
+  margin-top: 9px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 800;
+}
+html.ui-v2 .cu-approval-body {
+  margin-top: 5px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+html.ui-v2 .cu-approval-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+html.ui-v2 .cu-approval-chips:empty { display: none; }
+html.ui-v2 .cu-approval-chip {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  word-break: break-all;
+}
+html.ui-v2 .cu-approval-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+html.ui-v2 .cu-approval-approve {
+  flex: 1;
+  min-height: 36px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: var(--shadow-primary);
+  transition: filter var(--t-med);
+}
+html.ui-v2 .cu-approval-approve:hover { filter: brightness(1.08); }
+html.ui-v2 .cu-approval-deny {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid rgba(var(--rose-rgb), .4);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--cu-rose-ink);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .cu-approval-deny:hover {
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .55);
+}
+html.ui-v2 .cu-approval-card button:disabled {
+  opacity: .55;
+  cursor: wait;
+  filter: none;
 }
 
 @media (max-width: 1279px) {
@@ -23377,6 +23697,10 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
         <section aria-labelledby="ui2-live-authority-heading">
           <h3 class="ui2-live-rail-eyebrow" id="ui2-live-authority-heading">Input authority</h3>
           <div id="ui2-live-authority-card"></div>
+          <!-- Session-attributed approval card (45b-cu-overlays.js): shown
+               only when a pending approval's session is known to drive the
+               selected display; actions proxy the main approval panel. -->
+          <div id="ui2-live-approval" hidden></div>
         </section>
         <section aria-labelledby="ui2-live-activity-heading">
           <h3 class="ui2-live-rail-eyebrow" id="ui2-live-activity-heading">Display activity</h3>
@@ -26870,7 +27194,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '271f9b1422ecf205';
+const INTENDANT_APP_BUILD = '6873be26bb1d50fc';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -27692,6 +28016,9 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'recording_stopped',
   'recording_deleted',
   'recording_error',
+  // Unique event_id per action: dual-lane duplicates dedupe by id while
+  // two real identical clicks (distinct ids) both render.
+  'cu_action',
   'external_agent_changed',
   'autonomy_changed',
   'codex_thread_action_requested',
@@ -40724,6 +41051,11 @@ async function main() {
       // Display transport metrics (per-display sections)
       if (d.event === 'display_metrics') {
         serverMsgStep(d, 'display_metrics', () => updateDisplayMetrics(d));
+      }
+      // Live CU action-visualization events (stage overlays + per-display
+      // feed) — handled by 45b-cu-overlays.js.
+      if (d.event === 'cu_action') {
+        serverMsgStep(d, 'cu_action', () => window.handleCuActionEvent?.(d));
       }
       if (eventRefreshesSessionMetadata(d.event)) {
         serverMsgStep(d, 'sessions_metadata_refresh', () => scheduleSessionsMetadataRefresh());
@@ -63200,6 +63532,8 @@ class DisplaySlot {
     this.recordingStreamName = null;
     this._recordingPendingAction = null;
     this._recordingPendingTimer = null;
+    this._recordingStartedAt = null;  // client clock at server-confirmed start
+    this._recordingTimerId = null;    // 1 Hz elapsed-label ticker while recording
     this._recordingDeletePending = false;
     this._recordingDeleteStream = null;
     this._recordingDeleteTimer = null;
@@ -63314,6 +63648,20 @@ class DisplaySlot {
     this.controlBannerEl.className = 'display-control-banner';
     this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
     this.canvasEl.appendChild(this.controlBannerEl);
+    // Host identity chip (bottom-right stage chrome): "{host} · {display}"
+    // with the gradient identity square. Text is kept fresh by the live
+    // workspace projection (selfHostLabel arrives async via the agent
+    // card); hidden in thumb/fullscreen contexts by ui2-live.css.
+    this.hostChipEl = document.createElement('div');
+    this.hostChipEl.className = 'cu-host-chip';
+    this.hostChipEl.setAttribute('aria-hidden', 'true');
+    const hostMark = document.createElement('span');
+    hostMark.className = 'cu-host-chip-mark';
+    const hostText = document.createElement('span');
+    hostText.className = 'cu-host-chip-text';
+    this.hostChipEl.appendChild(hostMark);
+    this.hostChipEl.appendChild(hostText);
+    this.canvasEl.appendChild(this.hostChipEl);
     const rerenderSharedFocus = () => {
       if (!sharedViewState.visible) return;
       if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
@@ -64319,6 +64667,31 @@ class DisplaySlot {
     if (render) this._renderRecordingControls();
   }
 
+  // mm:ss since the server-confirmed recording start (applyRecordingState
+  // stamps `_recordingStartedAt` on the false→true confirmation).
+  _recordingElapsedLabel() {
+    const base = this._recordingStartedAt || Date.now();
+    const sec = Math.max(0, Math.floor((Date.now() - base) / 1000));
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  // Single writer for the 1 Hz elapsed ticker: runs exactly while the
+  // confirmed state is "recording" with no pending command. Idempotent —
+  // called from the render path so every state transition self-heals.
+  _syncRecordingTimer() {
+    const want = this.recording && !this._recordingPendingAction;
+    if (want && !this._recordingTimerId) {
+      this._recordingTimerId = window.setInterval(() => {
+        this._renderRecordingControls();
+      }, 1000);
+    } else if (!want && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
+  }
+
   _renderRecordingControls() {
     const action = this._recordingPendingAction;
     const deleting = this._recordingDeletePending;
@@ -64326,13 +64699,14 @@ class DisplaySlot {
     this.recordBtn.setAttribute('aria-busy', action ? 'true' : 'false');
     this.recordBtn.innerHTML = action
       ? (action === 'stop_recording' ? 'Stopping…' : 'Starting…')
-      : (this.recording ? '&#x23F9; Stop' : '&#x23FA; Record');
+      : (this.recording ? '&#x23F9; ' + this._recordingElapsedLabel() : '&#x23FA; Record');
     this.recordBtn.classList.toggle('active', this.recording);
     this.recordBtn.setAttribute('aria-pressed', this.recording ? 'true' : 'false');
     this.deleteRecBtn.disabled = Boolean(deleting || action);
     this.deleteRecBtn.setAttribute('aria-busy', deleting ? 'true' : 'false');
     this.deleteRecBtn.textContent = deleting ? 'Deleting…' : 'Delete';
     this.deleteRecBtn.style.display = this.recording || !this.recordingStreamName ? 'none' : '';
+    this._syncRecordingTimer();
   }
 
   applyRecordingState(recording, streamName, deleted = false) {
@@ -64358,7 +64732,13 @@ class DisplaySlot {
         this._recordingDeleteStream === streamName) {
       this._clearRecordingDeletePending(false);
     }
+    const wasRecording = this.recording;
     this.recording = Boolean(recording);
+    // Elapsed base = this confirmation's arrival (a bootstrap replay of an
+    // older recording restarts the visible counter — a known, honest
+    // limitation: the daemon does not publish the start timestamp).
+    if (this.recording && !wasRecording) this._recordingStartedAt = Date.now();
+    if (!this.recording) this._recordingStartedAt = null;
     this.recordingStreamName = deleted ? null : (streamName || this.recordingStreamName);
     this._renderRecordingControls();
     return true;
@@ -64433,6 +64813,13 @@ class DisplaySlot {
     this._setStageOverlay(null);
     this._clearRecordingPending();
     this._clearRecordingDeletePending();
+    // Transient disconnects keep the elapsed ticker (the server-side
+    // recording continues); a user close removes the slot, so the ticker
+    // must die with it.
+    if (userInitiated && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
     this.stopStreaming();
     // Flip `connected` BEFORE `_exitInteractive` so its status-text
     // ternary writes 'Disconnected' (not the stale 'Connected (view-
@@ -65000,9 +65387,12 @@ function applyDisplayStripState() {
 // The standalone CU concept is the presentation target; the production
 // displaySlots map remains the source of truth. This projection adds one
 // selected local stage, selected-slot authority controls, responsive rail
-// access, and a small feed of REAL browser-observed display lifecycle
-// changes. It never invents agent clicks, typed text, holder identities, or
-// display-scoped approvals: those do not exist in the current wire contract.
+// access, and a per-display feed of REAL events: browser-observed display
+// lifecycle changes plus daemon-reported CU actions (the `cu_action` wire
+// lane, appended via window.noteCuDisplayActivity from 45b-cu-overlays.js).
+// It still never invents holder identities, and display-scoped approval
+// attribution only renders when the daemon reported which session drives
+// the display (45b's attribution map from cu_action events).
 //
 // Key safety rule: a hidden interactive slot would keep its document-level
 // paste handler. Selecting another display therefore releases the old slot
@@ -65338,6 +65728,7 @@ function applyDisplayStripState() {
         '<span class="ui2-live-state-pill"></span>' +
       '</div>' +
       '<div class="ui2-live-auth-row">' +
+        '<span class="ui2-live-auth-avatar" aria-hidden="true"></span>' +
         '<span class="ui2-live-auth-name"></span>' +
       '</div>' +
       '<button class="ui2-live-card-btn" type="button"></button>' +
@@ -65346,6 +65737,7 @@ function applyDisplayStripState() {
   const authorityTitle = authorityCard.querySelector('.ui2-live-card-title');
   const authoritySub = authorityCard.querySelector('.ui2-live-card-sub');
   const authorityPill = authorityCard.querySelector('.ui2-live-state-pill');
+  const authorityAvatar = authorityCard.querySelector('.ui2-live-auth-avatar');
   const authorityName = authorityCard.querySelector('.ui2-live-auth-name');
   const authorityButton = authorityCard.querySelector('.ui2-live-card-btn');
   authorityButton.addEventListener('click', () => {
@@ -65386,12 +65778,18 @@ function applyDisplayStripState() {
       authorityTitle.textContent = 'No live display';
       authoritySub.textContent = 'Choose or share a display to see and control it here.';
       authorityPill.textContent = 'offline';
+      authorityAvatar.hidden = true;
       authorityName.textContent = 'Input is scoped to one display at a time.';
       authorityButton.hidden = true;
       return;
     }
 
     const state = slot.authorityState || 'unknown';
+    // Holder avatar: YOU when this dashboard holds input; another viewer's
+    // identity is deliberately not on the wire, so "other" stays abstract;
+    // agent-side / unclaimed / connecting reads AI.
+    authorityAvatar.hidden = false;
+    authorityAvatar.textContent = state === 'you' ? 'YOU' : state === 'other' ? '···' : 'AI';
     const pending = Boolean(slot._takeControlPending);
     authorityName.textContent = slotLabel(slot);
     authorityButton.hidden = false;
@@ -65468,20 +65866,44 @@ function applyDisplayStripState() {
     };
   }
 
-  function addDisplayActivity(displayId, kind, textValue) {
+  // Per-display feed cap. Raised from 10 for the action stream — lifecycle
+  // events alone rarely pass 10, but real CU action traffic does.
+  const ACTIVITY_MAX_ENTRIES = 50;
+
+  function addDisplayActivity(displayId, kind, textValue, extra) {
     const id = Number(displayId);
     const entries = activityByDisplay.get(id) || [];
     const last = entries[entries.length - 1];
-    if (last && last.kind === kind && last.text === textValue) return;
+    // Consecutive-duplicate guard is for lifecycle transitions only: two
+    // identical CU actions in a row (extra.action) are distinct real events
+    // and must both append.
+    if (!extra && last && last.kind === kind && last.text === textValue) return;
     entries.push({
       seq: ++activitySeq,
       kind,
       text: textValue,
       at: new Date(),
+      raw: extra && extra.raw ? String(extra.raw) : '',
+      action: Boolean(extra && extra.action),
     });
-    if (entries.length > 10) entries.splice(0, entries.length - 10);
+    if (entries.length > ACTIVITY_MAX_ENTRIES) {
+      entries.splice(0, entries.length - ACTIVITY_MAX_ENTRIES);
+    }
     activityByDisplay.set(id, entries);
   }
+
+  // Entry point for the CU action-visualization layer (45b-cu-overlays.js):
+  // appends a daemon-reported action to this display's feed using the
+  // concept's two-line grammar (friendly sentence + raw mono call).
+  window.noteCuDisplayActivity = function(displayId, kind, friendly, raw) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, kind, String(friendly || ''), {
+      raw: String(raw || ''),
+      action: true,
+    });
+    scheduleWorkspace();
+  };
 
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
@@ -65574,28 +65996,66 @@ function applyDisplayStripState() {
       row.remove();
       activityRows.delete(seq);
     }
+    // Auto-follow policy (same as the main log): stick to the bottom only
+    // when the user is already reading the bottom. Measure BEFORE appends;
+    // a fresh fill (display switch) always lands on the latest entries.
+    const freshFill = activityRows.size === 0;
+    const nearBottom = freshFill ||
+      (activityList.scrollHeight - activityList.scrollTop - activityList.clientHeight) <= 30;
+    let appended = false;
     // role=log expects chronological DOM order so only the newly appended
     // row is announced. Rebuilding newest-first made every state change
     // sound like ten new events to screen readers.
     for (const entry of entries) {
       if (activityRows.has(entry.seq)) continue;
       const row = document.createElement('div');
-      row.className = 'ui2-live-activity-row kind-' + entry.kind;
       const dot = document.createElement('span');
       dot.className = 'ui2-live-activity-dot';
       dot.setAttribute('aria-hidden', 'true');
-      const textEl = document.createElement('span');
-      textEl.className = 'ui2-live-activity-text';
-      textEl.textContent = entry.text;
       const time = document.createElement('time');
       time.className = 'ui2-live-activity-time';
       time.dateTime = entry.at.toISOString();
-      time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      row.appendChild(dot);
-      row.appendChild(textEl);
-      row.appendChild(time);
+      if (entry.action) {
+        // Daemon-reported CU action: the concept's two-line grammar —
+        // friendly sentence + seconds-precision ts, raw mono call below.
+        row.className = 'ui2-live-activity-row cu-action-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], {
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+        });
+        const main = document.createElement('div');
+        main.className = 'cu-action-main';
+        const head = document.createElement('div');
+        head.className = 'cu-action-head';
+        const friendly = document.createElement('span');
+        friendly.className = 'cu-action-friendly';
+        friendly.textContent = entry.text;
+        head.appendChild(friendly);
+        head.appendChild(time);
+        main.appendChild(head);
+        if (entry.raw) {
+          const raw = document.createElement('div');
+          raw.className = 'cu-action-raw';
+          raw.textContent = entry.raw;
+          main.appendChild(raw);
+        }
+        row.appendChild(dot);
+        row.appendChild(main);
+      } else {
+        row.className = 'ui2-live-activity-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const textEl = document.createElement('span');
+        textEl.className = 'ui2-live-activity-text';
+        textEl.textContent = entry.text;
+        row.appendChild(dot);
+        row.appendChild(textEl);
+        row.appendChild(time);
+      }
       activityList.appendChild(row);
       activityRows.set(entry.seq, row);
+      appended = true;
+    }
+    if (appended && nearBottom) {
+      activityList.scrollTop = activityList.scrollHeight;
     }
   }
 
@@ -65885,12 +66345,26 @@ function applyDisplayStripState() {
     drawerMedia.addListener(onDrawerMediaChange);
   }
 
+  // Host identity chip text: "{host} · {display label}". The host label is
+  // the daemon's agent-card display name (status bar's source of truth),
+  // which arrives asynchronously — re-projected on every render.
+  function syncHostChips(slots) {
+    const host = (typeof selfHostLabel === 'string' && selfHostLabel) ? selfHostLabel : 'local';
+    for (const slot of slots) {
+      const textEl = slot.hostChipEl && slot.hostChipEl.querySelector('.cu-host-chip-text');
+      if (!textEl) continue;
+      const label = host + ' · ' + slotLabel(slot);
+      if (textEl.textContent !== label) textEl.textContent = label;
+    }
+  }
+
   function renderWorkspace() {
     railRaf = 0;
     const slots = Array.from(displaySlots.values());
     reconcileSelectedDisplay(slots);
     for (const slot of slots) captureSlotActivity(slot);
     syncDisplayRows(slots);
+    syncHostChips(slots);
     syncAuthorityCard();
     syncActivityList();
     syncPeerRows();
@@ -65972,6 +66446,540 @@ function applyDisplayStripState() {
   syncDrawerState(false);
   renderWorkspace();
 })();
+/* ── static/app/45b-cu-overlays.js ── */
+// ── CU action visualization (Live tab) ─────────────────────────────────
+// Renders what the agent DOES on a display from the daemon's `cu_action`
+// wire lane (one ephemeral event per successfully executed computer-use
+// action; see computer_use::CuActionObserver): the agent cursor + verb
+// pill, click ripples, keypress chips, the screenshot flash, the
+// per-display action feed rows (via window.noteCuDisplayActivity in
+// 45-displays-webrtc.js), and the session-attributed rail approval card.
+//
+// Honesty invariants:
+// - Everything here renders daemon-reported facts only. No clicks, typed
+//   text, roles, holders, or approvals are ever invented client-side.
+// - The concept's target-highlight box + role tag are deliberately NOT
+//   implemented: no element/role data exists on the wire today (future
+//   AX integration).
+// - Approval attribution: the amber rail card renders only when the
+//   pending approval's session was REPORTED (via cu_action session_id)
+//   as the session driving the selected display. No guessing.
+//
+// Stage guardrails (ui2-live.css header): overlays are absolutely
+// positioned, pointer-events:none, aria-hidden children of
+// .display-canvas; geometry comes from surfaceContentBox()
+// (getBoundingClientRect + intrinsic dims, pure letterbox); nothing here
+// touches the video element's dimensions or transforms.
+
+const CU_OVERLAY_IDLE_FADE_MS = 6000;   // cursor fades out after this much quiet
+const CU_OVERLAY_RIPPLE_MS = 560;       // concept-exact click ripple duration
+const CU_OVERLAY_FLASH_MS = 400;        // concept-exact screenshot flash duration
+const CU_OVERLAY_KEYS_HOLD_MS = 2600;   // keypress chips linger before clearing
+const CU_OVERLAY_LERP = 0.16;           // concept-exact cursor ease factor
+const CU_OVERLAY_DIMMED_OPACITY = 0.26; // cursor opacity while YOU hold input
+
+const cuReducedMotion = typeof window.matchMedia === 'function'
+  ? window.matchMedia('(prefers-reduced-motion: reduce)')
+  : { matches: false };
+
+// displayId → { sessionId, at } — the last session the daemon reported as
+// driving that display. Fed exclusively by cu_action events; consumed by
+// the rail approval card. Entries retire with their display slot.
+const cuDisplaySessionAttribution = new Map();
+
+// ── wire kind → presentation vocabularies ──────────────────────────────
+
+const CU_CLICK_KINDS = new Set([
+  'left_click', 'right_click', 'middle_click',
+  'double_click', 'triple_click', 'mouse_down', 'mouse_up',
+]);
+const CU_TYPE_KINDS = new Set(['type', 'paste', 'key', 'hold_key']);
+const CU_LOOK_KINDS = new Set(['screenshot', 'zoom']);
+
+// Feed dot color class (ui2-live.css kind-* rules): sky = look, iris =
+// click, violet = type, neutral = scroll/move, amber = waiting.
+function cuFeedKindFor(kind) {
+  if (CU_LOOK_KINDS.has(kind)) return 'look';
+  if (CU_CLICK_KINDS.has(kind)) return 'click';
+  if (CU_TYPE_KINDS.has(kind)) return 'type';
+  if (kind === 'wait') return 'attention';
+  return 'neutral'; // scroll, move, drag, unknown future kinds
+}
+
+// Cursor verb pill (concept vocabulary: Look/Move/Click/Type/Scroll/Waiting).
+function cuVerbFor(kind) {
+  if (CU_LOOK_KINDS.has(kind)) return 'Look';
+  if (CU_CLICK_KINDS.has(kind)) return 'Click';
+  if (CU_TYPE_KINDS.has(kind)) return 'Type';
+  if (kind === 'scroll') return 'Scroll';
+  if (kind === 'wait') return 'Waiting';
+  return 'Move'; // move, drag, unknown
+}
+
+// Pull the quoted text back out of a raw call string (`type("abc")`).
+function cuRawQuotedText(raw) {
+  const m = /^[a-z_]+\("([\s\S]*)"\)$/.exec(String(raw || ''));
+  return m ? m[1] : '';
+}
+
+// Pull the bare argument list out of a raw call string (`key(ctrl+c)`).
+function cuRawArgs(raw) {
+  const m = /^[a-z_]+\(([^)]*)\)$/.exec(String(raw || ''));
+  return m ? m[1] : '';
+}
+
+// Friendly first line for the feed. Generic on purpose: the wire carries
+// coordinates and raw calls, not element semantics, so the sentence never
+// pretends to know WHAT was clicked.
+function cuFriendlyFor(d) {
+  const hasPoint = Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y));
+  const at = hasPoint ? ` at (${d.x}, ${d.y})` : '';
+  switch (d.kind) {
+    case 'screenshot': return 'Looked at the screen';
+    case 'zoom': return 'Looked closer at a region';
+    case 'left_click': return 'Clicked' + at;
+    case 'right_click': return 'Right-clicked' + at;
+    case 'middle_click': return 'Middle-clicked' + at;
+    case 'double_click': return 'Double-clicked' + at;
+    case 'triple_click': return 'Triple-clicked' + at;
+    case 'mouse_down': return 'Pressed the mouse button' + at;
+    case 'mouse_up': return 'Released the mouse button' + at;
+    case 'move': return 'Moved the pointer' + at;
+    case 'drag': return hasPoint ? `Dragged to (${d.x}, ${d.y})` : 'Dragged';
+    case 'scroll': {
+      const dir = (cuRawArgs(d.raw).split(',')[0] || '').trim();
+      return dir ? `Scrolled ${dir}` : 'Scrolled';
+    }
+    case 'type': {
+      const text = cuRawQuotedText(d.raw);
+      if (!text) return 'Typed text';
+      const preview = text.length > 32 ? text.slice(0, 32) + '…' : text;
+      return `Typed “${preview}”`;
+    }
+    case 'paste': return 'Pasted text';
+    case 'key': {
+      const key = cuRawArgs(d.raw);
+      return key ? `Pressed ${key}` : 'Pressed a key';
+    }
+    case 'hold_key': {
+      const key = (cuRawArgs(d.raw).split(',')[0] || '').trim();
+      return key ? `Held ${key}` : 'Held a key';
+    }
+    case 'wait': {
+      const ms = Number((/^wait\((\d+)ms\)$/.exec(String(d.raw || '')) || [])[1]);
+      if (Number.isFinite(ms) && ms > 0) {
+        return ms >= 1000 ? `Waited ${(ms / 1000).toFixed(ms % 1000 ? 1 : 0)}s` : `Waited ${ms}ms`;
+      }
+      return 'Waited';
+    }
+    default: return `Performed ${String(d.kind || 'action')}`;
+  }
+}
+
+// ── per-slot overlay engine ─────────────────────────────────────────────
+
+const cuOverlayEngines = new Map(); // displayId → CuOverlayEngine
+
+class CuOverlayEngine {
+  constructor(displayId, slot) {
+    this.displayId = Number(displayId);
+    this.slot = slot;
+    this.raf = 0;
+    this.lastFrameAt = 0;
+    this.lastActivityAt = 0;
+    this.cursorShown = false;
+    this.cursorOpacity = 0;
+    this.cx = 0; this.cy = 0;   // current cursor position (stage px)
+    this.tx = 0; this.ty = 0;   // target cursor position
+    this.placed = false;        // cursor has a real position yet
+    this.ripple = null;         // { t0, x, y }
+    this.flashT0 = null;
+    this.keysTimer = 0;
+
+    const layer = (cls, zIndex) => {
+      const el = document.createElement('div');
+      el.className = cls;
+      el.setAttribute('aria-hidden', 'true');
+      if (zIndex) el.style.zIndex = String(zIndex);
+      slot.canvasEl.appendChild(el);
+      return el;
+    };
+    // z-order mirrors the concept: flash 9 < ripple 16 < keys 18 < cursor 20.
+    this.flashEl = layer('cu-overlay-flash', 9);
+    this.rippleEl = layer('cu-overlay-ripple', 16);
+    this.keysEl = layer('cu-overlay-keys', 18);
+    this.cursorEl = layer('cu-overlay-cursor', 20);
+    // Concept-exact white arrow (24×26) + iris verb pill.
+    this.cursorEl.innerHTML =
+      '<svg width="24" height="26" viewBox="0 0 24 26">' +
+      '<path d="M2 2 L2 20.5 L6.6 16.2 L9.9 23.4 L13 22 L9.7 15 L16 14.6 Z" ' +
+      'fill="#ffffff" stroke="rgba(10,12,20,.55)" stroke-width="1.2" ' +
+      'stroke-linejoin="round"></path></svg>' +
+      '<span class="cu-cursor-pill"></span>';
+    this.pillEl = this.cursorEl.querySelector('.cu-cursor-pill');
+  }
+
+  destroy() {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    if (this.keysTimer) clearTimeout(this.keysTimer);
+    for (const el of [this.flashEl, this.rippleEl, this.keysEl, this.cursorEl]) {
+      el?.remove();
+    }
+  }
+
+  // Map a display-space point (against the event's reference resolution,
+  // falling back to the stream's intrinsic size) into stage-local pixels.
+  stagePoint(x, y, refW, refH) {
+    const slot = this.slot;
+    if (!slot || !slot.canvasEl || !slot.videoEl) return null;
+    const box = surfaceContentBox(slot.canvasEl, slot.videoEl, slot.width, slot.height);
+    if (!box) return null;
+    const rw = refW > 0 ? refW : (Number(slot.videoEl.videoWidth) || Number(slot.width) || 0);
+    const rh = refH > 0 ? refH : (Number(slot.videoEl.videoHeight) || Number(slot.height) || 0);
+    if (!(rw > 0) || !(rh > 0)) return null;
+    const fx = Math.max(0, Math.min(1, x / rw));
+    const fy = Math.max(0, Math.min(1, y / rh));
+    return { x: box.x + fx * box.w, y: box.y + fy * box.h };
+  }
+
+  handle(d) {
+    const now = performance.now();
+    this.lastActivityAt = now;
+    this.cursorShown = true;
+    if (this.pillEl) {
+      const verb = cuVerbFor(d.kind);
+      if (this.pillEl.textContent !== verb) this.pillEl.textContent = verb;
+    }
+
+    const hasPoint = Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y));
+    if (hasPoint) {
+      const p = this.stagePoint(Number(d.x), Number(d.y), Number(d.ref_w) || 0, Number(d.ref_h) || 0);
+      if (p) {
+        this.tx = p.x; this.ty = p.y;
+        if (!this.placed || cuReducedMotion.matches) {
+          // First placement (or reduced motion): snap, don't fly across.
+          this.cx = p.x; this.cy = p.y;
+          this.placed = true;
+        }
+        if (CU_CLICK_KINDS.has(d.kind) && d.kind !== 'mouse_up' && !cuReducedMotion.matches) {
+          this.ripple = { t0: now, x: p.x, y: p.y };
+        }
+      }
+    } else if (!this.placed) {
+      // Coordinate-free first event: fade in at the stage centre (concept
+      // reset behavior) rather than the top-left corner.
+      const rect = this.slot.canvasEl.getBoundingClientRect();
+      if (rect.width > 0) {
+        this.cx = this.tx = rect.width / 2;
+        this.cy = this.ty = rect.height * 0.42;
+        this.placed = true;
+      }
+    }
+
+    if (CU_LOOK_KINDS.has(d.kind) && !cuReducedMotion.matches) {
+      this.flashT0 = now;
+    }
+    if (CU_TYPE_KINDS.has(d.kind)) {
+      this.showKeyChips(d);
+    }
+    this.ensureRunning();
+  }
+
+  showKeyChips(d) {
+    const chips = [];
+    if (d.kind === 'type' || d.kind === 'paste') {
+      const text = cuRawQuotedText(d.raw);
+      // Last ~9 typed characters, space rendered as · (concept grammar).
+      for (const ch of Array.from(text).slice(-9)) {
+        chips.push(ch === ' ' ? '·' : ch);
+      }
+      if (!chips.length) return; // nothing honest to show (empty/truncated-away)
+    } else {
+      const key = (d.kind === 'hold_key')
+        ? (cuRawArgs(d.raw).split(',')[0] || '').trim()
+        : cuRawArgs(d.raw);
+      if (!key) return;
+      chips.push(key);
+    }
+    this.keysEl.replaceChildren(...chips.map(label => {
+      const chip = document.createElement('span');
+      chip.className = 'cu-key-chip';
+      chip.textContent = label;
+      return chip;
+    }));
+    if (this.keysTimer) clearTimeout(this.keysTimer);
+    this.keysTimer = window.setTimeout(() => {
+      this.keysTimer = 0;
+      this.keysEl.replaceChildren();
+    }, CU_OVERLAY_KEYS_HOLD_MS);
+  }
+
+  ensureRunning() {
+    if (this.raf) return;
+    this.lastFrameAt = performance.now();
+    const step = () => { this.raf = 0; this.tick(); };
+    this.raf = requestAnimationFrame(step);
+  }
+
+  tick() {
+    const slot = displaySlots.get(this.displayId);
+    if (slot !== this.slot || !this.slot.canvasEl.isConnected) {
+      // Slot replaced or removed under us — retire the engine.
+      cuOverlayEngines.delete(this.displayId);
+      this.destroy();
+      return;
+    }
+    const now = performance.now();
+
+    // Cursor ease + opacity. The cursor dims while the DASHBOARD USER
+    // holds input authority (their pointer drives the display, not the
+    // agent's), and fades out entirely after idle.
+    const idle = now - this.lastActivityAt > CU_OVERLAY_IDLE_FADE_MS;
+    const userDriving = this.slot.authorityState === 'you';
+    const targetOpacity = !this.cursorShown || idle || !this.placed
+      ? 0
+      : (userDriving ? CU_OVERLAY_DIMMED_OPACITY : 1);
+    if (cuReducedMotion.matches) {
+      this.cx = this.tx; this.cy = this.ty;
+      this.cursorOpacity = targetOpacity;
+    } else {
+      this.cx += (this.tx - this.cx) * CU_OVERLAY_LERP;
+      this.cy += (this.ty - this.cy) * CU_OVERLAY_LERP;
+      this.cursorOpacity += (targetOpacity - this.cursorOpacity) * 0.18;
+    }
+    this.cursorEl.style.left = this.cx.toFixed(1) + 'px';
+    this.cursorEl.style.top = this.cy.toFixed(1) + 'px';
+    this.cursorEl.style.opacity = this.cursorOpacity.toFixed(3);
+
+    // Click ripple: 0.4→2.8 scale, 0.9→0 opacity over 560ms (concept).
+    if (this.ripple) {
+      const age = now - this.ripple.t0;
+      if (age < CU_OVERLAY_RIPPLE_MS) {
+        const k = age / CU_OVERLAY_RIPPLE_MS;
+        this.rippleEl.style.left = this.ripple.x.toFixed(1) + 'px';
+        this.rippleEl.style.top = this.ripple.y.toFixed(1) + 'px';
+        this.rippleEl.style.transform =
+          'translate(-50%,-50%) scale(' + (0.4 + 2.4 * k).toFixed(3) + ')';
+        this.rippleEl.style.opacity = (0.9 * (1 - k)).toFixed(3);
+      } else {
+        this.ripple = null;
+        this.rippleEl.style.opacity = '0';
+      }
+    }
+
+    // Screenshot flash: 0→0.85 over the first quarter, back to 0 (concept).
+    if (this.flashT0 != null) {
+      const age = now - this.flashT0;
+      if (age < CU_OVERLAY_FLASH_MS) {
+        const k = age / CU_OVERLAY_FLASH_MS;
+        const op = k < 0.25 ? (k / 0.25) * 0.85 : 0.85 * (1 - (k - 0.25) / 0.75);
+        this.flashEl.style.opacity = Math.max(0, op).toFixed(3);
+      } else {
+        this.flashT0 = null;
+        this.flashEl.style.opacity = '0';
+      }
+    }
+
+    const animating =
+      this.ripple !== null ||
+      this.flashT0 !== null ||
+      this.cursorOpacity > 0.005 ||
+      Math.abs(this.tx - this.cx) > 0.5 ||
+      Math.abs(this.ty - this.cy) > 0.5;
+    if (animating) {
+      this.raf = requestAnimationFrame(() => { this.raf = 0; this.tick(); });
+    } else {
+      // Fully settled and faded — park the loop until the next event.
+      this.cursorShown = false;
+    }
+  }
+}
+
+function cuEngineFor(displayId) {
+  const id = Number(displayId);
+  const slot = displaySlots.get(id);
+  if (!slot || !slot.canvasEl) return null;
+  let engine = cuOverlayEngines.get(id);
+  if (engine && engine.slot !== slot) {
+    engine.destroy();
+    engine = null;
+  }
+  if (!engine) {
+    engine = new CuOverlayEngine(id, slot);
+    cuOverlayEngines.set(id, engine);
+  }
+  return engine;
+}
+
+// ── wire entry point (dispatched from 36-voice-wasm-init.js) ────────────
+
+window.handleCuActionEvent = function(d) {
+  if (!d || typeof d !== 'object') return;
+  const displayId = Number(d.display_id);
+  const kind = String(d.kind || '');
+  if (!Number.isFinite(displayId) || !kind) return;
+
+  // Display→session attribution (drives the rail approval card).
+  const sessionId = typeof d.session_id === 'string' ? d.session_id.trim() : '';
+  if (sessionId) {
+    cuDisplaySessionAttribution.set(displayId, { sessionId, at: Date.now() });
+  }
+
+  // Per-display feed row (two-line action grammar, 45-displays-webrtc.js).
+  if (typeof window.noteCuDisplayActivity === 'function') {
+    window.noteCuDisplayActivity(displayId, cuFeedKindFor(kind), cuFriendlyFor(d), d.raw || '');
+  }
+
+  // Stage overlays for the display's live slot (no slot → feed only).
+  const engine = cuEngineFor(displayId);
+  if (engine) engine.handle(d);
+
+  scheduleCuApprovalCard();
+};
+
+// Attribution retires with its display slot (removeDisplaySlot calls this
+// through the live-workspace retire hook chain in 45-displays-webrtc.js).
+const cuPreviousRetire = window.retireLiveDisplayWorkspaceSlot;
+window.retireLiveDisplayWorkspaceSlot = function(displayId) {
+  const id = Number(displayId);
+  cuDisplaySessionAttribution.delete(id);
+  const engine = cuOverlayEngines.get(id);
+  if (engine) {
+    cuOverlayEngines.delete(id);
+    engine.destroy();
+  }
+  if (typeof cuPreviousRetire === 'function') cuPreviousRetire(displayId);
+  scheduleCuApprovalCard();
+};
+
+// ── session-attributed rail approval card ───────────────────────────────
+// Renders between Input authority and Display activity when the pending
+// approval's session is the daemon-reported driver of the SELECTED
+// display. Approve/Deny proxy the main approval panel's own actions
+// (window.sendApproval → the session-scoped approve/deny ControlMsg), so
+// there is exactly one approval state machine.
+
+let cuApprovalRaf = 0;
+
+function cuApprovalDom() {
+  const mount = document.getElementById('ui2-live-approval');
+  if (!mount) return null;
+  if (!mount.dataset.built) {
+    mount.dataset.built = '1';
+    mount.innerHTML =
+      '<div class="cu-approval-card">' +
+        '<div class="cu-approval-head">' +
+          '<span class="cu-approval-dot" aria-hidden="true"></span>' +
+          '<span class="cu-approval-eyebrow">Approval needed</span>' +
+        '</div>' +
+        '<div class="cu-approval-title">The agent is paused on this display</div>' +
+        '<div class="cu-approval-body">The session driving this display asked to run a ' +
+          'gated command and is waiting for your decision. The full request is in the ' +
+          'approval panel.</div>' +
+        '<div class="cu-approval-chips"></div>' +
+        '<div class="cu-approval-actions">' +
+          '<button type="button" class="cu-approval-approve">Approve &amp; continue</button>' +
+          '<button type="button" class="cu-approval-deny">Deny</button>' +
+        '</div>' +
+      '</div>';
+    mount.querySelector('.cu-approval-approve').addEventListener('click', () => {
+      if (typeof window.sendApproval === 'function') window.sendApproval('approve');
+    });
+    mount.querySelector('.cu-approval-deny').addEventListener('click', () => {
+      if (typeof window.sendApproval === 'function') window.sendApproval('deny');
+    });
+  }
+  return mount;
+}
+
+function renderCuApprovalCard() {
+  cuApprovalRaf = 0;
+  const mount = cuApprovalDom();
+  if (!mount) return;
+
+  const approvalId = typeof pendingApprovalId !== 'undefined' ? pendingApprovalId : null;
+  const approvalSession = typeof pendingApprovalSessionId !== 'undefined'
+    ? String(pendingApprovalSessionId || '')
+    : '';
+  const container = document.getElementById('displays-container');
+  const selRaw = container ? String(container.dataset.activeDisplayId || '') : '';
+  const selectedId = selRaw === '' ? NaN : Number(selRaw);
+  const attribution = Number.isFinite(selectedId)
+    ? cuDisplaySessionAttribution.get(selectedId)
+    : null;
+
+  const show = approvalId !== null &&
+    approvalSession !== '' &&
+    Boolean(attribution) &&
+    attribution.sessionId === approvalSession;
+  mount.hidden = !show;
+  if (!show) return;
+
+  // Chips mirror the approval panel's shown request (single source of
+  // truth for the command text and category).
+  const chipsEl = mount.querySelector('.cu-approval-chips');
+  const command = (document.getElementById('approval-command')?.textContent || '').trim();
+  const categoryEl = document.getElementById('approval-category');
+  const category = categoryEl && categoryEl.style.display !== 'none'
+    ? (categoryEl.textContent || '').trim()
+    : '';
+  const chips = [];
+  if (command) chips.push(command.length > 64 ? command.slice(0, 64) + '…' : command);
+  if (category) chips.push(category);
+  chipsEl.replaceChildren(...chips.map(text => {
+    const chip = document.createElement('span');
+    chip.className = 'cu-approval-chip';
+    chip.textContent = text;
+    return chip;
+  }));
+
+  const sending = typeof approvalSendPending !== 'undefined' && Boolean(approvalSendPending);
+  for (const btn of mount.querySelectorAll('button')) btn.disabled = sending;
+}
+
+function scheduleCuApprovalCard() {
+  if (cuApprovalRaf) return;
+  cuApprovalRaf = requestAnimationFrame(renderCuApprovalCard);
+}
+
+// Re-render on the approval panel's own lifecycle (show/hide/sending) and
+// on stage selection changes — both are DOM-observable without touching
+// the approval state machine.
+{
+  const approvalPanel = document.getElementById('approval-panel');
+  if (approvalPanel) {
+    new MutationObserver(scheduleCuApprovalCard).observe(approvalPanel, {
+      attributes: true,
+      attributeFilter: ['class'],
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+  }
+  const displaysContainer = document.getElementById('displays-container');
+  if (displaysContainer) {
+    new MutationObserver(scheduleCuApprovalCard).observe(displaysContainer, {
+      attributes: true,
+      attributeFilter: ['data-active-display-id'],
+    });
+  }
+}
+
+// Stable browser-QA surface (CDP probes; same convention as qa.liveDisplay).
+window.qa = Object.assign(window.qa || {}, {
+  cuOverlays() {
+    return {
+      engines: Array.from(cuOverlayEngines.keys()),
+      attribution: Array.from(cuDisplaySessionAttribution.entries()).map(([id, a]) => ({
+        displayId: id,
+        sessionId: a.sessionId,
+        at: a.at,
+      })),
+      approvalCardVisible: !(document.getElementById('ui2-live-approval')?.hidden ?? true),
+    };
+  },
+});
 /* ── static/app/46-recording-replay.js ── */
 // ── Recording Replay ──
 
