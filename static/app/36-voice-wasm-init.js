@@ -907,20 +907,26 @@ async function main() {
       if (d.event === 'recording_started' && d.stream_name) {
         serverMsgStep(d, 'recording_started', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+          if (slot) slot.applyRecordingState(true, d.stream_name);
           handleDebugRecordingEvent(d); // debug tab's Record button tracks its display's streams
         });
       } else if (d.event === 'recording_stopped' && d.stream_name) {
         serverMsgStep(d, 'recording_stopped', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { slot.recordingStreamName = d.stream_name; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+          if (slot) slot.applyRecordingState(false, d.stream_name);
           handleDebugRecordingEvent(d);
         });
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         serverMsgStep(d, 'recording_deleted', () => {
           const slot = slotForRecordingStream(d.stream_name);
-          if (slot) { if (slot.recordingStreamName === d.stream_name) slot.recordingStreamName = null; slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+          if (slot) slot.applyRecordingState(false, d.stream_name, true);
           deleteRecordingStream(d.stream_name);
+        });
+      } else if (d.event === 'recording_error' && d.stream_name) {
+        serverMsgStep(d, 'recording_error', () => {
+          const slot = slotForRecordingStream(d.stream_name);
+          if (slot) slot._failRecordingCommand(d.message || 'Recording failed');
+          handleDebugRecordingEvent(d);
         });
       }
       // Display transport metrics (per-display sections)
@@ -1417,4 +1423,3 @@ async function main() {
     if (modelConnected && app) disconnectDashboardVoice();
   });
 }
-

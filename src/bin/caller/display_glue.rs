@@ -1483,22 +1483,29 @@ pub(crate) async fn handle_shared_view_calls(
             ))
         });
 
-        let resolved_target = mcp::shared_view_display_target(display_target, None);
-        let display_id = mcp::shared_view_display_id(resolved_target.as_deref(), None);
-        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
-
         // The user's own screen is an explicit opt-in path: require the
         // existing display grant instead of flipping it from a tool call.
         // Only display-exposing verbs gate — focus/input/hide operate on
         // whatever view is already shown.
         let user_display_granted = autonomy.read().await.user_display_granted;
+        let resolved =
+            mcp::resolve_concrete_shared_view_target(display_target, None).or_else(|| {
+                if action == "hide" {
+                    None
+                } else {
+                    Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
+                        user_display_granted,
+                    )))
+                }
+            });
+        let resolved_target = resolved.as_ref().map(|(target, _)| target.clone());
+        let display_id = resolved.map(|(_, id)| id);
+        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
+
         let effective_user_display = match display_id {
             Some(0) => true,
             Some(_) => false,
-            None => matches!(
-                resolve_cu_display_target(user_display_granted),
-                computer_use::DisplayTarget::UserSession
-            ),
+            None => false,
         };
         if matches!(action, "show" | "capture") && effective_user_display && !user_display_granted {
             conversation.add_tool_result(
@@ -1598,7 +1605,12 @@ pub(crate) async fn handle_shared_view_calls(
                 }
             }
             "input" => {
-                bus.send(emit("input", None));
+                // `input` is the tool-call vocabulary; the browser event
+                // vocabulary is `input_request` (shared with the MCP path).
+                // Keeping that boundary canonical makes the dashboard show
+                // its user-clicked Take input affordance without granting
+                // authority automatically.
+                bus.send(emit("input_request", None));
                 format!(
                     "Input authority requested for {label}. The user must accept from the \
                      dashboard control — continue only after they take over or respond."
@@ -1743,6 +1755,27 @@ pub(crate) async fn execute_cu_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DisplayEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl DisplayEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("DISPLAY");
+            std::env::set_var("DISPLAY", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for DisplayEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("DISPLAY", value),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn resolve_attachments_includes_uploaded_files_and_images() {
@@ -2047,6 +2080,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_view_calls_validate_and_gate_user_session() {
+        let _env_lock = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let _display = DisplayEnvGuard::set(":99");
         let tmp = tempfile::tempdir().unwrap();
         let session_log: SharedSessionLog = Arc::new(Mutex::new(
             session_log::SessionLog::open(tmp.path().to_path_buf()).unwrap(),
@@ -2067,6 +2102,7 @@ mod tests {
                 serde_json::json!({"action": "show", "display_target": "user_session"}),
             ),
             ("c4".to_string(), serde_json::json!({"action": "bogus"})),
+            ("c5".to_string(), serde_json::json!({"action": "input"})),
         ];
         handle_shared_view_calls(
             &calls,
@@ -2086,7 +2122,7 @@ mod tests {
             .iter()
             .filter(|m| m.role == "tool")
             .collect();
-        assert_eq!(results.len(), 4, "one result per call");
+        assert_eq!(results.len(), 5, "one result per call");
         assert!(
             results[0].content.contains("dismissed"),
             "{}",
@@ -2107,9 +2143,14 @@ mod tests {
             "{}",
             results[3].content
         );
+        assert!(
+            results[4].content.contains("Input authority requested"),
+            "{}",
+            results[4].content
+        );
 
-        // Only the valid hide emitted a SharedView event; the gated and
-        // invalid calls must not reach the dashboard.
+        // The valid hide and advisory input request emit SharedView events;
+        // gated and invalid calls must not reach the dashboard.
         match rx.try_recv() {
             Ok(AppEvent::SharedView {
                 action, session_id, ..
@@ -2118,6 +2159,21 @@ mod tests {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
             }
             other => panic!("expected SharedView hide event, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action,
+                session_id,
+                display_target,
+                display_id,
+                ..
+            }) => {
+                assert_eq!(action, "input_request");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(display_target.as_deref(), Some(":99"));
+                assert_eq!(display_id, Some(99));
+            }
+            other => panic!("expected SharedView input_request event, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no further events expected");
     }

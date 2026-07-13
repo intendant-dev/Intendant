@@ -28,7 +28,7 @@
     <span class="display-toggle-wrap">
       <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
       <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
-      <div class="display-picker" id="display-picker"></div>
+      <div class="display-picker" id="display-picker" aria-hidden="true"></div>
     </span>
     <span class="sep">|</span>
     <span class="field-label">Intendant session</span>
@@ -195,12 +195,14 @@
               <button class="strip-minimize-btn" id="strip-minimize" type="button" title="Minimize displays" aria-label="Minimize displays" aria-pressed="false">&minus;</button>
               <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
             </div>
-            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
+            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner"
+                 data-shared-view-banner role="status" aria-live="polite" aria-atomic="true">
               <span class="shared-view-kicker">Shared view</span>
               <span class="shared-view-message" data-shared-view-message></span>
               <span class="shared-view-actions">
                 <button class="shared-view-action" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-                <button class="shared-view-close" type="button" data-shared-view-close title="Hide shared view">&times;</button>
+                <button class="shared-view-close" type="button" data-shared-view-close
+                        aria-label="Hide shared view" title="Hide shared view">&times;</button>
               </span>
             </div>
             <div class="activity-display-row" id="activity-display-row"></div>
@@ -974,19 +976,32 @@
 
     <!-- Displays Tab -->
     <div id="tab-displays" class="tab-pane">
-      <div class="display-approval-banner hidden" id="display-approval-banner">
+      <div class="ui2-live-main" id="ui2-live-main">
+      <div class="ui2-live-mobile-bar">
+        <div>
+          <span class="ui2-live-mobile-kicker">Computer use</span>
+          <span class="ui2-live-mobile-summary" id="ui2-live-mobile-summary">No display selected</span>
+        </div>
+        <button class="ui2-live-rail-toggle" id="ui2-live-rail-toggle" type="button"
+                aria-controls="ui2-live-rail" aria-expanded="false">
+          Displays &amp; input
+        </button>
+      </div>
+      <div class="display-approval-banner hidden" id="display-approval-banner" role="alert" aria-atomic="true">
         <div class="icon">&#x26A0;</div>
         <div class="text">
           <div class="title">Screen sharing approval needed</div>
           <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
         </div>
       </div>
-      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner>
+      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner
+           role="status" aria-live="polite" aria-atomic="true">
         <span class="shared-view-kicker">Shared view</span>
         <span class="shared-view-message" id="shared-view-message" data-shared-view-message></span>
         <span class="shared-view-actions">
           <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close title="Hide shared view">&times;</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close
+                  aria-label="Hide shared view" title="Hide shared view">&times;</button>
         </span>
       </div>
       <div class="displays-container" id="displays-container">
@@ -1103,6 +1118,40 @@
           <button id="rec-clip-btn" title="Send Clip (C)">&#127916; Clip</button>
         </div>
       </div>
+      </div>
+      <button class="ui2-live-rail-scrim" id="ui2-live-rail-scrim" type="button"
+              aria-label="Close live display controls" tabindex="-1"></button>
+      <aside class="ui2-live-rail" id="ui2-live-rail" aria-labelledby="ui2-live-rail-title">
+        <header class="ui2-live-rail-header">
+          <div>
+            <div class="ui2-live-rail-kicker">Live workspace</div>
+            <h2 id="ui2-live-rail-title">Computer use</h2>
+          </div>
+          <button class="ui2-live-rail-close" id="ui2-live-rail-close" type="button"
+                  aria-label="Close live display controls">&times;</button>
+        </header>
+        <section aria-labelledby="ui2-live-displays-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-displays-heading">Displays</h3>
+          <div class="ui2-live-rail-list" id="ui2-live-displays-list" role="group" aria-label="Live displays"></div>
+        </section>
+        <section aria-labelledby="ui2-live-authority-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-authority-heading">Input authority</h3>
+          <div id="ui2-live-authority-card"></div>
+        </section>
+        <section aria-labelledby="ui2-live-activity-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-activity-heading">Display activity</h3>
+          <div class="ui2-live-activity" id="ui2-live-activity" role="log"
+               aria-live="polite" aria-relevant="additions text"></div>
+        </section>
+        <section aria-labelledby="ui2-live-peer-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-peer-heading">Peer displays</h3>
+          <div class="ui2-live-rail-list" id="ui2-live-peer-list" role="group" aria-label="Peer displays"></div>
+        </section>
+        <section aria-labelledby="ui2-live-yourscreen-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-yourscreen-heading">Your screen</h3>
+          <div id="ui2-live-yourscreen"></div>
+        </section>
+      </aside>
     </div>
 
     <!-- Sessions Tab -->
