@@ -3320,7 +3320,7 @@ mod tests {
     {
         use tokio::io::AsyncReadExt;
         let (mut client, server) = tokio::io::duplex(1 << 20);
-        run(Box::pin(server)).await;
+        run(DemuxStream::new(Box::pin(server))).await;
         let mut response = Vec::new();
         client
             .read_to_end(&mut response)
@@ -3985,7 +3985,7 @@ mod tests {
     {
         use tokio::io::AsyncReadExt;
         let (mut client, server) = tokio::io::duplex(1 << 20);
-        run(Box::pin(server)).await;
+        run(DemuxStream::new(Box::pin(server))).await;
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         response

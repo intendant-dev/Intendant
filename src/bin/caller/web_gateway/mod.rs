@@ -27,6 +27,9 @@ pub(crate) use static_assets::*;
 mod http;
 pub(crate) use http::*;
 
+mod keep_alive;
+pub(crate) use keep_alive::*;
+
 mod api_core;
 pub(crate) use api_core::*;
 
@@ -494,7 +497,7 @@ mod tests {
     {
         use tokio::io::AsyncReadExt;
         let (mut client, server) = tokio::io::duplex(1 << 20);
-        run(Box::pin(server)).await;
+        run(DemuxStream::new(Box::pin(server))).await;
         let mut response = Vec::new();
         client
             .read_to_end(&mut response)
@@ -1858,9 +1861,29 @@ mod tests {
         (port, handle)
     }
 
+    /// Insert `Connection: close` after the request line unless the
+    /// request already carries a Connection header (WS upgrades send
+    /// `Connection: Upgrade` and must not gain a second, conflicting
+    /// one).
+    fn pin_connection_close(request: &str) -> String {
+        if request.to_ascii_lowercase().contains("\r\nconnection:") {
+            return request.to_string();
+        }
+        request.replacen("\r\n", "\r\nConnection: close\r\n", 1)
+    }
+
     /// Fire a raw HTTP request and read the response bytes.
+    ///
+    /// One-shot contract: the read runs to EOF, so the request is pinned
+    /// to `Connection: close` here (inserted after the request line) —
+    /// otherwise every keep-alive-eligible response would park the
+    /// connection and this helper would idle out the 2s deadline per
+    /// call. Keep-alive itself is exercised by the dedicated listener
+    /// tests. Requests that already carry a `Connection` header (the WS
+    /// upgrade shapes send `Connection: Upgrade`) pass through verbatim.
     async fn http_request_bytes(port: u16, request: &str) -> Vec<u8> {
         use tokio::io::AsyncWriteExt;
+        let request = pin_connection_close(request);
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .unwrap();
@@ -2367,6 +2390,10 @@ mod tests {
             .await
             .unwrap();
         let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        // One-shot contract (same as http_request_bytes): pin the request
+        // to `Connection: close` so a keep-alive-eligible response can't
+        // park the connection and stall the read-to-EOF below.
+        let request = pin_connection_close(request);
         tls.write_all(request.as_bytes()).await.unwrap();
         // Read to EOF under one generous deadline. The old 2s timeout with
         // its result discarded turned this into a load lottery: ~2.8 MB of

@@ -986,7 +986,6 @@ pub fn spawn_web_gateway(
                 }
 
                 let buf_owned: Vec<u8>;
-                let n: usize;
                 let mut stream: DemuxStream;
                 let tls_client_cert_present: bool;
                 let tls_client_cert_fingerprint: Option<String>;
@@ -1031,73 +1030,191 @@ pub fn spawn_web_gateway(
                         }
                     };
                     decrypted.truncate(read_n);
-                    n = read_n;
                     buf_owned = decrypted.clone();
                     // Replay the decrypted request head in front of the TLS
                     // stream so the WS upgrade / HTTP body reads downstream
                     // see the request from byte zero.
-                    stream = Box::pin(crate::web_tls::PrefixedStream::new(decrypted, tls_stream));
+                    stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
+                        decrypted, tls_stream,
+                    )));
                 } else {
                     // Plain HTTP/WS: the peeked bytes are still in the
                     // kernel buffer. Box the raw stream with an empty
                     // replay prefix — a zero-overhead pass-through that
                     // reads the request straight from the socket.
-                    n = peeked;
                     buf_owned = buf[..peeked].to_vec();
                     tls_client_cert_present = false;
                     tls_client_cert_fingerprint = None;
-                    stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
+                    stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
+                        Vec::new(),
+                        raw_stream,
+                    )));
                 }
-                // Downstream code reads `buf[..n]`; point `buf` at the
-                // (decrypted, for TLS) request head we just captured.
-                let buf = buf_owned.as_slice();
+                // ── HTTP/1.1 keep-alive request loop ─────────────────
+                // One accepted connection serves a sequence of requests:
+                // each iteration processes the request head captured in
+                // `head_segment` (request 1: the demux peek / first TLS
+                // read; request N+1: read back below after the previous
+                // response PARKED the stream instead of closing it).
+                // Identity, IAM context, and the origin gates are
+                // re-evaluated PER REQUEST inside `serve_http_request` —
+                // only transport facts (TLS-ness, the client-cert
+                // fingerprint, the peer address) are connection-scoped.
+                // The loop ends when a write edge closes instead of
+                // parking (the keep_alive module holds the decision
+                // table), when the idle timeout / request budget runs
+                // out, or when a WebSocket upgrade hands the whole
+                // connection off below.
+                let parked = DemuxStream::new_parked_slot();
+                stream.arm_keep_alive(&parked);
+                let mut served: u32 = 0;
+                let mut head_segment: Vec<u8> = buf_owned;
+                let (mut stream, header_text, peer_connection_identity, browser_host_ip) = loop {
+                    served += 1;
+                    let n = head_segment.len();
+                    let header_text = String::from_utf8_lossy(&head_segment).to_string();
+                    let peer_connection_identity = match resolve_peer_connection_identity(
+                        &header_text,
+                        tls_client_cert_fingerprint.as_deref(),
+                    ) {
+                        Ok(identity) => identity,
+                        Err((status, body)) => {
+                            use tokio::io::AsyncWriteExt;
+                            let reason = match status {
+                                401 => "Unauthorized",
+                                403 => "Forbidden",
+                                _ => "Error",
+                            };
+                            let response = HttpResponse::with_content(
+                                format!("{} {}", status, reason),
+                                "application/json",
+                                body,
+                            )
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "close")
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    };
+                    let is_websocket = header_text
+                        .lines()
+                        .any(|l| l.to_lowercase().contains("upgrade: websocket"));
 
-                let header_text = String::from_utf8_lossy(&buf[..n]);
-                let peer_connection_identity = match resolve_peer_connection_identity(
-                    &header_text,
-                    tls_client_cert_fingerprint.as_deref(),
-                ) {
-                    Ok(identity) => identity,
-                    Err((status, body)) => {
-                        use tokio::io::AsyncWriteExt;
-                        let reason = match status {
-                            401 => "Unauthorized",
-                            403 => "Forbidden",
-                            _ => "Error",
-                        };
-                        let response = HttpResponse::with_content(
-                            format!("{} {}", status, reason),
-                            "application/json",
-                            body,
-                        )
-                        .header("Cache-Control", "no-cache")
-                        .header("Connection", "close")
-                        .into_string();
-                        let _ = stream.write_all(response.as_bytes()).await;
+                    // Parse the `Host:` header to learn what address the
+                    // browser thinks reaches us. We use this later as the IP
+                    // for ICE-TCP host candidates: Firefox refuses to pair
+                    // remote loopback candidates, so we need a non-loopback
+                    // address the browser can actually connect to. The only
+                    // one we know for sure the browser can reach is whatever
+                    // it just used to reach us for HTTP — which is exactly
+                    // what the Host header contains. If the user accessed
+                    // via a hostname (`localhost`, `myserver.local`) rather
+                    // than a literal IP, we get None here and skip the TCP
+                    // candidate entirely; those users can still use UDP if
+                    // their topology allows it.
+                    let browser_host_ip: Option<std::net::IpAddr> =
+                        extract_host_header_ip(&header_text);
+
+                    if is_websocket {
+                        // Upgrades never loop: the connection stops being
+                        // HTTP. Hand the WS path everything it needs —
+                        // whether this was request 1 or a kept-alive
+                        // follow-up, the stream delivers the upgrade head
+                        // from byte zero (kernel buffer / PrefixedStream /
+                        // replay).
+                        break (
+                            stream,
+                            header_text,
+                            peer_connection_identity,
+                            browser_host_ip,
+                        );
+                    }
+
+                    // Request leg of the keep-alive verdict; the body and
+                    // response legs are dispatch's and the write edges'.
+                    stream.begin_request(
+                        served < KEEP_ALIVE_MAX_REQUESTS
+                            && request_allows_keep_alive(&header_text)
+                            && segment_is_single_request(&head_segment),
+                    );
+                    let http_ctx = HttpRequestCtx {
+                        bus: bus.clone(),
+                        config_json: config_json.clone(),
+                        session_provider: session_provider.clone(),
+                        session_model: session_model.clone(),
+                        agent_card_json: agent_card_json.clone(),
+                        agent_card_value_for_targets: agent_card_value_for_targets.clone(),
+                        app_html: app_html.clone(),
+                        app_html_override: app_html_override.clone(),
+                        app_html_cache: app_html_cache.clone(),
+                        worktree_inventory_cache: worktree_inventory_cache.clone(),
+                        mcp_server: mcp_server.clone(),
+                        peer_registry: peer_registry.clone(),
+                        project_root: project_root.clone(),
+                        inbound_bearer_token: inbound_bearer_token.clone(),
+                        tls_client_cert_required,
+                        peer_access_request_config: peer_access_request_config.clone(),
+                        active_presence: active_presence.clone(),
+                        voice_debug: voice_debug.clone(),
+                        dashboard_control: Arc::clone(&dashboard_control),
+                        daemon_session_id: daemon_session_id.clone(),
+                        query_ctx: query_ctx.clone(),
+                        frame_registry: frame_registry.clone(),
+                        session_log: session_log.clone(),
+                        recording_registry: recording_registry.clone(),
+                        session_registry: session_registry.clone(),
+                        snapshot_dir: snapshot_dir.clone(),
+                        project_root_for_changes: project_root_for_changes.clone(),
+                        runtime_settings: runtime_settings.clone(),
+                        file_watcher: file_watcher.clone(),
+                    };
+                    serve_http_request(
+                        http_ctx,
+                        stream,
+                        n,
+                        &header_text,
+                        peer_addr,
+                        source_hint.clone(),
+                        is_tls,
+                        tls_client_cert_present,
+                        tls_client_cert_fingerprint.clone(),
+                        peer_connection_identity,
+                    )
+                    .await;
+
+                    // The write edge either parked the stream for reuse
+                    // or closed it (finalize); no parked stream means the
+                    // connection is done.
+                    let Some(back) = parked.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                        return;
+                    };
+                    stream = back;
+                    let Some(next) = read_next_request_head(
+                        &mut stream,
+                        std::time::Duration::from_secs(KEEP_ALIVE_IDLE_SECS),
+                    )
+                    .await
+                    else {
+                        // Idle timeout, clean client close, or an
+                        // unparseable follow-up: flush + shutdown ends the
+                        // connection (the finalize contract's home is
+                        // connection end now — parked responses were
+                        // already flushed per response).
                         finalize_http_stream(&mut stream).await;
                         return;
-                    }
+                    };
+                    // Serve the captured segment back to readers so
+                    // dispatch (or a WS upgrade) sees the request from
+                    // byte zero, exactly as request 1 arrives.
+                    stream.push_replay(&next);
+                    head_segment = next;
                 };
-                let is_websocket = header_text
-                    .lines()
-                    .any(|l| l.to_lowercase().contains("upgrade: websocket"));
 
-                // Parse the `Host:` header to learn what address the
-                // browser thinks reaches us. We use this later as the IP
-                // for ICE-TCP host candidates: Firefox refuses to pair
-                // remote loopback candidates, so we need a non-loopback
-                // address the browser can actually connect to. The only
-                // one we know for sure the browser can reach is whatever
-                // it just used to reach us for HTTP — which is exactly
-                // what the Host header contains. If the user accessed
-                // via a hostname (`localhost`, `myserver.local`) rather
-                // than a literal IP, we get None here and skip the TCP
-                // candidate entirely; those users can still use UDP if
-                // their topology allows it.
-                let browser_host_ip: Option<std::net::IpAddr> =
-                    extract_host_header_ip(&header_text);
-
-                if is_websocket {
+                // ── WebSocket upgrade path — request 1 or any kept-alive
+                //    follow-up whose head asked to upgrade. ──
+                {
                     if tls_client_cert_required && !tls_client_cert_present {
                         use tokio::io::AsyncWriteExt;
                         let body = serde_json::json!({
@@ -1592,51 +1709,6 @@ pub fn spawn_web_gateway(
 
                     let _ = tokio::join!(inbound, outbound);
                     crate::attention_nudge::dashboard_disconnected();
-                } else {
-                    let http_ctx = HttpRequestCtx {
-                        bus: bus.clone(),
-                        config_json: config_json.clone(),
-                        session_provider: session_provider.clone(),
-                        session_model: session_model.clone(),
-                        agent_card_json: agent_card_json.clone(),
-                        agent_card_value_for_targets: agent_card_value_for_targets.clone(),
-                        app_html: app_html.clone(),
-                        app_html_override: app_html_override.clone(),
-                        app_html_cache: app_html_cache.clone(),
-                        worktree_inventory_cache: worktree_inventory_cache.clone(),
-                        mcp_server: mcp_server.clone(),
-                        peer_registry: peer_registry.clone(),
-                        project_root: project_root.clone(),
-                        inbound_bearer_token: inbound_bearer_token.clone(),
-                        tls_client_cert_required,
-                        peer_access_request_config: peer_access_request_config.clone(),
-                        active_presence: active_presence.clone(),
-                        voice_debug: voice_debug.clone(),
-                        dashboard_control: Arc::clone(&dashboard_control),
-                        daemon_session_id: daemon_session_id.clone(),
-                        query_ctx: query_ctx.clone(),
-                        frame_registry: frame_registry.clone(),
-                        session_log: session_log.clone(),
-                        recording_registry: recording_registry.clone(),
-                        session_registry: session_registry.clone(),
-                        snapshot_dir: snapshot_dir.clone(),
-                        project_root_for_changes: project_root_for_changes.clone(),
-                        runtime_settings: runtime_settings.clone(),
-                        file_watcher: file_watcher.clone(),
-                    };
-                    serve_http_request(
-                        http_ctx,
-                        stream,
-                        n,
-                        &header_text,
-                        peer_addr,
-                        source_hint,
-                        is_tls,
-                        tls_client_cert_present,
-                        tls_client_cert_fingerprint,
-                        peer_connection_identity,
-                    )
-                    .await;
                 }
             });
         }
@@ -2281,7 +2353,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -2341,7 +2413,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -2395,7 +2467,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -2474,7 +2546,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -3190,7 +3262,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -3248,7 +3320,9 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(
+                b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
 
@@ -3745,6 +3819,243 @@ mod tests {
             "should not emit duplicate PresenceConnected for already-active browser"
         );
 
+        handle.abort();
+    }
+
+    // ── HTTP/1.1 keep-alive (the per-connection request loop) ──
+
+    /// Spawn a bare test gateway (no session state, no TLS) and return
+    /// its port + task handle — the common preamble of the keep-alive
+    /// tests below.
+    async fn spawn_keep_alive_test_gateway() -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            None,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    /// Read exactly ONE HTTP response off a kept-alive connection: the
+    /// head through `\r\n\r\n`, then exactly `Content-Length` body
+    /// bytes. Asserts the server sent nothing beyond the response — on
+    /// a parked connection stray bytes would be protocol corruption.
+    async fn read_one_http_response(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("response head timed out")
+                    .expect("response head read failed");
+            assert!(n > 0, "connection closed mid-head");
+            bytes.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map(|value| value.trim().parse().expect("Content-Length parses"))
+            .unwrap_or(0);
+        while bytes.len() < head_end + content_length {
+            let n =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("response body timed out")
+                    .expect("response body read failed");
+            assert!(n > 0, "connection closed mid-body");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(
+            bytes.len(),
+            head_end + content_length,
+            "server sent bytes beyond the framed response"
+        );
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_http_keep_alive_reuses_connection() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        // Request 1: HTTP/1.1 defaults to keep-alive; the framed JSON
+        // response advertises it and the connection stays open.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp1 = read_one_http_response(&mut stream).await;
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"), "{resp1}");
+        assert!(resp1.contains("Connection: keep-alive\r\n"), "{resp1}");
+        assert!(
+            resp1.contains(&format!("Keep-Alive: timeout={KEEP_ALIVE_IDLE_SECS}\r\n")),
+            "{resp1}"
+        );
+
+        // Request 2 rides the SAME connection through the route-table
+        // funnel (write_api_response): the rewritten header tail must
+        // advertise keep-alive there too.
+        stream
+            .write_all(b"GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp2 = read_one_http_response(&mut stream).await;
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "{resp2}");
+        assert!(resp2.contains("Connection: keep-alive\r\n"), "{resp2}");
+        assert!(!resp2.contains("Connection: close"), "{resp2}");
+
+        // Request 3: a static-asset chain arm, same connection still.
+        stream
+            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp3 = read_one_http_response(&mut stream).await;
+        assert!(resp3.starts_with("HTTP/1.1 200 OK\r\n"), "{resp3}");
+        assert!(resp3.contains("Connection: keep-alive\r\n"), "{resp3}");
+
+        // Request 4 says close: the server honors it and the connection
+        // ends cleanly right after the response.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let resp4 = read_one_http_response(&mut stream).await;
+        assert!(resp4.starts_with("HTTP/1.1 200 OK\r\n"), "{resp4}");
+        assert!(resp4.contains("Connection: close\r\n"), "{resp4}");
+        assert!(!resp4.contains("Connection: keep-alive"), "{resp4}");
+        let mut rest = Vec::new();
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest),
+        )
+        .await
+        .expect("EOF after Connection: close")
+        .expect("clean EOF read");
+        assert_eq!(n, 0, "no bytes may follow a Connection: close response");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_closes_by_default() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await
+        .expect("HTTP/1.0 response must end in EOF promptly")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("Connection: close\r\n"), "{response}");
+        assert!(!response.contains("Connection: keep-alive"), "{response}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_upgrade_on_kept_alive_connection() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        // Plain request first; the connection parks for reuse.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_one_http_response(&mut stream).await;
+        assert!(resp.contains("Connection: keep-alive\r\n"), "{resp}");
+
+        // A WebSocket upgrade arrives as the SECOND request on the same
+        // connection: the loop replays the captured head to the upgrade
+        // handshake and hands the connection off — it must never keep
+        // looping past an upgrade.
+        let (ws, upgrade_response) =
+            tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), stream)
+                .await
+                .expect("WS upgrade on a kept-alive connection");
+        assert_eq!(
+            upgrade_response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
+        );
+        drop(ws);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_keep_alive_request_budget_closes_at_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        for i in 1..=KEEP_ALIVE_MAX_REQUESTS {
+            stream
+                .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let resp = read_one_http_response(&mut stream).await;
+            if i < KEEP_ALIVE_MAX_REQUESTS {
+                assert!(
+                    resp.contains("Connection: keep-alive\r\n"),
+                    "request {i}: {resp}"
+                );
+            } else {
+                // The budget-exhausting request answers close…
+                assert!(
+                    resp.contains("Connection: close\r\n"),
+                    "request {i}: {resp}"
+                );
+            }
+        }
+        // …and the connection really ends.
+        let mut rest = Vec::new();
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest),
+        )
+        .await
+        .expect("EOF after the request budget is spent")
+        .expect("clean EOF read");
+        assert_eq!(n, 0);
         handle.abort();
     }
 }

@@ -2730,7 +2730,7 @@ mod tests {
         ));
         let (mut client, server) = tokio::io::duplex(1 << 20);
         crate::web_gateway::write_api_response(
-            Box::pin(server),
+            crate::web_gateway::DemuxStream::new(Box::pin(server)),
             response,
             crate::gateway_routes::CorsPosture::OwnOrigin,
             None,

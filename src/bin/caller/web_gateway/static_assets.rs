@@ -340,12 +340,20 @@ pub(crate) struct StaticAssetView<'a> {
 /// asset: conditional requests (`If-None-Match` → `304 Not Modified` with
 /// an empty body), gzip negotiation via `Accept-Encoding`, HEAD (same
 /// headers as GET, no body), CORS, and the `?v=` Cache-Control policy.
+///
+/// `keep_alive` is the exchange's keep-alive verdict
+/// (`DemuxStream::exchange_reusable` at the serving arm): every shape
+/// this builder emits is self-framing (`Content-Length` on 200, no body
+/// on 304/HEAD), so static assets are prime keep-alive citizens — the
+/// whole point of the request loop is not paying a TCP+TLS handshake
+/// per asset on a cold dashboard load.
 pub(crate) fn build_static_asset_response(
     method: &str,
     header_text: &str,
     query: &str,
     current_version: &str,
     asset: StaticAssetView<'_>,
+    keep_alive: bool,
 ) -> Vec<u8> {
     let cache_control = asset
         .cache_control
@@ -363,7 +371,7 @@ pub(crate) fn build_static_asset_response(
             .header("Cache-Control", cache_control)
             .header_segment(vary)
             .header("Access-Control-Allow-Origin", "*")
-            .header("Connection", "close")
+            .connection_reuse(keep_alive)
             .into_bytes();
     }
     let gzip_body = asset
@@ -381,7 +389,7 @@ pub(crate) fn build_static_asset_response(
         .header("Cache-Control", cache_control)
         .header_segment(vary)
         .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
+        .connection_reuse(keep_alive)
         .into_bytes();
     if method != "HEAD" {
         response.extend_from_slice(payload);
@@ -470,6 +478,7 @@ pub(crate) fn app_html_override_response(
     header_text: &str,
     query: &str,
     path: &std::path::Path,
+    keep_alive: bool,
 ) -> Vec<u8> {
     match std::fs::read_to_string(path) {
         Ok(html) => {
@@ -487,6 +496,7 @@ pub(crate) fn app_html_override_response(
                     gzip: None,
                     cache_control: Some("no-cache"),
                 },
+                keep_alive,
             )
         }
         Err(err) => {
@@ -505,7 +515,7 @@ pub(crate) fn app_html_override_response(
                 .header("Content-Length", body.len().to_string())
                 .header("Cache-Control", "no-store")
                 .header("Access-Control-Allow-Origin", "*")
-                .header("Connection", "close")
+                .connection_reuse(keep_alive)
                 .into_bytes();
             if method != "HEAD" {
                 response.extend_from_slice(body.as_bytes());
@@ -528,6 +538,7 @@ pub(crate) fn vault_kernel_override_response(
     header_text: &str,
     query: &str,
     app_html_path: &std::path::Path,
+    keep_alive: bool,
 ) -> Option<Vec<u8>> {
     let sibling = app_html_path.parent()?.join("vault-kernel.js");
     let body = std::fs::read(&sibling).ok()?;
@@ -544,6 +555,7 @@ pub(crate) fn vault_kernel_override_response(
             gzip: None,
             cache_control: Some("no-cache"),
         },
+        keep_alive,
     ))
 }
 
@@ -610,13 +622,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app_html_path = dir.path().join("app.html");
         // No sibling yet: fall back to the embedded kernel.
-        assert!(vault_kernel_override_response("GET", "", "", &app_html_path).is_none());
+        assert!(vault_kernel_override_response("GET", "", "", &app_html_path, false).is_none());
         std::fs::write(
             dir.path().join("vault-kernel.js"),
             b"self.onmessage=null;\n",
         )
         .unwrap();
-        let resp = vault_kernel_override_response("GET", "", "", &app_html_path)
+        let resp = vault_kernel_override_response("GET", "", "", &app_html_path, false)
             .expect("sibling kernel must be served");
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -823,6 +835,7 @@ mod tests {
             "v=cur",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -852,6 +865,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -872,6 +886,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"));
@@ -893,6 +908,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -960,7 +976,7 @@ mod tests {
             "<!DOCTYPE html><script src=\"/three.module.min.js\"></script>one",
         )
         .unwrap();
-        let first = app_html_override_response("GET", "", "", &path);
+        let first = app_html_override_response("GET", "", "", &path, false);
         let first = String::from_utf8_lossy(&first);
         assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(first.contains("Content-Type: text/html"));
@@ -970,7 +986,7 @@ mod tests {
 
         // An edit is visible on the very next request — nothing caches it.
         std::fs::write(&path, "<!DOCTYPE html>two").unwrap();
-        let second = app_html_override_response("GET", "", "", &path);
+        let second = app_html_override_response("GET", "", "", &path, false);
         let second = String::from_utf8_lossy(&second);
         assert!(second.ends_with("two"));
 
@@ -981,8 +997,13 @@ mod tests {
             .and_then(|rest| rest.split('"').next())
             .expect("override response carries an ETag")
             .to_string();
-        let third =
-            app_html_override_response("GET", &format!("If-None-Match: \"{etag}\"\r\n"), "", &path);
+        let third = app_html_override_response(
+            "GET",
+            &format!("If-None-Match: \"{etag}\"\r\n"),
+            "",
+            &path,
+            false,
+        );
         assert!(String::from_utf8_lossy(&third).starts_with("HTTP/1.1 304"));
     }
 
@@ -990,13 +1011,13 @@ mod tests {
     fn app_html_override_read_failure_is_a_loud_500() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.html");
-        let resp = app_html_override_response("GET", "", "", &path);
+        let resp = app_html_override_response("GET", "", "", &path, false);
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 500"));
         assert!(text.contains("INTENDANT_APP_HTML_PATH"));
         assert!(text.contains("missing.html"));
         // HEAD keeps the status but sends headers only.
-        let head = app_html_override_response("HEAD", "", "", &path);
+        let head = app_html_override_response("HEAD", "", "", &path, false);
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 500"));
         assert!(head.ends_with("\r\n\r\n"));
