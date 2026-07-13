@@ -3273,8 +3273,13 @@ mod tests {
     }
 
     /// `POST /api/peers/{id}/task` with `{instructions}` returns 200 +
-    /// `task_id`. Wire-level encoding covered by
-    /// `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`.
+    /// `task_id` + the delivery-receipt fields. The target here is a bare
+    /// gateway with no session supervisor, i.e. a receiver that never
+    /// acks — the canonical old-peer/fire-and-forget shape, so `delivery`
+    /// must read `unconfirmed` after exactly one send (no retry storm
+    /// against a stable-but-silent receiver). Wire-level encoding covered
+    /// by `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`;
+    /// the acknowledged shape by `peer::handle::tests::delegate_task_confirms_on_peer_receipt`.
     #[tokio::test]
     async fn test_api_peers_delegate_task_returns_200() {
         let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
@@ -3295,6 +3300,22 @@ mod tests {
         assert!(
             parsed["task_id"].as_str().is_some(),
             "expected task_id in response: {resp_body}"
+        );
+        assert_eq!(
+            parsed["delivery"].as_str(),
+            Some("unconfirmed"),
+            "a supervisor-less receiver never acks: {resp_body}"
+        );
+        assert!(
+            parsed["delegation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "expected delegation_id in response: {resp_body}"
+        );
+        assert_eq!(
+            parsed["sends"].as_u64(),
+            Some(1),
+            "stable-but-silent receiver must not trigger re-sends: {resp_body}"
         );
 
         target_handle.abort();

@@ -317,6 +317,20 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
+    /// Peer-delegation delivery receipt. Emitted when a daemon
+    /// supervisor *dispatches* (not merely reads) a `StartTask` frame
+    /// that carried a `delegation_id`: `session_id` is the receiver's
+    /// real local session identity for the accepted task. The
+    /// delegating daemon's federation transport correlates it back to
+    /// the in-flight `PeerOp::DelegateTask` by `delegation_id` (see
+    /// `peer::transport::intendant` for the wire contract and the
+    /// old-peer compatibility matrix). Re-emitted with the original
+    /// `session_id` when a duplicate `delegation_id` is deduped.
+    /// Informational only — carries no authority.
+    TaskReceived {
+        delegation_id: String,
+        session_id: String,
+    },
     SessionIdentity {
         session_id: String,
         source: String,

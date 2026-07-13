@@ -1363,6 +1363,7 @@ impl IntendantServer {
                     display_target: params.display_target,
                     attachments: vec![],
                     follow_up_id: None,
+                    delegation_id: None,
                 }));
             if target_phase
                 .as_ref()
@@ -1395,6 +1396,7 @@ impl IntendantServer {
                     display_target: params.display_target,
                     attachments: vec![],
                     follow_up_id: None,
+                    delegation_id: None,
                 }));
             return "ok (CU task dispatched)".to_string();
         }
@@ -2730,6 +2732,7 @@ pub(crate) mod tests {
                     display_target,
                     attachments,
                     follow_up_id,
+                    delegation_id,
                 }))) => {
                     assert_eq!(session_id.as_deref(), Some("managed-session-1"));
                     assert_eq!(task, "continue existing managed session");
@@ -2739,6 +2742,7 @@ pub(crate) mod tests {
                     assert!(display_target.is_none());
                     assert!(attachments.is_empty());
                     assert!(follow_up_id.is_none());
+                    assert!(delegation_id.is_none());
                 }
                 other => panic!("expected targeted StartTask control event, got {other:?}"),
             }

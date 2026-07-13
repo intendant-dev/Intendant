@@ -46,6 +46,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     display_target: envelope.display_target.clone(),
                     attachments: envelope.attachment_frame_ids.clone(),
                     follow_up_id: None,
+                    delegation_id: None,
                 },
                 confirmation,
             ))
@@ -1118,7 +1119,11 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SteerDelivered { .. }
         | AppEvent::SteerCancelRequested { .. }
         | AppEvent::SteerCancelled { .. }
-        | AppEvent::FollowUpCancelRequested { .. } => None,
+        | AppEvent::FollowUpCancelRequested { .. }
+        // Peer-delegation delivery receipts are wire-facing correlation
+        // events (OutboundEvent::TaskReceived); the accepted task
+        // narrates itself through its own session lifecycle.
+        | AppEvent::TaskReceived { .. } => None,
     }
 }
 

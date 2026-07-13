@@ -1460,6 +1460,7 @@ mod tests {
             display_target: None,
             attachments: Vec::new(),
             follow_up_id: None,
+            delegation_id: None,
         };
         let approval = ControlMsg::Approve {
             session_id: None,

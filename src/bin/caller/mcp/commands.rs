@@ -1326,6 +1326,7 @@ pub(crate) async fn handle_control_command_mcp(
                         display_target: None,
                         attachments: vec![],
                         follow_up_id: None,
+                        delegation_id: None,
                     }));
                     emit_control_result(
                         control_tx,

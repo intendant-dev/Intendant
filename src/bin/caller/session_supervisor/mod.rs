@@ -80,6 +80,11 @@ pub struct SessionSupervisor {
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on the peer-delegation dedup ledger (`delegation_receipts`).
+/// Entries only need to outlive the delegating side's bounded re-send
+/// window (~30 s), so a FIFO of this size is generous; the bound keeps
+/// a peer that mints endless delegation ids from growing the map.
+const MAX_DELEGATION_RECEIPTS: usize = 128;
 const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
 #[cfg(not(test))]
 const EDIT_ATTACH_ROUTE_TIMEOUT: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
@@ -111,6 +116,15 @@ pub(crate) struct SupervisorState {
     /// The fallback responder defers to the advertising loop for exactly
     /// these ops instead of false-rejecting non-external sessions.
     advertised_thread_actions: HashMap<String, std::collections::HashSet<String>>,
+    /// Peer-delegation dedup ledger: delegation id → the session the
+    /// task was dispatched as. A `StartTask` re-sent with an
+    /// already-recorded `delegation_id` (the delegating daemon's
+    /// at-least-once retry after a connection drop) re-acks with the
+    /// original session instead of starting a duplicate task. Bounded
+    /// by [`MAX_DELEGATION_RECEIPTS`], oldest-accepted evicted
+    /// (tracked in `delegation_receipt_order`).
+    delegation_receipts: HashMap<String, String>,
+    delegation_receipt_order: std::collections::VecDeque<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +421,32 @@ impl SupervisorState {
             self.external_attach_dedupe.remove(key);
         }
     }
+
+    /// The session a delegation id was already dispatched as, if any.
+    fn recorded_delegation_session(&self, delegation_id: &str) -> Option<String> {
+        self.delegation_receipts.get(delegation_id).cloned()
+    }
+
+    /// Record an accepted delegation for dedup, evicting the oldest
+    /// entry beyond [`MAX_DELEGATION_RECEIPTS`]. First writer wins —
+    /// a delegation id is never re-pointed at a different session.
+    fn record_delegation(&mut self, delegation_id: &str, session_id: &str) {
+        if self.delegation_receipts.contains_key(delegation_id) {
+            return;
+        }
+        while self.delegation_receipt_order.len() >= MAX_DELEGATION_RECEIPTS {
+            match self.delegation_receipt_order.pop_front() {
+                Some(evicted) => {
+                    self.delegation_receipts.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+        self.delegation_receipt_order
+            .push_back(delegation_id.to_string());
+        self.delegation_receipts
+            .insert(delegation_id.to_string(), session_id.to_string());
+    }
 }
 
 impl SessionSupervisor {
@@ -697,6 +737,43 @@ mod tests {
                 as Box<dyn provider::ChatProvider>
         }));
         SessionSupervisor::new(config)
+    }
+
+    /// The delegation dedup ledger: first writer wins for a given id,
+    /// and the FIFO bound evicts the oldest acceptance, never the
+    /// newest.
+    #[test]
+    fn delegation_ledger_dedups_bounds_and_first_writer_wins() {
+        let mut state = SupervisorState::default();
+        state.record_delegation("dg-a", "sess-original");
+        // A re-record for the same id must NOT re-point it — the
+        // re-ack contract promises the ORIGINAL session identity.
+        state.record_delegation("dg-a", "sess-imposter");
+        assert_eq!(
+            state.recorded_delegation_session("dg-a").as_deref(),
+            Some("sess-original")
+        );
+
+        for i in 0..MAX_DELEGATION_RECEIPTS {
+            state.record_delegation(&format!("dg-fill-{i}"), &format!("sess-{i}"));
+        }
+        assert_eq!(
+            state.recorded_delegation_session("dg-a"),
+            None,
+            "oldest entry is evicted at the bound"
+        );
+        assert!(
+            state
+                .recorded_delegation_session(&format!("dg-fill-{}", MAX_DELEGATION_RECEIPTS - 1))
+                .is_some(),
+            "newest entry survives"
+        );
+        assert!(state.delegation_receipts.len() <= MAX_DELEGATION_RECEIPTS);
+        assert_eq!(
+            state.delegation_receipts.len(),
+            state.delegation_receipt_order.len(),
+            "map and eviction order stay in lockstep"
+        );
     }
 
     #[test]

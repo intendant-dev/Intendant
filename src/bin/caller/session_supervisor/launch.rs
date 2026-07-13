@@ -15,6 +15,11 @@ impl SessionSupervisor {
         }
     }
 
+    /// Create and dispatch a new managed session. Returns the launched
+    /// session id once the task is actually dispatched (the peer-
+    /// delegation receipt keys on this — see
+    /// [`Self::acknowledge_delegation`]); `None` on every failure exit,
+    /// which all narrate their own error before returning.
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn start_new_session(
         &self,
@@ -39,12 +44,12 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         codex_service_tier: Option<String>,
         worktree: Option<SessionWorktreeRequest>,
-    ) {
+    ) -> Option<String> {
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
         let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
@@ -52,7 +57,7 @@ impl SessionSupervisor {
             Ok(log) => Arc::new(Mutex::new(log)),
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
 
@@ -81,11 +86,11 @@ impl SessionSupervisor {
                     reason: format!("error: {reason}"),
                     error_kind: Some(NO_PROJECT_ERROR_KIND.to_string()),
                 });
-                return;
+                return None;
             }
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
         // Worktree launch: branch off the resolved project root's HEAD and
@@ -112,7 +117,7 @@ impl SessionSupervisor {
                             reason: format!("error: {reason}"),
                             error_kind: None,
                         });
-                        return;
+                        return None;
                     }
                 }
             }
@@ -126,7 +131,7 @@ impl SessionSupervisor {
             Ok(project) => project,
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
 
@@ -172,7 +177,8 @@ impl SessionSupervisor {
                 session_id: session_id.clone(),
                 task: Some(task.clone()),
             });
-            return;
+            // Dispatched (as an ephemeral CU task session).
+            return Some(session_id);
         }
 
         let use_direct = direct.unwrap_or(false)
@@ -183,7 +189,7 @@ impl SessionSupervisor {
             Ok(selection) => selection,
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
         let backend = match agent_selection {
@@ -200,7 +206,7 @@ impl SessionSupervisor {
             Ok(project) => project,
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
         let agent_command = normalize_session_agent_command(agent_command.as_deref());
@@ -209,7 +215,7 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: agent_command requires an external agent".to_string(),
                 );
-                return;
+                return None;
             };
             apply_session_agent_command(&mut project, backend, command);
         }
@@ -222,11 +228,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: claude_model requires Claude Code".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_claude_model(&mut project, backend, model.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) = claude_permission_mode
@@ -239,13 +245,13 @@ impl SessionSupervisor {
                     "Session create failed: claude_permission_mode requires Claude Code"
                         .to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) =
                 apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
             {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(effort) = claude_effort
@@ -257,11 +263,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: claude_effort requires Claude Code".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(model) = codex_model
@@ -271,11 +277,11 @@ impl SessionSupervisor {
         {
             let Some(ref backend) = backend else {
                 self.loop_error("Session create failed: codex_model requires Codex".to_string());
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_model(&mut project, backend, model.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(effort) = codex_reasoning_effort
@@ -289,23 +295,23 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_reasoning_effort requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) =
                 apply_session_codex_reasoning_effort(&mut project, backend, effort.to_string())
             {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) = normalize_session_codex_sandbox(codex_sandbox.as_deref()) {
             let Some(ref backend) = backend else {
                 self.loop_error("Session create failed: codex_sandbox requires Codex".to_string());
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_sandbox(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(policy) =
@@ -315,11 +321,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_approval_policy requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_approval_policy(&mut project, backend, policy) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) =
@@ -329,11 +335,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_managed_context requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_managed_context(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) =
@@ -343,11 +349,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_context_archive requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_context_archive(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         let codex_service_tier =
@@ -359,7 +365,7 @@ impl SessionSupervisor {
                     self.loop_error(
                         "Session create failed: codex_service_tier requires Codex".to_string(),
                     );
-                    return;
+                    return None;
                 }
             }
         }
@@ -414,6 +420,7 @@ impl SessionSupervisor {
         if !task.trim().is_empty() {
             emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
         }
+        let launched_session_id = session_id.clone();
         self.spawn_agent_session(
             session_id,
             source,
@@ -434,6 +441,7 @@ impl SessionSupervisor {
             None,
         )
         .await;
+        Some(launched_session_id)
     }
 
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle

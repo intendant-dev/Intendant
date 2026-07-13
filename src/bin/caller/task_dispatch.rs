@@ -97,6 +97,14 @@ impl Dispatcher {
                 display_target,
                 attachments,
                 follow_up_id,
+                // The legacy single-session dispatcher deliberately does
+                // NOT acknowledge peer delegations: it routes into an
+                // existing loop (presence/task/follow-up channels), so
+                // there is no fresh dispatch identity to report. A
+                // delegating daemon falls back to its fire-and-forget
+                // path exactly as against a pre-receipt build — see the
+                // compatibility matrix in peer::transport::intendant.
+                delegation_id: _,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
                 let has_metadata = !reference_frame_ids.is_empty()
@@ -358,6 +366,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -397,6 +406,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
@@ -431,6 +441,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -524,6 +535,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(follow_up_rx.try_recv().is_err());
@@ -553,6 +565,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())

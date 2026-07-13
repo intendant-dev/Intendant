@@ -294,6 +294,18 @@ pub enum AppEvent {
         session_id: String,
         task: Option<String>,
     },
+    /// Peer-delegation delivery receipt: the session supervisor accepted a
+    /// `StartTask` that carried a `delegation_id` and dispatched it as
+    /// `session_id`. Broadcast to every connected client as
+    /// `OutboundEvent::TaskReceived`; the delegating daemon's federation
+    /// transport correlates it back to the in-flight
+    /// `PeerOp::DelegateTask` (see `peer::transport::intendant`).
+    /// Re-emitted verbatim (same `session_id`) when a duplicate
+    /// `delegation_id` is deduped instead of dispatched.
+    TaskReceived {
+        delegation_id: String,
+        session_id: String,
+    },
     /// Links an Intendant wrapper/log session to a backend-native
     /// session/thread id. Frontends use this to route backend-specific actions
     /// without confusing the wrapper UUID with the provider's own id.
@@ -1542,6 +1554,22 @@ pub enum ControlMsg {
         /// use it to correlate queued/delivered/failed status updates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up_id: Option<String>,
+        /// Peer-delegation delivery-receipt correlation id. Set by a
+        /// federating daemon's `PeerOp::DelegateTask` (see
+        /// `peer::transport::intendant`): when a daemon supervisor
+        /// dispatches a new-session StartTask carrying this id, it
+        /// acknowledges acceptance by emitting
+        /// `OutboundEvent::TaskReceived { delegation_id, session_id }`
+        /// on its broadcast, and it dedups repeats of the same id
+        /// (an already-accepted id re-acks with the original session
+        /// identity instead of starting a duplicate task — the sender
+        /// re-sends the same id after a reconnect). Absent on frames
+        /// from browsers, ctl, and pre-receipt peer builds; receivers
+        /// older than this field ignore it (serde default) and never
+        /// ack. Carries no authority — IAM evaluation on the receiving
+        /// gateway is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegation_id: Option<String>,
     },
     ResumeSession {
         /// Session source: "intendant", "codex", "claude-code", or "gemini".
@@ -2213,6 +2241,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
             session_id: session_id.clone(),
             task: task.clone(),
+        }),
+        AppEvent::TaskReceived {
+            delegation_id,
+            session_id,
+        } => Some(OutboundEvent::TaskReceived {
+            delegation_id: delegation_id.clone(),
+            session_id: session_id.clone(),
         }),
         AppEvent::SessionIdentity {
             session_id,
@@ -4160,6 +4195,7 @@ mod tests {
                 display_target: None,
                 attachments: vec![],
                 follow_up_id: None,
+                delegation_id: None,
             },
             ControlMsg::FollowUp {
                 session_id: None,
@@ -4732,6 +4768,7 @@ mod tests {
             display_target: Some("user_session".to_string()),
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
             follow_up_id: None,
+            delegation_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();

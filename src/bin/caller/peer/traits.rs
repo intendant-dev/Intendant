@@ -198,12 +198,14 @@ pub struct PeerTask {
     #[allow(dead_code)]
     pub context: serde_json::Value,
 
-    /// Optional caller-supplied correlation id. Unused in phase 1.
-    /// Reserved for idempotent retries after transport timeouts: a
-    /// coordinator that retries a delegation after a timeout passes
-    /// the same id so the peer can deduplicate. Adding the field now
-    /// so the wire type is stable before retry logic lands.
-    #[allow(dead_code)]
+    /// Optional caller-supplied correlation id — the delegation's
+    /// delivery-receipt identity. When present it becomes the
+    /// `delegation_id` stamped on every StartTask write for this
+    /// delegation; when absent, [`crate::peer::handle::PeerHandle::
+    /// delegate_task`] mints one. The receiving daemon dedups by this
+    /// id (a repeat re-acks with the original session instead of
+    /// starting a duplicate task), so a coordinator that retries a
+    /// delegation after a timeout passes the same id for idempotency.
     pub client_correlation_id: Option<String>,
 }
 
