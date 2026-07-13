@@ -69703,6 +69703,14 @@ function dashboardNoteLegacyWsState(connected) {
       clearTimeout(dashboardLegacyWsWatchdog);
       dashboardLegacyWsWatchdog = null;
     }
+    // The /ws proved able to open after all (e.g. a browser that merely
+    // weathered a daemon restart): demote the promotion — autoFallback is
+    // derived "ws proven down past the deadline" state, and a live /ws
+    // resumes event duty. An already-running tunnel is left alone (dual
+    // delivery is the opt-in posture; dedup absorbs it) but loses its
+    // primary-lane reconnect duty; a later /ws drop re-derives the
+    // promotion through the watchdog.
+    dashboardControlAutoFallback = false;
     if (typeof dashboardUpdateTransportStatus === 'function') dashboardUpdateTransportStatus();
     return;
   }
