@@ -93,6 +93,15 @@ pub(crate) async fn serve_http_request(
     use tokio::io::AsyncReadExt;
     let _ = stream.read_exact(&mut discard).await;
 
+    // Keep-alive body leg (see the keep_alive module): a request with
+    // no body at all is trivially "fully consumed". Everything below
+    // that DOES read a body under a declared policy upgrades the mark
+    // itself; handlers that drive the stream (BodyPolicy::Streaming)
+    // never do, so their exchanges always close.
+    if request_is_bodyless(header_text) {
+        stream.mark_request_body_consumed();
+    }
+
     // Parse the request target once: the static-asset arms
     // below match on the *exact* path (query stripped), so
     // an API request that merely mentions an asset path in
@@ -154,12 +163,10 @@ pub(crate) async fn serve_http_request(
                     )
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
                 None => HttpResponse::new("204 No Content")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
             }
         } else if fleet_scoped {
             let methods = table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
@@ -183,12 +190,10 @@ pub(crate) async fn serve_http_request(
                     )
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
                 None => HttpResponse::new("204 No Content")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
             }
         } else {
             let methods = table_methods
@@ -203,10 +208,19 @@ pub(crate) async fn serve_http_request(
                 )
                 .header("Access-Control-Max-Age", "86400")
                 .header("Connection", "close")
-                .into_string()
         };
-        let _ = stream.write_all(response.as_bytes()).await;
-        finalize_http_stream(&mut stream).await;
+        // Preflights participate in keep-alive (204: self-framing, no
+        // body): browsers send the actual request right behind the
+        // preflight, so closing here would double every cross-origin
+        // API call's connection count.
+        let reuse = stream.exchange_reusable();
+        let response = response.connection_reuse(reuse).into_string();
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        if reuse && write_ok {
+            stream.park().await;
+        } else {
+            finalize_http_stream(&mut stream).await;
+        }
         return;
     }
 
@@ -379,6 +393,14 @@ pub(crate) async fn serve_http_request(
         }
     }
 
+    // Keep-alive response leg for the fall-through chain below: set by
+    // each participating arm after it wrote a self-framing response
+    // under a reusable exchange; the common tail parks instead of
+    // finalizing when it's set. Arms that never set it — the connect
+    // signaling lane, and any arm added without thinking about
+    // keep-alive — fail safe to the historical close.
+    let mut parked_ok = false;
+
     if let Some((route, route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
     {
         // Table-dispatched routes: every /api/* and /mcp route is
@@ -408,7 +430,25 @@ pub(crate) async fn serve_http_request(
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
                 match read_request_body_capped(&mut stream, header_text, cap).await {
-                    Ok(body) => body,
+                    Ok(body) => {
+                        // Keep-alive body leg: dispatch consumed exactly
+                        // the declared body (`read_request_body_capped`
+                        // reads Content-Length bytes), so the exchange
+                        // stays reusable — provided the framing was
+                        // unambiguous (one consistent Content-Length, no
+                        // Transfer-Encoding) AND the captured segment was
+                        // valid UTF-8. The reader does its peeked-body
+                        // accounting on the LOSSY header string; invalid
+                        // bytes inflate to U+FFFD there, skewing the
+                        // byte math and potentially leaving residue in
+                        // the socket — fail toward close in that case.
+                        if request_body_is_delimited(header_text)
+                            && std::str::from_utf8(&discard).is_ok()
+                        {
+                            stream.mark_request_body_consumed();
+                        }
+                        body
+                    }
                     Err((status, body)) => {
                         use tokio::io::AsyncWriteExt;
                         let base = HttpResponse::json(status_reason(status), body);
@@ -1132,7 +1172,10 @@ pub(crate) async fn serve_http_request(
             }
             _ => base,
         };
-        let _ = stream.write_all(&response.into_bytes()).await;
+        let reuse = stream.exchange_reusable();
+        let response = response.connection_reuse(reuse);
+        let write_ok = stream.write_all(&response.into_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
         use tokio::io::AsyncWriteExt;
         let body = connect_bootstrap_html();
@@ -1225,15 +1268,18 @@ pub(crate) async fn serve_http_request(
             "/wasm-station/station_web_bg.wasm",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if let Some(asset) = static_asset_arm(
         req_method,
         req_path,
@@ -1246,15 +1292,18 @@ pub(crate) async fn serve_http_request(
             "/manifest.webmanifest",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_path.starts_with("/frames/") {
         // Serve HQ frame images from the frame registry.
         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
@@ -1287,11 +1336,14 @@ pub(crate) async fn serve_http_request(
                 serde_json::json!({"error": msg}).to_string(),
             ),
         };
+        let reuse = stream.exchange_reusable();
         let response = HttpResponse::with_content(status, "application/json", body)
             .header("Connection", "close")
+            .connection_reuse(reuse)
             .into_string();
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_path.starts_with("/recordings/") {
         // Serve recording data: segment files and metadata. Path routing
         // (verbatim post-"/recordings/" token, historically including any
@@ -1350,20 +1402,26 @@ pub(crate) async fn serve_http_request(
             "active_connection_id": active_id,
         })
         .to_string();
+        let reuse = stream.exchange_reusable();
         let response = HttpResponse::with_content("200 OK", "application/json", debug_json)
             .header("Connection", "close")
+            .connection_reuse(reuse)
             .into_string();
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if let Some(response) = dashboard_local_file_response_blocking(request_line).await {
         use tokio::io::AsyncWriteExt;
+        let reuse = stream.exchange_reusable();
         match response {
             DashboardLocalFileResponse::Html { status, body } => {
                 let response = HttpResponse::with_content(status, "text/html; charset=utf-8", body)
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "close")
+                    .connection_reuse(reuse)
                     .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+                parked_ok = reuse && write_ok;
             }
             DashboardLocalFileResponse::Bytes {
                 status,
@@ -1376,9 +1434,11 @@ pub(crate) async fn serve_http_request(
                     .header("Cache-Control", "no-cache")
                     .header("X-Content-Type-Options", "nosniff")
                     .header("Connection", "close")
+                    .connection_reuse(reuse)
                     .into_string();
-                let _ = stream.write_all(header.as_bytes()).await;
-                let _ = stream.write_all(&bytes).await;
+                let head_ok = stream.write_all(header.as_bytes()).await.is_ok();
+                let body_ok = stream.write_all(&bytes).await.is_ok();
+                parked_ok = reuse && head_ok && body_ok;
             }
         }
     } else if let Some(asset) = static_asset_arm(req_method, req_path, &["/vault-kernel.js"]) {
@@ -1387,10 +1447,11 @@ pub(crate) async fn serve_http_request(
         // binary) always matches. Under the INTENDANT_APP_HTML_PATH dev
         // override the disk sibling wins instead: the overridden app.html
         // pins THAT file's hash.
+        let reuse = stream.exchange_reusable();
         let response = app_html_override
             .as_deref()
             .and_then(|path| {
-                vault_kernel_override_response(req_method, header_text, req_query, path)
+                vault_kernel_override_response(req_method, header_text, req_query, path, reuse)
             })
             .unwrap_or_else(|| {
                 build_static_asset_response(
@@ -1399,10 +1460,12 @@ pub(crate) async fn serve_http_request(
                     req_query,
                     asset_version(),
                     asset.view(),
+                    reuse,
                 )
             });
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if let Some(asset) = static_asset_arm(
         req_method,
         req_path,
@@ -1429,15 +1492,18 @@ pub(crate) async fn serve_http_request(
             "/manifest.webmanifest",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_path == "/.well-known/agent-card.json" || req_path == "/config" {
         let body = if req_path == "/.well-known/agent-card.json" {
             // Canonical peer identity + capability surface.
@@ -1453,13 +1519,16 @@ pub(crate) async fn serve_http_request(
         // on this daemon from a page served by a sibling
         // daemon (cross-origin). `*` works because our
         // fetches don't send credentials.
+        let reuse = stream.exchange_reusable();
         let response = HttpResponse::with_content("200 OK", "application/json", body)
             .header("Cache-Control", "no-cache")
             .header("Access-Control-Allow-Origin", "*")
             .header("Connection", "close")
+            .connection_reuse(reuse)
             .into_string();
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_method == "GET" || req_method == "HEAD" {
         // Default: serve app.html (also matches /app for
         // backward compat). The entry point stays no-cache —
@@ -1470,8 +1539,9 @@ pub(crate) async fn serve_http_request(
         // unlike the constants behind `embedded_static_asset`.
         // Under INTENDANT_APP_HTML_PATH the disk copy is
         // re-read (and re-tagged) on every request instead.
+        let reuse = stream.exchange_reusable();
         let response = if let Some(path) = app_html_override.as_deref() {
-            app_html_override_response(req_method, header_text, req_query, path)
+            app_html_override_response(req_method, header_text, req_query, path, reuse)
         } else {
             let (etag, gzip) = app_html_cache.get_or_init(|| {
                 (
@@ -1491,10 +1561,12 @@ pub(crate) async fn serve_http_request(
                     gzip: Some(gzip),
                     cache_control: Some("no-cache"),
                 },
+                reuse,
             )
         };
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else {
         // Non-GET/HEAD fallback: plain app.html, as before.
         let response =
@@ -1507,16 +1579,21 @@ pub(crate) async fn serve_http_request(
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    // Flush + cleanly shut down the stream before this task
-    // returns and drops it. Mandatory for the TLS path so the
-    // final ciphertext records reach the socket (rustls buffers
-    // them; dropping mid-buffer truncates large bodies); a
-    // harmless pass-through on plain TCP. Covers every
-    // fall-through chain arm above in one place; the early
-    // `return`s (OPTIONS / failed federation auth) finalize
-    // inline before returning, and every table-dispatched
-    // handler owns its stream and finalizes it itself.
-    finalize_http_stream(&mut stream).await;
+    // Connection tail for every fall-through chain arm above, in one
+    // place: a participating arm that wrote a self-framing response
+    // under a reusable exchange set `parked_ok`, so the stream goes back
+    // to the listener's request loop (park flushes per response — the
+    // TLS-ciphertext rationale on `finalize_http_stream`). Everything
+    // else — non-participating arms, failed writes, close verdicts —
+    // flushes and cleanly shuts down exactly as before. The early
+    // `return`s (OPTIONS / failed gates / body-cap errors) finish
+    // inline, and every table-dispatched handler owns its stream and
+    // parks or finalizes it itself.
+    if parked_ok {
+        stream.park().await;
+    } else {
+        finalize_http_stream(&mut stream).await;
+    }
 }
 
 /// HTTP adapter for the transport-neutral core (transport-unification
@@ -1613,10 +1690,17 @@ pub(crate) fn stream_response_http_head(
     apply_cors_posture(http, cors, fleet_origin).into_bytes()
 }
 
-/// Write an [`ApiResponse`] to the HTTP lane and finalize the stream —
+/// Write an [`ApiResponse`] to the HTTP lane and finish the exchange —
 /// the whole tail of a converted handler shim. The Stream lane writes
 /// its head then pumps the shared line source until it drains (or the
 /// client hangs up); buffered lanes render in one piece.
+///
+/// Keep-alive: buffered lanes are self-framing (`with_content` always
+/// emits `Content-Length`), so under a reusable exchange the baked
+/// `Connection: close` tail is rewritten to keep-alive and the stream is
+/// parked back to the request loop instead of finalized. The Stream lane
+/// NEVER parks — its body is EOF-delimited by design (`Connection:
+/// close` is pinned in its golden head), so it always finalizes.
 pub(crate) async fn write_api_response(
     mut stream: DemuxStream,
     response: ApiResponse,
@@ -1650,13 +1734,28 @@ pub(crate) async fn write_api_response(
             // finishes instead of deadlocking the join.
             drop(line_rx);
             let _ = source.await;
+            finalize_http_stream(&mut stream).await;
         }
-        buffered => {
+        mut buffered => {
+            let keep = stream.exchange_reusable();
+            if keep {
+                match &mut buffered {
+                    ApiResponse::Json { headers, .. } | ApiResponse::Bytes { headers, .. } => {
+                        apply_keep_alive_header_tail(headers);
+                    }
+                    // The outer match already bound the Stream lane.
+                    ApiResponse::Stream { .. } => {}
+                }
+            }
             let bytes = api_response_http_bytes(buffered, cors, fleet_origin);
-            let _ = stream.write_all(&bytes).await;
+            let write_ok = stream.write_all(&bytes).await.is_ok();
+            if keep && write_ok {
+                stream.park().await;
+            } else {
+                finalize_http_stream(&mut stream).await;
+            }
         }
     }
-    finalize_http_stream(&mut stream).await;
 }
 
 #[cfg(test)]

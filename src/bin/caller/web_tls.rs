@@ -237,7 +237,11 @@ fn server_config_from(
     let mut config = builder.with_cert_resolver(fleet_sni_resolver());
     // The dashboard speaks HTTP/1.1 and upgrades to WebSocket; advertise
     // only http/1.1 so a browser never negotiates h2 (which the gateway's
-    // hand-rolled HTTP/1 handler doesn't implement).
+    // hand-rolled HTTP/1 handler doesn't implement). KEEP THIS PINNED:
+    // connection reuse is HTTP/1.1 keep-alive (web_gateway::keep_alive's
+    // per-connection request loop), deliberately NOT h2 — adopting h2
+    // would mean migrating the whole hand-rolled server stack (demux, WS
+    // upgrade, streaming lanes), a separate program, not a config flip.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }

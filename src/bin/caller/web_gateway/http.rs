@@ -20,28 +20,195 @@ use super::*;
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
-/// Boxed demuxed connection (plain TCP or TLS), used for all post-demux
-/// HTTP/WebSocket handling.
-pub(crate) type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
-
-/// Finalize a one-shot HTTP response on a demuxed stream before it drops.
+/// Demuxed connection (plain TCP or TLS) used for all post-demux
+/// HTTP/WebSocket handling, plus the per-exchange keep-alive state the
+/// request loop and the write edges share (see the `keep_alive` module
+/// docs for the decision table).
 ///
-/// Every dashboard HTTP reply is a single buffered response sent with
-/// `Connection: close`, after which the connection task returns and the
-/// boxed [`DemuxStream`] is dropped. For a plain `TcpStream` that's fine —
-/// the kernel keeps queued bytes and flushes them on close. But the TLS
-/// path's stream is a `tokio_rustls::server::TlsStream`, which buffers
-/// *ciphertext* inside the rustls session: `write_all` only guarantees the
-/// plaintext was accepted into that buffer, not that the encrypted records
-/// reached the socket. Dropping the `TlsStream` without flushing discards
-/// the unwritten tail records, truncating large bodies (e.g. the ~871 KB
+/// Reads serve the `replay` buffer first — the request loop pushes each
+/// follow-up request's already-captured segment there so dispatch (and a
+/// WebSocket upgrade arriving on a kept-alive connection) see the request
+/// from byte zero, exactly as the first request is delivered (kernel
+/// buffer on the plain path, `PrefixedStream` on TLS). Writes delegate
+/// straight to the inner stream.
+pub(crate) struct DemuxStream {
+    inner: std::pin::Pin<Box<dyn AsyncReadWrite>>,
+    replay: Vec<u8>,
+    replay_pos: usize,
+    /// Request leg of the keep-alive verdict (client headers + loop
+    /// budget + segment framing); set by the request loop per request.
+    client_allows_reuse: bool,
+    /// Body leg: the request body was provably consumed in full; set by
+    /// dispatch, reset by [`Self::begin_request`]. Fail-closed default.
+    request_consumed: bool,
+    /// Give-back channel to the request loop: a write edge that finished
+    /// a self-framing response on a reusable exchange parks the stream
+    /// here instead of closing it. `Weak` — only the connection task
+    /// holds the slot strongly, so unarmed streams (handler test
+    /// fixtures, one-shot tools) fail closed to the historical
+    /// write-then-finalize behavior.
+    parked: std::sync::Weak<Mutex<Option<DemuxStream>>>,
+}
+
+/// The request loop's strong handle to the keep-alive give-back slot.
+pub(crate) type ParkedStreamSlot = Arc<Mutex<Option<DemuxStream>>>;
+
+impl DemuxStream {
+    /// Wrap a demuxed transport. Keep-alive starts disarmed: every write
+    /// edge behaves exactly like the historical close-per-request server
+    /// until the request loop arms the slot and begins a request.
+    pub(crate) fn new(inner: std::pin::Pin<Box<dyn AsyncReadWrite>>) -> Self {
+        Self {
+            inner,
+            replay: Vec::new(),
+            replay_pos: 0,
+            client_allows_reuse: false,
+            request_consumed: false,
+            parked: std::sync::Weak::new(),
+        }
+    }
+
+    pub(crate) fn new_parked_slot() -> ParkedStreamSlot {
+        Arc::new(Mutex::new(None))
+    }
+
+    pub(crate) fn arm_keep_alive(&mut self, slot: &ParkedStreamSlot) {
+        self.parked = Arc::downgrade(slot);
+    }
+
+    /// Begin one request/response exchange: record the request leg's
+    /// verdict and reset the body leg (fail-closed until dispatch proves
+    /// the body was consumed).
+    pub(crate) fn begin_request(&mut self, client_allows_reuse: bool) {
+        self.client_allows_reuse = client_allows_reuse;
+        self.request_consumed = false;
+    }
+
+    /// Body leg: dispatch proved this request's body is fully consumed
+    /// (or that there was none to consume).
+    pub(crate) fn mark_request_body_consumed(&mut self) {
+        self.request_consumed = true;
+    }
+
+    /// The verdict a write edge consults before opting in: park (and
+    /// emit `Connection: keep-alive`) only when the request leg, the
+    /// body leg, and a live loop slot all agree. Anything else — and
+    /// every write edge that never asks — closes.
+    pub(crate) fn exchange_reusable(&self) -> bool {
+        self.client_allows_reuse && self.request_consumed && self.parked.strong_count() > 0
+    }
+
+    /// Serve `segment` to readers before the socket (the request loop's
+    /// captured next-request head + any body prefix read with it).
+    pub(crate) fn push_replay(&mut self, segment: &[u8]) {
+        // The previous request drained its replay in full (dispatch
+        // consumes exactly the segment it was handed), so this replaces
+        // rather than appends.
+        debug_assert!(self.replay_pos >= self.replay.len());
+        self.replay = segment.to_vec();
+        self.replay_pos = 0;
+    }
+
+    /// Response-leg opt-in: flush this exchange's response through to
+    /// the socket — rustls buffers ciphertext, so this is the flush half
+    /// of the [`finalize_http_stream`] contract applied per response —
+    /// then hand the stream back to the request loop for the next
+    /// request. Falls back to a clean close when the flush fails or the
+    /// loop is gone (unarmed slot / dead task).
+    pub(crate) async fn park(mut self) {
+        use tokio::io::AsyncWriteExt;
+        if self.flush().await.is_err() {
+            let _ = self.shutdown().await;
+            return;
+        }
+        let Some(slot) = self.parked.upgrade() else {
+            let _ = self.shutdown().await;
+            return;
+        };
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
+    }
+}
+
+impl AsyncRead for DemuxStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.replay_pos < this.replay.len() {
+            let remaining = &this.replay[this.replay_pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            this.replay_pos += n;
+            // Serve only replay bytes on this poll (same shape as
+            // web_tls::PrefixedStream); the next read drains the inner
+            // stream.
+            return std::task::Poll::Ready(Ok(()));
+        }
+        this.inner.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DemuxStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// Finalize an HTTP connection before its stream drops: flush, then shut
+/// down cleanly.
+///
+/// The flush matters because the TLS path's stream is a
+/// `tokio_rustls::server::TlsStream`, which buffers *ciphertext* inside
+/// the rustls session: `write_all` only guarantees the plaintext was
+/// accepted into that buffer, not that the encrypted records reached the
+/// socket. Dropping the `TlsStream` without flushing discards the
+/// unwritten tail records, truncating large bodies (e.g. the ~871 KB
 /// `app.html` arrived ~19.5 KB short over HTTPS).
 ///
 /// Calling `flush` drives rustls to emit all buffered ciphertext to the
 /// TCP socket; `shutdown` then writes the TLS `close_notify` and the TCP
 /// FIN, closing the session cleanly. On the plain path both delegate
 /// straight through to the `TcpStream` (flush is a no-op, shutdown sends
-/// the FIN we'd send on drop anyway), so behavior there is unchanged.
+/// the FIN we'd send on drop anyway).
+///
+/// With HTTP/1.1 keep-alive this runs at CONNECTION end — after the last
+/// exchange of a kept-alive connection, or immediately after a
+/// `Connection: close` exchange (the historical one-shot shape). Between
+/// kept-alive exchanges the flush half runs per response inside
+/// [`DemuxStream::park`], so a parked response always reaches the client
+/// before the loop waits for the next request.
 pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
     use tokio::io::AsyncWriteExt;
     let _ = stream.flush().await;
@@ -455,6 +622,32 @@ impl HttpResponse {
         self.header("Access-Control-Allow-Origin", "*")
     }
 
+    /// Set this response's connection tail from the exchange's keep-alive
+    /// verdict. A close verdict keeps the historical bytes exactly: an
+    /// existing `Connection` header (every legacy shape bakes `close`) is
+    /// left untouched, and `Connection: close` is appended only when
+    /// absent. A keep-alive verdict replaces any baked tail with
+    /// `Connection: keep-alive` + `Keep-Alive: timeout=N` — emitted only
+    /// by write edges that will actually park the connection (see the
+    /// `keep_alive` module docs).
+    pub(crate) fn connection_reuse(mut self, keep_alive: bool) -> Self {
+        if keep_alive {
+            self.headers.retain(|(name, _)| {
+                !name.eq_ignore_ascii_case("connection") && !name.eq_ignore_ascii_case("keep-alive")
+            });
+            self.header("Connection", "keep-alive")
+                .header("Keep-Alive", keep_alive_header_value())
+        } else if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            self
+        } else {
+            self.header("Connection", "close")
+        }
+    }
+
     /// Fleet-allowlist CORS posture: strip any wildcard, echo the origin
     /// only when it passed the allowlist, and mark `Vary: Origin`. The
     /// one fleet renderer (its string-form ancestor retired with the S6
@@ -839,6 +1032,82 @@ mod tests {
              \r\n\
              {}"
         );
+    }
+
+    #[test]
+    fn connection_reuse_close_is_byte_identical_to_legacy_shapes() {
+        // Close verdict on a shape that bakes `Connection: close`
+        // (every legacy helper): a strict no-op.
+        assert_eq!(
+            HttpResponse::json("200 OK", "{}")
+                .connection_reuse(false)
+                .into_string(),
+            json_response("200 OK", "{}".to_string())
+        );
+        // Close verdict on a shape with no Connection header: one is
+        // appended so the client knows not to reuse.
+        let bare = HttpResponse::with_content("200 OK", "text/plain", "x")
+            .connection_reuse(false)
+            .into_string();
+        assert!(bare.contains("Connection: close\r\n"), "{bare}");
+    }
+
+    #[test]
+    fn connection_reuse_keep_alive_replaces_baked_close() {
+        let text = HttpResponse::json("200 OK", "{}")
+            .connection_reuse(true)
+            .into_string();
+        assert!(!text.contains("Connection: close"), "{text}");
+        assert!(text.contains("Connection: keep-alive\r\n"), "{text}");
+        assert!(
+            text.contains(&format!("Keep-Alive: timeout={KEEP_ALIVE_IDLE_SECS}\r\n")),
+            "{text}"
+        );
+        assert_eq!(text.matches("Connection").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn demux_stream_defaults_fail_closed_and_replay_serves_first() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut stream = DemuxStream::new(Box::pin(server));
+        // Fail-closed defaults: no verdict, no armed slot.
+        assert!(!stream.exchange_reusable());
+        stream.begin_request(true);
+        stream.mark_request_body_consumed();
+        // Still not reusable: the parked slot was never armed (the
+        // fixture / one-shot shape), so a park would just close.
+        assert!(!stream.exchange_reusable());
+        let slot = DemuxStream::new_parked_slot();
+        stream.arm_keep_alive(&slot);
+        assert!(stream.exchange_reusable());
+        // begin_request resets the body leg (fail-closed per request).
+        stream.begin_request(true);
+        assert!(!stream.exchange_reusable());
+
+        // Replay bytes are served before the transport's own bytes.
+        client.write_all(b"tail").await.unwrap();
+        stream.push_replay(b"head ");
+        let mut got = [0u8; 9];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"head tail");
+    }
+
+    #[tokio::test]
+    async fn demux_stream_park_hands_the_stream_back_through_the_slot() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut stream = DemuxStream::new(Box::pin(server));
+        let slot = DemuxStream::new_parked_slot();
+        stream.arm_keep_alive(&slot);
+        stream.begin_request(true);
+        stream.mark_request_body_consumed();
+        stream.park().await;
+        let parked = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("park() must hand the stream back through the slot");
+        drop(parked);
     }
 
     #[tokio::test]
