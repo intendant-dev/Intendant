@@ -2964,10 +2964,12 @@ pub(crate) fn emit_external_tool_output(
     config: &DrainConfig<'_>,
     session_id: Option<&str>,
     stdout: String,
+    item_id: Option<&str>,
 ) {
     if stdout.is_empty() {
         return;
     }
+    let item_id = item_id.map(str::trim).filter(|id| !id.is_empty());
     let output_id = event::next_agent_output_id();
     slog(config.session_log, |l| {
         l.agent_output_with_session_id(
@@ -2976,6 +2978,7 @@ pub(crate) fn emit_external_tool_output(
             "",
             config.agent_source.as_deref(),
             Some(&output_id),
+            item_id,
         )
     });
     config.bus.send(AppEvent::AgentOutput {
@@ -2984,6 +2987,7 @@ pub(crate) fn emit_external_tool_output(
         stderr: String::new(),
         source: config.agent_source.clone(),
         output_id: Some(output_id),
+        item_id: item_id.map(str::to_string),
     });
 }
 
@@ -3228,7 +3232,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
             let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
                 return;
             };
-            emit_external_tool_output(config, Some(&child_thread_id), stdout);
+            emit_external_tool_output(config, Some(&child_thread_id), stdout, Some(&item_id));
         }
         external_agent::AgentEvent::ToolCompleted { item_id, status } => {
             if let Some(limiter) = stats
@@ -3236,7 +3240,12 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 .get_mut(&child_thread_id)
             {
                 if let Some(stdout) = limiter.complete(&item_id) {
-                    emit_external_tool_output(config, Some(&child_thread_id), stdout);
+                    emit_external_tool_output(
+                        config,
+                        Some(&child_thread_id),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
             }
             if let external_agent::ToolCompletionStatus::Failed { message } = status {

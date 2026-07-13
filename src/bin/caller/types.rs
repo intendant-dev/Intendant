@@ -272,6 +272,10 @@ pub enum OutboundEvent {
         source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_id: Option<String>,
+        /// Originating tool call (`agent_started.item_id`) when known —
+        /// groups output under its command in the Activity log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
     },
     ApprovalRequired {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -928,6 +932,15 @@ pub enum OutboundEvent {
     /// Steer was explicitly cleared/cancelled before Intendant could prove
     /// delivery. This is terminal UI state, not an agent-observed message.
     SteerCancelled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
+    /// A cancel found nothing left to cancel — the steer already delivered
+    /// or converted to a follow-up. Terminal UI state that must NOT read as
+    /// a successful clear: the text reached (or will reach) the agent.
+    SteerCancelFailed {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         id: String,

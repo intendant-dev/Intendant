@@ -2427,13 +2427,30 @@ function isSessionWindowSteerActive(sessionId) {
 // truthful even when it is not the prompt target (the global banner stays
 // gated on the target in the set_phase command). A server phase is
 // authoritative — it also retires the optimistic-active guard.
+//
+// The session id must go through the identity translation: external
+// sessions re-key their window to the backend-native id while server
+// status events keep riding the wrapper/log id. A direct lookup missed
+// the re-keyed window, so its phase stayed optimistic forever — which is
+// what parked the composer in follow-up mode ("steering doesn't work")
+// via the optimistic-expired steer gate.
 function applyServerPhaseToSessionWindow(sessionId, phase) {
   const sid = String(sessionId || '').trim();
   if (!sid || !phase) return;
-  const win = sessionWindows.get(sid);
+  const targetSid = (typeof sessionWindowTargetForLogSession === 'function'
+    && sessionWindowTargetForLogSession(sid)) || sid;
+  const win = sessionWindows.get(targetSid);
   if (!win) return;
   win.optimisticActiveExpired = false;
   if (!isAgentActivePhase(normalizeSessionPhase(phase))) win.pendingActiveUntil = 0;
-  updateSessionWindow(sid, { phase });
+  // A pending follow-up row's message became this turn's input the moment
+  // the session went active — retire it as delivered. (The daemon lane's
+  // task-envelope channel drops follow_up ids, so no FollowUpStatus echo
+  // will ever come for these; without this the row sat at ⏳ forever.)
+  if (isAgentActivePhase(normalizeSessionPhase(phase))
+      && typeof retirePendingFollowUpRowsForSession === 'function') {
+    retirePendingFollowUpRowsForSession(targetSid, sid);
+  }
+  updateSessionWindow(targetSid, { phase });
 }
 

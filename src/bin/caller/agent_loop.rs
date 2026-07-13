@@ -2051,6 +2051,7 @@ pub(crate) async fn run_agent_loop(
                 stderr: output.stderr.clone(),
                 source: None,
                 output_id: Some(output_id),
+                item_id: None,
             });
 
             // Map results back to individual tool responses
@@ -2565,6 +2566,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 stderr: output.stderr.clone(),
                 source: None,
                 output_id: Some(output_id),
+                item_id: None,
             });
 
             // Format agent output as next user message, include budget summary

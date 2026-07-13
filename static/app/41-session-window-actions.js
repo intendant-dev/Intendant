@@ -904,6 +904,12 @@ function inferSessionPhaseFromLog(c) {
   }
   if (phase) {
     updateSessionWindow(sid, { phase });
+    // First live activity for the session = its queued follow-up became
+    // the running turn's input (see retirePendingFollowUpRowsForSession).
+    if ((phase === 'thinking' || phase === 'running') && !processingLogReplay
+        && typeof retirePendingFollowUpRowsForSession === 'function') {
+      retirePendingFollowUpRowsForSession(sid, String(c.session_id || ''));
+    }
     if (
       (phase === 'idle' || phase === 'done' || phase === 'interrupted') &&
       (
@@ -1217,6 +1223,9 @@ function formatCompactBytes(bytes) {
 
 function isCommandOutputLog(c) {
   if (!c) return false;
+  // Tool-call announcements are command ROWS, not command output — the
+  // level-'agent' fallback below used to swallow them into groups.
+  if (c.kind === 'tool_call') return false;
   if (
     c.kind === 'agent_output' ||
     c.kind === 'command_execution' ||
@@ -1365,7 +1374,28 @@ function formatLogTimestampTitle(value, rawValue = '') {
   return raw;
 }
 
+// Tool-call previews by item id, captured from agent_started-shaped
+// entries so output groups can name the command that produced them.
+// Bounded: insertion-ordered Map, oldest evicted past the cap.
+const commandPreviewsByItemId = new Map();
+const COMMAND_PREVIEW_CAP = 2000;
+function recordCommandPreviewFromLog(c) {
+  const itemId = String(c?.item_id || c?.itemId || '').trim();
+  if (!itemId) return;
+  const kind = String(c?.kind || '').trim();
+  if (kind === 'agent_output') return;
+  if (String(c?.level || '') !== 'agent') return;
+  const preview = String(c?.content || '').trim();
+  if (!preview) return;
+  commandPreviewsByItemId.delete(itemId);
+  commandPreviewsByItemId.set(itemId, preview.slice(0, 160));
+  while (commandPreviewsByItemId.size > COMMAND_PREVIEW_CAP) {
+    commandPreviewsByItemId.delete(commandPreviewsByItemId.keys().next().value);
+  }
+}
+
 function createLogScaffold(c, extraClass) {
+  recordCommandPreviewFromLog(c);
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
   entry.dataset.level = c.level;
@@ -1559,12 +1589,18 @@ function commandOutputGroupKey(c) {
 
 function commandOutputSummaryHtml(group) {
   const parts = [];
-  if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.lines > 0) parts.push(group.lines + ' line' + (group.lines === 1 ? '' : 's'));
+  else if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.bytes > 0) parts.push(formatCompactBytes(group.bytes));
   if (group.warns > 0) parts.push(`<span class="output-warn">${group.warns} warning${group.warns === 1 ? '' : 's'}</span>`);
   const detail = parts.length ? parts.join(' · ') : 'ready';
-  return `<span class="status-dot"></span><span>output · ${detail}</span>`;
+  // Name the group by the command that produced it (the agent_started
+  // preview for the same tool call) — "output · 6 chunks" said nothing
+  // about WHOSE output it was once consecutive tools coalesced.
+  const label = group.commandPreview
+    ? `<span class="output-command">${escapeHtml(group.commandPreview)}</span>`
+    : '<span>output</span>';
+  return `<span class="status-dot"></span>${label}<span class="output-detail"> · ${detail}</span>`;
 }
 
 function updateCommandOutputSummary(group) {
@@ -1739,6 +1775,10 @@ function renderCommandOutputEntry(c) {
     const copyRef = setLogEntryCopyText(entry, '');
     appendCopyLogEntryButton(entry);
 
+    const itemId = String(
+      c.command_item_id || c.commandItemId || c.command_execution?.id ||
+      c.commandExecution?.id || c.item_id || c.itemId || ''
+    ).trim();
     const group = {
       id: groupId,
       key: groupKey,
@@ -1756,6 +1796,8 @@ function renderCommandOutputEntry(c) {
       loading: false,
       clones: [],
       copyRef,
+      commandPreview: itemId ? (commandPreviewsByItemId.get(itemId) || '') : '',
+      userExpanded: false,
     };
     commandOutputGroupByEntry.set(entry, group);
     entry.addEventListener('click', () => toggleCommandOutputGroup(group));
@@ -1774,12 +1816,26 @@ function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
   group.entry.classList.add('finalized');
-  group.entry.classList.remove('expanded');
-  group.body.innerHTML = '';
-  group.loaded = false;
-  group.loading = false;
+  // A group the USER opened stays open with its streamed body — yanking
+  // the output shut mid-read because the command happened to finish was
+  // the "collapsible doesn't work" experience. Auto-expanded (streaming)
+  // groups still fold to their summary line.
+  if (group.userExpanded && group.entry.classList.contains('expanded')) {
+    group.loaded = true;
+    group.loading = false;
+  } else {
+    group.entry.classList.remove('expanded');
+    group.body.innerHTML = '';
+    group.loaded = false;
+    group.loading = false;
+  }
   for (const view of commandOutputCloneViews(group)) {
     view.entry.classList.add('finalized');
+    if (view.entry.classList.contains('expanded') && group.userExpanded) {
+      view.loaded = true;
+      view.loading = false;
+      continue;
+    }
     view.entry.classList.remove('expanded');
     view.body.innerHTML = '';
     view.loaded = false;
@@ -1821,9 +1877,22 @@ async function loadCommandOutputIntoBody(group, body) {
 }
 
 async function toggleCommandOutputView(group, view) {
-  if (!group.finalized || !view?.entry || !view?.body) return;
+  if (!view?.entry || !view?.body) return;
   const expanding = !view.entry.classList.contains('expanded');
+  // The user's explicit intent survives finalization: a group opened by
+  // hand stays open when the command completes; one closed by hand stays
+  // closed while streaming.
+  group.userExpanded = expanding;
   view.entry.classList.toggle('expanded', expanding);
+  if (!group.finalized) {
+    // Live group: the main body streams in place (CSS hides it while
+    // collapsed). A clone view expanded mid-stream backfills what it
+    // missed — chunk appends only reach expanded clones.
+    if (expanding && view !== group && !view.body.childElementCount) {
+      view.body.innerHTML = group.body.innerHTML;
+    }
+    return;
+  }
   if (!expanding) {
     view.body.innerHTML = '';
     view.loaded = false;
@@ -2391,10 +2460,16 @@ function setContextUsagePct(pct) {
     return;
   }
   const value = Number(pct);
-  fill.style.width = Math.min(value, 100) + '%';
-  const color = value < 50 ? 'var(--green)' : value < 85 ? 'var(--yellow)' : 'var(--red)';
+  // The label clamps like the fill: a stale context window can briefly
+  // over-report (backends now clamp too, but replayed older sessions
+  // still carry raw values) and "142.3%" is a lie either way — the
+  // tooltip keeps the raw figure for the curious.
+  const shown = Math.min(value, 100);
+  fill.style.width = shown + '%';
+  const color = shown < 50 ? 'var(--green)' : shown < 85 ? 'var(--yellow)' : 'var(--red)';
   fill.style.background = color;
-  label.textContent = value.toFixed(1) + '%';
+  label.textContent = shown.toFixed(1) + '%';
+  label.title = value > 100 ? `raw reading ${value.toFixed(1)}% — context window estimate stale` : '';
   label.style.color = color;
 }
 

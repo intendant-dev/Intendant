@@ -560,6 +560,26 @@ function forgetPendingFollowUp(id) {
   if (key) pendingFollowUpsById.delete(key);
 }
 
+// The strip's follow-up rows ('follow-…' keys) deliver silently in the
+// daemon lane (the task-envelope channel drops follow_up ids, so no
+// FollowUpStatus echo comes back). The turn STARTING for their session is
+// the delivery signal: retire pending rows then instead of leaving ⏳
+// rows behind. Steer rows ('steer-…') keep their explicit lifecycle.
+function retirePendingFollowUpRowsForSession(sessionId, aliasSessionId = '') {
+  const sids = new Set([String(sessionId || '').trim(), String(aliasSessionId || '').trim()]);
+  sids.delete('');
+  if (!sids.size) return;
+  for (const [key, entry] of steerRows) {
+    if (!key.startsWith('follow-')) continue;
+    const rowSid = String(entry?.sessionId || '').trim();
+    if (rowSid && !sids.has(rowSid)) continue;
+    const isPending = entry?.el?.classList.contains('pending') || entry?.el?.classList.contains('queued');
+    if (!isPending) continue;
+    forgetPendingFollowUp(key);
+    onSteerStatusUpdate(key, entry?.text || '', 'delivered', null, { sessionId: rowSid });
+  }
+}
+
 function removeSteerRowSoon(id, delayMs = 1400) {
   const key = String(id || '').trim();
   if (!key) return;
@@ -823,13 +843,35 @@ function cancelSteerRow(id) {
   if (!key) return;
   const entry = steerRows.get(key);
   const sessionId = String(entry?.sessionId || resolvePromptTargetSessionId() || '').trim();
-  const text = entry?.text || '';
   const isSteer = key.startsWith('steer-');
   if (isSteer && app) {
+    // No optimistic "cancelled": the backend may find nothing left to
+    // clear (already delivered / converted to a follow-up) and answers
+    // with steer_cancelled OR steer_cancel_failed — the row shows
+    // whichever actually happened. Until then it reads as clearing.
     const msg = { action: 'cancel_steer', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
     dispatchSessionControlMsg(msg);
-  } else if (app) {
+    const el = entry?.el;
+    const cancelBtn = el?.querySelector('.steer-cancel');
+    if (cancelBtn) cancelBtn.disabled = true;
+    const reasonNode = el?.querySelector('.steer-reason');
+    if (reasonNode) reasonNode.textContent = '— clearing…';
+    // Echo watchdog: if neither verdict arrives (daemon gone), re-enable
+    // the button instead of wedging the row.
+    setTimeout(() => {
+      const row = steerRows.get(key);
+      const btn = row?.el?.querySelector('.steer-cancel');
+      if (btn && btn.disabled) {
+        btn.disabled = false;
+        const rn = row.el.querySelector('.steer-reason');
+        if (rn && rn.textContent === '— clearing…') rn.textContent = '— no reply; try again';
+      }
+    }, 6000);
+    return;
+  }
+  const text = entry?.text || '';
+  if (app) {
     const msg = { action: 'cancel_follow_up', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
     dispatchSessionControlMsg(msg);
@@ -889,8 +931,10 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   // Clear any in-flight fade timer — a fresh status update preempts it.
   if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
 
-  if (status === 'delivered' || status === 'cancelled') {
-    // Brief visual confirmation, then remove the row.
+  if (status === 'delivered' || status === 'cancelled' || status === 'failed') {
+    // Brief visual confirmation, then remove the row. Failures linger
+    // longer — "couldn't clear: already delivered" is information the
+    // user needs a beat to read.
     entry.timeout = setTimeout(() => {
       el.classList.add('fading');
       entry.timeout = setTimeout(() => {
@@ -899,7 +943,7 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
         if (strip.childElementCount === 0) strip.classList.add('empty');
         stationScheduleUpdate();
       }, 220);
-    }, 1200);
+    }, status === 'failed' ? 6000 : 1200);
   }
 }
 

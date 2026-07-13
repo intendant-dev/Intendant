@@ -1621,13 +1621,17 @@ impl AppState {
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
+                // kind tool_call: a command ANNOUNCEMENT row, never command
+                // output — without the kind, the level-'agent' fallback in
+                // isCommandOutputLog swallowed these into output groups
+                // (external tool calls showed no command line at all).
                 cmds.extend(self.add_log_with_metadata(
                     "agent",
                     preview,
                     None,
                     source,
                     Vec::new(),
-                    None,
+                    Some("tool_call"),
                     None,
                     item_id,
                     None,
@@ -1646,6 +1650,9 @@ impl AppState {
             "agent_output" => {
                 let source = msg["source"].as_str().unwrap_or("agent");
                 let output_id = msg["output_id"].as_str().map(str::to_string);
+                // Originating tool call — groups output under its command
+                // row instead of coalescing consecutive tools' output.
+                let item_id = msg["item_id"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
@@ -1658,7 +1665,7 @@ impl AppState {
                                 out.images,
                                 Some("agent_output"),
                                 output_id.clone(),
-                                None,
+                                item_id.clone(),
                                 None,
                                 None,
                                 false,
@@ -1677,7 +1684,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
-                            None,
+                            item_id.clone(),
                             None,
                             None,
                             false,
@@ -1930,7 +1937,7 @@ impl AppState {
                     "info",
                     &format!("\u{23F3} Steer sent: {}", truncate(&text, 80)),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -1951,7 +1958,7 @@ impl AppState {
                     "warn",
                     &format!("\u{23F0} Steer queued: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 // Prefer the stored text so late/out-of-order queue
                 // events still render the original message in the strip.
@@ -1979,7 +1986,7 @@ impl AppState {
                     "info",
                     &format!("\u{21AA} Steer accepted: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 let text = self
                     .queued_steers
@@ -2012,7 +2019,7 @@ impl AppState {
                         truncate(&text, 80)
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -2038,12 +2045,38 @@ impl AppState {
                         }
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
                     text,
                     status: "cancelled".into(),
+                    reason: if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
+                });
+            }
+
+            // A cancel that found nothing to clear — the message already
+            // delivered or converted to a follow-up. Renders as a failed
+            // clear, never as a successful one.
+            "steer_cancel_failed" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                let entry = self.queued_steers.remove(&id);
+                let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("\u{2715} Couldn't clear message: {}", reason),
+                    None,
+                    "steer",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "failed".into(),
                     reason: if reason.is_empty() {
                         None
                     } else {

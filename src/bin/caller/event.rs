@@ -165,6 +165,10 @@ pub enum AppEvent {
         stderr: String,
         source: Option<String>,
         output_id: Option<String>,
+        /// The originating tool call (`AgentStarted.item_id`) when the
+        /// backend correlates output to calls — frontends group output
+        /// under its command instead of coalescing consecutive tools.
+        item_id: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -250,6 +254,16 @@ pub enum AppEvent {
     /// terminal UI state distinct from delivery: the prompt should no longer be
     /// shown as waiting, but Intendant is not claiming the agent saw it.
     SteerCancelled {
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
+    /// A cancel arrived but nothing was left to cancel — the steer already
+    /// delivered, drained into a follow-up, or was handed to the runtime.
+    /// Distinct from `SteerCancelled` so the dashboard never reports a
+    /// clear that did not happen (the old handler fabricated a
+    /// `SteerCancelled` here and the text still reached the model).
+    SteerCancelFailed {
         session_id: Option<String>,
         id: String,
         reason: String,
@@ -2136,12 +2150,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             stderr,
             source,
             output_id,
+            item_id,
         } => Some(OutboundEvent::AgentOutput {
             session_id: session_id.clone(),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
             output_id: output_id.clone(),
+            item_id: item_id.clone(),
         }),
         AppEvent::DoneSignal {
             session_id,
@@ -2209,6 +2225,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id,
             reason,
         } => Some(OutboundEvent::SteerCancelled {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            reason: reason.clone(),
+        }),
+        AppEvent::SteerCancelFailed {
+            session_id,
+            id,
+            reason,
+        } => Some(OutboundEvent::SteerCancelFailed {
             session_id: session_id.clone(),
             id: id.clone(),
             reason: reason.clone(),
@@ -3015,6 +3040,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::SteerAccepted { .. }
             | AppEvent::SteerDelivered { .. }
             | AppEvent::SteerCancelled { .. }
+            | AppEvent::SteerCancelFailed { .. }
             | AppEvent::InterruptRequested { .. }
             | AppEvent::Interrupted { .. }
             | AppEvent::SessionStarted { .. }
@@ -3139,6 +3165,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             reason,
         } => {
             log.steer_cancelled(session_id.as_deref(), id, reason);
+        }
+        AppEvent::SteerCancelFailed { id, reason, .. } => {
+            log.warn(&format!("Steer cancel failed ({id}): {reason}"));
         }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
@@ -5325,6 +5354,7 @@ mod tests {
             stderr: "".to_string(),
             source: None,
             output_id: None,
+            item_id: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -5502,6 +5532,7 @@ mod tests {
                 stderr: String::new(),
                 source: Some("Codex".to_string()),
                 output_id: Some("out-1".to_string()),
+                item_id: None,
             },
         );
         drop(shared);

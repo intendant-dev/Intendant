@@ -233,7 +233,10 @@ impl CcShared {
 
 /// Human preview for a tool invocation: shell command, file path (plus the
 /// model's own description when present), or a truncated JSON dump.
-fn tool_input_preview(input: &serde_json::Value) -> String {
+/// `pub(crate)`: the disk-transcript reconstruction
+/// (`session_catalog::transcripts::parse_claude_session_entries`) builds the
+/// same preview so hydrated tool-call rows are byte-identical to live ones.
+pub(crate) fn tool_input_preview(input: &serde_json::Value) -> String {
     let raw = if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
         cmd.to_string()
     } else if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
@@ -436,8 +439,14 @@ fn usage_snapshot_from_api_usage(
     if tokens_used == 0 {
         return None;
     }
-    let usage_pct = if context_window > 0 {
-        (tokens_used as f64 / context_window as f64) * 100.0
+    // A footprint above the window means the WINDOW figure is stale, not
+    // that the context is over-full (a resumed 1M-window session divided by
+    // the 200k default read >100% until the first result corrected it).
+    // Divide by the larger of the two: the meter tops out at 100% and the
+    // corrected window restores precision on the next result.
+    let effective_window = context_window.max(tokens_used);
+    let usage_pct = if effective_window > 0 {
+        (tokens_used as f64 / effective_window as f64) * 100.0
     } else {
         0.0
     };
@@ -462,8 +471,8 @@ fn usage_snapshot_from_api_usage(
         provider: "anthropic".to_string(),
         model: model.to_string(),
         tokens_used,
-        context_window,
-        hard_context_window: Some(context_window),
+        context_window: effective_window,
+        hard_context_window: Some(effective_window),
         usage_pct,
         prompt_tokens,
         completion_tokens: output,
@@ -1808,22 +1817,36 @@ impl CcReader {
             .get("rateLimitType")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown");
-        // Vitals gauge: every event with a utilization updates the window
-        // (live wire: {"status":"allowed_warning","resetsAt":…,
-        // "rateLimitType":"seven_day","utilization":0.49}). Attached to
-        // the next usage snapshot rather than emitted on its own — an
-        // all-zero usage event would stomp the dashboard meter.
-        if let Some(utilization) = info.get("utilization").and_then(|v| v.as_f64()) {
-            self.limit_windows.insert(
-                kind.to_string(),
-                crate::types::SessionLimitWindow {
-                    label: cc_rate_limit_label(kind),
-                    used_pct: (utilization * 100.0).round().clamp(0.0, 100.0) as u8,
-                    resets_at_epoch: info.get("resetsAt").and_then(|v| v.as_u64()),
-                },
-            );
-        }
+        // Vitals gauge: every event updates its window. Older CLIs carried a
+        // `utilization` fraction; 2.1.2xx dropped it in normal operation
+        // (live wire: {"status":"allowed","resetsAt":…,"rateLimitType":
+        // "five_hour","overageStatus":…}), so the pct is optional and the
+        // status/reset still feed the gauge. A newer event without
+        // utilization keeps the last known pct — it says nothing about
+        // consumption, only about status. Attached to the next usage
+        // snapshot rather than emitted on its own — an all-zero usage event
+        // would stomp the dashboard meter.
         let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        let used_pct = info
+            .get("utilization")
+            .and_then(|v| v.as_f64())
+            .map(|utilization| (utilization * 100.0).round().clamp(0.0, 100.0) as u8);
+        let window = self
+            .limit_windows
+            .entry(kind.to_string())
+            .or_insert_with(|| crate::types::SessionLimitWindow {
+                label: cc_rate_limit_label(kind),
+                ..Default::default()
+            });
+        if used_pct.is_some() {
+            window.used_pct = used_pct;
+        }
+        if let Some(resets_at) = info.get("resetsAt").and_then(|v| v.as_u64()) {
+            window.resets_at_epoch = Some(resets_at);
+        }
+        if !status.is_empty() {
+            window.status = Some(status.to_string());
+        }
         if status.is_empty() || status == "allowed" {
             return;
         }
@@ -2039,17 +2062,21 @@ impl ClaudeCodeAgent {
         }
     }
 
-    /// Deliver an operator-goal notice to the model: written immediately
-    /// when a turn is running (the turn absorbs it, no extra cost), queued
-    /// as a prelude on the next user message when idle (a standalone user
-    /// message would start — and pay for — a whole turn).
+    /// Deliver an operator-goal notice to the model: queued as a prelude on
+    /// the next user message, always. Mid-turn stdin writes were the old
+    /// delivery for running turns, but 2.1.2xx discards user lines while a
+    /// turn runs (see `steer_turn`) — the notice would silently vanish. A
+    /// standalone user message is no better: it would start — and pay for —
+    /// a whole turn. The prelude path costs nothing and cannot be dropped;
+    /// a notice raced by an in-flight turn reaches the model one turn later.
     async fn deliver_goal_notice(&mut self, notice: String) -> Result<(), CallerError> {
-        if self.shared.turn_active.load(Ordering::SeqCst) && self.writer.is_some() {
-            self.write_user_message(&notice).await
-        } else {
-            self.pending_goal_notice = Some(notice);
-            Ok(())
-        }
+        self.pending_goal_notice = match self.pending_goal_notice.take() {
+            // Coalesce an undelivered notice instead of overwriting it —
+            // both statements still reach the model, in order.
+            Some(previous) => Some(format!("{previous}\n{notice}")),
+            None => Some(notice),
+        };
+        Ok(())
     }
 
     /// Wrapper-level `/goal` engine (Claude Code has no native goals).
@@ -2463,14 +2490,26 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
-        // A user message written while a turn is running is absorbed into
-        // the running turn — Claude Code queues it and the model reads it
-        // between tool calls (verified against 2.1.200). That matches
-        // Intendant's steer contract exactly; no separate protocol needed.
-        if self.writer.is_none() {
-            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        // 2.1.200 absorbed a user message written mid-turn into the running
+        // turn; that was a bug, and 2.1.2xx removed it — the CLI silently
+        // DISCARDS stdin user lines while a turn is running (probed live on
+        // 2.1.207: the text never enters the conversation, no ack, no next
+        // turn; init capabilities advertise no replacement protocol yet).
+        // Writing the bytes anyway produced phantom "delivered" steers. So:
+        // report the truth and let the drain queue the steer for the turn
+        // boundary (the load-bearing "mid-turn steering not supported"
+        // wording — see external_steer_queue_reason), or, when no turn is
+        // running, hand it back as an immediate follow-up ("no active
+        // turn" marker).
+        let _ = text;
+        if !self.shared.turn_active.load(Ordering::SeqCst) {
+            return Err(CallerError::ExternalAgent(
+                "claude-code has no active turn to steer".into(),
+            ));
         }
-        self.write_user_message(text).await
+        Err(CallerError::ExternalAgent(
+            "mid-turn steering not supported by Claude Code 2.1.x — stream-json input applies user messages only at turn boundaries".into(),
+        ))
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
@@ -2728,11 +2767,50 @@ mod tests {
         assert!(!agent.shared.interrupt_pending.load(Ordering::SeqCst));
     }
 
+    /// The steer contract the drain keys on: idle → "no active turn"
+    /// (immediate follow-up path); running → "mid-turn steering not
+    /// supported" (queue-for-turn-boundary path). CC 2.1.2xx discards
+    /// stdin user lines mid-turn, so steer_turn never writes — writing
+    /// produced phantom "delivered" steers the model never saw.
     #[tokio::test]
-    async fn steer_before_initialize_errors() {
+    async fn steer_reports_queue_semantics_instead_of_writing() {
         let mut agent =
             ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
-        assert!(agent.steer_turn("more context").await.is_err());
+        let idle_err = agent.steer_turn("more context").await.unwrap_err();
+        assert!(
+            idle_err.to_string().contains("no active turn"),
+            "got: {idle_err}"
+        );
+        agent.shared.turn_active.store(true, Ordering::SeqCst);
+        let running_err = agent.steer_turn("more context").await.unwrap_err();
+        assert!(
+            running_err
+                .to_string()
+                .contains("mid-turn steering not supported"),
+            "got: {running_err}"
+        );
+    }
+
+    /// Goal notices always queue as the next prompt's prelude — a mid-turn
+    /// stdin write would be discarded by the CLI, and consecutive notices
+    /// coalesce in order instead of overwriting each other.
+    #[tokio::test]
+    async fn goal_notices_queue_and_coalesce() {
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        agent.shared.turn_active.store(true, Ordering::SeqCst);
+        agent
+            .deliver_goal_notice("first notice".into())
+            .await
+            .unwrap();
+        agent
+            .deliver_goal_notice("second notice".into())
+            .await
+            .unwrap();
+        let queued = agent.pending_goal_notice.clone().expect("queued prelude");
+        let first = queued.find("first notice").expect("first present");
+        let second = queued.find("second notice").expect("second present");
+        assert!(first < second, "notices keep arrival order");
     }
 
     #[test]
@@ -4180,16 +4258,63 @@ mod tests {
         assert_eq!(usage.limits.len(), 2);
         // BTreeMap order: five_hour before seven_day.
         assert_eq!(usage.limits[0].label, "5h");
-        assert_eq!(usage.limits[0].used_pct, 12);
+        assert_eq!(usage.limits[0].used_pct, Some(12));
         assert_eq!(usage.limits[0].resets_at_epoch, Some(1_783_300_000));
         assert_eq!(usage.limits[1].label, "7d");
-        assert_eq!(usage.limits[1].used_pct, 49);
-        // Events without a utilization leave the gauges untouched.
+        assert_eq!(usage.limits[1].used_pct, Some(49));
+    }
+
+    /// 2.1.2xx dropped `utilization` from rate_limit_event in normal
+    /// operation (live wire probed on 2.1.207: status/resetsAt/
+    /// rateLimitType/overageStatus only). The window still feeds the gauge
+    /// — status and reset, no pct — instead of vanishing.
+    #[test]
+    fn utilization_less_rate_limit_event_still_builds_window() {
         let mut reader = test_reader();
         reader.process_line(
-            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1783929600,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false},"session_id":"s1"}"#,
         );
-        assert!(reader.current_limit_windows().is_empty());
+        let windows = reader.current_limit_windows();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].used_pct, None);
+        assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_600));
+        assert_eq!(windows[0].status.as_deref(), Some("allowed"));
+
+        // A later utilization-bearing event fills the pct; a still-later
+        // utilization-less event keeps it (it says nothing about
+        // consumption) while refreshing status/reset.
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1783929700,"rateLimitType":"five_hour","utilization":0.34},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783929800,"rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let windows = reader.current_limit_windows();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, Some(34));
+        assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_800));
+        assert_eq!(windows[0].status.as_deref(), Some("allowed_warning"));
+    }
+
+    /// A resumed big-context session reports usage before the first result
+    /// corrects the window: the meter divides by the LARGER of window and
+    /// footprint so it tops out at 100% instead of reading 250%.
+    #[test]
+    fn stale_window_usage_caps_at_hundred_pct() {
+        let usage = serde_json::json!({
+            "input_tokens": 400_000,
+            "cache_read_input_tokens": 100_000,
+            "output_tokens": 500
+        });
+        let snapshot =
+            usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000).expect("snapshot");
+        assert!(snapshot.usage_pct <= 100.0, "pct {}", snapshot.usage_pct);
+        assert_eq!(snapshot.context_window, 500_500);
+        // A corrected window restores the honest ratio.
+        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000)
+            .expect("snapshot");
+        assert!((corrected.usage_pct - 50.05).abs() < 0.01);
     }
 
     #[test]

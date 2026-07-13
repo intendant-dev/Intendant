@@ -109,8 +109,9 @@ fn anthropic_rate_limit_windows_from_headers(
             .map(|dt| dt.timestamp().max(0) as u64);
         windows.push(crate::types::SessionLimitWindow {
             label: label.to_string(),
-            used_pct,
+            used_pct: Some(used_pct),
             resets_at_epoch,
+            status: None,
         });
     }
     windows
@@ -1567,10 +1568,10 @@ mod tests {
         let windows = anthropic_rate_limit_windows_from_headers(&headers);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "req/min");
-        assert_eq!(windows[0].used_pct, 0);
+        assert_eq!(windows[0].used_pct, Some(0));
         assert!(windows[0].resets_at_epoch.is_some());
         assert_eq!(windows[1].label, "tok/min");
-        assert_eq!(windows[1].used_pct, 80);
+        assert_eq!(windows[1].used_pct, Some(80));
         // Missing reset degrades to a gauge without a countdown.
         assert_eq!(windows[1].resets_at_epoch, None);
 

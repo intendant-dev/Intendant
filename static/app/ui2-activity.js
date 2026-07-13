@@ -220,18 +220,37 @@ function ui2QueueFocusSurface() {
   });
 }
 
-// Raw-payload hygiene: backend stderr lines render as compact, dimmed
-// mono rows instead of full-voice paragraphs.
-function ui2TagRawEntries() {
-  const stream = document.getElementById('log-stream');
-  if (!stream) return;
-  stream.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
+// Raw-payload hygiene + tier tagging: backend stderr lines render as
+// compact, dimmed mono rows; session bookkeeping ("Round N complete",
+// "Turn N started", "Session attached…") and steer receipts read as
+// quiet meta hairlines instead of full-voice rows. Runs over BOTH the
+// combined stream and the session windows — Focus promotes a window, so
+// tagging the stream alone misses everything the user actually reads.
+function ui2TagEntriesIn(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
     e.classList.add('ui2-raw-checked');
-    const text = e.querySelector('.log-content')?.textContent || '';
-    if (/^\s*\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+    const text = (e.querySelector('.log-content')?.textContent || '').trim();
+    if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
       e.classList.add('ui2-stderr');
     }
+    if (e.classList.contains('source-steer')) {
+      e.classList.add('ui2-meta');
+      return;
+    }
+    const level = e.dataset.level || '';
+    if (
+      (level === 'info' || level === 'detail') &&
+      /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
+    ) {
+      e.classList.add('ui2-meta');
+    }
   });
+}
+
+function ui2TagRawEntries() {
+  ui2TagEntriesIn(document.getElementById('log-stream'));
+  ui2TagEntriesIn(document.getElementById('session-window-grid'));
 }
 
 // The approval hero names its session — with several agents running,
@@ -395,8 +414,11 @@ function ui2RailTick(force) {
     if (chip) new MutationObserver(ui2QueueFocusSurface).observe(chip, {
       childList: true, characterData: true, subtree: true, attributes: true,
     });
+    // subtree: entries append INSIDE window logs — the meta/stderr tagger
+    // must see them, not just window add/remove. ui2QueueFocusSurface is
+    // rAF-debounced, so per-entry firing collapses to one pass a frame.
     const windowGrid = document.getElementById('session-window-grid');
-    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true });
+    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true, subtree: true });
     ui2ApplyFocusSurface();
     ui2TagRawEntries();
     // Approval hero session identity.

@@ -915,11 +915,12 @@ pub(crate) fn codex_rate_limit_windows(
             .and_then(|v| v.as_u64());
         windows.push(crate::types::SessionLimitWindow {
             label: codex_rate_limit_label(minutes, key),
-            used_pct: used.round().clamp(0.0, 100.0) as u8,
+            used_pct: Some(used.round().clamp(0.0, 100.0) as u8),
             resets_at_epoch: window
                 .get("resetsAt")
                 .or_else(|| window.get("resets_at"))
                 .and_then(|v| v.as_u64()),
+            status: None,
         });
     }
     windows
@@ -2976,10 +2977,10 @@ mod tests {
         let windows = codex_rate_limit_windows(&params);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
-        assert_eq!(windows[0].used_pct, 34);
+        assert_eq!(windows[0].used_pct, Some(34));
         assert_eq!(windows[0].resets_at_epoch, Some(1_783_300_000));
         assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].used_pct, 12);
+        assert_eq!(windows[1].used_pct, Some(12));
         assert_eq!(windows[1].resets_at_epoch, None);
 
         let snake = serde_json::json!({
@@ -2990,7 +2991,7 @@ mod tests {
         let windows = codex_rate_limit_windows(&snake);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "1h");
-        assert_eq!(windows[0].used_pct, 91);
+        assert_eq!(windows[0].used_pct, Some(91));
 
         assert!(codex_rate_limit_windows(&serde_json::json!({})).is_empty());
         assert_eq!(codex_rate_limit_label(Some(2880), "primary"), "2d");

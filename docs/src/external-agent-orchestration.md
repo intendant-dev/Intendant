@@ -108,7 +108,7 @@ loop.
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON string |
 | Multi-thread | Yes — many threads per process | No |
 | Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
-| Mid-turn steer | Yes (`turn/steer`) | Yes — a user message written mid-turn is absorbed into the running turn |
+| Mid-turn steer | Yes (`turn/steer`) | No — 2.1.2xx discards stdin user messages mid-turn (2.1.200's absorb was a CLI bug, since removed); `steer_turn` reports queue semantics and the steer delivers at the turn boundary (or immediately as its own turn when idle) |
 | Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) |
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
@@ -508,9 +508,15 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   `error_during_execution`, mapped to a completed turn rather than a
   backend error when Intendant requested the interrupt); the process stays
   usable for follow-up turns.
-- **Steer**: a user message written while a turn runs is queued by the CLI
-  and absorbed into the *running* turn (the model reads it between tool
-  calls) — Intendant's `steer_turn` is exactly that write.
+- **Steer**: the CLI **discards** a user message written while a turn runs
+  (probed on 2.1.207; the 2.1.200-era absorb was a CLI bug, since removed,
+  and `system/init.capabilities` advertises no replacement protocol yet).
+  `steer_turn` therefore returns the load-bearing "mid-turn steering not
+  supported" / "no active turn" markers and the drain queues the text onto
+  `context_injection`: it delivers as a `[User]` line when the next turn's
+  message is sent, and an idle session flushes the queue immediately as
+  its own turn. Goal notices queue as next-prompt preludes for the same
+  reason (a mid-turn write would vanish).
 - **Usage**: per-API-call usage from `message_delta` stream events plus the
   turn `result` feed `AgentEvent::Usage`; the context window comes from the
   result's `modelUsage` map (200k default until the first result).
@@ -608,7 +614,7 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
-| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices always queue as a prelude on the next prompt (2.1.2xx discards mid-turn stdin writes; consecutive notices coalesce in order, and updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
 | Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` + `side` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt); `side` (`/btw`) is the same respawn with `relationship_kind: "side"` and the boundary + question as the child's first prompt. No Claude analog planned: fast / review / memory-reset |
 | Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `side` + `subagent` emitted.** Fork/side on the forked child's first identity announcement (persisted `forked_from` + `fork_relationship` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`) | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |

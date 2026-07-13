@@ -253,6 +253,7 @@ mod tests {
             stderr: "".to_string(),
             source: None,
             output_id: None,
+            item_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));

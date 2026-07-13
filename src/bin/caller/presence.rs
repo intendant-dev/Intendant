@@ -1119,6 +1119,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SteerDelivered { .. }
         | AppEvent::SteerCancelRequested { .. }
         | AppEvent::SteerCancelled { .. }
+        | AppEvent::SteerCancelFailed { .. }
         | AppEvent::FollowUpCancelRequested { .. }
         // Peer-delegation delivery receipts are wire-facing correlation
         // events (OutboundEvent::TaskReceived); the accepted task
@@ -1490,6 +1491,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
@@ -1614,6 +1616,7 @@ mod tests {
                 stderr: String::new(),
                 source: None,
                 output_id: None,
+                item_id: None,
             },
             &state,
         );

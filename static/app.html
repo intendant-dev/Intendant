@@ -18707,6 +18707,137 @@ html.ui-v2 #question-panel .question-free-text:focus {
 /* Inline command code rides the design mono, not the UA's generic
    monospace (chrome-audit cross-surface sweep). */
 html.ui-v2 code.log-command-code { font-family: var(--mono); }
+
+/* ── The working transcript: three tiers (overhaul 2026-07-13) ─────────
+   Prose (user + worker voice) keeps the base grammar. WORK (tool calls,
+   command output, diffs) gets a spine + mono so a glance separates what
+   the agent SAID from what it DID. META (session bookkeeping, steer
+   receipts) recedes to hairline annotations. Tags come from the entry's
+   own level/kind plus ui2TagEntriesIn — no DOM restructuring, so the
+   virtualizer, clone-and-rewire, and Station text readers are untouched. */
+
+/* — work tier: the spine — */
+html.ui-v2 .log-entry.level-agent,
+html.ui-v2 .log-entry.diff-log-entry {
+  position: relative;
+}
+html.ui-v2 .log-entry.level-agent::before,
+html.ui-v2 .log-entry.diff-log-entry::before {
+  content: '';
+  position: absolute;
+  left: 66px;               /* between the ts gutter (56px) and the dot column */
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--green) 32%, transparent);
+}
+/* tool-call rows read as commands: mono, quiet */
+html.ui-v2 .log-entry.level-agent:not(.command-output-group) .log-content {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+/* — command-output groups: named, chevroned, heartbeat — */
+html.ui-v2 .command-output-group .command-output-summary {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-command {
+  color: var(--text-2);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-detail { color: var(--text-3); }
+html.ui-v2 .command-output-group .command-output-summary .status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  align-self: center;
+  background: var(--green);
+  flex: none;
+}
+/* the live heartbeat: THE signal for "working right now" — one pulse,
+   nowhere else */
+html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+  background: var(--iris);
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+    animation: ui2-pulse 1.6s ease-in-out infinite;
+  }
+}
+html.ui-v2 .command-output-group .command-output-body {
+  display: block;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  overflow: hidden;
+}
+html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
+/* live groups are collapsible now too (v1 only ever hid finalized
+   bodies): a collapsed streaming group keeps receiving text off-screen */
+html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
+html.ui-v2 .command-output-group .command-output-pre {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* collapse affordances read as controls, not stray glyphs */
+html.ui-v2 .collapse-toggle {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 6px;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .log-entry:hover .collapse-toggle {
+  color: var(--text-2);
+  border-color: var(--line);
+  background: var(--hover-wash);
+}
+
+/* — meta tier: bookkeeping + steer receipts as hairline annotations — */
+html.ui-v2 .log-entry.ui2-meta {
+  padding: 1px 0;
+}
+html.ui-v2 .log-entry.ui2-meta .log-content {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  letter-spacing: .02em;
+}
+html.ui-v2 .log-entry.ui2-meta .log-icon { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-3); opacity: .55; }
+html.ui-v2 .log-entry.source-steer .log-level { color: var(--text-3); }
+
+/* the worker eyebrow names the backend (source string flows through
+   text-transform, so "Claude Code" reads CLAUDE CODE) — tint matches the
+   worker role */
+html.ui-v2 .log-entry.source-claude-code .log-level,
+html.ui-v2 .log-entry.source-codex .log-level,
+html.ui-v2 .log-entry.source-gemini .log-level { color: var(--iris-2); }
+html.ui-v2 .log-entry.source-claude-code.level-model .log-icon,
+html.ui-v2 .log-entry.source-codex.level-model .log-icon,
+html.ui-v2 .log-entry.source-gemini.level-model .log-icon { background: var(--iris); }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
    All scoped html.ui-v2. The v1 window machinery (collapse states,
@@ -26505,18 +26636,37 @@ function ui2QueueFocusSurface() {
   });
 }
 
-// Raw-payload hygiene: backend stderr lines render as compact, dimmed
-// mono rows instead of full-voice paragraphs.
-function ui2TagRawEntries() {
-  const stream = document.getElementById('log-stream');
-  if (!stream) return;
-  stream.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
+// Raw-payload hygiene + tier tagging: backend stderr lines render as
+// compact, dimmed mono rows; session bookkeeping ("Round N complete",
+// "Turn N started", "Session attached…") and steer receipts read as
+// quiet meta hairlines instead of full-voice rows. Runs over BOTH the
+// combined stream and the session windows — Focus promotes a window, so
+// tagging the stream alone misses everything the user actually reads.
+function ui2TagEntriesIn(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
     e.classList.add('ui2-raw-checked');
-    const text = e.querySelector('.log-content')?.textContent || '';
-    if (/^\s*\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+    const text = (e.querySelector('.log-content')?.textContent || '').trim();
+    if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
       e.classList.add('ui2-stderr');
     }
+    if (e.classList.contains('source-steer')) {
+      e.classList.add('ui2-meta');
+      return;
+    }
+    const level = e.dataset.level || '';
+    if (
+      (level === 'info' || level === 'detail') &&
+      /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
+    ) {
+      e.classList.add('ui2-meta');
+    }
   });
+}
+
+function ui2TagRawEntries() {
+  ui2TagEntriesIn(document.getElementById('log-stream'));
+  ui2TagEntriesIn(document.getElementById('session-window-grid'));
 }
 
 // The approval hero names its session — with several agents running,
@@ -26680,8 +26830,11 @@ function ui2RailTick(force) {
     if (chip) new MutationObserver(ui2QueueFocusSurface).observe(chip, {
       childList: true, characterData: true, subtree: true, attributes: true,
     });
+    // subtree: entries append INSIDE window logs — the meta/stderr tagger
+    // must see them, not just window add/remove. ui2QueueFocusSurface is
+    // rAF-debounced, so per-entry firing collapses to one pass a frame.
     const windowGrid = document.getElementById('session-window-grid');
-    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true });
+    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true, subtree: true });
     ui2ApplyFocusSurface();
     ui2TagRawEntries();
     // Approval hero session identity.
@@ -26717,7 +26870,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '909c00fc333ee48a';
+const INTENDANT_APP_BUILD = '271f9b1422ecf205';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -45808,14 +45961,31 @@ function isSessionWindowSteerActive(sessionId) {
 // truthful even when it is not the prompt target (the global banner stays
 // gated on the target in the set_phase command). A server phase is
 // authoritative — it also retires the optimistic-active guard.
+//
+// The session id must go through the identity translation: external
+// sessions re-key their window to the backend-native id while server
+// status events keep riding the wrapper/log id. A direct lookup missed
+// the re-keyed window, so its phase stayed optimistic forever — which is
+// what parked the composer in follow-up mode ("steering doesn't work")
+// via the optimistic-expired steer gate.
 function applyServerPhaseToSessionWindow(sessionId, phase) {
   const sid = String(sessionId || '').trim();
   if (!sid || !phase) return;
-  const win = sessionWindows.get(sid);
+  const targetSid = (typeof sessionWindowTargetForLogSession === 'function'
+    && sessionWindowTargetForLogSession(sid)) || sid;
+  const win = sessionWindows.get(targetSid);
   if (!win) return;
   win.optimisticActiveExpired = false;
   if (!isAgentActivePhase(normalizeSessionPhase(phase))) win.pendingActiveUntil = 0;
-  updateSessionWindow(sid, { phase });
+  // A pending follow-up row's message became this turn's input the moment
+  // the session went active — retire it as delivered. (The daemon lane's
+  // task-envelope channel drops follow_up ids, so no FollowUpStatus echo
+  // will ever come for these; without this the row sat at ⏳ forever.)
+  if (isAgentActivePhase(normalizeSessionPhase(phase))
+      && typeof retirePendingFollowUpRowsForSession === 'function') {
+    retirePendingFollowUpRowsForSession(targetSid, sid);
+  }
+  updateSessionWindow(targetSid, { phase });
 }
 
 /* ── static/app/39-session-windows.js ── */
@@ -46649,30 +46819,61 @@ function formatLimitReset(resetsAtEpoch) {
 }
 
 // The gauge shows the most-used window; the tooltip lists them all.
+// A window may arrive WITHOUT a percentage (Claude Code 2.1.2xx reports
+// status/reset only) — it still renders, as "label ok · ↻reset", with
+// severity derived from the provider status instead of the number.
+function limitStatusSeverity(status) {
+  const s = String(status || '').trim().toLowerCase();
+  if (!s || s === 'allowed') return '';
+  if (s === 'allowed_warning') return 'warn';
+  return 'crit'; // rejected / limited / queueing / anything non-allowed
+}
+
 function sessionVitalsLimitsSegment(limits) {
   if (!Array.isArray(limits) || !limits.length) return null;
   const windows = limits
-    .map((w) => ({
-      label: String(w?.label || '').trim() || 'window',
-      usedPct: Math.max(0, Math.min(100, Number(w?.usedPct) || 0)),
-      resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
-    }));
-  const top = windows.reduce((a, b) => (b.usedPct > a.usedPct ? b : a));
-  let text = `▮${top.usedPct}% ${top.label}`;
-  let cls = 'vit-limits';
-  let severity = '';
-  if (top.usedPct >= 90) {
-    severity = 'crit';
-    cls += ' limits-crit';
-    const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+    .map((w) => {
+      const rawPct = Number(w?.usedPct);
+      return {
+        label: String(w?.label || '').trim() || 'window',
+        usedPct: Number.isFinite(rawPct) && w?.usedPct !== null && w?.usedPct !== undefined
+          ? Math.max(0, Math.min(100, rawPct))
+          : null,
+        resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
+        status: String(w?.status || '').trim(),
+      };
+    });
+  const top = windows.reduce((a, b) => ((b.usedPct ?? -1) > (a.usedPct ?? -1) ? b : a));
+  const statusSeverity = windows
+    .map((w) => limitStatusSeverity(w.status))
+    .reduce((a, b) => (b === 'crit' || (b === 'warn' && a !== 'crit') ? b : a), '');
+  let severity = statusSeverity;
+  let text;
+  if (top.usedPct !== null) {
+    text = `▮${top.usedPct}% ${top.label}`;
+    if (top.usedPct >= 90) severity = 'crit';
+    else if (top.usedPct >= 70 && severity !== 'crit') severity = 'warn';
+  } else {
+    const worst = windows.find((w) => limitStatusSeverity(w.status) === statusSeverity) || top;
+    const state = statusSeverity === 'crit' ? 'limited' : statusSeverity === 'warn' ? 'high' : 'ok';
+    text = `${worst.label} ${state}`;
+    const reset = worst.resetsAtEpoch ? formatLimitReset(worst.resetsAtEpoch) : '';
     if (reset) text += ` ↻${reset}`;
-  } else if (top.usedPct >= 70) {
-    severity = 'warn';
+  }
+  let cls = 'vit-limits';
+  if (severity === 'crit') {
+    cls += ' limits-crit';
+    if (top.usedPct !== null) {
+      const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
+      if (reset) text += ` ↻${reset}`;
+    }
+  } else if (severity === 'warn') {
     cls += ' limits-warn';
   }
   const titleLines = windows.map((w) => {
     const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
-    return `Rate limit ${w.label}: ${w.usedPct}% used${reset}`;
+    const used = w.usedPct !== null ? `${w.usedPct}% used` : (w.status || 'ok');
+    return `Rate limit ${w.label}: ${used}${reset}`;
   });
   return { text, titleLines, cls, severity };
 }
@@ -47485,14 +47686,16 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'agent_started') {
     content = String(entry.commands_preview || entry.commandsPreview || '').trim();
     if (!content) return null;
-    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind };
+    // kind tool_call = command announcement (parity with the live WASM
+    // path) — keeps replayed calls out of isCommandOutputLog's grouping.
+    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind: kind || 'tool_call' };
   }
   if (event === 'agent_output') {
     const stdout = String(entry.stdout || '').trim();
     const stderr = String(entry.stderr || '').trim();
     content = stdout || stderr;
     if (!content) return null;
-    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '' };
+    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '', item_id: entry.item_id || entry.itemId || '' };
   }
   if (event === 'presence_log') {
     if (!content) return null;
@@ -47553,6 +47756,13 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
     .map(entry => sessionWindowRecordFromReplayEntry(entry, fallbackSessionId))
     .filter(Boolean);
   if (!records.length) return 0;
+  // The emptiness the caller checked can be stale by now: the fetch
+  // awaited while the live replay/stream filled the window. Resetting
+  // here wiped the streamed rows and re-rendered the fetched copy NEXT
+  // TO their clones — merge into the streamed timeline instead.
+  if (sessionWindowHasStreamedHistory(win)) {
+    return appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId);
+  }
   resetSessionWindowLog(win);
   appendSessionWindowHistoryBatch(win, records, true);
   return records.length;
@@ -47651,7 +47861,10 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.eventId) signatures.push(['event', parts.sessionId, parts.eventId].join('\u001f'));
   if (parts.commandItemId) signatures.push(['command-item', parts.sessionId, parts.commandItemId].join('\u001f'));
-  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
+  // kind joins the item identity: a tool CALL row and its OUTPUT rows now
+  // share the tool_use id (output attribution), and an id-only signature
+  // would dedupe one against the other.
+  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.kind, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
   if (parts.turnId && parts.itemType && parts.itemId) {
     signatures.push(['thread-item', parts.sessionId, parts.turnId, parts.itemType, parts.itemId].join('\u001f'));
@@ -47814,10 +48027,14 @@ function sessionWindowTranscriptTimestampMs(value) {
   }
   const direct = Date.parse(raw);
   if (Number.isFinite(direct)) return direct;
-  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  // Fractional seconds ride the session log's HH:MM:SS.mmm stamps — an
+  // unmatched fraction made every replayed row timestamp-less, which
+  // broke ordered merges (hydration landed as a tail block).
+  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/);
   if (match) {
     const date = new Date();
-    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), 0);
+    const fraction = match[4] ? Number(('0.' + match[4])) * 1000 : 0;
+    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), Math.round(fraction));
     return date.getTime();
   }
   match = raw.match(/^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
@@ -49954,11 +50171,13 @@ function buildSessionWindowCommandOutputEntry(c) {
   wrap.appendChild(body);
   const stats = commandOutputRecordStats(c, content);
   const canFetchFull = commandOutputRecordHasFullFetch(c);
+  const itemId = String(c?.item_id || c?.itemId || '').trim();
   summary.innerHTML = commandOutputSummaryHtml({
     chunks: 1,
     lines: stats.lines,
     bytes: stats.bytes,
     warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
+    commandPreview: itemId ? (commandPreviewsByItemId.get(itemId) || '') : '',
   });
   if (content && !canFetchFull) {
     setDeferredCommandOutputText(entry, body, content, stats);
@@ -52568,6 +52787,12 @@ function inferSessionPhaseFromLog(c) {
   }
   if (phase) {
     updateSessionWindow(sid, { phase });
+    // First live activity for the session = its queued follow-up became
+    // the running turn's input (see retirePendingFollowUpRowsForSession).
+    if ((phase === 'thinking' || phase === 'running') && !processingLogReplay
+        && typeof retirePendingFollowUpRowsForSession === 'function') {
+      retirePendingFollowUpRowsForSession(sid, String(c.session_id || ''));
+    }
     if (
       (phase === 'idle' || phase === 'done' || phase === 'interrupted') &&
       (
@@ -52881,6 +53106,9 @@ function formatCompactBytes(bytes) {
 
 function isCommandOutputLog(c) {
   if (!c) return false;
+  // Tool-call announcements are command ROWS, not command output — the
+  // level-'agent' fallback below used to swallow them into groups.
+  if (c.kind === 'tool_call') return false;
   if (
     c.kind === 'agent_output' ||
     c.kind === 'command_execution' ||
@@ -53029,7 +53257,28 @@ function formatLogTimestampTitle(value, rawValue = '') {
   return raw;
 }
 
+// Tool-call previews by item id, captured from agent_started-shaped
+// entries so output groups can name the command that produced them.
+// Bounded: insertion-ordered Map, oldest evicted past the cap.
+const commandPreviewsByItemId = new Map();
+const COMMAND_PREVIEW_CAP = 2000;
+function recordCommandPreviewFromLog(c) {
+  const itemId = String(c?.item_id || c?.itemId || '').trim();
+  if (!itemId) return;
+  const kind = String(c?.kind || '').trim();
+  if (kind === 'agent_output') return;
+  if (String(c?.level || '') !== 'agent') return;
+  const preview = String(c?.content || '').trim();
+  if (!preview) return;
+  commandPreviewsByItemId.delete(itemId);
+  commandPreviewsByItemId.set(itemId, preview.slice(0, 160));
+  while (commandPreviewsByItemId.size > COMMAND_PREVIEW_CAP) {
+    commandPreviewsByItemId.delete(commandPreviewsByItemId.keys().next().value);
+  }
+}
+
 function createLogScaffold(c, extraClass) {
+  recordCommandPreviewFromLog(c);
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
   entry.dataset.level = c.level;
@@ -53223,12 +53472,18 @@ function commandOutputGroupKey(c) {
 
 function commandOutputSummaryHtml(group) {
   const parts = [];
-  if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.lines > 0) parts.push(group.lines + ' line' + (group.lines === 1 ? '' : 's'));
+  else if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.bytes > 0) parts.push(formatCompactBytes(group.bytes));
   if (group.warns > 0) parts.push(`<span class="output-warn">${group.warns} warning${group.warns === 1 ? '' : 's'}</span>`);
   const detail = parts.length ? parts.join(' · ') : 'ready';
-  return `<span class="status-dot"></span><span>output · ${detail}</span>`;
+  // Name the group by the command that produced it (the agent_started
+  // preview for the same tool call) — "output · 6 chunks" said nothing
+  // about WHOSE output it was once consecutive tools coalesced.
+  const label = group.commandPreview
+    ? `<span class="output-command">${escapeHtml(group.commandPreview)}</span>`
+    : '<span>output</span>';
+  return `<span class="status-dot"></span>${label}<span class="output-detail"> · ${detail}</span>`;
 }
 
 function updateCommandOutputSummary(group) {
@@ -53403,6 +53658,10 @@ function renderCommandOutputEntry(c) {
     const copyRef = setLogEntryCopyText(entry, '');
     appendCopyLogEntryButton(entry);
 
+    const itemId = String(
+      c.command_item_id || c.commandItemId || c.command_execution?.id ||
+      c.commandExecution?.id || c.item_id || c.itemId || ''
+    ).trim();
     const group = {
       id: groupId,
       key: groupKey,
@@ -53420,6 +53679,8 @@ function renderCommandOutputEntry(c) {
       loading: false,
       clones: [],
       copyRef,
+      commandPreview: itemId ? (commandPreviewsByItemId.get(itemId) || '') : '',
+      userExpanded: false,
     };
     commandOutputGroupByEntry.set(entry, group);
     entry.addEventListener('click', () => toggleCommandOutputGroup(group));
@@ -53438,12 +53699,26 @@ function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
   group.entry.classList.add('finalized');
-  group.entry.classList.remove('expanded');
-  group.body.innerHTML = '';
-  group.loaded = false;
-  group.loading = false;
+  // A group the USER opened stays open with its streamed body — yanking
+  // the output shut mid-read because the command happened to finish was
+  // the "collapsible doesn't work" experience. Auto-expanded (streaming)
+  // groups still fold to their summary line.
+  if (group.userExpanded && group.entry.classList.contains('expanded')) {
+    group.loaded = true;
+    group.loading = false;
+  } else {
+    group.entry.classList.remove('expanded');
+    group.body.innerHTML = '';
+    group.loaded = false;
+    group.loading = false;
+  }
   for (const view of commandOutputCloneViews(group)) {
     view.entry.classList.add('finalized');
+    if (view.entry.classList.contains('expanded') && group.userExpanded) {
+      view.loaded = true;
+      view.loading = false;
+      continue;
+    }
     view.entry.classList.remove('expanded');
     view.body.innerHTML = '';
     view.loaded = false;
@@ -53485,9 +53760,22 @@ async function loadCommandOutputIntoBody(group, body) {
 }
 
 async function toggleCommandOutputView(group, view) {
-  if (!group.finalized || !view?.entry || !view?.body) return;
+  if (!view?.entry || !view?.body) return;
   const expanding = !view.entry.classList.contains('expanded');
+  // The user's explicit intent survives finalization: a group opened by
+  // hand stays open when the command completes; one closed by hand stays
+  // closed while streaming.
+  group.userExpanded = expanding;
   view.entry.classList.toggle('expanded', expanding);
+  if (!group.finalized) {
+    // Live group: the main body streams in place (CSS hides it while
+    // collapsed). A clone view expanded mid-stream backfills what it
+    // missed — chunk appends only reach expanded clones.
+    if (expanding && view !== group && !view.body.childElementCount) {
+      view.body.innerHTML = group.body.innerHTML;
+    }
+    return;
+  }
   if (!expanding) {
     view.body.innerHTML = '';
     view.loaded = false;
@@ -54055,10 +54343,16 @@ function setContextUsagePct(pct) {
     return;
   }
   const value = Number(pct);
-  fill.style.width = Math.min(value, 100) + '%';
-  const color = value < 50 ? 'var(--green)' : value < 85 ? 'var(--yellow)' : 'var(--red)';
+  // The label clamps like the fill: a stale context window can briefly
+  // over-report (backends now clamp too, but replayed older sessions
+  // still carry raw values) and "142.3%" is a lie either way — the
+  // tooltip keeps the raw figure for the curious.
+  const shown = Math.min(value, 100);
+  fill.style.width = shown + '%';
+  const color = shown < 50 ? 'var(--green)' : shown < 85 ? 'var(--yellow)' : 'var(--red)';
   fill.style.background = color;
-  label.textContent = value.toFixed(1) + '%';
+  label.textContent = shown.toFixed(1) + '%';
+  label.title = value > 100 ? `raw reading ${value.toFixed(1)}% — context window estimate stale` : '';
   label.style.color = color;
 }
 
@@ -84961,6 +85255,26 @@ function forgetPendingFollowUp(id) {
   if (key) pendingFollowUpsById.delete(key);
 }
 
+// The strip's follow-up rows ('follow-…' keys) deliver silently in the
+// daemon lane (the task-envelope channel drops follow_up ids, so no
+// FollowUpStatus echo comes back). The turn STARTING for their session is
+// the delivery signal: retire pending rows then instead of leaving ⏳
+// rows behind. Steer rows ('steer-…') keep their explicit lifecycle.
+function retirePendingFollowUpRowsForSession(sessionId, aliasSessionId = '') {
+  const sids = new Set([String(sessionId || '').trim(), String(aliasSessionId || '').trim()]);
+  sids.delete('');
+  if (!sids.size) return;
+  for (const [key, entry] of steerRows) {
+    if (!key.startsWith('follow-')) continue;
+    const rowSid = String(entry?.sessionId || '').trim();
+    if (rowSid && !sids.has(rowSid)) continue;
+    const isPending = entry?.el?.classList.contains('pending') || entry?.el?.classList.contains('queued');
+    if (!isPending) continue;
+    forgetPendingFollowUp(key);
+    onSteerStatusUpdate(key, entry?.text || '', 'delivered', null, { sessionId: rowSid });
+  }
+}
+
 function removeSteerRowSoon(id, delayMs = 1400) {
   const key = String(id || '').trim();
   if (!key) return;
@@ -85224,13 +85538,35 @@ function cancelSteerRow(id) {
   if (!key) return;
   const entry = steerRows.get(key);
   const sessionId = String(entry?.sessionId || resolvePromptTargetSessionId() || '').trim();
-  const text = entry?.text || '';
   const isSteer = key.startsWith('steer-');
   if (isSteer && app) {
+    // No optimistic "cancelled": the backend may find nothing left to
+    // clear (already delivered / converted to a follow-up) and answers
+    // with steer_cancelled OR steer_cancel_failed — the row shows
+    // whichever actually happened. Until then it reads as clearing.
     const msg = { action: 'cancel_steer', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
     dispatchSessionControlMsg(msg);
-  } else if (app) {
+    const el = entry?.el;
+    const cancelBtn = el?.querySelector('.steer-cancel');
+    if (cancelBtn) cancelBtn.disabled = true;
+    const reasonNode = el?.querySelector('.steer-reason');
+    if (reasonNode) reasonNode.textContent = '— clearing…';
+    // Echo watchdog: if neither verdict arrives (daemon gone), re-enable
+    // the button instead of wedging the row.
+    setTimeout(() => {
+      const row = steerRows.get(key);
+      const btn = row?.el?.querySelector('.steer-cancel');
+      if (btn && btn.disabled) {
+        btn.disabled = false;
+        const rn = row.el.querySelector('.steer-reason');
+        if (rn && rn.textContent === '— clearing…') rn.textContent = '— no reply; try again';
+      }
+    }, 6000);
+    return;
+  }
+  const text = entry?.text || '';
+  if (app) {
     const msg = { action: 'cancel_follow_up', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
     dispatchSessionControlMsg(msg);
@@ -85290,8 +85626,10 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   // Clear any in-flight fade timer — a fresh status update preempts it.
   if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
 
-  if (status === 'delivered' || status === 'cancelled') {
-    // Brief visual confirmation, then remove the row.
+  if (status === 'delivered' || status === 'cancelled' || status === 'failed') {
+    // Brief visual confirmation, then remove the row. Failures linger
+    // longer — "couldn't clear: already delivered" is information the
+    // user needs a beat to read.
     entry.timeout = setTimeout(() => {
       el.classList.add('fading');
       entry.timeout = setTimeout(() => {
@@ -85300,7 +85638,7 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
         if (strip.childElementCount === 0) strip.classList.add('empty');
         stationScheduleUpdate();
       }, 220);
-    }, 1200);
+    }, status === 'failed' ? 6000 : 1200);
   }
 }
 
@@ -98078,8 +98416,13 @@ function updateStopButtonVisibility(phase) {
   if (!btn) return;
   const key = phaseKey(phase);
   const targetSessionId = resolvePromptTargetSessionId();
+  // Trust the phase the user is LOOKING at: the per-window activity flag
+  // can lag the banner (identity re-keying, optimistic-expiry) and hid
+  // Stop during live turns — an unusable interrupt affordance mid-turn is
+  // the worst failure mode this button has.
   const show = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId) && sessionSupportsInterrupt(targetSessionId)
+    ? sessionSupportsInterrupt(targetSessionId)
+      && (isSessionWindowEffectivelyActive(targetSessionId) || isAgentActivePhase(key))
     : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.
