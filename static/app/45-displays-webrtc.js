@@ -212,6 +212,8 @@ class DisplaySlot {
     this.recordingStreamName = null;
     this._recordingPendingAction = null;
     this._recordingPendingTimer = null;
+    this._recordingStartedAt = null;  // client clock at server-confirmed start
+    this._recordingTimerId = null;    // 1 Hz elapsed-label ticker while recording
     this._recordingDeletePending = false;
     this._recordingDeleteStream = null;
     this._recordingDeleteTimer = null;
@@ -326,6 +328,20 @@ class DisplaySlot {
     this.controlBannerEl.className = 'display-control-banner';
     this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
     this.canvasEl.appendChild(this.controlBannerEl);
+    // Host identity chip (bottom-right stage chrome): "{host} · {display}"
+    // with the gradient identity square. Text is kept fresh by the live
+    // workspace projection (selfHostLabel arrives async via the agent
+    // card); hidden in thumb/fullscreen contexts by ui2-live.css.
+    this.hostChipEl = document.createElement('div');
+    this.hostChipEl.className = 'cu-host-chip';
+    this.hostChipEl.setAttribute('aria-hidden', 'true');
+    const hostMark = document.createElement('span');
+    hostMark.className = 'cu-host-chip-mark';
+    const hostText = document.createElement('span');
+    hostText.className = 'cu-host-chip-text';
+    this.hostChipEl.appendChild(hostMark);
+    this.hostChipEl.appendChild(hostText);
+    this.canvasEl.appendChild(this.hostChipEl);
     const rerenderSharedFocus = () => {
       if (!sharedViewState.visible) return;
       if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
@@ -1331,6 +1347,31 @@ class DisplaySlot {
     if (render) this._renderRecordingControls();
   }
 
+  // mm:ss since the server-confirmed recording start (applyRecordingState
+  // stamps `_recordingStartedAt` on the false→true confirmation).
+  _recordingElapsedLabel() {
+    const base = this._recordingStartedAt || Date.now();
+    const sec = Math.max(0, Math.floor((Date.now() - base) / 1000));
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  // Single writer for the 1 Hz elapsed ticker: runs exactly while the
+  // confirmed state is "recording" with no pending command. Idempotent —
+  // called from the render path so every state transition self-heals.
+  _syncRecordingTimer() {
+    const want = this.recording && !this._recordingPendingAction;
+    if (want && !this._recordingTimerId) {
+      this._recordingTimerId = window.setInterval(() => {
+        this._renderRecordingControls();
+      }, 1000);
+    } else if (!want && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
+  }
+
   _renderRecordingControls() {
     const action = this._recordingPendingAction;
     const deleting = this._recordingDeletePending;
@@ -1338,13 +1379,14 @@ class DisplaySlot {
     this.recordBtn.setAttribute('aria-busy', action ? 'true' : 'false');
     this.recordBtn.innerHTML = action
       ? (action === 'stop_recording' ? 'Stopping…' : 'Starting…')
-      : (this.recording ? '&#x23F9; Stop' : '&#x23FA; Record');
+      : (this.recording ? '&#x23F9; ' + this._recordingElapsedLabel() : '&#x23FA; Record');
     this.recordBtn.classList.toggle('active', this.recording);
     this.recordBtn.setAttribute('aria-pressed', this.recording ? 'true' : 'false');
     this.deleteRecBtn.disabled = Boolean(deleting || action);
     this.deleteRecBtn.setAttribute('aria-busy', deleting ? 'true' : 'false');
     this.deleteRecBtn.textContent = deleting ? 'Deleting…' : 'Delete';
     this.deleteRecBtn.style.display = this.recording || !this.recordingStreamName ? 'none' : '';
+    this._syncRecordingTimer();
   }
 
   applyRecordingState(recording, streamName, deleted = false) {
@@ -1370,7 +1412,13 @@ class DisplaySlot {
         this._recordingDeleteStream === streamName) {
       this._clearRecordingDeletePending(false);
     }
+    const wasRecording = this.recording;
     this.recording = Boolean(recording);
+    // Elapsed base = this confirmation's arrival (a bootstrap replay of an
+    // older recording restarts the visible counter — a known, honest
+    // limitation: the daemon does not publish the start timestamp).
+    if (this.recording && !wasRecording) this._recordingStartedAt = Date.now();
+    if (!this.recording) this._recordingStartedAt = null;
     this.recordingStreamName = deleted ? null : (streamName || this.recordingStreamName);
     this._renderRecordingControls();
     return true;
@@ -1445,6 +1493,13 @@ class DisplaySlot {
     this._setStageOverlay(null);
     this._clearRecordingPending();
     this._clearRecordingDeletePending();
+    // Transient disconnects keep the elapsed ticker (the server-side
+    // recording continues); a user close removes the slot, so the ticker
+    // must die with it.
+    if (userInitiated && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
     this.stopStreaming();
     // Flip `connected` BEFORE `_exitInteractive` so its status-text
     // ternary writes 'Disconnected' (not the stale 'Connected (view-
@@ -2012,9 +2067,12 @@ function applyDisplayStripState() {
 // The standalone CU concept is the presentation target; the production
 // displaySlots map remains the source of truth. This projection adds one
 // selected local stage, selected-slot authority controls, responsive rail
-// access, and a small feed of REAL browser-observed display lifecycle
-// changes. It never invents agent clicks, typed text, holder identities, or
-// display-scoped approvals: those do not exist in the current wire contract.
+// access, and a per-display feed of REAL events: browser-observed display
+// lifecycle changes plus daemon-reported CU actions (the `cu_action` wire
+// lane, appended via window.noteCuDisplayActivity from 45b-cu-overlays.js).
+// It still never invents holder identities, and display-scoped approval
+// attribution only renders when the daemon reported which session drives
+// the display (45b's attribution map from cu_action events).
 //
 // Key safety rule: a hidden interactive slot would keep its document-level
 // paste handler. Selecting another display therefore releases the old slot
@@ -2350,6 +2408,7 @@ function applyDisplayStripState() {
         '<span class="ui2-live-state-pill"></span>' +
       '</div>' +
       '<div class="ui2-live-auth-row">' +
+        '<span class="ui2-live-auth-avatar" aria-hidden="true"></span>' +
         '<span class="ui2-live-auth-name"></span>' +
       '</div>' +
       '<button class="ui2-live-card-btn" type="button"></button>' +
@@ -2358,6 +2417,7 @@ function applyDisplayStripState() {
   const authorityTitle = authorityCard.querySelector('.ui2-live-card-title');
   const authoritySub = authorityCard.querySelector('.ui2-live-card-sub');
   const authorityPill = authorityCard.querySelector('.ui2-live-state-pill');
+  const authorityAvatar = authorityCard.querySelector('.ui2-live-auth-avatar');
   const authorityName = authorityCard.querySelector('.ui2-live-auth-name');
   const authorityButton = authorityCard.querySelector('.ui2-live-card-btn');
   authorityButton.addEventListener('click', () => {
@@ -2398,12 +2458,18 @@ function applyDisplayStripState() {
       authorityTitle.textContent = 'No live display';
       authoritySub.textContent = 'Choose or share a display to see and control it here.';
       authorityPill.textContent = 'offline';
+      authorityAvatar.hidden = true;
       authorityName.textContent = 'Input is scoped to one display at a time.';
       authorityButton.hidden = true;
       return;
     }
 
     const state = slot.authorityState || 'unknown';
+    // Holder avatar: YOU when this dashboard holds input; another viewer's
+    // identity is deliberately not on the wire, so "other" stays abstract;
+    // agent-side / unclaimed / connecting reads AI.
+    authorityAvatar.hidden = false;
+    authorityAvatar.textContent = state === 'you' ? 'YOU' : state === 'other' ? '···' : 'AI';
     const pending = Boolean(slot._takeControlPending);
     authorityName.textContent = slotLabel(slot);
     authorityButton.hidden = false;
@@ -2480,20 +2546,44 @@ function applyDisplayStripState() {
     };
   }
 
-  function addDisplayActivity(displayId, kind, textValue) {
+  // Per-display feed cap. Raised from 10 for the action stream — lifecycle
+  // events alone rarely pass 10, but real CU action traffic does.
+  const ACTIVITY_MAX_ENTRIES = 50;
+
+  function addDisplayActivity(displayId, kind, textValue, extra) {
     const id = Number(displayId);
     const entries = activityByDisplay.get(id) || [];
     const last = entries[entries.length - 1];
-    if (last && last.kind === kind && last.text === textValue) return;
+    // Consecutive-duplicate guard is for lifecycle transitions only: two
+    // identical CU actions in a row (extra.action) are distinct real events
+    // and must both append.
+    if (!extra && last && last.kind === kind && last.text === textValue) return;
     entries.push({
       seq: ++activitySeq,
       kind,
       text: textValue,
       at: new Date(),
+      raw: extra && extra.raw ? String(extra.raw) : '',
+      action: Boolean(extra && extra.action),
     });
-    if (entries.length > 10) entries.splice(0, entries.length - 10);
+    if (entries.length > ACTIVITY_MAX_ENTRIES) {
+      entries.splice(0, entries.length - ACTIVITY_MAX_ENTRIES);
+    }
     activityByDisplay.set(id, entries);
   }
+
+  // Entry point for the CU action-visualization layer (45b-cu-overlays.js):
+  // appends a daemon-reported action to this display's feed using the
+  // concept's two-line grammar (friendly sentence + raw mono call).
+  window.noteCuDisplayActivity = function(displayId, kind, friendly, raw) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, kind, String(friendly || ''), {
+      raw: String(raw || ''),
+      action: true,
+    });
+    scheduleWorkspace();
+  };
 
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
@@ -2586,28 +2676,66 @@ function applyDisplayStripState() {
       row.remove();
       activityRows.delete(seq);
     }
+    // Auto-follow policy (same as the main log): stick to the bottom only
+    // when the user is already reading the bottom. Measure BEFORE appends;
+    // a fresh fill (display switch) always lands on the latest entries.
+    const freshFill = activityRows.size === 0;
+    const nearBottom = freshFill ||
+      (activityList.scrollHeight - activityList.scrollTop - activityList.clientHeight) <= 30;
+    let appended = false;
     // role=log expects chronological DOM order so only the newly appended
     // row is announced. Rebuilding newest-first made every state change
     // sound like ten new events to screen readers.
     for (const entry of entries) {
       if (activityRows.has(entry.seq)) continue;
       const row = document.createElement('div');
-      row.className = 'ui2-live-activity-row kind-' + entry.kind;
       const dot = document.createElement('span');
       dot.className = 'ui2-live-activity-dot';
       dot.setAttribute('aria-hidden', 'true');
-      const textEl = document.createElement('span');
-      textEl.className = 'ui2-live-activity-text';
-      textEl.textContent = entry.text;
       const time = document.createElement('time');
       time.className = 'ui2-live-activity-time';
       time.dateTime = entry.at.toISOString();
-      time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      row.appendChild(dot);
-      row.appendChild(textEl);
-      row.appendChild(time);
+      if (entry.action) {
+        // Daemon-reported CU action: the concept's two-line grammar —
+        // friendly sentence + seconds-precision ts, raw mono call below.
+        row.className = 'ui2-live-activity-row cu-action-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], {
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+        });
+        const main = document.createElement('div');
+        main.className = 'cu-action-main';
+        const head = document.createElement('div');
+        head.className = 'cu-action-head';
+        const friendly = document.createElement('span');
+        friendly.className = 'cu-action-friendly';
+        friendly.textContent = entry.text;
+        head.appendChild(friendly);
+        head.appendChild(time);
+        main.appendChild(head);
+        if (entry.raw) {
+          const raw = document.createElement('div');
+          raw.className = 'cu-action-raw';
+          raw.textContent = entry.raw;
+          main.appendChild(raw);
+        }
+        row.appendChild(dot);
+        row.appendChild(main);
+      } else {
+        row.className = 'ui2-live-activity-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const textEl = document.createElement('span');
+        textEl.className = 'ui2-live-activity-text';
+        textEl.textContent = entry.text;
+        row.appendChild(dot);
+        row.appendChild(textEl);
+        row.appendChild(time);
+      }
       activityList.appendChild(row);
       activityRows.set(entry.seq, row);
+      appended = true;
+    }
+    if (appended && nearBottom) {
+      activityList.scrollTop = activityList.scrollHeight;
     }
   }
 
@@ -2897,12 +3025,26 @@ function applyDisplayStripState() {
     drawerMedia.addListener(onDrawerMediaChange);
   }
 
+  // Host identity chip text: "{host} · {display label}". The host label is
+  // the daemon's agent-card display name (status bar's source of truth),
+  // which arrives asynchronously — re-projected on every render.
+  function syncHostChips(slots) {
+    const host = (typeof selfHostLabel === 'string' && selfHostLabel) ? selfHostLabel : 'local';
+    for (const slot of slots) {
+      const textEl = slot.hostChipEl && slot.hostChipEl.querySelector('.cu-host-chip-text');
+      if (!textEl) continue;
+      const label = host + ' · ' + slotLabel(slot);
+      if (textEl.textContent !== label) textEl.textContent = label;
+    }
+  }
+
   function renderWorkspace() {
     railRaf = 0;
     const slots = Array.from(displaySlots.values());
     reconcileSelectedDisplay(slots);
     for (const slot of slots) captureSlotActivity(slot);
     syncDisplayRows(slots);
+    syncHostChips(slots);
     syncAuthorityCard();
     syncActivityList();
     syncPeerRows();

@@ -72,6 +72,9 @@ ui2-activity.js
 # objects read its top-level consts at class-evaluation time.
 45-display-viewer-core.js
 45-displays-webrtc.js
+# 45b-cu-overlays.js must stay AFTER 45-displays-webrtc.js: it wraps the
+# live workspace's retire hook and calls its noteCuDisplayActivity export.
+45b-cu-overlays.js
 46-recording-replay.js
 47-annotation-clips.js
 48-router-settings.js

@@ -474,6 +474,31 @@ pub enum AppEvent {
         display_id: u32,
         backend: &'static str,
     },
+    /// One successfully executed computer-use action on a display —
+    /// emitted by [`crate::computer_use::CuActionObserver`] for the
+    /// dashboard's live action overlays and per-display feed. EPHEMERAL by
+    /// design: broadcast-lane only, never session-logged, never replayed
+    /// (the Activity log carries the durable CU trace).
+    CuActionExecuted {
+        /// Unique id (`cu-<ts>-<seq>`) — the browser's dual-lane dedupe key.
+        event_id: String,
+        session_id: Option<String>,
+        display_id: u32,
+        /// Action vocabulary: `left_click`, `type`, `screenshot`, … — see
+        /// `computer_use::cu_action_kind`.
+        kind: String,
+        /// Action point in display pixel space, when the action has one.
+        x: Option<i32>,
+        y: Option<i32>,
+        /// Resolution the coordinates are relative to (0 = unknown; viewers
+        /// fall back to the stream's intrinsic dimensions).
+        ref_w: u32,
+        ref_h: u32,
+        /// Short raw call string for the feed (`left_click(612, 233)`).
+        raw: String,
+        /// Unix milliseconds at execution.
+        ts: u64,
+    },
     /// Agent-requested visual collaboration state for the dashboard.
     ///
     /// This is intentionally presentation-level: it does not grant input
@@ -2407,6 +2432,29 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             display_id: *display_id,
             width: *width,
             height: *height,
+        }),
+        AppEvent::CuActionExecuted {
+            event_id,
+            session_id,
+            display_id,
+            kind,
+            x,
+            y,
+            ref_w,
+            ref_h,
+            raw,
+            ts,
+        } => Some(OutboundEvent::CuAction {
+            event_id: event_id.clone(),
+            session_id: session_id.clone(),
+            display_id: *display_id,
+            kind: kind.clone(),
+            x: *x,
+            y: *y,
+            ref_w: *ref_w,
+            ref_h: *ref_h,
+            raw: raw.clone(),
+            ts: *ts,
         }),
         AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
             display_id: *display_id,
@@ -5291,6 +5339,66 @@ mod tests {
     #[test]
     fn outbound_skips_tick() {
         assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
+    }
+
+    fn sample_cu_action_event() -> AppEvent {
+        AppEvent::CuActionExecuted {
+            event_id: "cu-1700000000000-7".to_string(),
+            session_id: Some("sess-1".to_string()),
+            display_id: 99,
+            kind: "left_click".to_string(),
+            x: Some(612),
+            y: Some(233),
+            ref_w: 1280,
+            ref_h: 800,
+            raw: "left_click(612, 233)".to_string(),
+            ts: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn outbound_cu_action_pins_the_wire_shape() {
+        let outbound = app_event_to_outbound(&sample_cu_action_event()).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"cu_action\""), "{json}");
+        assert!(json.contains("\"event_id\":\"cu-1700000000000-7\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
+        assert!(json.contains("\"display_id\":99"));
+        assert!(json.contains("\"kind\":\"left_click\""));
+        assert!(json.contains("\"x\":612"));
+        assert!(json.contains("\"y\":233"));
+        assert!(json.contains("\"ref_w\":1280"));
+        assert!(json.contains("\"ref_h\":800"));
+        assert!(json.contains("\"raw\":\"left_click(612, 233)\""));
+        assert!(json.contains("\"ts\":1700000000000"));
+    }
+
+    #[test]
+    fn outbound_cu_action_omits_absent_point_and_session() {
+        let event = AppEvent::CuActionExecuted {
+            event_id: "cu-1-1".to_string(),
+            session_id: None,
+            display_id: 0,
+            kind: "type".to_string(),
+            x: None,
+            y: None,
+            ref_w: 0,
+            ref_h: 0,
+            raw: "type(\"hi\")".to_string(),
+            ts: 1,
+        };
+        let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
+        assert!(!json.contains("\"session_id\""), "{json}");
+        assert!(!json.contains("\"x\""), "{json}");
+        assert!(!json.contains("\"y\""), "{json}");
+    }
+
+    #[test]
+    fn cu_action_events_never_reach_the_session_log() {
+        // The action-visualization lane is deliberately ephemeral: it rides
+        // the broadcast ring only. A cu_action in session.jsonl (and hence
+        // in log_replay) would violate the no-replay contract.
+        assert!(!app_event_writes_to_session_log(&sample_cu_action_event()));
     }
 
     #[test]

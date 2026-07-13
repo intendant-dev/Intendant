@@ -439,6 +439,216 @@ pub fn normalized_to_pixels(
     (px, py)
 }
 
+// ── Action visualization events ──────────────────────────────────────────────
+//
+// The dashboard's Live tab renders what the agent DOES on a display — cursor,
+// click ripples, keypress chips, the per-display action feed — from a live,
+// display-scoped event per executed action. These events are deliberately
+// EPHEMERAL presentation data: they ride the bounded broadcast ring to the
+// web gateway / dashboard-control lanes only, are never written to the
+// session log, and have no replay (the Activity log already carries the
+// durable CU trace). Coordinates are in the same pixel space the action was
+// executed against; `ref_w`/`ref_h` carry that space's reference resolution
+// so viewers can normalize against their letterboxed video frame.
+
+/// Interval floor between emitted `move` events (`MoveMouse`); clicks, keys,
+/// and every other kind always emit. 10 Hz keeps a move-heavy batch from
+/// flooding the broadcast ring while still animating the dashboard cursor.
+const CU_MOVE_EVENT_MIN_INTERVAL_MS: u64 = 100;
+
+/// Cap on text embedded in a raw call string (`type("…")`). The same text
+/// already reaches the Activity log in full, so this is presentation-side
+/// truncation, not redaction.
+const CU_RAW_TEXT_MAX_CHARS: usize = 120;
+
+/// Observer handed down to [`execute_actions`]: emits one
+/// [`crate::event::AppEvent::CuActionExecuted`] per successfully executed
+/// action. `session_id` is the supervised session driving the actions
+/// (`None` for sessionless surfaces like the MCP tools).
+pub struct CuActionObserver {
+    bus: crate::event::EventBus,
+    session_id: Option<String>,
+    /// Unix-ms timestamp of the last emitted `move` event (0 = none yet);
+    /// atomic so the shared observer stays `Send + Sync` across `.await`s.
+    last_move_ms: std::sync::atomic::AtomicU64,
+}
+
+impl CuActionObserver {
+    pub fn new(bus: crate::event::EventBus, session_id: Option<String>) -> Self {
+        Self {
+            bus,
+            session_id,
+            last_move_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Emit the event for one executed action. Failed actions are skipped —
+    /// the overlays must never show a click that did not happen.
+    fn observe(&self, target: DisplayTarget, ref_size: (u32, u32), action: &CuAction) {
+        let ts = unix_ms_now();
+        if matches!(action, CuAction::MoveMouse { .. }) && !self.move_gate_admits(ts) {
+            return;
+        }
+        let (x, y) = match cu_action_point(action) {
+            Some((px, py)) => (Some(px), Some(py)),
+            None => (None, None),
+        };
+        let seq = CU_EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bus.send(crate::event::AppEvent::CuActionExecuted {
+            event_id: format!("cu-{ts}-{seq}"),
+            session_id: self.session_id.clone(),
+            display_id: display_id_for_target(target),
+            kind: cu_action_kind(action).to_string(),
+            x,
+            y,
+            ref_w: ref_size.0,
+            ref_h: ref_size.1,
+            raw: cu_action_raw_call(action),
+            ts,
+        });
+    }
+
+    /// 10 Hz gate for `move` events: admits when at least
+    /// [`CU_MOVE_EVENT_MIN_INTERVAL_MS`] elapsed since the last admitted move
+    /// (and records the admission). Pure timestamp logic for testability.
+    fn move_gate_admits(&self, now_ms: u64) -> bool {
+        let last = self.last_move_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < CU_MOVE_EVENT_MIN_INTERVAL_MS {
+            return false;
+        }
+        self.last_move_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+}
+
+/// Monotonic per-process sequence for cu_action event ids (combined with the
+/// unix-ms timestamp so ids stay unique across daemon restarts within the
+/// browser's dual-lane dedupe window).
+static CU_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The dashboard display id an action target maps to (`0` = the user-session
+/// display, mirroring `lookup_display_session` and the `display_ready` ids).
+pub fn display_id_for_target(target: DisplayTarget) -> u32 {
+    match target {
+        DisplayTarget::UserSession => 0,
+        DisplayTarget::Virtual { id } => id,
+    }
+}
+
+/// Wire `kind` for an action — the dashboard's verb/color vocabulary.
+pub fn cu_action_kind(action: &CuAction) -> &'static str {
+    match action {
+        CuAction::Click { button, .. } => match button {
+            MouseButton::Left => "left_click",
+            MouseButton::Right => "right_click",
+            MouseButton::Middle => "middle_click",
+        },
+        CuAction::DoubleClick { .. } => "double_click",
+        CuAction::TripleClick { .. } => "triple_click",
+        CuAction::MouseDown { .. } => "mouse_down",
+        CuAction::MouseUp { .. } => "mouse_up",
+        CuAction::Type { .. } => "type",
+        CuAction::Paste { .. } => "paste",
+        CuAction::Key { .. } => "key",
+        CuAction::HoldKey { .. } => "hold_key",
+        CuAction::Scroll { .. } => "scroll",
+        CuAction::MoveMouse { .. } => "move",
+        CuAction::Drag { .. } => "drag",
+        CuAction::Screenshot => "screenshot",
+        CuAction::Zoom { .. } => "zoom",
+        CuAction::Wait { .. } => "wait",
+    }
+}
+
+/// The display-space point an action lands on, when it has one. Drags report
+/// their END point (where the cursor comes to rest).
+pub fn cu_action_point(action: &CuAction) -> Option<(i32, i32)> {
+    match action {
+        CuAction::Click { x, y, .. }
+        | CuAction::DoubleClick { x, y, .. }
+        | CuAction::TripleClick { x, y, .. }
+        | CuAction::MouseDown { x, y, .. }
+        | CuAction::MouseUp { x, y, .. }
+        | CuAction::Scroll { x, y, .. }
+        | CuAction::MoveMouse { x, y }
+        | CuAction::Zoom { x, y, .. } => Some((*x, *y)),
+        CuAction::Drag { end_x, end_y, .. } => Some((*end_x, *end_y)),
+        CuAction::Type { .. }
+        | CuAction::Paste { .. }
+        | CuAction::Key { .. }
+        | CuAction::HoldKey { .. }
+        | CuAction::Screenshot
+        | CuAction::Wait { .. } => None,
+    }
+}
+
+/// Single-line text embedded in raw call strings: newlines collapse to
+/// spaces, and text longer than [`CU_RAW_TEXT_MAX_CHARS`] is truncated with
+/// an ellipsis (char-boundary safe).
+fn cu_raw_text(text: &str) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let truncated = crate::types::truncate_str(&flat, CU_RAW_TEXT_MAX_CHARS);
+    if truncated.len() < flat.len() {
+        format!("{truncated}…")
+    } else {
+        flat
+    }
+}
+
+/// Short raw call string for the dashboard action feed — the concept's
+/// mono second line (`left_click(612, 233)`, `type("San Francisco…")`).
+pub fn cu_action_raw_call(action: &CuAction) -> String {
+    match action {
+        CuAction::Click { x, y, button } => match button {
+            MouseButton::Left => format!("left_click({x}, {y})"),
+            MouseButton::Right => format!("right_click({x}, {y})"),
+            MouseButton::Middle => format!("middle_click({x}, {y})"),
+        },
+        CuAction::DoubleClick { x, y, .. } => format!("double_click({x}, {y})"),
+        CuAction::TripleClick { x, y, .. } => format!("triple_click({x}, {y})"),
+        CuAction::MouseDown { x, y, .. } => format!("mouse_down({x}, {y})"),
+        CuAction::MouseUp { x, y, .. } => format!("mouse_up({x}, {y})"),
+        CuAction::Type { text } => format!("type(\"{}\")", cu_raw_text(text)),
+        CuAction::Paste { text } => format!("paste(\"{}\")", cu_raw_text(text)),
+        CuAction::Key { key } => format!("key({key})"),
+        CuAction::HoldKey { key, ms } => format!("hold_key({key}, {ms}ms)"),
+        CuAction::Scroll {
+            direction, amount, ..
+        } => {
+            let dir = match direction {
+                ScrollDirection::Up => "up",
+                ScrollDirection::Down => "down",
+                ScrollDirection::Left => "left",
+                ScrollDirection::Right => "right",
+            };
+            format!("scroll({dir}, {amount})")
+        }
+        CuAction::MoveMouse { x, y } => format!("move({x}, {y})"),
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => format!("drag({start_x}, {start_y} -> {end_x}, {end_y})"),
+        CuAction::Screenshot => "screenshot()".to_string(),
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => format!("zoom({x}, {y}, {width}x{height})"),
+        CuAction::Wait { ms } => format!("wait({ms}ms)"),
+    }
+}
+
 // ── Executor ─────────────────────────────────────────────────────────────────
 
 /// Execute a batch of CU actions on the given display.
@@ -454,6 +664,9 @@ pub fn normalized_to_pixels(
 /// `user_session_allowed == false` fails closed here for every action, on
 /// every backend — the Wayland/Windows session-existence requirement is a
 /// second fence, not the gate.
+///
+/// `observer` (when provided) emits one ephemeral `cu_action` dashboard
+/// event per successfully executed action — see [`CuActionObserver`].
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_actions(
     actions: &[CuAction],
@@ -464,6 +677,7 @@ pub async fn execute_actions(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
     denorm_ref: Option<(u32, u32)>,
     user_session_allowed: bool,
+    observer: Option<&CuActionObserver>,
 ) -> Vec<CuActionResult> {
     if target.is_user_session() && !user_session_allowed {
         // One result per action, like every other outcome of this function
@@ -500,6 +714,8 @@ pub async fn execute_actions(
                     screenshot_dir,
                     action_counter,
                     denorm_ref,
+                    observer,
+                    target,
                 )
                 .await;
             }
@@ -518,6 +734,17 @@ pub async fn execute_actions(
     // Even on the subprocess-input backends, prefer the in-memory frames of a
     // live capture session for screenshots — no fork, no disk round-trip.
     let session = lookup_display_session(session_registry, &target).await;
+    // Coordinate reference for emitted action events: the denorm reference
+    // when the caller supplied one, else the live session resolution.
+    // (0, 0) = unknown; viewers fall back to the stream's intrinsic size.
+    let observe_ref = denorm_ref
+        .or_else(|| {
+            session
+                .as_ref()
+                .map(|s| s.resolution())
+                .filter(|(w, h)| *w > 0 && *h > 0)
+        })
+        .unwrap_or((0, 0));
     let display = target.display_env_string();
     let mut results = Vec::with_capacity(actions.len());
     let mut last_screenshot: Option<ScreenshotData> = None;
@@ -594,6 +821,11 @@ pub async fn execute_actions(
         };
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
+        }
+        if result.success {
+            if let Some(obs) = observer {
+                obs.observe(target, observe_ref, action);
+            }
         }
         results.push(result);
     }
@@ -1799,6 +2031,8 @@ async fn execute_via_session(
     screenshot_dir: &std::path::Path,
     action_counter: &mut u64,
     denorm_ref: Option<(u32, u32)>,
+    observer: Option<&CuActionObserver>,
+    target: DisplayTarget,
 ) -> Vec<CuActionResult> {
     let (width, height) = denorm_ref.unwrap_or_else(|| session.resolution());
     let mut results = Vec::with_capacity(actions.len());
@@ -2242,6 +2476,12 @@ async fn execute_via_session(
             CuAction::Screenshot | CuAction::Zoom { .. } | CuAction::Wait { .. }
         ) {
             last_input_at = Some(std::time::Instant::now());
+        }
+        // Every arm above pushes exactly one result for `action`.
+        if results.last().is_some_and(|r| r.success) {
+            if let Some(obs) = observer {
+                obs.observe(target, (width, height), action);
+            }
         }
     }
 
@@ -2856,6 +3096,295 @@ mod tests {
         assert_eq!(ScrollDirection::Right.x11_button(), 7);
     }
 
+    // ── cu_action visualization events ──────────────────────────────────
+
+    #[test]
+    fn cu_action_kind_covers_the_wire_vocabulary() {
+        let click = |button| CuAction::Click { x: 1, y: 2, button };
+        let cases: Vec<(CuAction, &str)> = vec![
+            (click(MouseButton::Left), "left_click"),
+            (click(MouseButton::Right), "right_click"),
+            (click(MouseButton::Middle), "middle_click"),
+            (
+                CuAction::DoubleClick {
+                    x: 1,
+                    y: 2,
+                    button: MouseButton::Left,
+                },
+                "double_click",
+            ),
+            (
+                CuAction::TripleClick {
+                    x: 1,
+                    y: 2,
+                    button: MouseButton::Left,
+                },
+                "triple_click",
+            ),
+            (
+                CuAction::MouseDown {
+                    x: 1,
+                    y: 2,
+                    button: MouseButton::Left,
+                },
+                "mouse_down",
+            ),
+            (
+                CuAction::MouseUp {
+                    x: 1,
+                    y: 2,
+                    button: MouseButton::Left,
+                },
+                "mouse_up",
+            ),
+            (CuAction::Type { text: "a".into() }, "type"),
+            (CuAction::Paste { text: "a".into() }, "paste"),
+            (
+                CuAction::Key {
+                    key: "ctrl+c".into(),
+                },
+                "key",
+            ),
+            (
+                CuAction::HoldKey {
+                    key: "cmd".into(),
+                    ms: 100,
+                },
+                "hold_key",
+            ),
+            (
+                CuAction::Scroll {
+                    x: 1,
+                    y: 2,
+                    direction: ScrollDirection::Down,
+                    amount: 3,
+                },
+                "scroll",
+            ),
+            (CuAction::MoveMouse { x: 1, y: 2 }, "move"),
+            (
+                CuAction::Drag {
+                    start_x: 1,
+                    start_y: 2,
+                    end_x: 3,
+                    end_y: 4,
+                },
+                "drag",
+            ),
+            (CuAction::Screenshot, "screenshot"),
+            (
+                CuAction::Zoom {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                },
+                "zoom",
+            ),
+            (CuAction::Wait { ms: 5 }, "wait"),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(cu_action_kind(&action), expected, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn cu_action_raw_call_matches_the_feed_grammar() {
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Click {
+                x: 612,
+                y: 233,
+                button: MouseButton::Left,
+            }),
+            "left_click(612, 233)"
+        );
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Type {
+                text: "San Francisco (SFO)".into()
+            }),
+            "type(\"San Francisco (SFO)\")"
+        );
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Scroll {
+                x: 4,
+                y: 5,
+                direction: ScrollDirection::Down,
+                amount: 3,
+            }),
+            "scroll(down, 3)"
+        );
+        assert_eq!(cu_action_raw_call(&CuAction::Screenshot), "screenshot()");
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Wait { ms: 1500 }),
+            "wait(1500ms)"
+        );
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Drag {
+                start_x: 10,
+                start_y: 20,
+                end_x: 400,
+                end_y: 300,
+            }),
+            "drag(10, 20 -> 400, 300)"
+        );
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Key {
+                key: "ctrl+c".into()
+            }),
+            "key(ctrl+c)"
+        );
+        assert_eq!(
+            cu_action_raw_call(&CuAction::Zoom {
+                x: 8,
+                y: 9,
+                width: 400,
+                height: 300,
+            }),
+            "zoom(8, 9, 400x300)"
+        );
+    }
+
+    #[test]
+    fn cu_action_raw_call_truncates_and_flattens_embedded_text() {
+        let long = "x".repeat(500);
+        let raw = cu_action_raw_call(&CuAction::Type { text: long });
+        // type(" + 120 chars + …") — presentation truncation only (the
+        // Activity log still carries the full text).
+        assert_eq!(raw, format!("type(\"{}…\")", "x".repeat(120)));
+
+        let multiline = CuAction::Type {
+            text: "line one\nline two\r\nthree".into(),
+        };
+        assert_eq!(
+            cu_action_raw_call(&multiline),
+            "type(\"line one line two  three\")"
+        );
+
+        // Char-boundary safety: a multibyte char straddling the cap must not
+        // panic and must stay valid UTF-8.
+        let multibyte = "é".repeat(90);
+        let raw = cu_action_raw_call(&CuAction::Type { text: multibyte });
+        assert!(raw.starts_with("type(\"é"));
+        assert!(raw.ends_with("…\")"));
+    }
+
+    #[test]
+    fn cu_action_point_reports_display_space_landing_points() {
+        assert_eq!(
+            cu_action_point(&CuAction::Click {
+                x: 612,
+                y: 233,
+                button: MouseButton::Left,
+            }),
+            Some((612, 233))
+        );
+        assert_eq!(
+            cu_action_point(&CuAction::Drag {
+                start_x: 1,
+                start_y: 2,
+                end_x: 30,
+                end_y: 40,
+            }),
+            Some((30, 40)),
+            "drags report their end point"
+        );
+        assert_eq!(
+            cu_action_point(&CuAction::MoveMouse { x: 7, y: 8 }),
+            Some((7, 8))
+        );
+        assert_eq!(cu_action_point(&CuAction::Screenshot), None);
+        assert_eq!(cu_action_point(&CuAction::Type { text: "a".into() }), None);
+        assert_eq!(cu_action_point(&CuAction::Wait { ms: 1 }), None);
+        assert_eq!(cu_action_point(&CuAction::Key { key: "a".into() }), None);
+    }
+
+    #[test]
+    fn display_id_for_target_matches_the_session_registry_keys() {
+        assert_eq!(display_id_for_target(DisplayTarget::UserSession), 0);
+        assert_eq!(display_id_for_target(DisplayTarget::Virtual { id: 99 }), 99);
+    }
+
+    #[test]
+    fn cu_move_gate_coalesces_moves_to_ten_hz() {
+        let observer = CuActionObserver::new(crate::event::EventBus::new(), None);
+        assert!(observer.move_gate_admits(1_000), "first move always emits");
+        assert!(
+            !observer.move_gate_admits(1_050),
+            "a move 50ms later is coalesced"
+        );
+        assert!(
+            observer.move_gate_admits(1_100),
+            "100ms after the last ADMITTED move re-opens the gate"
+        );
+        assert!(!observer.move_gate_admits(1_150));
+    }
+
+    #[tokio::test]
+    async fn cu_observer_emits_display_scoped_events_on_the_bus() {
+        let bus = crate::event::EventBus::new();
+        let mut rx = bus.subscribe();
+        let observer = CuActionObserver::new(bus, Some("sess-1".to_string()));
+
+        observer.observe(
+            DisplayTarget::Virtual { id: 99 },
+            (1280, 800),
+            &CuAction::Click {
+                x: 612,
+                y: 233,
+                button: MouseButton::Left,
+            },
+        );
+        match rx.try_recv() {
+            Ok(crate::event::AppEvent::CuActionExecuted {
+                event_id,
+                session_id,
+                display_id,
+                kind,
+                x,
+                y,
+                ref_w,
+                ref_h,
+                raw,
+                ts,
+            }) => {
+                assert!(event_id.starts_with("cu-"));
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(display_id, 99);
+                assert_eq!(kind, "left_click");
+                assert_eq!((x, y), (Some(612), Some(233)));
+                assert_eq!((ref_w, ref_h), (1280, 800));
+                assert_eq!(raw, "left_click(612, 233)");
+                assert!(ts > 0);
+            }
+            other => panic!("expected CuActionExecuted, got {other:?}"),
+        }
+
+        // Coordinate-free action: no point, kind/raw still emitted.
+        observer.observe(
+            DisplayTarget::UserSession,
+            (0, 0),
+            &CuAction::Type {
+                text: "hello".to_string(),
+            },
+        );
+        match rx.try_recv() {
+            Ok(crate::event::AppEvent::CuActionExecuted {
+                display_id,
+                kind,
+                x,
+                y,
+                raw,
+                ..
+            }) => {
+                assert_eq!(display_id, 0);
+                assert_eq!(kind, "type");
+                assert_eq!((x, y), (None, None));
+                assert_eq!(raw, "type(\"hello\")");
+            }
+            other => panic!("expected CuActionExecuted, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn execute_actions_refuses_user_session_without_allowance() {
         // The chokepoint: a user_session target with user_session_allowed ==
@@ -2880,6 +3409,7 @@ mod tests {
                 &None,
                 None,
                 false,
+                None,
             )
             .await;
             assert_eq!(results.len(), actions.len(), "one result per action");
@@ -2954,6 +3484,7 @@ mod tests {
             &registry,
             None,
             true,
+            None,
         )
         .await;
         assert!(!results[0].success);
@@ -2979,6 +3510,7 @@ mod tests {
             &registry,
             None,
             true,
+            None,
         )
         .await;
         assert!(!results[0].success);
@@ -3025,6 +3557,7 @@ mod tests {
             &None,
             None,
             false,
+            None,
         )
         .await;
         let error = results[0].error.as_deref().unwrap_or_default();

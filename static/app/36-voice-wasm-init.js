@@ -933,6 +933,11 @@ async function main() {
       if (d.event === 'display_metrics') {
         serverMsgStep(d, 'display_metrics', () => updateDisplayMetrics(d));
       }
+      // Live CU action-visualization events (stage overlays + per-display
+      // feed) — handled by 45b-cu-overlays.js.
+      if (d.event === 'cu_action') {
+        serverMsgStep(d, 'cu_action', () => window.handleCuActionEvent?.(d));
+      }
       if (eventRefreshesSessionMetadata(d.event)) {
         serverMsgStep(d, 'sessions_metadata_refresh', () => scheduleSessionsMetadataRefresh());
       }

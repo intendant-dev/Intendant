@@ -1097,6 +1097,9 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DebugScreenTornDown { .. }
         | AppEvent::DisplayCaptureLost { .. }
         | AppEvent::DisplayApprovalPending { .. }
+        // Presence sees the display via frames; per-action overlay events
+        // are dashboard presentation, not narration material.
+        | AppEvent::CuActionExecuted { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
         | AppEvent::LiveAudioCompleted { .. }

@@ -581,6 +581,10 @@ impl AppEventUpcaster {
             // carry them (peers resolve nothing here).
             | AppEvent::DisplayRequestRaised { .. }
             | AppEvent::DisplayRequestResolved { .. }
+            // Live CU action overlays are a LOCAL-dashboard presentation
+            // lane; peer viewers don't render them (documented follow-up
+            // in docs/src/computer-use-and-audio.md).
+            | AppEvent::CuActionExecuted { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
@@ -1953,6 +1957,10 @@ impl WireEventUpcaster {
             // AppEvent upcaster twin above).
             | OutboundEvent::DisplayRequestRaised { .. }
             | OutboundEvent::DisplayRequestResolved { .. }
+            // A peer's live CU action overlays render on ITS dashboards;
+            // the peer rail doesn't mirror them (same class as the
+            // AppEvent upcaster twin above).
+            | OutboundEvent::CuAction { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }

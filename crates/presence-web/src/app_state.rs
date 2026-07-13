@@ -2413,6 +2413,12 @@ impl AppState {
                 cmds.extend(self.add_log("info", &text, None, "system"));
             }
 
+            // Live CU action-visualization events: consumed by the plain-JS
+            // Live-tab overlay layer (45b-cu-overlays.js), not by this app
+            // state. Swallow them here so the unknown-event catch-all below
+            // doesn't dump one debug log line per executed agent action.
+            "cu_action" => {}
+
             "recording_started" => {
                 let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
                 cmds.extend(self.add_log(

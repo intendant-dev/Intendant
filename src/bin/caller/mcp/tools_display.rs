@@ -922,6 +922,9 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        // Sessionless surface: the dashboard shows the capture flash but
+        // attributes it to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
         let results = execute_actions(
             &[CuAction::Screenshot],
             target,
@@ -931,6 +934,7 @@ impl IntendantServer {
             &session_registry,
             None,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
         )
         .await;
 
@@ -1099,6 +1103,8 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        // Sessionless surface: overlays/feed render, attributed to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
         let results = execute_actions(
             &actions,
             target,
@@ -1108,6 +1114,7 @@ impl IntendantServer {
             &session_registry,
             denorm_ref,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
         )
         .await;
 
@@ -1601,10 +1608,16 @@ mod tests {
             !rendered.contains(opt_in_refusal_marker()),
             "capture must use virtual display 99, not fall through to the user display: {rendered}"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "no display-0 activation was emitted"
-        );
+        // The successful capture also emits its ephemeral cu_action
+        // screenshot event on the bus. The assertion here is specifically
+        // that no display-0 ACTIVATION (user-display grant) was requested —
+        // not that the bus is otherwise quiet.
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::UserDisplayGranted { .. }),
+                "no display-0 activation should be emitted, got {event:?}"
+            );
+        }
     }
 
     #[test]
