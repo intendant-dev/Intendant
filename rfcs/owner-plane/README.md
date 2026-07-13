@@ -14,7 +14,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
 | `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.18) — the red baselines |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
-| `core/` | The reference core (canonical CBOR, hash domains, vector RNG) — the fixture-minting implementation |
+| `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
 
 ## Provenance note
 
