@@ -305,6 +305,7 @@ function setLiveAnnotationButton(provider, active) {
     : null;
   if (!btn) return;
   btn.classList.toggle('active', !!active);
+  btn.setAttribute('aria-pressed', active ? 'true' : 'false');
   btn.innerHTML = active ? '&#x2715; Annotating' : '&#9998; Annotate';
   btn.title = active ? 'Exit live annotation' : 'Freeze current frame and annotate it';
 }
@@ -2573,4 +2574,3 @@ document.getElementById('recording-timeline').addEventListener('contextmenu', (e
     deleteClipAnnotationLayer(layerId);
   }
 });
-

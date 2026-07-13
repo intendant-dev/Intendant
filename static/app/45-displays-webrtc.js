@@ -241,25 +241,34 @@ class DisplaySlot {
     this.el.className = 'display-slot';
     const label = displayLabel(displayId);
     this.el.innerHTML = `
-      <div class="display-toolbar">
-        <span class="display-label">${label}</span>
-        <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
-        <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
-        <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
-        <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
-        <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
-        <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">Attach</button>
-        <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
-        <button class="callout-btn" id="ds-callout-${displayId}" aria-pressed="false" disabled title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
-        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">Record</button>
-        <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
-        <button class="display-close-btn" id="ds-close-${displayId}" title="Close this display stream">&times;</button>
-        <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
-        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
-        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">Delete</button>
-        <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
+      <div class="display-toolbar" role="group">
+        <div class="display-toolbar-meta">
+          <span class="display-label"></span>
+          <span class="display-visibility" id="ds-visibility-${displayId}" style="display:none"></span>
+          <span class="display-status" id="ds-status-${displayId}" role="status" aria-live="polite" aria-atomic="true">Connecting...</span>
+          <span class="display-input-authority" id="ds-authority-${displayId}" role="status" aria-live="polite" aria-atomic="true" style="display:none" title="Input authority for this display: who can drive keyboard and pointer input."></span>
+        </div>
+        <div class="display-toolbar-actions">
+          <input class="release-note" id="ds-note-${displayId}" aria-label="Note to the agent when releasing this display" placeholder="Note (optional)" style="display:none">
+          <button class="stream-btn" id="ds-stream-${displayId}" type="button" aria-pressed="false" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">Stream</button>
+          <button class="ann-attach-btn" id="ds-attach-${displayId}" type="button" title="Capture current frame and attach to next task">Attach</button>
+          <button class="annotate-btn" id="ds-annotate-${displayId}" type="button" aria-pressed="false" title="Freeze current frame and annotate it">&#9998; Annotate</button>
+          <button class="callout-btn" id="ds-callout-${displayId}" type="button" aria-pressed="false" disabled title="Call out a region: arm, then drag a rectangle on the frame to attach it to the next task (needs input control)">&#x2316; Callout</button>
+          <button class="record-btn" id="ds-record-${displayId}" type="button" aria-pressed="false" title="Record this display (ffmpeg)">Record</button>
+          <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" type="button" aria-label="Open display full screen" title="Full screen">&#x26F6;</button>
+          <button class="display-close-btn" id="ds-close-${displayId}" type="button" aria-label="Close this display stream" title="Close this display stream">&times;</button>
+          <button class="take-control-btn" id="ds-take-${displayId}" type="button" title="Take interactive control of this display (keyboard and mouse)">Take control</button>
+          <button class="release-control-btn" id="ds-release-${displayId}" type="button" style="display:none" title="Release control and return display to view-only mode">Release</button>
+          <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" type="button" style="display:none" title="Delete recording files for this display">Delete</button>
+          <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0)"></span>
+        </div>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
+    this.el.setAttribute('aria-label', label);
+    const labelEl = this.el.querySelector('.display-label');
+    if (labelEl) labelEl.textContent = label;
+    const toolbarEl = this.el.querySelector('.display-toolbar');
+    if (toolbarEl) toolbarEl.setAttribute('aria-label', `${label} controls`);
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
     this.visibilityEl = this.el.querySelector(`#ds-visibility-${displayId}`);
     this.authorityEl = this.el.querySelector(`#ds-authority-${displayId}`);
@@ -285,6 +294,8 @@ class DisplaySlot {
     this.videoEl.muted = true;
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
+    this.videoEl.setAttribute('aria-label', `Live view of ${label}`);
+    this.videoEl.setAttribute('aria-describedby', `ds-status-${displayId} ds-authority-${displayId}`);
     this.canvasEl.appendChild(this.videoEl);
     // In-stage connection status overlay (time-to-first-frame): staged
     // copy while negotiating ("Negotiating…" → "Waiting for first
@@ -302,7 +313,14 @@ class DisplaySlot {
     this.metricsEl = document.createElement('div');
     this.metricsEl.className = 'display-live-metrics';
     this.metricsEl.style.display = 'none';
+    this.metricsEl.setAttribute('aria-hidden', 'true');
     this.canvasEl.appendChild(this.metricsEl);
+    this.controlBannerEl = document.createElement('div');
+    this.controlBannerEl.className = 'display-control-banner';
+    this.controlBannerEl.setAttribute('role', 'status');
+    this.controlBannerEl.setAttribute('aria-live', 'polite');
+    this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
+    this.canvasEl.appendChild(this.controlBannerEl);
     const rerenderSharedFocus = () => {
       if (!sharedViewState.visible) return;
       if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
@@ -356,6 +374,8 @@ class DisplaySlot {
     if (this.fullscreenBtn) {
       this.fullscreenBtn.innerHTML = want ? '&times;' : '&#x26F6;';
       this.fullscreenBtn.title = want ? 'Exit full screen' : 'Full screen';
+      this.fullscreenBtn.setAttribute('aria-label', want ? 'Exit display full screen' : 'Open display full screen');
+      this.fullscreenBtn.setAttribute('aria-pressed', want ? 'true' : 'false');
     }
   }
 
@@ -850,7 +870,8 @@ class DisplaySlot {
     if (this.takeBtn) {
       this.takeBtn.disabled = pending;
       this.takeBtn.classList.toggle('is-pending', pending);
-      this.takeBtn.textContent = pending ? 'Requesting…' : 'Take Control';
+      this.takeBtn.textContent = pending ? 'Requesting…' : 'Take control';
+      this.takeBtn.setAttribute('aria-busy', pending ? 'true' : 'false');
     }
     if (pending) {
       this._takePendingTimer = window.setTimeout(() => {
@@ -877,6 +898,7 @@ class DisplaySlot {
   _enterInteractive() {
     if (this.interactive) return;
     this.interactive = true;
+    this.el.classList.add('is-interactive');
     this.noteInput.style.display = '';
     const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
     this.statusEl.textContent = `Interactive${res}`;
@@ -982,6 +1004,7 @@ class DisplaySlot {
   _exitInteractive(userInitiated) {
     if (!this.interactive) return;
     this.interactive = false;
+    this.el.classList.remove('is-interactive');
     // Item 3: flush synthetic keyups for every held key BEFORE the
     // listeners are removed. Server-driven demotion never fires blur, so
     // without this any held key (modifier or not) stays latched down on
@@ -1001,6 +1024,7 @@ class DisplaySlot {
       }
     }
     this._boundHandlers = {};
+    vid.removeAttribute('tabindex');
     const note = this.noteInput.value.trim() || undefined;
     this.noteInput.value = ''; this.noteInput.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
@@ -1110,6 +1134,7 @@ class DisplaySlot {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
     this.streamBtn.classList.add('active');
+    this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
     this.frameIdEl.style.display = '';
     const streamName = 'display_' + this.displayId;
@@ -1161,6 +1186,7 @@ class DisplaySlot {
     this.streaming = false;
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
     this.streamBtn.classList.remove('active');
+    this.streamBtn.setAttribute('aria-pressed', 'false');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
     this.frameIdEl.style.display = 'none';
     this.frameIdEl.textContent = '';
@@ -1174,6 +1200,7 @@ class DisplaySlot {
       this.recording = false;
       this.recordBtn.innerHTML = '&#x23FA; Record';
       this.recordBtn.classList.remove('active');
+      this.recordBtn.setAttribute('aria-pressed', 'false');
       this.deleteRecBtn.style.display = '';
     } else {
       dispatchDashboardActionMsg({ action: 'start_recording', stream_name: baseStream });
@@ -1181,6 +1208,7 @@ class DisplaySlot {
       this.recording = true;
       this.recordBtn.innerHTML = '&#x23F9; Stop';
       this.recordBtn.classList.add('active');
+      this.recordBtn.setAttribute('aria-pressed', 'true');
       this.deleteRecBtn.style.display = 'none';
     }
   }
@@ -1428,6 +1456,12 @@ function applySharedViewToSlot(slot) {
   if (sharedViewState.displayId !== null && Number(slot.displayId) !== sharedViewState.displayId) {
     return;
   }
+  // The Live workspace is a selected-display stage. Agent-requested
+  // shared views must foreground their real target rather than leaving
+  // the focus box mounted on a hidden slot.
+  if (typeof window.selectLiveDisplay === 'function') {
+    window.selectLiveDisplay(slot.displayId, { source: 'shared-view' });
+  }
   updateSharedViewBanner();
   slot.el.classList.add('shared-view-active');
   renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
@@ -1463,7 +1497,12 @@ function takeSharedViewInput() {
 }
 
 function handleSharedViewEvent(evt) {
-  const action = String(evt.action || 'show');
+  // Native shared_view historically emitted `input`; MCP already emits
+  // the presentation-level `input_request`. Canonicalize at the browser
+  // boundary so mixed-version daemons still expose the real Take input
+  // affordance without ever granting authority automatically.
+  const rawAction = String(evt.action || 'show');
+  const action = rawAction === 'input' ? 'input_request' : rawAction;
   if (action === 'hide') {
     hideSharedView();
     return;
@@ -1739,306 +1778,806 @@ function applyDisplayStripState() {
 }
 
 
-// ── ui-v2 Live-display right rail (design-overhaul P2) ─────────────────
-// Display-only mirror chrome, active only under the ?ui=v2 flag: renders
-// rail rows FROM existing state (displaySlots + slot DOM, the Station
-// peer-display chips, the sb-display-access grant chip) via
-// MutationObservers, and proxies every click to the existing controls.
-// It owns no state, sends no messages, and never touches the WebRTC
-// slots, the single-reparented <video> elements, or v1 markup. Honest
-// authority copy: taking control is last-take-wins displacement between
-// viewers (no request/approve ceremony), and "another viewer has input"
-// is a first-class rendered state.
+// ── Live display workspace ──────────────────────────────────────────────
+// The standalone CU concept is the presentation target; the production
+// displaySlots map remains the source of truth. This projection adds one
+// selected local stage, selected-slot authority controls, responsive rail
+// access, and a small feed of REAL browser-observed display lifecycle
+// changes. It never invents agent clicks, typed text, holder identities, or
+// display-scoped approvals: those do not exist in the current wire contract.
+//
+// Key safety rule: a hidden interactive slot would keep its document-level
+// paste handler. Selecting another display therefore releases the old slot
+// through DisplaySlot.releaseControl(), which flushes held keys before
+// releasing server authority. Live annotation/callout ownership is torn
+// down through the existing provider lifecycle before that slot is hidden.
 (() => {
   const tab = document.getElementById('tab-displays');
-  if (!tab) return;
-  const rail = document.createElement('aside');
-  rail.className = 'ui2-live-rail';
-  rail.id = 'ui2-live-rail';
-  rail.innerHTML = `
-    <section>
-      <div class="ui2-live-rail-eyebrow">Displays</div>
-      <div class="ui2-live-rail-list" id="ui2-live-displays-list"></div>
-    </section>
-    <section>
-      <div class="ui2-live-rail-eyebrow">Input authority</div>
-      <div id="ui2-live-authority-card"></div>
-    </section>
-    <section>
-      <div class="ui2-live-rail-eyebrow">Peer displays</div>
-      <div class="ui2-live-rail-list" id="ui2-live-peer-list"></div>
-    </section>
-    <section>
-      <div class="ui2-live-rail-eyebrow">Your screen</div>
-      <div id="ui2-live-yourscreen"></div>
-    </section>`;
-  tab.appendChild(rail);
-  const displaysList = rail.querySelector('#ui2-live-displays-list');
-  const authorityCard = rail.querySelector('#ui2-live-authority-card');
-  const peerList = rail.querySelector('#ui2-live-peer-list');
-  const yourScreen = rail.querySelector('#ui2-live-yourscreen');
-
-  const emptyHint = (text) => {
-    const div = document.createElement('div');
-    div.className = 'ui2-live-rail-empty';
-    div.textContent = text;
-    return div;
-  };
-
-  function renderDisplayRows() {
-    displaysList.textContent = '';
-    const slots = Array.from(displaySlots.values());
-    if (!slots.length) {
-      displaysList.appendChild(emptyHint('No displays active. They appear here when the agent launches a GUI or you share your screen.'));
-      return;
-    }
-    for (const slot of slots) {
-      const row = document.createElement('button');
-      row.type = 'button';
-      const err = slot.statusEl && slot.statusEl.classList.contains('error');
-      row.className = 'ui2-live-row' + (slot.connected ? ' ok viewing' : (err ? ' err' : ''));
-      const dot = document.createElement('span');
-      dot.className = 'ui2-live-row-dot';
-      const main = document.createElement('span');
-      main.className = 'ui2-live-row-main';
-      const title = document.createElement('span');
-      title.className = 'ui2-live-row-title';
-      const labelEl = slot.el && slot.el.querySelector('.display-label');
-      title.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
-      const meta = document.createElement('span');
-      meta.className = 'ui2-live-row-meta';
-      meta.textContent = (slot.statusEl && slot.statusEl.textContent) || '';
-      main.appendChild(title);
-      main.appendChild(meta);
-      row.appendChild(dot);
-      row.appendChild(main);
-      if (displayAgentVisibility.get(Number(slot.displayId)) === false) {
-        const tag = document.createElement('span');
-        tag.className = 'ui2-live-row-tag';
-        tag.textContent = 'PRIVATE';
-        tag.title = 'Private view — the agent cannot see this display';
-        row.appendChild(tag);
-      }
-      if (slot.connected) {
-        const tag = document.createElement('span');
-        tag.className = 'ui2-live-row-tag';
-        tag.textContent = 'VIEWING';
-        row.appendChild(tag);
-      }
-      row.title = 'Scroll this display into view';
-      row.addEventListener('click', () => {
-        if (slot.el && slot.el.isConnected) slot.el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      });
-      displaysList.appendChild(row);
-    }
-  }
+  const container = document.getElementById('displays-container');
+  const rail = document.getElementById('ui2-live-rail');
+  const displaysList = document.getElementById('ui2-live-displays-list');
+  const authorityCard = document.getElementById('ui2-live-authority-card');
+  const activityList = document.getElementById('ui2-live-activity');
+  const peerList = document.getElementById('ui2-live-peer-list');
+  const yourScreen = document.getElementById('ui2-live-yourscreen');
+  const mobileSummary = document.getElementById('ui2-live-mobile-summary');
+  const railToggle = document.getElementById('ui2-live-rail-toggle');
+  const railClose = document.getElementById('ui2-live-rail-close');
+  const railScrim = document.getElementById('ui2-live-rail-scrim');
+  if (!tab || !container || !rail || !displaysList || !authorityCard ||
+      !activityList || !peerList || !yourScreen) return;
 
   const AUTH_LABEL = {
     you: 'you',
     other: 'another viewer',
-    unclaimed: 'shared',
-    unknown: 'view-only',
+    unclaimed: 'available',
+    unknown: 'connecting',
   };
-  function renderAuthorityCard() {
-    authorityCard.textContent = '';
-    const card = document.createElement('div');
-    card.className = 'ui2-live-card';
-    const title = document.createElement('div');
-    title.className = 'ui2-live-card-title';
-    const sub = document.createElement('div');
-    sub.className = 'ui2-live-card-sub';
-    const slots = Array.from(displaySlots.values());
-    if (!slots.length) {
-      title.textContent = 'No live display';
-      sub.textContent = 'Input authority appears here once a display is streaming.';
-      card.appendChild(title);
-      card.appendChild(sub);
-      authorityCard.appendChild(card);
-      return;
-    }
-    const anyYou = slots.some(s => s.authorityState === 'you');
-    const anyOther = slots.some(s => s.authorityState === 'other');
-    title.textContent = anyYou
-      ? 'You have input control'
-      : anyOther
-        ? 'Another viewer has input'
-        : 'You have view-only';
-    sub.textContent = 'Take control forwards your mouse and keyboard to the display. It displaces whoever holds input — last take wins, there is no approval step. Release hands the display back.';
-    card.appendChild(title);
-    card.appendChild(sub);
-    for (const slot of slots) {
-      const row = document.createElement('div');
-      row.className = 'ui2-live-auth-row';
-      const name = document.createElement('span');
-      name.className = 'ui2-live-auth-name';
-      const labelEl = slot.el && slot.el.querySelector('.display-label');
-      name.textContent = (labelEl && labelEl.textContent) || `Display ${slot.displayId}`;
-      const pill = document.createElement('span');
-      const st = slot.authorityState || 'unknown';
-      pill.className = 'ui2-live-state-pill' + (st === 'you' ? ' you' : st === 'other' ? ' other' : '');
-      pill.textContent = AUTH_LABEL[st] || AUTH_LABEL.unknown;
-      row.appendChild(name);
-      row.appendChild(pill);
-      card.appendChild(row);
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      if (st === 'you') {
-        btn.className = 'ui2-live-card-btn release';
-        btn.textContent = 'Release control';
-        btn.title = 'Release input and return this display to view-only';
-        btn.addEventListener('click', () => {
-          const b = document.getElementById(`ds-release-${slot.displayId}`);
-          if (b) b.click();
-        });
-      } else {
-        btn.className = 'ui2-live-card-btn';
-        btn.textContent = st === 'other' ? 'Take control anyway' : 'Take control';
-        btn.title = st === 'other'
-          ? 'Takes input immediately and displaces the current viewer'
-          : 'Take interactive control of this display (keyboard and mouse)';
-        btn.addEventListener('click', () => {
-          const b = document.getElementById(`ds-take-${slot.displayId}`);
-          if (b) b.click();
-        });
-      }
-      card.appendChild(btn);
-    }
-    authorityCard.appendChild(card);
+  const displayRows = new Map();
+  const peerRows = new Map();
+  const peerSources = new Map();
+  const slotSnapshots = new Map();
+  const activityByDisplay = new Map();
+  const drawerMedia = window.matchMedia('(max-width: 1279px)');
+  let selectedDisplayId = null;
+  let railOpen = false;
+  let railRaf = 0;
+  let activitySeq = 0;
+  let lastActivitySignature = '';
+  let lastAuthoritySignature = '';
+  let lastScreenSignature = '';
+
+  function slotLabel(slot) {
+    const labelEl = slot && slot.el && slot.el.querySelector('.display-label');
+    return (labelEl && labelEl.textContent) || displayLabel(slot && slot.displayId);
   }
 
-  function renderPeerRows() {
-    peerList.textContent = '';
-    const chips = document.querySelectorAll('#station-peer-chips .station-peer-chip');
-    if (!chips.length) {
-      peerList.appendChild(emptyHint('No peer displays advertised. Paired daemons that share a display appear here.'));
+  function selectedSlot() {
+    return selectedDisplayId === null ? null : displaySlots.get(selectedDisplayId) || null;
+  }
+
+  function emptyHint(textValue) {
+    const div = document.createElement('div');
+    div.className = 'ui2-live-rail-empty';
+    div.textContent = textValue;
+    return div;
+  }
+
+  function setSelectedProjection() {
+    const slots = Array.from(displaySlots.values());
+    const selectedExists = selectedDisplayId !== null && displaySlots.has(selectedDisplayId);
+    container.classList.toggle('ui2-live-single-stage', slots.length > 0);
+    container.dataset.activeDisplayId = selectedExists ? String(selectedDisplayId) : '';
+    for (const slot of slots) {
+      const active = selectedExists && Number(slot.displayId) === selectedDisplayId;
+      slot.el.classList.toggle('ui2-live-selected', active);
+      slot.el.classList.toggle('ui2-live-inactive', !active);
+      slot.el.setAttribute('aria-hidden', active ? 'false' : 'true');
+      slot.el.inert = !active;
+    }
+  }
+
+  function teardownSelectedSurface(slot) {
+    if (!slot) return;
+    // releaseControl is the only safe ordering: held-key keyups are sent
+    // before the server-side authority release closes the input gate.
+    if (slot.interactive) slot.releaseControl();
+    if (typeof teardownLiveSurfaceForOwner === 'function') {
+      teardownLiveSurfaceForOwner(slot);
+    }
+  }
+
+  function selectLiveDisplay(displayId, options) {
+    const opts = options || {};
+    const id = Number(displayId);
+    const next = Number.isFinite(id) ? displaySlots.get(id) : null;
+    if (!next) return false;
+    if (selectedDisplayId !== id) {
+      teardownSelectedSurface(selectedSlot());
+      selectedDisplayId = id;
+    }
+    setSelectedProjection();
+    scheduleWorkspace();
+    if (opts.focusStage && next.el && next.el.isConnected) {
+      requestAnimationFrame(() => {
+        try { next.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+      });
+    }
+    return true;
+  }
+  window.selectLiveDisplay = selectLiveDisplay;
+
+  function reconcileSelectedDisplay(slots) {
+    const shared = slots.find(slot => slot.el && slot.el.classList.contains('shared-view-active'));
+    if (shared && Number(shared.displayId) !== selectedDisplayId) {
+      selectLiveDisplay(shared.displayId, { source: 'shared-view' });
       return;
     }
-    chips.forEach((chip) => {
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.className = 'ui2-live-row' + (chip.disabled ? '' : ' ok');
-      row.disabled = chip.disabled;
-      row.title = chip.title || '';
-      const dot = document.createElement('span');
-      dot.className = 'ui2-live-row-dot';
-      const main = document.createElement('span');
-      main.className = 'ui2-live-row-main';
-      const title = document.createElement('span');
-      title.className = 'ui2-live-row-title';
-      title.textContent = chip.textContent || '';
-      const meta = document.createElement('span');
-      meta.className = 'ui2-live-row-meta';
-      meta.textContent = chip.disabled ? 'peer offline' : 'peer · view display';
-      main.appendChild(title);
-      main.appendChild(meta);
-      const chev = document.createElement('span');
-      chev.className = 'ui2-live-row-chev';
-      chev.textContent = '›';
-      row.appendChild(dot);
-      row.appendChild(main);
-      row.appendChild(chev);
-      row.addEventListener('click', () => chip.click());
-      peerList.appendChild(row);
+    if (selectedDisplayId !== null && displaySlots.has(selectedDisplayId)) {
+      setSelectedProjection();
+      return;
+    }
+    selectedDisplayId = slots.length ? Number(slots[0].displayId) : null;
+    setSelectedProjection();
+  }
+
+  function createDisplayRow(id) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'ui2-live-row';
+    row.dataset.displayId = String(id);
+    row.innerHTML =
+      '<span class="ui2-live-row-dot" aria-hidden="true"></span>' +
+      '<span class="ui2-live-row-main">' +
+        '<span class="ui2-live-row-title"></span>' +
+        '<span class="ui2-live-row-meta"></span>' +
+      '</span>' +
+      '<span class="ui2-live-row-tags" aria-hidden="true">' +
+        '<span class="ui2-live-row-tag ui2-live-row-privacy"></span>' +
+        '<span class="ui2-live-row-tag ui2-live-row-current"></span>' +
+      '</span>';
+    row.addEventListener('click', () => {
+      selectLiveDisplay(id, { focusStage: true, source: 'rail' });
+      if (drawerMedia.matches) setRailOpen(false, true);
+    });
+    return {
+      row,
+      title: row.querySelector('.ui2-live-row-title'),
+      meta: row.querySelector('.ui2-live-row-meta'),
+      privacy: row.querySelector('.ui2-live-row-privacy'),
+      current: row.querySelector('.ui2-live-row-current'),
+    };
+  }
+
+  function orderRows(parent, records) {
+    records.forEach((record, index) => {
+      const current = parent.children[index] || null;
+      if (current !== record.row) parent.insertBefore(record.row, current);
     });
   }
 
-  function renderYourScreen() {
-    yourScreen.textContent = '';
-    const card = document.createElement('div');
-    card.className = 'ui2-live-card';
-    const head = document.createElement('div');
-    head.style.display = 'flex';
-    head.style.alignItems = 'center';
-    head.style.gap = '8px';
-    const title = document.createElement('div');
-    title.className = 'ui2-live-card-title';
-    title.style.flex = '1';
-    title.textContent = 'Your screen';
-    // Two distinct things can be active here, and the card never
-    // conflates them:
-    //  - a PRIVATE VIEW ("View this machine"): remote view/control of
-    //    this machine from the dashboard; the agent cannot see it;
-    //  - an AGENT SHARE ("Share with agent"): the screen is visible to
-    //    the agent for computer-use tasks.
-    // (Streaming frames to the live presence/voice model is a third,
-    // separate control -- the Stream button on the display tile.)
-    const granted = userDisplayGranted;
-    const shared = granted && userDisplayAgentVisible;
-    const pill = document.createElement('span');
-    pill.className = 'ui2-live-state-pill'
-      + (shared ? ' other' : granted ? ' you' : '');
-    pill.textContent = shared ? 'agent can see this' : granted ? 'private view' : 'off';
-    head.appendChild(title);
-    head.appendChild(pill);
-    const sub = document.createElement('div');
-    sub.className = 'ui2-live-card-sub';
-    sub.textContent = shared
-      ? 'The agent can see and drive this screen for computer-use tasks until you revoke access.'
-      : granted
-        ? 'Streaming to your dashboard only. The agent cannot see this display.'
-        : 'View and control this machine’s display from here, or share it with the agent for computer-use tasks. You choose the display and can stop at any time.';
-    card.appendChild(head);
-    card.appendChild(sub);
-    const addBtn = (label, cls, title, onClick) => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'ui2-live-card-btn ' + cls;
-      btn.textContent = label;
-      btn.title = title;
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        onClick();
-      });
-      card.appendChild(btn);
-      return btn;
-    };
-    if (!granted) {
-      // Primary: private remote view. Secondary: the agent share.
-      addBtn('View this machine', 'secondary',
-        'Watch and control this machine’s display from the dashboard. Private: the agent cannot see it.',
-        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('view'); });
-      addBtn('Share with agent…', 'secondary',
-        'Make this screen visible to the agent for computer-use tasks. Revocable at any time.',
-        () => { if (typeof startUserDisplayGrantFlow === 'function') startUserDisplayGrantFlow('share'); });
-    } else if (!shared) {
-      addBtn('Stop viewing', 'danger',
-        'Close the private view of this machine.',
-        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
-      addBtn('Share with agent', 'secondary',
-        'Upgrade this private view: make the display visible to the agent for computer-use tasks.',
-        () => { if (typeof shareUserDisplayWithAgent === 'function') shareUserDisplayWithAgent(); });
-    } else {
-      addBtn('Revoke access', 'danger',
-        'Take the display away from the agent and stop streaming it.',
-        () => { if (typeof revokeUserDisplayNow === 'function') revokeUserDisplayNow(); });
+  function syncDisplayRows(slots) {
+    const liveIds = new Set(slots.map(slot => Number(slot.displayId)));
+    for (const [id, record] of displayRows) {
+      if (liveIds.has(id)) continue;
+      record.row.remove();
+      displayRows.delete(id);
+      slotSnapshots.delete(id);
+      activityByDisplay.delete(id);
     }
-    yourScreen.appendChild(card);
+
+    let empty = displaysList.querySelector('.ui2-live-rail-empty');
+    if (!slots.length) {
+      if (!empty) {
+        empty = emptyHint('No displays active. Agent workspaces and screens you choose to view appear here.');
+        displaysList.appendChild(empty);
+      }
+      return;
+    }
+    if (empty) empty.remove();
+
+    const ordered = [];
+    for (const slot of slots) {
+      const id = Number(slot.displayId);
+      let record = displayRows.get(id);
+      if (!record) {
+        record = createDisplayRow(id);
+        displayRows.set(id, record);
+      }
+      const label = slotLabel(slot);
+      const state = slot.authorityState || 'unknown';
+      const status = (slot.statusEl && slot.statusEl.textContent.trim()) || 'Connecting';
+      const error = Boolean(slot.statusEl && slot.statusEl.classList.contains('error'));
+      const active = id === selectedDisplayId;
+      const privateView = displayAgentVisibility.get(id) === false;
+
+      record.row.classList.toggle('ok', Boolean(slot.connected));
+      record.row.classList.toggle('err', error);
+      record.row.classList.toggle('viewing', active);
+      record.row.classList.toggle('selected', active);
+      record.row.setAttribute('aria-pressed', active ? 'true' : 'false');
+      if (active) record.row.setAttribute('aria-current', 'true');
+      else record.row.removeAttribute('aria-current');
+      record.row.title = active ? label + ' is shown on the stage' : 'Show ' + label + ' on the stage';
+      record.row.setAttribute('aria-label',
+        label + ', ' + status + ', input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown));
+      record.title.textContent = label;
+      record.meta.textContent = status + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
+      record.privacy.textContent = privateView ? 'PRIVATE' : '';
+      record.privacy.title = privateView ? 'The agent cannot see this private view' : '';
+      record.current.textContent = active ? 'VIEWING' : (slot.connected ? 'LIVE' : '');
+      ordered.push(record);
+    }
+    orderRows(displaysList, ordered);
   }
 
-  let railRaf = 0;
-  function renderRail() {
-    railRaf = 0;
-    renderDisplayRows();
-    renderAuthorityCard();
-    renderPeerRows();
-    renderYourScreen();
+  authorityCard.innerHTML =
+    '<div class="ui2-live-card ui2-live-authority-card">' +
+      '<div class="ui2-live-authority-head">' +
+        '<span class="ui2-live-authority-dot" aria-hidden="true"></span>' +
+        '<div class="ui2-live-authority-copy">' +
+          '<div class="ui2-live-card-title"></div>' +
+          '<div class="ui2-live-card-sub"></div>' +
+        '</div>' +
+        '<span class="ui2-live-state-pill"></span>' +
+      '</div>' +
+      '<div class="ui2-live-auth-row">' +
+        '<span class="ui2-live-auth-name"></span>' +
+      '</div>' +
+      '<button class="ui2-live-card-btn" type="button"></button>' +
+    '</div>';
+  const authorityBox = authorityCard.querySelector('.ui2-live-card');
+  const authorityTitle = authorityCard.querySelector('.ui2-live-card-title');
+  const authoritySub = authorityCard.querySelector('.ui2-live-card-sub');
+  const authorityPill = authorityCard.querySelector('.ui2-live-state-pill');
+  const authorityName = authorityCard.querySelector('.ui2-live-auth-name');
+  const authorityButton = authorityCard.querySelector('.ui2-live-card-btn');
+  authorityButton.addEventListener('click', () => {
+    const slot = selectedSlot();
+    if (!slot) return;
+    if (slot.authorityState === 'you' && !slot.interactive) {
+      // Selection-away releases bound input immediately. During the
+      // authority round-trip (or after a failed release), let the holder
+      // safely re-bind listeners instead of trapping it behind a Release-
+      // only toolbar state.
+      slot.takeControl();
+      return;
+    }
+    const source = slot.authorityState === 'you' ? slot.releaseBtn : slot.takeBtn;
+    if (source && !source.disabled) source.click();
+  });
+
+  function syncAuthorityCard() {
+    const slot = selectedSlot();
+    const signature = slot
+      ? [
+          selectedDisplayId,
+          slotLabel(slot),
+          slot.authorityState || 'unknown',
+          Boolean(slot.interactive),
+          Boolean(slot._takeControlPending),
+          Boolean(slot.pc),
+        ].join('|')
+      : 'none';
+    if (signature === lastAuthoritySignature) return;
+    lastAuthoritySignature = signature;
+    authorityBox.className = 'ui2-live-card ui2-live-authority-card';
+    authorityPill.className = 'ui2-live-state-pill';
+    authorityButton.className = 'ui2-live-card-btn';
+    if (!slot) {
+      authorityTitle.textContent = 'No live display';
+      authoritySub.textContent = 'Choose or share a display to see and control it here.';
+      authorityPill.textContent = 'offline';
+      authorityName.textContent = 'Input is scoped to one display at a time.';
+      authorityButton.hidden = true;
+      return;
+    }
+
+    const state = slot.authorityState || 'unknown';
+    const pending = Boolean(slot._takeControlPending);
+    authorityName.textContent = slotLabel(slot);
+    authorityButton.hidden = false;
+    authorityButton.disabled = !slot.pc || pending;
+    authorityButton.setAttribute('aria-busy', pending ? 'true' : 'false');
+    authorityBox.classList.add('state-' + state);
+    if (state === 'you') {
+      authorityTitle.textContent = slot.interactive
+        ? 'You are driving this display'
+        : 'You hold input authority';
+      authoritySub.textContent =
+        'Keyboard, pointer, and paste input are scoped to this display. Release it before handing control back.';
+      authorityPill.classList.add('you');
+      authorityPill.textContent = 'you';
+      if (slot.interactive) {
+        authorityButton.classList.add('release');
+        authorityButton.textContent = 'Release control';
+        authorityButton.title = 'Release input and return this display to view-only';
+      } else {
+        authorityButton.textContent = 'Resume control';
+        authorityButton.title = 'Bind keyboard, pointer, and paste input to this display again';
+      }
+    } else if (state === 'other') {
+      authorityTitle.textContent = 'Another viewer has input';
+      authoritySub.textContent =
+        'Taking control is immediate and displaces the current viewer. Last take wins; there is no approval step.';
+      authorityPill.classList.add('other');
+      authorityPill.textContent = 'another viewer';
+      authorityButton.textContent = pending ? 'Requesting…' : 'Take control anyway';
+      authorityButton.title = 'Take input immediately and displace the current viewer';
+    } else if (state === 'unclaimed') {
+      authorityTitle.textContent = 'Input is available';
+      authoritySub.textContent =
+        'No dashboard viewer holds exclusive input. Take control to bind keyboard, pointer, and paste input here.';
+      authorityPill.textContent = 'available';
+      authorityButton.textContent = pending ? 'Requesting…' : 'Take control';
+      authorityButton.title = 'Take interactive control of this display';
+    } else {
+      authorityTitle.textContent = 'View only while input connects';
+      authoritySub.textContent =
+        'The stream can be watched now. Input controls become available when the authority state arrives.';
+      authorityPill.textContent = 'connecting';
+      authorityButton.textContent = pending ? 'Requesting…' : 'Take control';
+      authorityButton.title = 'Input authority is not available yet';
+    }
   }
-  function scheduleRail() {
-    if (railRaf) return;
-    railRaf = requestAnimationFrame(renderRail);
+
+  function visibilityMode(id) {
+    const visible = displayAgentVisibility.get(id);
+    if (visible === false) return 'private';
+    if (visible === true && userDisplayIds.has(id)) return 'agent';
+    return 'workspace';
   }
-  const observe = (el, opts) => {
-    if (!el) return;
-    new MutationObserver(scheduleRail).observe(el, opts);
+
+  function snapshotSlot(slot) {
+    const statusEl = slot.statusEl;
+    const mode = slot.interactive
+      ? 'interactive'
+      : slot.connected
+        ? 'connected'
+        : statusEl && statusEl.classList.contains('error')
+          ? 'error'
+          : statusEl && statusEl.classList.contains('warn')
+            ? 'warn'
+            : 'connecting';
+    return {
+      mode,
+      authority: slot.authorityState || 'unknown',
+      streaming: Boolean(slot.streaming),
+      recording: Boolean(slot.recording),
+      visibility: visibilityMode(Number(slot.displayId)),
+      shared: Boolean(slot.el && slot.el.classList.contains('shared-view-active')),
+      annotating: Boolean(slot.annotateBtn && slot.annotateBtn.classList.contains('active')),
+      callout: Boolean(slot.calloutBtn && slot.calloutBtn.getAttribute('aria-pressed') === 'true'),
+    };
+  }
+
+  function addDisplayActivity(displayId, kind, textValue) {
+    const id = Number(displayId);
+    const entries = activityByDisplay.get(id) || [];
+    const last = entries[entries.length - 1];
+    if (last && last.kind === kind && last.text === textValue) return;
+    entries.push({
+      seq: ++activitySeq,
+      kind,
+      text: textValue,
+      at: new Date(),
+    });
+    if (entries.length > 10) entries.splice(0, entries.length - 10);
+    activityByDisplay.set(id, entries);
+  }
+
+  function captureSlotActivity(slot) {
+    const id = Number(slot.displayId);
+    const next = snapshotSlot(slot);
+    const prev = slotSnapshots.get(id);
+    if (!prev) {
+      addDisplayActivity(id, 'neutral', 'Display became available');
+      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
+      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      if (next.visibility === 'private') addDisplayActivity(id, 'private', 'Private dashboard view started');
+      if (next.visibility === 'agent') addDisplayActivity(id, 'share', 'Display shared with the agent');
+      if (next.authority === 'you') addDisplayActivity(id, 'control', 'This dashboard holds input authority');
+      if (next.authority === 'other') addDisplayActivity(id, 'attention', 'Another viewer holds input authority');
+      if (next.shared) addDisplayActivity(id, 'focus', 'Agent shared this display with you');
+      slotSnapshots.set(id, next);
+      return;
+    }
+
+    if (prev.mode !== next.mode) {
+      if (next.mode === 'connected') addDisplayActivity(id, 'live', 'Live stream connected');
+      else if (next.mode === 'interactive') addDisplayActivity(id, 'control', 'Interactive input is active');
+      else if (next.mode === 'error') addDisplayActivity(id, 'error', 'The stream needs attention');
+      else if (next.mode === 'warn') addDisplayActivity(id, 'attention', 'The stream is reconnecting');
+      else addDisplayActivity(id, 'neutral', 'Connecting to the display');
+    }
+    if (prev.authority !== next.authority) {
+      if (next.authority === 'you') addDisplayActivity(id, 'control', 'You took input control');
+      else if (next.authority === 'other') addDisplayActivity(id, 'attention', 'Another viewer took input control');
+      else if (next.authority === 'unclaimed') addDisplayActivity(id, 'neutral', 'Input control was released');
+      else addDisplayActivity(id, 'neutral', 'Input authority is reconnecting');
+    }
+    if (prev.streaming !== next.streaming) {
+      addDisplayActivity(id, next.streaming ? 'share' : 'neutral',
+        next.streaming ? 'Presence stream started' : 'Presence stream stopped');
+    }
+    if (prev.recording !== next.recording) {
+      addDisplayActivity(id, next.recording ? 'recording' : 'neutral',
+        next.recording ? 'Recording started' : 'Recording stopped');
+    }
+    if (prev.visibility !== next.visibility) {
+      if (next.visibility === 'private') addDisplayActivity(id, 'private', 'Display changed to a private view');
+      else if (next.visibility === 'agent') addDisplayActivity(id, 'share', 'Display shared with the agent');
+      else addDisplayActivity(id, 'neutral', 'Agent display workspace active');
+    }
+    if (prev.shared !== next.shared) {
+      addDisplayActivity(id, next.shared ? 'focus' : 'neutral',
+        next.shared ? 'Agent shared this display with you' : 'Shared view ended');
+    }
+    if (prev.annotating !== next.annotating) {
+      addDisplayActivity(id, next.annotating ? 'focus' : 'neutral',
+        next.annotating ? 'Annotation editor opened' : 'Annotation editor closed');
+    }
+    if (prev.callout !== next.callout) {
+      addDisplayActivity(id, next.callout ? 'focus' : 'neutral',
+        next.callout ? 'Region callout armed' : 'Region callout cleared');
+    }
+    slotSnapshots.set(id, next);
+  }
+
+  function syncActivityList() {
+    const entries = selectedDisplayId === null
+      ? []
+      : activityByDisplay.get(selectedDisplayId) || [];
+    const signature = String(selectedDisplayId) + ':' +
+      entries.map(entry => String(entry.seq)).join(',');
+    if (signature === lastActivitySignature) return;
+    lastActivitySignature = signature;
+    activityList.replaceChildren();
+    if (!entries.length) {
+      activityList.appendChild(emptyHint(
+        selectedDisplayId === null
+          ? 'Select a display to see its connection, authority, sharing, and recording events.'
+          : 'Display events will appear here as its real state changes.'));
+      return;
+    }
+
+    for (const entry of entries.slice().reverse()) {
+      const row = document.createElement('div');
+      row.className = 'ui2-live-activity-row kind-' + entry.kind;
+      const dot = document.createElement('span');
+      dot.className = 'ui2-live-activity-dot';
+      dot.setAttribute('aria-hidden', 'true');
+      const textEl = document.createElement('span');
+      textEl.className = 'ui2-live-activity-text';
+      textEl.textContent = entry.text;
+      const time = document.createElement('time');
+      time.className = 'ui2-live-activity-time';
+      time.dateTime = entry.at.toISOString();
+      time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      row.appendChild(dot);
+      row.appendChild(textEl);
+      row.appendChild(time);
+      activityList.appendChild(row);
+    }
+  }
+
+  yourScreen.innerHTML =
+    '<div class="ui2-live-card ui2-live-screen-card">' +
+      '<div class="ui2-live-screen-head">' +
+        '<div class="ui2-live-card-title">Your screen</div>' +
+        '<span class="ui2-live-state-pill"></span>' +
+      '</div>' +
+      '<div class="ui2-live-card-sub"></div>' +
+      '<div class="ui2-live-screen-actions">' +
+        '<button class="ui2-live-card-btn secondary" type="button"></button>' +
+        '<button class="ui2-live-card-btn secondary" type="button"></button>' +
+      '</div>' +
+    '</div>';
+  const screenPill = yourScreen.querySelector('.ui2-live-state-pill');
+  const screenSub = yourScreen.querySelector('.ui2-live-card-sub');
+  const screenButtons = Array.from(yourScreen.querySelectorAll('.ui2-live-card-btn'));
+
+  function runScreenAction(action) {
+    if (action === 'view' && typeof startUserDisplayGrantFlow === 'function') {
+      startUserDisplayGrantFlow('view');
+    } else if (action === 'share' && typeof startUserDisplayGrantFlow === 'function') {
+      startUserDisplayGrantFlow('share');
+    } else if (action === 'upgrade' && typeof shareUserDisplayWithAgent === 'function') {
+      shareUserDisplayWithAgent();
+    } else if (action === 'revoke' && typeof revokeUserDisplayNow === 'function') {
+      revokeUserDisplayNow();
+    }
+  }
+  screenButtons.forEach(button => {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      runScreenAction(button.dataset.action || '');
+    });
+  });
+
+  function setScreenButton(button, config) {
+    if (!config) {
+      button.hidden = true;
+      button.dataset.action = '';
+      return;
+    }
+    button.hidden = false;
+    button.dataset.action = config.action;
+    button.textContent = config.label;
+    button.title = config.title;
+    button.className = 'ui2-live-card-btn ' + config.className;
+  }
+
+  function syncYourScreen() {
+    const granted = userDisplayGranted;
+    const shared = granted && userDisplayAgentVisible;
+    const signature = granted ? (shared ? 'agent' : 'private') : 'off';
+    if (signature === lastScreenSignature) return;
+    lastScreenSignature = signature;
+    screenPill.className = 'ui2-live-state-pill' + (shared ? ' other' : granted ? ' you' : '');
+    screenPill.textContent = shared ? 'agent can see this' : granted ? 'private view' : 'off';
+    if (!granted) {
+      screenSub.textContent =
+        'View this machine privately, or explicitly share a chosen screen with the agent for computer-use tasks.';
+      setScreenButton(screenButtons[0], {
+        action: 'view',
+        label: 'View this machine',
+        title: 'Private dashboard view. The agent cannot see this screen.',
+        className: 'secondary',
+      });
+      setScreenButton(screenButtons[1], {
+        action: 'share',
+        label: 'Share with agent…',
+        title: 'Choose a screen to share with the agent. Revocable at any time.',
+        className: 'secondary',
+      });
+    } else if (!shared) {
+      screenSub.textContent =
+        'This is a private dashboard view. The agent cannot enumerate, capture, or drive it.';
+      setScreenButton(screenButtons[0], {
+        action: 'revoke',
+        label: 'Stop viewing',
+        title: 'Close this private display view.',
+        className: 'danger',
+      });
+      setScreenButton(screenButtons[1], {
+        action: 'upgrade',
+        label: 'Share with agent',
+        title: 'Make this display visible to the agent for computer-use tasks.',
+        className: 'secondary',
+      });
+    } else {
+      screenSub.textContent =
+        'The agent can see and drive this screen for computer-use tasks until you revoke access.';
+      setScreenButton(screenButtons[0], {
+        action: 'revoke',
+        label: 'Revoke access',
+        title: 'Stop sharing this screen with the agent.',
+        className: 'danger',
+      });
+      setScreenButton(screenButtons[1], null);
+    }
+  }
+
+  function peerKey(chip, index) {
+    const host = chip.dataset.hostId || '';
+    const display = chip.dataset.displayId || '';
+    return host || display
+      ? host + ':' + display
+      : (chip.getAttribute('aria-label') || chip.textContent || String(index));
+  }
+
+  function createPeerRow(key) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'ui2-live-row';
+    row.innerHTML =
+      '<span class="ui2-live-row-dot" aria-hidden="true"></span>' +
+      '<span class="ui2-live-row-main">' +
+        '<span class="ui2-live-row-title"></span>' +
+        '<span class="ui2-live-row-meta">peer · opens in Station</span>' +
+      '</span>' +
+      '<span class="ui2-live-row-chev" aria-hidden="true">›</span>';
+    row.addEventListener('click', () => {
+      const chip = peerSources.get(key);
+      if (!chip || chip.disabled) return;
+      const hostId = chip.dataset.hostId || '';
+      const displayId = Number(chip.dataset.displayId || 0);
+      if (typeof routeTo === 'function') routeTo('station');
+      if (hostId && typeof stationOpenDisplay === 'function') {
+        stationOpenDisplay(hostId, displayId);
+      } else {
+        chip.click();
+      }
+    });
+    return {
+      row,
+      title: row.querySelector('.ui2-live-row-title'),
+    };
+  }
+
+  function syncPeerRows() {
+    const chips = Array.from(document.querySelectorAll('#station-peer-chips .station-peer-chip'));
+    peerSources.clear();
+    const liveKeys = new Set();
+    const ordered = [];
+    chips.forEach((chip, index) => {
+      const key = peerKey(chip, index);
+      liveKeys.add(key);
+      peerSources.set(key, chip);
+      let record = peerRows.get(key);
+      if (!record) {
+        record = createPeerRow(key);
+        peerRows.set(key, record);
+      }
+      record.row.disabled = chip.disabled;
+      record.row.classList.toggle('ok', !chip.disabled);
+      record.row.title = chip.disabled
+        ? (chip.title || 'Peer unavailable')
+        : (chip.title || 'Open this peer display in Station');
+      record.row.setAttribute('aria-label', chip.getAttribute('aria-label') || chip.textContent || 'Peer display');
+      record.title.textContent = chip.textContent || 'Peer display';
+      ordered.push(record);
+    });
+    for (const [key, record] of peerRows) {
+      if (liveKeys.has(key)) continue;
+      record.row.remove();
+      peerRows.delete(key);
+    }
+
+    let empty = peerList.querySelector('.ui2-live-rail-empty');
+    if (!ordered.length) {
+      if (!empty) {
+        empty = emptyHint('No peer displays advertised. Connected peers open in the Station workspace.');
+        peerList.appendChild(empty);
+      }
+      return;
+    }
+    if (empty) empty.remove();
+    orderRows(peerList, ordered);
+  }
+
+  function syncMobileSummary() {
+    if (!mobileSummary) return;
+    const slot = selectedSlot();
+    if (!slot) {
+      mobileSummary.textContent = 'No display selected';
+      return;
+    }
+    const state = slot.authorityState || 'unknown';
+    mobileSummary.textContent = slotLabel(slot) + ' · input ' + (AUTH_LABEL[state] || AUTH_LABEL.unknown);
+  }
+
+  function drawerFocusable() {
+    return Array.from(rail.querySelectorAll(
+      'button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), select:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])'
+    )).filter(element => element.getClientRects().length > 0);
+  }
+
+  function syncDrawerState(restoreFocus) {
+    const drawer = drawerMedia.matches;
+    const visible = !drawer || railOpen;
+    tab.classList.toggle('ui2-live-rail-open', drawer && railOpen);
+    rail.inert = !visible;
+    if (visible) rail.removeAttribute('aria-hidden');
+    else rail.setAttribute('aria-hidden', 'true');
+    if (railToggle) railToggle.setAttribute('aria-expanded', drawer && railOpen ? 'true' : 'false');
+    if (railScrim) {
+      railScrim.tabIndex = drawer && railOpen ? 0 : -1;
+      railScrim.setAttribute('aria-hidden', drawer && railOpen ? 'false' : 'true');
+    }
+    if (restoreFocus && railToggle && drawer) railToggle.focus();
+  }
+
+  function setRailOpen(open, restoreFocus) {
+    railOpen = drawerMedia.matches && Boolean(open);
+    syncDrawerState(Boolean(restoreFocus));
+    if (railOpen) {
+      requestAnimationFrame(() => {
+        const focusable = drawerFocusable();
+        (railClose || focusable[0] || rail).focus();
+      });
+    }
+  }
+
+  if (railToggle) railToggle.addEventListener('click', () => setRailOpen(!railOpen, false));
+  if (railClose) railClose.addEventListener('click', () => setRailOpen(false, true));
+  if (railScrim) railScrim.addEventListener('click', () => setRailOpen(false, true));
+  rail.addEventListener('keydown', event => {
+    if (!drawerMedia.matches || !railOpen || event.key !== 'Tab') return;
+    const focusable = drawerFocusable();
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && drawerMedia.matches && railOpen) {
+      event.preventDefault();
+      setRailOpen(false, true);
+    }
+  });
+  const onDrawerMediaChange = () => {
+    railOpen = false;
+    syncDrawerState(false);
   };
-  // Slots come and go / status text + authority chips restyle in place.
-  observe(document.getElementById('displays-container'),
-    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style'], characterData: true });
-  // Station peer chips re-render on peer_display_ready/removed.
-  observe(document.getElementById('station-peer-chips'),
-    { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'disabled', 'title'] });
-  // user_session grant chip flips text + .granted.
-  observe(document.getElementById('sb-display-access'),
-    { childList: true, attributes: true, attributeFilter: ['class'], characterData: true, subtree: true });
-  renderRail();
+  if (typeof drawerMedia.addEventListener === 'function') {
+    drawerMedia.addEventListener('change', onDrawerMediaChange);
+  } else if (typeof drawerMedia.addListener === 'function') {
+    drawerMedia.addListener(onDrawerMediaChange);
+  }
+
+  function renderWorkspace() {
+    railRaf = 0;
+    const slots = Array.from(displaySlots.values());
+    reconcileSelectedDisplay(slots);
+    for (const slot of slots) captureSlotActivity(slot);
+    syncDisplayRows(slots);
+    syncAuthorityCard();
+    syncActivityList();
+    syncPeerRows();
+    syncYourScreen();
+    syncMobileSummary();
+  }
+
+  function scheduleWorkspace() {
+    if (railRaf) return;
+    railRaf = requestAnimationFrame(renderWorkspace);
+  }
+
+  function observe(element, options) {
+    if (!element) return;
+    new MutationObserver(scheduleWorkspace).observe(element, options);
+  }
+  // The observer catches legacy direct DOM writes without rebuilding the
+  // rail. Keyed rows and stable authority/screen controls preserve focus;
+  // activity rendering is signature-gated, so the 3s metrics sampler is a
+  // no-op unless a real display state changed.
+  observe(container, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['class', 'style', 'aria-pressed', 'disabled'],
+  });
+  observe(document.getElementById('station-peer-chips'), {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['class', 'disabled', 'title', 'aria-label', 'data-host-id', 'data-display-id'],
+  });
+  observe(document.getElementById('sb-display-access'), {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['class'],
+  });
+
+  // Stable, side-effect-free browser QA surface. CDP cannot read the
+  // module-scoped displaySlots map directly, so dashboard acceptance
+  // probes use this documented window.qa convention.
+  window.qa = Object.assign(window.qa || {}, {
+    liveDisplay() {
+      return {
+        activeTab,
+        selectedDisplayId,
+        layout: drawerMedia.matches ? 'drawer' : 'rail',
+        railOpen: !drawerMedia.matches || railOpen,
+        userDisplayMode: userDisplayGranted
+          ? (userDisplayAgentVisible ? 'agent' : 'private')
+          : 'off',
+        slots: Array.from(displaySlots.values()).map(slot => {
+          const id = Number(slot.displayId);
+          return {
+            displayId: id,
+            selected: id === selectedDisplayId,
+            connected: Boolean(slot.connected),
+            firstFrameSeen: Boolean(slot._firstFrameSeen),
+            intrinsicWidth: Number(slot.videoEl && slot.videoEl.videoWidth) || 0,
+            intrinsicHeight: Number(slot.videoEl && slot.videoEl.videoHeight) || 0,
+            authorityState: slot.authorityState || 'unknown',
+            interactive: Boolean(slot.interactive),
+            agentVisible: displayAgentVisibility.has(id)
+              ? displayAgentVisibility.get(id)
+              : null,
+            streaming: Boolean(slot.streaming),
+            recording: Boolean(slot.recording),
+            activityCount: (activityByDisplay.get(id) || []).length,
+          };
+        }),
+      };
+    },
+  });
+
+  syncDrawerState(false);
+  renderWorkspace();
 })();

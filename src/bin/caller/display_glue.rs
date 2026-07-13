@@ -1598,7 +1598,12 @@ pub(crate) async fn handle_shared_view_calls(
                 }
             }
             "input" => {
-                bus.send(emit("input", None));
+                // `input` is the tool-call vocabulary; the browser event
+                // vocabulary is `input_request` (shared with the MCP path).
+                // Keeping that boundary canonical makes the dashboard show
+                // its user-clicked Take input affordance without granting
+                // authority automatically.
+                bus.send(emit("input_request", None));
                 format!(
                     "Input authority requested for {label}. The user must accept from the \
                      dashboard control — continue only after they take over or respond."
@@ -2067,6 +2072,7 @@ mod tests {
                 serde_json::json!({"action": "show", "display_target": "user_session"}),
             ),
             ("c4".to_string(), serde_json::json!({"action": "bogus"})),
+            ("c5".to_string(), serde_json::json!({"action": "input"})),
         ];
         handle_shared_view_calls(
             &calls,
@@ -2086,7 +2092,7 @@ mod tests {
             .iter()
             .filter(|m| m.role == "tool")
             .collect();
-        assert_eq!(results.len(), 4, "one result per call");
+        assert_eq!(results.len(), 5, "one result per call");
         assert!(
             results[0].content.contains("dismissed"),
             "{}",
@@ -2107,9 +2113,14 @@ mod tests {
             "{}",
             results[3].content
         );
+        assert!(
+            results[4].content.contains("Input authority requested"),
+            "{}",
+            results[4].content
+        );
 
-        // Only the valid hide emitted a SharedView event; the gated and
-        // invalid calls must not reach the dashboard.
+        // The valid hide and advisory input request emit SharedView events;
+        // gated and invalid calls must not reach the dashboard.
         match rx.try_recv() {
             Ok(AppEvent::SharedView {
                 action, session_id, ..
@@ -2118,6 +2129,15 @@ mod tests {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
             }
             other => panic!("expected SharedView hide event, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action, session_id, ..
+            }) => {
+                assert_eq!(action, "input_request");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected SharedView input_request event, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no further events expected");
     }

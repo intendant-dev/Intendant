@@ -210,6 +210,7 @@ function updateDisplayMetrics(d) {
 // declared in fragment 32 next to the display maps: earlier fragments
 // render against them at load time.)
 let displayPickerVisible = false;
+let displayPickerReturnFocus = null;
 // Which action the open picker performs: 'share' (agent access) or
 // 'view' (private remote view; the agent cannot see the display).
 let displayPickerMode = 'share';
@@ -218,15 +219,30 @@ var cachedDisplays = null;
 function hideDisplayPicker() {
   const picker = document.getElementById('display-picker');
   picker.classList.remove('visible');
+  picker.setAttribute('aria-hidden', 'true');
   displayPickerVisible = false;
+  const returnFocus = displayPickerReturnFocus;
+  displayPickerReturnFocus = null;
+  if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+    returnFocus.focus();
+  }
 }
 
 function showDisplayPicker(displays, mode) {
   displayPickerMode = mode === 'view' ? 'view' : 'share';
   const picker = document.getElementById('display-picker');
+  displayPickerReturnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
   picker.innerHTML = '';
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-modal', 'false');
+  picker.setAttribute('aria-label', displayPickerMode === 'view'
+    ? 'Choose a screen for your private dashboard view'
+    : 'Choose a screen to share with the agent');
   for (const d of displays) {
-    const item = document.createElement('div');
+    const item = document.createElement('button');
+    item.type = 'button';
     item.className = 'display-picker-item';
     const label = d.name + ' (' + d.width + 'x' + d.height + ')';
     item.textContent = label;
@@ -252,7 +268,8 @@ function showDisplayPicker(displays, mode) {
   if (displayPickerMode !== 'view' && virtualDisplaysAvailableNow()) {
     // Virtual displays are agent workspaces — offering one from the
     // private "View this machine" flow would conflate the two concepts.
-    const createItem = document.createElement('div');
+    const createItem = document.createElement('button');
+    createItem.type = 'button';
     createItem.className = 'display-picker-item dp-action';
     createItem.textContent = 'New virtual display';
     createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
@@ -289,7 +306,9 @@ function showDisplayPicker(displays, mode) {
     }
   }
   picker.classList.add('visible');
+  picker.setAttribute('aria-hidden', 'false');
   displayPickerVisible = true;
+  requestAnimationFrame(() => picker.querySelector('.display-picker-item')?.focus());
 }
 
 // Keyless "new virtual display": the daemon launches an Xvfb and registers
