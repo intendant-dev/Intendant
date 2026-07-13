@@ -246,7 +246,10 @@ mod tests {
     #[test]
     fn register_snapshot_unregister_roundtrip() {
         let reg = empty_registry();
-        reg.register("ws-1", conn(DashboardTabLane::LegacyWs, "trusted-local", 10));
+        reg.register(
+            "ws-1",
+            conn(DashboardTabLane::LegacyWs, "trusted-local", 10),
+        );
         reg.register(
             "sess-1",
             conn(DashboardTabLane::ControlTunnel, "trusted-local", 20),

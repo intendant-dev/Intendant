@@ -1445,8 +1445,7 @@ pub(crate) async fn ws_inbound_task(
                                 // Tab presence: annotate the session with the
                                 // offer's client-declared tab id, when sent.
                                 if let Some(tab) = json["tab_id"].as_str() {
-                                    dashboard_control_inbound
-                                        .note_tab_id(&answer.session_id, tab);
+                                    dashboard_control_inbound.note_tab_id(&answer.session_id, tab);
                                 }
                                 let msg = serde_json::json!({
                                     "t": "dashboard_control_answer",

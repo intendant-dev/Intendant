@@ -294,10 +294,8 @@ pub fn spawn_web_gateway(
     // with voice/input ownership joined from the two handles above at
     // query time. The /ws lane registers below at accept; the control
     // tunnel registers inside DashboardControlRegistry's answer/close.
-    let dashboard_tabs = DashboardTabsRegistry::new(
-        active_presence.clone(),
-        display_input_authority.clone(),
-    );
+    let dashboard_tabs =
+        DashboardTabsRegistry::new(active_presence.clone(), display_input_authority.clone());
 
     // Phase 5a.1 authority transition channel.  Each per-connection
     // outbound task subscribes; emit sites are the Request/Release
