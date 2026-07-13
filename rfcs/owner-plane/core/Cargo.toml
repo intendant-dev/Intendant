@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 sha2 = "0.10"
 chacha20 = "0.9"
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+aes-gcm = "0.10"
 
 [dev-dependencies]
 # The companion-schema drift gate (domains::tests) parses
