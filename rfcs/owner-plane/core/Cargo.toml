@@ -1,0 +1,19 @@
+[package]
+name = "owner-plane-core"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A reference core: canonical CBOR (E1-E10 writer side), hash domains (§2), vector RNG (§13.1). Fixture-minting implementation — the independent reducer must NOT share this code."
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+chacha20 = "0.9"
+
+[dev-dependencies]
+# The companion-schema drift gate (domains::tests) parses
+# ../d0a-vector-cases.v1.json.
+serde_json = "1"
+
+# Standalone: deliberately NOT a member of the intendant workspace —
+# the reference core lives and versions with the spec, not the daemon.
+[workspace]
