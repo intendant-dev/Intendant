@@ -531,20 +531,42 @@ pub(crate) async fn run_with_presence(
                         &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
                         &persistent_open_side_threads,
                     ) => {
+                        // Resolve like the drain and the external CLI idle
+                        // loop do: idle steers queue with their RESOLVED
+                        // target (side steers keep the side id), so the
+                        // cancel sweep must address the same target or a
+                        // still-queued side steer would falsely report
+                        // "nothing pending to clear".
+                        let Some((target_session_id, _target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
+                                Some(&persistent_open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
                         let cancelled = cancel_queued_steers_for_session(
                             &context_injection,
                             &bus,
-                            local_session_id.as_deref(),
-                            persistent_thread
-                                .as_ref()
-                                .map(|thread| thread.thread_id.as_str()),
+                            target_session_id.as_deref(),
+                            if target_session_id == local_session_id {
+                                persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.as_str())
+                            } else {
+                                None
+                            },
                             id.as_deref(),
                             &reason,
                         );
                         if cancelled == 0 {
                             emit_steer_cancel_failed_for_unmatched(
                                 &bus,
-                                session_id.or_else(|| local_session_id.clone()),
+                                target_session_id.or_else(|| local_session_id.clone()),
                                 id,
                                 STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
                             );
