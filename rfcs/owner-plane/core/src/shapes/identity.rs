@@ -262,49 +262,6 @@ impl ToValue for Grant {
     }
 }
 
-impl Grant {
-    /// A minimal well-formed grant for scenario builders: single
-    /// tenant/zone/space, no optional levers. Cross-field validity
-    /// (budgets, lineage-on-authoring) stays the caller's duty.
-    pub fn minimal(
-        plane_id: Bytes32,
-        grant_id: Bytes16,
-        subject_device: Bytes16,
-        lineage: Option<Bytes16>,
-        zone: Bytes16,
-        space: Bytes16,
-        ops: Vec<Verb>,
-        issued_admin_epoch: u64,
-        capability_epoch: u64,
-    ) -> Grant {
-        Grant {
-            plane_id,
-            grant_id,
-            subject_device,
-            lineage,
-            tenants: vec![GrantTenant::Memory],
-            zone: ZoneSel::Zone(zone),
-            spaces: SpacesSel::Spaces(vec![space]),
-            ops,
-            kinds: None,
-            class_ceiling: Class::Sensitive,
-            can_declassify: None,
-            can_raise: None,
-            raise_quota: None,
-            flows: None,
-            budget: Some(Budget {
-                max_ops: 1_000_000,
-                max_bytes: 268_435_456,
-            }),
-            online_lease: false,
-            max_age_ms: None,
-            issued_admin_epoch,
-            capability_epoch,
-            expiry_deadline_ms: None,
-        }
-    }
-}
-
 /// `flow = { from_zone: ulid, ? from_space: ulid, to: endpoint,
 ///   ? kinds: [+ kind], class_ceiling: class, expiry_deadline_ms: ms }`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,6 +397,7 @@ impl ToValue for Authproof {
     }
 }
 
+#[cfg(test)]
 pub(crate) const CDDL_PINS_IDENTITY: &[&str] = &[
     r#"genesis = { v: 1, suite: "suite-v1", root_sig_alg: sigalg,
   root_sig_pk: bstr, recovery_commitment: bytes32,
@@ -556,18 +514,32 @@ mod tests {
     }
 
     #[test]
-    fn grant_minimal_and_selectors() {
-        let g = Grant::minimal(
-            [1; 32],
-            [2; 16],
-            [3; 16],
-            Some([4; 16]),
-            [5; 16],
-            [6; 16],
-            vec![Verb::Propose, Verb::Read],
-            1,
-            1,
-        );
+    fn grant_fields_and_selectors() {
+        let g = Grant {
+            plane_id: [1; 32],
+            grant_id: [2; 16],
+            subject_device: [3; 16],
+            lineage: Some([4; 16]),
+            tenants: vec![GrantTenant::Memory],
+            zone: ZoneSel::Zone([5; 16]),
+            spaces: SpacesSel::Spaces(vec![[6; 16]]),
+            ops: vec![Verb::Propose, Verb::Read],
+            kinds: None,
+            class_ceiling: Class::Sensitive,
+            can_declassify: None,
+            can_raise: None,
+            raise_quota: None,
+            flows: None,
+            budget: Some(Budget {
+                max_ops: 1_000_000,
+                max_bytes: 268_435_456,
+            }),
+            online_lease: false,
+            max_age_ms: None,
+            issued_admin_epoch: 1,
+            capability_epoch: 1,
+            expiry_deadline_ms: None,
+        };
         let v = g.to_value();
         assert_eq!(
             map_keys(&v),

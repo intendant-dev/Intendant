@@ -19,6 +19,8 @@
 
 use crate::cbor::{self, Value};
 
+pub mod control;
+pub mod envelope;
 pub mod identity;
 
 /// Everything the shape layer emits implements this.
@@ -105,6 +107,7 @@ macro_rules! closed_vocab {
         }
     };
 }
+pub(crate) use closed_vocab;
 
 closed_vocab!(Sigalg { Ed25519 => "ed25519", P256 => "p256" });
 
@@ -532,6 +535,7 @@ impl ToValue for Erasemref {
 
 // ---- the verbatim CDDL pins (checked against the spec by test) ----
 
+#[cfg(test)]
 pub(crate) const CDDL_PINS_COMMON: &[&str] = &[
     r#"bytes16 = bstr .size 16    bytes32 = bstr .size 32
 ulid = bytes16             ms = uint
