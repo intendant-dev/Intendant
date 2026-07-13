@@ -662,6 +662,11 @@ pub(crate) fn control_frame_response(
                     ),
                     "dashboard targets",
                 )),
+                "api_dashboard_tabs" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::dashboard_tabs_api_response(&runtime.tabs),
+                    "dashboard tabs",
+                )),
                 "api_access_overview" => {
                     let current_principal = runtime.grant.access_principal();
                     let cert_dir = crate::access::backend::select_backend().cert_dir();

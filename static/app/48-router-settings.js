@@ -339,6 +339,7 @@ function switchTab(tabId) {
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
     refreshAccessEnrollments({ silent: true }).catch(() => {});
     refreshAccessConnectStatus({ silent: true }).catch(() => {});
+    refreshDashboardTabs({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
   flushPaneRenders(tabId);

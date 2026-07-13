@@ -976,6 +976,7 @@ class DashboardControlTransport {
           daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
           sdp,
           client_nonce: this.clientNonce,
+          tab_id: INTENDANT_TAB_ID,
           ...identity,
           ...(orgGrant ? { org_grant: orgGrant } : {}),
         });
@@ -1000,6 +1001,7 @@ class DashboardControlTransport {
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
+        tab_id: INTENDANT_TAB_ID,
         ...identity,
         ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
@@ -1011,7 +1013,7 @@ class DashboardControlTransport {
       return answer;
     } catch (err) {
       console.warn('[dashboard-control] local offer signaling failed', err);
-      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce })) {
+      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce, tab_id: INTENDANT_TAB_ID })) {
         this.signalingMode = 'websocket-fallback';
         dashboardUpdateTransportStatus();
         return null;
