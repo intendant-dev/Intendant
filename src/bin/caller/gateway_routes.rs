@@ -284,6 +284,9 @@ pub(crate) enum RouteHandlerId {
     /// connect status payload).
     AccessFleetCertRequest,
     DashboardTargets,
+    /// Live dashboard connections (tab presence): the tabs registry
+    /// snapshot with voice/input-authority ownership joined in.
+    DashboardTabs,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
     /// declarations are a deliberate follow-up, not part of the
@@ -1509,6 +1512,15 @@ pub(crate) static ROUTES: &[Route] = &[
         "Dashboard target list (this daemon + connected peers)",
     )
     .with_tunnel(tunnel_method("api_dashboard_targets")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/dashboard/tabs"),
+        PeerOperation::AccessInspect,
+        BodyPolicy::None,
+        RouteHandlerId::DashboardTabs,
+        "Live dashboard connections (open tabs) with voice/input-authority holders",
+    )
+    .with_tunnel(tunnel_method("api_dashboard_tabs")),
     // ── Federation surface: registry, pairing, quick controls,
     //    capability routing. Carved per-leaf rows (S7) declare each
     //    leaf's datachannel twin — the twin's IAM operation derives from

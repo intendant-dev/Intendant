@@ -435,6 +435,7 @@ pub struct DashboardControlRegistry {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+    tabs: crate::web_gateway::DashboardTabsRegistry,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
@@ -481,12 +482,23 @@ pub struct PeerAttribution {
 }
 
 impl DashboardControlGrant {
-    fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::TrustedLocal => "trusted-local",
             Self::UserClientRoot { principal } => principal.label.as_str(),
             Self::UserClient { principal, .. } => principal.label.as_str(),
             Self::Peer { label, .. } => label.as_str(),
+        }
+    }
+
+    /// Coarse provenance bucket for the tabs-presence surface: the
+    /// owner's own dashboard, an enrolled client key, or a federated
+    /// peer / delegation-lane connection.
+    pub(crate) fn connection_kind(&self) -> &'static str {
+        match self {
+            Self::TrustedLocal => "local",
+            Self::UserClientRoot { .. } | Self::UserClient { .. } => "client",
+            Self::Peer { .. } => "peer",
         }
     }
 
@@ -792,6 +804,7 @@ impl DashboardControlRegistry {
         presence: Option<DashboardPresenceBridge>,
         ice_config: crate::display::IceConfig,
         tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+        tabs: crate::web_gateway::DashboardTabsRegistry,
     ) -> Self {
         Self {
             config,
@@ -810,9 +823,23 @@ impl DashboardControlRegistry {
             presence,
             ice_config,
             tcp_peer_registry,
+            tabs,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The live tabs-presence registry (shared with the `/ws` lane); the
+    /// HTTP `GET /api/dashboard/tabs` handler reads it through here.
+    pub(crate) fn tabs(&self) -> &crate::web_gateway::DashboardTabsRegistry {
+        &self.tabs
+    }
+
+    /// Annotate a control session with the client-declared tab id from
+    /// its offer body (the offer paths learn the id after `answer_offer`
+    /// has registered the session).
+    pub(crate) fn note_tab_id(&self, session_id: &str, tab_id: &str) {
+        self.tabs.note_tab_id(session_id, tab_id);
     }
 
     #[allow(dead_code)]
@@ -878,6 +905,18 @@ impl DashboardControlRegistry {
         tcp_advertised_addr: Option<SocketAddr>,
     ) -> Result<DashboardControlAnswer, String> {
         let identity = self.identity().await?;
+        // Captured before `grant` moves into the session task; the tab id
+        // (when the offer carried one) is annotated post-answer via
+        // `note_tab_id`.
+        let tab_entry = crate::web_gateway::DashboardTabConnection {
+            lane: crate::web_gateway::DashboardTabLane::ControlTunnel,
+            kind: grant.connection_kind(),
+            label: grant.label().to_string(),
+            tab_id: None,
+            remote: None,
+            user_agent: None,
+            connected_at_unix_ms: crate::web_gateway::now_unix_ms(),
+        };
         let (peer, answer_sdp, binding) = DashboardControlPeer::answer_offer(
             session_id.clone(),
             offer_sdp,
@@ -902,10 +941,12 @@ impl DashboardControlRegistry {
             tcp_advertised_addr,
             identity,
             grant,
+            self.tabs.clone(),
         )
         .await
         .map_err(|e| e.to_string())?;
         self.peers.lock().await.insert(session_id.clone(), peer);
+        self.tabs.register(&session_id, tab_entry);
         Ok(DashboardControlAnswer {
             session_id,
             sdp: answer_sdp,
@@ -927,6 +968,7 @@ impl DashboardControlRegistry {
     }
 
     pub async fn close(&self, session_id: &str) {
+        self.tabs.unregister(session_id);
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
         }
@@ -1065,6 +1107,7 @@ impl DashboardControlPeer {
         tcp_advertised_addr: Option<SocketAddr>,
         identity: Arc<DaemonIdentity>,
         grant: DashboardControlGrant,
+        tabs: crate::web_gateway::DashboardTabsRegistry,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let local_ufrag = new_control_ice_fragment();
         let local_pwd = new_control_ice_password();
@@ -1177,6 +1220,7 @@ impl DashboardControlPeer {
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
             grant,
+            tabs,
             state_root: crate::platform::intendant_home(),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
@@ -1263,6 +1307,9 @@ pub(crate) struct ControlRuntime {
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
     grant: DashboardControlGrant,
+    /// The live tabs-presence registry (shared with the `/ws` lane) —
+    /// serves the `api_dashboard_tabs` twin.
+    tabs: crate::web_gateway::DashboardTabsRegistry,
     /// The daemon state root (`intendant_home()`), resolved once at the
     /// control-channel edge. Adapters that fall back to the daemon-global
     /// store (uploads, transfers) resolve their scope against this instead
@@ -2347,6 +2394,10 @@ mod tests {
             control_frames_tx: None,
             display_peer_id: 1,
             grant: DashboardControlGrant::TrustedLocal,
+            tabs: crate::web_gateway::DashboardTabsRegistry::new(
+                Arc::new(std::sync::Mutex::new(None)),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            ),
             // Per-instance scratch (never the machine's real ~/.intendant):
             // projectless adapters resolve the daemon-global store under
             // this root. PID+nanos, per the state_paths uniqueness rule.
@@ -3075,6 +3126,7 @@ mod tests {
                 Some(Op::AccessInspect),
             ),
             ("api_dashboard_targets", Row, Some(Op::AccessInspect)),
+            ("api_dashboard_tabs", Row, Some(Op::AccessInspect)),
             ("api_access_connect_status", Row, Some(Op::AccessInspect)),
             ("api_access_connect_claim_code", Row, Some(Op::AccessManage)),
             ("api_access_connect_config", Row, Some(Op::AccessManage)),
@@ -3574,6 +3626,7 @@ mod tests {
             "api_access_set_hosted_ceiling",
             "api_fleet_cert_request",
             "api_dashboard_targets",
+            "api_dashboard_tabs",
             "api_access_org_trust",
             "api_access_org_revoke",
             "api_access_org_issue",

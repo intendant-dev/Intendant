@@ -23353,6 +23353,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
             <div id="access-identity-hero" class="acc-hero-grid"></div>
             <div id="access-tier-card"></div>
             <div id="access-connect-card"></div>
+            <div id="access-tabs-card"></div>
             <div class="acc-section-head">
               <div class="acc-section-title">Fleet</div>
               <div class="acc-section-sub">Every daemon you can reach from here. Each one still decides locally what you may do.</div>
@@ -26169,7 +26170,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '1069e3a0dd20e6b2';
+const INTENDANT_APP_BUILD = 'eb4d9541ca580e78';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -26204,12 +26205,36 @@ function maybeNudgeStaleBuild(serverBuild) {
   });
 }
 
+// ── Per-tab identity ──
+//
+// A random id minted once per browser tab (sessionStorage is per-tab and
+// survives reloads). Sent on both event lanes — `?tab=` on the /ws URL
+// and `tab_id` in control-tunnel offers — so the daemon's tab-presence
+// surface (`api_dashboard_tabs`, Access pane) can group one tab's
+// connections and this tab can recognize itself in the list. Opaque and
+// authority-free: the daemon sanitizes it and uses it for display only.
+const INTENDANT_TAB_ID = (() => {
+  try {
+    const stored = sessionStorage.getItem('intendant_tab_id') || '';
+    if (/^[A-Za-z0-9_-]{8,64}$/.test(stored)) return stored;
+    const minted = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    sessionStorage.setItem('intendant_tab_id', minted);
+    return minted;
+  } catch (_) {
+    // Private-mode/storage-denied fallback: stable for this page load only.
+    return 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+})();
+
 // QA readback (window.qa convention) + one explicit test hook: the build
 // stamp and nudge state are module-scoped, and the mismatch path can only
 // be exercised for real by building a second bundle — the hook lets the
 // lane-verify harness drive it with a synthetic server stamp instead.
 window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  tabId: () => INTENDANT_TAB_ID,
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
 });
 
@@ -26290,6 +26315,9 @@ function buildWsUrl(path) {
     const sep = url.includes('?') ? '&' : '?';
     url += sep + 'token=' + encodeURIComponent(token);
   }
+  // Tab presence: browsers can't set headers on WebSocket opens, so the
+  // per-tab id rides the URL the same way the token does.
+  url += (url.includes('?') ? '&' : '?') + 'tab=' + encodeURIComponent(INTENDANT_TAB_ID);
   return url;
 }
 
@@ -27609,6 +27637,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
   api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
   api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
+  api_dashboard_tabs: { verb: 'GET', path: '/api/dashboard/tabs' },
   api_access_org_trust: { verb: 'POST', path: '/api/access/orgs/trust' },
   api_access_org_revoke: { verb: 'POST', path: '/api/access/orgs/revoke' },
   api_access_org_issue: { verb: 'POST', path: '/api/access/org-grants/issue' },
@@ -55004,6 +55033,41 @@ async function refreshAccessConnectStatus(options = {}) {
   }
 }
 
+/* Live dashboard connections (tab presence): who else has this daemon's
+   dashboard open, over which lane, and who holds voice / display input.
+   Pull-based like the overview; renderers read the cached payload. */
+let dashboardTabsPresence = null;
+
+async function refreshDashboardTabs(options = {}) {
+  try {
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_dashboard_tabs', {}, {
+      signal: options.signal,
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error(`/api/dashboard/tabs returned ${resp.status}`);
+    const payload = resp.body;
+    const changed = JSON.stringify(payload) !== JSON.stringify(dashboardTabsPresence);
+    dashboardTabsPresence = payload;
+    if (changed) renderAccessAdminSummaries();
+    return payload;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) console.warn('[dashboard-tabs] refresh failed', err);
+    return null;
+  }
+}
+
+// Presence changes when OTHER tabs connect or leave — nothing pushes that
+// to this tab (v1 is pull-only), so poll gently, and only while the
+// Access pane is actually on screen in a foreground tab.
+setInterval(() => {
+  if (typeof paneIsVisible === 'function' && paneIsVisible('access')
+      && document.visibilityState === 'visible') {
+    refreshDashboardTabs({ silent: true }).catch(() => {});
+  }
+}, 15000);
+
 async function accessConnectFetchClaimCode() {
   // daemonApi (transport F4): GET twin, so the derived policy allows the
   // direct-HTTP retry after a failed tunnel attempt (the legacy call site
@@ -58291,6 +58355,118 @@ function renderAccessIdentityHero() {
   }));
 }
 
+// ── Open dashboards (tab presence) ──
+//
+// Rendered from `dashboardTabsPresence` (42b refresher over
+// api_dashboard_tabs). Browser-tab connections group by their
+// client-declared tab id — one tab can hold both event lanes — and this
+// tab recognizes itself by INTENDANT_TAB_ID. Peer-daemon connections
+// (kind "peer") are counted separately: they're machines, not tabs.
+function accessTabsBrowserName(ua) {
+  if (!ua) return '';
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  if (/Safari\//.test(ua)) return 'Safari';
+  return '';
+}
+
+function renderAccessTabsCard() {
+  const mount = document.getElementById('access-tabs-card');
+  if (!mount) return;
+  mount.textContent = '';
+  const payload = dashboardTabsPresence;
+  // Older daemon (no api_dashboard_tabs) or nothing fetched yet: stay
+  // invisible, exactly like the Connect card.
+  if (!payload || !Array.isArray(payload.connections)) return;
+
+  const tabs = new Map();
+  const untagged = [];
+  const peers = [];
+  for (const c of payload.connections) {
+    if (c.kind === 'peer') { peers.push(c); continue; }
+    if (c.tab_id) {
+      if (!tabs.has(c.tab_id)) tabs.set(c.tab_id, []);
+      tabs.get(c.tab_id).push(c);
+    } else {
+      untagged.push(c);
+    }
+  }
+  const groups = [...tabs.values(), ...untagged.map(c => [c])];
+  const tabCount = groups.length;
+
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Open dashboards';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  const parts = [`${tabCount} ${tabCount === 1 ? 'tab is' : 'tabs are'} connected to this daemon right now.`];
+  if (peers.length) {
+    parts.push(`${peers.length} peer ${peers.length === 1 ? 'daemon holds' : 'daemons hold'} a control connection.`);
+  }
+  sub.textContent = parts.join(' ');
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const fmtSince = (ms) => {
+    if (!ms) return '';
+    try {
+      return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (_) { return ''; }
+  };
+
+  const renderRow = (conns, { isPeer } = {}) => {
+    const first = conns[0];
+    const browser = accessTabsBrowserName(conns.map(c => c.user_agent).find(Boolean));
+    const isThisTab = !isPeer && first.tab_id
+      && typeof INTENDANT_TAB_ID !== 'undefined' && first.tab_id === INTENDANT_TAB_ID;
+
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const headRow = document.createElement('div');
+    headRow.className = 'acc-principal-head';
+    const glyphEl = document.createElement('div');
+    glyphEl.className = `acc-principal-glyph kind-${isPeer ? 'peer' : 'local'}`;
+    glyphEl.textContent = isPeer ? 'P' : (browser ? browser[0] : 'T');
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = isPeer
+      ? `Peer daemon · ${first.label || 'peer'}`
+      : `${browser || 'Dashboard tab'}${isThisTab ? ' — this tab' : ''}`;
+    const kindLine = document.createElement('div');
+    kindLine.className = 'acc-principal-kind';
+    const details = [];
+    if (!isPeer && first.label && first.label !== 'trusted-local') details.push(first.label);
+    const lanes = [...new Set(conns.map(c => c.lane === 'tunnel' ? 'control tunnel' : 'WebSocket'))];
+    details.push(lanes.join(' + '));
+    const since = fmtSince(Math.min(...conns.map(c => Number(c.connected_at_unix_ms) || Infinity)));
+    if (since) details.push(`since ${since}`);
+    const remote = conns.map(c => c.remote).find(Boolean);
+    if (remote) details.push(`from ${remote}`);
+    kindLine.textContent = details.join(' · ');
+    nameWrap.append(name, kindLine);
+    headRow.append(glyphEl, nameWrap);
+    if (conns.some(c => c.voice_active)) {
+      headRow.appendChild(accessRouteChip('webrtc', 'holds voice',
+        'This connection owns the live voice presence; only one tab can at a time.'));
+    }
+    const inputDisplays = [...new Set(conns.flatMap(c => Array.isArray(c.input_display_ids) ? c.input_display_ids : []))].sort((a, b) => a - b);
+    if (inputDisplays.length) {
+      headRow.appendChild(accessRouteChip('mtls', `holds display input (${inputDisplays.join(', ')})`,
+        'This connection holds exclusive input authority on the listed display ids.'));
+    }
+    card.appendChild(headRow);
+    return card;
+  };
+
+  for (const conns of groups) mount.appendChild(renderRow(conns));
+  for (const p of peers) mount.appendChild(renderRow([p], { isPeer: true }));
+}
+
 function renderAccessFleetStrip() {
   const mount = document.getElementById('access-fleet-strip');
   if (!mount) return;
@@ -60179,6 +60355,9 @@ function renderAccessAdminSummaries() {
       avail('api_access_connect_unclaim'), avail('api_fleet_cert_request'),
     ]),
     renderAccessConnectCard);
+  accessGuardedRender('access-tabs-card',
+    accessSectionFp([dashboardTabsPresence]),
+    renderAccessTabsCard);
   accessGuardedRender('access-fleet-strip',
     accessSectionFp([targetsFp, daemonsFp, transportFp, peersFp]),
     renderAccessFleetStrip);
@@ -67951,6 +68130,7 @@ function switchTab(tabId) {
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
     refreshAccessEnrollments({ silent: true }).catch(() => {});
     refreshAccessConnectStatus({ silent: true }).catch(() => {});
+    refreshDashboardTabs({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
   flushPaneRenders(tabId);
@@ -73377,6 +73557,7 @@ class DashboardControlTransport {
           daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
           sdp,
           client_nonce: this.clientNonce,
+          tab_id: INTENDANT_TAB_ID,
           ...identity,
           ...(orgGrant ? { org_grant: orgGrant } : {}),
         });
@@ -73401,6 +73582,7 @@ class DashboardControlTransport {
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
+        tab_id: INTENDANT_TAB_ID,
         ...identity,
         ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
@@ -73412,7 +73594,7 @@ class DashboardControlTransport {
       return answer;
     } catch (err) {
       console.warn('[dashboard-control] local offer signaling failed', err);
-      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce })) {
+      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce, tab_id: INTENDANT_TAB_ID })) {
         this.signalingMode = 'websocket-fallback';
         dashboardUpdateTransportStatus();
         return null;

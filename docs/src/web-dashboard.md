@@ -802,6 +802,23 @@ hints. The browser may refine the local route label to **Intendant Connect**,
 current page was reached, but it should not invent principal/grant/policy
 vocabulary.
 
+`GET /api/dashboard/tabs` / `api_dashboard_tabs` (`access.inspect`) is the
+**tab-presence** surface: every live dashboard connection on either event lane
+(the `/ws` WebSocket or a dashboard-control tunnel session), each entry
+carrying its lane, grant provenance (`local` / `client` / `peer`), grant
+label, remote host, user agent, connect time, and whether it currently holds
+the voice presence or display input authority (with display ids). Browser
+tabs group by a client-declared per-tab id: the SPA mints a random id in
+`sessionStorage` and sends it as `?tab=` on the `/ws` URL and `tab_id` in
+control-tunnel offers. The id is sanitized, display-only, and grants nothing;
+server-internal connection ids never appear in the payload (the same rule the
+input-authority wire follows). The Access **Overview** renders this as the
+**Open dashboards** card — "N tabs connected · this tab · holds voice /
+display input" — refreshed on pane entry and every 15 s while the pane is
+visible; peer-daemon control connections are counted separately from tabs.
+Hosted Connect offers relayed through the rendezvous don't carry the tab id
+yet (the relay envelope drops unknown fields), so those sessions list untagged.
+
 ### Debug
 
 Observer display and browser workspaces (daemon diagnostics and raw event
@@ -2097,6 +2114,7 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
 | POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
+| GET | `/api/dashboard/tabs` | AccessInspect | own origin | none | Live dashboard connections (open tabs) with voice/input-authority holders |
 | POST | `/api/peers/pairing/invite` | federation (per method/path) | own origin | bounded | Issue a peer-scoped mTLS pairing invite |
 | POST | `/api/peers/pairing/request-access` | federation (per method/path) | own origin | bounded | Start an outgoing access request against a remote daemon's doorbell |
 | POST | `/api/peers/pairing/request-access/poll` | federation (per method/path) | own origin | bounded | Poll an outgoing access request (installs the approved identity) |
