@@ -540,6 +540,41 @@ async function refreshAccessConnectStatus(options = {}) {
   }
 }
 
+/* Live dashboard connections (tab presence): who else has this daemon's
+   dashboard open, over which lane, and who holds voice / display input.
+   Pull-based like the overview; renderers read the cached payload. */
+let dashboardTabsPresence = null;
+
+async function refreshDashboardTabs(options = {}) {
+  try {
+    // daemonApi (transport F4): GET twin — read fallback policy.
+    const resp = await daemonApi.request('api_dashboard_tabs', {}, {
+      signal: options.signal,
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error(`/api/dashboard/tabs returned ${resp.status}`);
+    const payload = resp.body;
+    const changed = JSON.stringify(payload) !== JSON.stringify(dashboardTabsPresence);
+    dashboardTabsPresence = payload;
+    if (changed) renderAccessAdminSummaries();
+    return payload;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) console.warn('[dashboard-tabs] refresh failed', err);
+    return null;
+  }
+}
+
+// Presence changes when OTHER tabs connect or leave — nothing pushes that
+// to this tab (v1 is pull-only), so poll gently, and only while the
+// Access pane is actually on screen in a foreground tab.
+setInterval(() => {
+  if (typeof paneIsVisible === 'function' && paneIsVisible('access')
+      && document.visibilityState === 'visible') {
+    refreshDashboardTabs({ silent: true }).catch(() => {});
+  }
+}, 15000);
+
 async function accessConnectFetchClaimCode() {
   // daemonApi (transport F4): GET twin, so the derived policy allows the
   // direct-HTTP retry after a failed tunnel attempt (the legacy call site

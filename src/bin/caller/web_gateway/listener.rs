@@ -290,6 +290,15 @@ pub fn spawn_web_gateway(
     let display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> =
         Arc::new(StdRwLock::new(HashMap::new()));
 
+    // Tab presence (Access pane): live connections on both event lanes,
+    // with voice/input ownership joined from the two handles above at
+    // query time. The /ws lane registers below at accept; the control
+    // tunnel registers inside DashboardControlRegistry's answer/close.
+    let dashboard_tabs = DashboardTabsRegistry::new(
+        active_presence.clone(),
+        display_input_authority.clone(),
+    );
+
     // Phase 5a.1 authority transition channel.  Each per-connection
     // outbound task subscribes; emit sites are the Request/Release
     // ControlMsg handlers, the WS-close cleanup, and the DisplayReady
@@ -487,6 +496,7 @@ pub fn spawn_web_gateway(
         Some(dashboard_presence),
         ice_config.clone(),
         Arc::clone(&tcp_peer_registry),
+        dashboard_tabs.clone(),
     ));
     crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
@@ -777,6 +787,7 @@ pub fn spawn_web_gateway(
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
+            let dashboard_tabs = dashboard_tabs.clone();
             let authority_change_tx = authority_change_tx.clone();
             let federated_authority_subscribers = federated_authority_subscribers.clone();
             let last_usage_json = last_usage_json.clone();
@@ -1291,6 +1302,26 @@ pub fn spawn_web_gateway(
                     // Per-connection identity for active/passive tracking
                     let connection_id = uuid::Uuid::new_v4().to_string();
 
+                    // Tab presence: register this event-lane connection.
+                    // The tab id is client-declared (`?tab=` beside the
+                    // token — browsers can't set headers on WebSocket
+                    // opens); ws_inbound_task unregisters on close.
+                    dashboard_tabs.register(
+                        &connection_id,
+                        DashboardTabConnection {
+                            lane: DashboardTabLane::LegacyWs,
+                            kind: dashboard_control_grant_for_ws.connection_kind(),
+                            label: dashboard_control_grant_for_ws.label().to_string(),
+                            tab_id: extract_query_param(
+                                header_text.lines().next().unwrap_or(""),
+                                "tab",
+                            ),
+                            remote: browser_host_ip.map(|ip| ip.to_string()),
+                            user_agent: extract_header_value(&header_text, "user-agent"),
+                            connected_at_unix_ms: now_unix_ms(),
+                        },
+                    );
+
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
@@ -1666,6 +1697,7 @@ pub fn spawn_web_gateway(
                         authority_change_tx: authority_change_tx.clone(),
                         federated_authority_subscribers: federated_authority_subscribers.clone(),
                         connection_id: connection_id.clone(),
+                        dashboard_tabs: dashboard_tabs.clone(),
                         frame_registry: frame_registry.clone(),
                         recording_registry: recording_registry.clone(),
                         session_log: session_log.clone(),

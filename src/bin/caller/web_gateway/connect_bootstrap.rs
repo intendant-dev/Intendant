@@ -106,6 +106,11 @@ pub(crate) async fn connect_dashboard_offer_response(
         .await
     {
         Ok(answer) => {
+            // Tab presence: annotate the session with the offer's
+            // client-declared tab id, when sent.
+            if let Some(tab) = body.get("tab_id").and_then(|v| v.as_str()) {
+                dashboard_control.note_tab_id(&answer.session_id, tab);
+            }
             let mut response = serde_json::json!({
                 "ok": true,
                 "signaling": "connect-bootstrap-local",
