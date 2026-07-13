@@ -4203,6 +4203,29 @@ pub(crate) fn managed_context_fission_response_from_home(
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
+/// Best-effort message-search tombstoning for a deliberate session
+/// deletion. Never creates the store (a box that never ran the indexer
+/// has nothing to tombstone) and never fails the deletion.
+fn tombstone_search_shards(home: &Path, session_keys: &[String]) {
+    let root = crate::platform::intendant_home_in(home)
+        .join("cache")
+        .join("message_search")
+        .join("v1");
+    if !root.exists() {
+        return;
+    }
+    match crate::message_search::Store::open(&root) {
+        Ok(store) => {
+            for key in session_keys {
+                if let Err(err) = store.delete_session(key) {
+                    eprintln!("[message-search] tombstone {key} failed: {err}");
+                }
+            }
+        }
+        Err(err) => eprintln!("[message-search] store open for tombstone failed: {err}"),
+    }
+}
+
 pub(crate) fn delete_session_data(home: &Path, session_id: &str, target: &str) -> String {
     // Path traversal protection
     if !session_lookup_id_is_safe(session_id) {
@@ -4248,8 +4271,17 @@ pub(crate) fn delete_session_data(home: &Path, session_id: &str, target: &str) -
         "session" => {
             let bytes = dir_byte_size(&dir);
             let external_delete_target = external_delete_target_for_intendant_session_dir(&dir);
+            // Deliberate deletion also tombstones the message-search
+            // shard(s): the session vanishes from search immediately and
+            // can never resurrect from stale sources (plan §6) — instead
+            // of riding `source_gone` until the retention window expires.
+            let mut search_tombstones = vec![format!("intendant:{session_id}")];
+            if let Some((source, external_id)) = &external_delete_target {
+                search_tombstones.push(format!("{source}:{external_id}"));
+            }
             match std::fs::remove_dir_all(&dir) {
                 Ok(_) => {
+                    tombstone_search_shards(home, &search_tombstones);
                     let mut body =
                         serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes});
                     if let Some((source, external_id)) = external_delete_target {
@@ -4317,6 +4349,50 @@ pub(crate) fn delete_session_data(home: &Path, session_id: &str, target: &str) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deleting_a_session_tombstones_its_search_shards() {
+        use crate::message_search::{PublishOutcome, SessionShard, Store};
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "0d0d0d0d-1111-2222-3333-444444444444";
+        let logs = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("session.jsonl"), "{}\n").unwrap();
+
+        // A published shard for the session, in the home-scoped store.
+        let store_root = home
+            .path()
+            .join(".intendant")
+            .join("cache")
+            .join("message_search")
+            .join("v1");
+        let store = Store::open(&store_root).unwrap();
+        let source = home.path().join("src.jsonl");
+        std::fs::write(&source, "line\n".repeat(4)).unwrap();
+        let cursor = crate::message_search::SourceCursor::capture(&source, 5).unwrap();
+        let key = format!("intendant:{session_id}");
+        assert!(matches!(
+            store
+                .publish_session(&key, &SessionShard::default(), vec![cursor.clone()], false)
+                .unwrap(),
+            PublishOutcome::Published
+        ));
+
+        let body = super::delete_session_data(home.path(), session_id, "session");
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(!logs.exists());
+
+        // Shard gone, key tombstoned: a stale republish must be refused.
+        let snapshot = store.snapshot();
+        assert!(!snapshot.manifest.sessions.contains_key(&key));
+        assert!(snapshot.manifest.tombstones.contains_key(&key));
+        assert!(matches!(
+            store
+                .publish_session(&key, &SessionShard::default(), vec![cursor], false)
+                .unwrap(),
+            PublishOutcome::RejectedTombstoned
+        ));
+    }
+
     use super::*;
 
     #[test]
