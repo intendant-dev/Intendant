@@ -7,6 +7,27 @@ use super::*;
 
 pub(crate) const APP_HTML: &str = include_str!("../../../../static/app.html");
 
+/// Build stamp of the embedded dashboard bundle — the value
+/// app-html-assembler substituted for `__INTENDANT_APP_BUILD__` (first 16
+/// hex chars of the sha256 over the raw manifest-ordered fragments).
+/// Extracted once from [`APP_HTML`], so the daemon and the SPA it serves
+/// cannot disagree by construction; `/config` reports it and a dashboard
+/// tab whose own stamp differs knows it predates the served bundle. Empty
+/// when the artifact carries no stamp (pre-stamp checkouts) — the SPA
+/// treats an absent value as "no signal", never as a mismatch.
+pub(crate) fn app_build() -> &'static str {
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| extract_app_build(APP_HTML).unwrap_or_default())
+}
+
+fn extract_app_build(html: &str) -> Option<String> {
+    let marker = "const INTENDANT_APP_BUILD = '";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let value = &rest[..rest.find('\'')?];
+    (value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| value.to_string())
+}
+
 // The vault crypto kernel: the small, separately served worker that owns
 // the vault's key material. app.html pins its sha256 (VAULT_KERNEL_SHA256,
 // minted by crates/app-html-assembler) and the page refuses to instantiate
@@ -575,6 +596,26 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// The build stamp: the embedded app.html must carry a minted (16-hex)
+    /// `INTENDANT_APP_BUILD` value, never the raw placeholder — otherwise
+    /// every served tab would see a stampless daemon and the stale-tab
+    /// reload nudge goes blind.
+    #[test]
+    fn app_build_stamp_is_minted_in_embedded_artifact() {
+        let stamp = app_build();
+        assert_eq!(
+            stamp.len(),
+            16,
+            "embedded app.html carries no minted INTENDANT_APP_BUILD stamp — \
+             regenerate with `cargo run -p app-html-assembler` and commit"
+        );
+        assert!(stamp.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            !APP_HTML.contains("__INTENDANT_APP_BUILD__"),
+            "the raw placeholder must never ship"
+        );
     }
 
     /// The vault-kernel hash pin: the embedded app.html must pin exactly the

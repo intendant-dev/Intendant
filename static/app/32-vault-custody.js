@@ -3228,6 +3228,10 @@ function applyGatewayConfig(config) {
   if (currentExternalAgent === null) {
     currentExternalAgent = normalizeAgentId(cfg.external_agent);
   }
+  // Every lane's config lands here (boot fetch, tunnel config RPC,
+  // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
+  // a stale tab learns the daemon now serves a newer bundle.
+  if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
   applyMainBackendStatus();
 }
 

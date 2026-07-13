@@ -221,6 +221,12 @@ pub struct WebGatewayConfig {
     /// `[webrtc].federation_allow_h264` in intendant.toml.
     #[serde(default)]
     pub federation_allow_h264: bool,
+    /// Build stamp of the dashboard bundle this daemon serves, extracted at
+    /// startup from the embedded app.html (minted there by
+    /// app-html-assembler). The SPA compares it against its own stamped
+    /// constant and nudges stale tabs to reload after a daemon upgrade.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_build: String,
     /// Public peer access-request hardening. This is gateway runtime state,
     /// not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
@@ -243,6 +249,7 @@ impl Default for WebGatewayConfig {
             transcription_enabled: false,
             ice_servers: Vec::new(),
             federation_allow_h264: false,
+            app_build: String::new(),
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
             connect: crate::project::ConnectConfig::default(),
         }

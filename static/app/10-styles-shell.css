@@ -848,3 +848,36 @@ html {
   color: var(--yellow, #f9e2af);
   vertical-align: middle;
 }
+
+/* Stale-build reload nudge + event-lane staleness banner: slim fixed
+   strips at the top of the viewport, above everything, never blocking. */
+#ui-stale-build-banner,
+#ui-event-lane-banner {
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--surface1);
+  background: var(--mantle, #181825);
+  color: var(--text);
+  font-size: 12.5px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+#ui-stale-build-banner button {
+  border: 1px solid var(--blue);
+  background: transparent;
+  color: var(--blue);
+  border-radius: 6px;
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+#ui-event-lane-banner {
+  border-color: var(--yellow, #f9e2af);
+}
