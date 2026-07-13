@@ -263,6 +263,7 @@ pub(crate) struct WsInboundCtx {
     pub(crate) authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     pub(crate) federated_authority_subscribers: FederatedAuthoritySubscribers,
     pub(crate) connection_id: String,
+    pub(crate) dashboard_tabs: DashboardTabsRegistry,
     pub(crate) frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     pub(crate) recording_registry:
         Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
@@ -305,6 +306,7 @@ pub(crate) async fn ws_inbound_task(
         authority_change_tx: authority_change_tx_inbound,
         federated_authority_subscribers: federated_authority_subscribers_inbound,
         connection_id: connection_id_inbound,
+        dashboard_tabs: dashboard_tabs_inbound,
         frame_registry: frame_registry_inbound,
         recording_registry: recording_registry_inbound,
         session_log: session_log_inbound,
@@ -1440,6 +1442,11 @@ pub(crate) async fn ws_inbound_task(
                         {
                             Ok(answer) => {
                                 dashboard_control_session_ids.push(answer.session_id.clone());
+                                // Tab presence: annotate the session with the
+                                // offer's client-declared tab id, when sent.
+                                if let Some(tab) = json["tab_id"].as_str() {
+                                    dashboard_control_inbound.note_tab_id(&answer.session_id, tab);
+                                }
                                 let msg = serde_json::json!({
                                     "t": "dashboard_control_answer",
                                     "session_id": answer.session_id,
@@ -2087,4 +2094,6 @@ pub(crate) async fn ws_inbound_task(
     for session_id in dashboard_control_session_ids {
         dashboard_control_inbound.close(&session_id).await;
     }
+    // Tab presence: this event-lane connection is gone.
+    dashboard_tabs_inbound.unregister(&connection_id_inbound);
 }

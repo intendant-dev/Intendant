@@ -62,6 +62,8 @@ mod dashboard_presence;
 pub(crate) use dashboard_presence::*;
 mod input_authority;
 pub(crate) use input_authority::*;
+mod dashboard_tabs;
+pub(crate) use dashboard_tabs::*;
 mod connect_bootstrap;
 pub(crate) use connect_bootstrap::*;
 mod settings;

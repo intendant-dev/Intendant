@@ -986,6 +986,8 @@ function stationRenderPeerChips() {
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'station-peer-chip';
+        chip.dataset.hostId = hostId;
+        chip.dataset.displayId = String(displayId);
         chip.disabled = !d.connected;
         chip.title = d.connected
           ? `Open a live view of display ${displayId}${size} on ${name}`
@@ -1006,6 +1008,8 @@ function stationRenderPeerChips() {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'station-peer-chip';
+    chip.dataset.hostId = hostId;
+    chip.dataset.displayId = String(displayId);
     chip.disabled = !d.connected;
     chip.title = d.connected
       ? `Open a live view of display ${displayId} on ${name}`
@@ -2752,4 +2756,3 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
     }
   }
 }
-

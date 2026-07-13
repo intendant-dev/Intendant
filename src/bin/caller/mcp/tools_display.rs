@@ -665,14 +665,36 @@ impl IntendantServer {
         Ok(())
     }
 
+    /// Resolve the optional shared-view target once, before both dashboard
+    /// presentation and any capture side effect. The default is derived from
+    /// the same live display registry as ordinary MCP computer-use calls, so
+    /// the event and screenshot cannot drift onto different displays.
+    async fn resolve_shared_view_target(
+        &self,
+        display_target: Option<String>,
+        display_id: Option<u32>,
+    ) -> (Option<String>, Option<u32>) {
+        if let Some((display_target, display_id)) =
+            resolve_concrete_shared_view_target(display_target, display_id)
+        {
+            return (Some(display_target), Some(display_id));
+        }
+
+        let session_registry = self.state.read().await.session_registry.clone();
+        let default_target = crate::computer_use::default_display_target(&session_registry).await;
+        let (display_target, display_id) = concrete_shared_view_target(default_target);
+        (Some(display_target), Some(display_id))
+    }
+
     pub(crate) async fn show_shared_view_for_session(
         &self,
         params: ShowSharedViewParams,
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let display_target = shared_view_display_target(params.display_target, params.display_id);
-        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let (display_target, display_id) = self
+            .resolve_shared_view_target(params.display_target, params.display_id)
+            .await;
         let region = params.focus_region.map(normalize_shared_view_region);
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
@@ -728,8 +750,9 @@ impl IntendantServer {
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let display_target = shared_view_display_target(params.display_target, params.display_id);
-        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let (display_target, display_id) = self
+            .resolve_shared_view_target(params.display_target, params.display_id)
+            .await;
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -766,8 +789,9 @@ impl IntendantServer {
         session_id: Option<&str>,
         caller: ToolCallerTrust,
     ) -> String {
-        let display_target = shared_view_display_target(params.display_target, params.display_id);
-        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let (display_target, display_id) = self
+            .resolve_shared_view_target(params.display_target, params.display_id)
+            .await;
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -805,8 +829,9 @@ impl IntendantServer {
         compact_output: bool,
         caller: ToolCallerTrust,
     ) -> Result<CallToolResult, McpError> {
-        let display_target = shared_view_display_target(params.display_target, params.display_id);
-        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let (display_target, display_id) = self
+            .resolve_shared_view_target(params.display_target, params.display_id)
+            .await;
         if let Err(denied) = self
             .ensure_shared_view_display_active(display_target.as_deref(), display_id, caller)
             .await
@@ -1389,7 +1414,9 @@ impl IntendantServer {
 mod tests {
     use super::*;
     use crate::autonomy::{self, AutonomyState};
-    use crate::mcp::tests::{test_session_registry_with_display, test_state};
+    use crate::mcp::tests::{
+        test_session_registry_with_display, test_state, test_state_with_log_dir,
+    };
     use tokio::time::{timeout, Duration};
 
     /// A fragment unique to the user-session opt-in refusal
@@ -1474,6 +1501,110 @@ mod tests {
             let autonomy = { server.state.read().await.autonomy.clone() };
             assert!(!autonomy.read().await.user_display_granted);
         });
+    }
+
+    #[tokio::test]
+    async fn omitted_shared_view_targets_use_the_live_virtual_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_with_log_dir(tmp.path().join("session"));
+        state.write().await.session_registry =
+            Some(test_session_registry_with_display(99, 1280, 720));
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let server = IntendantServer::new(state, bus);
+
+        macro_rules! assert_shared_event {
+            ($expected_action:literal) => {
+                match timeout(Duration::from_secs(1), rx.recv()).await {
+                    Ok(Ok(AppEvent::SharedView {
+                        action,
+                        display_target,
+                        display_id,
+                        session_id,
+                        ..
+                    })) => {
+                        assert_eq!(action, $expected_action);
+                        assert_eq!(display_target.as_deref(), Some(":99"));
+                        assert_eq!(display_id, Some(99));
+                        assert_eq!(session_id.as_deref(), Some("session-default"));
+                    }
+                    other => panic!(
+                        "expected concrete {} SharedView event, got {other:?}",
+                        $expected_action
+                    ),
+                }
+            };
+        }
+
+        server
+            .show_shared_view_for_session(
+                ShowSharedViewParams {
+                    display_target: None,
+                    display_id: None,
+                    reason: Some("show the active workspace".to_string()),
+                    focus_region: None,
+                },
+                Some("session-default"),
+                ToolCallerTrust::Scoped,
+            )
+            .await;
+        assert_shared_event!("show");
+
+        server
+            .focus_shared_view_for_session(
+                FocusSharedViewParams {
+                    display_target: None,
+                    display_id: None,
+                    region: SharedViewRegionParams {
+                        x: 0.1,
+                        y: 0.2,
+                        width: 0.3,
+                        height: 0.4,
+                    },
+                    note: Some("look here".to_string()),
+                },
+                Some("session-default"),
+                ToolCallerTrust::Scoped,
+            )
+            .await;
+        assert_shared_event!("focus");
+
+        server
+            .request_shared_view_input_for_session(
+                RequestSharedViewInputParams {
+                    display_target: None,
+                    display_id: None,
+                    reason: Some("please take over".to_string()),
+                },
+                Some("session-default"),
+                ToolCallerTrust::Scoped,
+            )
+            .await;
+        assert_shared_event!("input_request");
+
+        let capture = server
+            .capture_shared_view_frame_for_session(
+                CaptureSharedViewFrameParams {
+                    display_target: None,
+                    display_id: None,
+                    reason: Some("capture the active workspace".to_string()),
+                },
+                Some("session-default"),
+                true,
+                ToolCallerTrust::Scoped,
+            )
+            .await
+            .expect("capture handler should return an MCP result");
+        assert_shared_event!("capture");
+        let rendered = serde_json::to_string(&capture).unwrap_or_default();
+        assert!(
+            !rendered.contains(opt_in_refusal_marker()),
+            "capture must use virtual display 99, not fall through to the user display: {rendered}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no display-0 activation was emitted"
+        );
     }
 
     #[test]

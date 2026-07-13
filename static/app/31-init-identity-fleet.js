@@ -48,12 +48,36 @@ function maybeNudgeStaleBuild(serverBuild) {
   });
 }
 
+// ── Per-tab identity ──
+//
+// A random id minted once per browser tab (sessionStorage is per-tab and
+// survives reloads). Sent on both event lanes — `?tab=` on the /ws URL
+// and `tab_id` in control-tunnel offers — so the daemon's tab-presence
+// surface (`api_dashboard_tabs`, Access pane) can group one tab's
+// connections and this tab can recognize itself in the list. Opaque and
+// authority-free: the daemon sanitizes it and uses it for display only.
+const INTENDANT_TAB_ID = (() => {
+  try {
+    const stored = sessionStorage.getItem('intendant_tab_id') || '';
+    if (/^[A-Za-z0-9_-]{8,64}$/.test(stored)) return stored;
+    const minted = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    sessionStorage.setItem('intendant_tab_id', minted);
+    return minted;
+  } catch (_) {
+    // Private-mode/storage-denied fallback: stable for this page load only.
+    return 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+})();
+
 // QA readback (window.qa convention) + one explicit test hook: the build
 // stamp and nudge state are module-scoped, and the mismatch path can only
 // be exercised for real by building a second bundle — the hook lets the
 // lane-verify harness drive it with a synthetic server stamp instead.
 window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  tabId: () => INTENDANT_TAB_ID,
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
 });
 
@@ -134,6 +158,9 @@ function buildWsUrl(path) {
     const sep = url.includes('?') ? '&' : '?';
     url += sep + 'token=' + encodeURIComponent(token);
   }
+  // Tab presence: browsers can't set headers on WebSocket opens, so the
+  // per-tab id rides the URL the same way the token does.
+  url += (url.includes('?') ? '&' : '?') + 'tab=' + encodeURIComponent(INTENDANT_TAB_ID);
   return url;
 }
 

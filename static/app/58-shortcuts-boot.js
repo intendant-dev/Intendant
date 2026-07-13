@@ -215,23 +215,90 @@ function updateDisplayMetrics(d) {
 // declared in fragment 32 next to the display maps: earlier fragments
 // render against them at load time.)
 let displayPickerVisible = false;
+let displayPickerReturnFocus = null;
+let displayPickerPositionRaf = 0;
+let displayPickerDrawerModal = false;
 // Which action the open picker performs: 'share' (agent access) or
 // 'view' (private remote view; the agent cannot see the display).
 let displayPickerMode = 'share';
 var cachedDisplays = null;
 
-function hideDisplayPicker() {
+function hideDisplayPicker(restoreFocus = true) {
   const picker = document.getElementById('display-picker');
   picker.classList.remove('visible');
+  picker.setAttribute('aria-hidden', 'true');
   displayPickerVisible = false;
+  if (displayPickerDrawerModal) {
+    const rail = document.getElementById('ui2-live-rail');
+    const railOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    if (rail) {
+      rail.inert = !railOpen;
+      if (railOpen) rail.removeAttribute('aria-hidden');
+      else rail.setAttribute('aria-hidden', 'true');
+      rail.setAttribute('aria-modal', railOpen ? 'true' : 'false');
+    }
+    displayPickerDrawerModal = false;
+  }
+  const returnFocus = displayPickerReturnFocus;
+  displayPickerReturnFocus = null;
+  if (restoreFocus && returnFocus && returnFocus.isConnected &&
+      typeof returnFocus.focus === 'function' && !returnFocus.closest('[inert]')) {
+    returnFocus.focus();
+  }
+}
+
+function positionDisplayPicker() {
+  const picker = document.getElementById('display-picker');
+  if (!displayPickerVisible || picker.parentElement !== document.body) return;
+  const anchor = document.getElementById('ui2-live-yourscreen');
+  const rect = anchor ? anchor.getBoundingClientRect() : null;
+  const margin = 12;
+  const gap = 8;
+  const width = picker.offsetWidth;
+  const height = picker.offsetHeight;
+  picker.style.position = 'fixed';
+  picker.style.zIndex = '95';
+  picker.style.right = 'auto';
+  picker.style.transform = 'none';
+  if (rect && rect.width) {
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const left = Math.min(Math.max(margin, rect.left), maxLeft);
+    let top = rect.bottom + gap;
+    if (top + height > window.innerHeight - margin && rect.top - height - gap >= margin) {
+      top = rect.top - height - gap;
+    }
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    picker.style.left = `${Math.round(left)}px`;
+    picker.style.top = `${Math.round(Math.min(Math.max(margin, top), maxTop))}px`;
+  } else {
+    picker.style.left = `${Math.round(Math.max(margin, (window.innerWidth - width) / 2))}px`;
+    picker.style.top = `${Math.round(Math.min(96, Math.max(margin, window.innerHeight - height - margin)))}px`;
+  }
+}
+
+function scheduleDisplayPickerPosition() {
+  if (!displayPickerVisible || displayPickerPositionRaf) return;
+  displayPickerPositionRaf = requestAnimationFrame(() => {
+    displayPickerPositionRaf = 0;
+    positionDisplayPicker();
+  });
 }
 
 function showDisplayPicker(displays, mode) {
   displayPickerMode = mode === 'view' ? 'view' : 'share';
   const picker = document.getElementById('display-picker');
+  displayPickerReturnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
   picker.innerHTML = '';
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-modal', 'false');
+  picker.setAttribute('aria-label', displayPickerMode === 'view'
+    ? 'Choose a screen for your private dashboard view'
+    : 'Choose a screen to share with the agent');
   for (const d of displays) {
-    const item = document.createElement('div');
+    const item = document.createElement('button');
+    item.type = 'button';
     item.className = 'display-picker-item';
     const label = d.name + ' (' + d.width + 'x' + d.height + ')';
     item.textContent = label;
@@ -248,7 +315,7 @@ function showDisplayPicker(displays, mode) {
     }
     item.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       if (!app) return;
       grantUserDisplayTarget(d, displayPickerMode !== 'view');
     });
@@ -257,13 +324,14 @@ function showDisplayPicker(displays, mode) {
   if (displayPickerMode !== 'view' && virtualDisplaysAvailableNow()) {
     // Virtual displays are agent workspaces — offering one from the
     // private "View this machine" flow would conflate the two concepts.
-    const createItem = document.createElement('div');
+    const createItem = document.createElement('button');
+    createItem.type = 'button';
     createItem.className = 'display-picker-item dp-action';
     createItem.textContent = 'New virtual display';
     createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
     createItem.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       createVirtualDisplay();
     });
     picker.appendChild(createItem);
@@ -277,24 +345,23 @@ function showDisplayPicker(displays, mode) {
     document.body.appendChild(picker);
   }
   if (picker.parentElement === document.body) {
-    const anchor = document.getElementById('ui2-live-yourscreen');
-    const rect = anchor ? anchor.getBoundingClientRect() : null;
-    picker.style.position = 'fixed';
-    picker.style.zIndex = '95';
-    if (rect && rect.width) {
-      picker.style.left = `${Math.round(rect.left)}px`;
-      picker.style.top = `${Math.round(rect.bottom + 8)}px`;
-      picker.style.right = 'auto';
-      picker.style.transform = 'none';
-    } else {
-      picker.style.left = '50%';
-      picker.style.top = '96px';
-      picker.style.right = 'auto';
-      picker.style.transform = 'translateX(-50%)';
+    const drawerOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    picker.setAttribute('aria-modal', drawerOpen ? 'true' : 'false');
+    displayPickerDrawerModal = Boolean(drawerOpen);
+    if (displayPickerDrawerModal) {
+      const rail = document.getElementById('ui2-live-rail');
+      if (rail) {
+        rail.inert = true;
+        rail.setAttribute('aria-hidden', 'true');
+        rail.setAttribute('aria-modal', 'false');
+      }
     }
   }
   picker.classList.add('visible');
+  picker.setAttribute('aria-hidden', 'false');
   displayPickerVisible = true;
+  positionDisplayPicker();
+  requestAnimationFrame(() => picker.querySelector('.display-picker-item')?.focus());
 }
 
 // Keyless "new virtual display": the daemon launches an Xvfb and registers
@@ -469,11 +536,35 @@ function setUserDisplayState(granted, agentVisible = true) {
 document.addEventListener('click', (e) => {
   if (!displayPickerVisible) return;
   const picker = document.getElementById('display-picker');
-  if (!picker.contains(e.target)) hideDisplayPicker();
+  if (!picker.contains(e.target)) hideDisplayPicker(false);
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
-});
+  if (!displayPickerVisible) return;
+  const picker = document.getElementById('display-picker');
+  if (e.key === 'Escape') {
+    // Capture owns the first Escape so annotation/callout/drawer layers
+    // underneath cannot consume the same keystroke.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    hideDisplayPicker(true);
+    return;
+  }
+  if (e.key !== 'Tab' || picker.getAttribute('aria-modal') !== 'true') return;
+  const focusable = Array.from(picker.querySelectorAll('button:not([disabled])'))
+    .filter(element => element.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    first.focus();
+  }
+}, true);
+window.addEventListener('resize', scheduleDisplayPickerPosition);
+document.addEventListener('scroll', scheduleDisplayPickerPosition, true);
 
 // Rollback modal: Escape closes, click on the backdrop (outside the
 // dialog) also closes — follows the same dismissal pattern as the

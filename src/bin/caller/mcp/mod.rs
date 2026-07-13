@@ -871,33 +871,40 @@ impl UserSessionDisplayActivationRequest {
     }
 }
 
-pub(crate) fn shared_view_display_target(
-    display_target: Option<String>,
-    display_id: Option<u32>,
-) -> Option<String> {
-    display_target
-        .map(|target| target.trim().to_string())
-        .filter(|target| !target.is_empty())
-        .or_else(|| display_id.map(|id| format!(":{}", id)))
+/// Canonical dashboard wire representation for an already-resolved display
+/// target. Shared-view callers that omit their target must resolve it before
+/// emitting an event: otherwise the browser has to guess among its streamed
+/// displays, and `capture` can show one display while screenshotting another.
+pub(crate) fn concrete_shared_view_target(
+    target: crate::computer_use::DisplayTarget,
+) -> (String, u32) {
+    match target {
+        crate::computer_use::DisplayTarget::UserSession => ("user_session".to_string(), 0),
+        crate::computer_use::DisplayTarget::Virtual { id } => (format!(":{id}"), id),
+    }
 }
 
-pub(crate) fn shared_view_display_id(
-    display_target: Option<&str>,
+/// Resolve the two public shared-view target aliases into one canonical
+/// target/id pair. `display_id` is documented as the preferred field, so it
+/// wins when both are supplied; deriving both outputs from that one choice
+/// prevents dashboard activation and screenshot capture from diverging.
+pub(crate) fn resolve_concrete_shared_view_target(
+    display_target: Option<String>,
     display_id: Option<u32>,
-) -> Option<u32> {
-    if display_id.is_some() {
-        return display_id;
+) -> Option<(String, u32)> {
+    if let Some(id) = display_id {
+        let target = if id == 0 {
+            crate::computer_use::DisplayTarget::UserSession
+        } else {
+            crate::computer_use::DisplayTarget::Virtual { id }
+        };
+        return Some(concrete_shared_view_target(target));
     }
-    let target = display_target?.trim();
-    if target.eq_ignore_ascii_case("user_session") || target.eq_ignore_ascii_case("primary") {
-        return Some(0);
-    }
-    target
-        .strip_prefix(':')
-        .or_else(|| target.strip_prefix("display_"))
-        .unwrap_or(target)
-        .parse::<u32>()
-        .ok()
+
+    let target = display_target
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())?;
+    Some(concrete_shared_view_target(resolve_display_target(&target)))
 }
 
 pub(crate) fn shared_view_target_label(
@@ -947,7 +954,10 @@ fn shared_view_user_display_id(
         .map(str::trim)
         .filter(|target| !target.is_empty())
     else {
-        return Some(0);
+        // Omission means availability-aware auto-detection, never an
+        // implicit user-session request. Shared-view entry points resolve
+        // it before reaching this activation helper.
+        return None;
     };
     if target.eq_ignore_ascii_case("user_session")
         || target.eq_ignore_ascii_case("user")
@@ -2401,6 +2411,22 @@ pub(crate) mod tests {
         assert_eq!(
             shared_view_target_label(Some(99), Some(":99")),
             "display 99"
+        );
+    }
+
+    #[test]
+    fn shared_view_target_aliases_resolve_from_one_preferred_field() {
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some("user_session".to_string()), Some(99)),
+            Some((":99".to_string(), 99))
+        );
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some(":99".to_string()), Some(0)),
+            Some(("user_session".to_string(), 0))
+        );
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some("user".to_string()), None),
+            Some(("user_session".to_string(), 0))
         );
     }
 

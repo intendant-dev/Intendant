@@ -1114,6 +1114,13 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::DashboardTabs => {
+                let response =
+                    crate::web_gateway::dashboard_tabs_api_response(dashboard_control.tabs());
+                write_api_response(stream, response, route.cors, fleet_cors_origin.as_deref())
+                    .await;
+                return;
+            }
             RouteHandlerId::PeersSubRouter => {
                 return handle_peers_sub_router(
                     stream,

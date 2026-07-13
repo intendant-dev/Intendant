@@ -589,6 +589,118 @@ function renderAccessIdentityHero() {
   }));
 }
 
+// ── Open dashboards (tab presence) ──
+//
+// Rendered from `dashboardTabsPresence` (42b refresher over
+// api_dashboard_tabs). Browser-tab connections group by their
+// client-declared tab id — one tab can hold both event lanes — and this
+// tab recognizes itself by INTENDANT_TAB_ID. Peer-daemon connections
+// (kind "peer") are counted separately: they're machines, not tabs.
+function accessTabsBrowserName(ua) {
+  if (!ua) return '';
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  if (/Safari\//.test(ua)) return 'Safari';
+  return '';
+}
+
+function renderAccessTabsCard() {
+  const mount = document.getElementById('access-tabs-card');
+  if (!mount) return;
+  mount.textContent = '';
+  const payload = dashboardTabsPresence;
+  // Older daemon (no api_dashboard_tabs) or nothing fetched yet: stay
+  // invisible, exactly like the Connect card.
+  if (!payload || !Array.isArray(payload.connections)) return;
+
+  const tabs = new Map();
+  const untagged = [];
+  const peers = [];
+  for (const c of payload.connections) {
+    if (c.kind === 'peer') { peers.push(c); continue; }
+    if (c.tab_id) {
+      if (!tabs.has(c.tab_id)) tabs.set(c.tab_id, []);
+      tabs.get(c.tab_id).push(c);
+    } else {
+      untagged.push(c);
+    }
+  }
+  const groups = [...tabs.values(), ...untagged.map(c => [c])];
+  const tabCount = groups.length;
+
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Open dashboards';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  const parts = [`${tabCount} ${tabCount === 1 ? 'tab is' : 'tabs are'} connected to this daemon right now.`];
+  if (peers.length) {
+    parts.push(`${peers.length} peer ${peers.length === 1 ? 'daemon holds' : 'daemons hold'} a control connection.`);
+  }
+  sub.textContent = parts.join(' ');
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const fmtSince = (ms) => {
+    if (!ms) return '';
+    try {
+      return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (_) { return ''; }
+  };
+
+  const renderRow = (conns, { isPeer } = {}) => {
+    const first = conns[0];
+    const browser = accessTabsBrowserName(conns.map(c => c.user_agent).find(Boolean));
+    const isThisTab = !isPeer && first.tab_id
+      && typeof INTENDANT_TAB_ID !== 'undefined' && first.tab_id === INTENDANT_TAB_ID;
+
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const headRow = document.createElement('div');
+    headRow.className = 'acc-principal-head';
+    const glyphEl = document.createElement('div');
+    glyphEl.className = `acc-principal-glyph kind-${isPeer ? 'peer' : 'local'}`;
+    glyphEl.textContent = isPeer ? 'P' : (browser ? browser[0] : 'T');
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = isPeer
+      ? `Peer daemon · ${first.label || 'peer'}`
+      : `${browser || 'Dashboard tab'}${isThisTab ? ' — this tab' : ''}`;
+    const kindLine = document.createElement('div');
+    kindLine.className = 'acc-principal-kind';
+    const details = [];
+    if (!isPeer && first.label && first.label !== 'trusted-local') details.push(first.label);
+    const lanes = [...new Set(conns.map(c => c.lane === 'tunnel' ? 'control tunnel' : 'WebSocket'))];
+    details.push(lanes.join(' + '));
+    const since = fmtSince(Math.min(...conns.map(c => Number(c.connected_at_unix_ms) || Infinity)));
+    if (since) details.push(`since ${since}`);
+    const remote = conns.map(c => c.remote).find(Boolean);
+    if (remote) details.push(`from ${remote}`);
+    kindLine.textContent = details.join(' · ');
+    nameWrap.append(name, kindLine);
+    headRow.append(glyphEl, nameWrap);
+    if (conns.some(c => c.voice_active)) {
+      headRow.appendChild(accessRouteChip('webrtc', 'holds voice',
+        'This connection owns the live voice presence; only one tab can at a time.'));
+    }
+    const inputDisplays = [...new Set(conns.flatMap(c => Array.isArray(c.input_display_ids) ? c.input_display_ids : []))].sort((a, b) => a - b);
+    if (inputDisplays.length) {
+      headRow.appendChild(accessRouteChip('mtls', `holds display input (${inputDisplays.join(', ')})`,
+        'This connection holds exclusive input authority on the listed display ids.'));
+    }
+    card.appendChild(headRow);
+    return card;
+  };
+
+  for (const conns of groups) mount.appendChild(renderRow(conns));
+  for (const p of peers) mount.appendChild(renderRow([p], { isPeer: true }));
+}
+
 function renderAccessFleetStrip() {
   const mount = document.getElementById('access-fleet-strip');
   if (!mount) return;
@@ -2477,6 +2589,9 @@ function renderAccessAdminSummaries() {
       avail('api_access_connect_unclaim'), avail('api_fleet_cert_request'),
     ]),
     renderAccessConnectCard);
+  accessGuardedRender('access-tabs-card',
+    accessSectionFp([dashboardTabsPresence]),
+    renderAccessTabsCard);
   accessGuardedRender('access-fleet-strip',
     accessSectionFp([targetsFp, daemonsFp, transportFp, peersFp]),
     renderAccessFleetStrip);

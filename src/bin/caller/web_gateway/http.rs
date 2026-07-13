@@ -951,16 +951,41 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
 /// `"GET /ws?token=abc HTTP/1.1"`. Returns the extracted token if
 /// present, `None` if there's no `?token=` parameter.
 pub(crate) fn extract_token_query_param(request_line: &str) -> Option<String> {
+    // No URL-decoding: bearer tokens are typically URL-safe
+    // (hex / base64-url). If a token contains characters that
+    // require encoding, the operator can either pick a
+    // different token or send via Authorization header (which
+    // doesn't have the URL-encoding constraint).
+    extract_query_param(request_line, "token")
+}
+
+/// Extract a named query parameter from an HTTP request line (same
+/// no-URL-decoding contract as the token extractor above — callers pass
+/// URL-safe values).
+pub(crate) fn extract_query_param(request_line: &str, name: &str) -> Option<String> {
     let path_and_query = request_line.split_whitespace().nth(1)?;
     let query = path_and_query.split_once('?')?.1;
     for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("token=") {
-            // No URL-decoding: bearer tokens are typically URL-safe
-            // (hex / base64-url). If a token contains characters that
-            // require encoding, the operator can either pick a
-            // different token or send via Authorization header (which
-            // doesn't have the URL-encoding constraint).
+        if let Some(value) = pair
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
             return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Case-insensitive lookup of one header's value in a raw HTTP header
+/// block (request line + `Name: value` lines).
+pub(crate) fn extract_header_value(header_text: &str, name: &str) -> Option<String> {
+    for line in header_text.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_string());
         }
     }
     None

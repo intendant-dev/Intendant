@@ -336,17 +336,37 @@ An embedded xterm.js terminal hosting an interactive **Shell** session on the
 daemon (or a selected peer). Session monitoring and control live in the
 Activity/Station tabs, not here.
 
-### Video
+### Live display
 
-WebRTC display viewers for the agent's graphical displays, with interactive
-control (see [Display Pipeline](./display-pipeline.md)):
+The Computer Use workspace combines a selected WebRTC stage with a live rail
+for displays, input authority, browser-observed display activity, peer
+launchers, and the user's own screen (see
+[Display Pipeline](./display-pipeline.md)):
 
 - **View mode** (default) — watch the agent's display in real time
 - **Take Control** — forward mouse and keyboard events to the agent's display
 - **Release** — relinquish control, with an optional note
-- **Display picker** — choose which monitor to view when several are present
+- **Selected display stage** — switch among active local displays without
+  recreating their capture sessions or video elements. A shared-view request
+  selects its target once unless that would interrupt active human input,
+  annotation, callout, or full-screen work; later manual selection is
+  respected.
+- **Input authority** — the toolbar and rail project the same server truth:
+  you, another viewer, available, or connecting. Hiding an interactive or
+  pending display releases it before input listeners are removed. Editable
+  annotation/callout work blocks navigation instead of being discarded.
+- **Display activity** — reports real connection, authority, visibility,
+  streaming, recording, annotation, callout, and shared-view transitions. It
+  does not invent agent click/type history that the display protocol does not
+  publish.
+- **Peer displays** — open on Station, whose viewer understands federated
+  display targets, rather than masquerading as local stages.
+- **Responsive controls** — below the desktop breakpoint the rail becomes a
+  keyboard-accessible **Displays & input** drawer; primary controls remain in
+  the stage toolbar.
 - **Recording replay** — browse and play back recorded sessions with timeline
-  seeking and speed control (1x / 2x / 4x)
+  seeking and speed control (1x / 2x / 4x). Live recording controls show a
+  pending command but change REC/activity state only on daemon confirmation.
 
 The live rail's **Your screen** card keeps the three screen-on-the-wire
 concepts separate (see
@@ -801,6 +821,23 @@ hints. The browser may refine the local route label to **Intendant Connect**,
 **Browser mTLS**, or **Local/debug** because only the browser knows how the
 current page was reached, but it should not invent principal/grant/policy
 vocabulary.
+
+`GET /api/dashboard/tabs` / `api_dashboard_tabs` (`access.inspect`) is the
+**tab-presence** surface: every live dashboard connection on either event lane
+(the `/ws` WebSocket or a dashboard-control tunnel session), each entry
+carrying its lane, grant provenance (`local` / `client` / `peer`), grant
+label, remote host, user agent, connect time, and whether it currently holds
+the voice presence or display input authority (with display ids). Browser
+tabs group by a client-declared per-tab id: the SPA mints a random id in
+`sessionStorage` and sends it as `?tab=` on the `/ws` URL and `tab_id` in
+control-tunnel offers. The id is sanitized, display-only, and grants nothing;
+server-internal connection ids never appear in the payload (the same rule the
+input-authority wire follows). The Access **Overview** renders this as the
+**Open dashboards** card — "N tabs connected · this tab · holds voice /
+display input" — refreshed on pane entry and every 15 s while the pane is
+visible; peer-daemon control connections are counted separately from tabs.
+Hosted Connect offers relayed through the rendezvous don't carry the tab id
+yet (the relay envelope drops unknown fields), so those sessions list untagged.
 
 ### Debug
 
@@ -2097,6 +2134,7 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
 | POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
+| GET | `/api/dashboard/tabs` | AccessInspect | own origin | none | Live dashboard connections (open tabs) with voice/input-authority holders |
 | POST | `/api/peers/pairing/invite` | federation (per method/path) | own origin | bounded | Issue a peer-scoped mTLS pairing invite |
 | POST | `/api/peers/pairing/request-access` | federation (per method/path) | own origin | bounded | Start an outgoing access request against a remote daemon's doorbell |
 | POST | `/api/peers/pairing/request-access/poll` | federation (per method/path) | own origin | bounded | Poll an outgoing access request (installs the approved identity) |

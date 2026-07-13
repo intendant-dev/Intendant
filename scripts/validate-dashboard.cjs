@@ -64,6 +64,7 @@ const STATIC_IDENTITY_ASSETS = [
   { urlPath: '/icon-128.png', file: path.join('static', 'icon-128.png'), kind: 'binary' },
 ];
 const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
+  '/xterm.css',
   '/wasm-web/presence_web.js',
   '/wasm-web/presence_web_bg.wasm',
   '/wasm-station/station_web.js',
@@ -72,6 +73,10 @@ const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
   '/codemirror-bundle.js',
   '/codemirror-bundle.css',
   '/icon-128.png',
+  '/fonts/hanken-grotesk-latin.woff2',
+  '/fonts/hanken-grotesk-latin-ext.woff2',
+  '/fonts/jetbrains-mono-latin.woff2',
+  '/fonts/jetbrains-mono-latin-ext.woff2',
 ];
 
 const BROWSER_EXECUTABLE_ENVS = [
