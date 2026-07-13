@@ -168,12 +168,18 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     // approval handler has unblocked and returned.
     let watcher_handle = {
         let mut watcher_rx = config.bus.subscribe();
+        let watcher_bus = config.bus.clone();
         let registry = config.approval_registry.clone();
         let watcher_session_id = local_session_id.clone();
         let watcher_alias_session_id = alias_session_id.clone();
         // The backend-native id joins the group mid-flight (announced on the
         // backend's first stdout); frontends target it afterwards. Seed from
         // the previous turn's announcement and fold identity events live.
+        // The broadcast lane is LOSSY: a lag here permanently drops events —
+        // a missed SessionIdentity leaves `watcher_native_id` stale (healed
+        // only when the next drain re-seeds from `stats`), and a missed
+        // Interrupt/Stop skips the approval drain — so lags are warned, not
+        // shrugged off.
         let mut watcher_native_id = stats.announced_native_session_id.clone();
         tokio::spawn(async move {
             loop {
@@ -214,7 +220,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         // a follow-up turn starts new approvals.
                     }
                     Ok(_) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        watcher_bus.send(AppEvent::LogEntry {
+                            session_id: watcher_session_id.clone(),
+                            level: "warn".to_string(),
+                            source: "system".to_string(),
+                            content: format!(
+                                "Drain approval watcher lagged; {} dropped event(s) — a missed SessionIdentity or Interrupt may leave native-id targeting stale or an approval blocked until the next event",
+                                n
+                            ),
+                            turn: None,
+                        });
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -423,13 +441,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             // old fabricated `SteerCancelled` here made the
                             // dashboard report a clear while the text still
                             // reached the model.
-                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                config.bus.send(AppEvent::SteerCancelFailed {
-                                    session_id: target_session_id.or_else(|| local_session_id.clone()),
-                                    id,
-                                    reason: "nothing pending to clear — the message already delivered or converted to a follow-up".to_string(),
-                                });
-                            }
+                            emit_steer_cancel_failed_for_unmatched(
+                                config.bus,
+                                target_session_id.or_else(|| local_session_id.clone()),
+                                id,
+                                STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+                            );
                         }
                         continue;
                     }
@@ -2305,8 +2322,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
 /// announced backend-native id so they read as targeting the primary
 /// session. The identity contract lets frontends use either id after the
 /// mid-flight upgrade; the drain's launch-time local/alias snapshot can't
-/// know the native id, so targeted Steer/Interrupt/Stop/CancelSteer events
-/// otherwise fall through every guard and vanish.
+/// know the native id, so targeted control events — Steer/Interrupt/Stop/
+/// CancelSteer/CancelFollowUp/ThreadAction/ConversationRollback — otherwise
+/// fall through every guard and vanish during the announce window.
 pub(crate) fn normalize_native_session_target(
     event: AppEvent,
     local_session_id: &Option<String>,
@@ -2353,6 +2371,39 @@ pub(crate) fn normalize_native_session_target(
             session_id: local_session_id.clone(),
             id,
             reason,
+        },
+        AppEvent::FollowUpCancelRequested {
+            session_id,
+            id,
+            reason,
+        } if matches_native(&session_id) => AppEvent::FollowUpCancelRequested {
+            session_id: local_session_id.clone(),
+            id,
+            reason,
+        },
+        AppEvent::CodexThreadActionRequested {
+            request_id,
+            session_id,
+            action,
+            params,
+            origin,
+        } if matches_native(&session_id) => AppEvent::CodexThreadActionRequested {
+            request_id,
+            session_id: local_session_id.clone(),
+            action,
+            params,
+            origin,
+        },
+        AppEvent::ConversationRollbackRequested {
+            session_id,
+            round_id,
+            target_native_message_count,
+            turns_to_drop,
+        } if matches_native(&session_id) => AppEvent::ConversationRollbackRequested {
+            session_id: local_session_id.clone(),
+            round_id,
+            target_native_message_count,
+            turns_to_drop,
         },
         other => other,
     }
@@ -2618,6 +2669,91 @@ mod tests {
         match normalize_native_session_target(event, &resume_local, Some("native-id")) {
             AppEvent::InterruptRequested { session_id } => {
                 assert_eq!(session_id.as_deref(), Some("native-id"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// The rest of the targeted control family — follow-up cancels, thread
+    /// actions, conversation rollbacks — must normalize under the same
+    /// identity-group rules: during Claude Code's turn-1 announce window
+    /// they otherwise fall through every drain guard and vanish.
+    #[test]
+    fn native_session_target_normalizes_control_family() {
+        let local = Some("wrapper-id".to_string());
+
+        let event = AppEvent::FollowUpCancelRequested {
+            session_id: Some("native-id".into()),
+            id: Some("fu-1".into()),
+            reason: "cleared by user".into(),
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::FollowUpCancelRequested {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(id.as_deref(), Some("fu-1"));
+                assert_eq!(reason, "cleared by user");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let event = AppEvent::CodexThreadActionRequested {
+            request_id: "req-1".into(),
+            session_id: Some("native-id".into()),
+            action: "compact".into(),
+            params: serde_json::json!({"k": "v"}),
+            origin: Some("dashboard".into()),
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::CodexThreadActionRequested {
+                request_id,
+                session_id,
+                action,
+                params,
+                origin,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(action, "compact");
+                assert_eq!(params, serde_json::json!({"k": "v"}));
+                assert_eq!(origin.as_deref(), Some("dashboard"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let event = AppEvent::ConversationRollbackRequested {
+            session_id: Some("native-id".into()),
+            round_id: 7,
+            target_native_message_count: Some(12),
+            turns_to_drop: 2,
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::ConversationRollbackRequested {
+                session_id,
+                round_id,
+                target_native_message_count,
+                turns_to_drop,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(round_id, 7);
+                assert_eq!(target_native_message_count, Some(12));
+                assert_eq!(turns_to_drop, 2);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // Foreign targets stay foreign across the whole family.
+        let foreign = AppEvent::FollowUpCancelRequested {
+            session_id: Some("someone-else".into()),
+            id: None,
+            reason: "x".into(),
+        };
+        match normalize_native_session_target(foreign, &local, Some("native-id")) {
+            AppEvent::FollowUpCancelRequested { session_id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("someone-else"));
             }
             other => panic!("unexpected event {other:?}"),
         }

@@ -234,6 +234,80 @@ pub(crate) fn cancel_pending_runtime_steers_for_session(
     cancelled
 }
 
+/// Reason attached to `SteerCancelFailed` when a cancel matched nothing in
+/// an external-agent lane: the steer already delivered, drained into a
+/// follow-up at a turn boundary, or was handed to the runtime.
+pub(crate) const STEER_CANCEL_UNMATCHED_EXTERNAL_REASON: &str =
+    "nothing pending to clear — the message already delivered or converted to a follow-up";
+
+/// Native-loop variant: the only steer queue is `context_injection`, drained
+/// at the top of every turn, so an unmatched cancel means the text already
+/// entered the conversation at a model checkpoint.
+pub(crate) const STEER_CANCEL_UNMATCHED_NATIVE_REASON: &str =
+    "nothing pending to clear — the message already delivered at a model checkpoint";
+
+/// A cancel that removed nothing must NOT fabricate `SteerCancelled` — the
+/// steer text reached or will reach the model, and reporting a successful
+/// clear here is how the dashboard lied about it (the pre-#293 handlers).
+/// Emits the terminal `SteerCancelFailed` row instead, so the pending UI
+/// retires without claiming a clear that did not happen. Blank ids are
+/// skipped: a blanket "clear everything" that found nothing has no row to
+/// retire.
+pub(crate) fn emit_steer_cancel_failed_for_unmatched(
+    bus: &EventBus,
+    session_id: Option<String>,
+    id: Option<String>,
+    reason: &str,
+) {
+    let Some(id) = id.filter(|id| !id.trim().is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SteerCancelFailed {
+        session_id,
+        id,
+        reason: reason.to_string(),
+    });
+}
+
+/// Queue an idle-lane steer for an external session, preserving the
+/// RESOLVED target so a side-thread steer never flushes into the parent
+/// conversation. Primary-targeted steers ride the caller's synthesized
+/// empty-turn flush and deliver immediately; side-targeted steers wait in
+/// `context_injection` for the side conversation's next turn
+/// (`start_external_side_followup_turn` / the mid-turn side drain both
+/// merge queued entries for their own session id) — the emitted
+/// `SteerQueued` reason says which, so the dashboard never promises an
+/// immediate send that the side lane cannot perform.
+pub(crate) fn queue_idle_external_steer(
+    context_injection: &event::ContextInjectionQueue,
+    bus: &EventBus,
+    target_session_id: Option<String>,
+    target_kind: ExternalSteerTargetKind,
+    text: String,
+    id: String,
+) {
+    if let Ok(mut queue) = context_injection.lock() {
+        queue.push(event::ContextInjection::text_with_steer_id_for_target(
+            text,
+            id.clone(),
+            target_session_id.clone(),
+        ));
+    }
+    let reason = match target_kind {
+        ExternalSteerTargetKind::Primary => {
+            "session is idle — sending as its own message now".to_string()
+        }
+        ExternalSteerTargetKind::Side => {
+            "side conversation is idle — queued for its next turn".to_string()
+        }
+    };
+    bus.send(AppEvent::SteerQueued {
+        session_id: target_session_id,
+        id,
+        reason,
+    });
+}
+
 pub(crate) fn flush_pending_runtime_steers_for_model_checkpoint(
     bus: &EventBus,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
@@ -793,6 +867,138 @@ mod tests {
                 assert_eq!(reason, "cleared by user");
             }
             other => panic!("expected SteerCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unmatched_cancel_emits_cancel_failed_never_cancelled() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        emit_steer_cancel_failed_for_unmatched(
+            &bus,
+            Some("session-a".into()),
+            Some("steer-1".into()),
+            STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+        );
+
+        match rx.try_recv().expect("SteerCancelFailed event") {
+            AppEvent::SteerCancelFailed {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-a"));
+                assert_eq!(id, "steer-1");
+                assert_eq!(reason, STEER_CANCEL_UNMATCHED_EXTERNAL_REASON);
+            }
+            other => panic!("expected SteerCancelFailed, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one event");
+    }
+
+    #[test]
+    fn unmatched_cancel_with_blank_id_emits_nothing() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        emit_steer_cancel_failed_for_unmatched(
+            &bus,
+            Some("session-a".into()),
+            None,
+            STEER_CANCEL_UNMATCHED_NATIVE_REASON,
+        );
+        emit_steer_cancel_failed_for_unmatched(
+            &bus,
+            Some("session-a".into()),
+            Some("   ".into()),
+            STEER_CANCEL_UNMATCHED_NATIVE_REASON,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "blanket clears that matched nothing have no row to retire"
+        );
+    }
+
+    #[test]
+    fn queue_idle_external_steer_preserves_side_target() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+
+        queue_idle_external_steer(
+            &queue,
+            &bus,
+            Some("side-thread".into()),
+            ExternalSteerTargetKind::Side,
+            "steer the side".into(),
+            "steer-side".into(),
+        );
+
+        // The injection keeps the SIDE target: the parent's empty-turn
+        // flush (`has_queued_steers_for_session(local, thread)`) must not
+        // pick it up, and the next side turn's
+        // `drain_steer_queue_as_followup(Some(side))` must.
+        {
+            let q = queue.lock().unwrap();
+            assert_eq!(q.len(), 1);
+            assert_eq!(q[0].target_session_id.as_deref(), Some("side-thread"));
+            assert_eq!(q[0].steer_id.as_deref(), Some("steer-side"));
+        }
+        assert!(!has_queued_steers_for_session(
+            &queue,
+            Some("parent-session"),
+            Some("parent-thread")
+        ));
+
+        match rx.try_recv().expect("SteerQueued event") {
+            AppEvent::SteerQueued {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("side-thread"));
+                assert_eq!(id, "steer-side");
+                assert!(
+                    reason.contains("side conversation"),
+                    "side reason must not promise an immediate send: {reason}"
+                );
+            }
+            other => panic!("expected SteerQueued, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn queue_idle_external_steer_primary_targets_flush() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+
+        queue_idle_external_steer(
+            &queue,
+            &bus,
+            Some("parent-session".into()),
+            ExternalSteerTargetKind::Primary,
+            "steer the parent".into(),
+            "steer-primary".into(),
+        );
+
+        // Primary-targeted entries are what the synthesized empty-turn
+        // flush picks up.
+        assert!(has_queued_steers_for_session(
+            &queue,
+            Some("parent-session"),
+            None
+        ));
+        match rx.try_recv().expect("SteerQueued event") {
+            AppEvent::SteerQueued { reason, .. } => {
+                assert!(
+                    reason.contains("sending as its own message now"),
+                    "primary reason promises the immediate flush: {reason}"
+                );
+            }
+            other => panic!("expected SteerQueued, got {:?}", other),
         }
     }
 

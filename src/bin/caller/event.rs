@@ -3214,8 +3214,12 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         } => {
             log.steer_cancelled(session_id.as_deref(), id, reason);
         }
-        AppEvent::SteerCancelFailed { id, reason, .. } => {
-            log.warn(&format!("Steer cancel failed ({id}): {reason}"));
+        AppEvent::SteerCancelFailed {
+            session_id,
+            id,
+            reason,
+        } => {
+            log.steer_cancel_failed(session_id.as_deref(), id, reason);
         }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");

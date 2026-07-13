@@ -906,13 +906,17 @@ pub(crate) async fn run_agent_loop(
                             &reason,
                         );
                         if removed == 0 {
-                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                watcher_bus.send(AppEvent::SteerCancelled {
-                                    session_id: watcher_session_id.clone(),
-                                    id,
-                                    reason,
-                                });
-                            }
+                            // Nothing queued to remove: the turn-start drain
+                            // already claimed the steer and put it in the
+                            // conversation (emitting `SteerDelivered`).
+                            // Fabricating `SteerCancelled` here reported a
+                            // clear for text the model already saw.
+                            emit_steer_cancel_failed_for_unmatched(
+                                &watcher_bus,
+                                watcher_session_id.clone(),
+                                id,
+                                STEER_CANCEL_UNMATCHED_NATIVE_REASON,
+                            );
                         }
                     }
                     Ok(_) => continue,
