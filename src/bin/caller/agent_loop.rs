@@ -841,8 +841,7 @@ pub(crate) async fn run_agent_loop(
     let local_session_id = session_log_id(&session_log);
     // Live action-visualization lane for the dashboard: one ephemeral
     // cu_action event per executed CU action (never session-logged).
-    let cu_observer =
-        computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());
+    let cu_observer = computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();

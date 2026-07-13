@@ -1160,8 +1160,7 @@ pub(crate) async fn run_cu_task(
 
     // Live action-visualization lane for the dashboard (ephemeral events;
     // the session log below stays the durable trace).
-    let cu_observer =
-        computer_use::CuActionObserver::new(bus.clone(), session_log_id(session_log));
+    let cu_observer = computer_use::CuActionObserver::new(bus.clone(), session_log_id(session_log));
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt =
@@ -1576,10 +1575,8 @@ pub(crate) async fn handle_shared_view_calls(
                 let screenshot_dir = log_dir.join("screenshots");
                 let _ = std::fs::create_dir_all(&screenshot_dir);
                 let registry = session_registry.cloned();
-                let capture_observer = computer_use::CuActionObserver::new(
-                    bus.clone(),
-                    session_id.clone(),
-                );
+                let capture_observer =
+                    computer_use::CuActionObserver::new(bus.clone(), session_id.clone());
                 let results = computer_use::execute_actions(
                     &[computer_use::CuAction::Screenshot],
                     target,

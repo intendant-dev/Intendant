@@ -1880,12 +1880,7 @@ async fn cu_actions_broadcast_display_scoped_events_over_ws() {
         json.get("event").and_then(|v| v.as_str()) == Some("cu_action")
     })
     .await
-    .unwrap_or_else(|| {
-        panic!(
-            "cu_action never broadcast on /ws:\n{}",
-            daemon.log_tail()
-        )
-    });
+    .unwrap_or_else(|| panic!("cu_action never broadcast on /ws:\n{}", daemon.log_tail()));
     assert_eq!(event["display_id"], 0, "{event}");
     assert_eq!(event["kind"], "screenshot", "{event}");
     assert_eq!(event["raw"], "screenshot()", "{event}");
