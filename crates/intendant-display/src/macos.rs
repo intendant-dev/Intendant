@@ -519,8 +519,8 @@ fn enumerate_window_display_infos() -> Vec<super::DisplayInfo> {
         if window_dict_i64(&dict, "kCGWindowLayer") != Some(0) {
             continue;
         }
-        let Some(native_window_id) = window_dict_i64(&dict, "kCGWindowNumber")
-            .and_then(|n| u32::try_from(n).ok())
+        let Some(native_window_id) =
+            window_dict_i64(&dict, "kCGWindowNumber").and_then(|n| u32::try_from(n).ok())
         else {
             continue;
         };
