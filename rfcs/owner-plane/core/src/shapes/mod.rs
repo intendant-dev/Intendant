@@ -22,6 +22,8 @@ use crate::cbor::{self, Value};
 pub mod control;
 pub mod envelope;
 pub mod identity;
+pub mod journal;
+pub mod memory;
 
 /// Everything the shape layer emits implements this.
 pub trait ToValue {
