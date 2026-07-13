@@ -289,3 +289,10 @@ opt-level = 2
 opt-level = 3
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+# Wire-MTU fix for federated data channels: rtc-sctp's default packet size
+# overflows 1280-MTU (IPv6-minimum / overlay) paths once DTLS+UDP headers
+# are added, and oversized flights blackhole silently. One-constant vendored
+# patch; rationale + exit criteria in vendor/rtc-sctp/INTENDANT-PATCH.md.
+[patch.crates-io]
+rtc-sctp = { path = "vendor/rtc-sctp" }

@@ -117,6 +117,19 @@ pub enum DisplayInfoKind {
 /// Callers that have access to the live session registry should prefer
 /// [`enumerate_displays_with_sessions`], which patches each entry with the
 /// session's actual stream resolution.
+/// Single-flight + short-TTL guard for platform enumeration. The platform
+/// enumerators block on OS capture services (macOS `SCShareableContent`
+/// parks a thread on a WindowServer callback; X11 round-trips the display
+/// connection). Uncoalesced hammering — a browser pool re-fetching
+/// `/api/displays` over kept-alive connections — degrades those services
+/// until the callback never fires, and every subsequent caller parks with
+/// it (2026-07-13 soak: all tokio workers wedged in
+/// `SCShareableContent::get`, daemon unresponsive, RSS climbing). One
+/// enumeration in flight at a time; results are fresh enough for 2s.
+static ENUM_CACHE: Mutex<Option<(Instant, Vec<DisplayInfo>)>> = Mutex::const_new(None);
+static ENUM_FLIGHT: Mutex<()> = Mutex::const_new(());
+const ENUM_CACHE_TTL: Duration = Duration::from_secs(2);
+
 pub async fn enumerate_displays() -> Vec<DisplayInfo> {
     // Synthetic display mode (headless test rigs): serve the deterministic
     // synthetic list and never touch a platform enumerator (macOS SCK's
@@ -125,14 +138,27 @@ pub async fn enumerate_displays() -> Vec<DisplayInfo> {
     if synthetic::armed() {
         return synthetic::enumerate_displays();
     }
+    if let Some((at, cached)) = ENUM_CACHE.lock().await.as_ref() {
+        if at.elapsed() < ENUM_CACHE_TTL && !cached.is_empty() {
+            return cached.clone();
+        }
+    }
+    let _flight = ENUM_FLIGHT.lock().await;
+    // Re-check under the flight lock: a concurrent caller may have just
+    // refreshed the cache while this one waited on it.
+    if let Some((at, cached)) = ENUM_CACHE.lock().await.as_ref() {
+        if at.elapsed() < ENUM_CACHE_TTL && !cached.is_empty() {
+            return cached.clone();
+        }
+    }
     let displays = enumerate_displays_platform().await;
-    if displays.is_empty() {
+    let displays = if displays.is_empty() {
         // macOS ScreenCaptureKit may not be ready on first call (TCC prompt,
         // cold start). Retry once after a brief delay before falling back.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let retry = enumerate_displays_platform().await;
         if retry.is_empty() {
-            vec![DisplayInfo {
+            return vec![DisplayInfo {
                 id: 0,
                 platform_id: 0,
                 name: "Default Display".to_string(),
@@ -142,13 +168,17 @@ pub async fn enumerate_displays() -> Vec<DisplayInfo> {
                 kind: DisplayInfoKind::Display,
                 application_name: None,
                 window_title: None,
-            }]
+            }];
+            // Deliberately uncached: the fallback answers "enumeration
+            // failed", and the next caller should retry the real thing.
         } else {
             retry
         }
     } else {
         displays
-    }
+    };
+    *ENUM_CACHE.lock().await = Some((Instant::now(), displays.clone()));
+    displays
 }
 
 /// Enumerate displays and overlay each entry with the live resolution from
