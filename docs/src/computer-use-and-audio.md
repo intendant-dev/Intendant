@@ -66,6 +66,38 @@ on HiDPI and under the Wayland portal, which reports its own stream size).
 (2x on Retina) and crops the requested logical region, because detail is the
 point.
 
+### Screen-capture permissions & signing identity (macOS)
+
+macOS TCC keys every permission grant (Screen Recording, Accessibility,
+Apple Events, Microphone, Camera) to the app's **code-signing designated
+requirement** as it was at grant time. If the binary is rebuilt or re-signed
+under a different identity — or the signing *identifier* changes — every
+existing grant silently stops validating: System Settings keeps showing the
+toggle ON while `SCShareableContent::get` fails with "The user declined
+TCCs…". The macOS capture backend classifies that failure and appends the
+recovery path to the error (permission missing **or** invalidated by a
+re-signed build; toggle it off/on under System Settings → Privacy &
+Security → Screen & System Audio Recording, then relaunch — grants are only
+re-read at launch), and requests screen-capture access once per process so
+a fresh install gets the native prompt.
+
+`scripts/bundle-macos.sh` defends the identity's stability:
+
+- The local-dev signing identity ("Intendant Dev", in
+  `~/.intendant/signing.keychain-db`) is **escrowed** to
+  `~/.intendant/signing-identity.p12` (chmod 600) when created, and
+  backfilled from the keychain for identities that predate the escrow. If
+  the keychain is ever lost, the script re-imports that file — same cert,
+  same designated requirement, existing grants keep validating — instead of
+  silently minting a fresh identity that voids them all.
+- When a genuinely new identity must be minted (keychain *and* escrow both
+  gone), the script prints a loud re-grant warning listing the System
+  Settings steps.
+- After every signing run it diffs the bundle's designated requirement
+  against `~/.intendant/last-signed-dr.txt` and prints the same warning on
+  any drift (this also catches signing-identifier changes and dev-cert ↔
+  Developer ID switches), then refreshes the cache.
+
 ### Element Observation (`read_screen`)
 
 `read_screen` is the cheap textual grounding path: a filtered accessibility

@@ -21,7 +21,11 @@
 #      ~/.intendant/signing.keychain-db. A cert-based Designated
 #      Requirement survives rebuilds, so a one-time TCC grant keeps
 #      working across `./scripts/bundle-macos.sh` re-runs. (Ad-hoc
-#      signing would re-prompt every rebuild.)
+#      signing would re-prompt every rebuild.) The identity is escrowed
+#      to ~/.intendant/signing-identity.p12: TCC keys every grant to the
+#      signing cert, so a lost keychain must re-import the same cert —
+#      silently minting a new one voids all grants (see the signing
+#      section below and the DR drift check after it).
 #   4. Installing the bundle to /Applications/Intendant.app and
 #      refreshing LaunchServices. This is the only location a few
 #      pieces of the stack (Claude Code's computer-use MCP, Dock
@@ -270,6 +274,48 @@ release_codesign() {
     fi
 }
 
+# Loud re-grant instructions, printed whenever this build's signature no
+# longer matches what previous TCC grants were keyed to (a fresh identity
+# was minted, or the designated requirement drifted). macOS keeps the
+# System Settings toggles visually ON while every grant silently stops
+# validating, so without this warning the failure surfaces days later as an
+# opaque "declined TCC" capture error at runtime. Printed at most once in
+# full; later calls in the same run add a one-line note.
+TCC_REGRANT_WARNED=0
+warn_tcc_regrant() {
+    if [ "$TCC_REGRANT_WARNED" = "1" ]; then
+        echo "(TCC re-grant warning above also applies: $1)" >&2
+        return
+    fi
+    TCC_REGRANT_WARNED=1
+    cat >&2 << WARN
+
+============================================================================
+  WARNING: TCC grants from previous Intendant builds are now VOID
+============================================================================
+
+  Why: $1
+
+  macOS keys TCC permissions to the app's code-signing requirement. When it
+  changes, every grant made to earlier builds — Screen Recording,
+  Accessibility, Apple Events / Automation, Microphone, Camera — silently
+  stops validating. System Settings still shows the toggles ON, but capture
+  fails at runtime with "The user declined TCCs".
+
+  Re-grant once this build is installed:
+    1. System Settings → Privacy & Security → Screen & System Audio
+       Recording ("Screen Recording" on older macOS): toggle Intendant
+       OFF, then back ON (remove and re-add it if the toggle seems inert).
+    2. Repeat for Accessibility, and for Automation (Apple Events),
+       Microphone, and Camera if you use those features.
+    3. Relaunch Intendant (open -b com.intendant.app) — TCC grants are
+       re-read at launch, not live.
+
+============================================================================
+
+WARN
+}
+
 # Bundle every non-system dylib the executables reference (today: Homebrew
 # libvpx) into Contents/Frameworks and rewrite the load commands to
 # @executable_path/../Frameworks/. A distributable app cannot reference
@@ -340,18 +386,43 @@ if [ -n "$SIGN_RELEASE_IDENTITY" ]; then
     codesign --verify --deep --strict --verbose=2 "$APP"
     echo "Signed and verified with '$SIGN_RELEASE_IDENTITY'"
 else
-    # Local-dev path (unchanged behavior): sign with a stable self-signed
-    # identity so TCC permissions survive recompiles. Uses a dedicated
-    # keychain at ~/.intendant/signing.keychain-db (works over SSH, no Apple
-    # Developer account needed, no GUI Keychain prompts).
+    # Local-dev path: sign with a stable self-signed identity so TCC
+    # permissions survive recompiles. Uses a dedicated keychain at
+    # ~/.intendant/signing.keychain-db (works over SSH, no Apple Developer
+    # account needed, no GUI Keychain prompts).
     SIGN_IDENTITY="Intendant Dev"
     SIGN_KEYCHAIN="$HOME/.intendant/signing.keychain-db"
     SIGN_KEYCHAIN_PASS="intendant-dev"
+    # PKCS#12 escrow of the signing identity, outside the keychain. The
+    # keychain used to hold the ONLY copy of the private key (the temp cert
+    # dir is deleted right after import), so a lost or recreated keychain
+    # silently minted a brand-new identity — and because macOS TCC keys
+    # every grant to the signing cert, all Screen Recording / Accessibility
+    # / Apple Events grants died with no visible error (2026-07-13
+    # incident). With the escrow, a later run re-imports the SAME identity
+    # instead. Passphrase choice: fixed and public ("intendant", the same
+    # one this script has always used for the import) — this is a
+    # machine-local self-signed cert whose only job is a stable designated
+    # requirement, not a trust anchor. The secret is the key *file*, which
+    # lives chmod-600 under ~/.intendant and never enters the repo tree.
+    SIGN_P12_BACKUP="$HOME/.intendant/signing-identity.p12"
+    SIGN_P12_PASS="intendant"
 
     if ! security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
-        echo "Creating local code signing certificate '$SIGN_IDENTITY'..."
-        CERT_DIR=$(mktemp -d)
-        cat > "$CERT_DIR/cert.conf" << 'CERTCONF'
+        mkdir -p "$(dirname "$SIGN_KEYCHAIN")"
+        security create-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
+        security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN"
+        security set-keychain-settings "$SIGN_KEYCHAIN"
+        if [ -f "$SIGN_P12_BACKUP" ]; then
+            # The keychain is gone/empty but the escrow survives: re-import
+            # the same cert + key, so the designated requirement — and every
+            # TCC grant keyed to it — keeps validating.
+            echo "Signing keychain is missing '$SIGN_IDENTITY'; re-importing it from $SIGN_P12_BACKUP (existing TCC grants stay valid)..."
+            security import "$SIGN_P12_BACKUP" -k "$SIGN_KEYCHAIN" -P "$SIGN_P12_PASS" -T /usr/bin/codesign -A
+        else
+            echo "Creating local code signing certificate '$SIGN_IDENTITY'..."
+            CERT_DIR=$(mktemp -d)
+            cat > "$CERT_DIR/cert.conf" << 'CERTCONF'
 [req]
 distinguished_name = req_dn
 x509_extensions = codesign
@@ -362,25 +433,40 @@ CN = Intendant Dev
 keyUsage = digitalSignature
 extendedKeyUsage = codeSigning
 CERTCONF
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-            -days 3650 -config "$CERT_DIR/cert.conf" 2>/dev/null
-        openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
-            -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
-            -passout pass:intendant 2>/dev/null
-        mkdir -p "$(dirname "$SIGN_KEYCHAIN")"
-        security create-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
-        security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN"
-        security set-keychain-settings "$SIGN_KEYCHAIN"
-        security import "$CERT_DIR/cert.p12" -k "$SIGN_KEYCHAIN" -P "intendant" -T /usr/bin/codesign -A
+            openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+                -days 3650 -config "$CERT_DIR/cert.conf" 2>/dev/null
+            openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
+                -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
+                -passout "pass:$SIGN_P12_PASS" 2>/dev/null
+            security import "$CERT_DIR/cert.p12" -k "$SIGN_KEYCHAIN" -P "$SIGN_P12_PASS" -T /usr/bin/codesign -A
+            # Escrow the identity BEFORE deleting the temp dir — the
+            # keychain must never again hold the only copy of the key.
+            cp "$CERT_DIR/cert.p12" "$SIGN_P12_BACKUP"
+            chmod 600 "$SIGN_P12_BACKUP"
+            rm -rf "$CERT_DIR"
+            echo "Certificate created in $SIGN_KEYCHAIN (escrowed to $SIGN_P12_BACKUP)"
+            warn_tcc_regrant "a NEW signing identity was created — no '$SIGN_IDENTITY' in $SIGN_KEYCHAIN and no escrow at $SIGN_P12_BACKUP to recover it from"
+        fi
         security set-key-partition-list -S apple-tool:,apple: -s -k "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" >/dev/null 2>&1
         # Add to search list so codesign can find it (list-keychains -s
         # replaces the whole list, so re-list the existing entries too;
         # word-splitting the quoted paths is intended).
         # shellcheck disable=SC2046
         security list-keychains -d user -s "$SIGN_KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-        rm -rf "$CERT_DIR"
-        echo "Certificate created in $SIGN_KEYCHAIN"
+    elif [ ! -f "$SIGN_P12_BACKUP" ]; then
+        # The identity predates the escrow (or the escrow was deleted):
+        # backfill it from the keychain so a future keychain loss re-imports
+        # instead of minting. Non-fatal — an un-escrowed identity still
+        # signs; it just cannot survive keychain loss.
+        security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
+        if security export -k "$SIGN_KEYCHAIN" -t identities -f pkcs12 -P "$SIGN_P12_PASS" -o "$SIGN_P12_BACKUP" 2>/dev/null; then
+            chmod 600 "$SIGN_P12_BACKUP"
+            echo "Escrowed signing identity to $SIGN_P12_BACKUP"
+        else
+            rm -f "$SIGN_P12_BACKUP"
+            echo "Warning: could not escrow the signing identity to $SIGN_P12_BACKUP; if $SIGN_KEYCHAIN is ever lost, a new identity will be minted and every TCC grant will be void" >&2
+        fi
     fi
 
     echo "Signing app bundle..."
@@ -393,6 +479,30 @@ CERTCONF
         echo "TCC permissions may be invalidated on each recompile"
         codesign --force --deep --sign - "$APP" 2>/dev/null || true
     fi
+fi
+
+# --- TCC drift check: designated requirement vs. the last signed build -------
+# macOS TCC keys each grant to the app's designated requirement (DR) as it
+# was at grant time. ANY DR change — a re-minted signing cert, a changed
+# signing identifier (the 2026-07-10 `Intendant` → `com.intendant.app`
+# identifier move voided grants exactly this way), a dev-cert ↔ Developer ID
+# switch, or ad-hoc's per-build cdhash — voids every existing grant while
+# System Settings keeps showing the toggles ON. Diff this build's DR against
+# the previous signed build's and warn loudly when it moved. Reads only the
+# bundle plus a cache under ~/.intendant — needs no TCC or Full Disk Access.
+DR_CACHE="$HOME/.intendant/last-signed-dr.txt"
+# codesign -d -r- prints the requirement itself ("designated => ...") on
+# stdout and the Executable= header on stderr; unsigned bundles yield empty.
+CURRENT_DR="$(codesign -d -r- "$APP" 2>/dev/null || true)"
+if [ -n "$CURRENT_DR" ]; then
+    PREVIOUS_DR="$(cat "$DR_CACHE" 2>/dev/null || true)"
+    if [ -n "$PREVIOUS_DR" ] && [ "$CURRENT_DR" != "$PREVIOUS_DR" ]; then
+        echo "Designated requirement changed since the last signed build:" >&2
+        printf '  was: %s\n  now: %s\n' "$PREVIOUS_DR" "$CURRENT_DR" >&2
+        warn_tcc_regrant "this build's code-signing designated requirement differs from the last signed build's (cached at $DR_CACHE)"
+    fi
+    mkdir -p "$(dirname "$DR_CACHE")"
+    printf '%s\n' "$CURRENT_DR" > "$DR_CACHE"
 fi
 
 # --- Notarization (optional; requires the release identity) ------------------
@@ -493,4 +603,11 @@ else
     echo ""
     echo "Launch:"
     echo "  open target/Intendant.app"
+fi
+
+# Repeat a one-line pointer at the very end so the full warning can't be
+# scrolled away by the install output above.
+if [ "$TCC_REGRANT_WARNED" = "1" ]; then
+    echo "" >&2
+    echo "⚠️  TCC re-grant required (see the warning above): cycle Screen Recording / Accessibility for Intendant in System Settings, then relaunch." >&2
 fi
