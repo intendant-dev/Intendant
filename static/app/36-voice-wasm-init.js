@@ -61,6 +61,15 @@ function setPrimaryEventStatus(kind, label, title) {
 
 function setServerWebSocketStatus(connected) {
   if (dashboardConnectModeEnabled()) return;
+  // While the control tunnel is the promoted event lane (this browser's
+  // /ws cannot open — see dashboardTriggerEventLaneFallback), the events
+  // chip belongs to the tunnel status; don't stomp it with the /ws state
+  // the promotion already accounts for. A live /ws always reclaims it.
+  if (!connected
+      && typeof dashboardControlTunnelIsPrimaryEventLane === 'function'
+      && dashboardControlTunnelIsPrimaryEventLane()) {
+    return;
+  }
   setPrimaryEventStatus(
     connected ? 'ok' : 'err',
     'ws',
@@ -950,6 +959,9 @@ async function main() {
 
   // Connection state indicator
   app.set_on_server_state((connected) => {
+    // Feed the capability probe first so the chip guard below sees fresh
+    // lane state (open clears the fallback watchdog, close re-arms it).
+    if (typeof dashboardNoteLegacyWsState === 'function') dashboardNoteLegacyWsState(connected);
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
     // A dead event stream can't retract pending-request items — drop the
@@ -1234,6 +1246,13 @@ async function main() {
     // Connect to server over the normal daemon-origin WebSocket.
     const wsUrl = buildWsUrl();
     app.connect_server(wsUrl);
+    // Capability watchdog: if this browser cannot open the /ws at all
+    // (WebKit + mTLS hangs in CONNECTING forever — no open, no close, no
+    // error), promote the control tunnel to event lane instead of leaving
+    // the page with working HTTP and no intent path (49-daemons-multihost).
+    if (typeof dashboardArmLegacyWsWatchdog === 'function') {
+      dashboardArmLegacyWsWatchdog('legacy WebSocket did not connect');
+    }
 
     // Fetch runtime config (/config) and identity (agent card) in
     // parallel. /config is voice/WebRTC-scoped now; identity lives on

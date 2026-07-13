@@ -28278,6 +28278,7 @@ window.qa = Object.assign(window.qa || {}, {
           reachable: !dashboardConnectModeEnabled(),
           transfersProbe: daemonApiHttpProbeState('transfers'),
         },
+        lane: typeof dashboardEventLaneQa === 'function' ? dashboardEventLaneQa() : null,
       },
       availability: {
         api_fs_stat: daemonApiAvailability('api_fs_stat'),
@@ -31284,8 +31285,20 @@ function dispatchSessionControlMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Session control request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // send_server_action reports whether the frame reached an OPEN
+      // legacy /ws socket (only an explicit false refuses — QA stubs
+      // return undefined). A refused intent must not die silently: kick
+      // the event-lane fallback so the tunnel comes up, and tell the
+      // caller the send never left the browser.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'session control'} intent found no open event lane`);
+      }
+      console.warn('session control: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('session control: no app connection, dropped', payload);
     return false;
@@ -31332,8 +31345,16 @@ function dispatchDashboardActionMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Dashboard action request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // Same refused-send contract as dispatchSessionControlMsg above.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'dashboard action'} intent found no open event lane`);
+      }
+      console.warn('dashboard action: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('dashboard action: no app connection, dropped', payload);
     return false;
@@ -38802,6 +38823,15 @@ function setPrimaryEventStatus(kind, label, title) {
 
 function setServerWebSocketStatus(connected) {
   if (dashboardConnectModeEnabled()) return;
+  // While the control tunnel is the promoted event lane (this browser's
+  // /ws cannot open — see dashboardTriggerEventLaneFallback), the events
+  // chip belongs to the tunnel status; don't stomp it with the /ws state
+  // the promotion already accounts for. A live /ws always reclaims it.
+  if (!connected
+      && typeof dashboardControlTunnelIsPrimaryEventLane === 'function'
+      && dashboardControlTunnelIsPrimaryEventLane()) {
+    return;
+  }
   setPrimaryEventStatus(
     connected ? 'ok' : 'err',
     'ws',
@@ -39691,6 +39721,9 @@ async function main() {
 
   // Connection state indicator
   app.set_on_server_state((connected) => {
+    // Feed the capability probe first so the chip guard below sees fresh
+    // lane state (open clears the fallback watchdog, close re-arms it).
+    if (typeof dashboardNoteLegacyWsState === 'function') dashboardNoteLegacyWsState(connected);
     setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
     // A dead event stream can't retract pending-request items — drop the
@@ -39975,6 +40008,13 @@ async function main() {
     // Connect to server over the normal daemon-origin WebSocket.
     const wsUrl = buildWsUrl();
     app.connect_server(wsUrl);
+    // Capability watchdog: if this browser cannot open the /ws at all
+    // (WebKit + mTLS hangs in CONNECTING forever — no open, no close, no
+    // error), promote the control tunnel to event lane instead of leaving
+    // the page with working HTTP and no intent path (49-daemons-multihost).
+    if (typeof dashboardArmLegacyWsWatchdog === 'function') {
+      dashboardArmLegacyWsWatchdog('legacy WebSocket did not connect');
+    }
 
     // Fetch runtime config (/config) and identity (agent card) in
     // parallel. /config is voice/WebRTC-scoped now; identity lives on
@@ -41369,7 +41409,17 @@ function dispatchControlMsg(payload) {
     return;
   }
   if (app && app.send_server_action) {
-    app.send_server_action(payload);
+    // Refused-send contract (see dispatchSessionControlMsg): only an
+    // explicit false means the frame never reached an open /ws.
+    if (app.send_server_action(payload) === false) {
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'control'} intent found no open event lane`);
+      }
+      console.warn('control pane: no open event lane, refused', action || payload);
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Dashboard control connection is down — reconnecting. Retry in a moment.');
+      }
+    }
   } else {
     console.warn('control pane: no app connection, dropped', payload);
   }
@@ -60085,6 +60135,9 @@ function utf8ToBase64(s) {
 
 // Send a raw WS message object by going through the WASM app's send_raw.
 // Falls back to send_server_action if send_raw isn't available.
+// Returns whether the frame reached an open /ws (only an explicit false
+// from the wasm send refuses — QA stubs return undefined); a refused send
+// kicks the event-lane fallback so the tunnel comes up.
 function sendRawMessage(obj) {
   if (dashboardConnectModeEnabled()) {
     console.warn('[dashboard-control] legacy WebSocket message unavailable in Connect mode', obj?.t || obj);
@@ -60092,15 +60145,16 @@ function sendRawMessage(obj) {
   }
   if (!app) return false;
   const payload = JSON.stringify(obj);
+  let sent = false;
   if (app.send_raw) {
-    app.send_raw(payload);
-    return true;
+    sent = app.send_raw(payload) !== false;
+  } else if (app.send_server_action) {
+    sent = app.send_server_action(obj) !== false;
   }
-  if (app.send_server_action) {
-    app.send_server_action(obj);
-    return true;
+  if (!sent && typeof dashboardTriggerEventLaneFallback === 'function') {
+    dashboardTriggerEventLaneFallback('legacy /ws frame found no open event lane');
   }
-  return false;
+  return sent;
 }
 
 const dashboardPresenceWarned = new Set();
@@ -62041,13 +62095,13 @@ class DisplaySlot {
 
   sendLegacyDisplaySignal(payload) {
     if (!app) return false;
+    // Refused-send contract (see sendRawMessage): only an explicit false
+    // means the frame never reached an open /ws.
     if (app.send_raw) {
-      app.send_raw(JSON.stringify(payload));
-      return true;
+      return app.send_raw(JSON.stringify(payload)) !== false;
     }
     if (app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      return app.send_server_action(payload) !== false;
     }
     return false;
   }
@@ -69575,6 +69629,10 @@ function dashboardControlTransportEnabled() {
   // path — always on (localStorage is also unreliable on the custom
   // intendant:// scheme, so this cannot be a stored preference there).
   if (window.__intendantPort && window.__intendantBackendTls) return true;
+  // Capability fallback: this browser proved unable to open the legacy
+  // /ws (see dashboardTriggerEventLaneFallback below) — the tunnel is
+  // the lane now. Derived state, never stored.
+  if (dashboardControlAutoFallback) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
@@ -69588,16 +69646,126 @@ function dashboardConnectModeEnabled() {
 
 // True when the dashboard-control tunnel is the PRIMARY event lane — the
 // postures where losing the tunnel means losing events entirely:
-//   - hosted Connect dashboards (?connect=1), and
+//   - hosted Connect dashboards (?connect=1),
 //   - the macOS-app mTLS bundle, where the legacy WebSocket can never
 //     present the client certificate (36-voice-wasm-init.js skips it), so
-//     the tunnel is the only event path.
+//     the tunnel is the only event path, and
+//   - the capability fallback below, for exactly as long as the /ws
+//     stays down: a plain browser whose /ws proved unable to open is in
+//     the same boat as the app bundle. If the /ws does open later it
+//     resumes event duty and the tunnel drops back to the opt-in role
+//     (kept, not torn down — dual delivery is the opt-in posture and the
+//     event dedup absorbs it).
 // The localStorage `webrtc-control` opt-in is deliberately excluded: there
 // the legacy /ws lane still carries events, and reload semantics own that
 // toggle. Gate for the event-lane reconnect machinery below.
 function dashboardControlTunnelIsPrimaryEventLane() {
   if (dashboardConnectModeEnabled()) return true;
-  return Boolean(window.__intendantPort && window.__intendantBackendTls);
+  if (window.__intendantPort && window.__intendantBackendTls) return true;
+  return dashboardControlAutoFallback && !dashboardLegacyWsConnected;
+}
+
+// ── Legacy /ws capability probe → tunnel fallback ──
+//
+// The plain-browser posture assumes the legacy /ws is the event lane, but
+// that assumption is not universally true: WebKit (Safari, and WKWebViews
+// outside the packaged app) never attaches an mTLS client certificate to
+// a WebSocket upgrade — against an mTLS daemon the socket hangs in
+// CONNECTING forever, firing neither open nor close nor error, while
+// fetch/XHR mTLS keeps working. The page looks healthy and every intent
+// send is refused. Rather than sniffing browsers, probe the capability:
+// if the /ws has not opened within DASHBOARD_LEGACY_WS_FALLBACK_MS of an
+// attempt (or an intent send reports no open lane), promote the control
+// tunnel to primary event lane — the posture the packaged macOS app runs
+// permanently — and let the existing event-lane reconnect machinery own
+// start, hydration (api_dashboard_bootstrap replay), retry, backoff, and
+// status. The promotion is derived, never stored: a browser that can
+// open the /ws never enters it; one that cannot re-derives it each load.
+const DASHBOARD_LEGACY_WS_FALLBACK_MS = 3000;
+let dashboardControlAutoFallback = false;
+let dashboardLegacyWsConnected = false;
+let dashboardLegacyWsWatchdog = null;
+
+// The posture where the /ws is attempted at all (36-voice-wasm-init.js
+// branch order): not hosted Connect, not the packaged-app bundle.
+function dashboardLegacyWsPostureApplies() {
+  if (dashboardConnectModeEnabled()) return false;
+  return !(window.__intendantPort && window.__intendantBackendTls);
+}
+
+// Fed from the wasm client's server-state callback (open/close); the boot
+// path arms the watchdog right after connect_server. Open clears the
+// watchdog; closed (re-)arms it.
+function dashboardNoteLegacyWsState(connected) {
+  dashboardLegacyWsConnected = !!connected;
+  if (connected) {
+    if (dashboardLegacyWsWatchdog) {
+      clearTimeout(dashboardLegacyWsWatchdog);
+      dashboardLegacyWsWatchdog = null;
+    }
+    // The /ws proved able to open after all (e.g. a browser that merely
+    // weathered a daemon restart): demote the promotion — autoFallback is
+    // derived "ws proven down past the deadline" state, and a live /ws
+    // resumes event duty. An already-running tunnel is left alone (dual
+    // delivery is the opt-in posture; dedup absorbs it) but loses its
+    // primary-lane reconnect duty; a later /ws drop re-derives the
+    // promotion through the watchdog.
+    dashboardControlAutoFallback = false;
+    if (typeof dashboardUpdateTransportStatus === 'function') dashboardUpdateTransportStatus();
+    return;
+  }
+  dashboardArmLegacyWsWatchdog('legacy WebSocket disconnected');
+}
+
+function dashboardArmLegacyWsWatchdog(reason) {
+  if (!dashboardLegacyWsPostureApplies()) return;
+  if (dashboardLegacyWsConnected || dashboardLegacyWsWatchdog) return;
+  dashboardLegacyWsWatchdog = window.setTimeout(() => {
+    dashboardLegacyWsWatchdog = null;
+    if (dashboardLegacyWsConnected) return;
+    dashboardTriggerEventLaneFallback(reason || 'legacy WebSocket did not connect');
+  }, DASHBOARD_LEGACY_WS_FALLBACK_MS);
+}
+
+// Promote the tunnel to event lane now (watchdog expiry, or an intent
+// send that found no open lane). Idempotent; safe to call eagerly.
+function dashboardTriggerEventLaneFallback(reason) {
+  if (!dashboardLegacyWsPostureApplies() || dashboardLegacyWsConnected) return false;
+  if (!window.RTCPeerConnection) {
+    setConnectEventStatus('err',
+      'No dashboard event lane: this browser could not open the WebSocket and has no WebRTC');
+    return false;
+  }
+  if (!dashboardControlAutoFallback) {
+    dashboardControlAutoFallback = true;
+    console.info('[dashboard-control] legacy /ws unavailable — promoting the control tunnel to event lane:', reason);
+  }
+  // Already carrying events (the localStorage opt-in started it at boot):
+  // nothing to start — the promotion above re-labels it primary.
+  if (dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive) {
+    setConnectEventStatus('ok', 'Dashboard events are live through the control tunnel');
+    return true;
+  }
+  scheduleDashboardConnectReconnect(reason || 'legacy WebSocket unavailable', { delayMs: 0 });
+  return true;
+}
+
+// One question, one answer: "can an intent sent right now reach the
+// daemon?" — either lane counts.
+function dashboardEventLaneUp() {
+  if (dashboardLegacyWsConnected) return true;
+  return Boolean(dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive);
+}
+
+// QA/debug readback (window.qa.daemonApi() and DashboardTransport.status()
+// fold this in).
+function dashboardEventLaneQa() {
+  return {
+    legacyWsConnected: dashboardLegacyWsConnected,
+    autoFallback: dashboardControlAutoFallback,
+    watchdogArmed: Boolean(dashboardLegacyWsWatchdog),
+    tunnelEventsActive: Boolean(dashboardControlEventsActive),
+  };
 }
 
 // Human wording for the active primary event lane, used by the reconnect
@@ -70148,13 +70316,14 @@ class DashboardTransport {
 
   status() {
     const reconnect = dashboardConnectReconnectStatus();
-    return dashboardControlTransport?.debugStatus() || {
+    const base = dashboardControlTransport?.debugStatus() || {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
       lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
+    return { ...base, lane: dashboardEventLaneQa() };
   }
 
   canUseRpc() {
@@ -88804,8 +88973,16 @@ function beginNewSessionSpawnNotice(task, text, name = '') {
     newSessionSpawnTask = '';
     newSessionSpawnName = '';
     setNewSessionStartButtonPending(false);
-    setNewSessionSpawnNotice('warn', 'No start confirmation yet. Check the Activity log before retrying.');
-    showControlToast('info', 'No new-session start confirmation yet.');
+    // Blame the transport when it is actually down — "check the Activity
+    // log" is a dead end while no event lane exists to have delivered
+    // anything to the daemon in the first place.
+    const laneDown = typeof dashboardEventLaneUp === 'function' && !dashboardEventLaneUp();
+    setNewSessionSpawnNotice('warn', laneDown
+      ? 'No start confirmation — the dashboard has no live event connection (reconnecting), so the request may not have reached the daemon. Retry once the connection is back.'
+      : 'No start confirmation yet. Check the Activity log before retrying.');
+    showControlToast('info', laneDown
+      ? 'No start confirmation — dashboard event connection is down.'
+      : 'No new-session start confirmation yet.');
   }, NEW_SESSION_SPAWN_TIMEOUT_MS);
 }
 

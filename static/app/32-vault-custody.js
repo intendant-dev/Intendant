@@ -2978,8 +2978,20 @@ function dispatchSessionControlMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Session control request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // send_server_action reports whether the frame reached an OPEN
+      // legacy /ws socket (only an explicit false refuses — QA stubs
+      // return undefined). A refused intent must not die silently: kick
+      // the event-lane fallback so the tunnel comes up, and tell the
+      // caller the send never left the browser.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'session control'} intent found no open event lane`);
+      }
+      console.warn('session control: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('session control: no app connection, dropped', payload);
     return false;
@@ -3026,8 +3038,16 @@ function dispatchDashboardActionMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Dashboard action request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // Same refused-send contract as dispatchSessionControlMsg above.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'dashboard action'} intent found no open event lane`);
+      }
+      console.warn('dashboard action: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('dashboard action: no app connection, dropped', payload);
     return false;

@@ -1171,6 +1171,7 @@ window.qa = Object.assign(window.qa || {}, {
           reachable: !dashboardConnectModeEnabled(),
           transfersProbe: daemonApiHttpProbeState('transfers'),
         },
+        lane: typeof dashboardEventLaneQa === 'function' ? dashboardEventLaneQa() : null,
       },
       availability: {
         api_fs_stat: daemonApiAvailability('api_fs_stat'),

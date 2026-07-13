@@ -3639,8 +3639,9 @@ async fn main() -> Result<(), CallerError> {
                 );
             } else {
                 eprintln!(
-                    "Note: starting without a model provider — AI features stay off until an API key is configured. \
-                     The dashboard, display control, and session browsing still work.",
+                    "Note: starting without a model provider — the built-in agent stays off until an API key is configured. \
+                     External agents signed in with their own accounts (Claude Code, Codex) still work, \
+                     as do the dashboard, display control, and session browsing.",
                 );
             }
             slog(&session_log, |l| {
