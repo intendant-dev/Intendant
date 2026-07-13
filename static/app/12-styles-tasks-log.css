@@ -773,13 +773,27 @@ body.context-focus-active {
 /* Idle notice for the live log: absolute overlay so the stream's scroll
    geometry is untouched; pointer-events none so clicks reach the log and
    the approval/human panels are unaffected. Below .concurrent-log-label
-   (z-index 2), which must stay on top. */
+   (z-index 2), which must stay on top.
+
+   overflow:hidden is load-bearing: this notice is ~180px tall once the
+   unfueled copy adds a hint paragraph and an "Add a provider key" button,
+   and it is centered inside a region that can be far shorter than that
+   (minimized, or squeezed by a tall session grid). Uncontained, the
+   surplus escaped the region — which outranks the grid in the stacking
+   order (z-index 3 vs 1) — and painted the notice straight over the
+   session windows. `safe center` degrades to top-aligned instead of
+   clipping the title off both ends when the room runs out. */
 .log-empty-overlay {
   position: absolute;
   inset: 0;
   z-index: 1;
-  align-content: center;
+  align-content: safe center;
+  overflow: hidden;
   pointer-events: none;
+}
+/* A 30px strip has no room for an empty state at all. */
+.subtab-pane.concurrent-log-minimized .log-empty-overlay {
+  display: none;
 }
 .concurrent-log-label {
   position: absolute;

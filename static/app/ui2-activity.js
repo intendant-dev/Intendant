@@ -86,7 +86,13 @@ function ui2ApplyLayout(mode) {
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
   if (gBtn) gBtn.setAttribute('aria-pressed', String(grid));
   if (typeof syncConcurrentLogStreamMount === 'function') syncConcurrentLogStreamMount();
-  if (grid && typeof fitSessionWindowGridHeight === 'function') fitSessionWindowGridHeight();
+  // applySessionWindowGridHeight is the APPLIER (sets --session-window-grid-height,
+  // the .resized class, and — via syncSessionWindowGridControls — unhides the drag
+  // handle and stamps the pane's concurrent-log mode classes).
+  // fitSessionWindowGridHeight, which used to be called here, is a pure getter: it
+  // returns a number and touches nothing, so entering Grid left the grid unsized and
+  // its controls unsynced until some unrelated path happened to apply them.
+  if (grid && typeof applySessionWindowGridHeight === 'function') applySessionWindowGridHeight();
   if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
 }
 
