@@ -641,7 +641,36 @@ pub(crate) fn resolve_production_roots() -> SweepRoots {
         staged_entries: Vec::new(),
     };
     add_registry_and_staged_roots(&staging.active, &staging.staging, &mut roots);
+    let logs_root = roots.intendant_logs.clone();
+    add_session_codex_home_roots(&logs_root, &mut roots);
     roots
+}
+
+/// Per-session `codex_home` overrides (docs-audit finding 2026-07-12): a
+/// session configured with a custom Codex home writes its rollouts
+/// there, invisible to the default/leased/staged roots. Each session
+/// dir's `session_agent_config.json` is tiny; reading the field per
+/// sweep costs less than one shard parse.
+pub(crate) fn add_session_codex_home_roots(logs_root: &Path, roots: &mut SweepRoots) {
+    let Ok(entries) = std::fs::read_dir(logs_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let config_path = entry.path().join("session_agent_config.json");
+        let Ok(raw) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(home) = value.get("codex_home").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let home = PathBuf::from(home);
+        if home.is_dir() && !roots.codex_roots.contains(&home) {
+            roots.codex_roots.push(home);
+        }
+    }
 }
 
 /// The active-registry + staging halves of root resolution, parameterized
@@ -1103,6 +1132,68 @@ mod tests {
             .get("codex:codex-leased")
             .unwrap();
         assert!(!leased_entry.source_gone);
+    }
+
+    #[test]
+    fn per_session_codex_home_overrides_are_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut roots = rig(tmp.path());
+        // A session configured with a custom codex home; its rollout
+        // lives outside every default root.
+        let custom_home = tmp.path().join("custom-codex-home");
+        write_lines(
+            &custom_home.join("sessions").join("r.jsonl"),
+            &[codex_meta("codex-custom"), codex_user("override rollout text")],
+        );
+        let session_dir = roots.intendant_logs.join("cfg-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session_agent_config.json"),
+            serde_json::json!({"codex_home": custom_home.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        // A dangling override (dir gone) and a duplicate are ignored.
+        let dup_dir = roots.intendant_logs.join("cfg-dup");
+        std::fs::create_dir_all(&dup_dir).unwrap();
+        std::fs::write(
+            dup_dir.join("session_agent_config.json"),
+            serde_json::json!({"codex_home": custom_home.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        let gone_dir = roots.intendant_logs.join("cfg-gone");
+        std::fs::create_dir_all(&gone_dir).unwrap();
+        std::fs::write(
+            gone_dir.join("session_agent_config.json"),
+            serde_json::json!({"codex_home": tmp.path().join("nope").to_string_lossy()})
+                .to_string(),
+        )
+        .unwrap();
+
+        let logs_root = roots.intendant_logs.clone();
+        add_session_codex_home_roots(&logs_root, &mut roots);
+        assert_eq!(
+            roots
+                .codex_roots
+                .iter()
+                .filter(|root| **root == custom_home)
+                .count(),
+            1,
+            "override collected exactly once: {:?}",
+            roots.codex_roots
+        );
+
+        let mut indexer = Indexer::default();
+        assert_eq!(indexer.sweep(&roots).published, 1);
+        let store = Store::open(&roots.store_root).unwrap();
+        assert_eq!(
+            store
+                .snapshot()
+                .read_shard("codex:codex-custom")
+                .unwrap()
+                .records[0]
+                .text,
+            "override rollout text"
+        );
     }
 
     #[test]
