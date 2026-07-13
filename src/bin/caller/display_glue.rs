@@ -1158,6 +1158,11 @@ pub(crate) async fn run_cu_task(
     let display_target =
         target_override.unwrap_or_else(|| resolve_cu_display_target(user_display_granted));
 
+    // Live action-visualization lane for the dashboard (ephemeral events;
+    // the session log below stays the durable trace).
+    let cu_observer =
+        computer_use::CuActionObserver::new(bus.clone(), session_log_id(session_log));
+
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt =
         "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
@@ -1397,6 +1402,7 @@ pub(crate) async fn run_cu_task(
                     &session_registry,
                     None,
                     user_display_granted,
+                    Some(&cu_observer),
                 )
                 .await;
 
@@ -1570,6 +1576,10 @@ pub(crate) async fn handle_shared_view_calls(
                 let screenshot_dir = log_dir.join("screenshots");
                 let _ = std::fs::create_dir_all(&screenshot_dir);
                 let registry = session_registry.cloned();
+                let capture_observer = computer_use::CuActionObserver::new(
+                    bus.clone(),
+                    session_id.clone(),
+                );
                 let results = computer_use::execute_actions(
                     &[computer_use::CuAction::Screenshot],
                     target,
@@ -1579,6 +1589,7 @@ pub(crate) async fn handle_shared_view_calls(
                     &registry,
                     None,
                     user_display_granted,
+                    Some(&capture_observer),
                 )
                 .await;
                 match results.first().and_then(|r| r.screenshot.as_ref()) {
@@ -1633,7 +1644,8 @@ pub(crate) async fn handle_shared_view_calls(
 }
 
 /// `user_display_granted` is the autonomy guard's grant state, read by the
-/// caller before dispatching the batch.
+/// caller before dispatching the batch. `cu_observer` feeds the dashboard's
+/// live action-visualization lane (`None` disables emission).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
@@ -1644,6 +1656,7 @@ pub(crate) async fn execute_cu_calls(
     session_log: &SharedSessionLog,
     session_registry: Option<&display::SharedSessionRegistry>,
     user_display_granted: bool,
+    cu_observer: Option<&computer_use::CuActionObserver>,
 ) {
     // Owned form for execute_actions, which wants `&Option<_>`.
     let session_registry = session_registry.cloned();
@@ -1728,6 +1741,7 @@ pub(crate) async fn execute_cu_calls(
             &session_registry,
             None,
             user_display_granted,
+            cu_observer,
         )
         .await;
 

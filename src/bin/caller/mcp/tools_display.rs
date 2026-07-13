@@ -922,6 +922,9 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        // Sessionless surface: the dashboard shows the capture flash but
+        // attributes it to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
         let results = execute_actions(
             &[CuAction::Screenshot],
             target,
@@ -931,6 +934,7 @@ impl IntendantServer {
             &session_registry,
             None,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
         )
         .await;
 
@@ -1099,6 +1103,8 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        // Sessionless surface: overlays/feed render, attributed to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
         let results = execute_actions(
             &actions,
             target,
@@ -1108,6 +1114,7 @@ impl IntendantServer {
             &session_registry,
             denorm_ref,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
         )
         .await;
 

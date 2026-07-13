@@ -395,6 +395,33 @@ pub enum OutboundEvent {
         #[serde(default = "default_true")]
         agent_visible: bool,
     },
+    /// One executed computer-use action on a display — the dashboard's live
+    /// action-visualization lane (stage overlays + per-display feed).
+    /// Ephemeral: never session-logged, never replayed; `event_id` is the
+    /// browser's dual-lane dedupe key.
+    CuAction {
+        event_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        display_id: u32,
+        /// `left_click` | `type` | `screenshot` | … (see
+        /// `computer_use::cu_action_kind`).
+        kind: String,
+        /// Action point in display pixel space, when the action has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        /// Resolution the coordinates are relative to (0 = unknown).
+        #[serde(default)]
+        ref_w: u32,
+        #[serde(default)]
+        ref_h: u32,
+        /// Short raw call string for the feed (`left_click(612, 233)`).
+        raw: String,
+        /// Unix milliseconds at execution.
+        ts: u64,
+    },
     DisplayResize {
         display_id: u32,
         width: u32,
