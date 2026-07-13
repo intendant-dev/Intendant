@@ -86,8 +86,14 @@ function ui2ApplyLayout(mode) {
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
   if (gBtn) gBtn.setAttribute('aria-pressed', String(grid));
   if (typeof syncConcurrentLogStreamMount === 'function') syncConcurrentLogStreamMount();
-  if (grid && typeof fitSessionWindowGridHeight === 'function') fitSessionWindowGridHeight();
-  if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
+  // applySessionWindowGridHeight is the APPLIER (sets --session-window-grid-height,
+  // the .resized class, and — via syncSessionWindowGridControls — unhides the drag
+  // handle and stamps the pane's concurrent-log mode classes).
+  // fitSessionWindowGridHeight, which used to be called here, is a pure getter: it
+  // returns a number and touches nothing, so entering Grid left the grid unsized and
+  // its controls unsynced until some unrelated path happened to apply them.
+  if (grid && typeof applySessionWindowGridHeight === 'function') applySessionWindowGridHeight();
+  if (typeof ui2ApplyFocusSurface === 'function') ui2ApplyFocusSurface();
 }
 
 function ui2WireLayoutToggle() {
@@ -109,31 +115,107 @@ function ui2DressComposer() {
   if (attach && typeof ui2Icon === 'function') attach.innerHTML = ui2Icon('attach', 15);
 }
 
-// ── Focus filter: Focus shows the FOREGROUND session's timeline ────────
-// The original product decision: "Focus timeline + session switcher".
-// Entries from other sessions hide; daemon-level entries (no session id)
-// always show. No target selected ("all sessions") = the combined
-// stream. Grid mode never filters — the concurrent view is combined by
-// definition.
-function ui2ApplyFocusFilter() {
-  const stream = document.getElementById('log-stream');
-  if (!stream) return;
-  const focusMode = document.documentElement.dataset.ui2Layout !== 'grid';
-  const sid = (focusMode && typeof resolvePromptTargetSessionId === 'function'
-    && resolvePromptTargetSessionId()) || '';
-  stream.querySelectorAll('.log-entry').forEach((e) => {
-    const esid = e.dataset.sessionId || '';
-    e.classList.toggle('hidden-by-focus', !!sid && !!esid && esid !== sid);
-  });
+// ── Focus surface: Focus shows the FOREGROUND session's transcript ─────
+// The product decision: "Focus timeline + session switcher".
+//
+// Focus used to implement that as a FILTER over #log-stream — the combined
+// ("Concurrent view") stream — hiding entries belonging to other sessions.
+// But that stream only ever carries entries the live event feed delivered.
+// A resumed session's transcript is fetched and rendered straight into its
+// session window (hydrateRestoredSessionWindow → renderRestoredSessionWindow-
+// Entries, which touches the main stream nowhere), so it never enters the
+// stream at all — and Focus rendered a blank page for precisely the sessions
+// the user had just reopened, while Grid showed them fine.
+//
+// The session window already IS the per-session timeline: hydrated (external
+// and restored sessions included), signature-deduped, virtualized, paginated,
+// and live. So Focus PROMOTES that window rather than rendering a second copy
+// of it — one renderer, one DOM, and a resumed session appears in Focus
+// because it is the very node Grid draws.
+//
+// With no session targeted, Focus falls back to the combined stream (the
+// "all sessions" reading) — which is also where the idle / unfueled empty
+// state lives, so that notice now shows only when there is genuinely
+// nothing to read.
+function ui2FocusSessionId() {
+  // The canonical target first — the same resolver the composer and the
+  // session switcher use.
+  if (typeof resolvePromptTargetSessionId === 'function') {
+    const sid = resolvePromptTargetSessionId();
+    if (sid) return sid;
+  }
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  if (!windows || windows.size === 0) return '';
+  // That resolver gates every candidate on STEERABILITY (isPromptTargetSession-
+  // Usable: may I send this session a message?). Focus asks the weaker
+  // question — what am I READING? — and a session that has ended, or is still
+  // spinning up, is perfectly readable while not being steerable. So fall back
+  // past that gate: the window the user explicitly opened, and then an
+  // unambiguous single window (the same "one candidate" rule the resolver
+  // applies, minus the steerability filter). Without this, resuming a single
+  // session left Focus on the all-sessions surface — i.e. blank, since a
+  // resumed transcript never enters the combined stream.
+  if (typeof foregroundSessionFullId !== 'undefined'
+      && foregroundSessionFullId && windows.has(foregroundSessionFullId)) {
+    return foregroundSessionFullId;
+  }
+  if (windows.size === 1) return windows.keys().next().value;
+  return '';
 }
 
-let ui2FocusFilterQueued = false;
-function ui2QueueFocusFilter() {
-  if (ui2FocusFilterQueued) return;
-  ui2FocusFilterQueued = true;
+function ui2ApplyFocusSurface() {
+  const root = document.documentElement;
+  const focusMode = root.dataset.ui2Layout !== 'grid';
+  const sid = focusMode ? ui2FocusSessionId() : '';
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  const win = (sid && windows) ? windows.get(sid) : null;
+  if (windows) {
+    for (const [id, w] of windows) {
+      w?.el?.classList.toggle('ui2-focus-window', !!win && id === sid);
+    }
+  }
+  // CSS is the single reader: "session" promotes the marked window and
+  // retires the combined stream; "all" is the pre-existing combined view.
+  root.dataset.ui2Focus = win ? 'session' : 'all';
+  // A session promoted straight into Focus may never have been opened in
+  // Grid, so its window can still be empty. Hydration is idempotent (it
+  // no-ops on non-empty history and on an in-flight fetch), which makes
+  // Focus on its own enough to reopen a session.
+  if (win && typeof hydrateSessionWindowIfEmpty === 'function') {
+    Promise.resolve(hydrateSessionWindowIfEmpty(sid)).catch(() => {});
+  }
+}
+
+// QA readback (window.qa convention): the Focus surface's inputs and its
+// verdict. The interesting regression is silent — Focus renders an empty
+// page — so the probe exposes what it resolved and what it promoted.
+window.qa = Object.assign(window.qa || {}, {
+  focusSurface: () => ({
+    layout: document.documentElement.dataset.ui2Layout || 'focus',
+    surface: document.documentElement.dataset.ui2Focus || '',
+    sessionId: ui2FocusSessionId(),
+    promptTarget: typeof resolvePromptTargetSessionId === 'function'
+      ? (resolvePromptTargetSessionId() || '') : '',
+    foreground: typeof foregroundSessionFullId !== 'undefined' ? (foregroundSessionFullId || '') : '',
+    railSessionId: ui2RailForegroundSessionId(),
+    railTicks: ui2RailTickCount,
+    windows: typeof sessionWindows !== 'undefined' ? [...sessionWindows.keys()] : [],
+    promotedEntries: (() => {
+      const log = document.querySelector(
+        '#session-window-grid .session-window.ui2-focus-window .session-window-log'
+      );
+      return log ? log.querySelectorAll('.log-entry').length : 0;
+    })(),
+  }),
+});
+
+let ui2FocusSurfaceQueued = false;
+function ui2QueueFocusSurface() {
+  if (ui2FocusSurfaceQueued) return;
+  ui2FocusSurfaceQueued = true;
   requestAnimationFrame(() => {
-    ui2FocusFilterQueued = false;
-    ui2ApplyFocusFilter();
+    ui2FocusSurfaceQueued = false;
+    ui2ApplyFocusSurface();
     ui2TagRawEntries();
   });
 }
@@ -217,20 +299,27 @@ function ui2BuildVitalsRail() {
   });
 }
 
-// The rail describes the FOREGROUND session — prompt target, then the
-// current session, then the daemon's own. Same fallback chain the v1
-// composer targeting uses.
+// The rail describes the session Focus is SHOWING, so it derives from the
+// same selector the Focus surface promotes with (and the session switcher
+// displays) — one source, three readers. It previously stopped at
+// resolvePromptTargetSessionId, whose steerability gate rejects an ended or
+// still-starting session, and so read "No session yet" while a perfectly
+// live session was on screen beside it. The daemon's own session stays the
+// last resort.
 function ui2RailForegroundSessionId() {
-  if (typeof resolvePromptTargetSessionId === 'function') {
-    const sid = resolvePromptTargetSessionId();
-    if (sid) return sid;
-  }
-  if (typeof currentSessionFullId !== 'undefined' && currentSessionFullId) return currentSessionFullId;
+  const sid = ui2FocusSessionId();
+  if (sid) return sid;
   if (typeof daemonSessionFullId !== 'undefined' && daemonSessionFullId) return daemonSessionFullId;
   return '';
 }
 
+// The rail repaints on a 1s interval, so any probe of it races that interval —
+// reading it right after load shows the boot tick's values and looks exactly
+// like a broken selector. The counter lets a probe wait deterministically
+// (window.qa.focusSurface().railTicks) instead of sleeping and guessing.
+let ui2RailTickCount = 0;
 function ui2RailTick(force) {
+  ui2RailTickCount++;
   const rail = document.getElementById('ui2-vitals-rail');
   if (!rail) return;
   // hidden: other tab/subtab, grid layout, or <1180px — skip the interval
@@ -295,15 +384,20 @@ function ui2RailTick(force) {
     ui2BuildVitalsRail();
     ui2RailTick(true);
     setInterval(() => ui2RailTick(), 1000);
-    // Focus filter + raw-entry hygiene: follow stream appends, target
-    // changes (the chip re-renders on every change), and layout flips.
+    // Focus surface + raw-entry hygiene: follow stream appends, target
+    // changes (the chip re-renders on every change), layout flips, and the
+    // session-window grid's own membership — a session resumed from the
+    // Sessions tab materializes its window there, and that is the only
+    // signal Focus gets that the window it must promote now exists.
     const stream = document.getElementById('log-stream');
-    if (stream) new MutationObserver(ui2QueueFocusFilter).observe(stream, { childList: true });
+    if (stream) new MutationObserver(ui2QueueFocusSurface).observe(stream, { childList: true });
     const chip = document.getElementById('task-target-chip');
-    if (chip) new MutationObserver(ui2QueueFocusFilter).observe(chip, {
+    if (chip) new MutationObserver(ui2QueueFocusSurface).observe(chip, {
       childList: true, characterData: true, subtree: true, attributes: true,
     });
-    ui2ApplyFocusFilter();
+    const windowGrid = document.getElementById('session-window-grid');
+    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true });
+    ui2ApplyFocusSurface();
     ui2TagRawEntries();
     // Approval hero session identity.
     const panel = document.getElementById('approval-panel');
