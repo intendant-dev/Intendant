@@ -385,14 +385,26 @@ fn scaled_rect_to_damage_rect(
 /// (`CGMainDisplayID()`) gets `id: 0`; additional displays get sequential
 /// IDs starting from 1.
 pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
-    let content = match SCShareableContent::create()
-        .with_on_screen_windows_only(true)
-        .with_exclude_desktop_windows(true)
-        .get()
+    // SCShareableContent::get() parks the calling thread on a semaphore
+    // until WindowServer answers — sync FFI that must not run on a tokio
+    // worker (a starved callback wedges the whole reactor; see the
+    // single-flight rationale on lib.rs's ENUM_CACHE). Blocking pool +
+    // join-error → empty keeps the historical "enumeration failed" shape.
+    let content = match tokio::task::spawn_blocking(|| {
+        SCShareableContent::create()
+            .with_on_screen_windows_only(true)
+            .with_exclude_desktop_windows(true)
+            .get()
+    })
+    .await
     {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             eprintln!("[display/macos] SCShareableContent::get failed: {e}");
+            return Vec::new();
+        }
+        Err(join_err) => {
+            eprintln!("[display/macos] SCShareableContent::get task failed: {join_err}");
             return Vec::new();
         }
     };
