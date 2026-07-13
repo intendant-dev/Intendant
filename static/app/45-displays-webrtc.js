@@ -299,13 +299,27 @@ class DisplaySlot {
     // Video element for WebRTC media track
     this.videoEl = document.createElement('video');
     this.videoEl.autoplay = true;
-    this.videoEl.playsinline = true;
+    // The IDL property is camelCase — the lowercase assignment set a dead
+    // expando, so the element never actually carried playsinline. Set the
+    // attribute too for engines that read it directly.
+    this.videoEl.playsInline = true;
+    this.videoEl.setAttribute('playsinline', '');
     this.videoEl.muted = true;
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.videoEl.setAttribute('aria-label', `Live view of ${label}`);
     this.videoEl.setAttribute('aria-describedby', `ds-status-${displayId} ds-authority-${displayId}`);
     this.canvasEl.appendChild(this.videoEl);
+    // WebKit pauses a muted live <video> on tab switches and on every DOM
+    // reparent (this canvas moves whole through the thumb / fullscreen /
+    // Station containers) and does NOT auto-resume; Chromium mostly
+    // resumes srcObject streams on its own, which is why this never
+    // surfaced before Safari became a supported consumer. A paused element
+    // under a live track shows a frozen frame while the input datachannels
+    // keep working — it reads as catastrophic remote-control lag (live
+    // incident, 2026-07-13). While the slot is connected, every pause is
+    // spurious: resume it.
+    this.videoEl.addEventListener('pause', () => this._resumeLiveVideoSoon());
     // In-stage connection status overlay (time-to-first-frame): staged
     // copy while negotiating ("Negotiating…" → "Waiting for first
     // frame…"), and a visible error state with a Reconnect button on
@@ -818,6 +832,36 @@ class DisplaySlot {
   // epoch comparison is this class's staleness guard).
   _onFirstFrame(epoch, cb) {
     displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
+  }
+
+  // Re-kick playback if the element sits paused under a live connection
+  // (tab return, missed pause event during a reparent). Safe to call any
+  // time; no-ops unless connected with a stream attached.
+  resumeLiveVideoIfPaused() {
+    if (this.videoEl && this.videoEl.paused) this._resumeLiveVideoSoon();
+  }
+
+  _resumeLiveVideoSoon() {
+    if (this._resumeVideoPending) return;
+    if (!this.pc || !this.connected || !this.videoEl.srcObject) return;
+    this._resumeVideoPending = true;
+    // Next macrotask: a reparent's pause fires between the removal and the
+    // re-insert, and a play() issued while the element is out of the
+    // document is voided by the move itself.
+    setTimeout(() => {
+      this._resumeVideoPending = false;
+      if (!this.pc || !this.connected || !this.videoEl.srcObject) return;
+      if (!this.videoEl.paused) return;
+      const p = this.videoEl.play();
+      if (p && p.catch) p.catch(() => {});
+      // Honest, display-scoped breadcrumb (consecutive repeats dedupe in
+      // addDisplayActivity), so a pause-storm is visible in the rail
+      // instead of masquerading as network lag.
+      if (typeof window.noteLiveDisplayLifecycle === 'function') {
+        window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+          'Playback auto-resumed after a browser pause');
+      }
+    }, 120);
   }
 
   // User-facing recovery entry point (overlay Reconnect button, revived
@@ -2585,6 +2629,31 @@ function applyDisplayStripState() {
     scheduleWorkspace();
   };
 
+  // Lifecycle breadcrumbs from the slot layer (one-line rows, deduped by
+  // addDisplayActivity's consecutive-repeat check) — e.g. the live-video
+  // pause guard's auto-resume note.
+  window.noteLiveDisplayLifecycle = function(displayId, kind, text) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, String(kind || 'neutral'), String(text || ''));
+    scheduleWorkspace();
+  };
+
+  // Safari parks media in hidden tabs and can defer the element's own
+  // pause event until nobody is listening usefully; returning to the tab
+  // (or a bfcache restore) must therefore sweep every live slot. The
+  // per-element pause guard in DisplaySlot covers reparents; this covers
+  // backgrounding.
+  const resumeAllLiveDisplayVideos = () => {
+    for (const slot of displaySlots.values()) {
+      if (typeof slot.resumeLiveVideoIfPaused === 'function') slot.resumeLiveVideoIfPaused();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeAllLiveDisplayVideos();
+  });
+  window.addEventListener('pageshow', resumeAllLiveDisplayVideos);
+
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
     const next = snapshotSlot(slot);
@@ -3107,6 +3176,7 @@ function applyDisplayStripState() {
             selected: id === selectedDisplayId,
             connected: Boolean(slot.connected),
             firstFrameSeen: Boolean(slot._firstFrameSeen),
+            paused: Boolean(slot.videoEl && slot.videoEl.paused),
             intrinsicWidth: Number(slot.videoEl && slot.videoEl.videoWidth) || 0,
             intrinsicHeight: Number(slot.videoEl && slot.videoEl.videoHeight) || 0,
             authorityState: slot.authorityState || 'unknown',
