@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 const MAX_SESSION_ROOTS: usize = 120;
@@ -13,6 +15,14 @@ const MAX_SIZE_ENTRIES_PER_SCAN: usize = 300_000;
 const MAX_STATUS_FILES_PER_INSPECT: usize = 300;
 const DISCOVERY_DEPTH: usize = 4;
 const STALE_DAYS: i64 = 14;
+/// Upper bound on concurrent per-worktree enrichment workers. Each worker
+/// runs a couple of short-lived read-only git subprocesses plus a bounded
+/// directory walk, so a small pool stops a 100-worktree scan from paying
+/// serial subprocess latency without swamping a loaded box.
+const ENRICH_WORKERS_CAP: usize = 8;
+/// Head-commit-time lookups are batched into one `git log --no-walk` per
+/// chunk; chunking keeps the argv comfortably under platform limits.
+const HEAD_TIME_BATCH: usize = 512;
 
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeSessionHint {
@@ -205,20 +215,220 @@ struct TreeMeasure {
 
 #[derive(Debug)]
 struct SizeBudget {
-    remaining_entries: usize,
+    remaining_entries: AtomicUsize,
 }
 
 impl SizeBudget {
     fn new(remaining_entries: usize) -> Self {
-        Self { remaining_entries }
+        Self {
+            remaining_entries: AtomicUsize::new(remaining_entries),
+        }
     }
 
-    fn take_entry(&mut self) -> bool {
-        if self.remaining_entries == 0 {
-            return false;
+    fn take_entry(&self) -> bool {
+        self.remaining_entries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .is_ok()
+    }
+}
+
+/// Repo-level facts shared by every worktree enrichment in a scan. Repo-wide
+/// git questions — the default branch, ref tips, ancestry answers, divergence
+/// counts, head commit times — are asked once per repository and memoized
+/// here instead of re-spawned per worktree; on a box with 100+ worktrees of
+/// one repository that is the difference between ~8 git subprocesses per
+/// worktree and ~2.
+struct RepoContext {
+    /// The repository's main-worktree root: the first entry of
+    /// `git worktree list`, which git documents as the main worktree.
+    root: PathBuf,
+    /// `path_key(root)`, precomputed once per repo.
+    root_key: String,
+    default_branch: Option<String>,
+    cache: Mutex<RepoRefCache>,
+}
+
+#[derive(Default)]
+struct RepoRefCache {
+    /// ref name -> resolved tip (None = the ref does not resolve).
+    tips: HashMap<String, Option<String>>,
+    /// (head, target ref name) -> `merge-base --is-ancestor` answer.
+    ancestry: HashMap<(String, String), bool>,
+    /// (head, target ref name) -> ahead/behind counts.
+    divergence: HashMap<(String, String), (i64, i64)>,
+    /// head sha -> committer time, prefilled by one batched `git log`.
+    head_times: HashMap<String, i64>,
+}
+
+impl RepoContext {
+    fn new(root: PathBuf) -> Self {
+        let root_key = path_key(&root);
+        let mut ctx = Self {
+            root,
+            root_key,
+            default_branch: None,
+            cache: Mutex::new(RepoRefCache::default()),
+        };
+        ctx.default_branch = default_branch_for_repo(&ctx);
+        ctx
+    }
+
+    /// Resolve a ref name to its tip commit, memoized (misses included).
+    fn tip(&self, name: &str) -> Option<String> {
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(hit) = cache.tips.get(name) {
+                return hit.clone();
+            }
         }
-        self.remaining_entries -= 1;
-        true
+        let tip = git_string(&self.root, &["rev-parse", "--verify", "--quiet", name])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.tips.insert(name.to_string(), tip.clone());
+        }
+        tip
+    }
+
+    fn ref_exists(&self, name: &str) -> bool {
+        self.tip(name).is_some()
+    }
+
+    /// Is `head` reachable from `target`? Free when `head` IS the target
+    /// tip; otherwise one memoized `merge-base --is-ancestor`.
+    fn is_ancestor(&self, head: &str, target: &str) -> bool {
+        if self.tip(target).as_deref() == Some(head) {
+            return true;
+        }
+        let key = (head.to_string(), target.to_string());
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(hit) = cache.ancestry.get(&key) {
+                return *hit;
+            }
+        }
+        let result = git_status(&self.root, &["merge-base", "--is-ancestor", head, target]);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.ancestry.insert(key, result);
+        }
+        result
+    }
+
+    /// Ahead/behind counts of `head` vs `target`, memoized; (0, 0) without
+    /// a rev-list when `head` is exactly the target tip.
+    fn divergence(&self, head: &str, target: &str) -> (i64, i64) {
+        if self.tip(target).as_deref() == Some(head) {
+            return (0, 0);
+        }
+        let key = (head.to_string(), target.to_string());
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(hit) = cache.divergence.get(&key) {
+                return *hit;
+            }
+        }
+        let counts = git_ahead_behind(&self.root, head, target).unwrap_or((0, 0));
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.divergence.insert(key, counts);
+        }
+        counts
+    }
+
+    /// Prefill committer times for a repository's worktree heads: one
+    /// `git log --no-walk` per [`HEAD_TIME_BATCH`] chunk instead of one
+    /// `git log -1` per worktree.
+    fn prefill_head_times(&self, heads: &[String]) {
+        let mut wanted: Vec<&str> = heads
+            .iter()
+            .map(String::as_str)
+            .filter(|h| !h.is_empty() && !h.bytes().all(|b| b == b'0'))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        for chunk in wanted.chunks(HEAD_TIME_BATCH) {
+            let mut args = vec![
+                "log",
+                "--no-walk=unsorted",
+                "--ignore-missing",
+                "--format=%H %ct",
+            ];
+            args.extend_from_slice(chunk);
+            let Ok(output) = git_string(&self.root, &args) else {
+                continue;
+            };
+            let Ok(mut cache) = self.cache.lock() else {
+                continue;
+            };
+            for line in output.lines() {
+                if let Some((sha, secs)) = line.split_once(' ') {
+                    if let Ok(secs) = secs.trim().parse::<i64>() {
+                        cache.head_times.insert(sha.to_string(), secs);
+                    }
+                }
+            }
+        }
+    }
+
+    fn head_time(&self, head: &str) -> Option<i64> {
+        self.cache.lock().ok()?.head_times.get(head).copied()
+    }
+}
+
+/// Session hints with their path keys canonicalized once per scan: relating
+/// N worktrees to H hints costs N+H canonicalizations instead of N*H
+/// (the per-pair `path_key` syscalls used to dominate hint matching on
+/// session-heavy daemons).
+struct HintIndex<'a> {
+    entries: Vec<HintEntry<'a>>,
+}
+
+struct HintEntry<'a> {
+    hint: &'a WorktreeSessionHint,
+    cwd_key: Option<String>,
+    project_root_key: Option<String>,
+}
+
+impl<'a> HintIndex<'a> {
+    fn new(hints: &'a [WorktreeSessionHint]) -> Self {
+        Self {
+            entries: hints
+                .iter()
+                .map(|hint| HintEntry {
+                    hint,
+                    cwd_key: hint.cwd.as_deref().map(path_key),
+                    project_root_key: hint.project_root.as_deref().map(path_key),
+                })
+                .collect(),
+        }
+    }
+
+    /// Sessions related to the worktree at `worktree_key` (a `path_key`):
+    /// a session belongs to a worktree when its cwd is inside it or its
+    /// project root is exactly it.
+    fn related_sessions(&self, worktree_key: &str) -> Vec<RelatedSession> {
+        let child_prefix = format!("{worktree_key}/");
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in &self.entries {
+            let hint = entry.hint;
+            if hint.session_id.is_empty() {
+                continue;
+            }
+            let related = entry
+                .cwd_key
+                .as_deref()
+                .map(|cwd| cwd == worktree_key || cwd.starts_with(&child_prefix))
+                .unwrap_or(false)
+                || entry.project_root_key.as_deref() == Some(worktree_key);
+            if !related || !seen.insert(hint.session_id.clone()) {
+                continue;
+            }
+            out.push(RelatedSession {
+                session_id: hint.session_id.clone(),
+                source: hint.source.clone(),
+                status: hint.status.clone(),
+                updated_at: hint.updated_at.clone(),
+            });
+        }
+        out
     }
 }
 
@@ -264,7 +474,8 @@ pub fn inspect_worktree(
         ));
     }
 
-    let raw = list_git_worktrees(&repo_root)?
+    let (listed_root, listed) = list_repo_worktrees(&repo_root)?;
+    let raw = listed
         .into_iter()
         .find(|raw| same_path(&raw.path, &request.path))
         .ok_or_else(|| {
@@ -275,10 +486,13 @@ pub fn inspect_worktree(
             )
         })?;
 
-    let mut default_branches = HashMap::new();
-    default_branches.insert(path_key(&repo_root), default_branch_for_repo(&repo_root));
-    let mut size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
-    let entry = enrich_worktree(raw, &default_branches, session_hints, &mut size_budget)?;
+    let repo_ctx = RepoContext::new(listed_root);
+    if let Some(head) = raw.head.clone() {
+        repo_ctx.prefill_head_times(std::slice::from_ref(&head));
+    }
+    let size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    let hint_index = HintIndex::new(session_hints);
+    let entry = enrich_worktree(raw, &repo_ctx, &hint_index, &size_budget)?;
     let status = worktree_status_files(&entry.path, MAX_STATUS_FILES_PER_INSPECT)?;
     let mut reasons = worktree_review_reasons(&entry);
     if let Some(expected) = request
@@ -316,37 +530,57 @@ fn scan_worktrees_with_size_budget(
     max_size_entries: usize,
 ) -> WorktreeScan {
     let mut roots = default_scan_roots(home, project_root, session_hints);
-    let (repo_roots, mut errors) = discover_repos(&mut roots);
-    let mut default_branches: HashMap<String, Option<String>> = HashMap::new();
-    let mut raw_entries = Vec::new();
-    let mut size_budget = SizeBudget::new(max_size_entries);
+    let (repo_candidates, mut errors) = discover_repos(&mut roots);
+    let size_budget = SizeBudget::new(max_size_entries);
 
-    for repo in repo_roots.iter().take(MAX_REPOS) {
-        match list_git_worktrees(repo) {
-            Ok(mut listed) => {
-                let default_branch = default_branch_for_repo(repo);
-                default_branches.insert(path_key(repo), default_branch);
-                raw_entries.append(&mut listed);
-            }
-            Err(e) => errors.push(format!("{}: {}", repo.display(), e)),
-        }
-        if raw_entries.len() >= MAX_WORKTREES {
-            errors.push(format!(
-                "worktree scan capped at {} entries; narrow scan roots to see more",
-                MAX_WORKTREES
-            ));
-            raw_entries.truncate(MAX_WORKTREES);
-            break;
-        }
-    }
-
+    // Discovery already dedupes candidates by repository identity, but a
+    // candidate listing can still fail or race a removal, so the loop keeps
+    // a repo-level guard of its own. Worktrees are deduped BEFORE the cap so
+    // one repository discovered through many of its checkouts cannot burn
+    // the entry budget on duplicates (the old pre-dedupe cap reported a
+    // spurious "capped at 1000" on exactly that shape).
+    let mut seen_repos: HashSet<String> = HashSet::new();
     let mut seen_worktrees = HashSet::new();
-    let mut worktrees = Vec::new();
-    for raw in raw_entries {
-        if !seen_worktrees.insert(path_key(&raw.path)) {
+    let mut repo_count = 0usize;
+    let mut work: Vec<(RawWorktree, Arc<RepoContext>)> = Vec::new();
+    let mut capped = false;
+    'candidates: for candidate in repo_candidates.iter().take(MAX_REPOS) {
+        let (repo_root, listed) = match list_repo_worktrees(candidate) {
+            Ok(listing) => listing,
+            Err(e) => {
+                errors.push(format!("{}: {}", candidate.display(), e));
+                continue;
+            }
+        };
+        if !seen_repos.insert(path_key(&repo_root)) {
             continue;
         }
-        match enrich_worktree(raw, &default_branches, session_hints, &mut size_budget) {
+        repo_count += 1;
+        let ctx = Arc::new(RepoContext::new(repo_root));
+        let heads: Vec<String> = listed.iter().filter_map(|raw| raw.head.clone()).collect();
+        ctx.prefill_head_times(&heads);
+        for raw in listed {
+            if !seen_worktrees.insert(path_key(&raw.path)) {
+                continue;
+            }
+            work.push((raw, Arc::clone(&ctx)));
+            if work.len() >= MAX_WORKTREES {
+                capped = true;
+                break 'candidates;
+            }
+        }
+    }
+    if capped {
+        errors.push(format!(
+            "worktree scan capped at {} entries; narrow scan roots to see more",
+            MAX_WORKTREES
+        ));
+    }
+
+    let hint_index = HintIndex::new(session_hints);
+    let mut worktrees = Vec::new();
+    for result in enrich_worktrees(work, &hint_index, &size_budget) {
+        match result {
             Ok(entry) => worktrees.push(entry),
             Err(e) => errors.push(e),
         }
@@ -360,7 +594,7 @@ fn scan_worktrees_with_size_budget(
 
     let mut summary = WorktreeSummary {
         worktrees: worktrees.len(),
-        repos: repo_roots.len(),
+        repos: repo_count,
         ..WorktreeSummary::default()
     };
     for wt in &worktrees {
@@ -422,7 +656,8 @@ pub fn remove_worktree_if_safe(
         ));
     }
 
-    let raw = list_git_worktrees(&repo_root)?
+    let (listed_root, listed) = list_repo_worktrees(&repo_root)?;
+    let raw = listed
         .into_iter()
         .find(|raw| same_path(&raw.path, &request.path))
         .ok_or_else(|| {
@@ -433,10 +668,13 @@ pub fn remove_worktree_if_safe(
             )
         })?;
 
-    let mut default_branches = HashMap::new();
-    default_branches.insert(path_key(&repo_root), default_branch_for_repo(&repo_root));
-    let mut size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
-    let entry = enrich_worktree(raw, &default_branches, session_hints, &mut size_budget)?;
+    let repo_ctx = RepoContext::new(listed_root);
+    if let Some(head) = raw.head.clone() {
+        repo_ctx.prefill_head_times(std::slice::from_ref(&head));
+    }
+    let size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    let hint_index = HintIndex::new(session_hints);
+    let entry = enrich_worktree(raw, &repo_ctx, &hint_index, &size_budget)?;
 
     if let Some(expected) = request
         .expected_head
@@ -543,6 +781,11 @@ fn default_scan_roots(
 
 fn discover_repos(roots: &mut [WorktreeScanRoot]) -> (Vec<PathBuf>, Vec<String>) {
     let mut repos = Vec::new();
+    // Candidates are deduped by repository identity (the git common dir),
+    // not by checkout toplevel: session cwds routinely point into many
+    // worktrees of the same repository, and each duplicate candidate used
+    // to cost a full `git worktree list` + default-branch derivation
+    // downstream while inflating the reported repo count.
     let mut seen = HashSet::new();
     let mut errors = Vec::new();
 
@@ -550,8 +793,8 @@ fn discover_repos(roots: &mut [WorktreeScanRoot]) -> (Vec<PathBuf>, Vec<String>)
         if !root.exists {
             continue;
         }
-        if let Some(repo) = git_repo_root(&root.path) {
-            if seen.insert(path_key(&repo)) {
+        if let Some((repo, identity)) = git_repo_identity(&root.path) {
+            if seen.insert(identity) {
                 root.repo_count += 1;
                 repos.push(repo);
             }
@@ -574,8 +817,8 @@ fn discover_repos(roots: &mut [WorktreeScanRoot]) -> (Vec<PathBuf>, Vec<String>)
                 continue;
             }
             if has_git_marker(&dir) {
-                if let Some(repo) = git_repo_root(&dir) {
-                    if seen.insert(path_key(&repo)) {
+                if let Some((repo, identity)) = git_repo_identity(&dir) {
+                    if seen.insert(identity) {
                         repos.push(repo);
                     }
                 }
@@ -622,22 +865,64 @@ fn discover_repos(roots: &mut [WorktreeScanRoot]) -> (Vec<PathBuf>, Vec<String>)
     (repos, errors)
 }
 
+/// Enrich every listed worktree, fanning the per-worktree git subprocesses
+/// and bounded directory walks across a small worker pool. Results keep the
+/// input order so error output stays deterministic (the caller re-sorts
+/// entries for presentation anyway).
+fn enrich_worktrees(
+    work: Vec<(RawWorktree, Arc<RepoContext>)>,
+    hints: &HintIndex<'_>,
+    size_budget: &SizeBudget,
+) -> Vec<Result<WorktreeEntry, String>> {
+    let total = work.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(ENRICH_WORKERS_CAP)
+        .min(total);
+    if workers <= 1 {
+        return work
+            .into_iter()
+            .map(|(raw, ctx)| enrich_worktree(raw, &ctx, hints, size_budget))
+            .collect();
+    }
+    let jobs = Mutex::new(work.into_iter().enumerate().collect::<VecDeque<_>>());
+    let mut slots: Vec<Option<Result<WorktreeEntry, String>>> = Vec::new();
+    slots.resize_with(total, || None);
+    let slots = Mutex::new(slots);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let job = jobs.lock().ok().and_then(|mut jobs| jobs.pop_front());
+                let Some((index, (raw, ctx))) = job else {
+                    break;
+                };
+                let result = enrich_worktree(raw, &ctx, hints, size_budget);
+                if let Ok(mut slots) = slots.lock() {
+                    slots[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err("worktree enrichment was interrupted".to_string())))
+        .collect()
+}
+
 fn enrich_worktree(
     raw: RawWorktree,
-    default_branches: &HashMap<String, Option<String>>,
-    session_hints: &[WorktreeSessionHint],
-    size_budget: &mut SizeBudget,
+    repo: &RepoContext,
+    hints: &HintIndex<'_>,
+    size_budget: &SizeBudget,
 ) -> Result<WorktreeEntry, String> {
-    let repo_root = git_common_repo_root(&raw.path).unwrap_or_else(|| {
-        git_repo_root(&raw.path)
-            .or_else(|| raw.path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| raw.path.clone())
-    });
-    let repo_key = path_key(&repo_root);
-    let default_branch = default_branches
-        .get(&repo_key)
-        .cloned()
-        .unwrap_or_else(|| default_branch_for_repo(&repo_root));
+    let repo_root = repo.root.clone();
+    let default_branch = repo.default_branch.clone();
     let status = if raw.path.is_dir() {
         status_info(&raw.path).unwrap_or_default()
     } else {
@@ -660,17 +945,18 @@ fn enrich_worktree(
         }
     }
 
-    let is_main = raw.path == repo_root || same_path(&raw.path, &repo_root);
+    let worktree_key = path_key(&raw.path);
+    let is_main = raw.path == repo_root || worktree_key == repo.root_key;
     let (default_ahead, default_behind) = match (raw.head.as_ref(), default_branch.as_ref()) {
-        (Some(head), Some(default_branch)) if git_ref_exists(&repo_root, default_branch) => {
-            git_ahead_behind(&repo_root, head, default_branch).unwrap_or((0, 0))
+        (Some(head), Some(default_branch)) if repo.ref_exists(default_branch) => {
+            repo.divergence(head, default_branch)
         }
         _ => (0, 0),
     };
     let mut merged_targets = Vec::new();
     if let Some(head) = raw.head.as_ref() {
         for target in &target_refs {
-            if git_ref_exists(&repo_root, target) && git_is_ancestor(&repo_root, head, target) {
+            if repo.ref_exists(target) && repo.is_ancestor(head, target) {
                 merged_targets.push(target.clone());
             }
         }
@@ -693,7 +979,7 @@ fn enrich_worktree(
         TreeMeasure::default()
     };
     let head_author_secs = if raw.path.is_dir() {
-        git_i64(&raw.path, &["log", "-1", "--format=%ct"]).ok()
+        raw.head.as_deref().and_then(|head| repo.head_time(head))
     } else {
         None
     };
@@ -706,7 +992,7 @@ fn enrich_worktree(
         .map(|secs| seconds_to_days(now.saturating_sub(secs)));
     let last_changed_at = tree.latest_mtime.map(system_time_to_rfc3339);
 
-    let related = related_sessions(&raw.path, session_hints);
+    let related = hints.related_sessions(&worktree_key);
     let active_sessions = related
         .iter()
         .filter(|s| is_active_session_status(&s.status))
@@ -1004,6 +1290,20 @@ fn worktree_review_reasons(entry: &WorktreeEntry) -> Vec<WorktreeReviewReason> {
     reasons
 }
 
+/// List a repository's worktrees and identify the repo's main root: git
+/// documents that the main worktree is listed first. Deriving the root from
+/// the listing (instead of a `rev-parse --git-common-dir` per worktree)
+/// also attributes prunable entries — whose checkout dir is gone — to their
+/// true repository rather than to a parent-directory guess.
+fn list_repo_worktrees(dir: &Path) -> Result<(PathBuf, Vec<RawWorktree>), String> {
+    let listed = list_git_worktrees(dir)?;
+    let root = listed
+        .first()
+        .map(|raw| raw.path.clone())
+        .ok_or_else(|| format!("{}: git listed no worktrees", dir.display()))?;
+    Ok((root, listed))
+}
+
 fn list_git_worktrees(repo: &Path) -> Result<Vec<RawWorktree>, String> {
     let output = git_string(repo, &["worktree", "list", "--porcelain"])?;
     let mut out = Vec::new();
@@ -1157,9 +1457,9 @@ fn is_conflicted_status(index: char, worktree: char) -> bool {
         || worktree == 'U'
 }
 
-fn default_branch_for_repo(repo: &Path) -> Option<String> {
+fn default_branch_for_repo(ctx: &RepoContext) -> Option<String> {
     if let Ok(origin_head) = git_string(
-        repo,
+        &ctx.root,
         &[
             "symbolic-ref",
             "--quiet",
@@ -1172,12 +1472,15 @@ fn default_branch_for_repo(repo: &Path) -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
+    // `ref_exists` resolves through the repo cache, so the main/master tip
+    // probed here is already memoized for the per-worktree divergence and
+    // ancestry checks that follow.
     for candidate in ["main", "master"] {
-        if git_ref_exists(repo, candidate) {
+        if ctx.ref_exists(candidate) {
             return Some(candidate.to_string());
         }
     }
-    git_string(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    git_string(&ctx.root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1190,24 +1493,28 @@ pub(crate) fn git_repo_root(path: &Path) -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-fn git_common_repo_root(path: &Path) -> Option<PathBuf> {
-    git_string(
+/// Resolve the checkout toplevel and the repository identity (the git
+/// common dir) for a directory, in one subprocess. The identity is stable
+/// across every worktree of a repository, which is what repo discovery
+/// dedupes on.
+fn git_repo_identity(path: &Path) -> Option<(PathBuf, String)> {
+    let output = git_string(
         path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
     )
-    .ok()
-    .and_then(|s| {
-        let git_dir = PathBuf::from(s.trim());
-        git_dir.parent().map(Path::to_path_buf)
-    })
-}
-
-fn git_ref_exists(repo: &Path, target: &str) -> bool {
-    git_status(repo, &["rev-parse", "--verify", "--quiet", target])
-}
-
-fn git_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
-    git_status(repo, &["merge-base", "--is-ancestor", ancestor, descendant])
+    .ok()?;
+    let mut lines = output.lines();
+    let toplevel = PathBuf::from(lines.next()?.trim());
+    let common_dir = lines.next()?.trim();
+    if toplevel.as_os_str().is_empty() || common_dir.is_empty() {
+        return None;
+    }
+    Some((toplevel, path_key(Path::new(common_dir))))
 }
 
 fn git_ahead_behind(repo: &Path, left: &str, right: &str) -> Option<(i64, i64)> {
@@ -1217,13 +1524,6 @@ fn git_ahead_behind(repo: &Path, left: &str, right: &str) -> Option<(i64, i64)> 
     let ahead = parts.next()?.parse().ok()?;
     let behind = parts.next()?.parse().ok()?;
     Some((ahead, behind))
-}
-
-fn git_i64(path: &Path, args: &[&str]) -> Result<i64, String> {
-    git_string(path, args)?
-        .trim()
-        .parse::<i64>()
-        .map_err(|e| e.to_string())
 }
 
 fn git_status(path: &Path, args: &[&str]) -> bool {
@@ -1258,11 +1558,11 @@ fn git_string(path: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 fn measure_tree(root: &Path) -> TreeMeasure {
-    let mut budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
-    measure_tree_with_budget(root, &mut budget)
+    let budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    measure_tree_with_budget(root, &budget)
 }
 
-fn measure_tree_with_budget(root: &Path, size_budget: &mut SizeBudget) -> TreeMeasure {
+fn measure_tree_with_budget(root: &Path, size_budget: &SizeBudget) -> TreeMeasure {
     let mut measure = TreeMeasure::default();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
@@ -1317,36 +1617,6 @@ fn measure_tree_with_budget(root: &Path, size_budget: &mut SizeBudget) -> TreeMe
     measure
 }
 
-fn related_sessions(path: &Path, session_hints: &[WorktreeSessionHint]) -> Vec<RelatedSession> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for hint in session_hints {
-        if hint.session_id.is_empty() {
-            continue;
-        }
-        let related = hint
-            .cwd
-            .as_ref()
-            .map(|cwd| is_path_within(cwd, path))
-            .unwrap_or(false)
-            || hint
-                .project_root
-                .as_ref()
-                .map(|root| same_path(root, path))
-                .unwrap_or(false);
-        if !related || !seen.insert(hint.session_id.clone()) {
-            continue;
-        }
-        out.push(RelatedSession {
-            session_id: hint.session_id.clone(),
-            source: hint.source.clone(),
-            status: hint.status.clone(),
-            updated_at: hint.updated_at.clone(),
-        });
-    }
-    out
-}
-
 fn has_git_marker(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
@@ -1384,12 +1654,6 @@ fn should_skip_session_root(home: &Path, path: &Path) -> bool {
 
 fn is_active_session_status(status: &str) -> bool {
     matches!(status, "running" | "in_progress" | "thinking")
-}
-
-fn is_path_within(path: &Path, root: &Path) -> bool {
-    let child_key = path_key(path);
-    let root_key = path_key(root);
-    child_key == root_key || child_key.starts_with(&(root_key + "/"))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -1451,16 +1715,32 @@ mod tests {
         tmp
     }
 
+    /// A fixture dir under the checkout's `target/` instead of the system
+    /// tempdir: session-hint roots under macOS's `/var/folders` tempdir are
+    /// skipped by `should_skip_session_root`, which would silently defang
+    /// hint-based discovery tests.
+    ///
+    /// The tempdir root is made an empty sentinel repository because the
+    /// fixture lives INSIDE the real repo this test runs in: a plain
+    /// fixture subdirectory (e.g. `home/projects`) would otherwise resolve
+    /// upward (`git rev-parse`) to the enclosing live checkout, and the
+    /// scan under test would enumerate and enrich every real worktree on
+    /// the box — non-hermetic, and minutes of git subprocesses on an agent
+    /// box with 100+ worktrees (the old 110s+ runtime of the session-hint
+    /// discovery test). The sentinel terminates that upward resolution at
+    /// the fixture boundary.
     fn tempdir_in_target() -> tempfile::TempDir {
         let base = std::env::current_dir()
             .unwrap()
             .join("target")
             .join("worktree-inventory-tests");
         std::fs::create_dir_all(&base).unwrap();
-        tempfile::Builder::new()
+        let tmp = tempfile::Builder::new()
             .prefix("scan-")
             .tempdir_in(base)
-            .unwrap()
+            .unwrap();
+        git(tmp.path(), &["init", "--quiet"]);
+        tmp
     }
 
     fn init_repo_at(repo: &Path) {
@@ -1840,6 +2120,105 @@ mod tests {
 
         assert!(err.contains("HEAD changed"));
         assert!(wt.exists());
+    }
+
+    /// Manual perf harness for the scan path: builds a synthetic corpus
+    /// shaped like a real agent box — one repository with ~120 linked
+    /// worktrees in mixed states (clean-at-main, diverged, dirty) and a
+    /// session-hint set whose cwds sit inside the worktrees, so repo
+    /// discovery sees one candidate per hinted checkout like production
+    /// does — then times `scan_worktrees` against it twice (cold, warm).
+    ///
+    /// Run explicitly:
+    /// `cargo test --bin intendant -- --ignored bench_scan_synthetic_worktree_corpus --nocapture`
+    /// Size the corpus with `INTENDANT_BENCH_WORKTREES` (default 120).
+    #[test]
+    #[ignore = "manual perf benchmark; run with --ignored --nocapture"]
+    fn bench_scan_synthetic_worktree_corpus() {
+        let worktree_count: usize = std::env::var("INTENDANT_BENCH_WORKTREES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let tmp = tempdir_in_target();
+        let repo = tmp.path().join("repo");
+        init_repo_at(&repo);
+        for module in 0..8 {
+            let dir = repo.join("src").join(format!("mod{module}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in 0..8 {
+                std::fs::write(
+                    dir.join(format!("file{file}.rs")),
+                    "pub fn placeholder() {}\n",
+                )
+                .unwrap();
+            }
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "widen tree"]);
+
+        let build_started = std::time::Instant::now();
+        let wt_parent = repo.join(".worktrees");
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let mut hints = Vec::new();
+        for i in 0..worktree_count {
+            let wt = wt_parent.join(format!("bench-{i}"));
+            let wt_str = wt.to_string_lossy().to_string();
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &format!("bench-branch-{i}"),
+                    &wt_str,
+                    "main",
+                ],
+            );
+            match i % 4 {
+                // Diverged: a local commit main does not have.
+                0 => {
+                    std::fs::write(wt.join("local.rs"), "pub fn local() {}\n").unwrap();
+                    git(&wt, &["add", "local.rs"]);
+                    git(&wt, &["commit", "-m", "local work"]);
+                }
+                // Dirty: an untracked scratch file.
+                1 => std::fs::write(wt.join("scratch.txt"), "wip\n").unwrap(),
+                // Clean, still exactly at main.
+                _ => {}
+            }
+            if i < 40 {
+                hints.push(WorktreeSessionHint {
+                    session_id: format!("bench-session-{i}"),
+                    source: "intendant".to_string(),
+                    status: if i % 2 == 0 { "running" } else { "done" }.to_string(),
+                    project_root: Some(wt.clone()),
+                    cwd: Some(wt.join("src")),
+                    updated_at: None,
+                });
+            }
+        }
+        println!(
+            "corpus: {} worktrees built in {:?}",
+            worktree_count,
+            build_started.elapsed()
+        );
+
+        for pass in ["cold", "warm"] {
+            let started = std::time::Instant::now();
+            let scan = scan_worktrees(tmp.path(), Some(&repo), &hints);
+            println!(
+                "scan[{pass}]: {:?} ({} worktrees, {} repos, {} dirty, {} unmerged, {} active, {} errors: {:?})",
+                started.elapsed(),
+                scan.summary.worktrees,
+                scan.summary.repos,
+                scan.summary.dirty,
+                scan.summary.unmerged,
+                scan.summary.active,
+                scan.errors.len(),
+                scan.errors,
+            );
+            assert_eq!(scan.summary.worktrees, worktree_count + 1);
+        }
     }
 
     // du-style block accounting + hardlink de-dup is Unix-only semantics
