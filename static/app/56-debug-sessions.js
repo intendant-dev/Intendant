@@ -2069,7 +2069,7 @@ const _sessionSearchTextCache = new WeakMap();
 function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
   const cached = _sessionSearchTextCache.get(session);
   if (cached && cached.status === displayStatus && cached.current === isCurrent) {
-    return cached.text;
+    return cached;
   }
   const totalBytes = session.total_bytes || 0;
   // Server-side conversation preview (first user/assistant messages) —
@@ -2112,20 +2112,35 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     totalBytes > 0 ? `${_fmtBytes(totalBytes)} size` : '',
     session.total_tokens != null ? `${session.total_tokens} tokens` : '',
     session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
-    previewText,
   ];
   const text = fields
     .filter(v => v !== null && v !== undefined && v !== '')
     .join(' ')
     .toLowerCase();
-  _sessionSearchTextCache.set(session, { status: displayStatus, current: isCurrent, text });
-  return text;
+  const entry = {
+    status: displayStatus,
+    current: isCurrent,
+    text,
+    // Kept OUT of the metadata haystack: preview text only participates
+    // as the old-daemon fallback (see sessionMatchesSearch).
+    preview: previewText.toLowerCase(),
+  };
+  _sessionSearchTextCache.set(session, entry);
+  return entry;
 }
 
 function sessionMatchesSearch(session, query, displayStatus, source, shortId, isCurrent) {
   if (!query) return true;
-  const haystack = sessionSearchText(session, displayStatus, source, shortId, isCurrent);
-  return query.split(/\s+/).every(term => haystack.includes(term));
+  const entry = sessionSearchText(session, displayStatus, source, shortId, isCurrent);
+  const terms = query.split(/\s+/);
+  if (terms.every(term => entry.text.includes(term))) return true;
+  // Preview fallback (plan §8 retirement): server-side conversation
+  // previews stop participating in search whenever the message-search
+  // lane can serve — the shard index is the authority on message text,
+  // and a preview-only match would contradict its (correct) no-hit
+  // answer. Old daemons / a down tunnel keep the fallback.
+  if (messageSearchSupersedesPreviews()) return false;
+  return entry.preview !== '' && terms.every(term => entry.preview.includes(term));
 }
 
 // Compact tile value + the exact figure for the hover: 144,900,123,456

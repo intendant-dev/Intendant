@@ -45,6 +45,23 @@ function messageSearchFlagEnabled() {
   return _msgSearchFlagMemo;
 }
 
+// The preview lane retires from search matching whenever the message
+// lane can serve this host (plan §8): flag on + the daemon-derived
+// availability of api_sessions_message_search. Per-query state is
+// deliberately ignored — an available lane is the authority on message
+// text even when the current query has no hits yet.
+function messageSearchSupersedesPreviews() {
+  if (!messageSearchFlagEnabled()) return false;
+  // Follow the lane's own serving state, not raw availability: a stale
+  // pre-hello "unavailable" answer (typed before the tunnel came up)
+  // must keep the preview fallback, or search would show neither
+  // preview matches nor message hits.
+  if (_sessionMsgSearch.unavailable || _sessionMsgSearch.error) return false;
+  const host = currentSessionsHostId();
+  const target = host && host !== selfPeerId ? host : null;
+  return !!daemonApi.availability('api_sessions_message_search', target).ok;
+}
+
 // Superseded matches are included by default and badged (plan D2); the
 // toolbar toggle (revealed only under the flag) flips the server-side
 // `include_superseded` param. Absent element ⇒ the default (include).
@@ -626,6 +643,7 @@ function buildSessionMessageSearchStubCard(m, ctx) {
 window.qa = Object.assign(window.qa || {}, {
   messageSearch: () => ({
     flag: messageSearchFlagEnabled(),
+    supersedesPreviews: messageSearchSupersedesPreviews(),
     query: _sessionMsgSearch.query,
     active: _sessionMsgSearch.active,
     loading: _sessionMsgSearch.loading,
