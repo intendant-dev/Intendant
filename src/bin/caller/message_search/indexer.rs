@@ -1143,7 +1143,10 @@ mod tests {
         let custom_home = tmp.path().join("custom-codex-home");
         write_lines(
             &custom_home.join("sessions").join("r.jsonl"),
-            &[codex_meta("codex-custom"), codex_user("override rollout text")],
+            &[
+                codex_meta("codex-custom"),
+                codex_user("override rollout text"),
+            ],
         );
         let session_dir = roots.intendant_logs.join("cfg-session");
         std::fs::create_dir_all(&session_dir).unwrap();
