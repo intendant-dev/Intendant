@@ -323,10 +323,14 @@ collisions cheap:
   --draft --fill`, then `gh pr ready` once green). Drafts are the fleet's
   files-in-flight signal — before touching hot files, check what's already
   in motion: `gh pr list --state open --json number,title,headRefName,isDraft,files`.
-- **Auto-merge silently disarms** whenever the PR stops being mergeable (main
-  conflict) or a check fails — after every conflict-resolution push or flake
-  rerun, re-run `gh pr merge <n> --merge --auto` and confirm
-  `autoMergeRequest` is set again. While the PR sits IN the queue,
+- **Auto-merge can silently disarm** (check failure, queue ejection) — after
+  every conflict-resolution push or flake rerun, re-run
+  `gh pr merge <n> --merge --auto` and confirm `autoMergeRequest` is set
+  again. But **disarm is NOT a reliable conflict signal**: a pre-queue PR
+  that goes `CONFLICTING`/`DIRTY` under a moving main can keep auto-merge
+  ARMED and park forever (observed live, PR #293 2026-07-13) — any
+  landing watcher must query `mergeable` + `mergeStateStatus` directly and
+  treat `CONFLICTING`/`DIRTY` as terminal. While the PR sits IN the queue,
   `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
   only `state` (`MERGED`/`CLOSED`) is terminal. A queued branch is frozen —
   pushes are rejected until the entry merges or is dequeued.
