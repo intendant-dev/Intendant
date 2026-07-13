@@ -452,12 +452,17 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("session_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let item_id = data
+                .and_then(|d| d.get("item_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::AgentOutput {
                 session_id,
                 stdout,
                 stderr,
                 source,
                 output_id,
+                item_id,
             })
         }
 
@@ -1548,6 +1553,7 @@ mod tests {
             "",
             Some("Codex"),
             Some("out-1"),
+            Some("call-9"),
         );
         drop(log);
 
@@ -1558,12 +1564,14 @@ mod tests {
                 stdout,
                 source,
                 output_id,
+                item_id,
                 ..
             } => {
                 assert_eq!(session_id.as_deref(), Some("child-thread"));
                 assert_eq!(stdout, "child stdout");
                 assert_eq!(source.as_deref(), Some("Codex"));
                 assert_eq!(output_id.as_deref(), Some("out-1"));
+                assert_eq!(item_id.as_deref(), Some("call-9"));
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }

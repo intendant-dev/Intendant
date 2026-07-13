@@ -277,8 +277,9 @@ mod tests {
         with_limits.cache_ttl_seconds = Some(300);
         with_limits.rate_limit_windows = vec![crate::types::SessionLimitWindow {
             label: "5h".into(),
-            used_pct: 42,
+            used_pct: Some(42),
             resets_at_epoch: None,
+            status: None,
         }];
         let second = rail
             .on_event(&response(Some("s1"), with_limits))
@@ -291,7 +292,7 @@ mod tests {
                 assert_eq!(main.last_uncached_input_tokens, 50);
                 assert_eq!(main.cache_ttl_seconds, Some(300));
                 assert_eq!(main.limits.len(), 1);
-                assert_eq!(main.limits[0].used_pct, 42);
+                assert_eq!(main.limits[0].used_pct, Some(42));
             }
             other => panic!("expected UsageSnapshot, got {other:?}"),
         }

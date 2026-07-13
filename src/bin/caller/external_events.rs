@@ -383,11 +383,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             &reason,
                         );
                         if cancelled_queue + cancelled_pending == 0 {
+                            // Nothing left to cancel: the steer already
+                            // delivered, drained into a follow-up at a turn
+                            // boundary, or was handed to the runtime. The
+                            // old fabricated `SteerCancelled` here made the
+                            // dashboard report a clear while the text still
+                            // reached the model.
                             if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                config.bus.send(AppEvent::SteerCancelled {
+                                config.bus.send(AppEvent::SteerCancelFailed {
                                     session_id: target_session_id.or_else(|| local_session_id.clone()),
                                     id,
-                                    reason,
+                                    reason: "nothing pending to clear — the message already delivered or converted to a follow-up".to_string(),
                                 });
                             }
                         }
@@ -1554,7 +1560,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 }
                 let stdout = text;
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
-                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
+                    emit_external_tool_output(
+                        config,
+                        config.session_id.as_deref(),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
@@ -1565,7 +1576,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 tool_start_seq.remove(&item_id);
                 pending_context_rewind_turn_stop.record_tool_completed(&item_id, &status);
                 if let Some(stdout) = tool_output_limiter.complete(&item_id) {
-                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
+                    emit_external_tool_output(
+                        config,
+                        config.session_id.as_deref(),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
                 let tool_preview = tool_previews.remove(&item_id);
                 // Success: nothing to emit.  The tool command was already

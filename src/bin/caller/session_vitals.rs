@@ -715,8 +715,9 @@ mod tests {
         let mut with_limits = usage_with_sample("anthropic", 80, 10, 10, Some(300));
         with_limits.limits = vec![crate::types::SessionLimitWindow {
             label: "7d".into(),
-            used_pct: 49,
+            used_pct: Some(49),
             resets_at_epoch: Some(1_783_807_200),
+            status: None,
         }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
@@ -738,7 +739,7 @@ mod tests {
         assert_eq!(cache.ttl_seconds, Some(300));
         assert!(cache.last_activity_epoch > 0);
         assert_eq!(vitals.limits.len(), 1);
-        assert_eq!(vitals.limits[0].used_pct, 49);
+        assert_eq!(vitals.limits[0].used_pct, Some(49));
 
         // Limits are sticky: a later usage emission without them keeps the
         // last known gauges.

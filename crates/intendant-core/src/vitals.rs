@@ -53,9 +53,19 @@ pub struct SessionCacheVitals {
 #[serde(rename_all = "camelCase")]
 pub struct SessionLimitWindow {
     pub label: String,
-    pub used_pct: u8,
+    /// Percent of the window consumed. `None` when the provider reports the
+    /// window without a utilization figure (Claude Code 2.1.2xx dropped it
+    /// from `rate_limit_event` in normal operation) — the gauge then shows
+    /// the window's status/reset instead of a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_pct: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_epoch: Option<u64>,
+    /// Provider-reported window status ("allowed", "allowed_warning",
+    /// "rejected", …) when the wire carries one; severity fallback for
+    /// utilization-less windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Per-session vitals (git / prompt-cache / rate limits) shown by the

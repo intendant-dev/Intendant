@@ -1629,7 +1629,7 @@ impl SessionLog {
         source: Option<&str>,
         output_id: Option<&str>,
     ) {
-        self.agent_output_with_session_id(None, stdout, stderr, source, output_id);
+        self.agent_output_with_session_id(None, stdout, stderr, source, output_id, None);
     }
 
     pub fn agent_output_with_session_id(
@@ -1639,6 +1639,7 @@ impl SessionLog {
         stderr: &str,
         source: Option<&str>,
         output_id: Option<&str>,
+        item_id: Option<&str>,
     ) {
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
@@ -1658,6 +1659,9 @@ impl SessionLog {
         });
         if let Some(id) = output_id {
             data["output_id"] = serde_json::Value::String(id.to_string());
+        }
+        if let Some(id) = item_id.map(str::trim).filter(|id| !id.is_empty()) {
+            data["item_id"] = serde_json::Value::String(id.to_string());
         }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());

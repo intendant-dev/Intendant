@@ -1698,6 +1698,18 @@ impl AppEventUpcaster {
                     format!("steer cancelled{id_part}: {reason}"),
                 )]
             }
+            AppEvent::SteerCancelFailed { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Warn,
+                    "agent",
+                    format!("steer cancel failed{id_part}: {reason}"),
+                )]
+            }
         }
     }
 }
@@ -3033,6 +3045,18 @@ impl WireEventUpcaster {
                     format!("steer cancelled{id_part}: {reason}"),
                 )]
             }
+            OutboundEvent::SteerCancelFailed { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Warn,
+                    "agent",
+                    format!("steer cancel failed{id_part}: {reason}"),
+                )]
+            }
         }
     }
 }
@@ -3471,6 +3495,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         });
         let progress_id = output
             .iter()
@@ -3566,6 +3591,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         });
         let progress_id = output
             .iter()

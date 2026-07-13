@@ -1008,6 +1008,20 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
+                    AppEvent::SteerCancelFailed {
+                        ref id, ref reason, ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Steer cancel failed{}: {}", id_part, reason),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
                     AppEvent::FollowUpStatus {
                         ref id,
                         ref status,

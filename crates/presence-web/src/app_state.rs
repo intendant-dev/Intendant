@@ -1930,7 +1930,7 @@ impl AppState {
                     "info",
                     &format!("\u{23F3} Steer sent: {}", truncate(&text, 80)),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -1951,7 +1951,7 @@ impl AppState {
                     "warn",
                     &format!("\u{23F0} Steer queued: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 // Prefer the stored text so late/out-of-order queue
                 // events still render the original message in the strip.
@@ -1979,7 +1979,7 @@ impl AppState {
                     "info",
                     &format!("\u{21AA} Steer accepted: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 let text = self
                     .queued_steers
@@ -2012,7 +2012,7 @@ impl AppState {
                         truncate(&text, 80)
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -2038,12 +2038,38 @@ impl AppState {
                         }
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
                     text,
                     status: "cancelled".into(),
+                    reason: if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
+                });
+            }
+
+            // A cancel that found nothing to clear — the message already
+            // delivered or converted to a follow-up. Renders as a failed
+            // clear, never as a successful one.
+            "steer_cancel_failed" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                let entry = self.queued_steers.remove(&id);
+                let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("\u{2715} Couldn't clear message: {}", reason),
+                    None,
+                    "steer",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "failed".into(),
                     reason: if reason.is_empty() {
                         None
                     } else {

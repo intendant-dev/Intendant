@@ -237,7 +237,7 @@ impl ChatProvider for MockProvider {
             .map(|used_pct| {
                 vec![crate::types::SessionLimitWindow {
                     label: "5h".to_string(),
-                    used_pct,
+                    used_pct: Some(used_pct),
                     resets_at_epoch: Some(
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -245,6 +245,7 @@ impl ChatProvider for MockProvider {
                             .unwrap_or(0)
                             + 7200,
                     ),
+                    status: None,
                 }]
             })
             .unwrap_or_default();
