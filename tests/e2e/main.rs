@@ -1861,20 +1861,49 @@ async fn cu_actions_broadcast_display_scoped_events_over_ws() {
     let output = ctl(&daemon, &["display", "grant-user"]).await;
     assert!(output.status.success(), "{}", text_of(&output));
 
-    let output = ctl(
-        &daemon,
-        &[
-            "--json",
-            "cu",
-            "actions",
-            "--actions",
-            r#"[{"type":"screenshot"}]"#,
-            "--target",
-            "user_session",
-        ],
-    )
-    .await;
-    assert!(output.status.success(), "{}", text_of(&output));
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously — "capture is ready after DisplayReady" is the
+    // command's own contract. A CU call racing past registration misses
+    // the session lookup and falls to the subprocess capture path, which
+    // for a user-session target on Linux is a real X server — correctly
+    // absent on a headless runner, so the action fails and the observer
+    // (by design) emits nothing. Proven live on the Linux fleet box:
+    // firing immediately after grant-user loses that race 5/5 with
+    // "cannot connect to X display". Screenshots are idempotent, so
+    // retry the action itself until its per-action result reports ok —
+    // this also avoids racing the /ws broadcast for the grant's own
+    // display_ready, and `ctl cu actions` exits 0 even for failed
+    // actions (failures are informational summaries), so only the
+    // per-action text is trustworthy. A persistent real failure
+    // surfaces here with its actual error text instead of as a /ws
+    // timeout downstream.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        let output = ctl(
+            &daemon,
+            &[
+                "--json",
+                "cu",
+                "actions",
+                "--actions",
+                r#"[{"type":"screenshot"}]"#,
+                "--target",
+                "user_session",
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{}", text_of(&output));
+        if String::from_utf8_lossy(&output.stdout).contains("(screenshot): ok") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CU screenshot never succeeded (capture session still absent?):\n{}\n{}",
+            text_of(&output),
+            daemon.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("cu_action")
