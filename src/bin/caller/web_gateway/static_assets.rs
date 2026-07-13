@@ -25,8 +25,7 @@ fn extract_app_build(html: &str) -> Option<String> {
     let start = html.find(marker)? + marker.len();
     let rest = &html[start..];
     let value = &rest[..rest.find('\'')?];
-    (value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| value.to_string())
+    (value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| value.to_string())
 }
 
 // The vault crypto kernel: the small, separately served worker that owns
