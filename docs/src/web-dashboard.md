@@ -975,6 +975,20 @@ The handshake is bound to the daemon identity:
   daemon public key registered for the selected daemon id and rejects the tunnel
   if that advertised key differs from the key inside the signed binding.
 
+The tunnel is the **primary event lane** — dashboard events and intents flow
+through it instead of the legacy `/ws` — in three postures: hosted Connect
+dashboards, the packaged macOS app (a WKWebView WebSocket can never present the
+mTLS client certificate), and the **capability fallback**. WebKit browsers
+(Safari) share that WebSocket limitation — against an mTLS daemon the `/ws`
+hangs in CONNECTING forever while fetch/XHR keeps working — so a plain browser
+tab whose `/ws` has not opened within a few seconds of an attempt promotes the
+tunnel automatically; the event-lane reconnect machinery then owns start,
+`api_dashboard_bootstrap` hydration, retry, backoff, and status. The promotion
+is derived, never stored: it clears the moment a `/ws` proves able to open
+(dual delivery is absorbed by event dedup), and intent sends that find no open
+lane surface an actionable error and kick the fallback instead of dropping
+silently.
+
 When enabled with
 `localStorage.intendant_dashboard_transport = "webrtc-control"` (or
 `window.intendantDashboardControl.enable()`), dashboard JSON reads prefer the
