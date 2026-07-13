@@ -37,6 +37,9 @@ x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "8.0"
 core-graphics = { version = "0.25", features = ["highsierra"] }
+# Display/window *enumeration* is CoreGraphics-only (CGWindowList); the
+# CFDictionary plumbing for window metadata needs core-foundation directly.
+core-foundation = "0.10"
 shiguredo_video_toolbox = "2026.1"
 
 # The VP8/libvpx encoder has no Windows backend (Tier-0 Windows port
