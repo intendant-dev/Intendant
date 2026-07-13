@@ -79,10 +79,18 @@ impl Dispatcher {
         ));
         if self.primary_session_id.is_some() {
             // Identity listener: fold backend-native ids into the accepted
-            // set as sessions upgrade their address. Broadcast-lane lag only
-            // delays alias adoption — the wrapper id keeps working regardless.
+            // set as sessions upgrade their address. The broadcast lane is
+            // LOSSY: a lagged receiver has permanently dropped events, and a
+            // `SessionIdentity` among them is forfeited — commands addressed
+            // to that backend-native id are then silently ignored until some
+            // later announcement re-links it (the wrapper id keeps working
+            // regardless). No cheap authoritative snapshot of announced
+            // identities exists in-process (they persist per-session-dir in
+            // `session.jsonl`), so the honest response is to say so loudly.
             let accepted = accepted.clone();
             let mut identity_rx = bus.subscribe();
+            let lag_bus = bus.clone();
+            let lag_session_id = self.primary_session_id.clone();
             tokio::spawn(async move {
                 loop {
                     match identity_rx.recv().await {
@@ -98,7 +106,20 @@ impl Dispatcher {
                             }
                         }
                         Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            lag_bus.send(AppEvent::LogEntry {
+                                session_id: lag_session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "system".to_string(),
+                                content: format!(
+                                    "Dispatcher identity listener lagged; {} dropped event(s) — a missed SessionIdentity means commands targeting the backend-native id may be ignored until the next announcement (session {})",
+                                    n,
+                                    lag_session_id.as_deref().unwrap_or("?")
+                                ),
+                                turn: None,
+                            });
+                            continue;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -852,6 +873,120 @@ mod tests {
             }
         }
         assert_eq!(seen_id.as_deref(), Some(""));
+    }
+
+    /// External `--agent` shape: no task channel, but the follow-up lane is
+    /// real (run_external_agent_mode consumes it) — the attachment steer
+    /// rides it with its steer id and unresolved frame ids intact.
+    #[tokio::test]
+    async fn steer_with_attachments_falls_back_to_follow_up_lane() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("ext-sess".into()),
+            text: "see the attached frame".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s3".into()),
+        }));
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.text, "see the attached frame");
+        assert_eq!(msg.steer_id.as_deref(), Some("s3"));
+        assert_eq!(msg.unresolved_attachment_ids, vec!["frame:latest"]);
+        assert_eq!(msg.target_session_id.as_deref(), Some("ext-sess"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_queued = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { id, .. })) => {
+                    assert_eq!(id, "s3");
+                    saw_queued = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_queued, "expected SteerQueued for follow-up-lane steer");
+    }
+
+    /// Presence shape: the headless wiring hands the dispatcher NO
+    /// follow_up_tx (nothing reads that channel under run_with_presence), so
+    /// when the task lane is unavailable the steer reaches the explicit
+    /// warn+drop — never a phantom `SteerQueued` receipt for a message
+    /// sitting in a channel nothing drains.
+    #[tokio::test]
+    async fn steer_with_attachments_without_consumer_drops_honestly() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        // Task lane exists but is FULL (capacity 1, pre-filled) — the
+        // presence loop is busy and try_send fails.
+        let (task_tx, _task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(1);
+        task_tx
+            .try_send(presence_core::TaskEnvelope {
+                task: "occupies the only slot".into(),
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+                steer_id: None,
+            })
+            .unwrap();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: Some(task_tx),
+            follow_up_tx: None,
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: None,
+            text: "attachment steer with nowhere to go".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s4".into()),
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_drop_warning = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { .. })) => {
+                    panic!("phantom SteerQueued for an undeliverable steer");
+                }
+                Ok(Ok(AppEvent::LogEntry { content, level, .. }))
+                    if level == "warn" && content.contains("Steer dropped") =>
+                {
+                    saw_drop_warning = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_drop_warning, "expected the explicit warn+drop");
     }
 
     #[tokio::test]

@@ -2061,12 +2061,20 @@ impl AppState {
 
             // A cancel that found nothing to clear — the message already
             // delivered or converted to a follow-up. Renders as a failed
-            // clear, never as a successful one.
+            // clear, never as a successful one. The entry is READ, not
+            // removed: the steer is still on its way to the model (that is
+            // what the failed clear means), so a later `steer_delivered`
+            // must still find the original text — removing here made that
+            // delivery render blank. Terminal cleanup stays with
+            // delivered/cancelled.
             "steer_cancel_failed" => {
                 let id = msg["id"].as_str().unwrap_or("").to_string();
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
-                let entry = self.queued_steers.remove(&id);
-                let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
+                let text = self
+                    .queued_steers
+                    .get(&id)
+                    .map(|q| q.text.clone())
+                    .unwrap_or_default();
                 cmds.extend(self.add_log(
                     "warn",
                     &format!("\u{2715} Couldn't clear message: {}", reason),
@@ -5783,6 +5791,68 @@ mod tests {
             "expected cancelled SteerStatusUpdate, got {:?}",
             cmds
         );
+    }
+
+    /// A failed clear means the message is still on its way to the model —
+    /// the tracked entry must survive so the eventual `steer_delivered`
+    /// renders the original text (removing it here made that delivery
+    /// render blank for steers that converted to follow-ups).
+    #[test]
+    fn handle_event_steer_cancel_failed_keeps_entry_for_delivery() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "in-flight".into(),
+            QueuedSteer {
+                text: "switch to SQLite".into(),
+                status: SteerStatus::Queued,
+                reason: Some("queued as follow-up".into()),
+            },
+        );
+        let msg = json!({
+            "event": "steer_cancel_failed",
+            "id": "in-flight",
+            "reason": "nothing pending to clear — the message already delivered or converted to a follow-up"
+        });
+        let cmds = s.handle_message(&msg);
+
+        // Rendered as a failed clear with the original text …
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, text, .. }
+                    if id == "in-flight" && status == "failed" && text == "switch to SQLite"
+            )
+        });
+        assert!(saw_update, "expected failed SteerStatusUpdate, got {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn" && content.contains("Couldn't clear message")
+        )));
+        // … and the entry survives for the delivery that is still coming.
+        assert!(
+            s.queued_steers.contains_key("in-flight"),
+            "cancel-failed must not discard the in-flight entry"
+        );
+
+        let delivered = json!({
+            "event": "steer_delivered",
+            "id": "in-flight",
+            "mid_turn": false
+        });
+        let cmds = s.handle_message(&delivered);
+        let saw_delivered = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, text, .. }
+                    if id == "in-flight" && status == "delivered" && text == "switch to SQLite"
+            )
+        });
+        assert!(
+            saw_delivered,
+            "delivery after a failed clear must render the original text, got {cmds:?}"
+        );
+        assert!(s.queued_steers.get("in-flight").is_none());
     }
 
     #[test]

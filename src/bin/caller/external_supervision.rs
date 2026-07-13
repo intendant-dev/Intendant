@@ -231,6 +231,31 @@ pub(crate) fn event_targets_external_session_or_optional_side(
     }
 }
 
+/// Non-blocking peek at a persistent external agent's event channel: returns
+/// a buffered event if one is already waiting, and disables the receiver
+/// (sets it to `None`) when the reader task is gone so the caller's select
+/// arm logic stays consistent with a `recv() -> None`.
+///
+/// Used by the idle queued-steer flush: a buffered event means the backend
+/// is (or is about to be) mid-turn — e.g. Claude Code starting a spontaneous
+/// task-notification round — and CC 2.1.2xx discards stdin written mid-turn,
+/// so flushing first would emit `SteerDelivered` for text the model never
+/// saw. Processing the buffered event first routes a turn start through the
+/// spontaneous-round drain, which delivers queued steers at a real boundary.
+pub(crate) fn try_buffered_idle_agent_event(
+    event_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>>,
+) -> Option<external_agent::AgentEvent> {
+    let rx = event_rx.as_mut()?;
+    match rx.try_recv() {
+        Ok(event) => Some(event),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            *event_rx = None;
+            None
+        }
+    }
+}
+
 pub(crate) fn emit_user_message_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -940,6 +965,28 @@ pub(crate) fn shared_codex_config_from_project(
 mod tests {
     use super::*;
     use crate::*;
+
+    #[test]
+    fn buffered_idle_agent_event_preempts_and_disables_on_disconnect() {
+        // A buffered event is returned (the flush must yield to it) …
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut event_rx = Some(rx);
+        tx.send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        assert!(matches!(
+            try_buffered_idle_agent_event(&mut event_rx),
+            Some(external_agent::AgentEvent::TurnCompleted { .. })
+        ));
+        // … an empty channel yields nothing and keeps the receiver armed …
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+        assert!(event_rx.is_some());
+        // … and a closed channel disables the receiver like `recv() -> None`.
+        drop(tx);
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+        assert!(event_rx.is_none());
+        // A disabled receiver stays disabled.
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+    }
 
     #[test]
     fn external_rollback_turn_in_progress_matches_codex_rpc_error() {

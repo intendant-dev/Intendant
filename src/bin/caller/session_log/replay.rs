@@ -600,6 +600,31 @@ pub fn session_log_entry_to_app_event(
                 reason,
             })
         }
+        "steer_cancel_failed" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(
+                    message
+                        .strip_prefix("Steer cancel failed: ")
+                        .unwrap_or(message),
+                )
+                .to_string();
+            Some(AppEvent::SteerCancelFailed {
+                session_id,
+                id,
+                reason,
+            })
+        }
         "session_started" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -1287,6 +1312,36 @@ mod tests {
                 assert_eq!(replayed, text);
             }
             other => panic!("expected SteerRequested, got {:?}", other),
+        }
+    }
+
+    /// A failed clear is terminal steer state: without a structured event +
+    /// replay arm the pending strip row resurrected as "queued" on reload
+    /// (the pre-fix writer emitted only a prose `log.warn`).
+    #[test]
+    fn rt_steer_cancel_failed_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.steer_cancel_failed(
+            Some("thread-1"),
+            "steer-9",
+            "nothing pending to clear — the message already delivered or converted to a follow-up",
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "steer_cancel_failed");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SteerCancelFailed {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-1"));
+                assert_eq!(id, "steer-9");
+                assert!(reason.starts_with("nothing pending to clear"), "{reason}");
+            }
+            other => panic!("expected SteerCancelFailed, got {:?}", other),
         }
     }
 
