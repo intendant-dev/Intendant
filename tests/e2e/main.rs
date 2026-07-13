@@ -1825,6 +1825,99 @@ async fn display_request_rail_round_trips_over_ws() {
     );
 }
 
+/// The CU action-visualization lane end to end: grant the (synthetic) user
+/// display, execute one `screenshot` action through `ctl cu actions` (the
+/// MCP `execute_cu_actions` tool → `computer_use::execute_actions` → the
+/// `CuActionObserver`), and require the display-scoped `cu_action` event
+/// the Live tab's overlays/feed render from to broadcast on `/ws` with the
+/// pinned wire shape. A screenshot is the one action that is safe on every
+/// backend here: it is input-free and the suite-wide synthetic display
+/// serves the frame (no SCK/GDI/X11). Also pins the lane's ephemerality —
+/// the event must never land in session.jsonl (no replay).
+#[tokio::test]
+async fn cu_actions_broadcast_display_scoped_events_over_ws() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before acting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Synthetic user-display capture session (1280×720 on every platform).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "cu",
+            "actions",
+            "--actions",
+            r#"[{"type":"screenshot"}]"#,
+            "--target",
+            "user_session",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("cu_action")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "cu_action never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
+    assert_eq!(event["display_id"], 0, "{event}");
+    assert_eq!(event["kind"], "screenshot", "{event}");
+    assert_eq!(event["raw"], "screenshot()", "{event}");
+    // Coordinate reference = the synthetic session resolution, the space
+    // viewers normalize overlay geometry against.
+    assert_eq!(event["ref_w"], 1280, "{event}");
+    assert_eq!(event["ref_h"], 720, "{event}");
+    // A screenshot has no landing point, and the MCP surface is
+    // sessionless — absent fields are omitted from the wire, not nulled.
+    assert!(event.get("x").is_none(), "{event}");
+    assert!(event.get("y").is_none(), "{event}");
+    assert!(event.get("session_id").is_none(), "{event}");
+    assert!(event["ts"].as_u64().unwrap_or(0) > 0, "{event}");
+    assert!(
+        event["event_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("cu-"),
+        "{event}"
+    );
+
+    // Ephemeral lane: the broadcast above is the event's ONLY life — it
+    // must never be written to session.jsonl (and hence never replays).
+    // An absence check can pass early by timing alone; the authoritative
+    // pin is event.rs's cu_action_events_never_reach_the_session_log —
+    // this asserts the same contract at the wire edge.
+    assert!(
+        !daemon.rig.session_logs().contains("\"cu_action\""),
+        "cu_action must not be written to session.jsonl"
+    );
+}
+
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
 /// renders the question on the rail (`user_question` on /ws), a frontend
 /// answers via `answer_question`, and the blocked ctl returns the exact

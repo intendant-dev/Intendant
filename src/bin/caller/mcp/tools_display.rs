@@ -1608,10 +1608,16 @@ mod tests {
             !rendered.contains(opt_in_refusal_marker()),
             "capture must use virtual display 99, not fall through to the user display: {rendered}"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "no display-0 activation was emitted"
-        );
+        // The successful capture also emits its ephemeral cu_action
+        // screenshot event on the bus. The assertion here is specifically
+        // that no display-0 ACTIVATION (user-display grant) was requested —
+        // not that the bus is otherwise quiet.
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::UserDisplayGranted { .. }),
+                "no display-0 activation should be emitted, got {event:?}"
+            );
+        }
     }
 
     #[test]
