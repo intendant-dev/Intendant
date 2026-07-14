@@ -1818,6 +1818,10 @@ function renderSharedViewFocus(slot, region, note) {
   if (!focus) {
     focus = document.createElement('div');
     focus.className = 'shared-view-focus-box';
+    const noteEl = document.createElement('div');
+    noteEl.className = 'shared-view-focus-note';
+    noteEl.hidden = true;
+    focus.appendChild(noteEl);
     slot.canvasEl.appendChild(focus);
   }
   const x = Math.max(0, Math.min(1, Number(region.x) || 0));
@@ -1829,23 +1833,66 @@ function renderSharedViewFocus(slot, region, note) {
   const videoRect = video ? video.getBoundingClientRect() : null;
   const videoWidth = video && Number(video.videoWidth);
   const videoHeight = video && Number(video.videoHeight);
+  // Box geometry in stage-local px (kept for the note clamp below even on
+  // the percentage fallback path).
+  let boxLeft; let boxTop; let boxW; let boxH;
   if (videoRect && videoRect.width > 0 && videoRect.height > 0 && canvasRect.width > 0 && canvasRect.height > 0 && videoWidth > 0 && videoHeight > 0) {
     const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
     const frameW = videoWidth * scale;
     const frameH = videoHeight * scale;
     const frameX = videoRect.left - canvasRect.left + ((videoRect.width - frameW) / 2);
     const frameY = videoRect.top - canvasRect.top + ((videoRect.height - frameH) / 2);
-    focus.style.left = (frameX + x * frameW).toFixed(1) + 'px';
-    focus.style.top = (frameY + y * frameH).toFixed(1) + 'px';
-    focus.style.width = (w * frameW).toFixed(1) + 'px';
-    focus.style.height = (h * frameH).toFixed(1) + 'px';
+    boxLeft = frameX + x * frameW;
+    boxTop = frameY + y * frameH;
+    boxW = w * frameW;
+    boxH = h * frameH;
+    focus.style.left = boxLeft.toFixed(1) + 'px';
+    focus.style.top = boxTop.toFixed(1) + 'px';
+    focus.style.width = boxW.toFixed(1) + 'px';
+    focus.style.height = boxH.toFixed(1) + 'px';
   } else {
+    boxLeft = x * canvasRect.width;
+    boxTop = y * canvasRect.height;
+    boxW = w * canvasRect.width;
+    boxH = h * canvasRect.height;
     focus.style.left = (x * 100).toFixed(3) + '%';
     focus.style.top = (y * 100).toFixed(3) + '%';
     focus.style.width = (w * 100).toFixed(3) + '%';
     focus.style.height = (h * 100).toFixed(3) + '%';
   }
-  focus.dataset.note = note || '';
+  positionSharedViewFocusNote(
+    focus, note, { left: boxLeft, top: boxTop, width: boxW, height: boxH },
+    canvasRect.width, canvasRect.height);
+}
+
+// Keep the focus note readable wherever the region lands: below the box
+// when that fits inside the stage, flipped above when it doesn't, and
+// always clamped into the stage box (the canvas clips at its edges, so an
+// unclamped chip near a corner renders as a cut-off sliver or nothing).
+const SHARED_FOCUS_NOTE_PAD = 8;   // stage-edge breathing room
+const SHARED_FOCUS_NOTE_GAP = 6;   // box ↔ chip spacing
+
+function positionSharedViewFocusNote(focus, note, box, canvasW, canvasH) {
+  const noteEl = focus.querySelector('.shared-view-focus-note');
+  if (!noteEl) return;
+  const text = String(note || '');
+  if (noteEl.textContent !== text) noteEl.textContent = text;
+  noteEl.hidden = text === '';
+  if (text === '' || !(canvasW > 0) || !(canvasH > 0)) return;
+  const pad = SHARED_FOCUS_NOTE_PAD;
+  const gap = SHARED_FOCUS_NOTE_GAP;
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  // Cap the chip's width to the stage before measuring it.
+  noteEl.style.maxWidth = Math.round(clamp(canvasW - 2 * pad, 60, 360)) + 'px';
+  const noteW = noteEl.offsetWidth;
+  const noteH = noteEl.offsetHeight;
+  const left = clamp(box.left, pad, canvasW - noteW - pad);
+  let top = box.top + box.height + gap;
+  if (top + noteH > canvasH - pad) top = box.top - gap - noteH; // flip above
+  top = clamp(top, pad, canvasH - noteH - pad);
+  // The chip is positioned relative to the focus box (its offset parent).
+  noteEl.style.left = (left - box.left).toFixed(1) + 'px';
+  noteEl.style.top = (top - box.top).toFixed(1) + 'px';
 }
 
 function updateSharedViewBanner() {
@@ -2882,6 +2929,51 @@ function applyDisplayStripState() {
     slotSnapshots.set(id, next);
   }
 
+  // Raw CU payloads can be huge — a type() of a percent-encoded data: URL
+  // runs to thousands of characters. Collapsed rows show a readable
+  // preview (URL-decoded when the text is percent-encoded) plus the total
+  // length; the full literal call is one click away.
+  const CU_RAW_COLLAPSE_MIN = 160;  // rows at or under this render inline
+  const CU_RAW_PREVIEW_CHARS = 96;  // collapsed preview length
+
+  function cuRawPreview(raw) {
+    let head = raw.slice(0, CU_RAW_PREVIEW_CHARS);
+    // Percent-encoded blobs read better decoded (`%20name%3D` → " name=").
+    // Only the preview decodes; expanding always shows the literal call.
+    if (/%[0-9A-Fa-f]{2}/.test(head)) {
+      try {
+        head = decodeURIComponent(head.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+      } catch (_) { /* not valid percent-encoding — keep the literal prefix */ }
+    }
+    // Keep the preview one tidy run: fold control chars and space runs.
+    head = head.replace(/[\u0000-\u001F\u007F]+/g, ' ').replace(/ {2,}/g, ' ');
+    return head + '… (' + raw.length + ' chars)';
+  }
+
+  function buildCuRawDetail(raw) {
+    const el = document.createElement('div');
+    el.className = 'cu-action-raw';
+    if (raw.length <= CU_RAW_COLLAPSE_MIN) {
+      el.textContent = raw;
+      return el;
+    }
+    const preview = cuRawPreview(raw);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'cu-action-raw-toggle';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.title = 'Show the full input';
+    toggle.textContent = preview;
+    toggle.addEventListener('click', () => {
+      const expand = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', expand ? 'true' : 'false');
+      toggle.textContent = expand ? raw : preview;
+      toggle.title = expand ? 'Show less' : 'Show the full input';
+    });
+    el.appendChild(toggle);
+    return el;
+  }
+
   function syncActivityList() {
     const entries = selectedDisplayId === null
       ? []
@@ -2948,10 +3040,7 @@ function applyDisplayStripState() {
         head.appendChild(time);
         main.appendChild(head);
         if (entry.raw) {
-          const raw = document.createElement('div');
-          raw.className = 'cu-action-raw';
-          raw.textContent = entry.raw;
-          main.appendChild(raw);
+          main.appendChild(buildCuRawDetail(entry.raw));
         }
         row.appendChild(dot);
         row.appendChild(main);
