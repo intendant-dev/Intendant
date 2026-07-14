@@ -9,6 +9,8 @@ pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod browser_workspace;
+#[path = "../../build_info.rs"]
+mod build_info;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;
@@ -356,6 +358,9 @@ fn print_help() {
         "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
     );
     println!("    --help, -h            Show this help message");
+    println!(
+        "    --version, -V         Print version and build provenance (commit, timestamp, target)"
+    );
     println!();
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
@@ -440,6 +445,10 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
         match args[i].as_str() {
             "--help" | "-h" => {
                 print_help();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("{}", build_info::version_line("intendant"));
                 std::process::exit(0);
             }
             "--provider" => {

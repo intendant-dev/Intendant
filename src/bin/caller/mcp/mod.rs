@@ -1056,6 +1056,13 @@ impl IntendantServer {
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
             let usage = s.usage_snapshot_for(Some(&session_id));
+            // Running-binary provenance (EV-02): the daemon's own embedded
+            // version line, so `intendant ctl status` can pin the exact
+            // revision serving this answer.
+            obj.insert(
+                "daemon_version".to_string(),
+                serde_json::Value::String(crate::build_info::version_line("intendant")),
+            );
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
