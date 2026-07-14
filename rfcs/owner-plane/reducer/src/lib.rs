@@ -17,4 +17,5 @@ pub mod domains;
 pub mod envelope;
 pub mod fold;
 pub mod harness;
+pub mod journal;
 pub mod outcomes;

@@ -179,13 +179,156 @@ fn check_decode(vector: &Json) -> Result<(), String> {
 /// state required, then per_item and trace comparison.
 fn run_semantics(vector: &Json) -> SemStatus {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
-    if kind != "fold" {
-        return SemStatus::Unimplemented(format!("case_kind {kind}"));
-    }
-    match run_fold_vector(vector) {
+    let run = match kind {
+        "fold" => run_fold_vector(vector),
+        "journal-replay" => run_journal_vector(vector),
+        other => return SemStatus::Unimplemented(format!("case_kind {other}")),
+    };
+    match run {
         Ok(status) => status,
         Err(e) => SemStatus::Fail(e),
     }
+}
+
+/// The journal-replay lane: every listed delivery plus the fresh
+/// sorted-order replay must agree on final verdicts, intervals, and
+/// probes; then per_record, intervals, and state_probes compare
+/// against the vector.
+fn run_journal_vector(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let mut aux: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    if let Some(m) = vector["inputs"]["aux"].as_object() {
+        for (name, hv) in m {
+            aux.insert(name.clone(), unhex(hv.as_str().ok_or("aux not a string")?)?);
+        }
+    }
+    let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?
+        .iter()
+        .map(|d| {
+            d.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or("delivery not an array")
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut runs = Vec::new();
+    for order in &deliveries {
+        match crate::journal::run_journal(&items, &aux, order) {
+            Ok(run) => runs.push(run),
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+        }
+    }
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let fresh = match crate::journal::run_journal(&items, &aux, &fresh_order) {
+        Ok(run) => run,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    for (i, run) in runs.iter().enumerate() {
+        if run.final_verdicts != fresh.final_verdicts
+            || run.intervals != fresh.intervals
+            || run.probes != fresh.probes
+        {
+            return Ok(SemStatus::Fail(format!(
+                "delivery {i} diverges from the fresh replay"
+            )));
+        }
+    }
+    let run = &runs[0];
+
+    // per_record: one row per delivered record; absent pair = admits.
+    let rows = vector["expected"]["result"]["per_record"]
+        .as_array()
+        .ok_or("per_record missing")?;
+    if rows.len() != run.final_verdicts.len() {
+        return Ok(SemStatus::Fail(format!(
+            "per_record rows {} != delivered records {}",
+            rows.len(),
+            run.final_verdicts.len()
+        )));
+    }
+    for row in rows {
+        let name = row["rec"].as_str().ok_or("row.rec")?;
+        let Some(verdict) = run.final_verdicts.get(name) else {
+            return Ok(SemStatus::Fail(format!(
+                "per_record names unknown record {name}"
+            )));
+        };
+        let want = match (row.get("outcome"), row.get("disposition")) {
+            (Some(o), Some(d)) => Some((
+                o.as_str().ok_or("row.outcome")?,
+                d.as_str().ok_or("row.disposition")?,
+            )),
+            _ => None,
+        };
+        if verdict.pair() != want {
+            return Ok(SemStatus::Fail(format!(
+                "{name}: expected {want:?}, reducer derived {:?}",
+                verdict.pair()
+            )));
+        }
+    }
+
+    // intervals: (incarnation, terminal) exactly.
+    let want_intervals: Vec<(u64, String)> = vector["expected"]["result"]["intervals"]
+        .as_array()
+        .ok_or("intervals missing")?
+        .iter()
+        .map(|iv| {
+            Ok((
+                iv["incarnation"].as_u64().ok_or("interval.incarnation")?,
+                iv["terminal"]
+                    .as_str()
+                    .ok_or("interval.terminal")?
+                    .to_string(),
+            ))
+        })
+        .collect::<Result<_, &str>>()?;
+    let got_intervals: Vec<(u64, String)> = run
+        .intervals
+        .iter()
+        .map(|(i, t)| (*i, t.to_string()))
+        .collect();
+    if got_intervals != want_intervals {
+        return Ok(SemStatus::Fail(format!(
+            "intervals: expected {want_intervals:?}, got {got_intervals:?}"
+        )));
+    }
+
+    // state_probes: exact-name registry, canonical-byte equality.
+    if let Some(probes) = vector["expected"]["result"]["state_probes"].as_array() {
+        for p in probes {
+            let name = p["name"].as_str().ok_or("probe.name")?;
+            let want = p["value"].as_str().ok_or("probe.value")?;
+            let Some(got) = run.probes.get(name) else {
+                return Ok(SemStatus::Unimplemented(format!("state probe {name:?}")));
+            };
+            let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+            if got_hex != want {
+                return Ok(SemStatus::Fail(format!(
+                    "probe {name:?}: expected {want}, got {got_hex}"
+                )));
+            }
+        }
+    }
+
+    Ok(SemStatus::Pass)
 }
 
 fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
@@ -367,23 +510,26 @@ mod tests {
         jsonschema::validator_for(&companion).unwrap();
     }
 
-    /// The tranche's structural layers: every committed vector passes
-    /// container + companion schemas, pair cross-validation, and the
-    /// strict-decode differential. Semantics stay red until the
-    /// reducer's engine lands — asserted as exactly Unimplemented so
-    /// engine progress must flip this test deliberately.
+    /// Every committed vector passes container + companion schemas,
+    /// pair cross-validation, the strict-decode differential, AND —
+    /// since the burn-down completed — semantics. A fixture leaves
+    /// `expect_pass` only by deliberate edit; a Fail anywhere is a
+    /// differential finding (the erase fixture's original mint died
+    /// exactly here: its release cited the flowless genesis grant,
+    /// D-76 vs §11.8 — fixed by re-minting with a flow grant).
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(reports.len(), 8, "the opening tranche is eight vectors");
-        // The burn-down: fixtures flip to Pass as engine coverage
-        // grows; a Fail anywhere is a differential finding.
         let expect_pass = [
             "f07-delayed-reference-convergence-c1-i-c2.json",
             "f07-negation-residual-acceptance.json",
             "f07-pending-revocation-window-grant-completing-rotation.json",
             "f07-staged-frontier-consumed-no-resurrection.json",
             "f11-collision-loser-reenters-on-winner-death.json",
+            "f11-erase-deferral-nonterminal-journal.json",
+            "f11-reopen-basis-op-kind-and-unheld-invalidation.json",
+            "f13-txn-internal-order-and-competing-terminals.json",
         ];
         for r in &reports {
             assert!(

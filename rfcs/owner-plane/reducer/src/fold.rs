@@ -127,6 +127,7 @@ struct HeldGrant {
 struct HeldTenantOp {
     op_hash: [u8; 32],
     zone: [u8; 16],
+    space: [u8; 16],
     lineage: [u8; 16],
     gen: u64,
     seq: u64,
@@ -280,6 +281,12 @@ pub struct State {
     repoch: u64,
     /// The current recovery commitment (`H_drill(recovery_pk)`).
     recovery_commitment: Option<[u8; 32]>,
+    /// §5.4 erase queue: accepted `m.erase_request` targets (claim op
+    /// hashes, acceptance order) — persisted until manifested.
+    erase_queue: Vec<[u8; 32]>,
+    /// §11.1: targets flagged retrieval-excluded IMMEDIATELY at the
+    /// erase request's acceptance.
+    retrieval_excluded: Vec<[u8; 32]>,
 }
 
 /// §11.6 classification lattice rank.
@@ -1154,7 +1161,9 @@ impl State {
     /// The §10.5 derived lanes: re-classify every held tenant
     /// operation against the current boundaries and claimant folds.
     /// Returns op_hash → verdict.
-    fn derived_tenant_verdicts(&self) -> Result<BTreeMap<[u8; 32], Verdict>, Unimplemented> {
+    pub(crate) fn derived_tenant_verdicts(
+        &self,
+    ) -> Result<BTreeMap<[u8; 32], Verdict>, Unimplemented> {
         let mut out = BTreeMap::new();
         for rec in &self.held_tenant {
             let v = if !self.op_standing(rec) {
@@ -1959,6 +1968,7 @@ impl State {
         self.held_tenant.push(HeldTenantOp {
             op_hash: op.op_hash(),
             zone: h.zone_id,
+            space: h.space_id,
             lineage: h.writer_lineage,
             gen: h.writer_gen,
             seq: h.writer_sequence,
@@ -2261,6 +2271,101 @@ impl State {
         ok(Ok(()))
     }
 
+    /// Tenant `m.erase_request` (§11.1): direct-human evidence,
+    /// `targets` = claim op hashes each in grant scope (D-66).
+    /// Acceptance flags the targets retrieval-excluded IMMEDIATELY
+    /// and queues them for the next rotation manifest (§5.4; the
+    /// D-198 deferral is the manifest-eligibility question, not the
+    /// queue's).
+    fn admit_erase_request(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let grant = match self.tenant_preamble(op, "erase.request")? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        // §10.1 shape-1: a human actor on an enrolled device with no
+        // attestation. Mediated evidence shapes are a later slice.
+        if op.header.actor_kind != "human" {
+            return Err(Unimplemented("mediated erase evidence".into()));
+        }
+        let Some(targets) = op.body.get("targets").and_then(|t| t.as_array()) else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        if targets.is_empty() {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        let mut resolved = Vec::new();
+        for tn in targets {
+            let Some(t) = tn.bytes_n::<32>() else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            // The target claim may arrive later (D-199 spirit —
+            // register #25; the fresh-fold order requires the pend).
+            let Some(rec) = self.held_tenant.iter().find(|r| r.op_hash == t) else {
+                return ok(Err(Verdict::Pending(
+                    "ref-unresolved",
+                    "pending-dependency",
+                )));
+            };
+            if rec.claim.is_none() {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            }
+            // In grant scope: the claim's zone/space under the CITING
+            // grant.
+            if grant.zone.is_some_and(|z| z != rec.zone)
+                || grant
+                    .spaces
+                    .as_ref()
+                    .is_some_and(|s| !s.contains(&rec.space))
+            {
+                return ok(Err(Verdict::Rejected("scope-space", "reject-permanent")));
+            }
+            resolved.push(t);
+        }
+
+        // Accept.
+        self.record_tenant(op, &grant, None, None, None);
+        for t in resolved {
+            if !self.erase_queue.contains(&t) {
+                self.erase_queue.push(t);
+            }
+            if !self.retrieval_excluded.contains(&t) {
+                self.retrieval_excluded.push(t);
+            }
+        }
+        ok(Ok(()))
+    }
+
+    /// Does the fold hold this operation (control or tenant)? The
+    /// journal machine's opfactref resolution consults it alongside
+    /// the aux set.
+    pub(crate) fn holds_op(&self, h: &[u8; 32]) -> bool {
+        self.held_tenant.iter().any(|r| r.op_hash == *h) || self.ctrl_head == *h
+    }
+
+    /// A held tenant op's chain coordinate — the erase machinery maps
+    /// target ops to their ItemCommits through it.
+    pub(crate) fn op_coordinate(&self, h: &[u8; 32]) -> Option<([u8; 16], u64, u64)> {
+        self.held_tenant
+            .iter()
+            .find(|r| r.op_hash == *h)
+            .map(|r| (r.lineage, r.gen, r.seq))
+    }
+
+    /// A held release's source set (D-198: the deferral reads the
+    /// LIVE release).
+    pub(crate) fn release_sources(&self, release_op: &[u8; 32]) -> Option<&[[u8; 32]]> {
+        self.held_tenant
+            .iter()
+            .find(|r| r.op_hash == *release_op)
+            .and_then(|r| r.release.as_ref())
+            .map(|f| f.sources.as_slice())
+    }
+
+    /// (erase queue, retrieval-excluded) — acceptance order.
+    pub(crate) fn erase_state(&self) -> (&[[u8; 32]], &[[u8; 32]]) {
+        (&self.erase_queue, &self.retrieval_excluded)
+    }
+
     /// Dispatch one operation.
     fn admit(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
         match op.header.operation_type {
@@ -2278,6 +2383,7 @@ impl State {
             "m.claim" => self.admit_claim(op),
             "m.export.release" => self.admit_release(op),
             "m.import.claim" => self.admit_import(op),
+            "m.erase_request" => self.admit_erase_request(op),
             other => Err(Unimplemented(format!("op_type {other}"))),
         }
     }
@@ -2351,7 +2457,7 @@ pub fn run_delivery(
     })
 }
 
-fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimplemented> {
+pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimplemented> {
     let op = match parse_op(bytes) {
         Ok(op) => op,
         Err(crate::envelope::OpError::Parse(e)) => {

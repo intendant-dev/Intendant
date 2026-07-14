@@ -1610,17 +1610,47 @@ pub fn f7_staged_frontier_consumed() -> Vector {
 /// the state probes pin all three facts, and the open interval pins
 /// the journal. (The adopted-erasure residual — `source-erased` via a
 /// C3′-adopted manifest — is a recovery-ceremony vector for the
-/// corpus phase.)
+/// corpus phase.) The release cites `gf`, dev1's flow-carrying
+/// export grant — the genesis grant pins no flows (D-76), so a
+/// release under it can never satisfy §11.8's flow-match; the first
+/// mint did exactly that and the differential reducer caught it
+/// (`no-flow` vs the expected admit).
 pub fn f11_erase_deferral() -> Vector {
     let name = "erase-deferral-nonterminal-journal";
     const STMT: &str = "harbor crane inspection completed without findings";
     let mut rig = PlaneRig::new(name);
     let d1 = rig.dev1.clone();
     let g1 = rig.genesis_grant.clone();
+    let (gz, home) = (rig.zone_id, rig.home_space);
 
     let dev2 = rig.mint_device("dev2");
     let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
     let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+
+    // dev1's export grant carrying the flow to the (opaque)
+    // destination endpoint.
+    let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
+    let dest_space = draw_id(&mut rig.rng, "dest.space_id");
+    let mut gf_grant = rig.grant_in(
+        "grantflow",
+        &d1,
+        vec![Verb::Read, Verb::Export],
+        gz,
+        vec![home],
+    );
+    gf_grant.flows = Some(vec![Flow {
+        from_zone: gz,
+        from_space: None,
+        to: Endpoint::Plane {
+            plane_id: rig.plane_id,
+            zone_id: dest_zone,
+            space_id: dest_space,
+        },
+        kinds: None,
+        class_ceiling: Class::Sensitive,
+        expiry_deadline_ms: T0_MS + 10 * 86_400_000,
+    }]);
+    let gf = rig.grant_op(gf_grant.clone());
 
     // The item: dev2's claim, committed to the zone log.
     let i1 = rig.claim(&dev2, &grant2, "i1", STMT, 1, None);
@@ -1644,12 +1674,10 @@ pub fn f11_erase_deferral() -> Vector {
         },
     }
     .leaf_hash()]);
-    let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
-    let dest_space = draw_id(&mut rig.rng, "dest.space_id");
     let data_frontier = rig.rng.draw32("rel.data_frontier");
     let rel = rig.release_op_signed(
         &d1,
-        &g1,
+        &gf_grant,
         "rel",
         export_id,
         vec![i1.op_hash()],
@@ -1697,6 +1725,7 @@ pub fn f11_erase_deferral() -> Vector {
         items_raw(&[
             ("c1", &c1.encode()),
             ("c2", &c2.encode()),
+            ("gf", &gf.encode()),
             ("i1", &i1.encode()),
             ("t.i1", &enc(&t_i1)),
             ("rel", &rel.encode()),
@@ -1706,7 +1735,7 @@ pub fn f11_erase_deferral() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "c2", "i1", "t.i1", "rel", "t.rel", "e"]]),
+        json!([["c1", "c2", "gf", "i1", "t.i1", "rel", "t.rel", "e"]]),
     );
 
     let probe = |ids: &[Bytes32]| -> String {
@@ -1732,6 +1761,7 @@ pub fn f11_erase_deferral() -> Vector {
             "per_record": [
                 { "rec": "c1" },
                 { "rec": "c2" },
+                { "rec": "gf" },
                 { "rec": "i1" },
                 { "rec": "t.i1" },
                 { "rec": "rel" },
