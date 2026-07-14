@@ -383,6 +383,7 @@ mod tests {
             "f07-negation-residual-acceptance.json",
             "f07-pending-revocation-window-grant-completing-rotation.json",
             "f07-staged-frontier-consumed-no-resurrection.json",
+            "f11-collision-loser-reenters-on-winner-death.json",
         ];
         for r in &reports {
             assert!(

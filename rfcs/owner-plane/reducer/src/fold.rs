@@ -24,6 +24,17 @@
 //! (D-136) plus `c.cap_epoch_bump` under the union-coverage rule —
 //! stages consume one-shot at the advance (D-153) and die vacuously
 //! at an authority-ending frontier (D-196).
+//!
+//! The import arc (§11.8): `c.zone_create`/`c.space_create`,
+//! `m.export.release` (flow matching, class-floor law, held-claim
+//! sources), `m.import.claim` (per-record Merkle proof, live-source
+//! equality, the D-134 derived shape), the derived claimant fold
+//! (D-155 total order; freeze via the authority-ending frontier;
+//! D-161/D-169 collision), and `c.recovery_succession` at the head
+//! (named preserves + the revivable omission blanket, D-132/D-151).
+//! Held tenant classifications are DERIVED (§10.5): `run_delivery`
+//! overlays them after every fixpoint, so a later boundary
+//! retro-quarantines and a dead basis re-derives ownership.
 
 use std::collections::BTreeMap;
 
@@ -70,6 +81,18 @@ struct HeldCert {
     revoked: bool,
 }
 
+/// One grant `flows` entry (§4.3): the release-matching facts.
+#[derive(Debug, Clone)]
+struct FlowFacts {
+    from_zone: [u8; 16],
+    from_space: Option<[u8; 16]>,
+    /// The endpoint's canonical bytes — matching is byte equality.
+    to_raw: Vec<u8>,
+    kinds: Option<Vec<String>>,
+    class_ceiling: u8,
+    expiry_deadline_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct HeldGrant {
     h_grant: [u8; 32],
@@ -83,9 +106,78 @@ struct HeldGrant {
     kinds: Option<Vec<String>>,
     capability_epoch: u64,
     imports: bool,
+    /// The control position that accepted this grant — the claimant
+    /// order's major key (D-155).
+    ctrl_pos: u64,
+    class_ceiling: Option<u8>,
+    flows: Vec<FlowFacts>,
     /// `c.revoke_grant`, or derived revocation at a device compound's
     /// completion (D-85).
     revoked: bool,
+    /// The revocation cutoff's carried `(gen, seq)` heads — an
+    /// at-or-below preserved claimant is thereby FROZEN (D-155).
+    revoke_caps: Option<Vec<(u64, u64)>>,
+}
+
+/// One accepted (held) tenant operation. Its FOLD verdict is derived
+/// (§10.5): boundaries and claimant folds re-classify held ops on
+/// every state change — acceptance into the chain is permanent, the
+/// classification is not.
+#[derive(Debug, Clone)]
+struct HeldTenantOp {
+    op_hash: [u8; 32],
+    zone: [u8; 16],
+    lineage: [u8; 16],
+    gen: u64,
+    seq: u64,
+    cited_grant: [u8; 32],
+    /// m.claim content — (kind, statement, sensitivity rank): the
+    /// D-134 source-equality material.
+    claim: Option<(String, String, u8)>,
+    release: Option<ReleaseFacts>,
+    import: Option<ImportFacts>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseFacts {
+    export_id: [u8; 16],
+    sources: Vec<[u8; 32]>,
+    content_digest: [u8; 32],
+    dest_zone: [u8; 16],
+    dest_space: [u8; 16],
+}
+
+#[derive(Debug, Clone)]
+struct ImportFacts {
+    /// The replay key: `(from_plane, release_op, source_op)` (D-123).
+    key: ([u8; 32], [u8; 32], [u8; 32]),
+    /// The citing import grant's control position — the claimant
+    /// order's major key (D-155).
+    grant_pos: u64,
+}
+
+/// A tenant-history boundary: operations of `(zone, lineage)`
+/// at-or-below a cap stand; beyond them — or in uncarried
+/// generations — `(cutoff, quarantine-reproposal)`.
+#[derive(Debug, Clone)]
+struct TenantBoundary {
+    zone: [u8; 16],
+    lineage: [u8; 16],
+    /// Revoke boundaries select the revoked grant's operations only;
+    /// recover-purpose entries are global selectors (D-143).
+    selector_grant: Option<[u8; 32]>,
+    /// (gen, max seq) pairs — empty = nothing stands.
+    caps: Vec<(u64, u64)>,
+}
+
+/// One accepted C3′: named entries preserve at-or-below (immutable
+/// termination); every omitted `(zone, lineage)` whose lineage was
+/// enrolled at or before base folds the revivable `"none"` override
+/// (D-132/D-138/D-151).
+#[derive(Debug, Clone)]
+struct RecoveryState {
+    named: Vec<TenantBoundary>,
+    lineages_at_base: Vec<[u8; 16]>,
 }
 
 /// §11.1 (D-60): the verbs whose operations append tenant chain
@@ -174,6 +266,31 @@ pub struct State {
     /// (D-153), vacuously consumed by an authority-ending frontier
     /// (D-196).
     staged_closes: Vec<ZoneLineage>,
+    /// Accepted tenant operations — the derived lanes re-classify
+    /// these against boundaries and claimant folds (§10.5).
+    held_tenant: Vec<HeldTenantOp>,
+    /// Immutable tenant boundaries (revoke cutoffs so far).
+    tenant_boundaries: Vec<TenantBoundary>,
+    /// Accepted C3′ recoveries (named preserves + omission blankets).
+    recoveries: Vec<RecoveryState>,
+    /// epoch → admin key (epoch 1 = the root key; successions and
+    /// C3′ install later epochs).
+    admin_keys: BTreeMap<u64, [u8; 32]>,
+    /// Recovery epoch (0 at genesis; C3′ = current + 1).
+    repoch: u64,
+    /// The current recovery commitment (`H_drill(recovery_pk)`).
+    recovery_commitment: Option<[u8; 32]>,
+}
+
+/// §11.6 classification lattice rank.
+fn class_rank(c: &str) -> Option<u8> {
+    match c {
+        "public" => Some(0),
+        "internal" => Some(1),
+        "private" => Some(2),
+        "sensitive" => Some(3),
+        _ => None,
+    }
 }
 
 fn ok<T>(v: T) -> Result<T, Unimplemented> {
@@ -236,14 +353,16 @@ impl State {
         }
     }
 
-    /// Admin-arm resolution: the root key IS the epoch-1 admin key
-    /// (no succession in tranche state yet).
+    /// Admin-arm resolution: epoch 1 is the root key; successions and
+    /// C3′ install later epochs. Pre-genesis, every arm pends.
     fn admin_key(&self, epoch: u64) -> Result<[u8; 32], Verdict> {
-        if epoch != 1 {
-            return Err(Verdict::Rejected("proof-arm", "reject-permanent"));
+        if self.admin_keys.is_empty() {
+            return Err(Verdict::Pending("ref-unresolved", "pending-dependency"));
         }
-        self.root_pk
-            .ok_or(Verdict::Pending("ref-unresolved", "pending-dependency"))
+        self.admin_keys
+            .get(&epoch)
+            .copied()
+            .ok_or(Verdict::Rejected("proof-arm", "reject-permanent"))
     }
 
     fn record_cert(&mut self, cert_node: &Node) -> Result<(), Unimplemented> {
@@ -280,7 +399,7 @@ impl State {
         ok(())
     }
 
-    fn record_grant(&mut self, grant_node: &Node) -> Result<(), Unimplemented> {
+    fn record_grant(&mut self, grant_node: &Node, ctrl_pos: u64) -> Result<(), Unimplemented> {
         let verbs = grant_node
             .get("ops")
             .and_then(|n| n.as_array())
@@ -324,6 +443,34 @@ impl State {
                     .collect::<Vec<_>>()
             })
         });
+        let mut flows = Vec::new();
+        for fnode in grant_node
+            .get("flows")
+            .and_then(|f| f.as_array())
+            .unwrap_or(&[])
+        {
+            flows.push(FlowFacts {
+                from_zone: b16_field(fnode, "from_zone").unwrap_or_default(),
+                from_space: b16_field(fnode, "from_space"),
+                to_raw: fnode.get("to").map(|t| t.raw.to_vec()).unwrap_or_default(),
+                kinds: fnode.get("kinds").and_then(|k| {
+                    k.as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_text().map(str::to_string))
+                            .collect()
+                    })
+                }),
+                class_ceiling: fnode
+                    .get("class_ceiling")
+                    .and_then(|c| c.as_text())
+                    .and_then(class_rank)
+                    .unwrap_or(0),
+                expiry_deadline_ms: fnode
+                    .get("expiry_deadline_ms")
+                    .and_then(|n| n.as_uint())
+                    .unwrap_or(0),
+            });
+        }
         self.grants.push(HeldGrant {
             h_grant: domains::h("grant", grant_node.raw),
             grant_id: b16_field(grant_node, "grant_id").unwrap_or_default(),
@@ -339,7 +486,14 @@ impl State {
                 .get("capability_epoch")
                 .and_then(|n| n.as_uint())
                 .unwrap_or(0),
+            ctrl_pos,
+            class_ceiling: grant_node
+                .get("class_ceiling")
+                .and_then(|c| c.as_text())
+                .and_then(class_rank),
+            flows,
             revoked: false,
+            revoke_caps: None,
         });
         ok(())
     }
@@ -560,11 +714,17 @@ impl State {
             }
         }
 
-        // Accept: install the plane. KEK epoch 1 AND capability
-        // epoch 1 open here (§7.1 row); the B.1 policy's strictness
-        // scopes the union-coverage rule.
+        // Accept: install the plane. KEK epoch 1, capability epoch 1,
+        // admin epoch 1 (the root key), repoch 0, and the recovery
+        // commitment open here (§7.1 row); the B.1 policy's
+        // strictness scopes the union-coverage rule.
         self.plane_id = Some(plane);
         self.root_pk = Some(root_pk);
+        self.admin_keys.insert(1, root_pk);
+        self.repoch = 0;
+        self.recovery_commitment = descriptor
+            .get("recovery_commitment")
+            .and_then(|n| n.bytes_n::<32>());
         self.zones.push(zone_id.unwrap_or_default());
         self.kek_epochs.insert(zone_id.unwrap_or_default(), 1);
         self.cap_epochs.insert(zone_id.unwrap_or_default(), 1);
@@ -586,7 +746,7 @@ impl State {
         self.record_cert(cert)?;
         for g in ["grant", "audit_grant"] {
             if let Some(gn) = body.get(g) {
-                self.record_grant(gn)?;
+                self.record_grant(gn, 1)?;
             }
         }
         self.ctrl_next_seq = 2;
@@ -726,7 +886,7 @@ impl State {
         self.lineages.push((lineage_id, device_id));
         self.record_cert(cert)?;
         for gn in &new_grants {
-            self.record_grant(gn)?;
+            self.record_grant(gn, op.header.writer_sequence)?;
         }
         for (z, e, d) in new_wraps {
             self.record_wrap(z, e, d);
@@ -789,7 +949,7 @@ impl State {
         }
 
         // Accept.
-        self.record_grant(gn)?;
+        self.record_grant(gn, op.header.writer_sequence)?;
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
         ok(Ok(()))
@@ -822,6 +982,7 @@ impl State {
             .iter()
             .any(|v| OP_AUTHORING.contains(&v.as_str()));
         let cutoff = body.get("cutoff");
+        let mut caps: Vec<(u64, u64)> = Vec::new();
         if op_authoring {
             let Some(cn) = cutoff else {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
@@ -831,12 +992,13 @@ impl State {
             {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             }
-            match cn.get("heads").and_then(|h| h.as_array()) {
-                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-                Some(a) if !a.is_empty() => {
-                    return Err(Unimplemented("frontierclose heads".into()))
-                }
-                Some(_) => {}
+            match self.parse_heads(
+                cn,
+                self.grants[idx].zone.unwrap_or_default(),
+                self.grants[idx].lineage.unwrap_or_default(),
+            )? {
+                Ok(h) => caps = h,
+                Err(v) => return ok(Err(v)),
             }
         } else if cutoff.is_some() {
             return Err(Unimplemented(
@@ -844,17 +1006,192 @@ impl State {
             ));
         }
 
-        // Accept. (The boundary's quarantine consumers arrive with
-        // later slices; state records the deactivation.)
+        // Accept: deactivate the grant, install the revoke boundary
+        // (selector = the revoked grant — its operations at or below
+        // the carried heads stand, beyond them quarantine), and mark
+        // the freeze frontier (an at-or-below preserved claimant is
+        // thereby frozen, D-155).
         let ended = match (self.grants[idx].zone, self.grants[idx].lineage) {
             (Some(z), Some(l)) if op_authoring => vec![(z, l)],
             _ => vec![],
         };
         self.grants[idx].revoked = true;
+        if op_authoring {
+            self.grants[idx].revoke_caps = Some(caps.clone());
+            self.tenant_boundaries.push(TenantBoundary {
+                zone: self.grants[idx].zone.unwrap_or_default(),
+                lineage: self.grants[idx].lineage.unwrap_or_default(),
+                selector_grant: Some(self.grants[idx].h_grant),
+                caps,
+            });
+        }
         self.consume_dead_stages(&ended);
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
         ok(Ok(()))
+    }
+
+    /// Parse a frontierclose's `heads` into `(gen, seq)` caps,
+    /// resolving each against the HELD chain: the named coordinate
+    /// must hold exactly the named op (an unheld head pends,
+    /// `ref-unresolved` — the c.cutoff row's rule; a held-but-
+    /// different op is unpinned).
+    fn parse_heads(
+        &self,
+        cn: &Node,
+        zone: [u8; 16],
+        lineage: [u8; 16],
+    ) -> Result<Result<Vec<(u64, u64)>, Verdict>, Unimplemented> {
+        let Some(heads) = cn.get("heads").and_then(|h| h.as_array()) else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let mut caps = Vec::new();
+        for hn in heads {
+            let (Some(hl), Some(gen), Some(seq), Some(hop)) = (
+                b16_field(hn, "lineage"),
+                hn.get("gen").and_then(|n| n.as_uint()),
+                hn.get("seq").and_then(|n| n.as_uint()),
+                hn.get("op").and_then(|n| n.bytes_n::<32>()),
+            ) else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            if hl != lineage {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            }
+            match self
+                .held_tenant
+                .iter()
+                .find(|r| r.zone == zone && r.lineage == lineage && r.gen == gen && r.seq == seq)
+            {
+                None => {
+                    return ok(Err(Verdict::Pending(
+                        "ref-unresolved",
+                        "pending-dependency",
+                    )))
+                }
+                Some(r) if r.op_hash != hop => {
+                    return Err(Unimplemented("carried head mismatches the held op".into()))
+                }
+                Some(_) => caps.push((gen, seq)),
+            }
+        }
+        ok(Ok(caps))
+    }
+
+    /// Is `(gen, seq)` at or below one of the carried caps?
+    fn at_or_below(caps: &[(u64, u64)], gen: u64, seq: u64) -> bool {
+        caps.iter().any(|&(g, s)| g == gen && seq <= s)
+    }
+
+    /// Does the held op stand against every boundary — the revoke
+    /// selectors and each recovery's named-or-blanket rule?
+    fn op_standing(&self, rec: &HeldTenantOp) -> bool {
+        for b in &self.tenant_boundaries {
+            if b.zone == rec.zone
+                && b.lineage == rec.lineage
+                && b.selector_grant.is_none_or(|g| g == rec.cited_grant)
+                && !Self::at_or_below(&b.caps, rec.gen, rec.seq)
+            {
+                return false;
+            }
+        }
+        for r in &self.recoveries {
+            if !r.lineages_at_base.contains(&rec.lineage) {
+                // Enrolled after the recovery: new authority under
+                // the surviving chain — folds normally.
+                continue;
+            }
+            match r
+                .named
+                .iter()
+                .find(|n| n.zone == rec.zone && n.lineage == rec.lineage)
+            {
+                Some(n) => {
+                    if !Self::at_or_below(&n.caps, rec.gen, rec.seq) {
+                        return false;
+                    }
+                }
+                // The omission blanket: the implicit revivable
+                // `"none"` override quarantines the pair's entire
+                // tenant history (D-132/D-151).
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Is the key's effective owner FROZEN (D-155)? Implemented arm:
+    /// a matching authority-ending frontier closed the owner's
+    /// authority's remaining claim room — the owner's citing grant is
+    /// revoked with the owner preserved at-or-below its cutoff. (The
+    /// effect-finality arm has no engine state yet; the D-161/D-169
+    /// reservation clause aborts honestly when an order-earlier
+    /// claimant exists — no vector pins that composition.)
+    fn owner_frozen(
+        &self,
+        owner: &HeldTenantOp,
+        claimants: &[&HeldTenantOp],
+    ) -> Result<bool, Unimplemented> {
+        if claimants
+            .iter()
+            .take_while(|c| c.op_hash != owner.op_hash)
+            .count()
+            > 0
+        {
+            return Err(Unimplemented(
+                "freeze reservation with order-earlier claimants".into(),
+            ));
+        }
+        let Some(g) = self.grants.iter().find(|g| g.h_grant == owner.cited_grant) else {
+            return Ok(false);
+        };
+        Ok(g.revoked
+            && g.revoke_caps
+                .as_ref()
+                .is_some_and(|caps| Self::at_or_below(caps, owner.gen, owner.seq)))
+    }
+
+    /// The §10.5 derived lanes: re-classify every held tenant
+    /// operation against the current boundaries and claimant folds.
+    /// Returns op_hash → verdict.
+    fn derived_tenant_verdicts(&self) -> Result<BTreeMap<[u8; 32], Verdict>, Unimplemented> {
+        let mut out = BTreeMap::new();
+        for rec in &self.held_tenant {
+            let v = if !self.op_standing(rec) {
+                Verdict::Rejected("cutoff", "quarantine-reproposal")
+            } else if let Some(imp) = &rec.import {
+                // The claimant fold: total portable order
+                // (grant control position, gen, seq); the effective
+                // owner is the order's first STANDING claimant.
+                let mut claimants: Vec<&HeldTenantOp> = self
+                    .held_tenant
+                    .iter()
+                    .filter(|c| c.import.as_ref().is_some_and(|i| i.key == imp.key))
+                    .collect();
+                claimants.sort_by_key(|c| {
+                    (c.import.as_ref().expect("filtered").grant_pos, c.gen, c.seq)
+                });
+                let owner = *claimants
+                    .iter()
+                    .find(|c| self.op_standing(c))
+                    .expect("rec itself stands");
+                if owner.op_hash == rec.op_hash {
+                    Verdict::Admitted
+                } else if self.owner_frozen(owner, &claimants)? {
+                    // A claim against a frozen owner can never win
+                    // while the basis stands (D-161/D-169/D-196).
+                    Verdict::Rejected("import-collision", "quarantine-reproposal")
+                } else {
+                    // An order-loser against an UNFROZEN owner is
+                    // ordinary displacement — outcome unpinned.
+                    return Err(Unimplemented("unfrozen order-loser".into()));
+                }
+            } else {
+                Verdict::Admitted
+            };
+            out.insert(rec.op_hash, v);
+        }
+        Ok(out)
     }
 
     /// Parse a compound's `cutoffs` into `(zone, lineage)` pairs.
@@ -1249,9 +1586,236 @@ impl State {
         ok(Ok(()))
     }
 
-    /// Tenant `m.claim` under the dev arm (D-199: unheld citations
-    /// pend).
-    fn admit_claim(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+    /// `c.zone_create` — a fresh zone opening at KEK epoch 1 and
+    /// capability epoch 1 with its wrap set and policy.
+    fn admit_zone_create(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let Some(zone_id) = b16_field(body, "zone_id") else {
+            return ok(Err(bad()));
+        };
+        if self.zones.contains(&zone_id)
+            || body.get("initial_epoch").and_then(|n| n.as_uint()) != Some(1)
+        {
+            return ok(Err(bad()));
+        }
+        let Some(policy) = body.get("zone_policy") else {
+            return ok(Err(bad()));
+        };
+        if b16_field(policy, "zone_id") != Some(zone_id) {
+            return ok(Err(bad()));
+        }
+        let plane = self
+            .plane_id
+            .expect("admin key resolved ⇒ genesis installed");
+        let wraps = match body.get("wraps").and_then(|w| w.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => return ok(Err(bad())),
+        };
+        let mut recipients = Vec::new();
+        for wn in wraps {
+            match self.check_wrap(wn, plane, zone_id, 1, None)? {
+                Ok(r) => recipients.push(r),
+                Err(v) => return ok(Err(v)),
+            }
+        }
+
+        // Accept.
+        self.zones.push(zone_id);
+        self.kek_epochs.insert(zone_id, 1);
+        self.cap_epochs.insert(zone_id, 1);
+        let strict = policy.get("strictness").and_then(|s| s.as_text()) == Some("strict");
+        self.zone_strict.insert(zone_id, strict);
+        for r in recipients {
+            self.record_wrap(zone_id, 1, r);
+        }
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// `c.space_create` — the body IS a `spacedef`. The status-policy
+    /// reference is recorded structurally; pinning its hash against
+    /// the B.2/B.3 literals is the surfaces phase's job.
+    fn admit_space_create(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let (Some(space_id), Some(zone_id)) =
+            (b16_field(body, "space_id"), b16_field(body, "zone_id"))
+        else {
+            return ok(Err(bad()));
+        };
+        if !self.zones.contains(&zone_id) {
+            // The zone's creation may arrive later (register #24).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        }
+        if self.spaces.iter().any(|(s, _)| *s == space_id) {
+            return ok(Err(bad()));
+        }
+
+        // Accept.
+        self.spaces.push((space_id, zone_id));
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// `c.recovery_succession` (§7.4 C3′), the base-at-head shape:
+    /// recovery-arm signature against the current commitment,
+    /// `repoch = current + 1`, `epoch >` the epoch at base; named
+    /// `tenant_cutoffs` preserve at-or-below, every omitted
+    /// base-enrolled `(zone, lineage)` folds the revivable blanket.
+    /// Branch cutting (base below the head), storage adoption, and
+    /// the D-150 freshness carriage abort honestly.
+    fn admit_recovery(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = Self::ctrl_header_pins(op) {
+            return ok(Err(v));
+        }
+        if let Err(v) = self.ctrl_chain(op) {
+            return ok(Err(v));
+        }
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let Proof::Recovery {
+            repoch,
+            recovery_pk,
+        } = op.header.proof
+        else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        let Ok(recovery_pk) = <[u8; 32]>::try_from(recovery_pk) else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        // The revealed key must match the CURRENT commitment.
+        let Some(commitment) = self.recovery_commitment else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if domains::h("drill", &recovery_pk) != commitment {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        }
+        if !op.verify_ed25519(&recovery_pk)
+            || op.header.signer_key_id != domains::key_id("ed25519", &recovery_pk)
+        {
+            return ok(Err(Verdict::Rejected("sig-invalid", "reject-permanent")));
+        }
+        if !op.body_hash_ok() {
+            return ok(Err(Verdict::Rejected("body-hash", "reject-permanent")));
+        }
+        let body = &op.body;
+        let Some(base) = body.get("base") else {
+            return ok(Err(bad()));
+        };
+        let (Some(base_seq), Some(base_op)) = (
+            base.get("seq").and_then(|n| n.as_uint()),
+            base.get("op").and_then(|n| n.bytes_n::<32>()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        // Placement is frozen: seq = base.seq + 1, prev = base.op.
+        let h = &op.header;
+        if h.writer_sequence != base_seq + 1 || h.previous_writer_hash != base_op {
+            return ok(Err(bad()));
+        }
+        // The chain gate above admitted this op at the CURRENT head —
+        // a base below it cuts control branches (the precedence
+        // exception), which no vector pins yet.
+        if base_seq + 1 != self.ctrl_next_seq.max(1) || base_op != self.ctrl_head {
+            return Err(Unimplemented("recovery branch cut below the head".into()));
+        }
+        // repoch = current + 1 (proof arm and body agree).
+        if body.get("repoch").and_then(|n| n.as_uint()) != Some(repoch) || repoch != self.repoch + 1
+        {
+            return ok(Err(bad()));
+        }
+        // epoch > the epoch at base.
+        let Some(epoch) = body.get("epoch").and_then(|n| n.as_uint()) else {
+            return ok(Err(bad()));
+        };
+        let current_admin = self.admin_keys.keys().max().copied().unwrap_or(0);
+        if epoch <= current_admin {
+            return ok(Err(bad()));
+        }
+        let Some(new_admin) = body.get("new_admin") else {
+            return ok(Err(bad()));
+        };
+        if new_admin.get("alg").and_then(|a| a.as_text()) != Some("ed25519") {
+            return Err(Unimplemented("non-ed25519 successor admin key".into()));
+        }
+        let Some(new_admin_pk) = new_admin.get("pk").and_then(|n| n.bytes_n::<32>()) else {
+            return ok(Err(bad()));
+        };
+        let Some(new_commitment) = body
+            .get("new_recovery_commitment")
+            .and_then(|n| n.bytes_n::<32>())
+        else {
+            return ok(Err(bad()));
+        };
+        if body.get("adopted_renewals").is_some() || body.get("retired_keys").is_some() {
+            return Err(Unimplemented("recovery renewal/freshness carriage".into()));
+        }
+        match body.get("adopted_rotations").and_then(|a| a.as_array()) {
+            Some([]) => {}
+            Some(_) => return Err(Unimplemented("adopted rotations".into())),
+            None => return ok(Err(bad())),
+        }
+        // Named tenant cutoffs: recover-purpose frontiercloses whose
+        // carried heads resolve against the held chains.
+        let Some(cutoffs) = body.get("tenant_cutoffs").and_then(|c| c.as_array()) else {
+            return ok(Err(bad()));
+        };
+        let mut named = Vec::new();
+        for cn in cutoffs {
+            let (Some(cz), Some(cl)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage")) else {
+                return ok(Err(bad()));
+            };
+            match self.parse_heads(cn, cz, cl)? {
+                Ok(caps) => named.push(TenantBoundary {
+                    zone: cz,
+                    lineage: cl,
+                    selector_grant: None,
+                    caps,
+                }),
+                Err(v) => return ok(Err(v)),
+            }
+        }
+
+        // Accept: install the successor epoch, rotate the recovery
+        // commitment, and fold the blanket. The total re-fold
+        // (D-138) is the derived lanes' job — with base at the head,
+        // no control state dissolves.
+        self.admin_keys.insert(epoch, new_admin_pk);
+        self.repoch = repoch;
+        self.recovery_commitment = Some(new_commitment);
+        self.recoveries.push(RecoveryState {
+            named,
+            lineages_at_base: self.lineages.iter().map(|(l, _)| *l).collect(),
+        });
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// The shared tenant preamble under the dev arm (D-199: unheld
+    /// citations pend): citation resolution, signature, O8 actor,
+    /// grant scope on every axis, §9.3 chain arithmetic, epochs.
+    /// Mutates nothing; the resolved grant comes back for the
+    /// per-verb body stage.
+    fn tenant_preamble(
+        &self,
+        op: &SignedOp,
+        verb: &str,
+    ) -> Result<Result<HeldGrant, Verdict>, Unimplemented> {
         let h = &op.header;
         if h.tenant != "memory" {
             return Err(Unimplemented(format!("tenant {}", h.tenant)));
@@ -1274,9 +1838,9 @@ impl State {
                 "pending-dependency",
             )));
         };
-        // Post-revocation claims need D-86 position-relative validity
-        // (the signed-before-the-boundary prefix stands) — a later
-        // slice; no tranche fixture claims across a revocation.
+        // Post-revocation citations need D-86 position-relative
+        // validity (the signed-before-the-boundary prefix stands) — a
+        // later slice; no tranche fixture cites across a revocation.
         if held_cert.revoked {
             return Err(Unimplemented("claim under a revoked certificate".into()));
         }
@@ -1310,8 +1874,8 @@ impl State {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
 
-        // Proof stage: grant scope (tenant ∧ zone ∧ space ∧ op ∧
-        // kind), lineage binding.
+        // Proof stage: grant scope (tenant ∧ zone ∧ space ∧ op),
+        // lineage binding.
         if grant.subject_device != held_cert.device_id {
             return ok(Err(Verdict::Rejected("no-grant", "reject-permanent")));
         }
@@ -1328,21 +1892,11 @@ impl State {
                 return ok(Err(Verdict::Rejected("scope-space", "reject-permanent")));
             }
         }
-        let verb = match h.operation_type {
-            "m.claim" => "propose",
-            other => return Err(Unimplemented(format!("op_type {other}"))),
-        };
         if !grant.verbs.iter().any(|v| v == verb) {
             return ok(Err(Verdict::Rejected("scope-op", "reject-permanent")));
         }
         if grant.lineage != Some(h.writer_lineage) {
             return ok(Err(Verdict::Rejected("no-grant", "reject-permanent")));
-        }
-        if let Some(kinds) = &grant.kinds {
-            let kind = op.body.get("kind").and_then(|k| k.as_text()).unwrap_or("");
-            if !kinds.iter().any(|k| k == kind) {
-                return ok(Err(Verdict::Rejected("scope-kind", "reject-permanent")));
-            }
         }
 
         // Chain: within (zone, lineage, gen), dense from 1.
@@ -1385,10 +1939,325 @@ impl State {
                 "quarantine-reproposal",
             )));
         }
+        ok(Ok(grant))
+    }
 
-        // Accept.
+    /// Accept a tenant op into its chain and the held registry. The
+    /// held record's FOLD verdict is thereafter derived (§10.5).
+    fn record_tenant(
+        &mut self,
+        op: &SignedOp,
+        grant: &HeldGrant,
+        claim: Option<(String, String, u8)>,
+        release: Option<ReleaseFacts>,
+        import: Option<ImportFacts>,
+    ) {
+        let h = &op.header;
+        let key = (h.zone_id, h.writer_lineage, h.writer_gen);
         self.tenant_chains
             .insert(key, (h.writer_sequence + 1, op.op_hash()));
+        self.held_tenant.push(HeldTenantOp {
+            op_hash: op.op_hash(),
+            zone: h.zone_id,
+            lineage: h.writer_lineage,
+            gen: h.writer_gen,
+            seq: h.writer_sequence,
+            cited_grant: grant.h_grant,
+            claim,
+            release,
+            import,
+        });
+    }
+
+    /// Tenant `m.claim` (plain propose).
+    fn admit_claim(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let grant = match self.tenant_preamble(op, "propose")? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        let body = &op.body;
+        let kind = body.get("kind").and_then(|k| k.as_text()).unwrap_or("");
+        if let Some(kinds) = &grant.kinds {
+            if !kinds.iter().any(|k| k == kind) {
+                return ok(Err(Verdict::Rejected("scope-kind", "reject-permanent")));
+            }
+        }
+        let statement = body
+            .get("statement")
+            .and_then(|s| s.as_text())
+            .unwrap_or("");
+        let Some(sens) = body
+            .get("sensitivity")
+            .and_then(|s| s.as_text())
+            .and_then(class_rank)
+        else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        // sensitivity ≤ ceilings (§11.1 row).
+        if grant.class_ceiling.is_some_and(|c| sens > c) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+
+        self.record_tenant(
+            op,
+            &grant,
+            Some((kind.to_string(), statement.to_string(), sens)),
+            None,
+            None,
+        );
+        ok(Ok(()))
+    }
+
+    /// Tenant `m.export.release` (§11.8): flow matching is
+    /// existential and whole; `class_floor = max effective(sources)`
+    /// ≤ min(flow ceiling, grant ceiling); sources are held claims.
+    /// The stamp (`data_frontier`/`control_frontier`/`as_of_ms`) is
+    /// carried, attested evaluation-point material — not re-verified
+    /// here. Budgets (the D-98 record surcharge) have no engine state
+    /// yet.
+    fn admit_release(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let grant = match self.tenant_preamble(op, "export")? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let (Some(export_id), Some(content_digest), Some(to), Some(class_floor), Some(expiry)) = (
+            b16_field(body, "export_id"),
+            body.get("content_digest").and_then(|n| n.bytes_n::<32>()),
+            body.get("to"),
+            body.get("class_floor")
+                .and_then(|c| c.as_text())
+                .and_then(class_rank),
+            body.get("expiry_deadline_ms").and_then(|n| n.as_uint()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        let Some(dest_zone) = b16_field(to, "zone_id") else {
+            // Egress endpoints are a governed-profile lane with no
+            // fixture yet.
+            return Err(Unimplemented("egress endpoint release".into()));
+        };
+        let Some(dest_space) = b16_field(to, "space_id") else {
+            return ok(Err(bad()));
+        };
+        if to.get("plane_id").and_then(|n| n.bytes_n::<32>()) != self.plane_id {
+            return Err(Unimplemented("cross-plane destination".into()));
+        }
+
+        // Sources: a keyed set of HELD claims (an unheld source
+        // pends — D-199 spirit, register #25).
+        let Some(sources) = body.get("sources").and_then(|s| s.as_array()) else {
+            return ok(Err(bad()));
+        };
+        let mut source_hashes: Vec<[u8; 32]> = Vec::new();
+        let mut max_sens: u8 = 0;
+        let mut source_kinds: Vec<String> = Vec::new();
+        for sn in sources {
+            let Some(sh) = sn.bytes_n::<32>() else {
+                return ok(Err(bad()));
+            };
+            if source_hashes.contains(&sh) {
+                return ok(Err(bad()));
+            }
+            let Some(rec) = self.held_tenant.iter().find(|r| r.op_hash == sh) else {
+                return ok(Err(Verdict::Pending(
+                    "ref-unresolved",
+                    "pending-dependency",
+                )));
+            };
+            let Some((kind, _, sens)) = &rec.claim else {
+                // Sources are claims, never judgments or pins.
+                return ok(Err(bad()));
+            };
+            max_sens = max_sens.max(*sens);
+            source_kinds.push(kind.clone());
+            source_hashes.push(sh);
+        }
+        if source_hashes.is_empty() {
+            return ok(Err(bad()));
+        }
+
+        // class_floor = max effective(sources) ≤ min(flow ceiling,
+        // grant ceiling) — the flow leg rides the match below.
+        if class_floor != max_sens || grant.class_ceiling.is_some_and(|c| class_floor > c) {
+            return ok(Err(bad()));
+        }
+
+        // Flow matching (D-75): existential and whole — one entry
+        // admits the release on every axis simultaneously.
+        let h = &op.header;
+        let matched = grant.flows.iter().any(|f| {
+            f.from_zone == h.zone_id
+                && f.from_space.is_none_or(|s| s == h.space_id)
+                && f.to_raw == to.raw
+                && f.kinds
+                    .as_ref()
+                    .is_none_or(|ks| source_kinds.iter().all(|k| ks.contains(k)))
+                && f.class_ceiling >= class_floor
+                && expiry <= f.expiry_deadline_ms
+        });
+        if !matched {
+            return ok(Err(Verdict::Rejected("no-flow", "reject-permanent")));
+        }
+
+        self.record_tenant(
+            op,
+            &grant,
+            None,
+            Some(ReleaseFacts {
+                export_id,
+                sources: source_hashes,
+                content_digest,
+                dest_zone,
+                dest_space,
+            }),
+            None,
+        );
+        ok(Ok(()))
+    }
+
+    /// Tenant `m.import.claim` (§11.8): per-record validation — the
+    /// self-describing leaf folded up the carried path must reach the
+    /// release's signed root; content equality against the LIVE
+    /// source (D-134/D-198); fully-derived shape (`sensitivity ==
+    /// class_floor`). The fold verdict (ownership, collision) is
+    /// DERIVED — structural acceptance holds the claimant.
+    fn admit_import(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let grant = match self.tenant_preamble(op, "import")? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let (Some(source_op), Some(kind), Some(statement), Some(rec_index), Some(proof_arr)) = (
+            body.get("source_op").and_then(|n| n.bytes_n::<32>()),
+            body.get("kind").and_then(|k| k.as_text()),
+            body.get("statement").and_then(|s| s.as_text()),
+            body.get("rec_index").and_then(|n| n.as_uint()),
+            body.get("proof").and_then(|p| p.as_array()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        let (Some(class_floor), Some(sens)) = (
+            body.get("class_floor")
+                .and_then(|c| c.as_text())
+                .and_then(class_rank),
+            body.get("sensitivity")
+                .and_then(|s| s.as_text())
+                .and_then(class_rank),
+        ) else {
+            return ok(Err(bad()));
+        };
+        // D-134: fully-derived content — sensitivity == class_floor.
+        if sens != class_floor {
+            return ok(Err(bad()));
+        }
+        if grant
+            .kinds
+            .as_ref()
+            .is_some_and(|ks| !ks.iter().any(|k| k == kind))
+        {
+            return ok(Err(Verdict::Rejected("scope-kind", "reject-permanent")));
+        }
+        if grant.class_ceiling.is_some_and(|c| sens > c) {
+            return ok(Err(bad()));
+        }
+        let Some(prov) = body.get("provenance").and_then(|p| p.get("import")) else {
+            return ok(Err(bad()));
+        };
+        let (Some(from_plane), Some(export_id), Some(release_op), Some(digest)) = (
+            prov.get("from_plane").and_then(|n| n.bytes_n::<32>()),
+            b16_field(prov, "export_id"),
+            prov.get("release_op").and_then(|n| n.bytes_n::<32>()),
+            prov.get("digest").and_then(|n| n.bytes_n::<32>()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        if Some(from_plane) != self.plane_id {
+            // Cross-plane import fails closed until D0-B (D-44).
+            return Err(Unimplemented("cross-plane import".into()));
+        }
+
+        // The release: a held accepted m.export.release (unheld
+        // citation pends, D-199).
+        let Some(rel) = self
+            .held_tenant
+            .iter()
+            .find(|r| r.op_hash == release_op)
+            .and_then(|r| r.release.as_ref())
+            .cloned()
+        else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if rel.export_id != export_id
+            || rel.content_digest != digest
+            || rel.dest_zone != op.header.zone_id
+            || rel.dest_space != op.header.space_id
+        {
+            return ok(Err(bad()));
+        }
+        // rec_index = the record's rank in the release's signed,
+        // sorted sources (D-156).
+        let Some(rank) = rel.sources.iter().position(|s| *s == source_op) else {
+            return ok(Err(bad()));
+        };
+        if rec_index != rank as u64 {
+            return ok(Err(bad()));
+        }
+
+        // Source equality against the LIVE source (D-134/D-198): the
+        // carried statement/kind equal the source claim's; the floor
+        // binds by equality against its effective classification.
+        let Some(src) = self
+            .held_tenant
+            .iter()
+            .find(|r| r.op_hash == source_op)
+            .and_then(|r| r.claim.as_ref())
+        else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if src.0 != kind || src.1 != statement || src.2 != class_floor {
+            return ok(Err(bad()));
+        }
+
+        // The Merkle leg: leaf + path against the signed root, exact
+        // consumption (§11.8/D-162).
+        let mut proof: Vec<[u8; 32]> = Vec::new();
+        for pn in proof_arr {
+            let Some(sib) = pn.bytes_n::<32>() else {
+                return ok(Err(bad()));
+            };
+            proof.push(sib);
+        }
+        let floor_text = body
+            .get("class_floor")
+            .and_then(|c| c.as_text())
+            .expect("checked above");
+        let leaf = domains::brec_leaf(
+            &export_id, rec_index, &source_op, kind, statement, floor_text,
+        );
+        let folded = domains::merkle_fold(leaf, rec_index, rel.sources.len() as u64, &proof);
+        if folded != Some(rel.content_digest) {
+            return ok(Err(bad()));
+        }
+
+        self.record_tenant(
+            op,
+            &grant,
+            None,
+            None,
+            Some(ImportFacts {
+                key: (from_plane, release_op, source_op),
+                grant_pos: grant.ctrl_pos,
+            }),
+        );
         ok(Ok(()))
     }
 
@@ -1403,7 +2272,12 @@ impl State {
             "c.cutoff" => self.admit_cutoff(op),
             "c.cap_epoch_bump" => self.admit_cap_epoch_bump(op),
             "c.kek_rotate" => self.admit_kek_rotate(op),
+            "c.zone_create" => self.admit_zone_create(op),
+            "c.space_create" => self.admit_space_create(op),
+            "c.recovery_succession" => self.admit_recovery(op),
             "m.claim" => self.admit_claim(op),
+            "m.export.release" => self.admit_release(op),
+            "m.import.claim" => self.admit_import(op),
             other => Err(Unimplemented(format!("op_type {other}"))),
         }
     }
@@ -1427,9 +2301,14 @@ pub fn run_delivery(
     let mut snapshots = Vec::new();
     // Pending queue in arrival order.
     let mut pending: Vec<String> = Vec::new();
+    // name → op hash, for the derived-lane overlay.
+    let mut hashes: BTreeMap<String, [u8; 32]> = BTreeMap::new();
 
     for name in order {
         let bytes = &items[name];
+        if let Ok(op) = parse_op(bytes) {
+            hashes.insert(name.clone(), op.op_hash());
+        }
         let verdict = classify(&mut state, bytes)?;
         verdicts.insert(name.clone(), verdict);
         if matches!(verdict, Verdict::Pending(..)) {
@@ -1452,6 +2331,16 @@ pub fn run_delivery(
             pending = still_pending;
             if !progressed {
                 break;
+            }
+        }
+        // The derived lanes (§10.5): a held tenant op's fold verdict
+        // is a projection of current state — recompute after every
+        // delivery's fixpoint (retro-quarantine, claimant
+        // re-derivation) and overlay.
+        let derived = state.derived_tenant_verdicts()?;
+        for (n, h) in &hashes {
+            if let Some(v) = derived.get(h) {
+                verdicts.insert(n.clone(), *v);
             }
         }
         snapshots.push(verdicts.clone());
@@ -1578,6 +2467,40 @@ mod tests {
             Verdict::Pending("causal-missing", "pending-dependency")
         );
         assert_eq!(run2.final_verdicts, run.final_verdicts);
+    }
+
+    /// The full collision arc: m1 wins the replay key, the revocation
+    /// freezes it (D-155), m2 collides against the frozen owner
+    /// (D-161/D-169 — the trace row), and the C3′'s omission blanket
+    /// kills m1's basis so the claimant fold re-derives m2 to owner
+    /// (D-196) while m1 retro-quarantines under `cutoff`.
+    #[test]
+    fn collision_loser_reenters_when_the_winner_basis_dies() {
+        let (items, _) = load("f11-collision-loser-reenters-on-winner-death.json");
+        let order: Vec<String> = [
+            "c1", "cz", "cs", "c2", "gf", "i1", "rel", "m1", "rg", "c3", "m2", "r",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let run = run_delivery(&items, &order).unwrap();
+        // m1 is the admitted owner right up to the recovery.
+        assert_eq!(run.snapshots[8]["m1"], Verdict::Admitted);
+        // m2 at its own delivery: a claim against a FROZEN owner.
+        assert_eq!(
+            run.snapshots[10]["m2"],
+            Verdict::Rejected("import-collision", "quarantine-reproposal")
+        );
+        // The C3′ flips both: the blanket cuts m1, m2 re-derives.
+        assert_eq!(
+            run.final_verdicts["m1"],
+            Verdict::Rejected("cutoff", "quarantine-reproposal")
+        );
+        for k in [
+            "c1", "cz", "cs", "c2", "gf", "i1", "rel", "rg", "c3", "m2", "r",
+        ] {
+            assert_eq!(run.final_verdicts[k], Verdict::Admitted, "{k}");
+        }
     }
 
     /// D-153/D-196: the staged close dies vacuously at the

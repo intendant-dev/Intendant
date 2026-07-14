@@ -80,6 +80,101 @@ pub fn key_id(alg: &str, pk: &[u8]) -> [u8; 32] {
     h("key", &m)
 }
 
+/// §11.8 bundle leaf: `H_brec(canonical bundleleaf)` where
+/// `bundleleaf = { v: 1, export_id, rec_index, rec: bundlerec }` and
+/// `bundlerec = { v: 1, op, kind, statement, class_floor }` — the
+/// reducer hand-encodes both maps in canonical (encoded-byte) key
+/// order: `v < rec < export_id < rec_index` and
+/// `v < op < kind < statement < class_floor`.
+pub fn brec_leaf(
+    export_id: &[u8; 16],
+    rec_index: u64,
+    op: &[u8; 32],
+    kind: &str,
+    statement: &str,
+    class_floor: &str,
+) -> [u8; 32] {
+    let mut rec = vec![0xa5u8];
+    rec.push(0x61);
+    rec.extend_from_slice(b"v");
+    rec.extend_from_slice(&uint_bytes(1));
+    rec.push(0x62);
+    rec.extend_from_slice(b"op");
+    rec.extend_from_slice(&bytes_header(op.len()));
+    rec.extend_from_slice(op);
+    rec.push(0x64);
+    rec.extend_from_slice(b"kind");
+    rec.extend_from_slice(&text_header(kind.len()));
+    rec.extend_from_slice(kind.as_bytes());
+    rec.extend_from_slice(&text_header("statement".len()));
+    rec.extend_from_slice(b"statement");
+    rec.extend_from_slice(&text_header(statement.len()));
+    rec.extend_from_slice(statement.as_bytes());
+    rec.extend_from_slice(&text_header("class_floor".len()));
+    rec.extend_from_slice(b"class_floor");
+    rec.extend_from_slice(&text_header(class_floor.len()));
+    rec.extend_from_slice(class_floor.as_bytes());
+
+    let mut leaf = vec![0xa4u8];
+    leaf.push(0x61);
+    leaf.extend_from_slice(b"v");
+    leaf.extend_from_slice(&uint_bytes(1));
+    leaf.push(0x63);
+    leaf.extend_from_slice(b"rec");
+    leaf.extend_from_slice(&rec);
+    leaf.extend_from_slice(&text_header("export_id".len()));
+    leaf.extend_from_slice(b"export_id");
+    leaf.extend_from_slice(&bytes_header(export_id.len()));
+    leaf.extend_from_slice(export_id);
+    leaf.extend_from_slice(&text_header("rec_index".len()));
+    leaf.extend_from_slice(b"rec_index");
+    leaf.extend_from_slice(&uint_bytes(rec_index));
+    h("brec", &leaf)
+}
+
+/// Fold a leaf up the §11.8 Merkle path: siblings bottom-up, exact
+/// consumption, the trailing odd node promoting unchanged. Level
+/// widths derive from `record_count` (a signed release fact). `None`
+/// on leftover/missing siblings.
+pub fn merkle_fold(
+    leaf: [u8; 32],
+    rec_index: u64,
+    record_count: u64,
+    proof: &[[u8; 32]],
+) -> Option<[u8; 32]> {
+    if record_count == 0 || rec_index >= record_count {
+        return None;
+    }
+    let mut cur = leaf;
+    let mut idx = rec_index;
+    let mut width = record_count;
+    let mut sibs = proof.iter();
+    while width > 1 {
+        if idx == width - 1 && width % 2 == 1 {
+            // The trailing odd node promotes unchanged.
+        } else {
+            let sib = sibs.next()?;
+            let mut cat = [0u8; 64];
+            if idx.is_multiple_of(2) {
+                cat[..32].copy_from_slice(&cur);
+                cat[32..].copy_from_slice(sib);
+            } else {
+                cat[..32].copy_from_slice(sib);
+                cat[32..].copy_from_slice(&cur);
+            }
+            cur = h("bnode", &cat);
+        }
+        idx /= 2;
+        width = width.div_ceil(2);
+    }
+    // Exact consumption: leftover siblings fail.
+    sibs.next().is_none().then_some(cur)
+}
+
+fn uint_bytes(n: u64) -> Vec<u8> {
+    header(0, n as usize)
+}
+
 fn header(major: u8, n: usize) -> Vec<u8> {
     let n = n as u64;
     let mt = major << 5;
