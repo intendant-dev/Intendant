@@ -1288,6 +1288,37 @@ impl EncoderPool {
         None
     }
 
+    /// Whether any encoder in the pool would actually do work for a
+    /// pushed frame right now: an **unpaused always-on layer**, or an
+    /// **on-demand encoder with at least one subscriber** (`refcount >
+    /// 0`) that is not paused. The active-encoder universe matches
+    /// [`Self::request_keyframe_all`] (always-on ∪ subscribed
+    /// on-demand), intersected with the pause state the layer-policy
+    /// coordinator drives via [`Self::pause_layer`] /
+    /// [`Self::resume_layer`].
+    ///
+    /// Used by the pool-feed bridge's idle gate (F2, 2026-07-13 display
+    /// review): when this is `false`, pushing a frame would only make
+    /// paused encoder threads drain-and-skip it, so the bridge skips
+    /// the BGRA→I420 conversion that feeds the push entirely. Cheap
+    /// enough for a per-tick call: one `RwLock` read over ≤3 always-on
+    /// handles plus one mutex-guarded scan of the (tiny) on-demand map.
+    pub fn has_active_consumer(&self) -> bool {
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            if always_on
+                .iter()
+                .any(|handle| !handle.paused.load(Ordering::SeqCst))
+            {
+                return true;
+            }
+        }
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        on_demand
+            .values()
+            .any(|slot| slot.refcount > 0 && !slot.handle.paused.load(Ordering::SeqCst))
+    }
+
     /// Test-only access to the always-on handles. Lets tests verify
     /// pool composition without exposing internals to production code.
     ///
@@ -3349,6 +3380,47 @@ mod tests {
         assert!(
             resumed_again,
             "resume_layer is idempotent on already-active slot"
+        );
+    }
+
+    /// `has_active_consumer` — the pool-feed bridge's idle gate (F2):
+    /// true while any always-on layer is unpaused; false once the
+    /// presence policy has paused everything; true again on resume;
+    /// and false for a pool with no encoders at all (the synthetic /
+    /// empty-bank shape).
+    #[tokio::test]
+    async fn pool_has_active_consumer_tracks_pause_state() {
+        let empty = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
+        assert!(
+            !empty.has_active_consumer(),
+            "a pool with no encoders has no consumer"
+        );
+
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
+        assert!(
+            pool.has_active_consumer(),
+            "always-on layers start unpaused — the pool is a live consumer"
+        );
+
+        // Presence-policy steady state at zero peers: everything paused.
+        for id in pool.always_on_ids() {
+            assert!(pool.pause_layer(id.codec, id.rid));
+        }
+        assert!(
+            !pool.has_active_consumer(),
+            "with every layer paused, pushing frames would be pure waste"
+        );
+
+        // One layer resuming is enough to demand frames again.
+        let first = pool
+            .always_on_ids()
+            .into_iter()
+            .next()
+            .expect("simulcast pool has layers");
+        assert!(pool.resume_layer(first.codec, first.rid));
+        assert!(
+            pool.has_active_consumer(),
+            "a single resumed layer re-establishes demand"
         );
     }
 
