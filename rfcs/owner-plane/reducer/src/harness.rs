@@ -616,8 +616,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            93,
-            "the tranche plus the corpus through families 12/13's edge+framing lanes"
+            97,
+            "the tranche plus the corpus through family 14"
         );
         for r in &reports {
             assert!(

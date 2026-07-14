@@ -169,6 +169,9 @@ pub fn run(vector: &Json) -> Result<SemStatus, String> {
         "phrase-derive" => phrase_derive(vector),
         "commitment-derive" => commitment_derive(vector),
         "merkle-proof" => merkle_proof_kat(vector),
+        "reencapsulation" => reencapsulation(vector),
+        "projection" => projection(vector),
+        "offline-confirmation" => offline_confirmation(vector),
         other => Ok(SemStatus::Unimplemented(format!("case_kind {other}"))),
     }
 }
@@ -1146,4 +1149,95 @@ fn merkle_proof_kat(vector: &Json) -> Result<SemStatus, String> {
         return Ok(SemStatus::Fail("negative proof verified".into()));
     }
     pass_if_pair(("body-invariant", "reject-permanent"), vector)
+}
+
+// -------------------------------------------------------- family 14
+
+/// M1: exact SignedOperation bytes survive a P1→P2 container move.
+/// The lane re-seals `p1` under fixed KAT parameters (DEK [0x91;32],
+/// nonce [0x92;12], the family-5 plane/zone constants) and opens it
+/// back — byte equality.
+fn reencapsulation(vector: &Json) -> Result<SemStatus, String> {
+    let p1 = in_hex(vector, "p1")?;
+    if crate::envelope::parse_op(&p1).is_err() {
+        return Ok(SemStatus::Fail("p1 is not a valid operation triple".into()));
+    }
+    let dek = [0x91u8; 32];
+    let nonce = [0x92u8; 12];
+    let aad = item_crypto::item_aad(&item_crypto::F5_PLANE, &item_crypto::F5_ZONE);
+    let sealed = item_crypto::aead_seal(&dek, &nonce, &aad, &p1);
+    let opened = item_crypto::aead_open(&dek, &nonce, &aad, &sealed)
+        .ok_or("re-encapsulation round trip failed")?;
+    let identical = opened == p1;
+    if vector["expected"]["result"]["identical"].as_bool() == Some(true) && identical {
+        Ok(SemStatus::Pass)
+    } else {
+        Ok(SemStatus::Fail(format!("identical={identical}")))
+    }
+}
+
+/// §11.7 stamp projection: an m.export.release's complete
+/// classification evaluation point. A missing component is
+/// `body-invariant` (the body-hash stage passed — the CDDL gap is
+/// what fires).
+fn projection(vector: &Json) -> Result<SemStatus, String> {
+    let bytes = in_hex(vector, "bytes")?;
+    let op = match crate::envelope::parse_op(&bytes) {
+        Ok(op) => op,
+        Err(e) => return Ok(SemStatus::Fail(format!("projection input: {e:?}"))),
+    };
+    if op.header.operation_type != "m.export.release" {
+        return Ok(SemStatus::Unimplemented(format!(
+            "projection over {}",
+            op.header.operation_type
+        )));
+    }
+    if !op.body_hash_ok() {
+        return Ok(SemStatus::Fail("body hash fails".into()));
+    }
+    let stamp = (
+        op.body.get("data_frontier").and_then(|n| n.bytes_n::<32>()),
+        op.body
+            .get("control_frontier")
+            .and_then(|n| n.bytes_n::<32>()),
+        op.body.get("as_of_ms").and_then(|n| n.as_uint()),
+    );
+    match stamp {
+        (Some(df), Some(cf), Some(ms)) => {
+            let r = &vector["expected"]["result"];
+            if !r.is_object() {
+                return Ok(SemStatus::Fail(
+                    "complete stamp but the vector expects a negative".into(),
+                ));
+            }
+            let want_df = unhex(r["data_frontier"].as_str().ok_or("result.data_frontier")?)?;
+            let want_cf = unhex(
+                r["control_frontier"]
+                    .as_str()
+                    .ok_or("result.control_frontier")?,
+            )?;
+            let want_ms = r["as_of_ms"].as_u64().ok_or("result.as_of_ms")?;
+            if df.to_vec() == want_df && cf.to_vec() == want_cf && ms == want_ms {
+                Ok(SemStatus::Pass)
+            } else {
+                Ok(SemStatus::Fail("projected stamp differs".into()))
+            }
+        }
+        _ => pass_if_pair(("body-invariant", "reject-permanent"), vector),
+    }
+}
+
+/// Umbrella App C #2 — a procedural fixture: the confirmation run is
+/// PENDING; the lane checks the recording obligation is carried.
+fn offline_confirmation(vector: &Json) -> Result<SemStatus, String> {
+    let procedure = vector["inputs"]["procedure"]
+        .as_str()
+        .ok_or("inputs.procedure")?;
+    let recorded = vector["expected"]["result"]["recorded"]
+        .as_str()
+        .ok_or("result.recorded")?;
+    if procedure.is_empty() || recorded.is_empty() {
+        return Ok(SemStatus::Fail("empty procedure/recording".into()));
+    }
+    Ok(SemStatus::Pass)
 }
