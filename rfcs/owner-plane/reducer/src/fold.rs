@@ -240,6 +240,36 @@ const OP_AUTHORING: &[&str] = &[
     "audit.write",
 ];
 
+/// §7.5 (b): the hosted-grantable set (the safe verbs plus the
+/// system-only `audit.write`).
+const HOSTED_GRANTABLE: &[&str] = &[
+    "search",
+    "read",
+    "evidence.read",
+    "propose",
+    "assert",
+    "judge.safe",
+    "pin.safe",
+    "erase.request",
+    "raise",
+    "audit.write",
+];
+
+/// §7.5 (c): control operations admissible under the hosted ceiling
+/// (the deeper per-op constraints — exclusion shape, own-lineage,
+/// ratify-only — are separate rules).
+const HOSTED_CTRL_ADMISSIBLE: &[&str] = &[
+    "c.enroll",
+    "c.revoke_device",
+    "c.kek_rotate",
+    "c.wrap_add",
+    "c.lineage_reauth",
+    "c.cutoff",
+    "c.abandon_writer",
+    "c.drill",
+    "c.recovery_succession",
+];
+
 /// §11.1's closed grant-verb vocabulary.
 const VERBS: &[&str] = &[
     "search",
@@ -351,6 +381,10 @@ pub struct State {
     leases: Vec<AuxLease>,
     /// The §5.6 local index (aux `index`): item_addr → op hash.
     item_index: BTreeMap<[u8; 32], [u8; 32]>,
+    /// The genesis descriptor's provenance ("trusted"/"hosted") —
+    /// the §7.5 ceiling binds while hosted AND no recovery has been
+    /// accepted (the lift is portable, D-42).
+    provenance: Option<String>,
 }
 
 /// A held Signed `accept` receipt from aux — unvalidated until an
@@ -666,6 +700,11 @@ impl State {
         {
             return bad;
         }
+        // §7.5 (b): under the hosted ceiling only the safe set plus
+        // the system-only audit.write is grantable.
+        if self.hosted_ceiling_active() && verbs.iter().any(|v| !HOSTED_GRANTABLE.contains(v)) {
+            return Some(Verdict::Rejected("hosted-ceiling", "reject-permanent"));
+        }
         if verbs.iter().any(|v| OP_AUTHORING.contains(v)) {
             let zone_finite = gn.get("zone").is_some_and(|z| z.bytes_n::<16>().is_some());
             let owned = match (b16_field(gn, "lineage"), b16_field(gn, "subject_device")) {
@@ -866,6 +905,10 @@ impl State {
         self.recovery_commitment = descriptor
             .get("recovery_commitment")
             .and_then(|n| n.bytes_n::<32>());
+        self.provenance = descriptor
+            .get("provenance")
+            .and_then(|n| n.as_text())
+            .map(str::to_string);
         self.zones.push(zone_id.unwrap_or_default());
         self.kek_epochs.insert(zone_id.unwrap_or_default(), 1);
         self.cap_epochs.insert(zone_id.unwrap_or_default(), 1);
@@ -1927,6 +1970,57 @@ impl State {
     /// base-enrolled `(zone, lineage)` folds the revivable blanket.
     /// Branch cutting (base below the head), storage adoption, and
     /// the D-150 freshness carriage abort honestly.
+    /// `c.drill` — a recovery-signed nonce statement (§7.1): the
+    /// recovery-arm signature against the CURRENT commitment at the
+    /// CURRENT repoch (a proof, not a succession; "trusted lane" is
+    /// product guidance, not a portable predicate).
+    fn admit_drill(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = Self::ctrl_header_pins(op) {
+            return ok(Err(v));
+        }
+        if let Err(v) = self.ctrl_chain(op) {
+            return ok(Err(v));
+        }
+        let Proof::Recovery {
+            repoch,
+            recovery_pk,
+        } = op.header.proof
+        else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        let Ok(recovery_pk) = <[u8; 32]>::try_from(recovery_pk) else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        let Some(commitment) = self.recovery_commitment else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if repoch != self.repoch || domains::h("drill", &recovery_pk) != commitment {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        }
+        if !op.verify_ed25519(&recovery_pk)
+            || op.header.signer_key_id != domains::key_id("ed25519", &recovery_pk)
+        {
+            return ok(Err(Verdict::Rejected("sig-invalid", "reject-permanent")));
+        }
+        if !op.body_hash_ok() {
+            return ok(Err(Verdict::Rejected("body-hash", "reject-permanent")));
+        }
+        if op
+            .body
+            .get("nonce")
+            .and_then(|n| n.bytes_n::<16>())
+            .is_none()
+        {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
     fn admit_recovery(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
         if let Err(v) = Self::ctrl_header_pins(op) {
             return ok(Err(v));
@@ -2333,6 +2427,26 @@ impl State {
             .collect()
     }
 
+    /// The walkthrough probe registry (register #17: fixture-named
+    /// canonical CBOR of the derived construct).
+    pub fn probe(&self, name: &str) -> Option<Vec<u8>> {
+        match name {
+            "plane.provenance" => {
+                let p = self.provenance.as_deref()?;
+                let mut out = vec![0x60 | p.len() as u8];
+                out.extend_from_slice(p.as_bytes());
+                Some(out)
+            }
+            "ceiling.lifted" => Some(vec![if self.repoch > 0 { 0xf5 } else { 0xf4 }]),
+            "ctrl.head" => {
+                let mut out = vec![0x58, 32];
+                out.extend_from_slice(&self.ctrl_head);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Install the vector's held context (the fold lane's `aux`):
     /// the §5.6 `index` plus `Signed<…>` receipts and leases (§4.7).
     /// Aux is STATE, not events — nothing here folds.
@@ -2423,6 +2537,13 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// §7.5: the hosted ceiling binds until ANY valid recovery
+    /// succession is accepted (the lift is portable by definition,
+    /// D-42 — repoch advances exactly there).
+    fn hosted_ceiling_active(&self) -> bool {
+        self.provenance.as_deref() == Some("hosted") && self.repoch == 0
     }
 
     /// §11.4 derived actor class. Human evidence + full judgment
@@ -3256,6 +3377,21 @@ impl State {
 
     /// Dispatch one operation.
     fn admit(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        // §7.5 (c): a control operation OUTSIDE the hosted-admissible
+        // set rejects at the authority stage — the position/signature
+        // stages still precede it (D-76 first-failing-stage; the
+        // fixtures' inadmissible ops are admin-armed and validly
+        // signed).
+        if self.hosted_ceiling_active()
+            && op.header.operation_type.starts_with("c.")
+            && op.header.operation_type != "c.genesis"
+            && !HOSTED_CTRL_ADMISSIBLE.contains(&op.header.operation_type)
+        {
+            if let Err(v) = self.ctrl_admin_preamble(op) {
+                return ok(Err(v));
+            }
+            return ok(Err(Verdict::Rejected("hosted-ceiling", "reject-permanent")));
+        }
         match op.header.operation_type {
             "c.genesis" => self.admit_genesis(op),
             "c.enroll" => self.admit_enroll(op),
@@ -3269,6 +3405,7 @@ impl State {
             "c.zone_create" => self.admit_zone_create(op),
             "c.space_create" => self.admit_space_create(op),
             "c.recovery_succession" => self.admit_recovery(op),
+            "c.drill" => self.admit_drill(op),
             "m.claim" => self.admit_claim(op),
             "m.judge" => self.admit_judge(op),
             "m.export.release" => self.admit_release(op),

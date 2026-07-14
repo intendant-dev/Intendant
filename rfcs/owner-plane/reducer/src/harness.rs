@@ -181,6 +181,7 @@ fn run_semantics(vector: &Json) -> SemStatus {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
     let run = match kind {
         "fold" => run_fold_vector(vector),
+        "walkthrough" => run_walkthrough(vector),
         "journal-replay" => run_journal_vector(vector),
         "export-import" => run_export_import(vector),
         "status-derive" => run_status_derive(vector),
@@ -515,6 +516,50 @@ fn parse_aux(vector: &Json) -> Result<std::collections::BTreeMap<String, Vec<u8>
     Ok(aux)
 }
 
+/// The walkthrough lane: a fold vector with REQUIRED state_probes —
+/// fold semantics first, then each probe against the fresh-fold
+/// final state's registry (exact names, canonical-byte equality).
+fn run_walkthrough(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+    let status = run_fold_vector(vector)?;
+    if status != SemStatus::Pass {
+        return Ok(status);
+    }
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let aux = parse_aux(vector)?;
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let (_, state) = match crate::fold::run_delivery_full(&items, &aux, &fresh_order) {
+        Ok(v) => v,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    let probes = vector["expected"]["result"]["state_probes"]
+        .as_array()
+        .ok_or("walkthrough state_probes missing")?;
+    for p in probes {
+        let name = p["name"].as_str().ok_or("probe.name")?;
+        let want = p["value"].as_str().ok_or("probe.value")?;
+        let Some(got) = state.probe(name) else {
+            return Ok(SemStatus::Unimplemented(format!("state probe {name:?}")));
+        };
+        let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+        if got_hex != want {
+            return Ok(SemStatus::Fail(format!(
+                "probe {name:?}: expected {want}, got {got_hex}"
+            )));
+        }
+    }
+    Ok(SemStatus::Pass)
+}
+
 fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
     use std::collections::BTreeMap;
 
@@ -707,8 +752,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            119,
-            "the tranche plus the corpus through the time/lease slice"
+            123,
+            "the tranche plus the corpus through the hosted-ceiling/drill slice"
         );
         for r in &reports {
             assert!(

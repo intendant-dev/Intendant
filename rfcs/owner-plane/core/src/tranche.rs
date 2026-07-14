@@ -20,7 +20,7 @@ use crate::domains::{h_tag, Tag};
 use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
-    ctrl_header, AdminKey, Ccutoff, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate,
+    ctrl_header, AdminKey, Ccutoff, Cdrill, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate,
     Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, Czonepolicy, RevokeMode,
     CSPACECREATE_OP_TYPE,
 };
@@ -91,6 +91,21 @@ pub fn h_grant(grant: &Grant) -> Bytes32 {
 
 /// The trusted-plane 15-verb genesis set: every verb except reserved
 /// `admin` and system-only `audit.write` (D-76), in registry order.
+/// The §7.5 hosted-safe verb set, §11.1 order.
+fn hosted_safe_verbs() -> Vec<Verb> {
+    vec![
+        Verb::Search,
+        Verb::Read,
+        Verb::EvidenceRead,
+        Verb::Propose,
+        Verb::Assert,
+        Verb::JudgeSafe,
+        Verb::PinSafe,
+        Verb::EraseRequest,
+        Verb::Raise,
+    ]
+}
+
 fn trusted_verbs() -> Vec<Verb> {
     vec![
         Verb::Search,
@@ -163,6 +178,7 @@ fn mint_device_inner(
     tag: &str,
     plane_id: Bytes32,
     kem: Option<([u8; 32], [u8; 65])>,
+    class: Devclass,
 ) -> Device {
     let sig_seed = rng.draw32(&format!("{tag}.sig_seed"));
     let (sig_sk, sig_pk) = suite::ed25519::keypair(&sig_seed);
@@ -180,7 +196,7 @@ fn mint_device_inner(
         sig_alg: Sigalg::Ed25519,
         sig_pk: sig_pk.to_vec(),
         kem_pk: kem_pk.to_vec(),
-        class: Devclass::Daemon,
+        class,
         evidence_hash,
         evidence_media_type: None,
         issued_admin_epoch: 1,
@@ -246,6 +262,19 @@ impl PlaneRig {
     /// Mint the plane: the full `c.genesis` ceremony per the §7.1
     /// registry row + D-68/D-76 cross-field validity.
     pub fn new(fixture_name: &str) -> PlaneRig {
+        Self::new_with(fixture_name, Provenance::Trusted)
+    }
+
+    /// [`Self::new`] on a HOSTED plane: `provenance = hosted`, a
+    /// `hosted-browser` first certificate, and the §7.5 safe verb
+    /// set on the genesis grant — the identical draw sequence, so
+    /// trusted fixtures reproduce byte-identically.
+    pub fn new_hosted(fixture_name: &str) -> PlaneRig {
+        Self::new_with(fixture_name, Provenance::Hosted)
+    }
+
+    fn new_with(fixture_name: &str, provenance: Provenance) -> PlaneRig {
+        let hosted = provenance == Provenance::Hosted;
         let mut rng = rng_for(fixture_name);
         let mut hlc_ms = T0_MS;
 
@@ -258,7 +287,7 @@ impl PlaneRig {
             root_sig_alg: Sigalg::Ed25519,
             root_sig_pk: root_pk.to_vec(),
             recovery_commitment: h_tag(Tag::Drill, &recovery_pk),
-            provenance: Provenance::Trusted,
+            provenance,
             created_ms: T0_MS,
         };
         let plane_id = h_tag(
@@ -266,7 +295,17 @@ impl PlaneRig {
             &cbor::encode(&descriptor.to_value()).expect("descriptor encodes"),
         );
 
-        let dev1 = mint_device_inner(&mut rng, "dev1", plane_id, None);
+        let dev1 = mint_device_inner(
+            &mut rng,
+            "dev1",
+            plane_id,
+            None,
+            if hosted {
+                Devclass::HostedBrowser
+            } else {
+                Devclass::Daemon
+            },
+        );
         let zone_id = draw_id(&mut rng, "zone_id");
         let home_space_id = draw_id(&mut rng, "home.space_id");
         let home_name_hash = rng.draw32("home.name_hash");
@@ -296,7 +335,11 @@ impl PlaneRig {
             tenants: vec![GrantTenant::Memory],
             zone: ZoneSel::Zone(zone_id),
             spaces: SpacesSel::Spaces(vec![home_space_id]),
-            ops: trusted_verbs(),
+            ops: if hosted {
+                hosted_safe_verbs()
+            } else {
+                trusted_verbs()
+            },
             kinds: None,
             class_ceiling: Class::Sensitive,
             can_declassify: None,
@@ -414,7 +457,7 @@ impl PlaneRig {
 
     /// Draw a device (see [`mint_device_inner`]).
     pub fn mint_device(&mut self, tag: &str) -> Device {
-        mint_device_inner(&mut self.rng, tag, self.plane_id, None)
+        mint_device_inner(&mut self.rng, tag, self.plane_id, None, Devclass::Daemon)
     }
 
     /// Draw a device whose KEM key is the NEGATION of the given pair
@@ -423,7 +466,13 @@ impl PlaneRig {
     /// derived, which is the point of the residual.
     pub fn mint_device_negated(&mut self, tag: &str, of_pk: [u8; 65], of_sk: [u8; 32]) -> Device {
         let (neg_pk, neg_sk) = negate_p256(&of_pk, &of_sk);
-        mint_device_inner(&mut self.rng, tag, self.plane_id, Some((neg_sk, neg_pk)))
+        mint_device_inner(
+            &mut self.rng,
+            tag,
+            self.plane_id,
+            Some((neg_sk, neg_pk)),
+            Devclass::Daemon,
+        )
     }
 
     /// An epoch-1 wrap of the zone KEK to `dev`.
@@ -1139,6 +1188,44 @@ impl PlaneRig {
     /// `writer_sequence = base.seq + 1`, `previous_writer_hash =
     /// base.op` (§7.4). Advances the rig chain (the fixture recovery
     /// bases on the head and cuts nothing control-side).
+    /// `c.drill` — a recovery-signed nonce statement at the next
+    /// chain position (recovery-arm admission; repoch = CURRENT,
+    /// this is a proof, not a succession).
+    pub fn drill_op(&mut self, repoch: u64) -> Signedop {
+        let seq = self.ctrl_seq + 1;
+        let nonce = draw_id(&mut self.rng, "drill.nonce");
+        let request_id = draw_id(&mut self.rng, &format!("ctrl{seq}.request_id"));
+        let hlc = self.next_hlc();
+        let header = ctrl_header(
+            self.plane_id,
+            CTRL_ZONE,
+            CTRL_SPACE,
+            Sigalg::Ed25519,
+            suite::key_id("ed25519", &self.recovery_pk),
+            Writer {
+                lineage: CTRL_LINEAGE,
+                gen: 1,
+            },
+            Authproof::Recovery {
+                repoch,
+                recovery_pk: self.recovery_pk,
+            },
+            request_id,
+            seq,
+            Some(self.ctrl_head),
+            hlc,
+            Cdrill::OP_TYPE,
+        );
+        let op = seal_op(
+            header,
+            Cdrill { nonce }.to_value(),
+            &OpSigner::Ed25519(&self.recovery_sk),
+        );
+        self.ctrl_seq = seq;
+        self.ctrl_head = op.op_hash();
+        op
+    }
+
     pub fn recovery_op(&mut self, body: Crecovsucc) -> Signedop {
         let seq = body.base_seq + 1;
         let request_id = draw_id(&mut self.rng, &format!("ctrl{seq}.request_id"));
