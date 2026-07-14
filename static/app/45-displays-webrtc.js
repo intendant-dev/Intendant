@@ -212,6 +212,8 @@ class DisplaySlot {
     this.recordingStreamName = null;
     this._recordingPendingAction = null;
     this._recordingPendingTimer = null;
+    this._recordingStartedAt = null;  // client clock at server-confirmed start
+    this._recordingTimerId = null;    // 1 Hz elapsed-label ticker while recording
     this._recordingDeletePending = false;
     this._recordingDeleteStream = null;
     this._recordingDeleteTimer = null;
@@ -239,6 +241,10 @@ class DisplaySlot {
     this._statsTimer = null;        // live metrics chip sampler
     this._statsPrev = null;
     this._takePendingTimer = null;  // Take Control 5s no-answer timeout
+    // Item F6: parked-on-transport-outage poll. Non-null while this slot
+    // is waiting for display signaling to return instead of burning its
+    // bounded retry budget on offers that cannot leave the browser.
+    this._transportWaitTimer = null;
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
@@ -297,13 +303,34 @@ class DisplaySlot {
     // Video element for WebRTC media track
     this.videoEl = document.createElement('video');
     this.videoEl.autoplay = true;
-    this.videoEl.playsinline = true;
+    // The IDL property is camelCase — the lowercase assignment set a dead
+    // expando, so the element never actually carried playsinline. Set the
+    // attribute too for engines that read it directly.
+    this.videoEl.playsInline = true;
+    this.videoEl.setAttribute('playsinline', '');
     this.videoEl.muted = true;
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.videoEl.setAttribute('aria-label', `Live view of ${label}`);
     this.videoEl.setAttribute('aria-describedby', `ds-status-${displayId} ds-authority-${displayId}`);
     this.canvasEl.appendChild(this.videoEl);
+    // Live-video pause guard (shared driver in 45-display-viewer-core —
+    // WebKit pauses muted live video on tab switches / DOM reparents and
+    // never auto-resumes; full rationale there). Armed once: this element
+    // lives for the slot's whole life. "Live" is pc + connected; the
+    // breadcrumb rides the display activity rail so a pause-storm is
+    // visible instead of masquerading as network lag.
+    displayViewerArmPauseGuard(
+      this,
+      this.videoEl,
+      () => Boolean(this.pc && this.connected),
+      () => {
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            'Playback auto-resumed after a browser pause');
+        }
+      },
+    );
     // In-stage connection status overlay (time-to-first-frame): staged
     // copy while negotiating ("Negotiating…" → "Waiting for first
     // frame…"), and a visible error state with a Reconnect button on
@@ -326,6 +353,20 @@ class DisplaySlot {
     this.controlBannerEl.className = 'display-control-banner';
     this.controlBannerEl.textContent = 'You have control — keyboard and pointer input drive this display.';
     this.canvasEl.appendChild(this.controlBannerEl);
+    // Host identity chip (bottom-right stage chrome): "{host} · {display}"
+    // with the gradient identity square. Text is kept fresh by the live
+    // workspace projection (selfHostLabel arrives async via the agent
+    // card); hidden in thumb/fullscreen contexts by ui2-live.css.
+    this.hostChipEl = document.createElement('div');
+    this.hostChipEl.className = 'cu-host-chip';
+    this.hostChipEl.setAttribute('aria-hidden', 'true');
+    const hostMark = document.createElement('span');
+    hostMark.className = 'cu-host-chip-mark';
+    const hostText = document.createElement('span');
+    hostText.className = 'cu-host-chip-text';
+    this.hostChipEl.appendChild(hostMark);
+    this.hostChipEl.appendChild(hostText);
+    this.canvasEl.appendChild(this.hostChipEl);
     const rerenderSharedFocus = () => {
       if (!sharedViewState.visible) return;
       if (sharedViewState.displayId !== null && Number(this.displayId) !== sharedViewState.displayId) return;
@@ -664,6 +705,10 @@ class DisplaySlot {
         this._firstFrameSeen = true;
         this._clearNoTrackWatchdog();
         this._setStageOverlay(null);
+        // From here on, "frames stopped advancing" is the failure mode
+        // the no-track watchdog can't see — hand over to the freeze
+        // watchdog for the rest of this negotiation.
+        this._armFreezeWatchdog();
       });
     };
 
@@ -702,6 +747,15 @@ class DisplaySlot {
         // with the flag cleared.
         if (this._closedByUser) return;
         this.connected = false;
+        // Item F6: the bounded budget measures THIS DISPLAY's failures.
+        // While the signaling transport itself is down (daemon restart,
+        // event-lane reconnect), an offer cannot even leave the browser
+        // — park on the transport instead of burning attempts into a
+        // void and dead-ending every open slot.
+        if (!this._displaySignalingAvailable()) {
+          this._waitForDisplaySignaling();
+          return;
+        }
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
         if (attempts <= DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
@@ -714,6 +768,13 @@ class DisplaySlot {
           this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS})…`);
           setTimeout(() => {
             if (this._closedByUser) return;
+            // The transport can die during the backoff — re-check at
+            // fire time so this attempt parks instead of failing into
+            // the dead-end overlay while nothing can be signaled.
+            if (!this._displaySignalingAvailable()) {
+              this._waitForDisplaySignaling();
+              return;
+            }
             this.connect();
           }, delay);
         } else {
@@ -773,6 +834,14 @@ class DisplaySlot {
     }).then(async () => {
       await this.sendDisplayOffer(this.pc.localDescription.sdp);
     }).catch(err => {
+      // Item F6: an offer that failed while the signaling transport is
+      // down is the transport's failure, not this display's — park until
+      // it returns rather than dead-ending on a Reconnect button whose
+      // click couldn't signal either.
+      if (!this._closedByUser && !this._displaySignalingAvailable()) {
+        this._waitForDisplaySignaling();
+        return;
+      }
       this.statusEl.textContent = 'Offer FAILED: ' + err.message;
       this.statusEl.className = 'display-status error';
       // Offer/signaling failure used to be a quiet toolbar note on a dark
@@ -804,6 +873,57 @@ class DisplaySlot {
     displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
   }
 
+  // Re-kick playback if the element sits paused under a live connection
+  // (tab return, missed pause event during a reparent). Safe to call any
+  // time; no-ops unless connected with a stream attached. Shared driver
+  // in 45-display-viewer-core (the constructor arms the guard; behavior —
+  // 120ms macrotask delay, pending-dedupe, activity breadcrumb — is the
+  // pre-extraction #299 semantics unchanged).
+  resumeLiveVideoIfPaused() {
+    displayViewerResumeLiveVideoIfPaused(this);
+  }
+
+  // Post-first-frame freeze watchdog (shared driver in
+  // 45-display-viewer-core): armed by the first rendered frame of each
+  // negotiation, cleared by disconnect(). Presented-frame progress via
+  // rVFC (framesDecoded fallback); on a stall it first re-kicks playback
+  // through the pause-guard path, then surfaces the stage overlay with
+  // the manual Reconnect — never an automatic reconnect loop.
+  _armFreezeWatchdog() {
+    displayViewerArmFreezeWatchdog(this, {
+      videoEl: () => this.videoEl,
+      isLive: () => Boolean(this.pc && this.connected),
+      tryResume: () => this.resumeLiveVideoIfPaused(),
+      onStalled: (seconds) => {
+        this.statusEl.textContent = `No new frames for ${seconds}s`;
+        this.statusEl.className = 'display-status error';
+        this._setStageOverlay('error',
+          `No new frames for ${seconds}s — the connection reports connected but the video has stopped advancing. Reconnecting usually fixes it.`, {
+            retryLabel: 'Reconnect',
+            onRetry: () => this.manualReconnect(),
+          });
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            `No new frames for ${seconds}s — stream looks frozen`);
+        }
+      },
+      onRecovered: () => {
+        this._setStageOverlay(null);
+        if (this.connected) {
+          const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
+          this.statusEl.textContent = this.interactive
+            ? `Interactive${res}`
+            : `Connected (view-only)${res}`;
+          this.statusEl.className = 'display-status connected';
+        }
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'live',
+            'Stream frames resumed');
+        }
+      },
+    });
+  }
+
   // User-facing recovery entry point (overlay Reconnect button, revived
   // slots). Resets the bounded-retry budget and renegotiates from scratch.
   manualReconnect() {
@@ -811,6 +931,50 @@ class DisplaySlot {
     this._reconnectAttempts = 0;
     this.disconnect();
     this.connect();
+  }
+
+  // ── Item F6: don't burn the retry budget on transport outages ───────
+
+  // Whether a display offer/ICE signal can leave the browser right now:
+  // the verified dashboard-control tunnel (availability-driven —
+  // daemonApi reports 'transport-down' during an outage and recovers
+  // when the tunnel reconnects), else the legacy /ws bridge on
+  // direct-origin dashboards. The /ws socket's own liveness is only
+  // observable at send time, so bridge presence is the honest static
+  // signal there — a refused send still surfaces through the offer
+  // path's failure handling.
+  _displaySignalingAvailable() {
+    if (dashboardTransport?.canUseDisplayWebRtcSignal?.()) return true;
+    if (dashboardConnectModeEnabled()) return false;
+    return Boolean(app && (app.send_raw || app.send_server_action));
+  }
+
+  // Park this slot until display signaling returns, WITHOUT consuming
+  // `_reconnectAttempts` — a daemon restart used to burn the whole
+  // bounded budget on offers that could never leave the browser and
+  // dead-end every open slot. Cleared by disconnect() (manual
+  // Reconnect, user close, and the display_ready revive path all run
+  // it); self-clears into connect() when the transport comes back.
+  _waitForDisplaySignaling() {
+    if (this._transportWaitTimer) return;
+    // disconnect() first (mirrors the retry arm): it clears watchdogs
+    // and samplers and hides the overlay — write the waiting copy after.
+    this.disconnect();
+    this.statusEl.textContent = 'Dashboard link to the daemon is down — waiting to reconnect…';
+    this.statusEl.className = 'display-status warn';
+    this._setStageOverlay('progress',
+      'Dashboard link to the daemon is down — this display reconnects when it returns…');
+    this._transportWaitTimer = window.setInterval(() => {
+      if (this._closedByUser) {
+        window.clearInterval(this._transportWaitTimer);
+        this._transportWaitTimer = null;
+        return;
+      }
+      if (!this._displaySignalingAvailable()) return;
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+      this.connect();
+    }, 2000);
   }
 
   // No-video watchdog, ported from the peer path (shared driver in
@@ -1003,21 +1167,44 @@ class DisplaySlot {
     // server demotes us) otherwise auto-repeats remotely forever.
     this._heldKeys = new Set();
 
-    // Input transport — the LOCAL policy: prefer the verified
-    // dashboard-control input lane (sendDisplayInputForSlot), fall back
-    // to this pc's data channels. The federated path sends over its
-    // data channels only.
+    // Input transport — the LOCAL policy, split by event class:
+    //
+    // DISCRETE events (kd/ku/md/mu — loss- and reorder-intolerant)
+    // prefer the verified dashboard-control input lane and fall back to
+    // this pc's reliable `control` channel. Never dropped.
+    //
+    // CONTINUOUS latest-wins events (mm/sc) go the other way round: the
+    // purpose-built lossy `pointer` channel first (ordered:false,
+    // maxRetransmits:0 — drop beats head-of-line blocking), because the
+    // dashboard-control tunnel is reliable+ordered and SHARED with all
+    // RPC/upload traffic — a pointer firehose queued behind a congested
+    // tunnel replays stale moves in order and reads as catastrophic
+    // remote-control lag. The tunnel remains the fallback while the
+    // pointer channel isn't open (early negotiation, channel loss), and
+    // it drops above a bufferedAmount watermark there (see
+    // DashboardControlTransport.displayInput) rather than queueing.
+    //
+    // The daemon dispatches the 'control' and 'pointer' channel labels
+    // through the same gated_input_handler as the tunnel lane, so only
+    // the transport preference changes here — input-authority gating is
+    // identical on every path. All raw sends are wrapped against throw
+    // (close races, full SCTP buffers).
     const sendControl = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      try {
+        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        this.controlChannel.send(JSON.stringify(msg));
+        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
       }
     };
     const sendPointer = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
-        this.pointerChannel.send(JSON.stringify(msg));
+        try {
+          this.pointerChannel.send(JSON.stringify(msg));
+          return;
+        } catch (_) { /* closing race / full buffer — try the tunnel */ }
       }
+      try { sendDisplayInputForSlot(this.displayId, msg); } catch (_) {}
     };
 
     // Held-key flusher, stored on the instance so `_exitInteractive`
@@ -1331,6 +1518,31 @@ class DisplaySlot {
     if (render) this._renderRecordingControls();
   }
 
+  // mm:ss since the server-confirmed recording start (applyRecordingState
+  // stamps `_recordingStartedAt` on the false→true confirmation).
+  _recordingElapsedLabel() {
+    const base = this._recordingStartedAt || Date.now();
+    const sec = Math.max(0, Math.floor((Date.now() - base) / 1000));
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  // Single writer for the 1 Hz elapsed ticker: runs exactly while the
+  // confirmed state is "recording" with no pending command. Idempotent —
+  // called from the render path so every state transition self-heals.
+  _syncRecordingTimer() {
+    const want = this.recording && !this._recordingPendingAction;
+    if (want && !this._recordingTimerId) {
+      this._recordingTimerId = window.setInterval(() => {
+        this._renderRecordingControls();
+      }, 1000);
+    } else if (!want && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
+  }
+
   _renderRecordingControls() {
     const action = this._recordingPendingAction;
     const deleting = this._recordingDeletePending;
@@ -1338,13 +1550,14 @@ class DisplaySlot {
     this.recordBtn.setAttribute('aria-busy', action ? 'true' : 'false');
     this.recordBtn.innerHTML = action
       ? (action === 'stop_recording' ? 'Stopping…' : 'Starting…')
-      : (this.recording ? '&#x23F9; Stop' : '&#x23FA; Record');
+      : (this.recording ? '&#x23F9; ' + this._recordingElapsedLabel() : '&#x23FA; Record');
     this.recordBtn.classList.toggle('active', this.recording);
     this.recordBtn.setAttribute('aria-pressed', this.recording ? 'true' : 'false');
     this.deleteRecBtn.disabled = Boolean(deleting || action);
     this.deleteRecBtn.setAttribute('aria-busy', deleting ? 'true' : 'false');
     this.deleteRecBtn.textContent = deleting ? 'Deleting…' : 'Delete';
     this.deleteRecBtn.style.display = this.recording || !this.recordingStreamName ? 'none' : '';
+    this._syncRecordingTimer();
   }
 
   applyRecordingState(recording, streamName, deleted = false) {
@@ -1370,7 +1583,13 @@ class DisplaySlot {
         this._recordingDeleteStream === streamName) {
       this._clearRecordingDeletePending(false);
     }
+    const wasRecording = this.recording;
     this.recording = Boolean(recording);
+    // Elapsed base = this confirmation's arrival (a bootstrap replay of an
+    // older recording restarts the visible counter — a known, honest
+    // limitation: the daemon does not publish the start timestamp).
+    if (this.recording && !wasRecording) this._recordingStartedAt = Date.now();
+    if (!this.recording) this._recordingStartedAt = null;
     this.recordingStreamName = deleted ? null : (streamName || this.recordingStreamName);
     this._renderRecordingControls();
     return true;
@@ -1441,10 +1660,22 @@ class DisplaySlot {
     // every per-connection timer — no leaked intervals across teardowns.
     this._connectEpoch++;
     this._clearNoTrackWatchdog();
+    displayViewerClearFreezeWatchdog(this);
+    if (this._transportWaitTimer) {
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+    }
     this._stopStatsSampler();
     this._setStageOverlay(null);
     this._clearRecordingPending();
     this._clearRecordingDeletePending();
+    // Transient disconnects keep the elapsed ticker (the server-side
+    // recording continues); a user close removes the slot, so the ticker
+    // must die with it.
+    if (userInitiated && this._recordingTimerId) {
+      window.clearInterval(this._recordingTimerId);
+      this._recordingTimerId = null;
+    }
     this.stopStreaming();
     // Flip `connected` BEFORE `_exitInteractive` so its status-text
     // ternary writes 'Disconnected' (not the stale 'Connected (view-
@@ -1587,6 +1818,10 @@ function renderSharedViewFocus(slot, region, note) {
   if (!focus) {
     focus = document.createElement('div');
     focus.className = 'shared-view-focus-box';
+    const noteEl = document.createElement('div');
+    noteEl.className = 'shared-view-focus-note';
+    noteEl.hidden = true;
+    focus.appendChild(noteEl);
     slot.canvasEl.appendChild(focus);
   }
   const x = Math.max(0, Math.min(1, Number(region.x) || 0));
@@ -1598,23 +1833,66 @@ function renderSharedViewFocus(slot, region, note) {
   const videoRect = video ? video.getBoundingClientRect() : null;
   const videoWidth = video && Number(video.videoWidth);
   const videoHeight = video && Number(video.videoHeight);
+  // Box geometry in stage-local px (kept for the note clamp below even on
+  // the percentage fallback path).
+  let boxLeft; let boxTop; let boxW; let boxH;
   if (videoRect && videoRect.width > 0 && videoRect.height > 0 && canvasRect.width > 0 && canvasRect.height > 0 && videoWidth > 0 && videoHeight > 0) {
     const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
     const frameW = videoWidth * scale;
     const frameH = videoHeight * scale;
     const frameX = videoRect.left - canvasRect.left + ((videoRect.width - frameW) / 2);
     const frameY = videoRect.top - canvasRect.top + ((videoRect.height - frameH) / 2);
-    focus.style.left = (frameX + x * frameW).toFixed(1) + 'px';
-    focus.style.top = (frameY + y * frameH).toFixed(1) + 'px';
-    focus.style.width = (w * frameW).toFixed(1) + 'px';
-    focus.style.height = (h * frameH).toFixed(1) + 'px';
+    boxLeft = frameX + x * frameW;
+    boxTop = frameY + y * frameH;
+    boxW = w * frameW;
+    boxH = h * frameH;
+    focus.style.left = boxLeft.toFixed(1) + 'px';
+    focus.style.top = boxTop.toFixed(1) + 'px';
+    focus.style.width = boxW.toFixed(1) + 'px';
+    focus.style.height = boxH.toFixed(1) + 'px';
   } else {
+    boxLeft = x * canvasRect.width;
+    boxTop = y * canvasRect.height;
+    boxW = w * canvasRect.width;
+    boxH = h * canvasRect.height;
     focus.style.left = (x * 100).toFixed(3) + '%';
     focus.style.top = (y * 100).toFixed(3) + '%';
     focus.style.width = (w * 100).toFixed(3) + '%';
     focus.style.height = (h * 100).toFixed(3) + '%';
   }
-  focus.dataset.note = note || '';
+  positionSharedViewFocusNote(
+    focus, note, { left: boxLeft, top: boxTop, width: boxW, height: boxH },
+    canvasRect.width, canvasRect.height);
+}
+
+// Keep the focus note readable wherever the region lands: below the box
+// when that fits inside the stage, flipped above when it doesn't, and
+// always clamped into the stage box (the canvas clips at its edges, so an
+// unclamped chip near a corner renders as a cut-off sliver or nothing).
+const SHARED_FOCUS_NOTE_PAD = 8;   // stage-edge breathing room
+const SHARED_FOCUS_NOTE_GAP = 6;   // box ↔ chip spacing
+
+function positionSharedViewFocusNote(focus, note, box, canvasW, canvasH) {
+  const noteEl = focus.querySelector('.shared-view-focus-note');
+  if (!noteEl) return;
+  const text = String(note || '');
+  if (noteEl.textContent !== text) noteEl.textContent = text;
+  noteEl.hidden = text === '';
+  if (text === '' || !(canvasW > 0) || !(canvasH > 0)) return;
+  const pad = SHARED_FOCUS_NOTE_PAD;
+  const gap = SHARED_FOCUS_NOTE_GAP;
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  // Cap the chip's width to the stage before measuring it.
+  noteEl.style.maxWidth = Math.round(clamp(canvasW - 2 * pad, 60, 360)) + 'px';
+  const noteW = noteEl.offsetWidth;
+  const noteH = noteEl.offsetHeight;
+  const left = clamp(box.left, pad, canvasW - noteW - pad);
+  let top = box.top + box.height + gap;
+  if (top + noteH > canvasH - pad) top = box.top - gap - noteH; // flip above
+  top = clamp(top, pad, canvasH - noteH - pad);
+  // The chip is positioned relative to the focus box (its offset parent).
+  noteEl.style.left = (left - box.left).toFixed(1) + 'px';
+  noteEl.style.top = (top - box.top).toFixed(1) + 'px';
 }
 
 function updateSharedViewBanner() {
@@ -1697,6 +1975,30 @@ function hideSharedView() {
   }
 }
 
+// CU-05 (docs/cu-e2e-findings-2026-07-13.md): retract the focus overlay +
+// note WITHOUT dismissing the shared view. Fired by the explicit
+// clear_shared_view_focus verb and by the daemon's lifecycle auto-clears
+// (display revoked, owning session ended). Idempotent: with nothing shown
+// (or after hide) it is a no-op.
+function clearSharedViewFocusAnnotation(evt) {
+  if (!sharedViewState.visible) return;
+  sharedViewState.region = null;
+  sharedViewState.note = '';
+  // Demote a "Focus" banner back to plain viewing; other action labels
+  // (input_request's Take-input affordance, capture) are not the
+  // annotation's and stay.
+  if (sharedViewState.action === 'focus') sharedViewState.action = 'show';
+  // A lifecycle clear names its cause ("display access revoked", "owning
+  // session ended") — surface it as the banner detail.
+  const reason = String((evt && evt.reason) || '').trim();
+  if (reason) sharedViewState.reason = reason;
+  for (const slot of displaySlots.values()) {
+    const focus = slot.canvasEl && slot.canvasEl.querySelector('.shared-view-focus-box');
+    if (focus) focus.remove();
+  }
+  updateSharedViewBanner();
+}
+
 function takeSharedViewInput() {
   if (sharedViewState.displayId === null) return;
   const slot = displaySlots.get(sharedViewState.displayId);
@@ -1726,6 +2028,10 @@ function handleSharedViewEvent(evt) {
   const action = rawAction === 'input' ? 'input_request' : rawAction;
   if (action === 'hide') {
     hideSharedView();
+    return;
+  }
+  if (action === 'focus_clear') {
+    clearSharedViewFocusAnnotation(evt);
     return;
   }
   sharedViewState.visible = true;
@@ -2012,9 +2318,12 @@ function applyDisplayStripState() {
 // The standalone CU concept is the presentation target; the production
 // displaySlots map remains the source of truth. This projection adds one
 // selected local stage, selected-slot authority controls, responsive rail
-// access, and a small feed of REAL browser-observed display lifecycle
-// changes. It never invents agent clicks, typed text, holder identities, or
-// display-scoped approvals: those do not exist in the current wire contract.
+// access, and a per-display feed of REAL events: browser-observed display
+// lifecycle changes plus daemon-reported CU actions (the `cu_action` wire
+// lane, appended via window.noteCuDisplayActivity from 45b-cu-overlays.js).
+// It still never invents holder identities, and display-scoped approval
+// attribution only renders when the daemon reported which session drives
+// the display (45b's attribution map from cu_action events).
 //
 // Key safety rule: a hidden interactive slot would keep its document-level
 // paste handler. Selecting another display therefore releases the old slot
@@ -2350,6 +2659,7 @@ function applyDisplayStripState() {
         '<span class="ui2-live-state-pill"></span>' +
       '</div>' +
       '<div class="ui2-live-auth-row">' +
+        '<span class="ui2-live-auth-avatar" aria-hidden="true"></span>' +
         '<span class="ui2-live-auth-name"></span>' +
       '</div>' +
       '<button class="ui2-live-card-btn" type="button"></button>' +
@@ -2358,6 +2668,7 @@ function applyDisplayStripState() {
   const authorityTitle = authorityCard.querySelector('.ui2-live-card-title');
   const authoritySub = authorityCard.querySelector('.ui2-live-card-sub');
   const authorityPill = authorityCard.querySelector('.ui2-live-state-pill');
+  const authorityAvatar = authorityCard.querySelector('.ui2-live-auth-avatar');
   const authorityName = authorityCard.querySelector('.ui2-live-auth-name');
   const authorityButton = authorityCard.querySelector('.ui2-live-card-btn');
   authorityButton.addEventListener('click', () => {
@@ -2398,12 +2709,18 @@ function applyDisplayStripState() {
       authorityTitle.textContent = 'No live display';
       authoritySub.textContent = 'Choose or share a display to see and control it here.';
       authorityPill.textContent = 'offline';
+      authorityAvatar.hidden = true;
       authorityName.textContent = 'Input is scoped to one display at a time.';
       authorityButton.hidden = true;
       return;
     }
 
     const state = slot.authorityState || 'unknown';
+    // Holder avatar: YOU when this dashboard holds input; another viewer's
+    // identity is deliberately not on the wire, so "other" stays abstract;
+    // agent-side / unclaimed / connecting reads AI.
+    authorityAvatar.hidden = false;
+    authorityAvatar.textContent = state === 'you' ? 'YOU' : state === 'other' ? '···' : 'AI';
     const pending = Boolean(slot._takeControlPending);
     authorityName.textContent = slotLabel(slot);
     authorityButton.hidden = false;
@@ -2480,20 +2797,75 @@ function applyDisplayStripState() {
     };
   }
 
-  function addDisplayActivity(displayId, kind, textValue) {
+  // Per-display feed cap. Raised from 10 for the action stream — lifecycle
+  // events alone rarely pass 10, but real CU action traffic does.
+  const ACTIVITY_MAX_ENTRIES = 50;
+
+  function addDisplayActivity(displayId, kind, textValue, extra) {
     const id = Number(displayId);
     const entries = activityByDisplay.get(id) || [];
     const last = entries[entries.length - 1];
-    if (last && last.kind === kind && last.text === textValue) return;
+    // Consecutive-duplicate guard is for lifecycle transitions only: two
+    // identical CU actions in a row (extra.action) are distinct real events
+    // and must both append.
+    if (!extra && last && last.kind === kind && last.text === textValue) return;
     entries.push({
       seq: ++activitySeq,
       kind,
       text: textValue,
       at: new Date(),
+      raw: extra && extra.raw ? String(extra.raw) : '',
+      action: Boolean(extra && extra.action),
     });
-    if (entries.length > 10) entries.splice(0, entries.length - 10);
+    if (entries.length > ACTIVITY_MAX_ENTRIES) {
+      entries.splice(0, entries.length - ACTIVITY_MAX_ENTRIES);
+    }
     activityByDisplay.set(id, entries);
   }
+
+  // Entry point for the CU action-visualization layer (45b-cu-overlays.js):
+  // appends a daemon-reported action to this display's feed using the
+  // concept's two-line grammar (friendly sentence + raw mono call).
+  window.noteCuDisplayActivity = function(displayId, kind, friendly, raw) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, kind, String(friendly || ''), {
+      raw: String(raw || ''),
+      action: true,
+    });
+    scheduleWorkspace();
+  };
+
+  // Lifecycle breadcrumbs from the slot layer (one-line rows, deduped by
+  // addDisplayActivity's consecutive-repeat check) — e.g. the live-video
+  // pause guard's auto-resume note.
+  window.noteLiveDisplayLifecycle = function(displayId, kind, text) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, String(kind || 'neutral'), String(text || ''));
+    scheduleWorkspace();
+  };
+
+  // Safari parks media in hidden tabs and can defer the element's own
+  // pause event until nobody is listening usefully; returning to the tab
+  // (or a bfcache restore) must therefore sweep every live slot. The
+  // per-element pause guard in DisplaySlot covers reparents; this covers
+  // backgrounding.
+  const resumeAllLiveDisplayVideos = () => {
+    for (const slot of displaySlots.values()) {
+      if (typeof slot.resumeLiveVideoIfPaused === 'function') slot.resumeLiveVideoIfPaused();
+    }
+    // Federated peer panes (and the Station HUD thumbnails drawImage-ing
+    // their video elements) have the same WebKit-parking exposure; their
+    // registry lives beside PeerDisplayConnection (52-peer-display.js).
+    for (const conn of peerDisplayConnections.values()) {
+      if (typeof conn.resumeLiveVideoIfPaused === 'function') conn.resumeLiveVideoIfPaused();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeAllLiveDisplayVideos();
+  });
+  window.addEventListener('pageshow', resumeAllLiveDisplayVideos);
 
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
@@ -2557,6 +2929,51 @@ function applyDisplayStripState() {
     slotSnapshots.set(id, next);
   }
 
+  // Raw CU payloads can be huge — a type() of a percent-encoded data: URL
+  // runs to thousands of characters. Collapsed rows show a readable
+  // preview (URL-decoded when the text is percent-encoded) plus the total
+  // length; the full literal call is one click away.
+  const CU_RAW_COLLAPSE_MIN = 160;  // rows at or under this render inline
+  const CU_RAW_PREVIEW_CHARS = 96;  // collapsed preview length
+
+  function cuRawPreview(raw) {
+    let head = raw.slice(0, CU_RAW_PREVIEW_CHARS);
+    // Percent-encoded blobs read better decoded (`%20name%3D` → " name=").
+    // Only the preview decodes; expanding always shows the literal call.
+    if (/%[0-9A-Fa-f]{2}/.test(head)) {
+      try {
+        head = decodeURIComponent(head.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+      } catch (_) { /* not valid percent-encoding — keep the literal prefix */ }
+    }
+    // Keep the preview one tidy run: fold control chars and space runs.
+    head = head.replace(/[\u0000-\u001F\u007F]+/g, ' ').replace(/ {2,}/g, ' ');
+    return head + '… (' + raw.length + ' chars)';
+  }
+
+  function buildCuRawDetail(raw) {
+    const el = document.createElement('div');
+    el.className = 'cu-action-raw';
+    if (raw.length <= CU_RAW_COLLAPSE_MIN) {
+      el.textContent = raw;
+      return el;
+    }
+    const preview = cuRawPreview(raw);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'cu-action-raw-toggle';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.title = 'Show the full input';
+    toggle.textContent = preview;
+    toggle.addEventListener('click', () => {
+      const expand = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', expand ? 'true' : 'false');
+      toggle.textContent = expand ? raw : preview;
+      toggle.title = expand ? 'Show less' : 'Show the full input';
+    });
+    el.appendChild(toggle);
+    return el;
+  }
+
   function syncActivityList() {
     const entries = selectedDisplayId === null
       ? []
@@ -2586,28 +3003,63 @@ function applyDisplayStripState() {
       row.remove();
       activityRows.delete(seq);
     }
+    // Auto-follow policy (same as the main log): stick to the bottom only
+    // when the user is already reading the bottom. Measure BEFORE appends;
+    // a fresh fill (display switch) always lands on the latest entries.
+    const freshFill = activityRows.size === 0;
+    const nearBottom = freshFill ||
+      (activityList.scrollHeight - activityList.scrollTop - activityList.clientHeight) <= 30;
+    let appended = false;
     // role=log expects chronological DOM order so only the newly appended
     // row is announced. Rebuilding newest-first made every state change
     // sound like ten new events to screen readers.
     for (const entry of entries) {
       if (activityRows.has(entry.seq)) continue;
       const row = document.createElement('div');
-      row.className = 'ui2-live-activity-row kind-' + entry.kind;
       const dot = document.createElement('span');
       dot.className = 'ui2-live-activity-dot';
       dot.setAttribute('aria-hidden', 'true');
-      const textEl = document.createElement('span');
-      textEl.className = 'ui2-live-activity-text';
-      textEl.textContent = entry.text;
       const time = document.createElement('time');
       time.className = 'ui2-live-activity-time';
       time.dateTime = entry.at.toISOString();
-      time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      row.appendChild(dot);
-      row.appendChild(textEl);
-      row.appendChild(time);
+      if (entry.action) {
+        // Daemon-reported CU action: the concept's two-line grammar —
+        // friendly sentence + seconds-precision ts, raw mono call below.
+        row.className = 'ui2-live-activity-row cu-action-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], {
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+        });
+        const main = document.createElement('div');
+        main.className = 'cu-action-main';
+        const head = document.createElement('div');
+        head.className = 'cu-action-head';
+        const friendly = document.createElement('span');
+        friendly.className = 'cu-action-friendly';
+        friendly.textContent = entry.text;
+        head.appendChild(friendly);
+        head.appendChild(time);
+        main.appendChild(head);
+        if (entry.raw) {
+          main.appendChild(buildCuRawDetail(entry.raw));
+        }
+        row.appendChild(dot);
+        row.appendChild(main);
+      } else {
+        row.className = 'ui2-live-activity-row kind-' + entry.kind;
+        time.textContent = entry.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const textEl = document.createElement('span');
+        textEl.className = 'ui2-live-activity-text';
+        textEl.textContent = entry.text;
+        row.appendChild(dot);
+        row.appendChild(textEl);
+        row.appendChild(time);
+      }
       activityList.appendChild(row);
       activityRows.set(entry.seq, row);
+      appended = true;
+    }
+    if (appended && nearBottom) {
+      activityList.scrollTop = activityList.scrollHeight;
     }
   }
 
@@ -2897,12 +3349,26 @@ function applyDisplayStripState() {
     drawerMedia.addListener(onDrawerMediaChange);
   }
 
+  // Host identity chip text: "{host} · {display label}". The host label is
+  // the daemon's agent-card display name (status bar's source of truth),
+  // which arrives asynchronously — re-projected on every render.
+  function syncHostChips(slots) {
+    const host = (typeof selfHostLabel === 'string' && selfHostLabel) ? selfHostLabel : 'local';
+    for (const slot of slots) {
+      const textEl = slot.hostChipEl && slot.hostChipEl.querySelector('.cu-host-chip-text');
+      if (!textEl) continue;
+      const label = host + ' · ' + slotLabel(slot);
+      if (textEl.textContent !== label) textEl.textContent = label;
+    }
+  }
+
   function renderWorkspace() {
     railRaf = 0;
     const slots = Array.from(displaySlots.values());
     reconcileSelectedDisplay(slots);
     for (const slot of slots) captureSlotActivity(slot);
     syncDisplayRows(slots);
+    syncHostChips(slots);
     syncAuthorityCard();
     syncActivityList();
     syncPeerRows();
@@ -2958,6 +3424,10 @@ function applyDisplayStripState() {
         userDisplayMode: userDisplayGranted
           ? (userDisplayAgentVisible ? 'agent' : 'private')
           : 'off',
+        // Item F4: pointer moves deliberately dropped by the shared
+        // reliable tunnel's bufferedAmount watermark (the fallback lane
+        // for mm when the per-display pointer channel isn't open).
+        inputTunnelMovesDropped: dashboardControlTunnelPointerMovesDropped,
         slots: Array.from(displaySlots.values()).map(slot => {
           const id = Number(slot.displayId);
           return {
@@ -2965,6 +3435,15 @@ function applyDisplayStripState() {
             selected: id === selectedDisplayId,
             connected: Boolean(slot.connected),
             firstFrameSeen: Boolean(slot._firstFrameSeen),
+            paused: Boolean(slot.videoEl && slot.videoEl.paused),
+            // Freeze-watchdog snapshot (null until the first frame arms
+            // it): { armed, source: 'rvfc'|'stats', stalledMs,
+            // resumeAttempted, overlayShown }.
+            freeze: displayViewerFreezeWatchQa(slot),
+            pointerChannelOpen: Boolean(
+              slot.pointerChannel && slot.pointerChannel.readyState === 'open'),
+            reconnectAttempts: Number(slot._reconnectAttempts) || 0,
+            waitingForSignalTransport: Boolean(slot._transportWaitTimer),
             intrinsicWidth: Number(slot.videoEl && slot.videoEl.videoWidth) || 0,
             intrinsicHeight: Number(slot.videoEl && slot.videoEl.videoHeight) || 0,
             authorityState: slot.authorityState || 'unknown',

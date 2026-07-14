@@ -573,6 +573,73 @@ fn enumerate_window_display_infos() -> Vec<super::DisplayInfo> {
     windows
 }
 
+/// True when a ScreenCaptureKit failure is the TCC screen-recording denial.
+///
+/// The two shapes Apple surfaces for a missing/invalid grant:
+/// `SCShareableContent::get` fails with "The user declined TCCs for
+/// application, window, display capture", and some paths report
+/// "no shareable content" instead. Matched case-insensitively on the
+/// stable fragments so wording drift around them doesn't break detection.
+fn is_tcc_denied_sck_error(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("declined tcc") || lower.contains("no shareable content")
+}
+
+/// Enrich a ScreenCaptureKit capture-start error with actionable guidance
+/// when it is the TCC denial; every other error passes through unchanged.
+///
+/// The denial is ambiguous at this layer: either Screen Recording was never
+/// granted, or a previous grant was silently invalidated because the binary
+/// was rebuilt/re-signed under a different code-signing identity — macOS
+/// keys TCC grants to the app's signing requirement, and System Settings
+/// keeps showing the toggle ON either way. The appended guidance spells out
+/// both causes and the recovery steps (kept in sync with the re-grant
+/// warning in scripts/bundle-macos.sh).
+fn enrich_sck_capture_error(raw: &str) -> String {
+    if !is_tcc_denied_sck_error(raw) {
+        return raw.to_string();
+    }
+    format!(
+        "{raw} — Screen Recording permission is missing, or a previous grant \
+         was invalidated by a rebuilt/re-signed binary (macOS keys TCC grants \
+         to the app's code signature; System Settings can still show the \
+         toggle ON). Fix: System Settings → Privacy & Security → Screen & \
+         System Audio Recording (\"Screen Recording\" on older macOS) → \
+         toggle Intendant off and back on (re-add it if missing), then \
+         relaunch Intendant — grants are only re-read at launch."
+    )
+}
+
+/// Pop the system Screen Recording prompt at most once per process.
+///
+/// `CGRequestScreenCaptureAccess` shows the "would like to record this
+/// computer's screen" dialog only when the app has no recorded TCC decision
+/// yet, and otherwise just returns the current verdict — so calling it on
+/// the first TCC-denied capture failure gives a fresh install the native
+/// prompt without nagging an already-denied user on every retry. Safe
+/// wrapper from the already-linked `core-graphics` crate (no new FFI).
+fn request_screen_capture_access_once() {
+    static REQUEST: std::sync::Once = std::sync::Once::new();
+    REQUEST.call_once(|| {
+        let granted = core_graphics::access::ScreenCaptureAccess.request();
+        eprintln!(
+            "[display/macos] requested Screen Recording access (granted: {granted}); \
+             re-granting requires relaunching Intendant"
+        );
+    });
+}
+
+/// Wrap an SCK capture-start failure into `CallerError::Display`, enriching
+/// TCC denials with recovery guidance and (once per process) requesting
+/// screen-capture access so the system prompt appears when it can.
+fn sck_capture_error(context: &str, err: impl std::fmt::Display) -> CallerError {
+    let raw = format!("{context}: {err}");
+    if is_tcc_denied_sck_error(&raw) {
+        request_screen_capture_access_once();
+    }
+    CallerError::Display(enrich_sck_capture_error(&raw))
+}
+
 #[async_trait]
 impl DisplayBackend for MacOSBackend {
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -587,7 +654,7 @@ impl DisplayBackend for MacOSBackend {
             .with_on_screen_windows_only(matches!(self.target, CaptureTarget::Window(_)))
             .with_exclude_desktop_windows(true)
             .get()
-            .map_err(|e| CallerError::Display(format!("SCShareableContent::get: {e}")))?;
+            .map_err(|e| sck_capture_error("SCShareableContent::get", e))?;
 
         let resolved = resolve_capture_target(&content, self.target)?;
         let width = resolved.width;
@@ -723,7 +790,7 @@ impl DisplayBackend for MacOSBackend {
 
         stream
             .start_capture()
-            .map_err(|e| CallerError::Display(format!("start_capture: {e}")))?;
+            .map_err(|e| sck_capture_error("start_capture", e))?;
 
         *self.capture.lock().await = Some(CaptureState {
             stream,
@@ -970,6 +1037,44 @@ mod tests {
         let point = geometry.point(0.5, 0.25);
         assert_eq!(point.x, 250.0);
         assert_eq!(point.y, 300.0);
+    }
+
+    #[test]
+    fn tcc_denial_detection_matches_known_shapes_case_insensitively() {
+        // Apple's observed wording for the two denial shapes.
+        assert!(is_tcc_denied_sck_error(
+            "The user declined TCCs for application, window, display capture"
+        ));
+        assert!(is_tcc_denied_sck_error("no shareable content available"));
+        assert!(is_tcc_denied_sck_error("Error: No Shareable Content"));
+        // Unrelated SCK failures must not classify as denials.
+        assert!(!is_tcc_denied_sck_error("connection interrupted"));
+        assert!(!is_tcc_denied_sck_error("the stream was stopped"));
+        assert!(!is_tcc_denied_sck_error(""));
+    }
+
+    #[test]
+    fn tcc_denied_errors_keep_original_text_and_gain_guidance() {
+        let raw = "SCShareableContent::get: The user declined TCCs for \
+                   application, window, display capture";
+        let enriched = enrich_sck_capture_error(raw);
+        assert!(
+            enriched.starts_with(raw),
+            "original error text must be preserved verbatim: {enriched}"
+        );
+        // The guidance must name both causes and the recovery path.
+        assert!(enriched.contains("rebuilt/re-signed"));
+        assert!(enriched.contains("Privacy & Security"));
+        assert!(enriched.contains("Screen & System Audio Recording"));
+        assert!(enriched.contains("relaunch"));
+    }
+
+    #[test]
+    fn non_tcc_errors_pass_through_unchanged() {
+        let raw = "SCShareableContent::get: connection interrupted";
+        assert_eq!(enrich_sck_capture_error(raw), raw);
+        let raw = "start_capture: stream failed to start";
+        assert_eq!(enrich_sck_capture_error(raw), raw);
     }
 
     #[test]

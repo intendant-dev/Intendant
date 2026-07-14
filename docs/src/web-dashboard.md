@@ -356,9 +356,17 @@ launchers, and the user's own screen (see
   pending display releases it before input listeners are removed. Editable
   annotation/callout work blocks navigation instead of being discarded.
 - **Display activity** — reports real connection, authority, visibility,
-  streaming, recording, annotation, callout, and shared-view transitions. It
-  does not invent agent click/type history that the display protocol does not
-  publish.
+  streaming, recording, annotation, callout, and shared-view transitions,
+  plus the daemon's per-action `cu_action` lane: every executed CU action
+  renders as a two-line row (friendly sentence + raw call like
+  `left_click(612, 233)`) and drives the stage overlays — agent cursor with
+  verb pill, click ripple, keypress chips, screenshot flash. The feed shows
+  only what the daemon actually reported (failed actions never render, and
+  the lane is ephemeral: no session log, no replay, no peer forwarding).
+- **Approval card** — when a pending approval's session is the reported
+  driver of the selected display, an amber card in the rail proxies the
+  approval panel's own Approve/Deny; without real display→session
+  attribution it stays hidden.
 - **Peer displays** — open on Station, whose viewer understands federated
   display targets, rather than masquerading as local stages.
 - **Responsive controls** — below the desktop breakpoint the rail becomes a

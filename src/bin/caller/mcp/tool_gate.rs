@@ -118,6 +118,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "notify_user"
                     | "show_shared_view"
                     | "focus_shared_view"
+                    | "clear_shared_view_focus"
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
@@ -135,6 +136,9 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
+                    // The per-layer CU diagnosis for when those calls fail
+                    // (grant held but an OS permission still blocking).
+                    | "display_readiness"
             ) || (managed_context
                 // Keep managed rewind + fission tools reachable from Codex's
                 // small MCP profile; descriptions and status decide when
@@ -158,10 +162,12 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
+                    | "display_readiness"
                     | "list_frames"
                     | "read_frame"
                     | "show_shared_view"
                     | "focus_shared_view"
+                    | "clear_shared_view_focus"
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
@@ -251,15 +257,20 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "peer_take_screenshot"
         | "peer_execute_cu_actions" => PeerOperation::PeerUse,
         // Viewing displays, frames, and shared-view surfaces.
+        // display_readiness classifies here too: it reveals display/CU
+        // capability metadata (grant state, OS permission booleans), the
+        // same audience and sensitivity as list_displays.
         "list_displays"
         | "take_screenshot"
         | "read_screen"
+        | "display_readiness"
         | "list_frames"
         | "read_frame"
         | "capture_shared_view_frame"
         | "show_shared_view"
         | "hide_shared_view"
-        | "focus_shared_view" => PeerOperation::DisplayView,
+        | "focus_shared_view"
+        | "clear_shared_view_focus" => PeerOperation::DisplayView,
         // Controlling displays and injecting input — including granting the
         // agent access to the user's real session.
         "take_display"
@@ -420,6 +431,14 @@ pub(crate) fn append_manual_http_tool_definitions(
         ),
     );
     push(
+        "clear_shared_view_focus",
+        manual_http_tool_definition!(
+            "clear_shared_view_focus",
+            "Clear the shared display view's focus annotation (highlight + note) while keeping the view open. Idempotent.",
+            ClearSharedViewFocusParams
+        ),
+    );
+    push(
         "request_shared_view_input",
         manual_http_tool_definition!(
             "request_shared_view_input",
@@ -484,6 +503,14 @@ pub(crate) fn append_manual_http_tool_definitions(
         ),
     );
     push(
+        "display_readiness",
+        manual_http_tool_definition!(
+            "display_readiness",
+            "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready.",
+            DisplayReadinessParams
+        ),
+    );
+    push(
         "execute_cu_actions",
         manual_http_tool_definition!(
             "execute_cu_actions",
@@ -535,7 +562,7 @@ pub(crate) fn append_manual_http_tool_definitions(
         "peer_execute_cu_actions",
         manual_http_tool_definition!(
             "peer_execute_cu_actions",
-            "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the annotated post-action screenshot. Needs a peer-granted profile with display input (peer-operator or peer-root).",
+            "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the peer's post-action observation (a clean screenshot by default; observe=\"ax\"/\"auto\"/\"none\" forwards the peer's element-tree/no-capture policies). Needs a peer-granted profile with display input (peer-operator or peer-root).",
             PeerExecuteCuActionsParams
         ),
     );
@@ -720,6 +747,42 @@ mod tests {
     }
 
     #[test]
+    fn display_readiness_is_advertised_with_matching_description() {
+        // The per-layer CU diagnosis exists for exactly the callers whose
+        // take_screenshot/read_screen just failed: the small core profile,
+        // the display profile, and the permissive default/full lists. Its
+        // manual HTTP definition must match the #[tool] attribute.
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+            Some("screen"),
+            Some("display"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("display_readiness", false, profile),
+                "display_readiness must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        let manual_description = manual
+            .iter()
+            .find(|tool| tool["name"] == "display_readiness")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("missing manual HTTP definition for display_readiness");
+        let attr = IntendantServer::display_readiness_tool_attr();
+        assert_eq!(
+            manual_description,
+            attr.description.as_deref().unwrap_or_default(),
+            "display_readiness manual HTTP description drifted from its #[tool] attribute"
+        );
+    }
+
+    #[test]
     fn ask_and_notify_tools_are_advertised_to_supervised_profiles() {
         // The agent→user primitives exist to be called by supervised
         // session-scoped agents (and `intendant ctl` on their behalf):
@@ -863,8 +926,24 @@ mod tests {
             mcp_tool_operation("read_screen"),
             PeerOperation::DisplayView
         );
+        // The readiness report is capability metadata (grant/permission
+        // booleans), the display-view class like list_displays — pinned so
+        // a refactor can't drop it to the RuntimeControl default and lock
+        // out the scoped agents it exists to unblock.
+        assert_eq!(
+            mcp_tool_operation("display_readiness"),
+            PeerOperation::DisplayView
+        );
         assert_eq!(
             mcp_tool_operation("show_shared_view"),
+            PeerOperation::DisplayView
+        );
+        // The focus-clear verb is a presentation retraction on the same
+        // shared-view surface as hide_shared_view; pinned so it never falls
+        // to the RuntimeControl default and strands a session-scoped agent
+        // with a stale annotation it cannot clear (CU-05).
+        assert_eq!(
+            mcp_tool_operation("clear_shared_view_focus"),
             PeerOperation::DisplayView
         );
         // The user-session reach: granting the agent the user's display and

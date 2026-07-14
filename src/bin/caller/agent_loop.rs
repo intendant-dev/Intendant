@@ -755,12 +755,18 @@ pub(crate) async fn handle_peer_tool_call(
             };
             let display_target = optional_str(args, "display_target");
             let coordinate_space = optional_str(args, "coordinate_space");
+            let observe = optional_str(args, "observe");
+            let annotate = args.get("annotate").and_then(|value| value.as_bool());
+            let settle = args.get("settle").filter(|value| !value.is_null()).cloned();
             crate::peer::ops::execute_cu_actions(
                 peer_registry,
                 peer_id,
                 actions,
                 display_target,
                 coordinate_space,
+                observe,
+                annotate,
+                settle,
             )
             .await
         }
@@ -839,6 +845,9 @@ pub(crate) async fn run_agent_loop(
     // We keep the watcher alive across multiple steers — unlike the interrupt
     // branch which exits after cancelling.
     let local_session_id = session_log_id(&session_log);
+    // Live action-visualization lane for the dashboard: one ephemeral
+    // cu_action event per executed CU action (never session-logged).
+    let cu_observer = computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();
@@ -2091,6 +2100,7 @@ pub(crate) async fn run_agent_loop(
                     &session_log,
                     session_registry,
                     autonomy.read().await.user_display_granted,
+                    Some(&cu_observer),
                 )
                 .await;
             }
@@ -2105,6 +2115,7 @@ pub(crate) async fn run_agent_loop(
                 &session_log,
                 session_registry,
                 autonomy.read().await.user_display_granted,
+                Some(&cu_observer),
             )
             .await;
         } else {

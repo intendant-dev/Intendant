@@ -322,15 +322,22 @@ impl IntendantServer {
 
         // Already holding what was asked for? Short-circuit without a
         // popup: view_and_control is the guard itself; a view request is
-        // satisfied by the guard too (control implies view).
-        let autonomy = self.state.read().await.autonomy.clone();
+        // satisfied by the guard too (control implies view). The grant is
+        // Intendant authority only — OS layers (TCC, portal, display) can
+        // still block actual CU, so the answer carries the live OS
+        // readiness gap instead of implying capability (CU-02).
+        let (autonomy, session_registry) = {
+            let state = self.state.read().await;
+            (state.autonomy.clone(), state.session_registry.clone())
+        };
         if autonomy.read().await.user_display_granted {
-            return serde_json::json!({
+            let mut result = serde_json::json!({
                 "status": "already_granted",
                 "access": DisplayRequestAccess::ViewAndControl.as_str(),
                 "note": "the user display grant is already held; use take_screenshot / execute_cu_actions with display_target \"user_session\"",
-            })
-            .to_string();
+            });
+            attach_os_readiness_gap(&mut result, &session_registry).await;
+            return result.to_string();
         }
 
         let outcome = display_requests::registry().raise(
@@ -424,6 +431,9 @@ impl IntendantServer {
                                  execute_cu_actions may target user_session until the grant \
                                  ends. De-escalate with revoke_user_display when done.",
                         });
+                        // The click minted Intendant authority; OS layers can
+                        // still block actual CU (CU-02).
+                        attach_os_readiness_gap(&mut result, &session_registry).await;
                     }
                     DisplayRequestOutcome::Denied => {
                         result["retry_after_secs"] =
@@ -744,6 +754,36 @@ impl IntendantServer {
         self.hide_shared_view_for_session(params, None).await
     }
 
+    pub(crate) async fn clear_shared_view_focus_for_session(
+        &self,
+        params: ClearSharedViewFocusParams,
+        session_id: Option<&str>,
+    ) -> String {
+        // Like hide, this is a cleanup verb: no display resolution and no
+        // activation gate — it only retracts presentation state, so it must
+        // stay callable after the underlying display/grant is gone.
+        self.emit_shared_view(
+            session_id,
+            "focus_clear",
+            None,
+            None,
+            params.reason,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Clear the shared display view's focus annotation (highlight region + note) while keeping the shared view itself open. Idempotent — safe to call when nothing is highlighted. Use it as soon as the annotated content is gone (tab closed, page navigated away) instead of leaving stale guidance on screen; hide_shared_view also clears it when the whole collaboration moment ends."
+    )]
+    pub(crate) async fn clear_shared_view_focus(
+        &self,
+        Parameters(params): Parameters<ClearSharedViewFocusParams>,
+    ) -> String {
+        self.clear_shared_view_focus_for_session(params, None).await
+    }
+
     pub(crate) async fn focus_shared_view_for_session(
         &self,
         params: FocusSharedViewParams,
@@ -922,7 +962,10 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        let results = execute_actions(
+        // Sessionless surface: the dashboard shows the capture flash but
+        // attributes it to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
+        let outcome = execute_actions(
             &[CuAction::Screenshot],
             target,
             backend,
@@ -931,10 +974,12 @@ impl IntendantServer {
             &session_registry,
             None,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
+            crate::computer_use::CuExecOptions::default(),
         )
         .await;
 
-        if let Some(result) = results.first() {
+        if let Some(result) = outcome.results.first() {
             if let Some(ref screenshot) = result.screenshot {
                 clear_wayland_user_session_activation_pending_after_capture(
                     &self.state,
@@ -1005,7 +1050,8 @@ impl IntendantServer {
                 ));
             }
         }
-        match crate::computer_use::read_screen_elements(target).await {
+        let full_values = params.full_values.unwrap_or(false);
+        match crate::computer_use::read_screen_elements(target, full_values).await {
             Ok(snapshot) => {
                 let body = if params.format.as_deref() == Some("json") {
                     serde_json::to_string_pretty(&snapshot)
@@ -1020,7 +1066,46 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+        description = "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready."
+    )]
+    pub(crate) async fn display_readiness(
+        &self,
+        Parameters(params): Parameters<DisplayReadinessParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.display_readiness_as_caller(Parameters(params), ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(crate) async fn display_readiness_as_caller(
+        &self,
+        Parameters(params): Parameters<DisplayReadinessParams>,
+        caller: ToolCallerTrust,
+    ) -> Result<CallToolResult, McpError> {
+        let (session_registry, autonomy) = {
+            let state = self.state.read().await;
+            (state.session_registry.clone(), state.autonomy.clone())
+        };
+        let target = match params.display_target.as_deref() {
+            Some(spec) => resolve_display_target(spec),
+            None => crate::computer_use::default_display_target(&session_registry).await,
+        };
+        let user_display_granted = autonomy.read().await.user_display_granted;
+        let readiness = crate::cu_readiness::probe_readiness(
+            target,
+            caller.allows_user_session(user_display_granted),
+            user_display_granted,
+            &session_registry,
+        )
+        .await;
+        Ok(text_tool_result(
+            serde_json::to_string_pretty(&readiness)
+                .unwrap_or_else(|e| format!("serialize error: {e}")),
+        ))
+    }
+
+    #[tool(
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set settle=true (or a cap in ms, max 5000) to wait until the display stops changing after the last input action before observing — use it instead of guessed wait actions; the result reports settled/still_loading with elapsed ms. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     pub(crate) async fn execute_cu_actions(
         &self,
@@ -1099,7 +1184,14 @@ impl IntendantServer {
             .await
             .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        let results = execute_actions(
+        // Sessionless surface: overlays/feed render, attributed to no session.
+        let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
+        let options = crate::computer_use::CuExecOptions {
+            observe: params.observe.unwrap_or_default(),
+            annotate: params.annotate.unwrap_or(false),
+            settle: params.settle.and_then(|s| s.resolve()),
+        };
+        let outcome = execute_actions(
             &actions,
             target,
             backend,
@@ -1108,18 +1200,30 @@ impl IntendantServer {
             &session_registry,
             denorm_ref,
             caller.allows_user_session(user_display_granted),
+            Some(&cu_observer),
+            options,
         )
         .await;
+        let results = &outcome.results;
 
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
         if let Some(hint) = activation_request.hint() {
             summaries.push(hint.to_string());
         }
+        // Status vocabulary: `ok` = effect verified, `injected` = events
+        // dispatched to the OS but effect unverified (the honest ceiling for
+        // most input injection), `failed` = dispatch failed or verification
+        // contradicted the intent. The detail carries the evidence
+        // (read-back excerpts, clipboard restore notes) or the error.
         for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
             let status = cu_result_status(result);
             let action_desc = format_cu_action_brief(action);
-            let detail = result.error.as_deref().unwrap_or("");
+            let detail = result
+                .error
+                .as_deref()
+                .or(result.detail.as_deref())
+                .unwrap_or("");
             if detail.is_empty() {
                 summaries.push(format!("action[{}] {}: {}", i, action_desc, status));
             } else {
@@ -1134,10 +1238,11 @@ impl IntendantServer {
         // clean MCP success just because a screenshot came along. Every
         // action failing marks the whole call is_error; partial failures get
         // a loud leading line (a "failed" buried mid-list gets skimmed over).
+        // `injected` counts as dispatched, not failed.
         let failed = actions
             .iter()
             .zip(results.iter())
-            .filter(|(_, r)| cu_result_status(r) != "ok")
+            .filter(|(_, r)| !r.success())
             .count();
         let all_failed = failed == actions.len();
         if failed > 0 && !all_failed {
@@ -1147,10 +1252,22 @@ impl IntendantServer {
             );
         }
 
-        // Attach the last screenshot inline, annotated with click markers.
-        // Also save the annotated version to disk so substitute_screenshot_from_disk
-        // picks it up for the Activity tab.
-        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+        // Report the settle outcome (settled / still_loading / fixed wait +
+        // elapsed) when one ran, then name the observation the result
+        // carries and why — a fallback (`ax sparse → pixels`) must never be
+        // silent.
+        if let Some(settle) = &outcome.settle {
+            summaries.push(format!("settle: {}", settle.describe()));
+        }
+        summaries.push(format!("observation: {}", outcome.observation.describe()));
+
+        // Attach the trailing observation. Pixels: the executor already
+        // finalized the artifact (markers only when annotate=true; disk ==
+        // model payload) — no decode/re-encode/rewrite here. AX: the element
+        // tree rides inline as text; for compact (managed-context) callers
+        // that is the whole win — an actual observation instead of a
+        // stripped image.
+        let last_screenshot = outcome.last_screenshot();
         if let Some(ss) = last_screenshot {
             clear_wayland_user_session_activation_pending_after_capture(
                 &self.state,
@@ -1158,22 +1275,20 @@ impl IntendantServer {
                 backend,
             )
             .await;
-            let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
-            // Save annotated screenshot to disk (overwrite the raw one)
-            if let Ok(bytes) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &annotated)
-            {
-                let _ = std::fs::write(&ss.path, &bytes);
-            }
             summaries.push("post-action screenshot captured".to_string());
             if compact_output {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "status": if all_failed { "all actions failed" } else { "actions executed" },
                     "actions": summaries,
+                    "observation": {
+                        "kind": outcome.observation.kind.label(),
+                        "reason": outcome.observation.reason,
+                    },
                     "screenshot_path": ss.path,
                     "width": ss.width,
                     "height": ss.height,
                 });
+                attach_settle_json(&mut payload, outcome.settle.as_ref());
                 return Ok(if all_failed {
                     compact_image_tool_error(payload, "image/png")
                 } else {
@@ -1181,9 +1296,39 @@ impl IntendantServer {
                 });
             }
             return Ok(if all_failed {
-                image_tool_error(summaries.join("\n"), annotated)
+                image_tool_error(summaries.join("\n"), ss.base64_png.clone())
             } else {
-                image_tool_result(summaries.join("\n"), annotated)
+                image_tool_result(summaries.join("\n"), ss.base64_png.clone())
+            });
+        }
+
+        if let Some(ax_text) = &outcome.observation.ax_text {
+            if compact_output {
+                let mut payload = serde_json::json!({
+                    "status": if all_failed { "all actions failed" } else { "actions executed" },
+                    "actions": summaries,
+                    "observation": {
+                        "kind": outcome.observation.kind.label(),
+                        "reason": outcome.observation.reason,
+                    },
+                    "elements": ax_text,
+                });
+                attach_settle_json(&mut payload, outcome.settle.as_ref());
+                return Ok(if all_failed {
+                    text_tool_error(payload.to_string())
+                } else {
+                    text_tool_result(payload.to_string())
+                });
+            }
+            let body = format!(
+                "{}\n--- screen elements ---\n{}",
+                summaries.join("\n"),
+                ax_text
+            );
+            return Ok(if all_failed {
+                text_tool_error(body)
+            } else {
+                text_tool_result(body)
             });
         }
 
@@ -1410,6 +1555,31 @@ impl IntendantServer {
     }
 }
 
+/// Attach the structured settle block to a compact CU payload, when a settle
+/// ran: `{"outcome": "settled"|"still_loading"|"fixed_wait", "elapsed_ms": n,
+/// "note"?: "..."}`.
+fn attach_settle_json(
+    payload: &mut serde_json::Value,
+    settle: Option<&crate::computer_use::SettleReport>,
+) {
+    let Some(settle) = settle else { return };
+    let outcome = match settle.outcome {
+        crate::computer_use::SettleOutcome::Settled => "settled",
+        crate::computer_use::SettleOutcome::StillLoading => "still_loading",
+        crate::computer_use::SettleOutcome::FixedWait => "fixed_wait",
+    };
+    let mut block = serde_json::json!({
+        "outcome": outcome,
+        "elapsed_ms": settle.elapsed_ms,
+    });
+    if let Some(note) = &settle.note {
+        block["note"] = serde_json::Value::String(note.clone());
+    }
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("settle".to_string(), block);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,10 +1771,16 @@ mod tests {
             !rendered.contains(opt_in_refusal_marker()),
             "capture must use virtual display 99, not fall through to the user display: {rendered}"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "no display-0 activation was emitted"
-        );
+        // The successful capture also emits its ephemeral cu_action
+        // screenshot event on the bus. The assertion here is specifically
+        // that no display-0 ACTIVATION (user-display grant) was requested —
+        // not that the bus is otherwise quiet.
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::UserDisplayGranted { .. }),
+                "no display-0 activation should be emitted, got {event:?}"
+            );
+        }
     }
 
     #[test]

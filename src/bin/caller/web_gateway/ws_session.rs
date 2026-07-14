@@ -1679,10 +1679,11 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("display_input") => {
                         // Input event (keyboard/mouse) for a display session.
-                        // Drop the registry read lock before the inject
-                        // (which runs xdotool/cliclick subprocesses) so a
-                        // concurrent deactivate can take the write lock
-                        // without waiting on subprocess exits.
+                        // Enqueued onto the session's ordered input queue
+                        // (single pump per display injects in arrival
+                        // order); the enqueue is sync and non-blocking, so
+                        // this read loop never stalls on slow injection and
+                        // the registry read lock is released immediately.
                         let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
 
                         // Phase 5 authority gate: if someone has claimed
@@ -1723,12 +1724,10 @@ pub(crate) async fn ws_inbound_task(
                                         None => None,
                                     };
                                 if let Some(session) = session {
-                                    if let Err(e) = session.inject_input(input_event).await {
-                                        eprintln!(
-                                            "[web_gateway] display input injection failed: {}",
-                                            e
-                                        );
-                                    }
+                                    // Fire-and-forget: injection failures
+                                    // are logged by the session's input
+                                    // pump.
+                                    session.enqueue_input(input_event);
                                 }
                             }
                         }

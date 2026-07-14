@@ -150,6 +150,7 @@ pub fn spawn_event_listener(
                 // will cause a compile error here, enforcing parity.
                 match event {
                     AppEvent::LogEntry { .. }
+                    | AppEvent::CuActionExecuted { .. }
                     | AppEvent::SessionNote { .. }
                     | AppEvent::UserNotification { .. }
                     | AppEvent::UserMessageRewind { .. }

@@ -358,6 +358,75 @@ class PeerDisplayConnection {
     displayViewerClearNoTrackWatchdog(this);
   }
 
+  // ── Live-video pause guard + freeze watchdog (peer wiring) ──────────
+  // Shared drivers in 45-display-viewer-core; what is OURS here is the
+  // liveness definition (`pc` alive + `stream` attached — this class's
+  // own idiom: close() nulls both, and every retry replaces the whole
+  // connection object) and the per-pane element churn (the pane <video>
+  // is rebuilt on every daemons-list re-render, so attachToDom re-arms
+  // the guard and re-binds the watchdog's rVFC pump each pass).
+
+  _armVideoPauseGuard(videoEl) {
+    displayViewerArmPauseGuard(
+      this,
+      videoEl,
+      () => Boolean(this.pc && this.stream),
+      // No display-scoped activity feed exists on the peer rail — log to
+      // the scoped console lane rather than inventing one.
+      () => this._log('info', 'video playback auto-resumed after a browser pause'),
+    );
+  }
+
+  // Called by the shared visibilitychange/pageshow sweep in
+  // 45-displays-webrtc.js (Safari parks media in hidden tabs; the HUD
+  // thumbnails drawImage this element and would render a paused frame
+  // indefinitely otherwise).
+  resumeLiveVideoIfPaused() {
+    displayViewerResumeLiveVideoIfPaused(this);
+  }
+
+  // The CURRENT pane video element across every container this host has
+  // (daemons-list panel + Station endpoint) — pane DOM is rebuilt on
+  // every re-render, so this is resolved fresh wherever it's needed.
+  _currentVideoEl() {
+    for (const container of this._containerCandidates()) {
+      const el = container.querySelector('.peer-display-video');
+      if (el) return el;
+    }
+    return null;
+  }
+
+  _armFreezeWatchdog() {
+    displayViewerArmFreezeWatchdog(this, {
+      videoEl: () => this._currentVideoEl(),
+      isLive: () => Boolean(
+        this.pc && this.pc.connectionState === 'connected' && this.stream),
+      tryResume: () => this.resumeLiveVideoIfPaused(),
+      onStalled: (seconds) => {
+        const message = `No new frames for ${seconds}s`;
+        this._log('warn', `${message} while connected — surfacing manual retry`);
+        this.setStatus(message, 'error');
+        // Same overlay plumbing as the no-track verdict: an error state
+        // whose Retry re-runs the full open path (fresh session id).
+        this._setStageOverlay('error',
+          `${message} — the connection is up but the video has stopped advancing.`, true);
+        stationPublishActivityEvent({
+          id: `peer-display-freeze:${this.hostId}:${this.displayId}:${this.sessionId}`,
+          hostId: this.hostId,
+          level: 'warn',
+          source: 'display',
+          msg: `Display ${this.displayId} on ${stationHostLabel(this.hostId)} stopped advancing — no new frames for ${seconds}s`,
+        });
+      },
+      onRecovered: () => {
+        this._setStageOverlay(null);
+        if (this.pc && this.pc.connectionState === 'connected') {
+          this.setStatus('Connected (view-only)', 'connected');
+        }
+      },
+    });
+  }
+
   sessionKey() {
     return `${this.hostId}|${this.displayId}|${this.sessionId}`;
   }
@@ -450,12 +519,27 @@ class PeerDisplayConnection {
     }
     container.style.display = 'block';
     const videoEl = container.querySelector('.peer-display-video');
+    // WebKit pause guard (shared driver in 45-display-viewer-core): the
+    // pane <video> is rebuilt on every daemons-list re-render, so every
+    // pass re-arms the guard against the CURRENT element.
+    if (videoEl) this._armVideoPauseGuard(videoEl);
     if (videoEl && this.stream) {
-      videoEl.srcObject = this.stream;
-      // autoplay doesn't re-fire when a stream is (re)attached to an
-      // element living in the offscreen endpoint container; without an
-      // explicit play() the pane sits paused on a black first frame.
+      // Reassigning the SAME stream re-runs the media-load algorithm
+      // (decoder reset + a black flash on WebKit) — and this path runs
+      // after every daemons-list re-render (peer add/remove/state
+      // pushes, display upserts, refreshes). Only assign on real change.
+      if (videoEl.srcObject !== this.stream) {
+        videoEl.srcObject = this.stream;
+      }
+      // KEEP the play() kick unconditionally: autoplay doesn't re-fire
+      // when a stream is (re)attached to an element living in the
+      // offscreen endpoint container (and reparents pause WebKit video);
+      // without an explicit play() the pane sits paused on a black
+      // first frame.
       videoEl.play().catch(() => {});
+      // The freeze watchdog's rVFC pump follows the element across pane
+      // rebuilds (no-op until the watchdog is armed by the first frame).
+      displayViewerFreezeWatchBindPump(this);
     }
     stationRegisterVideoSource(
       `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
@@ -819,6 +903,10 @@ class PeerDisplayConnection {
         // See the reapply path above: explicit play() because autoplay
         // doesn't re-fire on (re)attached offscreen elements.
         videoEl.play().catch(() => {});
+        // WebKit pause guard — the pane can predate the stream (built by
+        // attachToDom before ontrack), so arm here too; re-arming the
+        // same element is a no-op.
+        this._armVideoPauseGuard(videoEl);
       }
       // Item 5: track arrived, frames haven't — stage the last step and
       // drop the overlay on the first actually-rendered frame.
@@ -830,6 +918,10 @@ class PeerDisplayConnection {
       displayViewerOnFirstFrame(videoEl, () => !this.pc, () => {
         this._firstFrameSeen = true;
         this._setStageOverlay(null);
+        // From here on, "frames stopped advancing" is the failure mode
+        // the no-track watchdog can't see — hand over to the freeze
+        // watchdog for the rest of this connection.
+        this._armFreezeWatchdog();
       });
       if (videoEl) {
         stationRegisterVideoSource(
@@ -1487,6 +1579,7 @@ class PeerDisplayConnection {
 
   async close() {
     this._clearNoTrackWatchdog();
+    displayViewerClearFreezeWatchdog(this);
     // Stop every per-connection timer — no leaked intervals/timeouts
     // across close/retry cycles.
     if (this._retryTimer) {
@@ -1672,6 +1765,36 @@ function reapplyPeerDisplayPanes() {
     conn.attachToDom();
   }
 }
+
+// Stable, side-effect-free QA surface for the federated peer-display
+// path — the peer twin of qa.liveDisplay() (45-displays-webrtc.js), so
+// CDP probes can assert pause/freeze liveness without reaching into the
+// module-scoped registry.
+window.qa = Object.assign(window.qa || {}, {
+  peerDisplays() {
+    return Array.from(peerDisplayConnections.values()).map(conn => {
+      const videoEl = conn._currentVideoEl ? conn._currentVideoEl() : null;
+      return {
+        hostId: conn.hostId,
+        displayId: Number(conn.displayId),
+        sessionId: conn.sessionId,
+        connectionState: conn.pc ? conn.pc.connectionState : 'closed',
+        hasStream: Boolean(conn.stream),
+        firstFrameSeen: Boolean(conn._firstFrameSeen),
+        paused: Boolean(videoEl && videoEl.paused),
+        tileMode: Boolean(conn.tileCompositor),
+        // Freeze-watchdog snapshot (null until the first frame arms it):
+        // { armed, source: 'rvfc'|'stats', stalledMs, resumeAttempted,
+        // overlayShown }.
+        freeze: displayViewerFreezeWatchQa(conn),
+        overlay: conn._overlay
+          ? { mode: conn._overlay.mode, text: conn._overlay.text }
+          : null,
+        authority: conn.peerAuthorityState,
+      };
+    });
+  },
+});
 
 class PeerFileTransferConnection {
   constructor(hostId, sessionId) {

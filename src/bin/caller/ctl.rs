@@ -664,6 +664,15 @@ async fn run_display(
             let response = call_tool(client, config, "take_screenshot", Value::Object(map)).await?;
             print_tool_response(response, config, output_path(args.one("--output")))?;
         }
+        "status" | "readiness" | "ready" => {
+            ensure_help(&raw[1..], help_display_status)?;
+            let args = parse_command_args(&raw[1..], &["--target"], &[])?;
+            let mut map = Map::new();
+            insert_string(&mut map, "display_target", args.one("--target"));
+            let response =
+                call_tool(client, config, "display_readiness", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "take" => {
             let args = parse_command_args(&raw[1..], &[], &[])?;
             let id = positional_u32(&args, 0, "display take requires a display id")?;
@@ -889,17 +898,41 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
             ensure_help(&raw[1..], help_cu_actions)?;
             let args = parse_command_args(
                 &raw[1..],
-                &["--actions", "--target", "--coordinate-space", "--output"],
-                &[],
+                &[
+                    "--actions",
+                    "--target",
+                    "--observe",
+                    "--settle",
+                    "--coordinate-space",
+                    "--output",
+                ],
+                &["--annotate"],
             )?;
             let actions = args
                 .one("--actions")
                 .ok_or_else(|| "cu actions requires --actions JSON".to_string())
                 .and_then(read_json_value)?;
             validate_cu_actions(&actions)?;
+            if let Some(observe) = args.one("--observe") {
+                if !matches!(observe, "pixels" | "ax" | "auto" | "none") {
+                    return Err(format!(
+                        "unknown --observe mode '{observe}' (expected pixels, ax, auto, or none)"
+                    ));
+                }
+            }
             let mut map = Map::new();
             map.insert("actions".to_string(), actions);
             insert_string(&mut map, "display_target", args.one("--target"));
+            insert_string(&mut map, "observe", args.one("--observe"));
+            if args.has("--annotate") {
+                map.insert("annotate".to_string(), Value::Bool(true));
+            }
+            if let Some(settle) = args.one("--settle") {
+                let cap_ms: u64 = settle.parse().map_err(|_| {
+                    format!("--settle expects a cap in milliseconds (max 5000), got '{settle}'")
+                })?;
+                map.insert("settle".to_string(), Value::from(cap_ms));
+            }
             insert_string(&mut map, "coordinate_space", args.one("--coordinate-space"));
             let response =
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
@@ -912,10 +945,14 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
             run_display(client, config, &next).await?;
         }
         "elements" | "read-screen" => {
-            let args = parse_command_args(&raw[1..], &["--target", "--format"], &[])?;
+            let args =
+                parse_command_args(&raw[1..], &["--target", "--format"], &["--full-values"])?;
             let mut map = Map::new();
             insert_string(&mut map, "display_target", args.one("--target"));
             insert_string(&mut map, "format", args.one("--format"));
+            if args.has("--full-values") {
+                map.insert("full_values".to_string(), Value::Bool(true));
+            }
             let response = call_tool(client, config, "read_screen", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
@@ -951,6 +988,23 @@ async fn run_shared(
         }
         "focus" => {
             ensure_help(&raw[1..], help_shared_focus)?;
+            if raw.get(1).map(String::as_str) == Some("clear") {
+                // `shared focus clear`: idempotent annotation retraction —
+                // no target/region; the daemon clears whatever is shown.
+                ensure_help(&raw[2..], help_shared_focus)?;
+                let args = parse_command_args(&raw[2..], &["--reason"], &[])?;
+                let mut map = Map::new();
+                insert_string(&mut map, "reason", args.one("--reason"));
+                let response = call_tool(
+                    client,
+                    config,
+                    "clear_shared_view_focus",
+                    Value::Object(map),
+                )
+                .await?;
+                print_tool_response(response, config, None)?;
+                return Ok(());
+            }
             let args = parse_command_args(
                 &raw[1..],
                 &["--target", "--display-id", "--region", "--note"],
@@ -2347,6 +2401,7 @@ fn help_display() {
     println!(
         "Usage:\n\
   intendant ctl display list\n\
+  intendant ctl display status [--target TARGET]\n\
   intendant ctl display frames [--stream NAME] [--count N]\n\
   intendant ctl display read-frame [latest|ID] [--stream NAME]\n\
   intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
@@ -2355,6 +2410,20 @@ fn help_display() {
   intendant ctl display request --reason TEXT [--access view|control] [--wait SECS] [--session ID]\n\
   intendant ctl display take DISPLAY_ID\n\
   intendant ctl display release DISPLAY_ID [--note TEXT]"
+    );
+}
+
+fn help_display_status() {
+    println!(
+        "Usage: intendant ctl display status [--target TARGET]\n\
+Per-layer Computer Use readiness for a display target (default: auto-detect\n\
+like screenshot). Reports each layer independently — Intendant display\n\
+authority, OS screen-capture permission, accessibility permission, target\n\
+display availability, input backend — because a held display grant does NOT\n\
+imply the OS permissions: macOS Screen Recording/Accessibility (TCC), the\n\
+Wayland portal session, or an Xvfb socket can still block CU. Probes live\n\
+state on every call; unknown layers count as not ready. Blocked layers carry\n\
+a fix (e.g. the System Settings pane to open)."
     );
 }
 
@@ -2423,23 +2492,38 @@ const CU_ACTIONS_EXAMPLE: &str = r#"[{"type":"click","x":120,"y":260},{"type":"t
 fn help_cu() {
     println!(
         "Usage:\n\
-  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
-  intendant ctl cu elements [--target TARGET] [--format text|json]\n\
+  intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
 Run `intendant ctl cu actions --help` for the action JSON shapes.\n\
 `cu elements` reads the frontmost app's UI element tree (roles, labels, values, frames) — \n\
-cheap textual grounding: click the center of a reported frame. macOS user-session only for now.\n\
+cheap textual grounding: click the center of a reported frame. Long values/titles are\n\
+capped at 80 chars with a `… [N chars total, #hash]` marker; pass --full-values when you\n\
+need an exact long value. macOS user-session only for now.\n\
 Targets: user_session (needs display grant), 99/display_99 (virtual).\n\
-Omit to auto-detect: a live agent virtual display when one exists, else the user session."
+Omit to auto-detect: a live agent virtual display when one exists, else the user session.\n\
+If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
+(grant, OS permissions, display, input) with fixes."
     );
 }
 
 fn help_cu_actions() {
     println!(
-        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
 \n\
 {CU_ACTION_SHAPES}\n\
+\n\
+Observation (--observe): what rides the result after the batch.\n\
+  pixels  post-action screenshot (default)\n\
+  ax      frontmost UI element tree as text (user_session targets only)\n\
+  auto    element tree when usable, screenshot fallback\n\
+  none    per-action results only\n\
+The result names the observation it carries and why. --annotate draws click\n\
+markers on captured screenshots (off by default: clean pixels). --settle MS\n\
+waits (bounded by MS, max 5000) until the display stops changing for ~300ms\n\
+after the last input action, instead of a guessed wait — the result reports\n\
+settled / still_loading with the elapsed time.\n\
 \n\
 Example:\n\
   intendant ctl cu actions --actions '{CU_ACTIONS_EXAMPLE}' --output after.png"
@@ -2451,16 +2535,23 @@ fn help_shared() {
         "Usage:\n\
   intendant ctl shared show [--target TARGET|--display-id ID] [--reason TEXT] [--focus x,y,w,h]\n\
   intendant ctl shared focus --region x,y,w,h [--target TARGET|--display-id ID] [--note TEXT]\n\
+  intendant ctl shared focus clear [--reason TEXT]\n\
   intendant ctl shared input [--target TARGET|--display-id ID] [--reason TEXT]\n\
   intendant ctl shared capture [--target TARGET|--display-id ID] [--output out.png]\n\
   intendant ctl shared hide [--reason TEXT]\n\
 \n\
-Regions are normalized fractions from 0.0 to 1.0."
+Regions are normalized fractions from 0.0 to 1.0.\n\
+`focus clear` removes the highlight + note but keeps the view open (idempotent);\n\
+annotations also auto-clear on hide, display revocation, and session end."
     );
 }
 
 fn help_shared_focus() {
-    println!("Usage: intendant ctl shared focus --region x,y,width,height [--note TEXT]");
+    println!(
+        "Usage:\n\
+  intendant ctl shared focus --region x,y,width,height [--note TEXT]\n\
+  intendant ctl shared focus clear [--reason TEXT]"
+    );
 }
 
 fn help_approval() {

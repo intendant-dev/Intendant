@@ -523,6 +523,13 @@ impl IntendantServer {
                     self.hide_shared_view_for_session(params, session_id).await,
                 ))
             }
+            "clear_shared_view_focus" => {
+                let Parameters(params) = parse_params::<ClearSharedViewFocusParams>(args)?;
+                Ok(text_tool_result(
+                    self.clear_shared_view_focus_for_session(params, session_id)
+                        .await,
+                ))
+            }
             "focus_shared_view" => {
                 let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
                 Ok(text_tool_result(
@@ -561,6 +568,12 @@ impl IntendantServer {
             "read_screen" => {
                 let params = parse_params::<ReadScreenParams>(args)?;
                 self.read_screen_as_caller(params, caller)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            "display_readiness" => {
+                let params = parse_params::<DisplayReadinessParams>(args)?;
+                self.display_readiness_as_caller(params, caller)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -817,6 +830,29 @@ async fn active_display_session_resolution(
     Some(session.resolution())
 }
 
+/// Attach the user-session OS readiness gap to a user-display result when
+/// any OS layer is not ready (CU-02): Intendant authority (`already_granted`
+/// / an approved click) is only one layer — TCC permissions, portal
+/// sessions, and display presence can still block actual CU, and the
+/// operator must see that in the same answer. No-op when everything is
+/// ready. Probes live state; never cached.
+async fn attach_os_readiness_gap(
+    result: &mut serde_json::Value,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) {
+    let readiness = crate::cu_readiness::probe_user_session_os_readiness(session_registry).await;
+    if readiness.ready {
+        return;
+    }
+    result["os_readiness"] = readiness.gap_json();
+    result["readiness_note"] = serde_json::json!(
+        "the display grant is Intendant authority only — OS layers listed in \
+         os_readiness are still blocking; fix them (see each layer's fix) or CU \
+         calls will fail. Check again with display_readiness \
+         (or `intendant ctl display status`)."
+    );
+}
+
 async fn clear_wayland_user_session_activation_pending_after_capture(
     state: &SharedMcpState,
     target: crate::computer_use::DisplayTarget,
@@ -1056,6 +1092,13 @@ impl IntendantServer {
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
             let usage = s.usage_snapshot_for(Some(&session_id));
+            // Running-binary provenance (EV-02): the daemon's own embedded
+            // version line, so `intendant ctl status` can pin the exact
+            // revision serving this answer.
+            obj.insert(
+                "daemon_version".to_string(),
+                serde_json::Value::String(crate::build_info::version_line("intendant")),
+            );
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
@@ -2031,112 +2074,11 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
     }
 }
 
+/// The per-action status label shown to models: `ok` (effect verified),
+/// `injected` (dispatched to the OS, effect unverified — the honest ceiling
+/// for most input injection), or `failed`.
 fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
-    if result.success && result.error.is_none() {
-        "ok"
-    } else {
-        "failed"
-    }
-}
-
-/// Draw red crosshairs on a screenshot at click/double_click coordinates.
-/// Returns annotated base64 PNG, or the original if annotation fails.
-fn annotate_screenshot_with_clicks(
-    base64_png: &str,
-    actions: &[crate::computer_use::CuAction],
-) -> String {
-    use crate::computer_use::CuAction;
-
-    // Collect click coordinates
-    let clicks: Vec<(i32, i32)> = actions
-        .iter()
-        .filter_map(|a| match a {
-            CuAction::Click { x, y, .. }
-            | CuAction::DoubleClick { x, y, .. }
-            | CuAction::TripleClick { x, y, .. }
-            | CuAction::MouseDown { x, y, .. } => Some((*x, *y)),
-            _ => None,
-        })
-        .collect();
-
-    if clicks.is_empty() {
-        return base64_png.to_string();
-    }
-
-    // Decode PNG
-    let png_bytes =
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_png) {
-            Ok(b) => b,
-            Err(_) => return base64_png.to_string(),
-        };
-
-    let mut img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
-        Ok(i) => i.to_rgba8(),
-        Err(_) => return base64_png.to_string(),
-    };
-
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let red = image::Rgba([255u8, 0, 0, 255]);
-    let yellow = image::Rgba([255u8, 255, 0, 255]);
-    let arm = 20i32;
-    let thickness = 3i32;
-
-    for (cx, cy) in &clicks {
-        // Clamp to image bounds; use yellow for out-of-bounds clicks
-        let oob = *cx < 0 || *cx >= w || *cy < 0 || *cy >= h;
-        let color = if oob { yellow } else { red };
-        let dx = (*cx).max(0).min(w - 1);
-        let dy = (*cy).max(0).min(h - 1);
-
-        // Draw crosshair at clamped position
-        for offset in -arm..=arm {
-            for t in -thickness..=thickness {
-                let hx = dx + offset;
-                let hy = dy + t;
-                if hx >= 0 && hx < w && hy >= 0 && hy < h {
-                    img.put_pixel(hx as u32, hy as u32, color);
-                }
-                let vx = dx + t;
-                let vy = dy + offset;
-                if vx >= 0 && vx < w && vy >= 0 && vy < h {
-                    img.put_pixel(vx as u32, vy as u32, color);
-                }
-            }
-        }
-        // Draw circle (radius 12)
-        let r = 12i32;
-        for angle in 0..360 {
-            let rad = (angle as f64) * std::f64::consts::PI / 180.0;
-            let px = dx + (r as f64 * rad.cos()) as i32;
-            let py = dy + (r as f64 * rad.sin()) as i32;
-            for t in 0..=2 {
-                let px2 = px + t;
-                let py2 = py + t;
-                if px2 >= 0 && px2 < w && py2 >= 0 && py2 < h {
-                    img.put_pixel(px2 as u32, py2 as u32, color);
-                }
-            }
-        }
-
-        // Draw "OOB" indicator at top-left if out of bounds
-        if oob {
-            // Draw a solid yellow bar at the top of the image as a warning
-            for bx in 0..80i32 {
-                for by in 0..6i32 {
-                    if bx < w && by < h {
-                        img.put_pixel(bx as u32, by as u32, yellow);
-                    }
-                }
-            }
-        }
-    }
-
-    // Re-encode to PNG
-    let mut buf = std::io::Cursor::new(Vec::new());
-    if img.write_to(&mut buf, image::ImageFormat::Png).is_err() {
-        return base64_png.to_string();
-    }
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner())
+    result.status.label()
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,20 +2247,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cu_result_status_respects_success_flag() {
-        let result = crate::computer_use::CuActionResult {
-            success: false,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "failed");
-
-        let result = crate::computer_use::CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "ok");
+    fn cu_result_status_distinguishes_dispatch_from_verified_effect() {
+        use crate::computer_use::CuActionResult;
+        // Dispatch failure (and verification mismatch) → failed.
+        assert_eq!(cu_result_status(&CuActionResult::failed("boom")), "failed");
+        // Dispatched but unverified must NOT read as an unqualified ok.
+        assert_eq!(cu_result_status(&CuActionResult::injected()), "injected");
+        assert_eq!(
+            cu_result_status(&CuActionResult::injected_with("note")),
+            "injected"
+        );
+        // Only a verified effect earns "ok".
+        assert_eq!(cu_result_status(&CuActionResult::verified()), "ok");
     }
 
     pub(crate) fn spawn_codex_thread_action_result(

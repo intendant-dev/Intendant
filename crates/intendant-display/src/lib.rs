@@ -41,6 +41,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod encode;
 pub mod forward;
+pub(crate) mod input_queue;
 pub mod input_telemetry;
 pub mod keymap;
 #[cfg(target_os = "macos")]
@@ -426,6 +427,13 @@ pub struct DisplayMetricsCounters {
     /// Current number of connected WebRTC peers.
     pub peer_count: AtomicU64,
 
+    /// BGRA→I420 conversions performed by the pool-feed bridge. The
+    /// bridge skips conversion entirely while the encoder pool has no
+    /// active (unpaused, subscribed) consumer — this counter is how the
+    /// idle-cost gate is observable (and unit-testable) without exposing
+    /// bridge internals.
+    pub pool_feed_conversions: AtomicU64,
+
     /// Tile-stream damage samples processed in the current metrics window.
     pub tile_damage_samples: AtomicU64,
     /// Total dirty rects reported by the damage source in the current window.
@@ -470,6 +478,7 @@ impl DisplayMetricsCounters {
             encode_freshness_us_sum: AtomicU64::new(0),
             peer_drops: Arc::new(AtomicU64::new(0)),
             peer_count: AtomicU64::new(0),
+            pool_feed_conversions: AtomicU64::new(0),
             tile_damage_samples: AtomicU64::new(0),
             tile_dirty_rects: AtomicU64::new(0),
             tile_dirty_tiles: AtomicU64::new(0),
@@ -618,6 +627,16 @@ impl DisplayMetricsSnapshot {
 // Display backend trait
 // ---------------------------------------------------------------------------
 
+/// What a [`DisplayBackend::paste_text`] did to the clipboard beyond the
+/// paste itself.
+#[derive(Debug, Clone, Default)]
+pub struct PasteOutcome {
+    /// Honest note on the previous clipboard content: restored, cleared, or
+    /// left holding the pasted text (and why). `None` only when there is
+    /// nothing worth reporting.
+    pub clipboard_note: Option<String>,
+}
+
 /// Platform-specific display capture and input injection.
 ///
 /// # Capture lifecycle contract
@@ -712,7 +731,11 @@ pub trait DisplayBackend: Send + Sync + 'static {
     /// Paste literal text via the display's clipboard: set the clipboard,
     /// then press the platform paste chord. Backends without clipboard
     /// access keep this default error.
-    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    ///
+    /// The outcome reports what happened to the *previous* clipboard
+    /// content — restored, cleared, or left holding the pasted text — so
+    /// callers can surface residue honestly instead of guessing.
+    async fn paste_text(&self, text: &str) -> Result<PasteOutcome, CallerError> {
         let _ = text;
         Err(CallerError::Display(format!(
             "the {} display backend does not support clipboard paste — use a type action instead",
@@ -747,6 +770,21 @@ pub struct DisplaySession {
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Ordered browser-input queue (see [`input_queue`]). Every browser
+    /// input lane — the WebRTC data channels, the dashboard-control
+    /// tunnel, and the legacy `/ws` socket — enqueues here via
+    /// [`Self::enqueue_input`]; a single pump task drains it so
+    /// injection order equals wire arrival order. Direct
+    /// [`Self::inject_input`] stays available for callers that need
+    /// completion semantics (computer use awaits the injection before
+    /// screenshotting).
+    input_queue: Arc<input_queue::InputQueue>,
+    /// Lazy-spawn guard for the input pump (first enqueue spawns it).
+    input_pump_started: AtomicBool,
+    /// Join handle for the input pump. `std` mutex: taken from the sync
+    /// `enqueue_input` path (spawn) and briefly from async `stop()`
+    /// (join) — never held across an await.
+    input_pump_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Wakes the pool-feed bridge to open a peer-join burst window
     /// when a new pool peer attaches. `Some` after
     /// [`Self::spawn_pool_feed_bridge`] has run (eagerly from
@@ -1255,6 +1293,9 @@ impl DisplaySession {
             metrics_epoch: Mutex::new(Instant::now()),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
+            input_queue: Arc::new(input_queue::InputQueue::new()),
+            input_pump_started: AtomicBool::new(false),
+            input_pump_handle: std::sync::Mutex::new(None),
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
@@ -1762,12 +1803,28 @@ impl DisplaySession {
     pub async fn stop(&self) {
         self.shutdown.cancel();
         self.clipboard_monitor.stop();
+        // Close the input queue so the pump (which also observes the
+        // shutdown token) drains to a deterministic stop and any
+        // late-arriving lane pushes become no-ops.
+        self.input_queue.close();
         self.backend.stop_capture().await;
 
         if let Some(h) = self.capture_handle.lock().await.take() {
             let _ = h.await;
         }
         if let Some(h) = self.clipboard_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        // Input pump: same deterministic-teardown parity as the other
+        // session-owned tasks. The std-mutex guard is dropped before the
+        // await (a held guard across `.await` would be the classic
+        // deadlock-on-poll hazard).
+        let input_pump = self
+            .input_pump_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = input_pump {
             let _ = h.await;
         }
         // 3c.3b.3c-followup: the pool-feed bridge observes
@@ -1933,29 +1990,37 @@ impl DisplaySession {
         })
     }
 
-    /// Encode the latest frame as a PNG screenshot.
-    pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
-        let frame = self
-            .latest_frame()
+    /// The latest raw frame, erroring when the session has never captured one.
+    /// Raw twin of [`Self::screenshot`] for consumers that transform pixels
+    /// (resize, crop, annotate) before encoding — one PNG encode instead of an
+    /// encode/decode/re-encode round-trip.
+    pub async fn current_frame(&self) -> Result<Arc<Frame>, CallerError> {
+        self.latest_frame()
             .await
-            .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
-        encode_frame_png(&frame)
+            .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))
     }
 
-    /// Encode a PNG screenshot from a frame captured at or after `min_timestamp`,
-    /// waiting up to `timeout` for one to arrive.
+    /// Encode the latest frame as a PNG screenshot.
+    pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
+        encode_frame_png(&*self.current_frame().await?)
+    }
+
+    /// The freshest raw frame captured at or after `min_timestamp`, waiting up
+    /// to `timeout` for one to arrive.
     ///
-    /// Capture backends are damage-driven: after an input action the next frame
-    /// arrives within a vsync or two *if the action changed any pixels*, but no
-    /// frame arrives at all when nothing changed. Both outcomes are handled:
-    /// a fresh frame is returned as soon as it lands, and on timeout the most
-    /// recent frame is returned instead — pixel-accurate in the nothing-changed
-    /// case. Errors only when the session has never captured a frame.
-    pub async fn screenshot_fresh(
+    /// The freshness contract guarantees *recency*, not change: event-driven
+    /// backends (ScreenCaptureKit, DXGI, PipeWire) deliver a post-action frame
+    /// only when pixels changed, while the X11 backend polls at the capture
+    /// rate and re-delivers unchanged content. Both are handled: a
+    /// sufficiently-new frame is returned as soon as it lands, and on timeout
+    /// the most recent frame seen is returned instead — content-accurate on
+    /// the event-driven backends when nothing changed. Errors only when the
+    /// session has never captured a frame.
+    pub async fn fresh_frame(
         &self,
         min_timestamp: Instant,
         timeout: Duration,
-    ) -> Result<Vec<u8>, CallerError> {
+    ) -> Result<Arc<Frame>, CallerError> {
         // Subscribe before checking latest_frame so a frame landing between
         // the check and the subscription is not missed.
         let mut frames = self.subscribe_frames();
@@ -1963,7 +2028,7 @@ impl DisplaySession {
         let newest = self.latest_frame().await;
         if let Some(ref frame) = newest {
             if frame.timestamp >= min_timestamp {
-                return encode_frame_png(frame);
+                return Ok(Arc::clone(frame));
             }
         }
 
@@ -1975,7 +2040,7 @@ impl DisplaySession {
                 recv = frames.recv() => match recv {
                     Ok(frame) => {
                         if frame.timestamp >= min_timestamp {
-                            return encode_frame_png(&frame);
+                            return Ok(frame);
                         }
                         newest = Some(frame);
                     }
@@ -1987,18 +2052,32 @@ impl DisplaySession {
         }
 
         // Timed out (or the capture stream ended): fall back to the freshest
-        // frame seen, which is content-accurate when the screen did not change.
-        let frame = match self.latest_frame().await {
+        // frame seen.
+        match self.latest_frame().await {
             Some(frame) => Some(frame),
             None => newest,
         }
-        .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
-        encode_frame_png(&frame)
+        .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))
+    }
+
+    /// Encode a PNG screenshot from a frame captured at or after
+    /// `min_timestamp`, waiting up to `timeout` for one to arrive (the
+    /// [`Self::fresh_frame`] contract).
+    pub async fn screenshot_fresh(
+        &self,
+        min_timestamp: Instant,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, CallerError> {
+        encode_frame_png(&*self.fresh_frame(min_timestamp, timeout).await?)
     }
 }
 
-/// Encode a raw captured frame as PNG bytes.
-fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
+/// Convert a raw captured frame to a tightly-packed [`image::RgbaImage`].
+///
+/// Strips any stride padding and swaps BGRA to RGBA. Public so screenshot
+/// consumers can transform the raw pixels (resize, crop, annotate) and encode
+/// PNG exactly once, instead of decoding a PNG this crate just encoded.
+pub fn frame_to_rgba_image(frame: &Frame) -> Result<image::RgbaImage, CallerError> {
     let (w, h) = (frame.width, frame.height);
 
     // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
@@ -2033,9 +2112,13 @@ fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
         }
     };
 
-    let img = image::RgbaImage::from_raw(w, h, rgba_data)
-        .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))?;
+    image::RgbaImage::from_raw(w, h, rgba_data)
+        .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))
+}
 
+/// Encode a raw captured frame as PNG bytes.
+fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
+    let img = frame_to_rgba_image(frame)?;
     let mut png_buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png_buf, image::ImageFormat::Png)
         .map_err(|e| CallerError::Display(format!("PNG encode: {e}")))?;
@@ -2175,8 +2258,11 @@ impl DisplaySession {
             ))
         })?;
 
+        // Input flows through the session's ordered queue (F1): the
+        // handler gates then pushes; the pump injects in arrival order.
+        self.ensure_input_pump();
         let input_handler =
-            gated_input_handler(Arc::clone(&self.backend), input_authorized.clone());
+            gated_input_handler(Arc::clone(&self.input_queue), input_authorized.clone());
 
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
         let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
@@ -2647,6 +2733,19 @@ impl DisplaySession {
     /// re-pushes the latest frame once per second so the encoder's
     /// GOP cadence keeps producing decodable references.
     ///
+    /// **Demand gate (F2, 2026-07-13 display review).** BGRA→I420
+    /// conversion only runs while the pool has an **active consumer**
+    /// ([`EncoderPool::has_active_consumer`](crate::encode::pool::EncoderPool::has_active_consumer):
+    /// an unpaused always-on layer or a subscribed on-demand encoder)
+    /// or a peer-join burst window is open. With zero viewers the
+    /// presence policy pauses every layer, and the bridge then reduces
+    /// to an `Arc` stash per captured frame — an agent-only session no
+    /// longer pays full-resolution conversion at capture rate for a
+    /// stream nobody decodes. The newest unconverted frame is retained
+    /// (`pending_bgra`), so the first tick after a viewer joins
+    /// converts on demand and forwards immediately; heartbeat and
+    /// burst behavior above are unchanged whenever demand exists.
+    ///
     /// **Peer-join burst channel.** The bridge listens on
     /// `pool_feed_keyframe_tx` and opens a 1.5s burst window when
     /// signaled. Required because `force_keyframe` on a long-running
@@ -2713,6 +2812,10 @@ impl DisplaySession {
         // peer-join can wait many seconds for a natural GOP boundary.
         let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
         *self.pool_feed_keyframe_tx.lock().await = Some(kf_tx);
+        // Conversion-count telemetry for the idle gate (F2, 2026-07-13
+        // display review): lets tests (and operators) observe that no
+        // BGRA→I420 work happens while the pool has no active consumer.
+        let counters = Arc::clone(&self.counters);
         let task = tokio::spawn(async move {
             // Heartbeat cadence. 1 second strikes the balance
             // between "encoder stays healthy on idle" and "encoder
@@ -2733,6 +2836,16 @@ impl DisplaySession {
             // instead of the `Vec<u8>` clone the simpler
             // pre-3c.3b.3b-followup version did.
             let mut latest_i420: Option<(Arc<Vec<u8>>, Instant)> = None;
+            // F2 (2026-07-13 display review): the newest BGRA that has
+            // NOT been converted yet. Frames land here on arrival (a
+            // cheap `Arc` stash, latest-wins) and are converted in the
+            // tick arm ONLY when the pool has an active consumer (an
+            // unpaused always-on layer, a subscribed on-demand encoder,
+            // or an open peer-join burst window). An agent-only session
+            // whose layers the presence policy paused therefore pays
+            // zero conversion cost at capture rate, while the retained
+            // frame still seeds the first post-join push immediately.
+            let mut pending_bgra: Option<(Arc<Frame>, Instant)> = None;
             // `generation` bumps on every replacement; `last_sent_gen`
             // is what we last forwarded. Mismatch = "buffer changed
             // since last send" (i.e. real damage on a damage-driven
@@ -2748,14 +2861,15 @@ impl DisplaySession {
             // `PEER_JOIN_BURST` past the deadline.
             let mut burst_until: Option<Instant> = None;
 
-            // 3c.3b.3c-followup seed: convert the most recent BGRA
-            // the capture has already produced (if any) so the first
-            // tick has something to push even if no new BGRA arrives
-            // before the heartbeat. Closes the "first pool peer
-            // arrives after the capture went idle" black-screen path.
-            // Bumps `generation`; the very first tick sees
-            // `last_sent_gen=None != Some(1)` → forwards immediately,
-            // not waiting for IDLE_HEARTBEAT.
+            // 3c.3b.3c-followup seed: stash the most recent BGRA the
+            // capture has already produced (if any) so the first
+            // demand-tick has something to convert and push even if no
+            // new BGRA arrives before the heartbeat. Closes the "first
+            // pool peer arrives after the capture went idle"
+            // black-screen path. Since the F2 idle gate, the seed does
+            // NOT convert eagerly — the first tick with an active pool
+            // consumer converts it (`pending` → `changed` → forwarded
+            // immediately, not waiting for IDLE_HEARTBEAT).
             //
             // enc_w/enc_h are also seeded from the snapshotted
             // frame's actual dimensions. Without that, the first
@@ -2801,35 +2915,7 @@ impl DisplaySession {
                             });
                         }
                     }
-                    let frame_arc = Arc::clone(&frame);
-                    let arrived = Instant::now();
-                    // Pass NORMALIZED dims (frame_w / frame_h, computed
-                    // above with `& !1`) instead of raw frame.width /
-                    // frame.height. Odd raw dims would produce odd-dim
-                    // I420 from `bgra_to_i420`'s ceil-chroma sizing,
-                    // which then hits the layer-encode `downscale_i420`
-                    // path with an unencodable source layout (downscale
-                    // requires even source AND dest). The pool was
-                    // constructed at the same normalized dims, so
-                    // passing odd here would also be a bridge↔pool
-                    // dimension desync (silent black-screen class).
-                    // Cropping the rightmost column / bottom row at
-                    // this stage is invisible at display.
-                    let i420_result = tokio::task::spawn_blocking({
-                        move || {
-                            convert_for_pool_feed(
-                                &frame_arc.data,
-                                frame_w,
-                                frame_h,
-                                frame_arc.stride,
-                            )
-                        }
-                    })
-                    .await;
-                    if let Ok(i420) = i420_result {
-                        generation = generation.wrapping_add(1);
-                        latest_i420 = Some((Arc::new(i420), arrived));
-                    }
+                    pending_bgra = Some((frame, Instant::now()));
                 }
             }
 
@@ -2887,38 +2973,79 @@ impl DisplaySession {
                             }
                             enc_w = frame_w;
                             enc_h = frame_h;
-                            // Drop stale buffer: it's at the old
+                            // Drop stale buffers: they're at the old
                             // dimensions; pool's encoders have already
                             // been respawned by `pool.on_resize` and
                             // would either reject or mis-encode an
-                            // old-dim frame.
+                            // old-dim frame. (`pending_bgra` is about
+                            // to be replaced by this frame anyway.)
                             latest_i420 = None;
                             last_sent_gen = None;
                         }
 
-                        let frame_arc = Arc::clone(&frame);
-                        let arrived = Instant::now();
-                        // Same normalized-dims rationale as the seed
-                        // path above: pass `frame_w` / `frame_h`
-                        // (rounded to even with `& !1` at the top of
-                        // this branch) so I420 dims match what
-                        // `downscale_i420` and the pool's encoders
-                        // expect.
-                        let i420_result = tokio::task::spawn_blocking({
-                            move || convert_for_pool_feed(
-                                &frame_arc.data,
-                                frame_w,
-                                frame_h,
-                                frame_arc.stride,
-                            )
-                        })
-                        .await;
-                        if let Ok(i420) = i420_result {
-                            generation = generation.wrapping_add(1);
-                            latest_i420 = Some((Arc::new(i420), arrived));
-                        }
+                        // F2 idle gate: do NOT convert here. Stash the
+                        // frame (cheap Arc clone, latest-wins) and let
+                        // the tick arm convert it if — and only if —
+                        // the pool has an active consumer then. This
+                        // is what makes a zero-viewer session's
+                        // conversion cost zero at capture rate, and it
+                        // also naturally caps conversion at tick rate
+                        // when a backend captures faster than the
+                        // bridge forwards.
+                        pending_bgra = Some((frame, Instant::now()));
                     }
                     _ = tick.tick() => {
+                        // F2 demand gate: everything downstream of this
+                        // point exists to feed encoders. When the pool
+                        // has no active consumer — every always-on
+                        // layer paused by the presence policy and no
+                        // subscribed on-demand encoder — and no
+                        // peer-join burst is open, skip the tick
+                        // entirely: no conversion, no push. The stashed
+                        // `pending_bgra` (and `latest_frame` upstream)
+                        // keeps the newest content ready, so the first
+                        // tick after demand returns converts on the
+                        // spot and forwards immediately. The burst
+                        // window counts as demand on its own because
+                        // the peer-join signal can beat the layer
+                        // coordinator's resume vote by up to one poll
+                        // interval — the burst pushes keep the encoder
+                        // clocked through that gap exactly as before.
+                        let in_burst = burst_until
+                            .is_some_and(|u| Instant::now() < u);
+                        if !in_burst && !pool.has_active_consumer() {
+                            continue;
+                        }
+
+                        // Convert the newest stashed BGRA, if any.
+                        // Same normalized-dims rationale as always:
+                        // pass even dims so I420 dims match what
+                        // `downscale_i420` and the pool's encoders
+                        // expect (odd raw dims would produce odd-dim
+                        // I420 from `bgra_to_i420`'s ceil-chroma
+                        // sizing; cropping the rightmost column /
+                        // bottom row is invisible at display).
+                        if let Some((frame, arrived)) = pending_bgra.take() {
+                            let frame_w = frame.width & !1;
+                            let frame_h = frame.height & !1;
+                            let i420_result = tokio::task::spawn_blocking(
+                                move || convert_for_pool_feed(
+                                    &frame.data,
+                                    frame_w,
+                                    frame_h,
+                                    frame.stride,
+                                )
+                            )
+                            .await;
+                            if let Ok(i420) = i420_result {
+                                counters
+                                    .pool_feed_conversions
+                                    .fetch_add(1, Ordering::Relaxed);
+                                generation = generation.wrapping_add(1);
+                                latest_i420 = Some((Arc::new(i420), arrived));
+                            }
+                        }
+
                         // Forward latest_i420 if anything's worth
                         // forwarding. "Worth forwarding" = a fresher
                         // buffer than last sent, OR the heartbeat is
@@ -2938,8 +3065,6 @@ impl DisplaySession {
                         let changed = last_sent_gen != Some(generation);
                         let heartbeat_due =
                             last_send_at.elapsed() >= IDLE_HEARTBEAT;
-                        let in_burst = burst_until
-                            .is_some_and(|u| Instant::now() < u);
                         if !(changed || heartbeat_due || in_burst) {
                             continue;
                         }
@@ -2977,14 +3102,22 @@ impl DisplaySession {
     /// Ensure a clipboard forwarding task is running.
     ///
     /// Starts watching the system clipboard and forwards changes to all
-    /// connected peers via their clipboard data channel.
+    /// connected peers via their clipboard data channel. The monitor's
+    /// polling is gated on this session's `peer_count` gauge (the same
+    /// attach/reap-maintained signal the presence policy's peers map
+    /// mirrors), so a session whose viewers have all left stops paying
+    /// the per-500ms clipboard subprocess tax until the next peer joins
+    /// (F3, 2026-07-13 display review).
     async fn ensure_clipboard_forwarding(&self) {
         let mut handle = self.clipboard_handle.lock().await;
         if handle.is_some() {
             return; // already running
         }
 
-        let mut rx = self.clipboard_monitor.start_watching();
+        let peer_gauge = Arc::clone(&self.counters);
+        let mut rx = self.clipboard_monitor.start_watching(Arc::new(move || {
+            peer_gauge.peer_count.load(Ordering::Relaxed) > 0
+        }));
         let peers = Arc::clone(&self.peers);
         let shutdown = self.shutdown.clone();
 
@@ -3075,9 +3208,51 @@ impl DisplaySession {
         self.peers.read().await.get(&peer_id).cloned()
     }
 
-    /// Inject an input event into the display backend.
+    /// Inject an input event into the display backend, awaiting its
+    /// completion.
+    ///
+    /// This is the **synchronous-completion** path: the event is injected
+    /// before the future resolves, so a caller can act on the result
+    /// (computer use clicks then screenshots). Browser input lanes must
+    /// use [`Self::enqueue_input`] instead — calling this concurrently
+    /// from per-event tasks is exactly the ordering race the input queue
+    /// exists to fix.
     pub async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
         self.backend.inject_input(event).await
+    }
+
+    /// Enqueue a browser input event onto this session's ordered input
+    /// queue (fire-and-forget). Sync and non-blocking — callable from the
+    /// `rtc` data-channel receive path and the `/ws` read loop without
+    /// stalling them. A single pump task injects queued events strictly
+    /// in arrival order; see [`input_queue`] for the coalescing and
+    /// overflow policy. Injection failures are logged by the pump.
+    ///
+    /// Authority gating is the caller's job (each lane gates before
+    /// enqueue), matching the pre-queue convention.
+    ///
+    /// Must be called from within a tokio runtime (all input lanes are);
+    /// the first call spawns the pump.
+    pub fn enqueue_input(&self, event: InputEvent) {
+        self.ensure_input_pump();
+        self.input_queue.push(event);
+    }
+
+    /// Spawn the input pump exactly once. Sync (used from the sync
+    /// enqueue path); requires a tokio runtime context.
+    fn ensure_input_pump(&self) {
+        if self.input_pump_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let handle = input_queue::spawn_input_pump(
+            Arc::clone(&self.input_queue),
+            Arc::clone(&self.backend),
+            self.shutdown.clone(),
+        );
+        *self
+            .input_pump_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Inject literal text into the display backend.
@@ -3085,8 +3260,10 @@ impl DisplaySession {
         self.backend.inject_text(text).await
     }
 
-    /// Paste text via the display backend's clipboard.
-    pub async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    /// Paste text via the display backend's clipboard. The outcome carries
+    /// the backend's honest note on what happened to the previous clipboard
+    /// content.
+    pub async fn paste_text(&self, text: &str) -> Result<PasteOutcome, CallerError> {
         self.backend.paste_text(text).await
     }
 
@@ -3205,22 +3382,29 @@ impl SessionRegistry {
 ///
 /// 1. consults the `input_authorized` closure (Phase 5a.1 gate) and
 ///    silently drops the event if it returns `false`;
-/// 2. otherwise spawns the existing async `inject_input` dispatch onto
-///    the tokio runtime.
+/// 2. otherwise pushes the event onto the session's ordered
+///    [`input_queue::InputQueue`], whose single pump task injects
+///    events strictly in arrival order.
+///
+/// The push replaces the previous per-event `tokio::spawn`: the browser
+/// sends `kd`/`ku`/`md`/`mu` over reliable **ordered** channels, and
+/// one-task-per-event racing across runtime workers could invert
+/// adjacent events (stuck-auto-repeat keys, scrambled clicks) — the
+/// 2026-07-13 display-review F1 class. The caller is responsible for
+/// having the pump running ([`DisplaySession::handle_offer_pool_mode`]
+/// calls `ensure_input_pump` before building the handler).
 ///
 /// Extracted so the gate logic is unit-testable without standing up a
 /// full `DisplaySession` + `WebRtcPeer` + offer.  Keeping it free-
 /// standing rather than a method on `DisplaySession` means tests can
-/// build it from any backend stub in the test module without going
-/// through the offer plumbing.
+/// build it from any queue in the test module without going through
+/// the offer plumbing.
 ///
 /// The closure is `Arc<dyn Fn(InputEvent) + Send + Sync>`, sync-callable
-/// from rtc's data-channel receive context (which is sync); the async
-/// injection is `tokio::spawn`-ed because `DisplayBackend::inject_input`
-/// is async.  This shape predates phase 5a.1 — the gate just sits in
-/// front of it.
+/// from rtc's data-channel receive context (which is sync); the queue
+/// push is sync and non-blocking, so the rtc poll loop is never stalled.
 pub(crate) fn gated_input_handler(
-    backend: Arc<dyn DisplayBackend>,
+    queue: Arc<input_queue::InputQueue>,
     input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Arc<dyn Fn(InputEvent) + Send + Sync> {
     Arc::new(move |event: InputEvent| {
@@ -3232,22 +3416,13 @@ pub(crate) fn gated_input_handler(
         // `display_input_authority_state` notification).  Unclaimed
         // and "this peer holds it" both resolve to `true` — see the
         // closure builder in `web_gateway::spawn_web_gateway`.
+        // Gating happens BEFORE enqueue, so a refused event never
+        // enters the queue.
         if !input_authorized() {
             input_telemetry::record_authority_drop(kind);
             return;
         }
-        input_telemetry::record_inject_started(kind);
-        let backend = Arc::clone(&backend);
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            match backend.inject_input(event).await {
-                Ok(()) => input_telemetry::record_inject_completed(started.elapsed()),
-                Err(e) => {
-                    input_telemetry::record_inject_failed(started.elapsed());
-                    eprintln!("[display] input injection failed: {e}");
-                }
-            }
-        });
+        queue.push(event);
     })
 }
 
@@ -5053,6 +5228,92 @@ mod tests {
         session.shutdown.cancel();
     }
 
+    /// **F2 regression test (2026-07-13 display review).** With zero
+    /// viewers — every pool layer paused, no on-demand subscription —
+    /// the pool-feed bridge must not convert BGRA→I420 at all (pre-fix
+    /// it converted every captured frame at full resolution forever),
+    /// yet it must retain the newest BGRA so a joining viewer is seeded
+    /// by an on-demand conversion without waiting for new capture
+    /// activity. Observable via the `pool_feed_conversions` counter.
+    ///
+    /// VP8-specific (gated off Windows) like the other bridge tests:
+    /// subscribes with a VP8 preference to observe encoded output.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn pool_feed_bridge_skips_conversion_without_active_consumer() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = DisplaySession::new(0, backend);
+        // Deliberately NO peer registered: the session starts viewerless.
+        session
+            .start(30, None, None)
+            .await
+            .expect("start must succeed");
+
+        let pool = session.pool.get().expect("pool initialized after start");
+        // Reach the zero-viewer steady state deterministically (the
+        // layer coordinator converges here on its own at zero peers;
+        // pausing manually removes the poll-interval race): every
+        // always-on layer paused.
+        for id in pool.always_on_ids() {
+            assert!(pool.pause_layer(id.codec, id.rid));
+        }
+
+        // Capture keeps producing while nobody watches.
+        for _ in 0..4 {
+            let _ = session.frame_tx.send(Arc::new(make_test_bgra(64, 64)));
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        // Sit past the 1s idle heartbeat: pre-F2 the bridge converted
+        // every arriving frame AND kept heartbeat-pushing.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert_eq!(
+            session
+                .counters
+                .pool_feed_conversions
+                .load(Ordering::Relaxed),
+            0,
+            "no BGRA→I420 conversion may run while the pool has no \
+             active consumer"
+        );
+
+        // A viewer joins: model the real sequence — peer registered
+        // (so the layer coordinator keeps demand up once it polls),
+        // subscription taken, layers resumed. The retained BGRA must
+        // convert on demand and reach the encoder with NO new capture
+        // activity.
+        register_test_peer_demanding_all_layers(&session).await;
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![encode::pool::CodecKind::Vp8]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("VP8 always-on subscribe");
+        let mut frame_rx = subs
+            .into_iter()
+            .next()
+            .expect("at least one subscription")
+            .frames;
+        for id in pool.always_on_ids() {
+            assert!(pool.resume_layer(id.codec, id.rid));
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), frame_rx.recv()).await;
+        assert!(
+            result.is_ok() && result.as_ref().unwrap().is_ok(),
+            "the retained frame must be converted on demand and encoded \
+             once a consumer exists — got timeout/recv error within 2s"
+        );
+        assert!(
+            session
+                .counters
+                .pool_feed_conversions
+                .load(Ordering::Relaxed)
+                >= 1,
+            "demand-return must trigger the deferred conversion"
+        );
+
+        session.shutdown.cancel();
+    }
+
     /// `signal_peer_join_burst` must send `()` on
     /// `pool_feed_keyframe_tx` whenever the channel is installed.
     /// Pins the contract that `handle_offer_pool_mode`'s tail relies
@@ -5153,19 +5414,48 @@ mod tests {
         }
     }
 
+    /// Build the queue + pump rig the production offer path assembles
+    /// (`ensure_input_pump` + `gated_input_handler`), against an
+    /// injection-counting backend. Returns the pieces tests need.
+    #[allow(clippy::type_complexity)] // test-rig tuple, not a production type
+    fn gated_handler_rig(
+        counter: &Arc<std::sync::atomic::AtomicU64>,
+        input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> (
+        Arc<dyn Fn(InputEvent) + Send + Sync>,
+        Arc<input_queue::InputQueue>,
+        CancellationToken,
+    ) {
+        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
+            width: 64,
+            height: 64,
+            inject_count: Arc::clone(counter),
+        });
+        let queue = Arc::new(input_queue::InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let _pump = input_queue::spawn_input_pump(Arc::clone(&queue), backend, shutdown.clone());
+        let handler = super::gated_input_handler(Arc::clone(&queue), input_authorized);
+        (handler, queue, shutdown)
+    }
+
+    /// Give the pump a chance to drain the queue before asserting.
+    /// Yield several times to defeat the single-poll-then-check race
+    /// that a single yield_now occasionally exhibits under heavy
+    /// multi-test contention.
+    async fn settle_pump() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
     /// Closure returns `true` → events reach `inject_input`.  This is
     /// the unclaimed-or-this-peer-holds-it case from the per-`/ws`
     /// closure builder; both resolve to `true` there.
     #[tokio::test]
     async fn gated_input_handler_passes_event_when_authorized() {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
-            width: 64,
-            height: 64,
-            inject_count: Arc::clone(&counter),
-        });
-        let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
-        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+        let (handler, _queue, shutdown) = gated_handler_rig(&counter, Arc::new(|| true));
 
         handler(InputEvent::MouseMove {
             x: 0.5,
@@ -5173,39 +5463,26 @@ mod tests {
             buttons: 0,
         });
 
-        // The handler `tokio::spawn`s the async injection — give the
-        // runtime a chance to run the spawned task before asserting.
-        // Yield twice to defeat the single-poll-then-check race that a
-        // single yield_now occasionally exhibits under heavy multi-test
-        // contention; if the spawned future has been polled to
-        // completion and pumped through any pending wakers, the counter
-        // increment is visible.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        settle_pump().await;
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "authorized event should reach the backend"
         );
+        shutdown.cancel();
     }
 
     /// Closure returns `false` → events are silently dropped, matching
     /// the `/ws display_input` gate convention (no per-message denial
     /// feedback).  This is the "another connection holds the slot"
     /// case, plus the federated deny-by-default until federation
-    /// authority lands as its own slice.
+    /// authority lands as its own slice.  With the ordered queue, the
+    /// gate runs BEFORE enqueue — a refused event must never even
+    /// enter the queue.
     #[tokio::test]
     async fn gated_input_handler_drops_event_when_unauthorized() {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
-            width: 64,
-            height: 64,
-            inject_count: Arc::clone(&counter),
-        });
-        let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
-        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+        let (handler, queue, shutdown) = gated_handler_rig(&counter, Arc::new(|| false));
 
         handler(InputEvent::MouseMove {
             x: 0.5,
@@ -5221,62 +5498,55 @@ mod tests {
             meta: false,
         });
 
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(queue.len(), 0, "gate-refused events must never be enqueued");
+        settle_pump().await;
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "unauthorized events must not reach the backend at all"
         );
+        shutdown.cancel();
     }
 
     /// The closure can change its decision over time — required for
     /// the live grant/release flow, where the same `WebRtcPeer` lives
     /// across multiple authority transitions.  Verifies the gate reads
     /// fresh state on each event, not a captured snapshot.
+    ///
+    /// Uses discrete key events: mouse-moves are latest-wins coalesced
+    /// by the queue when adjacent, which would make the injected count
+    /// scheduling-dependent here; key events are never coalesced.
     #[tokio::test]
     async fn gated_input_handler_re_evaluates_authorization_per_event() {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
-            width: 64,
-            height: 64,
-            inject_count: Arc::clone(&counter),
-        });
         let allow = Arc::new(AtomicBool::new(true));
         let allow_for_closure = Arc::clone(&allow);
         let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
             Arc::new(move || allow_for_closure.load(std::sync::atomic::Ordering::SeqCst));
-        let handler = super::gated_input_handler(Arc::clone(&backend), input_authorized);
+        let (handler, _queue, shutdown) = gated_handler_rig(&counter, input_authorized);
 
-        handler(InputEvent::MouseMove {
-            x: 0.0,
-            y: 0.0,
-            buttons: 0,
-        });
+        let key = |code: &str| InputEvent::KeyDown {
+            code: code.into(),
+            key: code.into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        };
+
+        handler(key("KeyA"));
         allow.store(false, std::sync::atomic::Ordering::SeqCst);
-        handler(InputEvent::MouseMove {
-            x: 0.1,
-            y: 0.1,
-            buttons: 0,
-        });
+        handler(key("KeyB"));
         allow.store(true, std::sync::atomic::Ordering::SeqCst);
-        handler(InputEvent::MouseMove {
-            x: 0.2,
-            y: 0.2,
-            buttons: 0,
-        });
+        handler(key("KeyC"));
 
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        settle_pump().await;
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "gate must check authorization on every event, not at construction time"
         );
+        shutdown.cancel();
     }
 
     // -----------------------------------------------------------------------

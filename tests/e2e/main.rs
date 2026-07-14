@@ -1825,6 +1825,276 @@ async fn display_request_rail_round_trips_over_ws() {
     );
 }
 
+/// The CU action-visualization lane end to end: grant the (synthetic) user
+/// display, execute one `screenshot` action through `ctl cu actions` (the
+/// MCP `execute_cu_actions` tool → `computer_use::execute_actions` → the
+/// `CuActionObserver`), and require the display-scoped `cu_action` event
+/// the Live tab's overlays/feed render from to broadcast on `/ws` with the
+/// pinned wire shape. A screenshot is the one action that is safe on every
+/// backend here: it is input-free and the suite-wide synthetic display
+/// serves the frame (no SCK/GDI/X11). Also pins the lane's ephemerality —
+/// the event must never land in session.jsonl (no replay).
+#[tokio::test]
+async fn cu_actions_broadcast_display_scoped_events_over_ws() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before acting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Synthetic user-display capture session (1280×720 on every platform).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously — "capture is ready after DisplayReady" is the
+    // command's own contract. A CU call racing past registration misses
+    // the session lookup and falls to the subprocess capture path, which
+    // for a user-session target on Linux is a real X server — correctly
+    // absent on a headless runner, so the action fails and the observer
+    // (by design) emits nothing. Proven live on the Linux fleet box:
+    // firing immediately after grant-user loses that race 5/5 with
+    // "cannot connect to X display". Screenshots are idempotent, so
+    // retry the action itself until its per-action result reports ok —
+    // this also avoids racing the /ws broadcast for the grant's own
+    // display_ready, and `ctl cu actions` exits 0 even for failed
+    // actions (failures are informational summaries), so only the
+    // per-action text is trustworthy. A persistent real failure
+    // surfaces here with its actual error text instead of as a /ws
+    // timeout downstream.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        let output = ctl(
+            &daemon,
+            &[
+                "--json",
+                "cu",
+                "actions",
+                "--actions",
+                r#"[{"type":"screenshot"}]"#,
+                "--target",
+                "user_session",
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{}", text_of(&output));
+        if String::from_utf8_lossy(&output.stdout).contains("(screenshot): ok") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CU screenshot never succeeded (capture session still absent?):\n{}\n{}",
+            text_of(&output),
+            daemon.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("cu_action")
+    })
+    .await
+    .unwrap_or_else(|| panic!("cu_action never broadcast on /ws:\n{}", daemon.log_tail()));
+    assert_eq!(event["display_id"], 0, "{event}");
+    assert_eq!(event["kind"], "screenshot", "{event}");
+    assert_eq!(event["raw"], "screenshot()", "{event}");
+    // Coordinate reference = the synthetic session resolution, the space
+    // viewers normalize overlay geometry against.
+    assert_eq!(event["ref_w"], 1280, "{event}");
+    assert_eq!(event["ref_h"], 720, "{event}");
+    // A screenshot has no landing point, and the MCP surface is
+    // sessionless — absent fields are omitted from the wire, not nulled.
+    assert!(event.get("x").is_none(), "{event}");
+    assert!(event.get("y").is_none(), "{event}");
+    assert!(event.get("session_id").is_none(), "{event}");
+    assert!(event["ts"].as_u64().unwrap_or(0) > 0, "{event}");
+    assert!(
+        event["event_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("cu-"),
+        "{event}"
+    );
+
+    // Ephemeral lane: the broadcast above is the event's ONLY life — it
+    // must never be written to session.jsonl (and hence never replays).
+    // An absence check can pass early by timing alone; the authoritative
+    // pin is event.rs's cu_action_events_never_reach_the_session_log —
+    // this asserts the same contract at the wire edge.
+    assert!(
+        !daemon.rig.session_logs().contains("\"cu_action\""),
+        "cu_action must not be written to session.jsonl"
+    );
+}
+
+/// The CU observation policy end to end on the synthetic rig: `--observe`
+/// drives what the batch result carries, and the result names the
+/// observation and why. A `wait` action is the safe probe on every backend
+/// (no OS input path, no capture race): `ax`/`auto`/`none` never capture
+/// pixels, and under the armed synthetic backend the element walk serves the
+/// deterministic synthetic tree instead of touching a native accessibility
+/// API (macOS AX / AT-SPI / UIA) — this must stay true or CI walks a fleet
+/// runner's real desktop.
+#[tokio::test]
+async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // user_session CU requires the display grant (the synthetic backend
+    // serves the capture session it registers).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let run = |observe: &'static str| {
+        let daemon = &daemon;
+        async move {
+            let output = ctl(
+                daemon,
+                &[
+                    "cu",
+                    "actions",
+                    "--actions",
+                    r#"[{"type":"wait","ms":1}]"#,
+                    "--target",
+                    "user_session",
+                    "--observe",
+                    observe,
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{}", text_of(&output));
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+    };
+
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously, and on the session-only backends (Windows) a CU call
+    // racing past registration fails with the no-session guidance — same
+    // race as cu_actions_broadcast_display_scoped_events_over_ws, same
+    // remedy: retry the (idempotent) batch until its per-action result
+    // reports ok. On X11/macOS a `wait` needs no session, so the first
+    // attempt already passes there.
+    let text = {
+        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        loop {
+            let text = run("ax").await;
+            if text.contains("(wait 1ms): ok") {
+                break text;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "CU wait batch never succeeded (capture session still absent?):\n{text}\n{}",
+                daemon.log_tail()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    // observe=ax: the element tree IS the observation — synthetic tree text
+    // inline, no screenshot capture at all.
+    assert!(
+        text.contains("observation: ax (observe=ax"),
+        "result must name the ax observation:\n{text}"
+    );
+    assert!(
+        text.contains("Synthetic Desktop") && text.contains("button \"OK\""),
+        "synthetic element tree must ride the result:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured"),
+        "ax observation must not capture pixels:\n{text}"
+    );
+
+    // observe=auto: the synthetic tree is above the usability floor, so auto
+    // deterministically picks ax and says so.
+    let text = run("auto").await;
+    assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (auto):\n{text}"
+    );
+    assert!(
+        text.contains("observation: ax (auto: ax usable ("),
+        "auto must pick the usable tree and give the reason:\n{text}"
+    );
+    assert!(
+        text.contains("--- screen elements ---"),
+        "auto-chosen ax observation must carry the tree:\n{text}"
+    );
+
+    // observe=none: results only.
+    let text = run("none").await;
+    assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (none):\n{text}"
+    );
+    assert!(
+        text.contains("observation: none (observe=none)"),
+        "none must be named:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured")
+            && !text.contains("--- screen elements ---"),
+        "observe=none must attach nothing:\n{text}"
+    );
+
+    // settle: the synthetic test card free-runs (its counter strip changes
+    // every frame), so it has no quiescence semantics — settle must degrade
+    // to the fixed minimal wait AND SAY SO, deterministically, on every
+    // platform (session present → "synthetic display has no damage signal";
+    // session still absent on the subprocess backends → "no live capture
+    // session" — both are the honest fixed-wait label).
+    let output = ctl(
+        &daemon,
+        &[
+            "cu",
+            "actions",
+            "--actions",
+            r#"[{"type":"wait","ms":1}]"#,
+            "--target",
+            "user_session",
+            "--observe",
+            "none",
+            "--settle",
+            "1000",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        text.contains("settle: fixed 300ms wait ("),
+        "settle on the synthetic rig must report the honest fixed wait:\n{text}"
+    );
+}
+
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
 /// renders the question on the rail (`user_question` on /ws), a frontend
 /// answers via `answer_question`, and the blocked ctl returns the exact
