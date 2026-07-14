@@ -195,14 +195,14 @@ async function main() {
     }, logs.daemon);
     const claimCode = await waitFor(() => {
       const all = logs.connect.join('') + logs.daemon.join('');
-      const m = all.match(/claim_code=([^\s"'<>]+)/) || all.match(/claim this daemon with code ([^\s"'<>]+)/);
+      const m = all.match(/claim_code=([^\s"'<>]+)/) || all.match(/one-time claim code ([a-z0-9-]+)/i);
       return m && decodeURIComponent(m[1]);
     }, START_TIMEOUT_MS, 'claim code');
-    await page.goto(`${uiBase}/connect?claim_code=${encodeURIComponent(claimCode)}`, { waitUntil: 'networkidle' });
+    await page.goto(`${uiBase}/connect#claim_code=${encodeURIComponent(claimCode)}`, { waitUntil: 'networkidle' });
     await page.evaluate(code => { document.getElementById('claim-code').value = code; }, claimCode);
     await page.locator('#claim').click();
     try {
-      await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('claimed'), { timeout: START_TIMEOUT_MS });
+      await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('No machine access was granted'), { timeout: START_TIMEOUT_MS });
     } catch (err) {
       const statusText = await page.evaluate(() => document.getElementById('claim-status')?.textContent || '(missing)');
       console.error(`claim-status text: ${JSON.stringify(statusText)}`);

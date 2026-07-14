@@ -258,10 +258,6 @@ struct CliFlags {
     /// to wildcard dual-stack when available. Use 127.0.0.1 with --no-tls
     /// for local automation.
     web_bind: Option<IpAddr>,
-    /// --owner <CLIENT-KEY-FINGERPRINT>: seed a root grant pinned to that
-    /// browser identity key at startup (the install.sh bootstrap: authority
-    /// minted locally from first boot, no secrets on the wire).
-    owner: Option<String>,
     /// --no-tls: Explicitly serve the web dashboard over plain HTTP. The
     /// dashboard defaults to mTLS; this flag is the debug/programmatic escape
     /// hatch for callers that knowingly want cleartext.
@@ -269,9 +265,10 @@ struct CliFlags {
     /// --allow-public-plaintext: Acknowledge that --no-tls on a wildcard
     /// listener can expose the dashboard on public interfaces.
     allow_public_plaintext: bool,
-    /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring
-    /// browser/client certificates. Installed access certs are preferred when
-    /// present, otherwise a self-signed cert is minted at startup.
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring a
+    /// certificate at the TLS handshake. Certless dashboard authority remains
+    /// loopback-only; remote protected routes still require a verified client
+    /// certificate or authenticated peer identity.
     tls: bool,
     /// --tls-cert <PATH>: PEM cert (chain) overriding default cert selection.
     /// Must be paired with `--tls-key`. Implies `--tls`.
@@ -328,13 +325,12 @@ fn print_help() {
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
-    println!("    --owner <FINGERPRINT> Pin root authority to a browser client key at startup (install bootstrap)");
     println!(
         "    --no-tls              Serve the web dashboard over plain HTTP (explicit debug escape)"
     );
     println!("    --allow-public-plaintext  Allow --no-tls wildcard bind when public IPs exist");
     println!(
-        "    --tls                 Serve HTTPS/WSS without requiring browser client certificates"
+        "    --tls                 Serve HTTPS/WSS; certless dashboard authority stays loopback-only"
     );
     println!("    --tls-cert <PATH>     PEM cert overriding default cert selection (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
@@ -416,7 +412,6 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
         web_bind: None,
-        owner: None,
         no_tls: false,
         allow_public_plaintext: false,
         tls: false,
@@ -579,29 +574,12 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
                 }
             }
             "--owner" => {
-                if i + 1 < args.len() {
-                    // Fail a typo at the flag, not after it's pinned: an
-                    // install whose owner fingerprint is garbage is an
-                    // unclaimable box that believes it's owned.
-                    let value = args[i + 1].trim().to_string();
-                    if !access::client_key::is_client_key_fingerprint(&value) {
-                        let shown: String = if value.chars().count() > 48 {
-                            value.chars().take(48).chain("…".chars()).collect()
-                        } else {
-                            value.clone()
-                        };
-                        return Err(CallerError::Config(format!(
-                            "--owner: '{shown}' is not a client-key fingerprint (expected 43 \
-                             base64url characters — copy it from the dashboard's Access drawer)"
-                        )));
-                    }
-                    flags.owner = Some(value);
-                    i += 2;
-                } else {
-                    return Err(CallerError::Config(
-                        "Missing value for --owner (a client-key fingerprint)".to_string(),
-                    ));
-                }
+                return Err(CallerError::Config(
+                    "--owner is retired: browser identity keys cannot anchor root authority. \
+                     Run `intendant access setup`, then use the generated mTLS certificate or \
+                     signed native app for remote root access. Loopback access remains local root."
+                        .to_string(),
+                ));
             }
             "--no-tls" => {
                 flags.no_tls = true;
@@ -1792,7 +1770,6 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -1949,14 +1926,16 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn parse_cli_flags_value_flags_accept_dash_leading_values() {
-        // Value positions must never reject a token for its leading dash:
-        // --owner takes a base64url fingerprint, 1 in 64 of which starts
-        // with '-'.
+    fn parse_cli_flags_retired_owner_fails_with_mtls_migration_guidance() {
         let fingerprint = "-vyeJaE3hyqm4J45K5j_sVTXAAAABBBBCCCCDDDDEEE";
         assert_eq!(fingerprint.len(), 43);
-        let flags = parse_cli_flags_from(cli(&["--owner", fingerprint])).unwrap();
-        assert_eq!(flags.owner.as_deref(), Some(fingerprint));
+        let error = match parse_cli_flags_from(cli(&["--owner", fingerprint])) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("retired --owner must fail closed"),
+        };
+        assert!(error.contains("--owner is retired"), "{error}");
+        assert!(error.contains("intendant access setup"), "{error}");
+        assert!(error.contains("mTLS"), "{error}");
     }
 
     #[test]
@@ -1982,7 +1961,6 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -2037,7 +2015,6 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -2080,7 +2057,6 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: 9000,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -3482,23 +3458,6 @@ async fn main() -> Result<(), CallerError> {
 
     configure_sandbox_env(&flags, &project, &log_dir, daemon_project_root.as_deref());
 
-    // --owner bootstrap: pin root authority to the given browser key
-    // before any surface comes up. Failing this with the flag present is
-    // fatal — an install whose only authority path silently failed would
-    // be an unclaimable box.
-    if let Some(owner) = flags.owner.as_deref() {
-        let cert_dir = access::backend::select_backend().cert_dir();
-        match access::iam::seed_owner_bootstrap_grant(&cert_dir, owner) {
-            Ok(true) => eprintln!("[access] owner bootstrap: root grant pinned to client key"),
-            Ok(false) => eprintln!("[access] owner bootstrap: client key already holds root"),
-            Err(e) => {
-                return Err(CallerError::Config(format!(
-                    "--owner bootstrap failed: {e}"
-                )));
-            }
-        }
-    }
-
     // Credential custody: leases never survive a restart, so stale
     // materialized auth files (a crash's leftovers) are deleted before
     // anything can spawn an external agent; the timer keeps expiry
@@ -3652,7 +3611,7 @@ async fn main() -> Result<(), CallerError> {
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
              (cleartext HTTP/WS connections are refused){}",
             if web_tls_client_cert_required {
-                "; mTLS client certificates are required except for peer access and Connect bootstrap requests"
+                "; mTLS client certificates are required except for peer access and public Connect bootstrap/status requests"
             } else {
                 ""
             }

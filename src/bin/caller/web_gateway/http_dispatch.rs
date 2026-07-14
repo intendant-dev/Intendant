@@ -42,6 +42,24 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
 }
 
+fn session_token_api_response(result: Result<String, String>) -> ApiResponse {
+    let (status, body) = match result {
+        Ok(json) => (200, json),
+        Err(message) => (502, serde_json::json!({ "error": message }).to_string()),
+    };
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        // The body contains a live, short-lived vendor credential. `no-cache`
+        // still permits storage after revalidation; this response must never
+        // enter a browser, proxy, or native-app cache.
+        headers: vec![
+            ("Cache-Control", "no-store".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_http_request(
     ctx: HttpRequestCtx,
@@ -107,6 +125,27 @@ pub(crate) async fn serve_http_request(
     // an API request that merely mentions an asset path in
     // a query parameter can no longer be shadowed by them.
     let (req_method, req_path, req_query) = parse_request_target(request_line);
+
+    // Connect mode belongs on Connect's unprivileged hosted origin. If a
+    // hosted page could navigate an mTLS-bearing browser to the daemon's own
+    // origin with attacker-selected `connect_base`, privileged SPA code would
+    // ingest an untrusted DataChannel as a confused deputy. This gate precedes
+    // method routing: a top-level cross-origin POST can execute an HTML
+    // response too, and browsers decode percent-encoded query names.
+    if query_param(request_line, "connect").as_deref() == Some("1") {
+        use tokio::io::AsyncWriteExt;
+        let response = HttpResponse::with_content(
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "Hosted Connect mode is not served from the daemon origin.\n",
+        )
+        .header("Cache-Control", "no-store")
+        .deny_framing()
+        .header("Connection", "close");
+        let _ = stream.write_all(&response.into_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
 
     // CORS preflight: respond to OPTIONS with permissive headers.
     // Needed when the page is served from a custom scheme (intendant://)
@@ -225,16 +264,23 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    if tls_client_cert_required
-        && !tls_client_cert_present
+    let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+        peer_addr,
+        header_text,
+        tls_client_cert_fingerprint.as_deref(),
+        peer_connection_identity.as_ref(),
+    );
+    if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
         && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
-        && !is_public_peer_access_request_path(request_line)
-        && !is_public_org_grant_path(request_line)
-        && !is_public_connect_bootstrap_path(request_line)
+        && !allows_remote_certless_http(request_line, req_method, req_path)
     {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
-            "error": "mTLS client certificate required"
+            "error": if remote_client_auth_missing {
+                "verified client certificate or authenticated peer identity required for remote dashboard access"
+            } else {
+                "mTLS client certificate required"
+            }
         })
         .to_string();
         let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
@@ -337,7 +383,9 @@ pub(crate) async fn serve_http_request(
         }
     }
 
-    if let Some(op) = dashboard_http_operation(req_method, req_path) {
+    if let Some(op) = dashboard_http_operation(req_method, req_path)
+        .or_else(|| legacy_protected_http_operation(req_path))
+    {
         let decision = http_access_context.decision(op);
         if !decision.allowed {
             use tokio::io::AsyncWriteExt;
@@ -367,11 +415,13 @@ pub(crate) async fn serve_http_request(
         (req_path.starts_with("/api/")
             && !is_public_peer_access_request_path(request_line)
             && !is_public_org_grant_path(request_line))
+            || (req_method == "POST" && req_path == "/session")
             || is_connect_dashboard_signaling_path(req_path)
+            || req_path == "/config"
     }) {
         let own = is_own_or_app_origin(origin, is_tls, header_text);
         let fleet_allowed = !own
-            && is_fleet_cors_access_path(req_path)
+            && (is_fleet_cors_access_path(req_path) || req_path == "/config")
             && fleet_access_origin_allowed(
                 origin,
                 is_tls,
@@ -405,7 +455,7 @@ pub(crate) async fn serve_http_request(
 
     if let Some((route, route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
     {
-        // Table-dispatched routes: every /api/* and /mcp route is
+        // Table-dispatched routes: every /api/*, /session, and /mcp route is
         // declared once in gateway_routes::ROUTES (which the IAM
         // gate above already consulted through
         // dashboard_http_operation). The if/else chain below serves
@@ -568,6 +618,16 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_connection_identity,
                     bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::SessionToken => {
+                let result = mint_session_token(&session_provider, &session_model).await;
+                return write_api_response(
+                    stream,
+                    session_token_api_response(result),
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -1070,7 +1130,6 @@ pub(crate) async fn serve_http_request(
                 return handle_access_tier_settings(
                     stream,
                     route_body,
-                    req_path,
                     cert_dir,
                     http_access_context,
                     route.cors,
@@ -1113,6 +1172,7 @@ pub(crate) async fn serve_http_request(
                     route.cors,
                     fleet_cors_origin.as_deref(),
                     local_tier.as_deref(),
+                    http_access_context.principal,
                 )
                 .await;
             }
@@ -1203,10 +1263,15 @@ pub(crate) async fn serve_http_request(
             .await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
         use tokio::io::AsyncWriteExt;
-        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
             let response = json_error(
                 "401 Unauthorized",
-                "direct dashboard signaling requires local presence or a verified mTLS client",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
             );
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
@@ -1231,6 +1296,7 @@ pub(crate) async fn serve_http_request(
             &cert_dir,
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
         ) {
             Ok(grant) => grant,
             Err(message) => {
@@ -1240,23 +1306,54 @@ pub(crate) async fn serve_http_request(
                 return;
             }
         };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let response = with_allowed_origin_cors(
-            connect_dashboard_offer_response(
-                &dashboard_control,
-                &body_text,
-                &agent_card_value_for_targets,
-                grant,
-            )
-            .await,
+            connect_dashboard_offer_response(&dashboard_control, &body_text, grant).await,
             request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
         use tokio::io::AsyncWriteExt;
-        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
             let response = json_error(
                 "401 Unauthorized",
-                "direct dashboard signaling requires local presence or a verified mTLS client",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
             );
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
@@ -1278,16 +1375,44 @@ pub(crate) async fn serve_http_request(
             }
         };
         let response = with_allowed_origin_cors(
-            connect_dashboard_ice_response(&dashboard_control, &body_text).await,
+            connect_dashboard_ice_response(&dashboard_control, &body_text, &grant).await,
             request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
         use tokio::io::AsyncWriteExt;
-        if !peer_addr.ip().is_loopback() && tls_client_cert_fingerprint.is_none() {
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
             let response = json_error(
                 "401 Unauthorized",
-                "direct dashboard signaling requires local presence or a verified mTLS client",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
             );
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
@@ -1309,7 +1434,7 @@ pub(crate) async fn serve_http_request(
             }
         };
         let response = with_allowed_origin_cors(
-            connect_dashboard_close_response(&dashboard_control, &body_text).await,
+            connect_dashboard_close_response(&dashboard_control, &body_text, &grant).await,
             request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
@@ -1381,23 +1506,6 @@ pub(crate) async fn serve_http_request(
             None,
         )
         .await;
-    } else if req_method == "POST" && req_path == "/session" {
-        let result = mint_session_token(&session_provider, &session_model).await;
-        let (status, body) = match result {
-            Ok(json) => ("200 OK", json),
-            Err(msg) => (
-                "502 Bad Gateway",
-                serde_json::json!({"error": msg}).to_string(),
-            ),
-        };
-        let reuse = stream.exchange_reusable();
-        let response = HttpResponse::with_content(status, "application/json", body)
-            .header("Connection", "close")
-            .connection_reuse(reuse)
-            .into_string();
-        use tokio::io::AsyncWriteExt;
-        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
-        parked_ok = reuse && write_ok;
     } else if req_path.starts_with("/recordings/") {
         // Serve recording data: segment files and metadata. Path routing
         // (verbatim post-"/recordings/" token, historically including any
@@ -1464,13 +1572,30 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
         parked_ok = reuse && write_ok;
-    } else if let Some(response) = dashboard_local_file_response_blocking(request_line).await {
+    } else if let Some(response) = authorized_dashboard_local_file_response_blocking(
+        request_line,
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        &bus,
+    )
+    .await
+    {
         use tokio::io::AsyncWriteExt;
+        let response = match response {
+            Ok(response) => response,
+            Err(message) => {
+                let response = json_error("403 Forbidden", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
         let reuse = stream.exchange_reusable();
         match response {
             DashboardLocalFileResponse::Html { status, body } => {
                 let response = HttpResponse::with_content(status, "text/html; charset=utf-8", body)
                     .header("Cache-Control", "no-cache")
+                    .deny_framing()
                     .header("Connection", "close")
                     .connection_reuse(reuse)
                     .into_string();
@@ -1558,28 +1683,34 @@ pub(crate) async fn serve_http_request(
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(&response).await.is_ok();
         parked_ok = reuse && write_ok;
-    } else if req_path == "/.well-known/agent-card.json" || req_path == "/config" {
-        let body = if req_path == "/.well-known/agent-card.json" {
-            // Canonical peer identity + capability surface.
-            // Served alongside /config so the browser and
-            // federated peers can discover who this daemon
-            // is without parsing the voice-runtime config.
-            agent_card_json.clone()
-        } else {
-            config_json.clone()
-        };
-        // CORS: allow the multi-host dashboard to
-        // `fetch()` /config and /.well-known/agent-card.json
-        // on this daemon from a page served by a sibling
-        // daemon (cross-origin). `*` works because our
-        // fetches don't send credentials.
+    } else if req_path == "/.well-known/agent-card.json" {
+        // Canonical public peer identity + capability surface. It carries no
+        // runtime secret and remains wildcard-readable for discovery.
         let reuse = stream.exchange_reusable();
-        let response = HttpResponse::with_content("200 OK", "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Connection", "close")
-            .connection_reuse(reuse)
-            .into_string();
+        let response =
+            HttpResponse::with_content("200 OK", "application/json", agent_card_json.clone())
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Connection", "close")
+                .connection_reuse(reuse)
+                .into_string();
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if req_path == "/config" {
+        // Runtime config can include ICE/TURN credentials. The IAM and Origin
+        // gates above admit only PresenceRead on the daemon's own origin,
+        // signed-app origin, or an explicitly fleet-allowlisted origin; echo
+        // that approved origin instead of publishing wildcard CORS. This is
+        // intentionally no-store because TURN credentials can be long-lived.
+        let reuse = stream.exchange_reusable();
+        let response =
+            HttpResponse::with_content("200 OK", "application/json", config_json.clone())
+                .header("Cache-Control", "no-store")
+                .fleet_cors(request_origin.as_deref())
+                .header("Connection", "close")
+                .connection_reuse(reuse)
+                .into_string();
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
         parked_ok = reuse && write_ok;
@@ -1627,6 +1758,7 @@ pub(crate) async fn serve_http_request(
             HttpResponse::with_content("200 OK", "text/html; charset=utf-8", app_html.as_bytes())
                 .header("Cache-Control", "no-cache")
                 .header("Access-Control-Allow-Origin", "*")
+                .deny_framing()
                 .header("Connection", "close")
                 .into_string();
         use tokio::io::AsyncWriteExt;
@@ -1887,6 +2019,23 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
         assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    #[test]
+    fn ephemeral_session_token_response_is_never_stored() {
+        for result in [
+            Ok(r#"{"client_secret":{"value":"live-token"}}"#.to_string()),
+            Err("provider unavailable".to_string()),
+        ] {
+            let rendered = api_response_http_bytes(
+                session_token_api_response(result),
+                CorsPosture::OwnOrigin,
+                None,
+            );
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(text.contains("Cache-Control: no-store\r\n"), "{text}");
+            assert!(!text.contains("Cache-Control: no-cache\r\n"), "{text}");
+        }
     }
 
     // ── S10 golden: the sessions-stream NDJSON head (design §8) ──

@@ -1339,21 +1339,6 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             advertise_tcp_via_url,
             ..
         } => {
-            let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
-                Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
-                _ => None,
-            };
-            bus.send(AppEvent::LogEntry {
-                session_id: None,
-                level: "debug".to_string(),
-                source: LOG_SOURCE.to_string(),
-                content: format!(
-                    "file-transfer offer resolved advertise_tcp_via_url={:?} -> tcp_candidate={:?}",
-                    advertise_tcp_via_url.as_deref().unwrap_or(""),
-                    tcp_advertised_addr
-                ),
-                turn: None,
-            });
             let Some(identity) = identity else {
                 bus.send(AppEvent::LogEntry {
                     session_id: None,
@@ -1371,9 +1356,16 @@ pub(crate) async fn handle_peer_file_transfer_signal(
                 label: identity.label,
                 profile: identity.profile,
                 filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
             };
             match registry
-                .answer_offer(session_id.clone(), sdp, authorization, tcp_advertised_addr)
+                .answer_offer(
+                    session_id.clone(),
+                    sdp,
+                    authorization,
+                    advertise_tcp_via_url,
+                )
                 .await
             {
                 Ok(answer_sdp) => {
@@ -1423,18 +1415,41 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             }
         }
         crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping file-transfer ICE without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
             match registry
-                .add_ice_candidate(&session_id, &candidate_json)
+                .add_ice_candidate_for_peer(&session_id, &candidate_json, &identity.fingerprint)
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::Applied) => {}
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::NotFound) => {
                     bus.send(AppEvent::LogEntry {
                         session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
                             "dropping file-transfer ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::Forbidden) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing cross-peer file-transfer ICE for session {session_id}"
                         ),
                         turn: None,
                     });
@@ -1451,7 +1466,33 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             }
         }
         crate::peer::WebRtcSignal::Close => {
-            registry.close(&session_id).await;
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping file-transfer close without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            if registry
+                .close_for_peer(&session_id, &identity.fingerprint)
+                .await
+                == crate::peer_file_transfer::PeerFileTransferSessionMutation::Forbidden
+            {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "refusing cross-peer file-transfer close for session {session_id}"
+                    ),
+                    turn: None,
+                });
+            }
         }
         crate::peer::WebRtcSignal::Answer { .. } => {
             bus.send(AppEvent::LogEntry {
@@ -1583,10 +1624,8 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             // Delegation-lane attribution (docs/src/trust-tiers.md § Two
             // lanes). The transport edge resolves the ambient IAM state;
             // the resolution itself is the testable core below.
-            let iam_state = {
-                let cert_dir = crate::access::backend::select_backend().cert_dir();
-                crate::access::iam::load_state(&cert_dir).ok()
-            };
+            let cert_dir = crate::access::backend::select_backend().cert_dir();
+            let iam_state = crate::access::iam::load_state(&cert_dir).ok();
             let attributed = match resolve_peer_offer_attribution(
                 &client_key,
                 registry.local_card_id().as_str(),
@@ -1635,6 +1674,8 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                 label: identity.label,
                 profile: identity.profile,
                 filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(cert_dir),
                 attributed,
             };
             match registry
@@ -1699,6 +1740,18 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             }
         }
         crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping dashboard-control ICE without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
             let candidate = match serde_json::from_str::<serde_json::Value>(&candidate_json) {
                 Ok(candidate) => candidate,
                 Err(e) => {
@@ -1714,15 +1767,38 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                     return;
                 }
             };
-            match registry.add_ice_candidate(&session_id, &candidate).await {
-                Ok(true) => {}
-                Ok(false) => {
+            let caller = crate::dashboard_control::DashboardControlGrant::Peer {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
+                attributed: None,
+            };
+            match registry
+                .add_ice_candidate_for_grant(&session_id, &candidate, &caller)
+                .await
+            {
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::Applied) => {}
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::NotFound) => {
                     bus.send(AppEvent::LogEntry {
                         session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
                             "dropping dashboard-control ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::Forbidden) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing cross-peer dashboard-control ICE for session {session_id}"
                         ),
                         turn: None,
                     });
@@ -1741,7 +1817,40 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             }
         }
         crate::peer::WebRtcSignal::Close => {
-            registry.close(&session_id).await;
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping dashboard-control close without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            let caller = crate::dashboard_control::DashboardControlGrant::Peer {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
+                attributed: None,
+            };
+            if registry.close_for_grant(&session_id, &caller).await
+                == crate::dashboard_control::DashboardControlSessionMutation::Forbidden
+            {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "refusing cross-peer dashboard-control close for session {session_id}"
+                    ),
+                    turn: None,
+                });
+            }
         }
         crate::peer::WebRtcSignal::Answer { .. } => {
             bus.send(AppEvent::LogEntry {
@@ -2636,11 +2745,27 @@ mod tests {
     }
 
     #[test]
-    fn http_access_principal_maps_root_and_peer_routes() {
+    fn http_access_principal_maps_explicit_owner_and_peer_routes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = http_access_context(tmp.path(), None, Some("unbound-fp"), true, true).unwrap();
-        assert_eq!(root.principal.kind, "root_session");
-        assert_eq!(root.principal.source, "browser-mtls");
+        crate::access::certs::ensure_certs(
+            tmp.path(),
+            &crate::access::certs::ServerNames::new(
+                "127.0.0.1".parse().unwrap(),
+                Vec::<std::net::IpAddr>::new(),
+                Vec::<String>::new(),
+            )
+            .unwrap(),
+            "owner",
+            false,
+        )
+        .unwrap();
+        let owner_fingerprint =
+            crate::access::certs::read_owner_client_cert_fingerprint(tmp.path()).unwrap();
+        let root =
+            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        assert_eq!(root.principal.kind, "browser_certificate");
+        assert_eq!(root.principal.source, "local_iam_state");
+        assert_eq!(root.principal.role_id, "role:root");
         assert_eq!(root.principal.transport, "https");
         assert_eq!(
             root.principal
@@ -2655,11 +2780,20 @@ mod tests {
                 .allowed
         );
 
+        let unknown = http_access_context(tmp.path(), None, Some("aabbccdd"), true, true).unwrap();
+        assert_eq!(unknown.principal.role_id, "role:none");
+        assert!(
+            !unknown
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+
         let peer_identity = PeerConnectionIdentity {
             fingerprint: "abc123".to_string(),
             label: "peer-a".to_string(),
             profile: "peer-operator".to_string(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            record: None,
         };
         let peer =
             http_access_context(tmp.path(), Some(&peer_identity), Some("abc123"), true, true)

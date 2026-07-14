@@ -5,13 +5,42 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ClaimStartRequest {
-    #[serde(default)]
-    claim_code: String,
-    /// Preferred: SHA-256 (base64url) of the normalized phrase, computed
-    /// client-side — this service never needs to see plaintext codes.
-    #[serde(default)]
-    claim_code_hash: Option<String>,
+    /// SHA-256 (base64url, unpadded) of the normalized phrase, computed by
+    /// the browser. The hosted service never accepts the plaintext code.
+    claim_code_hash: String,
+}
+
+fn apply_claim_start_audit(
+    store: &mut Store,
+    daemon_id: &str,
+    claim_code_hash: &str,
+    claim_code_created_unix_ms: u64,
+    user_id: Uuid,
+    claim_id: &str,
+    now: u64,
+) -> ApiResult<()> {
+    let generation_is_current = store.daemons.iter().any(|daemon| {
+        daemon.daemon_id == daemon_id
+            && daemon.owner_user_id.is_none()
+            && daemon.claim_code_hash.as_deref() == Some(claim_code_hash)
+            && daemon.claim_code_created_unix_ms == Some(claim_code_created_unix_ms)
+            && now.saturating_sub(claim_code_created_unix_ms) <= CLAIM_CODE_TTL_MS
+    });
+    if !generation_is_current {
+        return Err(ApiError::conflict(
+            "claim code was consumed, rotated, linked, or expired",
+        ));
+    }
+    audit(
+        store,
+        "daemon_claim_started",
+        Some(user_id),
+        Some(daemon_id.to_string()),
+        json!({ "claim_id": claim_id, "authority": "none" }),
+    );
+    Ok(())
 }
 
 pub(crate) async fn api_claim_start(
@@ -22,27 +51,12 @@ pub(crate) async fn api_claim_start(
     let user = require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "claim_start", 10, 60_000).await?;
-    let code_hashes = match body
-        .claim_code_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|hash| !hash.is_empty())
-    {
-        Some(hash) => {
-            if !is_sha256_b64u(hash) {
-                return Err(ApiError::bad_request(
-                    "claim_code_hash must be an unpadded base64url SHA-256 digest",
-                ));
-            }
-            vec![hash.to_string()]
-        }
-        None => {
-            if normalize_claim_code(&body.claim_code).is_empty() {
-                return Err(ApiError::bad_request("claim_code is required"));
-            }
-            claim_code_hash_candidates(&body.claim_code)
-        }
-    };
+    let claim_code_hash = body.claim_code_hash.trim();
+    if !is_sha256_b64u(claim_code_hash) {
+        return Err(ApiError::bad_request(
+            "claim_code_hash must be an unpadded base64url SHA-256 digest",
+        ));
+    }
     let now = now_unix_ms();
     let daemon = {
         let store = state.store.lock().await;
@@ -53,161 +67,82 @@ pub(crate) async fn api_claim_start(
                 d.owner_user_id.is_none()
                     && d.claim_code_hash
                         .as_deref()
-                        .is_some_and(|hash| code_hashes.iter().any(|candidate| candidate == hash))
-                    && d.claim_code_created_unix_ms.is_some_and(|created| {
-                        // Daemon-minted hashes are presence-fresh (renewed
-                        // on every register poll), so the same TTL check
-                        // naturally covers both kinds.
-                        now.saturating_sub(created) <= CLAIM_CODE_TTL_MS
-                    })
+                        .is_some_and(|hash| hash == claim_code_hash)
+                    && d.claim_code_created_unix_ms
+                        .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS)
             })
             .cloned()
             .ok_or_else(|| ApiError::not_found("claim code not found"))?
     };
-    let needs_bootstrap_arm = daemon.claim_code_daemon_minted;
+    let claim_code_hash = daemon
+        .claim_code_hash
+        .clone()
+        .ok_or_else(|| ApiError::not_found("claim code not found"))?;
+    let claim_code_created_unix_ms = daemon
+        .claim_code_created_unix_ms
+        .ok_or_else(|| ApiError::not_found("claim code not found"))?;
     let claim_id = Uuid::new_v4().to_string();
     let challenge = random_b64u(32);
+    {
+        // Commit the audit record before publishing either the pending claim
+        // or its daemon event. A failed state-file write must leave no live
+        // challenge that could still link after the browser received 500.
+        // Re-check the exact code generation in the transaction so rotation
+        // or a competing claim cannot race the initial read.
+        let mut store = state.store.lock().await;
+        update_store_transaction(
+            &mut store,
+            |next| {
+                apply_claim_start_audit(
+                    next,
+                    &daemon.daemon_id,
+                    &claim_code_hash,
+                    claim_code_created_unix_ms,
+                    user.id,
+                    &claim_id,
+                    now_unix_ms(),
+                )
+            },
+            |next| persist_locked(&state, next),
+        )?;
+    }
     state.pending_claims.lock().await.insert(
         claim_id.clone(),
         PendingClaim {
             user_id: user.id,
             account_name: user.account_name.clone(),
             daemon_id: daemon.daemon_id.clone(),
+            daemon_public_key: daemon.daemon_public_key.clone(),
             challenge: challenge.clone(),
             created_unix_ms: now_unix_ms(),
-            bootstrap_required: needs_bootstrap_arm,
-            armed: false,
+            claim_code_hash,
+            claim_code_created_unix_ms,
             status: ClaimStatus::Pending,
         },
     );
     // The challenge names the claiming account so the daemon can co-sign
-    // *who* it is being claimed by (v2 proofs) and show "claimed by
-    // @handle" from its own signed record rather than this service's word.
-    // Bootstrap claims hold the challenge until the browser arms them
-    // with its identity key + phrase-derived tag (api_claim_arm).
-    if !needs_bootstrap_arm {
-        enqueue_event(
-            &state,
-            &daemon.daemon_id,
-            RendezvousEvent {
-                id: Uuid::new_v4().to_string(),
-                kind: "claim_challenge".to_string(),
-                claim_id: Some(claim_id.clone()),
-                challenge: Some(challenge),
-                user_id: Some(user.id.to_string()),
-                account_name: Some(user.account_name.clone()),
-                ..RendezvousEvent::default()
-            },
-        )
-        .await;
-    }
-    {
-        let mut store = state.store.lock().await;
-        audit(
-            &mut store,
-            "daemon_claim_started",
-            Some(user.id),
-            Some(daemon.daemon_id.clone()),
-            json!({ "claim_id": claim_id, "bootstrap": needs_bootstrap_arm }),
-        );
-        persist_locked(&state, &store)?;
-    }
+    // which account route it acknowledged. This is discovery provenance,
+    // not trusted-human confirmation and never a daemon IAM input.
+    enqueue_event(
+        &state,
+        &daemon.daemon_id,
+        RendezvousEvent {
+            id: Uuid::new_v4().to_string(),
+            kind: "claim_challenge".to_string(),
+            claim_id: Some(claim_id.clone()),
+            challenge: Some(challenge),
+            user_id: Some(user.id.to_string()),
+            account_name: Some(user.account_name.clone()),
+            ..RendezvousEvent::default()
+        },
+    )
+    .await;
     Ok(Json(json!({
         "ok": true,
         "claim_id": claim_id,
         "daemon_id": daemon.daemon_id,
         "daemon_public_key": daemon.daemon_public_key,
-        "needs_bootstrap_arm": needs_bootstrap_arm,
     })))
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ClaimArmRequest {
-    client_key: String,
-    client_key_tag: String,
-}
-
-/// Arm a first-owner bootstrap claim: the browser presents its identity
-/// key plus an HMAC tag derived from the daemon-minted phrase, and only
-/// then does the claim challenge fire. This service relays both blind —
-/// it holds the phrase's hash, not the phrase, so it can neither compute
-/// a tag for a key of its own nor alter the browser's (the daemon
-/// recomputes the tag over the exact key it enrolls).
-pub(crate) async fn api_claim_arm(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(claim_id): AxumPath<String>,
-    Json(body): Json<ClaimArmRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let user = require_user(&state, &headers).await?;
-    require_csrf(&state, &headers).await?;
-    check_rate_limit(&state, &headers, "claim_arm", 10, 60_000).await?;
-    let client_key = body.client_key.trim().to_string();
-    let client_key_tag = body.client_key_tag.trim().to_string();
-    if client_key.is_empty() || client_key_tag.is_empty() {
-        return Err(ApiError::bad_request(
-            "client_key and client_key_tag are required",
-        ));
-    }
-    let (daemon_id, challenge, user_id_string, account_name) = {
-        let mut claims = state.pending_claims.lock().await;
-        let claim = claims
-            .get_mut(claim_id.trim())
-            .ok_or_else(|| ApiError::not_found("claim not found"))?;
-        if claim.user_id != user.id {
-            return Err(ApiError::forbidden("claim belongs to a different account"));
-        }
-        if !matches!(claim.status, ClaimStatus::Pending) {
-            return Err(ApiError::bad_request("claim is already resolved"));
-        }
-        if now_unix_ms().saturating_sub(claim.created_unix_ms) > CLAIM_TIMEOUT_MS {
-            claim.status = ClaimStatus::Rejected {
-                error: "claim timed out".to_string(),
-            };
-            return Err(ApiError::bad_request("claim timed out"));
-        }
-        if !claim.bootstrap_required {
-            return Err(ApiError::bad_request("claim does not need arming"));
-        }
-        if claim.armed {
-            return Err(ApiError::bad_request("claim is already armed"));
-        }
-        claim.armed = true;
-        (
-            claim.daemon_id.clone(),
-            claim.challenge.clone(),
-            claim.user_id.to_string(),
-            claim.account_name.clone(),
-        )
-    };
-    enqueue_event(
-        &state,
-        &daemon_id,
-        RendezvousEvent {
-            id: Uuid::new_v4().to_string(),
-            kind: "claim_challenge".to_string(),
-            claim_id: Some(claim_id.trim().to_string()),
-            challenge: Some(challenge),
-            user_id: Some(user_id_string),
-            account_name: Some(account_name),
-            bootstrap_client_key: Some(client_key),
-            bootstrap_client_key_tag: Some(client_key_tag),
-            ..RendezvousEvent::default()
-        },
-    )
-    .await;
-    {
-        let mut store = state.store.lock().await;
-        audit(
-            &mut store,
-            "daemon_claim_armed",
-            Some(user.id),
-            Some(daemon_id),
-            json!({ "claim_id": claim_id.trim() }),
-        );
-        persist_locked(&state, &store)?;
-    }
-    Ok(Json(json!({ "ok": true })))
 }
 
 pub(crate) async fn api_claim_status(
@@ -314,18 +249,319 @@ pub(crate) async fn api_status(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DaemonRegisterRequest {
     protocol: String,
     daemon_id: String,
     daemon_public_key: String,
-    /// First-owner bootstrap (fresh boxes): the daemon minted its own
-    /// claim phrase locally and registers only the SHA-256 (base64url) of
-    /// its normalized form. This service never sees the plaintext, so it
-    /// can route a claim to the daemon but cannot claim (or enroll
-    /// against) the daemon itself.
+    #[serde(default, alias = "bootstrap_code_hash")]
+    claim_code_hash: String,
     #[serde(default)]
-    bootstrap_code_hash: Option<String>,
+    issued_at_unix_ms: u64,
+    #[serde(default)]
+    signature: String,
+}
+
+const MAX_DAEMON_ID_BYTES: usize = 128;
+const MAX_UNCLAIMED_DAEMONS: usize = 1024;
+
+fn validate_daemon_id(value: &str) -> ApiResult<()> {
+    if value.is_empty()
+        || value.len() > MAX_DAEMON_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(ApiError::bad_request(
+            "daemon_id must be 1..=128 ASCII letters, digits, '.', '_', '-', or ':'",
+        ));
+    }
+    Ok(())
+}
+
+fn is_canonical_b64u_len(value: &str, encoded_len: usize, decoded_len: usize) -> bool {
+    if value.len() != encoded_len
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+    b64u_decode(value)
+        .ok()
+        .filter(|decoded| decoded.len() == decoded_len)
+        .is_some_and(|decoded| b64u(&decoded) == value)
+}
+
+fn validate_daemon_register_shape(
+    body: &DaemonRegisterRequest,
+    operator_probe: bool,
+) -> ApiResult<()> {
+    if body.daemon_id != body.daemon_id.trim()
+        || body.daemon_public_key != body.daemon_public_key.trim()
+        || body.claim_code_hash != body.claim_code_hash.trim()
+        || body.signature != body.signature.trim()
+    {
+        return Err(ApiError::bad_request(
+            "registration identity fields must not contain surrounding whitespace",
+        ));
+    }
+    validate_daemon_id(&body.daemon_id)?;
+    if !is_canonical_b64u_len(&body.daemon_public_key, 43, 32) {
+        return Err(ApiError::bad_request(
+            "daemon_public_key must be canonical unpadded base64url for exactly 32 Ed25519 bytes",
+        ));
+    }
+    if !is_sha256_b64u(&body.claim_code_hash) {
+        return Err(ApiError::bad_request(
+            "claim_code_hash must be an unpadded base64url SHA-256 digest",
+        ));
+    }
+    if operator_probe {
+        if !body.signature.is_empty() {
+            return Err(ApiError::bad_request(
+                "operator registration probes must omit the signature",
+            ));
+        }
+    } else if !is_canonical_b64u_len(&body.signature, 86, 64) {
+        return Err(ApiError::bad_request(
+            "signature must be canonical unpadded base64url for exactly 64 Ed25519 signature bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn registration_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    claim_code_hash: &str,
+    issued_at_unix_ms: u64,
+) -> String {
+    format!(
+        "{REGISTER_PROOF_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{claim_code_hash}\n{issued_at_unix_ms}\n"
+    )
+}
+
+fn operator_bearer_matches(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = state.config.daemon_token.as_deref() else {
+        return false;
+    };
+    let expected = format!("Bearer {token}");
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected.as_str())
+}
+
+async fn issue_daemon_session(state: &AppState, daemon_id: &str) -> (String, u64) {
+    let token = random_b64u(32);
+    let now = now_unix_ms();
+    let expires_unix_ms = now.saturating_add(DAEMON_SESSION_TTL_MS);
+    let mut sessions = state.daemon_sessions.lock().await;
+    sessions.retain(|_, session| session.expires_unix_ms > now);
+    sessions.insert(
+        daemon_id.to_string(),
+        DaemonSessionCredential {
+            token: token.clone(),
+            expires_unix_ms,
+        },
+    );
+    (token, expires_unix_ms)
+}
+
+async fn require_daemon_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    daemon_id: &str,
+) -> ApiResult<()> {
+    // Closed fleets still require the operator bearer in addition to the
+    // daemon-scoped session credential. Open registration skips only that
+    // shared bearer, never this post-registration proof.
+    require_daemon_auth(state, headers)?;
+    let presented = headers
+        .get(DAEMON_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("missing daemon session credential"))?;
+    let now = now_unix_ms();
+    let mut sessions = state.daemon_sessions.lock().await;
+    sessions.retain(|_, session| session.expires_unix_ms > now);
+    let expected = sessions
+        .get(daemon_id)
+        .ok_or_else(|| ApiError::unauthorized("daemon session is missing or expired"))?;
+    if daemon_session_tokens_match(&expected.token, presented) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized("invalid daemon session credential"))
+    }
+}
+
+fn daemon_session_tokens_match(expected: &str, presented: &str) -> bool {
+    // `ring`'s public HMAC verifier gives us a maintained constant-time
+    // comparison without treating its deprecated internal helper as API.
+    let expected_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, expected.as_bytes());
+    let presented_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, presented.as_bytes());
+    let presented_tag = ring::hmac::sign(&presented_key, b"intendant-daemon-session");
+    ring::hmac::verify(
+        &expected_key,
+        b"intendant-daemon-session",
+        presented_tag.as_ref(),
+    )
+    .is_ok()
+}
+
+fn verify_registration_proof(body: &DaemonRegisterRequest, now: u64) -> ApiResult<()> {
+    validate_daemon_register_shape(body, false)?;
+    if body.issued_at_unix_ms == 0
+        || now.abs_diff(body.issued_at_unix_ms) > REGISTER_PROOF_MAX_SKEW_MS
+    {
+        return Err(ApiError::bad_request(
+            "registration proof is stale — check the daemon clock and retry",
+        ));
+    }
+    let payload = registration_signing_payload(
+        body.daemon_id.trim(),
+        body.daemon_public_key.trim(),
+        body.claim_code_hash.trim(),
+        body.issued_at_unix_ms,
+    );
+    if !verify_ed25519_b64u(
+        body.daemon_public_key.trim(),
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        return Err(ApiError::bad_request(
+            "registration identity signature is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonRegistrationOutcome {
+    claimed: bool,
+    claimed_by: Option<(Uuid, String)>,
+    claim_code_expires_unix_ms: Option<u64>,
+    stale_daemon_ids: Vec<String>,
+}
+
+/// Apply one daemon registration to a candidate Store. The caller persists
+/// that candidate before publishing it as live memory; this function therefore
+/// may consume a proof timestamp or rotate a route-code generation without
+/// making a failed disk write poison an exact retry.
+fn apply_daemon_registration(
+    store: &mut Store,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    claim_code_hash: &str,
+    registration_proof_unix_ms: Option<u64>,
+    now: u64,
+) -> ApiResult<DaemonRegistrationOutcome> {
+    let stale_daemon_ids = sweep_stale_unclaimed_daemons(store, now);
+    for stale_id in &stale_daemon_ids {
+        store
+            .dns_records
+            .retain(|record| record.daemon_id != *stale_id);
+    }
+    let existing = store
+        .daemons
+        .iter()
+        .any(|record| record.daemon_id == daemon_id);
+    if !existing
+        && store
+            .daemons
+            .iter()
+            .filter(|record| record.owner_user_id.is_none())
+            .count()
+            >= MAX_UNCLAIMED_DAEMONS
+    {
+        return Err(ApiError::too_many_requests(
+            "unclaimed daemon registration capacity is full; retry after stale registrations expire",
+        ));
+    }
+    let active_claim_hashes = active_claim_code_hashes(store, daemon_id, now);
+    // Re-registering the same hash does not refresh its TTL, so a code remains
+    // genuinely short-lived even while the daemon keeps polling.
+    let apply_claim_hash = |record: &mut DaemonRecord| -> ApiResult<()> {
+        if active_claim_hashes.contains(claim_code_hash) {
+            return Err(ApiError::conflict(
+                "claim code hash collides with another active route code",
+            ));
+        }
+        if record.claim_code_hash.as_deref() != Some(claim_code_hash) {
+            record.claim_code_hash = Some(claim_code_hash.to_string());
+            record.claim_code_created_unix_ms = Some(now);
+        } else if record.claim_code_created_unix_ms.is_none() {
+            record.claim_code_created_unix_ms = Some(now);
+        }
+        Ok(())
+    };
+    let (owner_user_id, code_created_unix_ms) = if let Some(existing) = store
+        .daemons
+        .iter_mut()
+        .find(|record| record.daemon_id == daemon_id)
+    {
+        require_registration_key_match(existing, daemon_public_key)?;
+        if let Some(issued_at_unix_ms) = registration_proof_unix_ms {
+            if let Some(previous) = existing.last_registration_proof_unix_ms {
+                if issued_at_unix_ms <= previous {
+                    return Err(ApiError::conflict(
+                        "registration proof is not newer than the latest accepted proof",
+                    ));
+                }
+            }
+            existing.last_registration_proof_unix_ms = Some(issued_at_unix_ms);
+        }
+        existing.last_seen_unix_ms = now;
+        record_presence_hour(&mut existing.presence_hours, now);
+        existing.updated_unix_ms = now;
+        if existing.owner_user_id.is_none() {
+            apply_claim_hash(existing)?;
+        }
+        (existing.owner_user_id, existing.claim_code_created_unix_ms)
+    } else {
+        let mut record = DaemonRecord {
+            daemon_id: daemon_id.to_string(),
+            label: None,
+            daemon_public_key: daemon_public_key.to_string(),
+            owner_user_id: None,
+            claim_code_hash: None,
+            claim_code_created_unix_ms: None,
+            last_registration_proof_unix_ms: registration_proof_unix_ms,
+            route_link_revision: 0,
+            last_unclaim_proof_unix_ms: None,
+            registered_unix_ms: now,
+            last_seen_unix_ms: now,
+            updated_unix_ms: now,
+            presence_hours: Vec::new(),
+        };
+        apply_claim_hash(&mut record)?;
+        let created = record.claim_code_created_unix_ms;
+        store.daemons.push(record);
+        (None, created)
+    };
+    let claimed_by = owner_user_id.map(|user_id| {
+        (
+            user_id,
+            store
+                .users
+                .iter()
+                .find(|user| user.id == user_id)
+                .map(|user| user.account_name.clone())
+                .unwrap_or_default(),
+        )
+    });
+    Ok(DaemonRegistrationOutcome {
+        claimed: owner_user_id.is_some(),
+        claimed_by,
+        claim_code_expires_unix_ms: if owner_user_id.is_none() {
+            code_created_unix_ms.map(|created| created.saturating_add(CLAIM_CODE_TTL_MS))
+        } else {
+            None
+        },
+        stale_daemon_ids,
+    })
 }
 
 pub(crate) async fn daemon_register(
@@ -341,159 +577,103 @@ pub(crate) async fn daemon_register(
     }
     let daemon_id = body.daemon_id.trim().to_string();
     let daemon_public_key = body.daemon_public_key.trim().to_string();
-    if daemon_id.is_empty() || daemon_public_key.is_empty() {
+    let claim_code_hash = body.claim_code_hash.trim().to_string();
+    if daemon_id.is_empty() || daemon_public_key.is_empty() || claim_code_hash.is_empty() {
         return Err(ApiError::bad_request(
-            "daemon_id and daemon_public_key are required",
+            "daemon_id, daemon_public_key, and claim_code_hash are required",
         ));
     }
-    let bootstrap_code_hash = body
-        .bootstrap_code_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|hash| !hash.is_empty());
-    if let Some(hash) = bootstrap_code_hash {
-        if !is_sha256_b64u(hash) {
-            return Err(ApiError::bad_request(
-                "bootstrap_code_hash must be an unpadded base64url SHA-256 digest",
-            ));
-        }
+    if !is_sha256_b64u(&claim_code_hash) {
+        return Err(ApiError::bad_request(
+            "claim_code_hash must be an unpadded base64url SHA-256 digest",
+        ));
     }
-    let mut claim_code = None;
-    let mut daemon_minted = false;
-    let (claimed, claimed_by, claim_code_expires_unix_ms) = {
-        let mut claim_codes = state.claim_codes.lock().await;
+    // Open registration means no shared service token is required; it does
+    // not mean a public key is itself a credential. Require the daemon to
+    // prove possession and bind the locally minted route-code hash into that
+    // proof. Connect never receives or returns the plaintext code. The
+    // configured operator bearer may run deployment probes because it already
+    // protects the service's admin API.
+    let operator_probe = operator_bearer_matches(&state, &headers)
+        && body.issued_at_unix_ms == 0
+        && body.signature.trim().is_empty();
+    validate_daemon_register_shape(&body, operator_probe)?;
+    let known_daemon = state
+        .store
+        .lock()
+        .await
+        .daemons
+        .iter()
+        .any(|record| record.daemon_id == daemon_id);
+    if !known_daemon {
+        // Refreshes arrive once a minute and must not spend the creation
+        // budget. New identities are separately bounded per observed source;
+        // the production proxy overwrites forwarded-address headers.
+        check_rate_limit(
+            &state,
+            &headers,
+            "daemon_register_new_identity",
+            30,
+            60 * 60_000,
+        )
+        .await?;
+    }
+    let proof_verified = !operator_probe;
+    if proof_verified {
+        verify_registration_proof(&body, now_unix_ms())?;
+    }
+    let registration = {
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
-        for stale_id in sweep_stale_unclaimed_daemons(&mut store, now) {
-            claim_codes.remove(&stale_id);
-            // Names follow the daemon record: a hard-deleted record
-            // takes its fleet-DNS records with it.
-            store.dns_records.retain(|r| r.daemon_id != stale_id);
-            if let Some(zone) = state.dns_zone.as_ref() {
-                zone.remove_daemon(&stale_id);
-            }
-        }
-        let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
-        // Applies the unclaimed-record claim-code policy: a daemon-minted
-        // bootstrap hash wins (presence-fresh, plaintext never seen here);
-        // otherwise the service mints and remints on the usual TTL.
-        let apply_claim_code = |record: &mut DaemonRecord,
-                                claim_codes: &mut HashMap<String, String>,
-                                claim_code: &mut Option<String>|
-         -> ApiResult<()> {
-            match bootstrap_code_hash {
-                Some(hash) => {
-                    if active_claim_hashes.contains(hash) {
-                        return Err(ApiError::conflict(
-                            "bootstrap claim hash collides with another active claim code",
-                        ));
-                    }
-                    claim_codes.remove(&record.daemon_id);
-                    record.claim_code_hash = Some(hash.to_string());
-                    record.claim_code_daemon_minted = true;
-                    // Presence-bound freshness: valid while the daemon
-                    // polls, instead of the 10-minute TTL.
-                    record.claim_code_created_unix_ms = Some(now);
-                }
-                None => {
-                    if record.claim_code_daemon_minted {
-                        // The daemon stopped offering bootstrap (an owner
-                        // appeared locally) — revert to service-minted.
-                        record.claim_code_hash = None;
-                        record.claim_code_daemon_minted = false;
-                        record.claim_code_created_unix_ms = None;
-                    }
-                    *claim_code = Some(ensure_claim_code(
-                        claim_codes,
-                        record,
-                        &active_claim_hashes,
-                    )?);
-                }
-            }
-            Ok(())
-        };
-        let (owner_user_id, code_created_unix_ms) = if let Some(existing) =
-            store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
-        {
-            if existing.owner_user_id.is_some() && existing.daemon_public_key != daemon_public_key {
-                return Err(ApiError::conflict(
-                    "claimed daemon_id is already bound to a different daemon key",
-                ));
-            }
-            existing.daemon_public_key = daemon_public_key.clone();
-            existing.last_seen_unix_ms = now;
-            record_presence_hour(&mut existing.presence_hours, now);
-            existing.updated_unix_ms = now;
-            if existing.owner_user_id.is_none() {
-                apply_claim_code(existing, &mut claim_codes, &mut claim_code)?;
-                daemon_minted = existing.claim_code_daemon_minted;
-            }
-            (existing.owner_user_id, existing.claim_code_created_unix_ms)
-        } else {
-            let mut record = DaemonRecord {
-                daemon_id: daemon_id.clone(),
-                label: None,
-                daemon_public_key: daemon_public_key.clone(),
-                owner_user_id: None,
-                claim_code_hash: None,
-                claim_code_daemon_minted: false,
-                claim_code_created_unix_ms: None,
-                registered_unix_ms: now,
-                last_seen_unix_ms: now,
-                updated_unix_ms: now,
-                presence_hours: Vec::new(),
-            };
-            apply_claim_code(&mut record, &mut claim_codes, &mut claim_code)?;
-            daemon_minted = record.claim_code_daemon_minted;
-            let created = record.claim_code_created_unix_ms;
-            store.daemons.push(record);
-            (None, created)
-        };
-        persist_locked(&state, &store)?;
-        // Current handle, not a claim-time snapshot: a renamed account
-        // shows its new name here. The daemon's own signed claim record
-        // (v2 proofs) keeps the at-claim-time identity.
-        let claimed_by = owner_user_id.map(|uid| {
-            (
-                uid,
-                store
-                    .users
-                    .iter()
-                    .find(|u| u.id == uid)
-                    .map(|u| u.account_name.clone())
-                    .unwrap_or_default(),
-            )
-        });
-        let expires = if owner_user_id.is_none() && !daemon_minted {
-            code_created_unix_ms.map(|created| created.saturating_add(CLAIM_CODE_TTL_MS))
-        } else {
-            // Claimed, or daemon-minted (presence-bound: fresh while the
-            // daemon keeps polling).
-            None
-        };
-        (owner_user_id.is_some(), claimed_by, expires)
+        update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_registration(
+                    next,
+                    &daemon_id,
+                    &daemon_public_key,
+                    &claim_code_hash,
+                    proof_verified.then_some(body.issued_at_unix_ms),
+                    now,
+                )
+            },
+            |next| persist_locked(&state, next),
+        )?
     };
-    let claim_url = claim_code
-        .as_ref()
-        .map(|code| format!("{}/connect?claim_code={code}", state.config.public_origin));
-    if let Some(url) = claim_url.as_deref() {
+    // DNS is an external live index. Publish deletions only after the Store
+    // commit succeeds so a failed state-file write remains exactly retryable.
+    if let Some(zone) = state.dns_zone.as_ref() {
+        for stale_id in &registration.stale_daemon_ids {
+            zone.remove_daemon(stale_id);
+        }
+    }
+    // Registration proof is single-use; only its successful caller receives
+    // this rotating credential. Later poll/answer/error calls require it, so
+    // a public daemon id cannot drain the event queue.
+    let (daemon_session_token, daemon_session_expires_unix_ms) =
+        issue_daemon_session(&state, &daemon_id).await;
+    if !registration.claimed {
         log_json(
             "daemon_awaiting_claim",
-            json!({ "daemon_id": daemon_id, "claim_url": url }),
+            json!({ "daemon_id": daemon_id, "code_custody": "daemon", "authority": "none" }),
         );
     }
     Ok(Json(json!({
         "ok": true,
-        "claimed": claimed,
-        "claimed_by_user_id": claimed_by.as_ref().map(|(uid, _)| uid.to_string()),
-        "claimed_by_handle": claimed_by
+        "claimed": registration.claimed,
+        "claimed_by_user_id": registration.claimed_by.as_ref().map(|(uid, _)| uid.to_string()),
+        "claimed_by_handle": registration.claimed_by
             .as_ref()
             .map(|(_, handle)| handle.clone())
             .filter(|handle| !handle.is_empty()),
-        "claim_code": claim_code,
-        "claim_code_daemon_minted": daemon_minted,
-        "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
-        "claim_url": claim_url,
+        // Compatibility fields stay explicit: modern daemons construct the
+        // URL from their local plaintext code. Connect has neither value.
+        "claim_code": null,
+        "claim_code_daemon_minted": true,
+        "claim_code_expires_unix_ms": registration.claim_code_expires_unix_ms,
+        "claim_url": null,
+        "daemon_session_token": daemon_session_token,
+        "daemon_session_expires_unix_ms": daemon_session_expires_unix_ms,
         "daemon_public_key": daemon_public_key,
         "observed_ip": observed_ip,
         // Fleet DNS hint: the daemon's derived name under the delegated
@@ -507,8 +687,26 @@ pub(crate) async fn daemon_register(
     })))
 }
 
-/// Shape check for a daemon-minted bootstrap hash: unpadded base64url of
-/// a SHA-256 digest — exactly 43 characters of the base64url alphabet.
+/// A daemon id is a durable key binding even before its route is linked.
+/// Letting open registration replace the key while reusing the in-memory
+/// claim code would let a second registrant turn the code already printed by
+/// K1 into a route for K2. Stale unlinked records are swept after their normal
+/// TTL, at which point a genuinely rebuilt daemon can register afresh.
+fn require_registration_key_match(
+    existing: &DaemonRecord,
+    presented_public_key: &str,
+) -> ApiResult<()> {
+    if existing.daemon_public_key == presented_public_key {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "daemon_id is already bound to a different daemon key",
+        ))
+    }
+}
+
+/// Shape check for a client-computed claim-code hash: unpadded base64url
+/// of a SHA-256 digest — exactly 43 characters of the base64url alphabet.
 pub(crate) fn is_sha256_b64u(value: &str) -> bool {
     value.len() == 43
         && value
@@ -516,53 +714,11 @@ pub(crate) fn is_sha256_b64u(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-pub(crate) fn ensure_claim_code(
-    claim_codes: &mut HashMap<String, String>,
-    daemon: &mut DaemonRecord,
-    active_claim_hashes: &HashSet<String>,
-) -> ApiResult<String> {
-    let now = now_unix_ms();
-    let existing_is_fresh = daemon
-        .claim_code_created_unix_ms
-        .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS);
-    let existing_hash_is_unique = daemon
-        .claim_code_hash
-        .as_deref()
-        .is_some_and(|hash| !active_claim_hashes.contains(hash));
-    if existing_is_fresh && existing_hash_is_unique {
-        if let Some(code) = claim_codes.get(&daemon.daemon_id).cloned() {
-            return Ok(code);
-        }
-    }
-    if !existing_is_fresh {
-        claim_codes.remove(&daemon.daemon_id);
-    }
-    for _ in 0..CLAIM_CODE_GENERATION_ATTEMPTS {
-        let code = generate_claim_code()?;
-        let code_hash = claim_code_hash(&code);
-        if active_claim_hashes.contains(&code_hash) {
-            continue;
-        }
-        daemon.claim_code_hash = Some(code_hash);
-        daemon.claim_code_created_unix_ms = Some(now);
-        claim_codes.insert(daemon.daemon_id.clone(), code.clone());
-        return Ok(code);
-    }
-    Err(ApiError::internal("failed to generate a unique claim code"))
-}
-
-pub(crate) fn generate_claim_code() -> ApiResult<String> {
-    let mut entropy = [0u8; CLAIM_CODE_ENTROPY_BYTES];
-    OsRng.fill_bytes(&mut entropy);
-    let mnemonic = Mnemonic::from_entropy(&entropy)
-        .map_err(|e| ApiError::internal(format!("generate claim mnemonic: {e}")))?;
-    Ok(mnemonic.to_string().replace(' ', "-"))
-}
-
 /// A day without polling: unclaimed records past this vanish on the next
 /// registration sweep, so open registration cannot grow the store without
-/// bound. Claimed daemons are never touched here — a returning unclaimed
-/// daemon simply re-registers and gets a fresh claim code.
+/// bound. Account-linked daemons are never touched here — a returning
+/// unlinked daemon with the same identity key simply re-registers and gets a
+/// fresh claim code.
 pub(crate) const UNCLAIMED_DAEMON_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) fn sweep_stale_unclaimed_daemons(store: &mut Store, now: u64) -> Vec<String> {
@@ -597,26 +753,12 @@ pub(crate) fn active_claim_code_hashes(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn claim_code_hash(code: &str) -> String {
     sha256_b64u(normalize_claim_code(code).as_bytes())
 }
 
-pub(crate) fn claim_code_hash_candidates(input: &str) -> Vec<String> {
-    let mut hashes = Vec::with_capacity(2);
-    let normalized = normalize_claim_code(input);
-    if !normalized.is_empty() {
-        hashes.push(sha256_b64u(normalized.as_bytes()));
-    }
-    let legacy = input.trim().replace(' ', "").to_ascii_uppercase();
-    if !legacy.is_empty() && legacy != normalized {
-        let hash = sha256_b64u(legacy.as_bytes());
-        if !hashes.iter().any(|existing| existing == &hash) {
-            hashes.push(hash);
-        }
-    }
-    hashes
-}
-
+#[cfg(test)]
 pub(crate) fn normalize_claim_code(input: &str) -> String {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -645,12 +787,12 @@ pub(crate) async fn daemon_next(
     headers: HeaderMap,
     Query(query): Query<DaemonNextQuery>,
 ) -> ApiResult<Response> {
-    require_daemon_auth(&state, &headers)?;
-    check_rate_limit(&state, &headers, "daemon_next", 240, 60_000).await?;
     let daemon_id = query.daemon_id.trim().to_string();
     if daemon_id.is_empty() {
         return Err(ApiError::bad_request("daemon_id is required"));
     }
+    require_daemon_session(&state, &headers, &daemon_id).await?;
+    check_rate_limit(&state, &headers, "daemon_next", 240, 60_000).await?;
     touch_daemon(&state, &daemon_id).await?;
     let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(30_000));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -728,13 +870,6 @@ pub(crate) struct RendezvousEvent {
     claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     challenge: Option<String>,
-    // First-owner bootstrap arm fields, relayed blind: the daemon
-    // recomputes the phrase-derived tag itself, so this service cannot
-    // substitute a key of its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bootstrap_client_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bootstrap_client_key_tag: Option<String>,
 }
 
 pub(crate) async fn enqueue_event(state: &AppState, daemon_id: &str, event: RendezvousEvent) {
@@ -850,7 +985,7 @@ pub(crate) async fn daemon_answer(
     headers: HeaderMap,
     Json(body): Json<DaemonAnswerRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_daemon_auth(&state, &headers)?;
+    require_daemon_session(&state, &headers, body.daemon_id.trim()).await?;
     let pending = state
         .pending_offers
         .lock()
@@ -942,7 +1077,7 @@ pub(crate) async fn daemon_error(
     headers: HeaderMap,
     Json(body): Json<DaemonErrorRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_daemon_auth(&state, &headers)?;
+    require_daemon_session(&state, &headers, body.daemon_id.trim()).await?;
     if let Some(pending) = state
         .pending_offers
         .lock()
@@ -995,7 +1130,7 @@ pub(crate) struct DaemonDryRequest {
 /// they can reconnect a fueling session — the service only relays the
 /// daemon's own report; it can't see leases.
 pub(crate) fn dry_push_payload(
-    daemon_id: &str,
+    _daemon_id: &str,
     label: &str,
     credentials: &[serde_json::Value],
 ) -> serde_json::Value {
@@ -1017,10 +1152,10 @@ pub(crate) fn dry_push_payload(
     json!({
         "title": format!("{label} is unfueled"),
         "body": format!(
-            "Credential lease expired: {}. Reconnect a fueling session to re-grant from the vault.",
+            "Credential lease expired: {}. Reconnect a trusted fueling session to re-grant from the vault.",
             names.join(", ")
         ),
-        "url": format!("/app?connect=1&daemon_id={daemon_id}"),
+        "url": "/connect",
     })
 }
 
@@ -1029,7 +1164,7 @@ pub(crate) async fn daemon_dry(
     headers: HeaderMap,
     Json(body): Json<DaemonDryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_daemon_auth(&state, &headers)?;
+    require_daemon_session(&state, &headers, body.daemon_id.trim()).await?;
     check_rate_limit(&state, &headers, "daemon_dry", 30, 60_000).await?;
     let daemon_id = body.daemon_id.trim().to_string();
     if daemon_id.is_empty() {
@@ -1081,12 +1216,71 @@ pub(crate) async fn daemon_dry(
     Ok(Json(json!({ "ok": true, "notified": notified })))
 }
 
+fn apply_daemon_claim_link(
+    store: &mut Store,
+    claim: &PendingClaim,
+    claim_id: &str,
+    request_id: &str,
+    daemon_id: &str,
+    proof_protocol: &str,
+    now: u64,
+) -> ApiResult<()> {
+    let daemon_index = store
+        .daemons
+        .iter()
+        .position(|daemon| daemon.daemon_id == daemon_id)
+        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+    if !claim_generation_is_current(&store.daemons[daemon_index], claim) {
+        return Err(ApiError::conflict(
+            "claim code was consumed, rotated, or linked by another account",
+        ));
+    }
+    let (linked_daemon_id, linked_daemon_public_key) = {
+        let daemon = &mut store.daemons[daemon_index];
+        daemon.owner_user_id = Some(claim.user_id);
+        daemon.claim_code_hash = None;
+        daemon.claim_code_created_unix_ms = None;
+        daemon.route_link_revision = daemon.route_link_revision.saturating_add(1);
+        daemon.updated_unix_ms = now;
+        (daemon.daemon_id.clone(), daemon.daemon_public_key.clone())
+    };
+    let log_event = json!({
+        "daemon_id": linked_daemon_id,
+        "daemon_public_key": linked_daemon_public_key,
+        "handle": store
+            .users
+            .iter()
+            .find(|user| user.id == claim.user_id)
+            .map(|user| user.account_name.clone())
+            .unwrap_or_default(),
+        // This proof acknowledges a Connect route association only.
+        // It never authenticates the account to the daemon.
+        "proof": proof_protocol,
+        "authority": "none",
+    });
+    // `daemon_claimed` is a stable transparency-log wire kind. It now means
+    // an account/route link only; the authority field pins that semantic.
+    append_log_entry(store, "daemon_claimed", log_event);
+    audit(
+        store,
+        "daemon_claimed",
+        Some(claim.user_id),
+        Some(daemon_id.to_string()),
+        json!({
+            "claim_id": claim_id,
+            "request_id": request_id,
+            "authority": "none",
+        }),
+    );
+    Ok(())
+}
+
 pub(crate) async fn daemon_claim_proof(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<ClaimProofRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_daemon_auth(&state, &headers)?;
+    require_daemon_session(&state, &headers, body.daemon_id.trim()).await?;
     let pending = state
         .pending_claims
         .lock()
@@ -1105,15 +1299,6 @@ pub(crate) async fn daemon_claim_proof(
         reject_claim(&state, &body.claim_id, "claim timed out").await;
         return Err(ApiError::bad_request("claim timed out"));
     }
-    let daemon = {
-        let store = state.store.lock().await;
-        store
-            .daemons
-            .iter()
-            .find(|d| d.daemon_id == body.daemon_id)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("daemon not found"))?
-    };
     let proof_protocol = if body.protocol.trim().is_empty() {
         // Daemons that predate the protocol field always signed v1.
         CLAIM_PROTOCOL
@@ -1124,13 +1309,13 @@ pub(crate) async fn daemon_claim_proof(
         CLAIM_PROTOCOL => claim_signing_payload(
             &body.claim_id,
             &body.daemon_id,
-            &daemon.daemon_public_key,
+            &pending.daemon_public_key,
             &body.challenge,
         ),
         CLAIM_PROTOCOL_V2 => claim_signing_payload_v2(
             &body.claim_id,
             &body.daemon_id,
-            &daemon.daemon_public_key,
+            &pending.daemon_public_key,
             &body.challenge,
             &pending.user_id.to_string(),
             &pending.account_name,
@@ -1143,7 +1328,7 @@ pub(crate) async fn daemon_claim_proof(
         }
     };
     if !verify_ed25519_b64u(
-        &daemon.daemon_public_key,
+        &pending.daemon_public_key,
         payload.as_bytes(),
         body.signature.trim(),
     ) {
@@ -1151,49 +1336,70 @@ pub(crate) async fn daemon_claim_proof(
         return Err(ApiError::bad_request("claim signature invalid"));
     }
     {
-        let mut store = state.store.lock().await;
-        let daemon = store
-            .daemons
-            .iter_mut()
-            .find(|d| d.daemon_id == body.daemon_id)
-            .ok_or_else(|| ApiError::not_found("daemon not found"))?;
-        daemon.owner_user_id = Some(pending.user_id);
-        daemon.claim_code_hash = None;
-        daemon.claim_code_created_unix_ms = None;
-        daemon.updated_unix_ms = now_unix_ms();
-        let log_event = json!({
-            "daemon_id": daemon.daemon_id,
-            "daemon_public_key": daemon.daemon_public_key,
-            "handle": store
-                .users
-                .iter()
-                .find(|u| u.id == pending.user_id)
-                .map(|u| u.account_name.clone())
-                .unwrap_or_default(),
-            // v2 = the daemon co-signed the claiming account; v1 = the
-            // binding rests on this service's account assertion alone.
-            "proof": proof_protocol,
-        });
-        append_log_entry(&mut store, "daemon_claimed", log_event);
-        audit(
-            &mut store,
-            "daemon_claimed",
-            Some(pending.user_id),
-            Some(body.daemon_id.clone()),
-            json!({ "claim_id": body.claim_id, "request_id": body.request_id }),
-        );
-        persist_locked(&state, &store)?;
-    }
-    state.claim_codes.lock().await.remove(&body.daemon_id);
-    {
+        // Claim resolution is one atomic winner. Re-check the pending
+        // status and exact code generation while holding both mutation
+        // locks; a competing, replayed, rotated, or delayed proof cannot
+        // overwrite an existing account link.
         let mut claims = state.pending_claims.lock().await;
-        if let Some(claim) = claims.get_mut(body.claim_id.trim()) {
-            claim.status = ClaimStatus::Approved {
-                daemon_id: body.daemon_id.clone(),
-            };
+        let claim = claims
+            .get_mut(body.claim_id.trim())
+            .ok_or_else(|| ApiError::not_found("claim not found"))?;
+        if !matches!(claim.status, ClaimStatus::Pending) {
+            return Err(ApiError::bad_request("claim is already resolved"));
         }
+        if now_unix_ms().saturating_sub(claim.created_unix_ms) > CLAIM_TIMEOUT_MS {
+            claim.status = ClaimStatus::Rejected {
+                error: "claim timed out".to_string(),
+            };
+            return Err(ApiError::bad_request("claim timed out"));
+        }
+
+        let mut store = state.store.lock().await;
+        let daemon_index = store
+            .daemons
+            .iter()
+            .position(|d| d.daemon_id == body.daemon_id)
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+        if !claim_generation_is_current(&store.daemons[daemon_index], claim) {
+            claim.status = ClaimStatus::Rejected {
+                error: "claim code was consumed, rotated, or linked by another account".to_string(),
+            };
+            return Err(ApiError::conflict(
+                "claim code was consumed, rotated, or linked by another account",
+            ));
+        }
+        let claim_snapshot = claim.clone();
+        let now = now_unix_ms();
+        update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_claim_link(
+                    next,
+                    &claim_snapshot,
+                    &body.claim_id,
+                    &body.request_id,
+                    &body.daemon_id,
+                    proof_protocol,
+                    now,
+                )
+            },
+            |next| persist_locked(&state, next),
+        )?;
+        // Publish approval only after the linked Store (including audit and
+        // transparency leaves) is durable. A failed write leaves both live
+        // Store and pending claim unchanged, so the exact proof can retry.
+        claim.status = ClaimStatus::Approved {
+            daemon_id: body.daemon_id.clone(),
+        };
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+fn claim_generation_is_current(daemon: &DaemonRecord, claim: &PendingClaim) -> bool {
+    daemon.owner_user_id.is_none()
+        && daemon.daemon_public_key == claim.daemon_public_key
+        && daemon.claim_code_hash.as_deref() == Some(claim.claim_code_hash.as_str())
+        && daemon.claim_code_created_unix_ms == Some(claim.claim_code_created_unix_ms)
 }
 
 pub(crate) async fn reject_claim(state: &AppState, claim_id: &str, error: &str) {
@@ -1249,12 +1455,39 @@ pub(crate) struct DaemonUnclaimRequest {
     signature: String,
 }
 
+fn validate_unclaim_transition(
+    current: &DaemonRecord,
+    registered_key: &str,
+    snapshot_owner: Option<Uuid>,
+    snapshot_revision: u64,
+    issued_at_unix_ms: u64,
+) -> ApiResult<()> {
+    if current.daemon_public_key != registered_key
+        || current.owner_user_id != snapshot_owner
+        || current.route_link_revision != snapshot_revision
+    {
+        return Err(ApiError::conflict(
+            "daemon route link changed while the release was being processed",
+        ));
+    }
+    if current
+        .last_unclaim_proof_unix_ms
+        .is_some_and(|consumed| issued_at_unix_ms <= consumed)
+    {
+        return Err(ApiError::conflict(
+            "unclaim proof was already consumed or predates the latest release",
+        ));
+    }
+    Ok(())
+}
+
 /// Daemon-initiated release of a claim binding. This is the recovery path
 /// the account side cannot provide: a squatted or mis-claimed box evicts
 /// the binding with its own key (the account holder would never revoke).
 /// The release is signed and timestamp-fresh, verified against the
 /// *registered* daemon key, and logged to the transparency log like the
-/// claim it undoes. A fresh claim code mints on the next register poll.
+/// claim it undoes. A fresh daemon-local claim code mints on the next
+/// register poll.
 pub(crate) async fn daemon_unclaim(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1301,54 +1534,100 @@ pub(crate) async fn daemon_unclaim(
     ) {
         return Err(ApiError::bad_request("unclaim signature invalid"));
     }
-    let Some(owner_user_id) = daemon.owner_user_id else {
-        // Idempotent: releasing an unclaimed daemon is a no-op success, so
-        // a daemon retrying after a lost response converges.
-        return Ok(Json(json!({ "ok": true, "changed": false })));
-    };
-    let active_session_ids = active_dashboard_session_ids(&state, &daemon_id).await;
-    let closed_sessions = active_session_ids.len();
-    {
-        let mut store = state.store.lock().await;
-        let Some(record) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) else {
-            return Err(ApiError::not_found("daemon not found"));
-        };
-        record.owner_user_id = None;
-        record.claim_code_hash = None;
-        record.claim_code_created_unix_ms = None;
-        record.updated_unix_ms = now;
-        store.fleet_targets.retain(|target| {
-            !(target.user_id == owner_user_id
-                && (target.host_id == daemon_id
-                    || target.id == daemon_id
-                    || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
-        });
-        let handle = store
-            .users
-            .iter()
-            .find(|u| u.id == owner_user_id)
-            .map(|u| u.account_name.clone())
-            .unwrap_or_default();
-        append_log_entry(
-            &mut store,
-            "daemon_unclaimed",
-            json!({
-                "daemon_id": daemon_id.clone(),
-                "daemon_public_key": daemon.daemon_public_key.clone(),
-                "handle": handle,
-                "initiated_by": "daemon",
-            }),
-        );
-        audit(
-            &mut store,
-            "daemon_unclaimed",
-            Some(owner_user_id),
-            Some(daemon_id.clone()),
-            json!({ "initiated_by": "daemon", "closed_sessions": closed_sessions }),
-        );
-        persist_locked(&state, &store)?;
+    if let Some(consumed) = daemon.last_unclaim_proof_unix_ms {
+        if body.issued_at_unix_ms < consumed
+            || (body.issued_at_unix_ms == consumed && daemon.owner_user_id.is_some())
+        {
+            return Err(ApiError::conflict(
+                "unclaim proof was already consumed or predates the latest release",
+            ));
+        }
+        if body.issued_at_unix_ms == consumed {
+            // Exact retry after a lost successful response. It is safe only
+            // while the route remains unlinked; a later claim changes both
+            // owner and revision and must not be evicted by this replay.
+            return Ok(Json(json!({ "ok": true, "changed": false })));
+        }
     }
-    state.claim_codes.lock().await.remove(&daemon_id);
+    let snapshot_owner = daemon.owner_user_id;
+    let snapshot_revision = daemon.route_link_revision;
+    let active_session_ids = if snapshot_owner.is_some() {
+        active_dashboard_session_ids(&state, &daemon_id).await
+    } else {
+        Vec::new()
+    };
+    let closed_sessions = active_session_ids.len();
+    let changed = {
+        let mut store = state.store.lock().await;
+        update_store_transaction(
+            &mut store,
+            |next| {
+                let Some(index) = next
+                    .daemons
+                    .iter()
+                    .position(|record| record.daemon_id == daemon_id)
+                else {
+                    return Err(ApiError::not_found("daemon not found"));
+                };
+                let current = &next.daemons[index];
+                validate_unclaim_transition(
+                    current,
+                    &daemon.daemon_public_key,
+                    snapshot_owner,
+                    snapshot_revision,
+                    body.issued_at_unix_ms,
+                )?;
+                let daemon_public_key = current.daemon_public_key.clone();
+                {
+                    let record = &mut next.daemons[index];
+                    record.last_unclaim_proof_unix_ms = Some(body.issued_at_unix_ms);
+                    if snapshot_owner.is_some() {
+                        record.owner_user_id = None;
+                        record.claim_code_hash = None;
+                        record.claim_code_created_unix_ms = None;
+                        record.route_link_revision = record.route_link_revision.saturating_add(1);
+                    }
+                    record.updated_unix_ms = now;
+                }
+                if let Some(owner_user_id) = snapshot_owner {
+                    next.fleet_targets.retain(|target| {
+                        !(target.user_id == owner_user_id
+                            && (target.host_id == daemon_id
+                                || target.id == daemon_id
+                                || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
+                    });
+                    let handle = next
+                        .users
+                        .iter()
+                        .find(|u| u.id == owner_user_id)
+                        .map(|u| u.account_name.clone())
+                        .unwrap_or_default();
+                    append_log_entry(
+                        next,
+                        "daemon_unclaimed",
+                        json!({
+                            "daemon_id": daemon_id.clone(),
+                            "daemon_public_key": daemon_public_key,
+                            "handle": handle,
+                            "initiated_by": "daemon",
+                        }),
+                    );
+                    audit(
+                        next,
+                        "daemon_unclaimed",
+                        Some(owner_user_id),
+                        Some(daemon_id.clone()),
+                        json!({ "initiated_by": "daemon", "closed_sessions": closed_sessions }),
+                    );
+                }
+                Ok(snapshot_owner.is_some())
+            },
+            |next| persist_locked(&state, next),
+        )?
+    };
+    if !changed {
+        return Ok(Json(json!({ "ok": true, "changed": false })));
+    }
     close_active_dashboard_sessions(&state, &daemon_id, active_session_ids).await;
     log_json(
         "daemon_unclaimed",
@@ -1677,257 +1956,94 @@ pub(crate) fn verify_ed25519_b64u(
         .is_ok()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct BrowserOfferRequest {
-    daemon_id: String,
-    sdp: String,
-    #[serde(default)]
-    client_nonce: Option<String>,
-    #[serde(default)]
-    client_key: Option<String>,
-    #[serde(default)]
-    client_key_sig: Option<String>,
-    #[serde(default)]
-    client_key_ts: Option<i64>,
-    #[serde(default)]
-    client_key_proto: Option<String>,
-    #[serde(default)]
-    client_key_account_user_id: Option<String>,
-    #[serde(default)]
-    client_key_account_name: Option<String>,
-    #[serde(default)]
-    org_grant: Option<serde_json::Value>,
+/// The default Connect service is a route directory, not a control relay.
+/// This service-side gate is essential during mixed-version rollout: an old
+/// daemon may still accept the legacy hosted-root offer, so refusing before
+/// queue/pending mutation prevents an upgraded service from reaching it.
+fn reject_hosted_control_api<T>() -> ApiResult<T> {
+    Err(ApiError::forbidden(
+        "hosted daemon control is unavailable in this build; use a trusted local, signed-native, or direct-mTLS client",
+    ))
 }
 
 pub(crate) async fn browser_offer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<BrowserOfferRequest>,
 ) -> ApiResult<Response> {
-    let user = require_user(&state, &headers).await?;
+    require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
-    check_rate_limit(&state, &headers, "browser_offer", 60, 60_000).await?;
-    let daemon_id = body.daemon_id.trim().to_string();
-    let sdp = body.sdp;
-    if daemon_id.is_empty() || sdp.trim().is_empty() {
-        return Err(ApiError::bad_request("daemon_id and sdp are required"));
-    }
-    let daemon = {
-        let store = state.store.lock().await;
-        store
-            .daemons
-            .iter()
-            .find(|d| d.daemon_id == daemon_id && d.owner_user_id == Some(user.id))
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("daemon not found"))?
-    };
-    let request_id = Uuid::new_v4().to_string();
-    let session_grant = random_b64u(32);
-    let (tx, rx) = oneshot::channel();
-    state.pending_offers.lock().await.insert(
-        request_id.clone(),
-        PendingOffer {
-            daemon_id: daemon_id.clone(),
-            user_id: user.id,
-            daemon_public_key: daemon.daemon_public_key.clone(),
-            session_grant: session_grant.clone(),
-            response_tx: tx,
-        },
-    );
-    enqueue_event(
-        &state,
-        &daemon_id,
-        RendezvousEvent {
-            id: request_id.clone(),
-            kind: "offer".to_string(),
-            sdp: Some(sdp),
-            session_grant: Some(session_grant),
-            client_nonce: body
-                .client_nonce
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            user_id: Some(user.id.to_string()),
-            account_name: Some(user.account_name.clone()),
-            client_key: body
-                .client_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            client_key_sig: body
-                .client_key_sig
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            client_key_ts: body.client_key_ts,
-            // v2 offer-signature fields, relayed verbatim like the key
-            // itself: the daemon verifies the signature covers them, so
-            // this service can neither mint nor alter an account claim.
-            client_key_proto: body
-                .client_key_proto
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            client_key_account_user_id: body
-                .client_key_account_user_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            client_key_account_name: body
-                .client_key_account_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
-            // Opaque passthrough, size-capped so the relay cannot be used
-            // to firehose daemons; the daemon re-verifies and rate-limits.
-            org_grant: body.org_grant.filter(|doc| {
-                !doc.is_null()
-                    && serde_json::to_string(doc)
-                        .map(|s| s.len())
-                        .unwrap_or(usize::MAX)
-                        <= MAX_ORG_GRANT_RELAY_BYTES
-            }),
-            ..RendezvousEvent::default()
-        },
-    )
-    .await;
-    {
-        let mut store = state.store.lock().await;
-        audit(
-            &mut store,
-            "dashboard_grant_started",
-            Some(user.id),
-            Some(daemon_id.clone()),
-            json!({ "request_id": request_id }),
-        );
-        persist_locked(&state, &store)?;
-    }
-    match tokio::time::timeout(Duration::from_millis(OFFER_TIMEOUT_MS), rx).await {
-        Ok(Ok(Ok(answer))) => Ok(Json(answer).into_response()),
-        Ok(Ok(Err(error))) => Err(ApiError::new(StatusCode::BAD_GATEWAY, error)),
-        Ok(Err(_)) => Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "daemon answer channel closed",
-        )),
-        Err(_) => {
-            state.pending_offers.lock().await.remove(&request_id);
-            Err(ApiError::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                "timed out waiting for daemon answer",
-            ))
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BrowserIceRequest {
-    daemon_id: String,
-    session_id: String,
-    #[serde(default)]
-    candidate: serde_json::Value,
+    reject_hosted_control_api()
 }
 
 pub(crate) async fn browser_ice(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<BrowserIceRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let user = require_user(&state, &headers).await?;
+    require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
-    check_rate_limit(&state, &headers, "browser_ice", 600, 60_000).await?;
-    require_owned_daemon(&state, user.id, &body.daemon_id).await?;
-    enqueue_event(
-        &state,
-        body.daemon_id.trim(),
-        RendezvousEvent {
-            id: Uuid::new_v4().to_string(),
-            kind: "ice".to_string(),
-            session_id: Some(body.session_id),
-            candidate: Some(body.candidate),
-            ..RendezvousEvent::default()
-        },
-    )
-    .await;
-    Ok(Json(json!({ "ok": true })))
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BrowserCloseRequest {
-    daemon_id: String,
-    session_id: String,
+    reject_hosted_control_api()
 }
 
 pub(crate) async fn browser_close(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<BrowserCloseRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let user = require_user(&state, &headers).await?;
+    require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
-    require_owned_daemon(&state, user.id, &body.daemon_id).await?;
-    state
-        .active_sessions
-        .lock()
-        .await
-        .remove(body.session_id.trim());
-    enqueue_event(
-        &state,
-        body.daemon_id.trim(),
-        RendezvousEvent {
-            id: Uuid::new_v4().to_string(),
-            kind: "close".to_string(),
-            session_id: Some(body.session_id),
-            ..RendezvousEvent::default()
-        },
-    )
-    .await;
-    Ok(Json(json!({ "ok": true })))
-}
-
-pub(crate) async fn require_owned_daemon(
-    state: &AppState,
-    user_id: Uuid,
-    daemon_id: &str,
-) -> ApiResult<DaemonRecord> {
-    ensure_owned_daemon(state, user_id, daemon_id).await?;
-    let store = state.store.lock().await;
-    store
-        .daemons
-        .iter()
-        .find(|d| d.daemon_id == daemon_id.trim() && d.owner_user_id == Some(user_id))
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("daemon not found"))
-}
-
-pub(crate) async fn ensure_owned_daemon(
-    state: &AppState,
-    user_id: Uuid,
-    daemon_id: &str,
-) -> ApiResult<()> {
-    let daemon_id = daemon_id.trim();
-    let store = state.store.lock().await;
-    let daemon = store
-        .daemons
-        .iter()
-        .find(|d| d.daemon_id == daemon_id)
-        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
-    if daemon.owner_user_id == Some(user_id) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("daemon belongs to a different account"))
-    }
+    reject_hosted_control_api()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bip39::Language;
+
+    fn hosted_control_test_state(
+        root: &Path,
+        user: UserRecord,
+        daemon: DaemonRecord,
+    ) -> Arc<AppState> {
+        let config = ServiceConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            public_origin: "https://connect.example.test".to_string(),
+            rp_id: "example.test".to_string(),
+            data_file: root.join("state.json"),
+            daemon_token: None,
+            release_token: None,
+            cookie_secure: true,
+            invite_required: false,
+            open_daemon_registration: false,
+            dns_zone: None,
+            dns_ns_name: None,
+            dns_listen: None,
+        };
+        let webauthn = Webauthn::new(&config.rp_id, "Intendant Connect", &config.public_origin)
+            .require_user_verification(true)
+            .strict_base64(true);
+        let mut store = Store::default();
+        store.users.push(user);
+        store.daemons.push(daemon);
+        let vapid = load_or_create_vapid_keypair(&mut store).unwrap();
+        let log_key = load_or_create_log_keypair(&mut store).unwrap();
+        Arc::new(AppState {
+            config,
+            webauthn,
+            store: Mutex::new(store),
+            sessions: Mutex::new(HashMap::new()),
+            pending_registrations: Mutex::new(HashMap::new()),
+            pending_authentications: Mutex::new(HashMap::new()),
+            pending_offers: Mutex::new(HashMap::new()),
+            pending_claims: Mutex::new(HashMap::new()),
+            event_queues: Mutex::new(HashMap::new()),
+            event_notify: Notify::new(),
+            daemon_sessions: Mutex::new(HashMap::new()),
+            rate_limits: Mutex::new(HashMap::new()),
+            active_sessions: Mutex::new(HashMap::new()),
+            vapid,
+            log_key,
+            push_http: reqwest::Client::new(),
+            dns_zone: None,
+        })
+    }
 
     fn daemon_record(
         daemon_id: &str,
@@ -1941,13 +2057,422 @@ mod tests {
             daemon_public_key: format!("{daemon_id}-key"),
             owner_user_id,
             claim_code_hash: claim_code.map(claim_code_hash),
-            claim_code_daemon_minted: false,
             claim_code_created_unix_ms,
+            last_registration_proof_unix_ms: None,
+            route_link_revision: 0,
+            last_unclaim_proof_unix_ms: None,
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
             updated_unix_ms: 1,
             presence_hours: Vec::new(),
         }
+    }
+
+    fn pending_claim_for(daemon: &DaemonRecord) -> PendingClaim {
+        PendingClaim {
+            user_id: Uuid::new_v4(),
+            account_name: "alice".to_string(),
+            daemon_id: daemon.daemon_id.clone(),
+            daemon_public_key: daemon.daemon_public_key.clone(),
+            challenge: "challenge".to_string(),
+            created_unix_ms: 1,
+            claim_code_hash: daemon.claim_code_hash.clone().unwrap(),
+            claim_code_created_unix_ms: daemon.claim_code_created_unix_ms.unwrap(),
+            status: ClaimStatus::Pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_control_endpoints_refuse_without_mutating_relay_state() {
+        let root = tempfile::tempdir().unwrap();
+        let user_id = Uuid::new_v4();
+        let user = UserRecord {
+            id: user_id,
+            account_name: "alice".to_string(),
+            display_name: "alice".to_string(),
+            passkeys: Vec::new(),
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+            last_login_unix_ms: 1,
+            attestations: Vec::new(),
+        };
+        let daemon = daemon_record("daemon-1", Some(user_id), None, None);
+        let state = hosted_control_test_state(root.path(), user, daemon);
+        let (session, csrf) = create_session(&state, user_id).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{COOKIE_NAME}={session}").parse().unwrap(),
+        );
+        headers.insert(CSRF_HEADER, csrf.parse().unwrap());
+        headers.insert(header::ORIGIN, state.config.public_origin.parse().unwrap());
+        state.event_queues.lock().await.insert(
+            "daemon-1".to_string(),
+            VecDeque::from([RendezvousEvent {
+                id: "existing-route-event".to_string(),
+                kind: "claim_challenge".to_string(),
+                ..RendezvousEvent::default()
+            }]),
+        );
+        state.active_sessions.lock().await.insert(
+            "legacy-session".to_string(),
+            ActiveDashboardSession {
+                daemon_id: "daemon-1".to_string(),
+                session_id: "legacy-session".to_string(),
+                created_unix_ms: now_unix_ms(),
+            },
+        );
+
+        let offer = browser_offer(State(state.clone()), headers.clone()).await;
+        let offer_error = match offer {
+            Err(error) => error,
+            Ok(_) => panic!("hosted offer unexpectedly succeeded"),
+        };
+        assert_eq!(offer_error.status, StatusCode::FORBIDDEN);
+
+        let ice = browser_ice(State(state.clone()), headers.clone()).await;
+        assert_eq!(ice.unwrap_err().status, StatusCode::FORBIDDEN);
+
+        let close = browser_close(State(state.clone()), headers).await;
+        assert_eq!(close.unwrap_err().status, StatusCode::FORBIDDEN);
+
+        assert!(state.pending_offers.lock().await.is_empty());
+        let queues = state.event_queues.lock().await;
+        let queue = queues.get("daemon-1").unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().id, "existing-route-event");
+        drop(queues);
+        assert!(state
+            .active_sessions
+            .lock()
+            .await
+            .contains_key("legacy-session"));
+        assert!(state.rate_limits.lock().await.is_empty());
+    }
+
+    #[test]
+    fn route_release_transaction_keeps_memory_retryable_after_persist_failure() {
+        let owner = Uuid::new_v4();
+        let mut store = Store::default();
+        store.daemons.push(daemon_record(
+            "daemon-1",
+            Some(owner),
+            Some("abandon-ability-able-about-above-absent-absorb"),
+            Some(1),
+        ));
+
+        let failed = update_store_transaction(
+            &mut store,
+            |next| {
+                let daemon = &mut next.daemons[0];
+                daemon.owner_user_id = None;
+                daemon.route_link_revision += 1;
+                Ok(())
+            },
+            |_| Err(ApiError::internal("forced persist failure")),
+        );
+        assert!(failed.is_err());
+        assert_eq!(store.daemons[0].owner_user_id, Some(owner));
+        assert_eq!(store.daemons[0].route_link_revision, 0);
+
+        update_store_transaction(
+            &mut store,
+            |next| {
+                let daemon = &mut next.daemons[0];
+                daemon.owner_user_id = None;
+                daemon.route_link_revision += 1;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(store.daemons[0].owner_user_id, None);
+        assert_eq!(store.daemons[0].route_link_revision, 1);
+    }
+
+    #[test]
+    fn registration_persist_failure_does_not_consume_proof_or_route_code() {
+        let mut store = Store::default();
+        let claim_hash = "A".repeat(43);
+        let failed = update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_registration(
+                    next,
+                    "daemon-1",
+                    "daemon-key",
+                    &claim_hash,
+                    Some(1_700_000_000_000),
+                    1_700_000_000_100,
+                )
+            },
+            |_| Err(ApiError::internal("forced persist failure")),
+        );
+        assert!(failed.is_err());
+        assert!(store.daemons.is_empty());
+
+        let retried = update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_registration(
+                    next,
+                    "daemon-1",
+                    "daemon-key",
+                    &claim_hash,
+                    Some(1_700_000_000_000),
+                    1_700_000_000_100,
+                )
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!retried.claimed);
+        assert_eq!(store.daemons.len(), 1);
+        assert_eq!(
+            store.daemons[0].last_registration_proof_unix_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            store.daemons[0].claim_code_hash.as_deref(),
+            Some(claim_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn registration_shape_rejects_oversized_and_noncanonical_identity_fields() {
+        let signing =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(signing.as_ref()).unwrap();
+        use ring::signature::KeyPair as _;
+        let now = 1_700_000_000_000;
+        let public_key = b64u(keypair.public_key().as_ref());
+        let claim_code_hash = "A".repeat(43);
+        let payload = registration_signing_payload("daemon-1", &public_key, &claim_code_hash, now);
+        let signature = b64u(keypair.sign(payload.as_bytes()).as_ref());
+        let valid = DaemonRegisterRequest {
+            protocol: PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key: public_key,
+            claim_code_hash,
+            issued_at_unix_ms: now,
+            signature,
+        };
+        validate_daemon_register_shape(&valid, false).unwrap();
+
+        let mut oversized = DaemonRegisterRequest {
+            daemon_id: "d".repeat(MAX_DAEMON_ID_BYTES + 1),
+            ..valid.clone()
+        };
+        assert!(validate_daemon_register_shape(&oversized, false).is_err());
+        oversized.daemon_id = "daemon/with/slash".to_string();
+        assert!(validate_daemon_register_shape(&oversized, false).is_err());
+
+        let mut bad_key = valid.clone();
+        bad_key.daemon_public_key.push('=');
+        assert!(validate_daemon_register_shape(&bad_key, false).is_err());
+        bad_key.daemon_public_key = "A".repeat(42);
+        assert!(validate_daemon_register_shape(&bad_key, false).is_err());
+
+        let mut bad_signature = valid.clone();
+        bad_signature.signature.push('=');
+        assert!(validate_daemon_register_shape(&bad_signature, false).is_err());
+        bad_signature.signature = "A".repeat(85);
+        assert!(validate_daemon_register_shape(&bad_signature, false).is_err());
+
+        let mut whitespace = valid;
+        whitespace.daemon_id.push(' ');
+        assert!(validate_daemon_register_shape(&whitespace, false).is_err());
+    }
+
+    #[test]
+    fn unclaimed_registration_capacity_is_bounded_without_blocking_refreshes() {
+        let now = 1_700_000_000_000;
+        let mut store = Store::default();
+        for index in 0..MAX_UNCLAIMED_DAEMONS {
+            store.daemons.push(daemon_record(
+                &format!("daemon-{index}"),
+                None,
+                Some(&format!("route-code-{index}")),
+                Some(now),
+            ));
+            store.daemons[index].last_seen_unix_ms = now;
+        }
+        let before = store.clone();
+        let error = apply_daemon_registration(
+            &mut store,
+            "capacity-overflow",
+            "new-key",
+            &"Z".repeat(43),
+            Some(now),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(store.daemons.len(), MAX_UNCLAIMED_DAEMONS);
+        assert_eq!(store.daemons[0].daemon_id, before.daemons[0].daemon_id);
+
+        let existing_key = store.daemons[0].daemon_public_key.clone();
+        let existing_hash = store.daemons[0].claim_code_hash.clone().unwrap();
+        apply_daemon_registration(
+            &mut store,
+            "daemon-0",
+            &existing_key,
+            &existing_hash,
+            Some(now + 1),
+            now + 1,
+        )
+        .expect("an existing daemon may refresh while capacity is full");
+        assert_eq!(store.daemons.len(), MAX_UNCLAIMED_DAEMONS);
+    }
+
+    #[test]
+    fn claim_start_persist_failure_publishes_no_durable_start_and_retries_exactly() {
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        let daemon = daemon_record("daemon-1", None, Some(code), Some(42));
+        let hash = daemon.claim_code_hash.clone().unwrap();
+        let user_id = Uuid::new_v4();
+        let mut store = Store::default();
+        store.daemons.push(daemon);
+
+        let failed = update_store_transaction(
+            &mut store,
+            |next| apply_claim_start_audit(next, "daemon-1", &hash, 42, user_id, "claim-1", 43),
+            |_| Err(ApiError::internal("forced persist failure")),
+        );
+        assert!(failed.is_err());
+        assert!(store.audit.is_empty());
+        assert_eq!(
+            store.daemons[0].claim_code_hash.as_deref(),
+            Some(hash.as_str())
+        );
+
+        update_store_transaction(
+            &mut store,
+            |next| apply_claim_start_audit(next, "daemon-1", &hash, 42, user_id, "claim-1", 43),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(store.audit.len(), 1);
+        assert_eq!(store.audit[0].event, "daemon_claim_started");
+        assert_eq!(store.audit[0].user_id, Some(user_id));
+        assert_eq!(store.audit[0].daemon_id.as_deref(), Some("daemon-1"));
+        assert_eq!(store.audit[0].detail["claim_id"], "claim-1");
+        assert_eq!(store.audit[0].detail["authority"], "none");
+    }
+
+    #[test]
+    fn claim_persist_failure_keeps_store_and_pending_status_retryable() {
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        let daemon = daemon_record("daemon-1", None, Some(code), Some(42));
+        let claim = pending_claim_for(&daemon);
+        let user_id = claim.user_id;
+        let mut status = ClaimStatus::Pending;
+        let mut store = Store::default();
+        store.users.push(UserRecord {
+            id: user_id,
+            account_name: "alice".to_string(),
+            display_name: "alice".to_string(),
+            passkeys: Vec::new(),
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+            last_login_unix_ms: 1,
+            attestations: Vec::new(),
+        });
+        store.daemons.push(daemon);
+
+        let failed = update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_claim_link(
+                    next,
+                    &claim,
+                    "claim-1",
+                    "request-1",
+                    "daemon-1",
+                    CLAIM_PROTOCOL_V2,
+                    100,
+                )
+            },
+            |_| Err(ApiError::internal("forced persist failure")),
+        );
+        assert!(failed.is_err());
+        assert!(matches!(status, ClaimStatus::Pending));
+        assert_eq!(store.daemons[0].owner_user_id, None);
+        assert_eq!(
+            store.daemons[0].claim_code_hash,
+            Some(claim.claim_code_hash.clone())
+        );
+        assert!(store.audit.is_empty());
+        assert!(store.log_entries.is_empty());
+
+        update_store_transaction(
+            &mut store,
+            |next| {
+                apply_daemon_claim_link(
+                    next,
+                    &claim,
+                    "claim-1",
+                    "request-1",
+                    "daemon-1",
+                    CLAIM_PROTOCOL_V2,
+                    100,
+                )
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        status = ClaimStatus::Approved {
+            daemon_id: "daemon-1".to_string(),
+        };
+        assert!(matches!(status, ClaimStatus::Approved { .. }));
+        assert_eq!(store.daemons[0].owner_user_id, Some(user_id));
+        assert_eq!(store.daemons[0].claim_code_hash, None);
+        assert_eq!(store.audit.len(), 1);
+        assert_eq!(store.log_entries.len(), 1);
+    }
+
+    #[test]
+    fn claim_generation_accepts_only_the_exact_unconsumed_route_code() {
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        let daemon = daemon_record("daemon", None, Some(code), Some(42));
+        let claim = pending_claim_for(&daemon);
+        assert!(claim_generation_is_current(&daemon, &claim));
+
+        let mut linked = daemon.clone();
+        linked.owner_user_id = Some(Uuid::new_v4());
+        assert!(!claim_generation_is_current(&linked, &claim));
+
+        let mut consumed = daemon.clone();
+        consumed.claim_code_hash = None;
+        assert!(!claim_generation_is_current(&consumed, &claim));
+
+        let mut rotated = daemon.clone();
+        rotated.claim_code_hash = Some(claim_code_hash(
+            "abstract-absurd-abuse-access-accident-account-accuse",
+        ));
+        assert!(!claim_generation_is_current(&rotated, &claim));
+
+        let mut rekeyed = daemon.clone();
+        rekeyed.daemon_public_key = "replacement-key".to_string();
+        assert!(!claim_generation_is_current(&rekeyed, &claim));
+
+        let mut reissued = daemon;
+        reissued.claim_code_created_unix_ms = Some(43);
+        assert!(!claim_generation_is_current(&reissued, &claim));
+    }
+
+    #[test]
+    fn registration_never_rekeys_an_existing_daemon_id() {
+        let unlinked = daemon_record("daemon", None, None, None);
+        assert!(require_registration_key_match(&unlinked, "daemon-key").is_ok());
+        let error = require_registration_key_match(&unlinked, "replacement-key").unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("already bound"));
+
+        let linked = daemon_record("daemon", Some(Uuid::new_v4()), None, None);
+        assert!(require_registration_key_match(&linked, "daemon-key").is_ok());
+        assert!(require_registration_key_match(&linked, "replacement-key").is_err());
     }
 
     #[test]
@@ -1956,7 +2481,7 @@ mod tests {
         let mut store = Store::default();
         let mut stale = daemon_record("stale-unclaimed", None, None, None);
         stale.last_seen_unix_ms = now - UNCLAIMED_DAEMON_TTL_MS - 1;
-        // Claimed daemons are the owner's — staleness never sweeps them.
+        // Account-linked routes are durable — staleness never sweeps them.
         let mut claimed = daemon_record("stale-claimed", Some(Uuid::new_v4()), None, None);
         claimed.last_seen_unix_ms = 0;
         let mut fresh = daemon_record("fresh-unclaimed", None, None, None);
@@ -1969,27 +2494,16 @@ mod tests {
         assert_eq!(ids, vec!["stale-claimed", "fresh-unclaimed"]);
     }
 
-    #[test]
-    fn generated_claim_code_is_12_word_bip39_mnemonic() {
-        let code = generate_claim_code().unwrap();
-        let parts: Vec<_> = code.split('-').collect();
-        let words = Language::English.word_list();
-        assert_eq!(parts.len(), 12);
-        for part in &parts {
-            assert!(words.contains(part), "unexpected claim word {part}");
-        }
-        assert_eq!(normalize_claim_code(&code), code);
-        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &code.replace('-', " "))
-            .expect("generated phrase must be a valid BIP39 mnemonic");
-        assert_eq!(mnemonic.to_entropy().len(), CLAIM_CODE_ENTROPY_BYTES);
-    }
-
     /// Pins the exact byte strings daemons sign. The daemon replicates
     /// these in `connect_rendezvous.rs` (same golden literals there) —
     /// a drift on either side fails one of the twin tests instead of
     /// shipping as an unverifiable signature.
     #[test]
     fn claim_and_unclaim_payloads_pin_the_wire_format() {
+        assert_eq!(
+            registration_signing_payload("daemon-1", "PubKey", "ClaimHash", 1_700_000_000_000),
+            "intendant-connect-register-proof-v1\ndaemon-1\nPubKey\nClaimHash\n1700000000000\n"
+        );
         assert_eq!(
             claim_signing_payload("claim-1", "daemon-1", "PubKey", "challenge-1"),
             "intendant-connect-claim-v1\nclaim-1\ndaemon-1\nPubKey\nchallenge-1\n"
@@ -2023,6 +2537,97 @@ mod tests {
         assert_eq!(
             dns_acme_signing_payload("daemon-1", "PubKey", 1_700_000_000_000, "tok-value"),
             "intendant-connect-dns-acme-v1\ndaemon-1\nPubKey\n1700000000000\ntok-value\n"
+        );
+    }
+
+    #[test]
+    fn registration_requires_possession_of_the_advertised_daemon_key() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        use ring::signature::KeyPair as _;
+        let daemon_public_key = b64u(key.public_key().as_ref());
+        let now = 1_700_000_000_000;
+        let claim_code_hash = claim_code_hash("abandon-ability-able-about-above-absent-absorb");
+        let payload =
+            registration_signing_payload("daemon-1", &daemon_public_key, &claim_code_hash, now);
+        let signature = b64u(key.sign(payload.as_bytes()).as_ref());
+        let valid = DaemonRegisterRequest {
+            protocol: PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key: daemon_public_key.clone(),
+            claim_code_hash: claim_code_hash.clone(),
+            issued_at_unix_ms: now,
+            signature,
+        };
+        verify_registration_proof(&valid, now).unwrap();
+
+        let copied_public_key = DaemonRegisterRequest {
+            signature: b64u(&[0u8; 64]),
+            ..valid
+        };
+        let error = verify_registration_proof(&copied_public_key, now).unwrap_err();
+        assert!(error.message.contains("signature is invalid"));
+
+        let stale_payload = registration_signing_payload(
+            "daemon-1",
+            &daemon_public_key,
+            &claim_code_hash,
+            now - REGISTER_PROOF_MAX_SKEW_MS - 1,
+        );
+        let stale = DaemonRegisterRequest {
+            protocol: PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key,
+            claim_code_hash,
+            issued_at_unix_ms: now - REGISTER_PROOF_MAX_SKEW_MS - 1,
+            signature: b64u(key.sign(stale_payload.as_bytes()).as_ref()),
+        };
+        let error = verify_registration_proof(&stale, now).unwrap_err();
+        assert!(error.message.contains("stale"));
+    }
+
+    #[test]
+    fn daemon_session_credentials_are_exact_and_unforgeable_from_daemon_id() {
+        assert!(daemon_session_tokens_match("secret-token", "secret-token"));
+        assert!(!daemon_session_tokens_match("secret-token", "daemon-1"));
+        assert!(!daemon_session_tokens_match(
+            "secret-token",
+            "secret-token-2"
+        ));
+    }
+
+    #[test]
+    fn unclaim_replay_cannot_unlink_a_newer_route_generation() {
+        let owner = Uuid::new_v4();
+        let mut daemon = daemon_record("daemon-1", Some(owner), None, None);
+        daemon.route_link_revision = 7;
+        validate_unclaim_transition(&daemon, "daemon-1-key", Some(owner), 7, 100).unwrap();
+
+        daemon.last_unclaim_proof_unix_ms = Some(100);
+        assert!(
+            validate_unclaim_transition(&daemon, "daemon-1-key", Some(owner), 7, 100)
+                .unwrap_err()
+                .message
+                .contains("already consumed")
+        );
+
+        daemon.last_unclaim_proof_unix_ms = None;
+        daemon.route_link_revision = 8;
+        assert!(
+            validate_unclaim_transition(&daemon, "daemon-1-key", Some(owner), 7, 101)
+                .unwrap_err()
+                .message
+                .contains("route link changed")
+        );
+
+        daemon.route_link_revision = 7;
+        daemon.owner_user_id = Some(Uuid::new_v4());
+        assert!(
+            validate_unclaim_transition(&daemon, "daemon-1-key", Some(owner), 7, 101)
+                .unwrap_err()
+                .message
+                .contains("route link changed")
         );
     }
 
@@ -2113,6 +2718,23 @@ mod tests {
     }
 
     #[test]
+    fn claim_start_request_accepts_only_the_hash() {
+        let digest = "Q4-Jf1pewq3jBEyujMeltvQLFADs3UikZAMej9Iu4j0";
+        let parsed: ClaimStartRequest =
+            serde_json::from_value(json!({ "claim_code_hash": digest })).unwrap();
+        assert_eq!(parsed.claim_code_hash, digest);
+        assert!(serde_json::from_value::<ClaimStartRequest>(json!({
+            "claim_code": "abandon-ability-able-about-above-absent-absorb"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ClaimStartRequest>(json!({
+            "claim_code_hash": digest,
+            "claim_code": "must-not-be-accepted"
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn claim_code_normalization_accepts_case_and_separator_variants() {
         let code = "abandon-ability-able-about-above-absent-absorb";
         assert_eq!(
@@ -2165,43 +2787,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_claim_code_reuses_fresh_unique_in_memory_code() {
-        let now = now_unix_ms();
-        let code = "abandon-ability-able-about-above-absent-absorb";
-        let mut daemon = daemon_record("daemon", None, Some(code), Some(now));
-        let mut claim_codes = HashMap::from([(daemon.daemon_id.clone(), code.to_string())]);
-        let active_hashes = HashSet::new();
-
-        let returned = ensure_claim_code(&mut claim_codes, &mut daemon, &active_hashes).unwrap();
-
-        assert_eq!(returned, code);
-        let expected_hash = claim_code_hash(code);
-        assert_eq!(
-            daemon.claim_code_hash.as_deref(),
-            Some(expected_hash.as_str())
-        );
-    }
-
-    #[test]
-    fn ensure_claim_code_replaces_active_hash_collision() {
-        let now = now_unix_ms();
-        let code = "abandon-ability-able-about-above-absent-absorb";
-        let mut daemon = daemon_record("daemon", None, Some(code), Some(now));
-        let mut claim_codes = HashMap::from([(daemon.daemon_id.clone(), code.to_string())]);
-        let active_hashes = HashSet::from([claim_code_hash(code)]);
-
-        let returned = ensure_claim_code(&mut claim_codes, &mut daemon, &active_hashes).unwrap();
-
-        assert_ne!(returned, code);
-        assert!(!active_hashes.contains(&claim_code_hash(&returned)));
-        let expected_hash = claim_code_hash(&returned);
-        assert_eq!(
-            daemon.claim_code_hash.as_deref(),
-            Some(expected_hash.as_str())
-        );
-    }
-
-    #[test]
     fn dry_push_payload_names_daemon_and_credentials() {
         let payload = dry_push_payload(
             "daemon-1",
@@ -2215,11 +2800,11 @@ mod tests {
         let body = payload["body"].as_str().unwrap();
         assert!(body.contains("Personal Anthropic"), "{body}");
         assert!(body.contains("oauth:codex"), "{body}");
-        assert!(body.contains("Reconnect a fueling session"), "{body}");
-        assert_eq!(
-            payload["url"].as_str(),
-            Some("/app?connect=1&daemon_id=daemon-1")
+        assert!(
+            body.contains("Reconnect a trusted fueling session"),
+            "{body}"
         );
+        assert_eq!(payload["url"].as_str(), Some("/connect"));
 
         // No names at all still produces a sensible message.
         let fallback = dry_push_payload("d", "D", &[]);

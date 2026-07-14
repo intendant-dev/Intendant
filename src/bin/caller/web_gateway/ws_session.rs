@@ -4,6 +4,11 @@
 //! slices, the inbound frame-dispatch reader.
 
 use super::*;
+use tokio_util::sync::CancellationToken;
+
+fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: &str) -> bool {
+    !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
+}
 
 /// Cache-backed resync lines for a `/ws` connection that lagged the
 /// outbound broadcast: the same latest-state lines a fresh bootstrap
@@ -81,14 +86,32 @@ pub(crate) async fn ws_outbound_task(
     session_registry: Option<crate::display::SharedSessionRegistry>,
     bootstrap_caches: crate::dashboard_control::DashboardBootstrapCaches,
     mut bootstrap_flushed_rx: tokio::sync::oneshot::Receiver<()>,
+    grant: crate::dashboard_control::DashboardControlGrant,
+    session_cancel: CancellationToken,
 ) {
     let mut bootstrap_flushed = false;
+    let mut authority_tick =
+        tokio::time::interval(crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL);
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
+            _ = session_cancel.cancelled() => break,
+            _ = authority_tick.tick() => {
+                if !grant.opening_authority_is_current() {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                    session_cancel.cancel();
+                    break;
+                }
+            }
             msg = direct_rx.recv() => {
                 match msg {
                     Some(line) => {
+                        if !grant.opening_authority_is_current() {
+                            let _ = ws_tx.send(Message::Close(None)).await;
+                            session_cancel.cancel();
+                            break;
+                        }
                         if ws_tx
                             .send(Message::Text(line.into()))
                             .await
@@ -109,6 +132,11 @@ pub(crate) async fn ws_outbound_task(
                 bootstrap_flushed = true;
             }
             msg = outbound_rx.recv(), if bootstrap_flushed => {
+                if !grant.opening_authority_is_current() {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                    session_cancel.cancel();
+                    break;
+                }
                 match msg {
                     Ok(line) => {
                         if ws_tx
@@ -172,6 +200,11 @@ pub(crate) async fn ws_outbound_task(
                 }
             }
             msg = authority_change_rx.recv() => {
+                if !grant.opening_authority_is_current() {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                    session_cancel.cancel();
+                    break;
+                }
                 match msg {
                     Ok(change) => {
                         // Personalize: never ship the holder's identity.
@@ -246,6 +279,7 @@ pub(crate) async fn ws_outbound_task(
             }
         }
     }
+    session_cancel.cancel();
 }
 
 /// Shared handles the inbound frame-dispatch task needs, cloned once per
@@ -280,6 +314,7 @@ pub(crate) struct WsInboundCtx {
     pub(crate) ice_config: crate::display::IceConfig,
     pub(crate) tcp_advertised_port: Option<u16>,
     pub(crate) tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+    pub(crate) session_cancel: CancellationToken,
 }
 
 /// Inbound half of a local `/ws` session: WebSocket -> EventBus frame
@@ -321,6 +356,7 @@ pub(crate) async fn ws_inbound_task(
         ice_config,
         tcp_advertised_port,
         tcp_peer_registry,
+        session_cancel,
     } = ctx;
     // Track whether this connection has an active presence model,
     // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -346,10 +382,6 @@ pub(crate) async fn ws_inbound_task(
     // frame itself is sent for every rejected frame.
     let mut ws_denied_logged: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Shell-session lane for this connection: root sees
-    // every session, scoped principals see owned/shared.
-    let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
-
     // Per-connection audio transcription buffer.
     // PCM16 bytes are accumulated and drained every ~3s.
     let mut audio_buf: Vec<u8> = Vec::new();
@@ -357,8 +389,22 @@ pub(crate) async fn ws_inbound_task(
     // Input sample rate (known from config, default 16kHz)
     let audio_sample_rate: u32 = 16000;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let next = tokio::select! {
+            _ = session_cancel.cancelled() => break,
+            next = ws_rx.next() => next,
+        };
+        let Some(Ok(msg)) = next else {
+            break;
+        };
+        if !dashboard_control_grant_inbound.opening_authority_is_current() {
+            session_cancel.cancel();
+            break;
+        }
         if let Message::Text(text) = msg {
+            // Re-derive after the live IAM check above so a root→scoped
+            // change can never retain the root terminal visibility lane.
+            let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1470,7 +1516,16 @@ pub(crate) async fn ws_inbound_task(
                             .get("candidate")
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({}));
-                        if session_id.is_empty() {
+                        if !websocket_owns_dashboard_control_session(
+                            &dashboard_control_session_ids,
+                            &session_id,
+                        ) {
+                            let msg = serde_json::json!({
+                                "t": "dashboard_control_error",
+                                "session_id": session_id,
+                                "error": "dashboard control session was not opened by this WebSocket connection",
+                            });
+                            let _ = direct_tx_inbound.send(msg.to_string());
                             continue;
                         }
                         let registry = Arc::clone(&dashboard_control_inbound);
@@ -1484,10 +1539,20 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("dashboard_control_close") => {
                         let session_id = json["session_id"].as_str().unwrap_or("").to_string();
-                        if !session_id.is_empty() {
-                            dashboard_control_inbound.close(&session_id).await;
-                            dashboard_control_session_ids.retain(|s| s != &session_id);
+                        if !websocket_owns_dashboard_control_session(
+                            &dashboard_control_session_ids,
+                            &session_id,
+                        ) {
+                            let msg = serde_json::json!({
+                                "t": "dashboard_control_error",
+                                "session_id": session_id,
+                                "error": "dashboard control session was not opened by this WebSocket connection",
+                            });
+                            let _ = direct_tx_inbound.send(msg.to_string());
+                            continue;
                         }
+                        dashboard_control_inbound.close(&session_id).await;
+                        dashboard_control_session_ids.retain(|s| s != &session_id);
                     }
                     Some("terminal_open") => {
                         // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}
@@ -1516,7 +1581,7 @@ pub(crate) async fn ws_inbound_task(
                                 )
                                 .allowed,
                             shared: json["shared"].as_bool().unwrap_or(false),
-                            scope: dashboard_control_grant_inbound.filesystem().cloned(),
+                            scope: dashboard_control_grant_inbound.filesystem(),
                         };
                         match terminal_registry_inbound
                             .open_or_attach(
@@ -2006,6 +2071,7 @@ pub(crate) async fn ws_inbound_task(
             }
         }
     }
+    session_cancel.cancel();
 
     // WebSocket closed — clean up active slot and auto-resume
     // server presence if this was the active browser (covers tab
@@ -2096,4 +2162,23 @@ pub(crate) async fn ws_inbound_task(
     }
     // Tab presence: this event-lane connection is gone.
     dashboard_tabs_inbound.unregister(&connection_id_inbound);
+}
+
+#[cfg(test)]
+mod signaling_ownership_tests {
+    use super::websocket_owns_dashboard_control_session;
+
+    #[test]
+    fn websocket_rejects_cross_connection_dashboard_control_session_ids() {
+        let owned = vec!["session-opened-here".to_string()];
+        assert!(websocket_owns_dashboard_control_session(
+            &owned,
+            "session-opened-here"
+        ));
+        assert!(!websocket_owns_dashboard_control_session(
+            &owned,
+            "session-opened-elsewhere"
+        ));
+        assert!(!websocket_owns_dashboard_control_session(&owned, ""));
+    }
 }

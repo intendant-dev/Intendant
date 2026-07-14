@@ -211,8 +211,8 @@ pub(crate) fn build_web_tls_acceptor(
                     CallerError::Config(format!(
                         "Dashboard mTLS is enabled by default and first-boot access \
                          certificate provisioning failed: {e}. Run `intendant access \
-                         setup`, pass `--tls` for HTTPS without client certificate \
-                         authentication, or pass `--no-tls --bind 127.0.0.1` only for \
+                         setup`, pass `--tls` for HTTPS with certless authority limited \
+                         to loopback, or pass `--no-tls --bind 127.0.0.1` only for \
                          explicit local/debug plaintext."
                     ))
                 })?;
@@ -314,7 +314,7 @@ pub(crate) fn missing_default_mtls_cert_message(cert_dir: &Path) -> String {
          found in {cert_dir} (expected server.crt and server.key). The directory holds other \
          access material, so first-boot auto-provisioning stayed hands-off rather than touch an \
          existing CA. Run `intendant access setup` to (re)generate what's missing, pass `--tls` \
-         for HTTPS without client certificate authentication, or pass `--no-tls --bind \
+         for HTTPS with certless authority limited to loopback, or pass `--no-tls --bind \
          127.0.0.1` only for explicit local/debug plaintext.",
         cert_dir = cert_dir.display()
     )

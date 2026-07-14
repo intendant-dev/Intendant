@@ -7,7 +7,8 @@
 use crate::error::CallerError;
 use crate::event::AppEvent;
 use crate::peer::access_policy::{
-    filesystem_access_allowed, FilesystemAccessKind, FilesystemAccessPolicy, PeerOperation,
+    filesystem_access_canonical_subject, FilesystemAccessKind, FilesystemAccessPolicy,
+    PeerOperation,
 };
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -26,7 +27,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Seek as _, SeekFrom};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +41,10 @@ const COMMAND_CHANNEL: usize = 64;
 const CHUNK_BYTES: usize = 16 * 1024;
 const MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
 const PENDING_CANDIDATES_PER_SESSION: usize = 64;
+const MAX_PENDING_TRANSFER_RESERVATIONS: usize = 128;
+const MAX_PENDING_TRANSFER_RESERVATIONS_PER_OWNER: usize = 8;
+const PENDING_TRANSFER_RESERVATION_TTL: Duration = Duration::from_secs(60);
+const LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const TCP_OUT_QUEUE: usize = 256;
 
 #[derive(Clone, Debug)]
@@ -48,9 +53,32 @@ pub struct PeerFileTransferAuthorization {
     pub label: String,
     pub profile: String,
     pub filesystem: FilesystemAccessPolicy,
+    /// Exact peer identity that authenticated the opening and its
+    /// daemon-owned store. Production sessions must carry both; `(None,
+    /// None)` is reserved for hermetic unit fixtures.
+    pub identity_record: Option<crate::peer::access_policy::PeerIdentityRecord>,
+    pub iam_cert_dir: Option<PathBuf>,
 }
 
 impl PeerFileTransferAuthorization {
+    fn is_current(&self) -> bool {
+        match (&self.identity_record, &self.iam_cert_dir) {
+            // Production construction always carries the exact opening
+            // identity and its store. The empty pair exists only to keep
+            // focused unit fixtures independent of machine state.
+            #[cfg(test)]
+            (None, None) => true,
+            (Some(opening), Some(cert_dir)) => {
+                let now_unix = crate::access::client_key::now_unix_ms() / 1000;
+                matches!(
+                    crate::peer::access_policy::lookup_identity(cert_dir, &self.fingerprint),
+                    Ok(Some(current)) if current == *opening && current.is_active(now_unix)
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn access_principal(&self) -> crate::access::iam::AccessPrincipal {
         crate::access::iam::AccessPrincipal::peer_daemon(
             self.fingerprint.clone(),
@@ -67,7 +95,21 @@ pub struct PeerFileTransferRegistry {
     bus: crate::event::EventBus,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     peers: Arc<Mutex<HashMap<String, PeerFileTransferPeer>>>,
-    pending_candidates: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pending_reservations: Arc<Mutex<HashMap<String, PendingTransferReservation>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerFileTransferSessionMutation {
+    Applied,
+    NotFound,
+    Forbidden,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTransferReservation {
+    owner_fingerprint: String,
+    candidates: Vec<String>,
+    created_at: Instant,
 }
 
 impl PeerFileTransferRegistry {
@@ -81,7 +123,7 @@ impl PeerFileTransferRegistry {
             bus,
             tcp_peer_registry,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            pending_candidates: Arc::new(Mutex::new(HashMap::new())),
+            pending_reservations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -90,9 +132,39 @@ impl PeerFileTransferRegistry {
         session_id: String,
         offer_sdp: String,
         authorization: PeerFileTransferAuthorization,
-        tcp_advertised_addr: Option<SocketAddr>,
+        advertise_tcp_via_url: Option<String>,
     ) -> Result<String, String> {
-        let (peer, answer_sdp) = PeerFileTransferPeer::answer_offer(
+        if !authorization.is_current() {
+            return Err(
+                "peer file-transfer opening identity changed or is no longer active".into(),
+            );
+        }
+        let owner_fingerprint = authorization.fingerprint.clone();
+        let reservation_created_at = Instant::now();
+        {
+            let peers = self.peers.lock().await;
+            if let Some(existing) = peers.get(&session_id) {
+                return Err(if existing.belongs_to(&owner_fingerprint) {
+                    "peer file-transfer session already exists".to_string()
+                } else {
+                    "peer file-transfer session belongs to another authenticated peer".to_string()
+                });
+            }
+            let mut reservations = self.pending_reservations.lock().await;
+            reserve_pending_transfer_session(
+                &mut reservations,
+                &session_id,
+                &owner_fingerprint,
+                reservation_created_at,
+            )?;
+        }
+        let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
+            Some(url) if !url.is_empty() => {
+                crate::web_gateway::resolve_url_to_socket_addr(url).await
+            }
+            _ => None,
+        };
+        let answer = PeerFileTransferPeer::answer_offer(
             session_id.clone(),
             offer_sdp,
             authorization,
@@ -101,37 +173,103 @@ impl PeerFileTransferRegistry {
             Arc::clone(&self.tcp_peer_registry),
             tcp_advertised_addr,
         )
-        .await
-        .map_err(|e| e.to_string())?;
-        self.peers
-            .lock()
-            .await
-            .insert(session_id.clone(), peer.clone());
-        let pending = self
-            .pending_candidates
-            .lock()
-            .await
-            .remove(&session_id)
-            .unwrap_or_default();
-        for candidate in pending {
-            peer.add_ice_candidate(candidate).await?;
+        .await;
+        let (peer, answer_sdp) = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.release_pending_reservation(&session_id, &owner_fingerprint)
+                    .await;
+                return Err(error.to_string());
+            }
+        };
+        if !peer.opening_authority_is_current() {
+            peer.close().await;
+            self.release_pending_reservation(&session_id, &owner_fingerprint)
+                .await;
+            return Err("peer file-transfer identity changed during WebRTC setup".into());
+        }
+        let pending_candidates = {
+            let mut peers = self.peers.lock().await;
+            if let Some(existing) = peers.get(&session_id) {
+                let message = if existing.belongs_to(&peer.owner_fingerprint) {
+                    "peer file-transfer session already exists"
+                } else {
+                    "peer file-transfer session belongs to another authenticated peer"
+                };
+                drop(peers);
+                peer.close().await;
+                return Err(message.to_string());
+            }
+            let mut reservations = self.pending_reservations.lock().await;
+            prune_expired_transfer_reservations(&mut reservations, Instant::now());
+            let Some(reservation) = reservations.get(&session_id) else {
+                drop(reservations);
+                drop(peers);
+                peer.close().await;
+                return Err("peer file-transfer offer reservation expired or was closed".into());
+            };
+            if reservation.owner_fingerprint != owner_fingerprint
+                || reservation.created_at != reservation_created_at
+            {
+                drop(reservations);
+                drop(peers);
+                peer.close().await;
+                return Err(
+                    "peer file-transfer offer reservation was replaced by another negotiation"
+                        .into(),
+                );
+            }
+            let pending = reservations
+                .remove(&session_id)
+                .expect("transfer reservation existed under the same lock")
+                .candidates;
+            peers.insert(session_id.clone(), peer.clone());
+            pending
+        };
+        for candidate in pending_candidates {
+            if let Err(error) = peer.add_ice_candidate(candidate).await {
+                let _ = self.close_for_peer(&session_id, &owner_fingerprint).await;
+                return Err(error);
+            }
         }
         Ok(answer_sdp)
     }
 
-    pub async fn add_ice_candidate(
+    pub async fn add_ice_candidate_for_peer(
         &self,
         session_id: &str,
         candidate_json: &str,
-    ) -> Result<bool, String> {
+        owner_fingerprint: &str,
+    ) -> Result<PeerFileTransferSessionMutation, String> {
         let candidate: serde_json::Value =
             serde_json::from_str(candidate_json).map_err(|e| format!("invalid ICE JSON: {e}"))?;
+        // ICE never creates state. The authenticated owner must first reserve
+        // the caller-chosen id by sending an Offer; this keeps the pending map
+        // bounded and prevents one peer from attaching to another's session.
+        {
+            let peers = self.peers.lock().await;
+            if let Some(peer) = peers.get(session_id) {
+                if !peer.belongs_to(owner_fingerprint) || !peer.opening_authority_is_current() {
+                    return Ok(PeerFileTransferSessionMutation::Forbidden);
+                }
+            } else {
+                let mut reservations = self.pending_reservations.lock().await;
+                prune_expired_transfer_reservations(&mut reservations, Instant::now());
+                match reservations.get(session_id) {
+                    Some(reservation) if reservation.owner_fingerprint != owner_fingerprint => {
+                        return Ok(PeerFileTransferSessionMutation::Forbidden)
+                    }
+                    Some(_) => {}
+                    None => return Ok(PeerFileTransferSessionMutation::NotFound),
+                }
+            }
+        }
         let candidate_str = candidate
             .get("candidate")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if candidate_str.is_empty() {
-            return Ok(true);
+            return Ok(PeerFileTransferSessionMutation::Applied);
         }
         let resolved = match crate::display::webrtc::resolve_mdns_in_candidate(candidate_str).await
         {
@@ -144,34 +282,130 @@ impl PeerFileTransferRegistry {
                     content: format!("mDNS resolve failed for transfer ICE candidate: {e}"),
                     turn: None,
                 });
-                return Ok(true);
+                return Ok(PeerFileTransferSessionMutation::Applied);
             }
         };
-        let peer = self.peers.lock().await.get(session_id).cloned();
-        let Some(peer) = peer else {
-            let mut pending = self.pending_candidates.lock().await;
-            let entry = pending.entry(session_id.to_string()).or_default();
-            if entry.len() < PENDING_CANDIDATES_PER_SESSION {
-                entry.push(resolved);
+        let peer = {
+            let peers = self.peers.lock().await;
+            if let Some(peer) = peers.get(session_id) {
+                if !peer.belongs_to(owner_fingerprint) || !peer.opening_authority_is_current() {
+                    return Ok(PeerFileTransferSessionMutation::Forbidden);
+                }
+                peer.clone()
+            } else {
+                let mut reservations = self.pending_reservations.lock().await;
+                prune_expired_transfer_reservations(&mut reservations, Instant::now());
+                let Some(reservation) = reservations.get_mut(session_id) else {
+                    return Ok(PeerFileTransferSessionMutation::NotFound);
+                };
+                if reservation.owner_fingerprint != owner_fingerprint {
+                    return Ok(PeerFileTransferSessionMutation::Forbidden);
+                }
+                if reservation.candidates.len() < PENDING_CANDIDATES_PER_SESSION {
+                    reservation.candidates.push(resolved);
+                }
+                return Ok(PeerFileTransferSessionMutation::Applied);
             }
-            return Ok(true);
         };
         peer.add_ice_candidate(resolved).await?;
-        Ok(true)
+        Ok(PeerFileTransferSessionMutation::Applied)
     }
 
-    pub async fn close(&self, session_id: &str) {
-        if let Some(peer) = self.peers.lock().await.remove(session_id) {
-            peer.close().await;
-        }
-        self.pending_candidates.lock().await.remove(session_id);
+    pub async fn close_for_peer(
+        &self,
+        session_id: &str,
+        owner_fingerprint: &str,
+    ) -> PeerFileTransferSessionMutation {
+        let peer = {
+            let mut peers = self.peers.lock().await;
+            let Some(existing) = peers.get(session_id) else {
+                let mut reservations = self.pending_reservations.lock().await;
+                prune_expired_transfer_reservations(&mut reservations, Instant::now());
+                return match reservations.get(session_id) {
+                    Some(existing) if existing.owner_fingerprint != owner_fingerprint => {
+                        PeerFileTransferSessionMutation::Forbidden
+                    }
+                    Some(_) => {
+                        reservations.remove(session_id);
+                        PeerFileTransferSessionMutation::Applied
+                    }
+                    None => PeerFileTransferSessionMutation::NotFound,
+                };
+            };
+            if !existing.belongs_to(owner_fingerprint) {
+                return PeerFileTransferSessionMutation::Forbidden;
+            }
+            peers
+                .remove(session_id)
+                .expect("peer file-transfer session existed under the same lock")
+        };
+        peer.close().await;
+        self.release_pending_reservation(session_id, owner_fingerprint)
+            .await;
+        PeerFileTransferSessionMutation::Applied
     }
+
+    async fn release_pending_reservation(&self, session_id: &str, owner_fingerprint: &str) {
+        let mut reservations = self.pending_reservations.lock().await;
+        if reservations
+            .get(session_id)
+            .is_some_and(|reservation| reservation.owner_fingerprint == owner_fingerprint)
+        {
+            reservations.remove(session_id);
+        }
+    }
+}
+
+fn prune_expired_transfer_reservations(
+    reservations: &mut HashMap<String, PendingTransferReservation>,
+    now: Instant,
+) {
+    reservations.retain(|_, reservation| {
+        now.saturating_duration_since(reservation.created_at) < PENDING_TRANSFER_RESERVATION_TTL
+    });
+}
+
+fn reserve_pending_transfer_session(
+    reservations: &mut HashMap<String, PendingTransferReservation>,
+    session_id: &str,
+    owner_fingerprint: &str,
+    now: Instant,
+) -> Result<(), String> {
+    prune_expired_transfer_reservations(reservations, now);
+    if let Some(existing) = reservations.get(session_id) {
+        return Err(if existing.owner_fingerprint == owner_fingerprint {
+            "peer file-transfer session is already being negotiated".to_string()
+        } else {
+            "peer file-transfer session belongs to another authenticated peer".to_string()
+        });
+    }
+    if reservations.len() >= MAX_PENDING_TRANSFER_RESERVATIONS {
+        return Err("too many pending peer file-transfer offers".to_string());
+    }
+    let owner_count = reservations
+        .values()
+        .filter(|reservation| reservation.owner_fingerprint == owner_fingerprint)
+        .count();
+    if owner_count >= MAX_PENDING_TRANSFER_RESERVATIONS_PER_OWNER {
+        return Err("authenticated peer has too many pending file-transfer offers".to_string());
+    }
+    reservations.insert(
+        session_id.to_string(),
+        PendingTransferReservation {
+            owner_fingerprint: owner_fingerprint.to_string(),
+            candidates: Vec::new(),
+            created_at: now,
+        },
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
 struct PeerFileTransferPeer {
     command_tx: mpsc::Sender<TransferCommand>,
     shutdown: CancellationToken,
+    owner_fingerprint: String,
+    opening_authorization: PeerFileTransferAuthorization,
 }
 
 impl PeerFileTransferPeer {
@@ -275,6 +509,8 @@ impl PeerFileTransferPeer {
 
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
+        let owner_fingerprint = authorization.fingerprint.clone();
+        let opening_authorization = authorization.clone();
         tokio::spawn(transfer_driver(
             session_id,
             rtc,
@@ -292,6 +528,8 @@ impl PeerFileTransferPeer {
             Self {
                 command_tx,
                 shutdown,
+                owner_fingerprint,
+                opening_authorization,
             },
             answer.sdp,
         ))
@@ -302,6 +540,14 @@ impl PeerFileTransferPeer {
             .send(TransferCommand::AddIceCandidate(candidate))
             .await
             .map_err(|_| "peer file-transfer driver gone".to_string())
+    }
+
+    fn belongs_to(&self, owner_fingerprint: &str) -> bool {
+        self.owner_fingerprint == owner_fingerprint
+    }
+
+    fn opening_authority_is_current(&self) -> bool {
+        self.opening_authorization.is_current()
     }
 
     async fn close(self) {
@@ -398,8 +644,14 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
 
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
     let mut active_reads: HashMap<String, CancellationToken> = HashMap::new();
+    let mut authority_tick = tokio::time::interval(LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL);
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    loop {
+    'driver: loop {
+        if !authorization.is_current() {
+            shutdown.cancel();
+            break;
+        }
         let timeout_at = match drain_transfer_outputs(
             &mut rtc,
             &sockets_by_addr,
@@ -420,6 +672,12 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = authority_tick.tick() => {
+                if !authorization.is_current() {
+                    shutdown.cancel();
+                    break;
+                }
+            }
             Some(pkt) = inbound_rx.recv() => {
                 let input = TaggedBytesMut {
                     now: pkt.received_at,
@@ -531,6 +789,10 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                 }
             }
             Some(cmd) = command_rx.recv() => {
+                if !authorization.is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 match cmd {
                     TransferCommand::AddIceCandidate(candidate) => {
                         let init = RTCIceCandidateInit {
@@ -578,6 +840,10 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
             let Ok(text) = std::str::from_utf8(&msg.data) else {
                 continue;
             };
+            if !authorization.is_current() {
+                shutdown.cancel();
+                break 'driver;
+            }
             handle_transfer_request(
                 &session_id,
                 text,
@@ -744,15 +1010,13 @@ async fn stream_read_request(
     bus: crate::event::EventBus,
 ) {
     let result = async {
-        authorize_path(&authorization, &raw_path)?;
-        let path = crate::web_gateway::expand_dashboard_fs_path(&raw_path)?;
-        let canonical = std::fs::canonicalize(&path)
-            .map_err(|e| format!("{} is not accessible: {e}", path.display()))?;
-        if !canonical.is_file() {
+        let (canonical, file) = open_authorized_read_file(&authorization, &raw_path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", canonical.display()))?;
+        if !metadata.is_file() {
             return Err(format!("{} is not a file", canonical.display()));
         }
-        let metadata = std::fs::metadata(&canonical)
-            .map_err(|e| format!("stat {}: {e}", canonical.display()))?;
         let total_size = metadata.len();
         if offset > total_size {
             return Err(format!("offset {offset} exceeds file size {total_size}"));
@@ -768,6 +1032,9 @@ async fn stream_read_request(
             .unwrap_or("download")
             .to_string();
         let content_type = crate::web_gateway::dashboard_fs_content_type(&canonical);
+        if !authorization.is_current() {
+            return Err("peer file-transfer identity changed before response".to_string());
+        }
         command_tx
             .send(TransferCommand::SendText(
                 serde_json::json!({
@@ -785,7 +1052,19 @@ async fn stream_read_request(
             .await
             .map_err(|_| "transfer driver gone".to_string())?;
 
-        stream_file_range(&canonical, offset, read_len, &command_tx, &cancel).await?;
+        stream_file_range(
+            file,
+            &canonical,
+            offset,
+            read_len,
+            &authorization,
+            &command_tx,
+            &cancel,
+        )
+        .await?;
+        if !authorization.is_current() {
+            return Err("peer file-transfer identity changed before completion".to_string());
+        }
         command_tx
             .send(TransferCommand::SendText(
                 serde_json::json!({
@@ -817,11 +1096,13 @@ async fn stream_read_request(
             });
         }
         Err(error) => {
-            let _ = command_tx
-                .send(TransferCommand::SendText(
-                    serde_json::json!({"t": "error", "id": id, "error": error}).to_string(),
-                ))
-                .await;
+            if authorization.is_current() {
+                let _ = command_tx
+                    .send(TransferCommand::SendText(
+                        serde_json::json!({"t": "error", "id": id, "error": error}).to_string(),
+                    ))
+                    .await;
+            }
         }
     }
     let _ = command_tx.send(TransferCommand::ReadFinished(id)).await;
@@ -830,25 +1111,75 @@ async fn stream_read_request(
 fn authorize_path(
     authorization: &PeerFileTransferAuthorization,
     raw_path: &str,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
+    if !authorization.is_current() {
+        return Err("peer file-transfer identity changed or is no longer active".to_string());
+    }
     crate::access::iam::evaluate_principal_operation(
         &authorization.access_principal(),
         PeerOperation::FilesystemRead,
     )
     .ensure_allowed()?;
     let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
-    filesystem_access_allowed(&authorization.filesystem, FilesystemAccessKind::Read, &path)
+    filesystem_access_canonical_subject(
+        &authorization.filesystem,
+        FilesystemAccessKind::Read,
+        &path,
+    )
+}
+
+/// Authorize one canonical path, open it once, then prove the opened handle
+/// still names that path. Streaming owns this handle and never reopens the
+/// caller-controlled path, narrowing symlink/path replacement races to the
+/// platform's path-open operation itself.
+fn open_authorized_read_file(
+    authorization: &PeerFileTransferAuthorization,
+    raw_path: &str,
+) -> Result<(PathBuf, std::fs::File), String> {
+    let canonical = authorize_path(authorization, raw_path)?;
+    let file = std::fs::File::open(&canonical)
+        .map_err(|e| format!("open {}: {e}", canonical.display()))?;
+
+    // Detect a parent-component or final-component replacement that raced
+    // authorization/open. The open handle is the object we will stream;
+    // both the path's fresh canonical form and stable file identity must
+    // still agree with it before any metadata or bytes leave the daemon.
+    let current_canonical = std::fs::canonicalize(&canonical)
+        .map_err(|e| format!("re-resolve {} after open: {e}", canonical.display()))?;
+    if current_canonical != canonical {
+        return Err(format!(
+            "{} changed while the peer file read was opening",
+            canonical.display()
+        ));
+    }
+    let opened_identity = crate::platform::FileIdentity::from_file(&file)
+        .map_err(|e| format!("identify opened {}: {e}", canonical.display()))?;
+    let path_identity = crate::platform::FileIdentity::from_path(&canonical)
+        .map_err(|e| format!("identify path {} after open: {e}", canonical.display()))?;
+    if !opened_identity.is_reliable()
+        || !path_identity.is_reliable()
+        || opened_identity != path_identity
+    {
+        return Err(format!(
+            "{} changed while the peer file read was opening",
+            canonical.display()
+        ));
+    }
+    if !authorization.is_current() {
+        return Err("peer file-transfer identity changed while opening the file".to_string());
+    }
+    Ok((canonical, file))
 }
 
 async fn stream_file_range(
+    mut file: std::fs::File,
     path: &Path,
     offset: u64,
     length: u64,
+    authorization: &PeerFileTransferAuthorization,
     command_tx: &mpsc::Sender<TransferCommand>,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek {}: {e}", path.display()))?;
     let mut file = tokio::fs::File::from_std(file);
@@ -858,6 +1189,9 @@ async fn stream_file_range(
         if cancel.is_cancelled() {
             return Err("transfer cancelled".to_string());
         }
+        if !authorization.is_current() {
+            return Err("peer file-transfer identity changed during read".to_string());
+        }
         let want = (remaining as usize).min(buf.len());
         let n = file
             .read(&mut buf[..want])
@@ -865,6 +1199,9 @@ async fn stream_file_range(
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         if n == 0 {
             break;
+        }
+        if !authorization.is_current() {
+            return Err("peer file-transfer identity changed during read".to_string());
         }
         remaining = remaining.saturating_sub(n as u64);
         command_tx
@@ -953,6 +1290,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transfer_session_owner_match_is_exact() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let opening_authorization = PeerFileTransferAuthorization {
+            fingerprint: "peer-a".to_string(),
+            label: "Peer A".to_string(),
+            profile: "file-reader".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+        };
+        let peer = PeerFileTransferPeer {
+            command_tx,
+            shutdown: CancellationToken::new(),
+            owner_fingerprint: "peer-a".to_string(),
+            opening_authorization,
+        };
+        assert!(peer.belongs_to("peer-a"));
+        assert!(!peer.belongs_to("peer-b"));
+    }
+
+    #[test]
+    fn live_peer_identity_change_invalidates_file_transfer_authority() {
+        assert!(LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL <= Duration::from_millis(500));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let record = crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            fingerprint,
+            "peer-b",
+            "file-reader",
+            None,
+            None,
+        )
+        .unwrap();
+        let authorization = PeerFileTransferAuthorization {
+            fingerprint: record.fingerprint.clone(),
+            label: record.label.clone(),
+            profile: record.profile.clone(),
+            filesystem: record.filesystem.clone(),
+            identity_record: Some(record),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        assert!(authorization.is_current());
+        crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
+        assert!(!authorization.is_current());
+    }
+
+    #[test]
+    fn pending_transfer_reservations_are_owner_bound_bounded_and_expiring() {
+        let now = Instant::now();
+        let mut reservations = HashMap::new();
+        reserve_pending_transfer_session(&mut reservations, "chosen", "peer-a", now).unwrap();
+        assert!(
+            reserve_pending_transfer_session(&mut reservations, "chosen", "peer-a", now)
+                .unwrap_err()
+                .contains("already being negotiated")
+        );
+        assert!(
+            reserve_pending_transfer_session(&mut reservations, "chosen", "peer-b", now)
+                .unwrap_err()
+                .contains("another authenticated peer")
+        );
+
+        for index in 1..MAX_PENDING_TRANSFER_RESERVATIONS_PER_OWNER {
+            reserve_pending_transfer_session(
+                &mut reservations,
+                &format!("peer-a-{index}"),
+                "peer-a",
+                now,
+            )
+            .unwrap();
+        }
+        assert!(reserve_pending_transfer_session(
+            &mut reservations,
+            "peer-a-over-limit",
+            "peer-a",
+            now,
+        )
+        .unwrap_err()
+        .contains("too many pending"));
+
+        let expired_at = now
+            .checked_sub(PENDING_TRANSFER_RESERVATION_TTL + Duration::from_secs(1))
+            .unwrap();
+        reservations.insert(
+            "expired".to_string(),
+            PendingTransferReservation {
+                owner_fingerprint: "peer-expired".to_string(),
+                candidates: vec!["candidate".to_string()],
+                created_at: expired_at,
+            },
+        );
+        prune_expired_transfer_reservations(&mut reservations, now);
+        assert!(!reservations.contains_key("expired"));
+
+        let mut global = HashMap::new();
+        for index in 0..MAX_PENDING_TRANSFER_RESERVATIONS {
+            reserve_pending_transfer_session(
+                &mut global,
+                &format!("session-{index}"),
+                &format!("peer-{index}"),
+                now,
+            )
+            .unwrap();
+        }
+        assert!(reserve_pending_transfer_session(
+            &mut global,
+            "global-over-limit",
+            "peer-over-limit",
+            now,
+        )
+        .unwrap_err()
+        .contains("too many pending"));
+    }
+
+    #[test]
     fn transfer_read_request_parses_range() {
         let req: TransferRequest =
             serde_json::from_str(r#"{"t":"read","id":"r1","path":"/tmp/a","offset":4,"length":8}"#)
@@ -986,6 +1439,8 @@ mod tests {
                 read_roots: vec![tmp.path().to_path_buf()],
                 write_roots: Vec::new(),
             },
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let err = authorize_path(&auth, file.to_str().unwrap()).unwrap_err();
         assert!(err.contains("does not allow filesystem.read"));
@@ -1004,7 +1459,43 @@ mod tests {
                 read_roots: vec![tmp.path().to_path_buf()],
                 write_roots: Vec::new(),
             },
+            identity_record: None,
+            iam_cert_dir: None,
         };
-        authorize_path(&auth, file.to_str().unwrap()).unwrap();
+        assert_eq!(
+            authorize_path(&auth, file.to_str().unwrap()).unwrap(),
+            std::fs::canonicalize(file).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_transfer_streams_the_opened_file_not_a_replaced_path() {
+        use std::io::Read as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("a.txt");
+        let moved = tmp.path().join("opened.txt");
+        std::fs::write(&file, b"authorized object").unwrap();
+        let auth = PeerFileTransferAuthorization {
+            fingerprint: "fp".into(),
+            label: "peer".into(),
+            profile: "file-reader".into(),
+            filesystem: FilesystemAccessPolicy {
+                read_roots: vec![tmp.path().to_path_buf()],
+                write_roots: Vec::new(),
+            },
+            identity_record: None,
+            iam_cert_dir: None,
+        };
+
+        let (_canonical, mut opened) =
+            open_authorized_read_file(&auth, file.to_str().unwrap()).unwrap();
+        std::fs::rename(&file, &moved).unwrap();
+        std::fs::write(&file, b"replacement object").unwrap();
+
+        let mut contents = String::new();
+        opened.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "authorized object");
     }
 }

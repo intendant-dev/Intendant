@@ -1,27 +1,20 @@
 <#
 .SYNOPSIS
-    Intendant bootstrap installer for Windows -- the install.sh counterpart.
+    Intendant hosted installer for Windows -- the install.sh counterpart.
     Served by every Intendant Connect rendezvous at /install.ps1.
 
 .DESCRIPTION
-    Stands up a daemon that is OWNED from first boot and holds no secrets:
-      1. -Owner pins root authority to your browser identity key (the
-         fingerprint is public -- shown in the dashboard's Access drawer).
-      2. The daemon prints its claim phrase; claim it from the browser you
-         are already holding.
-      3. The first dashboard session fuels it with credential leases from
-         your vault. Nothing sensitive ever appears on this machine's disk,
-         in this command, or on the wire.
+    Stands up a daemon and optionally links its route to Connect. The
+    one-time claim code grants no daemon access and changes no IAM. Establish
+    root separately through the machine's local console, the signed native
+    app, or direct mTLS; this hosted installer never accepts an owner key.
 
     One-liner (PowerShell):
-      & ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+      & ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
 
     Dependencies (git, rustup, VS Build Tools, NASM) are handled by
     scripts/setup-windows.ps1 from the cloned repo -- run automatically
     when this shell is elevated, otherwise checked and reported.
-
-.PARAMETER Owner
-    Client-key fingerprint to pin root authority to from first boot.
 
 .PARAMETER Connect
     Rendezvous URL to register with. Defaults to the rendezvous this
@@ -37,7 +30,7 @@
 .PARAMETER Service
     Keep the daemon running unattended: installs a Task Scheduler entry
     via `intendant service install` (at boot when elevated, at logon
-    otherwise) supervised by the built-in restart loop; the claim phrase
+    otherwise) supervised by the built-in restart loop; the one-time claim code
     lands in the service log the installer prints.
 
 .PARAMETER NoRun
@@ -51,7 +44,6 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Owner = "",
     [string]$Connect = "",
     [string]$DaemonId = "",
     [string]$Ref = "",
@@ -65,10 +57,6 @@ $ErrorActionPreference = "Stop"
 
 function Say([string]$Message) { Write-Host "[intendant install] $Message" -ForegroundColor White }
 function Fail([string]$Message) { Write-Host "[intendant install] $Message" -ForegroundColor Red; exit 1 }
-
-if (-not $Owner) {
-    Say "note: no -Owner given -- the daemon will start unowned; pass your client-key fingerprint (Access drawer) to own it from first boot."
-}
 
 $elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -121,18 +109,17 @@ $daemonExe = Join-Path $InstallDir "target\release\intendant.exe"
 
 # -- Launch --
 $daemonArgs = @("--no-tui")
-if ($Owner) { $daemonArgs += @("--owner", $Owner) }
 if ($Connect) {
     $env:INTENDANT_CONNECT_RENDEZVOUS_URL = $Connect
     if ($DaemonId) { $env:INTENDANT_CONNECT_DAEMON_ID = $DaemonId }
     Say "rendezvous: $Connect"
 } else {
-    Say "note: no -Connect rendezvous URL -- hosted claiming needs one (the daemon still serves its local dashboard)."
+    Say "note: no -Connect rendezvous URL -- the daemon will not publish a discovery route (its local dashboard still works)."
 }
 
 if ($Service) {
     # `service install` writes the Task Scheduler definition, captures the
-    # INTENDANT_CONNECT_* env set above, and prints where the claim phrase
+    # INTENDANT_CONNECT_* env set above, and prints where the one-time claim code
     # lands (the built-in supervisor's log file).
     if (-not $elevated) {
         Say "note: unelevated -- the task starts at logon; re-run elevated for an at-boot service."
@@ -147,7 +134,7 @@ if ($Service) {
     Say "done. Start it with:"
     Say "  `"$daemonExe`" $($daemonArgs -join ' ')"
 } else {
-    Say "starting the daemon -- it will print its claim phrase; claim it from your browser, then fuel it from the vault."
+    Say "starting the daemon -- its one-time Connect code links discovery only and grants no access. Establish owner through local console, signed native app, or direct mTLS."
     & $daemonExe @daemonArgs
     exit $LASTEXITCODE
 }

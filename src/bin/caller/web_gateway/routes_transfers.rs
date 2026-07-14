@@ -1552,6 +1552,7 @@ mod tests {
                 read_roots: vec![in_scope.clone()],
                 write_roots: vec![in_scope.clone()],
             },
+            record: None,
         };
         let authorize = |identity: Option<&PeerConnectionIdentity>,
                          op: PeerOperation,

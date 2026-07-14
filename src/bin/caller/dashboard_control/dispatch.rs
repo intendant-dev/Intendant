@@ -650,18 +650,22 @@ pub(crate) fn control_frame_response(
                 // S6 neutral cores under the family's historical
                 // ok/error envelope; the transport edge resolves the
                 // ambient cert dir (hermeticity convention).
-                "api_dashboard_targets" => Some(frame_api_ok_error_response(
-                    id,
-                    crate::web_gateway::dashboard_targets_api_response(
-                        &runtime.agent_card,
-                        runtime.peer_registry.as_ref(),
-                        crate::web_gateway::local_daemon_tier(
-                            &crate::access::backend::select_backend().cert_dir(),
-                        )
-                        .as_deref(),
-                    ),
-                    "dashboard targets",
-                )),
+                "api_dashboard_targets" => {
+                    let current_principal = runtime.grant.access_principal();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::dashboard_targets_api_response(
+                            &runtime.agent_card,
+                            runtime.peer_registry.as_ref(),
+                            crate::web_gateway::local_daemon_tier(
+                                &crate::access::backend::select_backend().cert_dir(),
+                            )
+                            .as_deref(),
+                            Some(&current_principal),
+                        ),
+                        "dashboard targets",
+                    ))
+                }
                 "api_dashboard_tabs" => Some(frame_api_ok_error_response(
                     id,
                     crate::web_gateway::dashboard_tabs_api_response(&runtime.tabs),
@@ -731,7 +735,7 @@ pub(crate) fn control_frame_response(
                         "connect config",
                     ))
                 }
-                "api_access_set_tier" | "api_access_set_hosted_ceiling" => {
+                "api_access_set_tier" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let actor = runtime.grant.access_principal();
                     // Transport edge resolves the ambient cert dir
@@ -740,10 +744,7 @@ pub(crate) fn control_frame_response(
                     Some(frame_api_ok_error_response(
                         id,
                         crate::web_gateway::access_tier_settings_api_response(
-                            &cert_dir,
-                            method == "api_access_set_hosted_ceiling",
-                            params,
-                            &actor,
+                            &cert_dir, params, &actor,
                         ),
                         "trust tier settings",
                     ))
@@ -1259,7 +1260,7 @@ pub(crate) fn control_terminal_open_frame(
             .get("shared")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
-        scope: runtime.grant.filesystem().cloned(),
+        scope: runtime.grant.filesystem(),
     };
     let handle = tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
@@ -2235,7 +2236,6 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             "principal_kind": access_principal.kind,
             "principal_binding": match runtime.grant {
                 DashboardControlGrant::TrustedLocal => "root_session",
-                DashboardControlGrant::UserClientRoot { .. } => "user_client_root",
                 DashboardControlGrant::UserClient { .. } => "user_client",
                 DashboardControlGrant::Peer { .. } => "peer_daemon",
             },
@@ -2462,41 +2462,6 @@ mod tests {
     }
 
     #[test]
-    fn user_client_root_grant_reports_identity_without_scoping_permissions() {
-        let mut rt = runtime();
-        rt.grant = DashboardControlGrant::UserClientRoot {
-            principal: crate::access::iam::AccessPrincipal::root_user_client(
-                "browser-mtls",
-                "webrtc-datachannel",
-                "Browser certificate ab123",
-                None,
-                None,
-                vec![serde_json::json!({
-                    "kind": "browser_mtls_cert",
-                    "fingerprint": "ab123"
-                })],
-            ),
-        };
-
-        let status = status_response_frame("s1".to_string(), &rt);
-        assert_eq!(status["result"]["grant_kind"], "user-client-root");
-        assert_eq!(status["result"]["access_principal"]["kind"], "root_session");
-        assert_eq!(
-            status["result"]["access_principal"]["authn"][0]["kind"],
-            "browser_mtls_cert"
-        );
-        assert_eq!(
-            status["result"]["iam_enforcement"]["principal_binding"],
-            "user_client_root"
-        );
-        assert_eq!(
-            status["result"]["iam_enforcement"]["user_client_grants"],
-            false
-        );
-        assert_eq!(status["result"]["access_manage_available"], true);
-    }
-
-    #[test]
     fn upload_start_authorizes_by_delivered_method_not_blanket_fs_write() {
         let file_operator = ControlRuntime {
             grant: DashboardControlGrant::Peer {
@@ -2505,6 +2470,8 @@ mod tests {
                 profile: "file-operator".into(),
                 filesystem: Default::default(),
                 attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             },
             ..runtime()
         };
@@ -2563,6 +2530,8 @@ mod tests {
                 profile: "admin".into(),
                 filesystem: Default::default(),
                 attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             },
             ..runtime()
         };

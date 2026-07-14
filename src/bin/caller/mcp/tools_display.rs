@@ -1420,7 +1420,6 @@ impl IntendantServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autonomy::{self, AutonomyState};
     use crate::mcp::tests::{
         test_session_registry_with_display, test_state, test_state_with_log_dir,
     };

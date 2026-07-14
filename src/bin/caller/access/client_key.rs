@@ -67,6 +67,7 @@ pub fn client_key_fingerprint(raw_point: &[u8]) -> String {
 /// unpadded base64url of a SHA-256 digest — exactly 43 characters of the
 /// base64url alphabet. Lets CLI boundaries reject typos and placeholders
 /// before they get pinned as root authority.
+#[cfg(test)]
 pub fn is_client_key_fingerprint(value: &str) -> bool {
     value.len() == 43
         && value

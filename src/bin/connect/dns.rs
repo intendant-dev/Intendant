@@ -4,7 +4,7 @@
 //! The convenient-direct-path design: the parent zone NS-delegates one
 //! subzone (e.g. `fleet.intendant.dev`) to this service, which answers
 //! for exactly that subzone and nothing else — the DNS twin of the
-//! zero-authority doctrine. Records served:
+//! separation from the daemon authority mint. Records served:
 //!
 //! - apex `SOA` / `NS` (this server, via the parent-zone glue name);
 //! - `d-<daemon-id>.<zone>` `A`/`AAAA` — addresses a registered daemon

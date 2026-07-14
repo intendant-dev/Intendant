@@ -140,23 +140,21 @@ curl -fsS "$CONNECT_PUBLIC_READYZ_URL" >/dev/null
 
 # Regression probe for the whole reverse-proxy chain: register a throwaway
 # daemon through the public origin and require the response to echo the
-# caller's address. observed_ip is what lets hosted dashboards reach NAT'd
-# daemons (they advertise ICE-TCP at that address) — a proxy that stops
-# forwarding X-Forwarded-For/X-Real-IP breaks every hosted dashboard, and
-# the failure only surfaces later as an ICE timeout on some daemon. The
-# throwaway registration is unclaimed and expires on its own.
-info "checking observed_ip echo at $CONNECT_PUBLIC_ORIGIN"
-PROBE_ARGS=(
-    -fsS -X POST "$CONNECT_PUBLIC_ORIGIN/api/daemon/register"
-    -H 'content-type: application/json'
-    -d '{"protocol":"intendant-connect-rendezvous-v1","daemon_id":"deploy-observed-ip-probe","daemon_public_key":"deploy-observed-ip-probe"}'
-)
-if [[ -n "${INTENDANT_CONNECT_TOKEN:-}" ]]; then
-    PROBE_ARGS+=(-H "Authorization: Bearer $INTENDANT_CONNECT_TOKEN")
-fi
-PROBE_RESPONSE="$(curl "${PROBE_ARGS[@]}")"
-if ! grep -qE '"observed_ip":"[0-9a-fA-F:.]+"' <<<"$PROBE_RESPONSE"; then
-    die "register response did not echo the caller address (observed_ip) — the reverse proxy in front of the service is not forwarding X-Forwarded-For/X-Real-IP, so hosted dashboards cannot reach NAT'd daemons. See the Reachability section of docs/src/self-hosted-rendezvous.md (Caddy applies header_up deletions after sets — do not strip-then-set). Response: $PROBE_RESPONSE"
+# caller's address. This is route/reachability metadata only in the default
+# discovery-only build. The deliberately unsigned probe is an operator action,
+# so skip it when the deployment bearer is not present in this shell.
+if [[ -z "${INTENDANT_CONNECT_TOKEN:-}" ]]; then
+    info "skipping observed_ip operator probe (INTENDANT_CONNECT_TOKEN is unset)"
+else
+    info "checking observed_ip echo at $CONNECT_PUBLIC_ORIGIN"
+    PROBE_RESPONSE="$(curl \
+        -fsS -X POST "$CONNECT_PUBLIC_ORIGIN/api/daemon/register" \
+        -H 'content-type: application/json' \
+        -H "Authorization: Bearer $INTENDANT_CONNECT_TOKEN" \
+        -d '{"protocol":"intendant-connect-rendezvous-v1","daemon_id":"deploy-observed-ip-probe","daemon_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","claim_code_hash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","issued_at_unix_ms":0,"signature":""}')"
+    if ! grep -qE '"observed_ip":"[0-9a-fA-F:.]+"' <<<"$PROBE_RESPONSE"; then
+        die "register response did not echo the caller address (observed_ip) — the reverse proxy in front of the service is not forwarding X-Forwarded-For/X-Real-IP. See the Reachability section of docs/src/self-hosted-rendezvous.md (Caddy applies header_up deletions after sets — do not strip-then-set). Response: $PROBE_RESPONSE"
+    fi
 fi
 
 info "deploy complete"

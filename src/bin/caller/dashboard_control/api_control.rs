@@ -2468,13 +2468,15 @@ mod tests {
         // empty agent card, no registry — the deterministic local-only
         // list).
         let card = serde_json::json!({});
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity-test", "local");
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::dashboard_targets_api_response(&card, None, None),
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None, Some(&principal)),
         );
         assert_eq!(status, 200);
         let frame = frame_api_ok_error_response(
             "parity-targets".to_string(),
-            crate::web_gateway::dashboard_targets_api_response(&card, None, None),
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None, Some(&principal)),
             "dashboard targets",
         );
         assert_eq!(frame["ok"], true);
@@ -2543,7 +2545,6 @@ mod tests {
         let (status, http_body) =
             parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
-                false,
                 serde_json::json!({"tier": 123}),
                 &actor,
             ));
@@ -2556,7 +2557,6 @@ mod tests {
             "parity-tier-bad".to_string(),
             crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
-                false,
                 serde_json::json!({"tier": 123}),
                 &actor,
             ),
@@ -2572,7 +2572,6 @@ mod tests {
         let (status, http_body) =
             parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
-                false,
                 serde_json::json!({"tier": "disposable"}),
                 &actor,
             ));
@@ -2582,7 +2581,6 @@ mod tests {
             "parity-tier".to_string(),
             crate::web_gateway::access_tier_settings_api_response(
                 tmp.path(),
-                false,
                 serde_json::json!({"tier": "disposable"}),
                 &actor,
             ),
@@ -2594,20 +2592,6 @@ mod tests {
             frame["result"]["schema_version"],
             http_body["schema_version"]
         );
-
-        // Hosted ceiling validation on both lanes.
-        let frame = frame_api_ok_error_response(
-            "parity-ceiling-bad".to_string(),
-            crate::web_gateway::access_tier_settings_api_response(
-                tmp.path(),
-                true,
-                serde_json::json!({}),
-                &actor,
-            ),
-            "trust tier settings",
-        );
-        assert_eq!(frame["ok"], false);
-        assert_eq!(frame["error"], "role_id is required");
     }
 
     #[tokio::test]

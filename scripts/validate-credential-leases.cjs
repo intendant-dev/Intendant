@@ -1,24 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 
-// Credential-lease E2E validation: a real hosted Connect service, a real
-// claimed daemon (spawned with NO provider keys in its environment), and
-// a real browser session fueling it over the verified tunnel:
+// Credential-lease hosted-boundary validation. Connect-origin vault storage
+// does not imply delivery: the default build has no trusted native/direct
+// bridge that can carry a lease from this hosted origin to the daemon.
 //
-//   1. register + claim; hosted dashboard binds under the OPERATOR role
-//      (seeded grant, default role ceilings kept — the real hosted posture;
-//      operator holds credentials.manage)
-//   2. lease status starts empty; /api/api-key-status all false
-//   3. grant an anthropic lease -> key status flips true
-//   4. renew extends the expiry; status reports the lease + usage fields
-//   5. unknown-kind grant is refused server-side
-//   6. revoke -> status empty, key status back to false
-//   7. oauth materialization lifecycle + the UI custody story + --owner
-//   8. access-token OAuth mode against a mock token endpoint: browser
-//      refresh with rotation written back to the vault, refresh-free
-//      material on disk, near-expiry re-grant on the renewal tick, the
-//      daemon's fail-closed refusal of refresh-bearing material, and the
-//      full-credential opt-in still carrying the whole auth file
+// It asserts route-only claiming leaves IAM empty, hosted offers are refused,
+// an adversarial operator grant + forged ceiling cannot change that outcome,
+// no control DataChannel opens, and the daemon remains unfueled. Full lease
+// lifecycle coverage belongs to a trusted direct/native bridge validator.
 //
 // Usage: node scripts/validate-credential-leases.cjs
 //   [--connect-binary <path>] [--daemon-binary <path>]
@@ -28,7 +18,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_CONNECT_PORT = 9895;
@@ -104,6 +94,43 @@ async function addVirtualAuthenticator(browser, page) {
   throw new Error('this validator needs the playwright driver for WebAuthn');
 }
 
+async function hostedControlStatuses(page, daemonId) {
+  return page.evaluate(async id => {
+    const me = await fetch('/api/me').then(response => response.json());
+    const headers = {
+      'content-type': 'application/json',
+      'x-intendant-csrf': me.csrf_token,
+    };
+    const call = async (path, body) => {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, text: await response.text() };
+    };
+    return {
+      offer: await call('/api/browser/offer', { daemon_id: id, sdp: 'retired-hosted-offer' }),
+      ice: await call('/api/browser/ice', {
+        daemon_id: id,
+        session_id: 'trusted-direct-session',
+        candidate: { candidate: 'candidate:retired-hosted' },
+      }),
+      close: await call('/api/browser/close', {
+        daemon_id: id,
+        session_id: 'trusted-direct-session',
+      }),
+    };
+  }, daemonId);
+}
+
+function assertHostedControlRefused(statuses, label) {
+  for (const [kind, result] of Object.entries(statuses)) {
+    assert.strictEqual(result.status, 403, `${label}: ${kind} returned ${result.status}: ${result.text}`);
+    assert(/hosted daemon control is unavailable/i.test(result.text), `${label}: ${kind} refusal was unclear: ${result.text}`);
+  }
+}
+
 function slugComponent(value) {
   const slug = String(value || '')
     .trim()
@@ -113,36 +140,29 @@ function slugComponent(value) {
   return slug || 'unknown';
 }
 
-// Seed the daemon's local IAM with an OPERATOR grant for the Connect
-// account — unlike the hosted-MVP validator this keeps the default role
-// ceilings (connect_account -> operator), so the tunnel binds exactly the
-// posture a real hosted session gets. Operator holds credentials.manage.
-function writeOperatorIamGrant(homeDir, user) {
-  assert(user && user.id, `Connect user id missing: ${JSON.stringify(user)}`);
+// Adversarial fixture: a real operator grant plus a hand-edited persisted
+// ceiling must not turn hosted provenance into a lease-delivery channel.
+function writeAdversarialOperatorGrant(homeDir, fingerprint, accountName) {
+  assert(fingerprint, 'hosted browser key fingerprint is required');
   const certDir = path.join(homeDir, '.intendant', 'access-certs');
   fs.mkdirSync(certDir, { recursive: true });
-  const principalId = `principal:connect-account:${slugComponent(user.id)}`;
+  const principalId = `principal:client-key:${slugComponent(fingerprint)}`;
   const now = Date.now();
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     principals: [{
       id: principalId,
-      kind: 'connect_account',
-      label: `@${user.account_name}`,
+      kind: 'client_key',
+      label: accountName ? `@${accountName} browser` : 'Hosted browser',
       status: 'active',
       source: 'local_iam_state',
-      account: {
-        provider: 'intendant.dev',
-        user_id: user.id,
-        account_name: user.account_name,
-        handle: user.account_name,
-      },
+      account: accountName ? { provider: 'intendant.dev', account_name: accountName, handle: accountName } : null,
       organization: null,
       authn: [{
-        kind: 'connect_account',
-        label: 'Intendant Connect account',
-        user_id: user.id,
-        account_name: user.account_name,
+        kind: 'client_key',
+        label: 'Browser identity key',
+        fingerprint,
+        origin: 'hosted-connect-e2e',
       }],
       notes: 'Credential-lease E2E operator grant',
       created_at_unix_ms: now,
@@ -161,6 +181,10 @@ function writeOperatorIamGrant(homeDir, user) {
       revoked_at_unix_ms: null,
     }],
     audit_events: [],
+    role_ceilings: {
+      connect_account: 'role:none',
+      client_key: 'role:operator',
+    },
   };
   fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 }
@@ -172,6 +196,17 @@ async function main() {
       throw new Error(`missing binary ${binary}; run cargo build --bin intendant --bin intendant-connect`);
     }
   }
+
+  const retiredOwner = spawnSync(options.daemonBinary, [
+    '--owner', 'E2E-Owner-Key-Fingerprint-000000000000000AA', '--no-web',
+  ], { encoding: 'utf8', timeout: 5000 });
+  const retiredOwnerOutput = `${retiredOwner.stdout || ''}\n${retiredOwner.stderr || ''}`;
+  assert.notStrictEqual(retiredOwner.status, 0, 'legacy --owner unexpectedly succeeded');
+  assert(
+    /unknown|unsupported|retired|unrecognized|unexpected argument/i.test(retiredOwnerOutput),
+    `legacy --owner must fail as a parser-level refusal, got: ${retiredOwnerOutput}`
+  );
+  console.log('PASS lease-owner-bootstrap legacy --owner is rejected');
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'intendant-leases-'));
   const daemonHome = path.join(tmp, 'daemon-home');
@@ -239,416 +274,62 @@ async function main() {
     page.on('console', msg => consoleMessages.push(msg.text()));
     await addVirtualAuthenticator(browser, page);
 
-    // ── Register + claim ──
+    // ── Register + route-only claim ──
     const claimCode = await waitFor(() => {
       const all = `${logs.connect.join('')}\n${logs.daemon.join('')}`;
       const urlMatch = all.match(/claim_code=([^\s"'<>]+)/);
       if (urlMatch) return decodeURIComponent(urlMatch[1]);
-      const codeMatch = all.match(/claim this daemon with code ([^\s"'<>]+)/);
+      const codeMatch = all.match(/one-time claim code ([a-z0-9-]+)/i);
       return codeMatch && codeMatch[1];
     }, START_TIMEOUT_MS, 'claim code');
-    await page.goto(`${connectOrigin}/connect?claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
+    await page.goto(`${connectOrigin}/connect#claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
     await page.evaluate(() => {
       document.getElementById('account').value = `lease-user-${Date.now()}`;
     });
     await page.locator('#register').click();
     await page.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: START_TIMEOUT_MS });
     await page.locator('#claim').click();
-    // Two success copies since the first-owner bootstrap landed: a
-    // daemon-minted phrase claims AND enrolls ("…enrolled as its first
-    // owner…"); an account-route claim keeps the original copy.
-    await page.waitForFunction(() => /Rendezvous route claimed|enrolled as its first owner/.test(document.getElementById('claim-status').textContent), { timeout: START_TIMEOUT_MS });
-    const me = await page.evaluate(async () => fetch('/api/me').then(r => r.json()));
-    writeOperatorIamGrant(daemonHome, me.user || me);
-    console.log('PASS lease-claim account registered, daemon claimed, operator grant seeded');
-
-    // ── Bind the hosted dashboard session ──
-    await page.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(DEFAULT_DAEMON_ID)}#access/advanced`, { timeout: START_TIMEOUT_MS });
-    await page.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
-    const bound = await waitFor(async () => {
-      const status = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null);
-      return status?.connected && status?.verifiedBinding?.ok && status?.grantKind ? status : null;
-    }, CONNECT_TIMEOUT_MS, 'verified hosted dashboard connection');
-    assert.strictEqual(bound.grantKind, 'user-client', `expected the scoped operator binding: ${JSON.stringify({ grantKind: bound.grantKind, role: bound.accessPrincipal?.role_id })}`);
-    assert.strictEqual(String(bound.accessPrincipal?.role_id || ''), 'role:operator', `expected operator role: ${JSON.stringify(bound.accessPrincipal)}`);
-    console.log('PASS lease-bind operator session over the verified tunnel');
-
-    const rpc = (method, params = {}) => page.evaluate(
-      ([m, p]) => window.intendantDashboardControl.request(m, p, { timeoutMs: 15000 }),
-      [method, params]
-    );
-
-    // ── Empty status, then grant ──
-    const statusEmpty = await rpc('api_credential_lease_status');
-    assert(Array.isArray(statusEmpty.leases) && statusEmpty.leases.length === 0, `expected no leases: ${JSON.stringify(statusEmpty)}`);
-
-    const granted = await rpc('api_credential_lease_grant', {
-      kind: 'api_key:anthropic',
-      label: 'E2E Anthropic',
-      material: 'sk-ant-e2e-lease-material',
-      ttl_ms: 120000,
-      offline_ms: 0,
-    });
-    assert(granted.lease_id && granted.lease_id.startsWith('lease_'), `grant returned no lease id: ${JSON.stringify(granted)}`);
-    assert.strictEqual(granted.replaced, false);
-
-    const keysAfterGrant = await waitFor(async () => {
-      const keys = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
-      return keys.anthropic === true ? keys : null;
-    }, STEP_TIMEOUT_MS, 'anthropic key visible after lease grant');
-    assert.strictEqual(keysAfterGrant.openai, false, 'lease must fuel only its own kind');
-    console.log(`PASS lease-grant daemon fueled (lease ${granted.lease_id.slice(0, 14)}…)`);
-
-    // ── Renew + status ──
-    const renewed = await rpc('api_credential_lease_renew', { lease_id: granted.lease_id });
-    assert(renewed.expires_at_unix_ms >= granted.expires_at_unix_ms, `renew did not extend expiry: ${JSON.stringify({ granted, renewed })}`);
-    const statusActive = await rpc('api_credential_lease_status');
-    assert.strictEqual(statusActive.leases.length, 1, `expected one lease: ${JSON.stringify(statusActive)}`);
-    const lease = statusActive.leases[0];
-    assert.strictEqual(lease.kind, 'api_key:anthropic');
-    assert.strictEqual(lease.label, 'E2E Anthropic');
-    assert(lease.granted_by, 'lease status must record who granted it');
-    assert(!JSON.stringify(statusActive).includes('sk-ant-e2e-lease-material'), 'lease status must never carry the material');
-    console.log(`PASS lease-renew-status expiry extended, granted_by="${lease.granted_by}"`);
-
-    // ── Unknown kinds are refused server-side ──
-    let unknownRefused = false;
-    try {
-      await rpc('api_credential_lease_grant', { kind: 'api_key:mystery', material: 'x' });
-    } catch (err) {
-      unknownRefused = /unknown credential kind/.test(String(err && err.message || err));
+    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('No machine access was granted'), { timeout: START_TIMEOUT_MS });
+    const iamPath = path.join(daemonHome, '.intendant', 'access-certs', 'iam.json');
+    if (fs.existsSync(iamPath)) {
+      const afterClaim = JSON.parse(fs.readFileSync(iamPath, 'utf8'));
+      assert.strictEqual((afterClaim.principals || []).length, 0, 'route claim unexpectedly created an IAM principal');
+      assert.strictEqual((afterClaim.grants || []).length, 0, 'route claim unexpectedly created an IAM grant');
     }
-    assert(unknownRefused, 'unknown credential kind must be refused');
-    console.log('PASS lease-validation unknown kind refused over the tunnel');
+    console.log('PASS lease-claim account registered, daemon route linked, IAM unchanged');
 
-    // ── Revoke ──
-    const revoked = await rpc('api_credential_lease_revoke', { lease_id: granted.lease_id });
-    assert.strictEqual(revoked.revoked, 1, `expected one revocation: ${JSON.stringify(revoked)}`);
-    const statusAfterRevoke = await rpc('api_credential_lease_status');
-    assert.strictEqual(statusAfterRevoke.leases.length, 0, 'revoked lease still listed');
-    const keysAfterRevoke = await waitFor(async () => {
-      const keys = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
-      return keys.anthropic === false ? keys : null;
-    }, STEP_TIMEOUT_MS, 'anthropic key gone after revocation');
-    assert(keysAfterRevoke, 'key status did not flip back after revoke');
-    console.log('PASS lease-revoke material dropped, daemon unfueled again');
-
-    // ── Custody trail: the daemon's own record of what just happened ──
-    const trail = await rpc('api_credential_custody_trail');
-    assert(Array.isArray(trail.events) && trail.events.length >= 2,
-      `expected custody events: ${JSON.stringify(trail).slice(0, 200)}`);
-    const trailKinds = trail.events.map(e => e.event);
-    assert(trailKinds.includes('lease_granted'), 'trail must record the grant');
-    assert(trailKinds.includes('lease_revoked'), 'trail must record the revocation');
-    const trailGrant = trail.events.find(e => e.event === 'lease_granted' && e.kind === 'api_key:anthropic');
-    assert(trailGrant && trailGrant.actor,
-      `trail grant must name the granting principal: ${JSON.stringify(trailGrant)}`);
-    assert(!JSON.stringify(trail).includes('sk-ant-e2e-lease-material'),
-      'the custody trail must never carry credential material');
-    console.log(`PASS lease-audit custody trail records grant + revoke (grant by "${trailGrant.actor}")`);
-
-    // ── OAuth materialization lifecycle (Codex + Claude Code) ──
-    // OAuth leases materialize a private auth file for the child process;
-    // revocation must delete it.
-    const codexGrant = await rpc('api_credential_lease_grant', {
-      kind: 'oauth:codex',
-      label: 'E2E Codex OAuth',
-      material: JSON.stringify({ tokens: { access_token: 'at-codex-e2e' } }),
-      ttl_ms: 120000,
-      offline_ms: 0,
-    });
-    const codexAuthPath = path.join(daemonHome, '.intendant', 'leased-auth', 'codex-home', 'auth.json');
-    await waitFor(() => fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'materialized codex auth.json');
-    assert(fs.readFileSync(codexAuthPath, 'utf8').includes('at-codex-e2e'), 'codex auth.json missing leased material');
-    if (process.platform !== 'win32') {
-      assert.strictEqual(fs.statSync(codexAuthPath).mode & 0o777, 0o600, 'codex auth.json must be 0600');
-      assert.strictEqual(fs.statSync(path.dirname(codexAuthPath)).mode & 0o777, 0o700, 'codex home dir must be 0700');
-    }
-
-    const claudeGrant = await rpc('api_credential_lease_grant', {
-      kind: 'oauth:claude-code',
-      label: 'E2E Claude Code OAuth',
-      material: JSON.stringify({ claudeAiOauth: { accessToken: 'at-claude-e2e' } }),
-      ttl_ms: 120000,
-      offline_ms: 0,
-    });
-    const claudeCredsPath = path.join(daemonHome, '.intendant', 'leased-auth', 'claude-home', '.credentials.json');
-    await waitFor(() => fs.existsSync(claudeCredsPath), STEP_TIMEOUT_MS, 'materialized claude .credentials.json');
-    assert(fs.readFileSync(claudeCredsPath, 'utf8').includes('at-claude-e2e'), 'claude credentials missing leased material');
-    console.log('PASS lease-oauth-materialize private auth files written for both agents');
-
-    await rpc('api_credential_lease_revoke', { lease_id: codexGrant.lease_id });
-    await waitFor(() => !fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'codex materialization deleted on revoke');
-    assert(fs.existsSync(claudeCredsPath), 'revoking codex must not touch the claude materialization');
-    await rpc('api_credential_lease_revoke', { lease_id: claudeGrant.lease_id });
-    await waitFor(() => !fs.existsSync(claudeCredsPath), STEP_TIMEOUT_MS, 'claude materialization deleted on revoke');
-    console.log('PASS lease-oauth-revoke materialized auth deleted per kind');
-
-    // ── The full custody story through the rendered UI ──
-    // register → create vault (phrase ceremony) → store a key → fuel the
-    // daemon from the fueling panel → lease visible → revoke → unfueled.
-    const uiClick = async needle => {
-      const clicked = await page.evaluate(text => {
-        const buttons = Array.from(document.querySelectorAll('#access-vault-section button'));
-        const button = buttons.find(b => b.textContent.trim().startsWith(text) && !b.disabled);
-        if (!button) return false;
-        button.click();
-        return true;
-      }, needle);
-      assert(clicked, `vault button not found or disabled: ${needle}`);
-    };
-    const vaultState = () => page.evaluate(() => window.intendantVault?.state() || null);
-
-    await waitFor(async () => (await vaultState())?.status === 'none', STEP_TIMEOUT_MS, 'vault ready to create');
-    await uiClick('Create vault');
-    await waitFor(() => page.evaluate(() =>
-      document.querySelectorAll('#access-vault-section .vault-words .w').length === 12
-    ), STEP_TIMEOUT_MS, 'phrase ceremony');
-    await uiClick('I saved the phrase — create the vault');
-    await waitFor(async () => (await vaultState())?.status === 'unlocked', STEP_TIMEOUT_MS, 'vault unlocked');
-
-    const uiKey = 'sk-ant-ui-custody-story';
-    const addOutcome = await page.evaluate(secret => {
-      const section = document.getElementById('access-vault-section');
-      const fold = Array.from(section.querySelectorAll('details summary'))
-        .find(s => s.textContent.trim() === 'Add a credential');
-      if (!fold) return 'no add fold';
-      fold.parentElement.open = true;
-      const selects = section.querySelectorAll('.vault-form-grid select');
-      const inputs = section.querySelectorAll('.vault-form-grid input');
-      if (selects.length < 2 || inputs.length < 2) return 'form fields missing';
-      selects[0].value = 'api_key';
-      selects[1].value = 'anthropic';
-      inputs[0].value = 'UI Anthropic';
-      inputs[1].value = secret;
-      const button = Array.from(section.querySelectorAll('button'))
-        .find(b => b.textContent.trim() === 'Add to vault');
-      if (!button) return 'no add button';
-      button.click();
-      return 'ok';
-    }, uiKey);
-    assert.strictEqual(addOutcome, 'ok', `UI add-entry failed: ${addOutcome}`);
-    await waitFor(async () => (await vaultState())?.entries.some(e => e.label === 'UI Anthropic'), STEP_TIMEOUT_MS, 'entry stored');
-
-    await uiClick('Fuel: UI Anthropic');
-    await waitFor(async () => {
-      const leases = await page.evaluate(() => window.intendantVault.leases());
-      return leases.leases.some(l => l.kind === 'api_key:anthropic' && l.label === 'UI Anthropic');
-    }, STEP_TIMEOUT_MS, 'lease visible in the fueling panel');
-    const keysAfterUiFuel = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
-    assert.strictEqual(keysAfterUiFuel.anthropic, true, 'UI fueling did not reach the daemon');
-    const ownIds = await page.evaluate(() => window.intendantVault.leases().ownLeaseIds);
-    assert.strictEqual(ownIds.length, 1, 'the granting tab must track its own lease for renewal');
-    console.log('PASS lease-ui-fuel vault entry fuels the daemon through the panel');
-
-    await uiClick('Revoke');
-    await waitFor(async () => {
-      const keys = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
-      return keys.anthropic === false;
-    }, STEP_TIMEOUT_MS, 'daemon unfueled after UI revoke');
-    console.log('PASS lease-ui-revoke panel revocation unfuels the daemon');
-
-    // ── Access-token OAuth mode (the default for oauth kinds) ──
-    // A mock token endpoint stands in for auth.openai.com: it rotates the
-    // refresh token on every use and mints JWT-shaped access tokens (the
-    // browser reads codex expiry from the JWT exp claim). CORS headers on
-    // both OPTIONS and POST are load-bearing — the refreshing page is on
-    // the connect origin.
-    const b64url = obj => Buffer.from(JSON.stringify(obj)).toString('base64url');
-    const oauthMock = { refreshToken: 'rt-0', expiresInSec: 300, refreshCount: 0, lastBody: null };
-    mockOauthServer = require('http').createServer((req, res) => {
-      const cors = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'content-type',
-      };
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, cors);
-        res.end();
-        return;
-      }
-      let body = '';
-      req.on('data', chunk => { body += chunk; });
-      req.on('end', () => {
-        let parsed = {};
-        try { parsed = JSON.parse(body); } catch { /* fall through to invalid_grant */ }
-        oauthMock.lastBody = parsed;
-        if (parsed.grant_type !== 'refresh_token' || parsed.refresh_token !== oauthMock.refreshToken) {
-          res.writeHead(401, { ...cors, 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid_grant' }));
-          return;
-        }
-        oauthMock.refreshCount += 1;
-        oauthMock.refreshToken = `rt-${oauthMock.refreshCount}`;
-        res.writeHead(200, { ...cors, 'content-type': 'application/json' });
-        res.end(JSON.stringify({
-          // n makes consecutive tokens distinct even within one epoch
-          // second (exp alone would collide on a fast run).
-          access_token: `${b64url({ alg: 'none' })}.${b64url({ exp: Math.floor(Date.now() / 1000) + oauthMock.expiresInSec, n: oauthMock.refreshCount })}.e2e`,
-          id_token: `idt-${oauthMock.refreshCount}`,
-          refresh_token: oauthMock.refreshToken,
-          expires_in: oauthMock.expiresInSec,
-        }));
-      });
-    });
-    await new Promise(resolve => mockOauthServer.listen(MOCK_OAUTH_PORT, '127.0.0.1', resolve));
-
-    // Store the full codex auth file in the vault through the real form.
-    const codexSeed = JSON.stringify({
-      OPENAI_API_KEY: null,
-      tokens: { access_token: 'stale-not-a-jwt', refresh_token: 'rt-0', account_id: 'acct-e2e' },
-      last_refresh: '2026-01-01T00:00:00.000Z',
-    });
-    const addCodex = await page.evaluate(secret => {
-      const section = document.getElementById('access-vault-section');
-      const fold = Array.from(section.querySelectorAll('details summary'))
-        .find(s => s.textContent.trim() === 'Add a credential');
-      if (!fold) return 'no add fold';
-      fold.parentElement.open = true;
-      const selects = section.querySelectorAll('.vault-form-grid select');
-      if (selects.length < 2) return 'form fields missing';
-      selects[0].value = 'oauth';
-      selects[0].dispatchEvent(new Event('change'));
-      selects[1].value = 'codex';
-      const inputs = section.querySelectorAll('.vault-form-grid input');
-      inputs[0].value = 'UI Codex';
-      const area = fold.parentElement.querySelector('textarea');
-      if (!area) return 'no auth textarea';
-      area.value = secret;
-      const button = Array.from(section.querySelectorAll('button'))
-        .find(b => b.textContent.trim() === 'Add to vault');
-      if (!button) return 'no add button';
-      button.click();
-      return 'ok';
-    }, codexSeed);
-    assert.strictEqual(addCodex, 'ok', `UI add-codex failed: ${addCodex}`);
-    const codexEntryId = await waitFor(async () =>
-      (await vaultState())?.entries.find(e => e.kind === 'oauth' && e.provider === 'codex')?.id,
-    STEP_TIMEOUT_MS, 'codex entry stored');
-
-    await page.evaluate(url => window.intendantVault.setOauthEndpoints({ 'oauth:codex': url }),
-      `http://127.0.0.1:${MOCK_OAUTH_PORT}/oauth/token`);
-    await page.evaluate(id => window.intendantVault.fuelEntry(id), codexEntryId);
-    const atLease = await waitFor(async () => {
-      const status = await rpc('api_credential_lease_status');
-      const lease = status.leases.find(l => l.kind === 'oauth:codex');
-      return lease && lease.mode === 'access_token' ? lease : null;
-    }, STEP_TIMEOUT_MS, 'access-token codex lease');
-    const codexAuthAt = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
-    assert.strictEqual(codexAuthAt.tokens.refresh_token, '', 'materialized auth must be refresh-free');
-    assert.strictEqual(codexAuthAt.OPENAI_API_KEY, null, 'materialized auth must not carry an API key');
-    assert.strictEqual(codexAuthAt.tokens.account_id, 'acct-e2e', 'non-secret fields must survive the strip');
-    assert(String(codexAuthAt.tokens.access_token).split('.').length === 3, 'expected the freshly minted JWT on disk');
-    assert.strictEqual(oauthMock.lastBody?.client_id, 'app_EMoamEEZ73f0CkXaXp7hrann', 'refresh must use the codex public client id');
-    const vaultCodexAfterFuel = JSON.parse(
-      (await vaultState()).entries.find(e => e.id === codexEntryId).secret
+    // ── Service-side refusal before and after an adversarial grant ──
+    const ungranted = await hostedControlStatuses(page, DEFAULT_DAEMON_ID);
+    assertHostedControlRefused(ungranted, 'before adversarial grant');
+    writeAdversarialOperatorGrant(
+      daemonHome,
+      'E2E-Hosted-Key-Fingerprint-0000000000000000AA',
+      'lease browser'
     );
-    assert.strictEqual(vaultCodexAfterFuel.tokens.refresh_token, 'rt-1', 'rotated refresh token must be written back to the vault');
-    assert.strictEqual(vaultCodexAfterFuel.tokens.access_token, codexAuthAt.tokens.access_token, 'vault copy tracks the fresh access token');
-    console.log('PASS lease-oauth-access-token browser-refreshed grant: refresh-free on disk, rotation in the vault');
+    const stillRefused = await hostedControlStatuses(page, DEFAULT_DAEMON_ID);
+    assertHostedControlRefused(stillRefused, 'after adversarial operator grant');
 
-    // The 300 s token life sits inside the 10-minute margin, so one
-    // renewal tick must refresh again and re-grant (new lease id).
-    await page.evaluate(() => window.intendantVault.renewTick());
-    const atLease2 = await waitFor(async () => {
-      const status = await rpc('api_credential_lease_status');
-      const lease = status.leases.find(l => l.kind === 'oauth:codex');
-      return lease && lease.lease_id !== atLease.lease_id ? lease : null;
-    }, STEP_TIMEOUT_MS, 're-granted access-token lease');
-    assert.strictEqual(atLease2.mode, 'access_token');
-    const codexAuthAt2 = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
-    assert.notStrictEqual(codexAuthAt2.tokens.access_token, codexAuthAt.tokens.access_token, 'renewal tick must materialize the newer token');
-    assert.strictEqual(codexAuthAt2.tokens.refresh_token, '', 're-granted material must stay refresh-free');
-    const vaultCodexAfterTick = JSON.parse(
-      (await vaultState()).entries.find(e => e.id === codexEntryId).secret
-    );
-    assert.strictEqual(vaultCodexAfterTick.tokens.refresh_token, 'rt-2', 'second rotation must be written back too');
-    const ownAfterTick = await page.evaluate(() => window.intendantVault.leases().ownLeaseIds);
-    assert(ownAfterTick.includes(atLease2.lease_id), 'the tab must renew the replacement lease');
-    console.log('PASS lease-oauth-access-token-renew near-expiry tick re-granted fresh material');
-
-    // Fail-closed on the daemon: material claiming access-token mode but
-    // still carrying durable authority is refused (both oauth kinds).
-    for (const [kind, material] of [
-      ['oauth:codex', JSON.stringify({ tokens: { access_token: 'a', refresh_token: 'r' } })],
-      ['oauth:claude-code', JSON.stringify({ claudeAiOauth: { accessToken: 'a', refreshToken: 'r' } })],
-    ]) {
-      let refused = false;
-      try {
-        await rpc('api_credential_lease_grant', { kind, label: 'x', mode: 'access_token', material });
-      } catch (err) {
-        refused = /refresh token/.test(String((err && err.message) || err));
-      }
-      assert(refused, `daemon must refuse refresh-bearing access-token material for ${kind}`);
-    }
-    console.log('PASS lease-oauth-fail-closed refresh-bearing access-token grants refused server-side');
-
-    // The full-credential opt-in still leases the whole auth file.
-    await page.evaluate(() => window.intendantVault.setOauthLeases(true));
-    await page.evaluate(id => window.intendantVault.fuelEntry(id), codexEntryId);
-    await waitFor(async () => {
-      const status = await rpc('api_credential_lease_status');
-      const lease = status.leases.find(l => l.kind === 'oauth:codex');
-      return lease && lease.mode === 'full_credential' ? lease : null;
-    }, STEP_TIMEOUT_MS, 'full-credential codex lease');
-    const codexAuthFull = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
-    assert.strictEqual(codexAuthFull.tokens.refresh_token, 'rt-2', 'full-credential mode leases the refresh token');
-    await page.evaluate(() => window.intendantVault.setOauthLeases(false));
-    await rpc('api_credential_lease_revoke', { kind: 'oauth:codex' });
-    await waitFor(() => !fs.existsSync(codexAuthPath), STEP_TIMEOUT_MS, 'codex materialization deleted after the mode scenarios');
-    console.log('PASS lease-oauth-full-credential opt-in leases the whole auth file');
-
-    // ── --owner bootstrap (install.sh step 6) ──
-    // A fresh daemon started with --owner <client-key-fingerprint> must
-    // seed a root grant pinned to that key at startup, and a restart with
-    // the same flag must not duplicate grants or grow the audit log.
-    const ownerHome = path.join(tmp, 'owner-home');
-    fs.mkdirSync(ownerHome, { recursive: true });
-    // Must satisfy the daemon's shape check (exactly 43 base64url chars —
-    // startup rejects garbage --owner values since d36f57fe).
-    const ownerFp = 'E2E-Owner-Key-Fingerprint-000000000000000AA';
-    // Offset past the org-validator port block (8898/8899).
-    const ownerPort = options.daemonPort + 11;
-    const ownerIamPath = path.join(ownerHome, '.intendant', 'access-certs', 'iam.json');
-    const spawnOwnerDaemon = () => spawnLogged(options.daemonBinary, [
-      '--no-tui', '--no-tls', '--bind', '127.0.0.1', '--web', String(ownerPort),
-      '--owner', ownerFp,
-    ], {
-      cwd: tmp,
-      env: { ...daemonEnv, HOME: ownerHome },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }, logs.daemon);
-
-    const ownerChild = spawnOwnerDaemon();
-    await waitFor(() => httpStatus(`http://127.0.0.1:${ownerPort}/config`).then(s => s === 200), START_TIMEOUT_MS, 'owner daemon readiness');
-    const ownerIam = JSON.parse(fs.readFileSync(ownerIamPath, 'utf8'));
-    const ownerPrincipal = ownerIam.principals.find(p =>
-      p.kind === 'client_key' && (p.authn || []).some(a => a.fingerprint === ownerFp));
-    assert(ownerPrincipal, `no client_key principal for the owner fingerprint: ${JSON.stringify(ownerIam.principals)}`);
-    const ownerGrants = ownerIam.grants.filter(g => g.principal_id === ownerPrincipal.id);
-    assert.strictEqual(ownerGrants.length, 1, `expected exactly one owner grant: ${JSON.stringify(ownerGrants)}`);
-    assert.strictEqual(ownerGrants[0].role_id, 'role:root', 'owner grant must be root');
-    assert.strictEqual(ownerGrants[0].status, 'active');
-    const ownerAuditCount = (ownerIam.audit_events || []).length;
-
-    ownerChild.kill('SIGTERM');
-    await new Promise(resolve => setTimeout(resolve, 500));
-    spawnOwnerDaemon();
-    await waitFor(() => httpStatus(`http://127.0.0.1:${ownerPort}/config`).then(s => s === 200), START_TIMEOUT_MS, 'owner daemon restart');
-    const ownerIamAfter = JSON.parse(fs.readFileSync(ownerIamPath, 'utf8'));
+    await page.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(DEFAULT_DAEMON_ID)}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: START_TIMEOUT_MS,
+    });
+    assert.strictEqual(new URL(page.url()).pathname, '/connect', 'retired /app route did not redirect to /connect');
     assert.strictEqual(
-      ownerIamAfter.grants.filter(g => g.principal_id === ownerPrincipal.id).length,
-      1,
-      'restart with the same --owner duplicated the grant'
+      await page.evaluate(() => typeof window.intendantDashboardControl),
+      'undefined',
+      'Connect directory unexpectedly loaded the dashboard control client'
     );
-    assert.strictEqual(
-      (ownerIamAfter.audit_events || []).length,
-      ownerAuditCount,
-      'idempotent --owner restart grew the audit log'
-    );
-    console.log('PASS lease-owner-bootstrap root grant pinned once, restart idempotent');
+    assert(!logs.daemon.join('').includes('[dashboard/control] data channel open:'), 'hosted route unexpectedly opened a control data channel');
+    const keysAfterRefusal = await fetch(`${daemonOrigin}/api/api-key-status`).then(r => r.json());
+    assert.strictEqual(keysAfterRefusal.anthropic, false, 'refused hosted path unexpectedly fueled the daemon');
+    console.log(JSON.stringify({
+      ok: true,
+      hosted_delivery_available: false,
+      control_statuses: stillRefused,
+      data_channel_open: false,
+      daemon_anthropic_key: keysAfterRefusal.anthropic,
+    }, null, 2));
 
-    console.log('PASS validate-credential-leases all scenarios');
   } catch (err) {
     console.error(`FAIL validate-credential-leases reason="${err.message}"`);
     console.error('--- connect tail ---');

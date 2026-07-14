@@ -72,7 +72,7 @@
           <div class="access-pane-body">
             <div class="acc-section-head">
               <div class="acc-section-title">People &amp; Devices</div>
-              <div class="acc-section-sub">Humans and their browsers, certificates, and Connect accounts — everyone who may operate <em>this</em> daemon. Daemon-to-daemon trust lives under Peers.</div>
+              <div class="acc-section-sub">Humans and their trusted local, mTLS-browser, or signed-native identities. Connect account fields are discovery metadata only in this alpha; daemon-to-daemon trust lives under Peers.</div>
             </div>
             <div id="access-people-current" class="acc-hero-grid"></div>
             <div id="access-enrollment-requests"></div>
@@ -80,7 +80,7 @@
             <details class="acc-fold" id="access-org-join-fold">
               <summary>Join with an org grant</summary>
               <div class="acc-fold-body">
-                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails. The document is also kept in this browser and presented automatically whenever you connect to a daemon that trusts the org, so you only do this once.</p>
+                <p class="acc-fold-hint">Paste a signed client-key document for verification and storage. Browser-key login is staged in this alpha, so materializing this document does not authorize the current session. Peer-subject org grants are usable today through peer mTLS. Nothing changes if verification fails.</p>
                 <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
                 <div class="acc-grant-flow-actions">
                   <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
@@ -241,7 +241,7 @@
           <div class="access-pane-body">
             <div class="acc-section-head">
               <div class="acc-section-title">Credential vault</div>
-              <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
+              <div class="acc-section-sub">Provider credentials sealed under passkey/recovery-derived keys. Passive hosted storage receives ciphertext, but code served by that origin can access entries while this page unlocks them. The Connect-account vault has no trusted delivery bridge to a daemon in this alpha; daemon-local vaults, local configuration, and time-boxed leases remain separate paths.</div>
             </div>
             <div id="access-vault-section"></div>
 

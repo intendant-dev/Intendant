@@ -229,7 +229,8 @@ fn default_true() -> bool {
 /// blob committed into the session's upload store — never inline bytes:
 /// the WebSocket broadcast and the session log both stay small, and the
 /// browser fetches the pixels lazily from `url` (the upload store's
-/// existing `/raw` route, which serves the stored MIME inline).
+/// existing `/raw` route, which preserves the stored MIME but forces an
+/// attachment disposition and disables MIME sniffing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNoteAttachment {
     /// Upload-store descriptor id the blob was committed under.

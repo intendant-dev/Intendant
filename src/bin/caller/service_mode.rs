@@ -9,9 +9,9 @@
 //! used; where it is weak (Task Scheduler, cron) the entry point is
 //! `intendant service run`, a small built-in supervisor that restarts
 //! the daemon with backoff and appends its output to a log file — which
-//! is also where the claim phrase lands on those backends.
+//! is also where the one-time claim code lands on those backends.
 //!
-//! `install` always says where to watch for the claim phrase; that line
+//! `install` always says where to watch for the claim code; that line
 //! is the contract the install scripts and the landing advisor lean on.
 
 use std::io::Write;
@@ -30,7 +30,7 @@ const BACKOFF_CAP_SECS: u64 = 60;
 const BACKOFF_RESET_UPTIME_SECS: u64 = 300;
 
 /// The environment a service definition must carry over: the rendezvous
-/// wiring is how a booted daemon finds its way back to being claimable.
+/// wiring is how a booted daemon finds its way back to being linkable.
 const CARRIED_ENV_KEYS: [&str; 3] = [
     "INTENDANT_CONNECT_RENDEZVOUS_URL",
     "INTENDANT_CONNECT_DAEMON_ID",
@@ -484,7 +484,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 unit_path.display()
             );
             println!(
-                "claim phrase / logs: journalctl {}-u intendant -f",
+                "claim code / logs: journalctl {}-u intendant -f",
                 if system { "" } else { "--user " }
             );
         }
@@ -513,7 +513,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 );
             }
             println!("installed LaunchAgent {}", plist_path.display());
-            println!("claim phrase / logs: tail -f {log_str}");
+            println!("claim code / logs: tail -f {log_str}");
         }
         Backend::WindowsTask { boot } => {
             let user_id = windows_user_id();
@@ -543,7 +543,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                     "starts at logon — rerun elevated for at-boot start"
                 }
             );
-            println!("claim phrase / logs: Get-Content -Wait {log_str}");
+            println!("claim code / logs: Get-Content -Wait {log_str}");
         }
         Backend::CronReboot => {
             let run_args = supervisor_run_args(&log_str, &envs, &daemon_args);
@@ -566,7 +566,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 spawn_supervisor_detached(&exe, &run_args)?;
                 println!("supervisor started");
             }
-            println!("claim phrase / logs: tail -f {log_str}");
+            println!("claim code / logs: tail -f {log_str}");
         }
     }
     if now {
@@ -581,10 +581,10 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
 /// its first 3s backoff), short enough not to stall the installer.
 const FIRST_BOOT_PROBE_DELAY_MS: u64 = 2500;
 
-/// `install --now` used to report success — and print where the claim
-/// phrase lands — while the daemon it had just started was crash-looping
+/// `install --now` used to report success — and print where the one-time
+/// claim code lands — while the daemon it had just started was crash-looping
 /// on a first-boot misconfiguration; the user then tails a log that never
-/// shows a claim phrase. After starting, wait briefly and fail loudly on
+/// shows a claim code. After starting, wait briefly and fail loudly on
 /// positive evidence of death: a failed/auto-restarting unit, a pid-less
 /// LaunchAgent, or supervisor restart lines from this run. Absence of
 /// evidence (a slow start) stays green — this must never flake a healthy

@@ -14,6 +14,7 @@ use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
 
 /// Advisory cap: newest requests win; the queue is a doorbell, not a log.
+#[cfg(test)]
 const MAX_PENDING: usize = 32;
 /// Requests older than this are pruned on read.
 const PENDING_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -54,6 +55,7 @@ fn prune_locked(pending: &mut Vec<PendingClientKeyEnrollment>, now_unix_ms: i64)
 
 /// Record a refused-but-verified key. Repeated attempts collapse into one
 /// entry with a bumped counter; overflow evicts the stalest entry.
+#[cfg(test)]
 pub fn record_refused_client_key(
     fingerprint: &str,
     public_key_b64u: &str,

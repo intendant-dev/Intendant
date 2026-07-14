@@ -95,11 +95,10 @@ pub fn spawn_web_gateway(
     // rely on transport security (mTLS proxy, tailnet, loopback).
     // Sourced from `[server.auth] bearer_token` in intendant.toml.
     //
-    // /ws, /.well-known/agent-card.json, /config, the dashboard HTML,
-    // and static assets are intentionally exempt in this slice — /ws
-    // enforcement requires a parallel dashboard auth flow (browser
-    // can't easily set headers on `WebSocket` opens) which lands in
-    // slice 2d.
+    // /.well-known/agent-card.json, /config, the dashboard HTML, and static
+    // assets are intentionally exempt. /ws is enforced separately below:
+    // daemons use Authorization, browsers use a ?token= query parameter, and
+    // every browser Origin must be the daemon's own or the signed app scheme.
     inbound_bearer_token: Option<String>,
     // What to advertise in the local Agent Card's `auth` field —
     // tells connecting peers what wire-layer (transport) and
@@ -117,8 +116,9 @@ pub fn spawn_web_gateway(
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
     // When true, the TLS layer may complete without a client certificate so
-    // public peer-access requests can reach the doorbell endpoint, but every
-    // other HTTP/WS path is rejected unless rustls verified a client cert.
+    // authority-free shell/discovery bytes and public access-request doors
+    // remain reachable. Protected HTTP and every WS path still require a
+    // rustls-verified client certificate (or authenticated peer identity).
     tls_client_cert_required: bool,
     // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
     // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
@@ -1224,10 +1224,50 @@ pub fn spawn_web_gateway(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
-                    if tls_client_cert_required && !tls_client_cert_present {
+                    // Browsers attach their page Origin to WebSocket
+                    // handshakes, but WebSocket's same-origin protection is
+                    // entirely server-enforced. Reject foreign pages before
+                    // transport identity is converted into a dashboard grant:
+                    // otherwise a hosted page can make the browser present an
+                    // already-enrolled mTLS certificate and inherit that
+                    // direct principal's daemon-local IAM grant. Native
+                    // and daemon clients may omit Origin; the signed native
+                    // app's custom scheme remains an explicit trusted origin.
+                    if let Some(origin) = extract_origin_header(&header_text)
+                        .filter(|origin| !is_own_or_app_origin(origin, is_tls, &header_text))
+                    {
                         use tokio::io::AsyncWriteExt;
                         let body = serde_json::json!({
-                            "error": "mTLS client certificate required"
+                            "error": "cross-origin caller is not allowed on this WebSocket",
+                            "origin": origin,
+                        })
+                        .to_string();
+                        let response =
+                            HttpResponse::with_content("403 Forbidden", "application/json", body)
+                                .header("Cache-Control", "no-cache")
+                                .header("Vary", "Origin")
+                                .header("Connection", "close")
+                                .into_string();
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+                    let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+                        peer_addr,
+                        &header_text,
+                        tls_client_cert_fingerprint.as_deref(),
+                        peer_connection_identity.as_ref(),
+                    );
+                    if (tls_client_cert_required && !tls_client_cert_present)
+                        || remote_client_auth_missing
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "error": if remote_client_auth_missing {
+                                "verified client certificate or authenticated peer identity required for remote dashboard access"
+                            } else {
+                                "mTLS client certificate required"
+                            }
                         })
                         .to_string();
                         let response = HttpResponse::with_content(
@@ -1278,6 +1318,7 @@ pub fn spawn_web_gateway(
                         &cert_dir,
                         peer_connection_identity.as_ref(),
                         tls_client_cert_fingerprint.as_deref(),
+                        tls_client_cert_present,
                     ) {
                         Ok(grant) => grant,
                         Err(message) => {
@@ -1288,6 +1329,16 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
+                    if !dashboard_control_grant_for_ws.allows_unfiltered_websocket_stream() {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "mTLS client lacks the complete observer read set required by the legacy WebSocket stream",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
                     let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -1682,6 +1733,7 @@ pub fn spawn_web_gateway(
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
                     // Assign a unique peer ID for WebRTC signaling
                     let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
+                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
 
                     let inbound_ctx = WsInboundCtx {
                         bus: bus.clone(),
@@ -1711,6 +1763,7 @@ pub fn spawn_web_gateway(
                         ice_config: ice_config.clone(),
                         tcp_advertised_port,
                         tcp_peer_registry: Arc::clone(&tcp_peer_registry),
+                        session_cancel: ws_session_cancel.clone(),
                     };
                     let inbound = tokio::spawn(ws_inbound_task(inbound_ctx, ws_rx, peer_id));
 
@@ -1736,6 +1789,8 @@ pub fn spawn_web_gateway(
                         session_registry.clone(),
                         bootstrap_caches.clone(),
                         bootstrap_flushed_rx,
+                        dashboard_control_grant_for_ws.clone(),
+                        ws_session_cancel,
                     ));
 
                     let _ = tokio::join!(inbound, outbound);

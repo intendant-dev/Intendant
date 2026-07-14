@@ -2040,7 +2040,6 @@ mod tests {
     use crate::autonomy::{self, AutonomyState};
     use crate::mcp::tests::test_state_with_log_dir;
     use tempfile::tempdir;
-    use tokio::time::{timeout, Duration};
 
     #[test]
     fn parse_restart_after_defaults_to_turn_end() {

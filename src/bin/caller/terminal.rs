@@ -102,7 +102,8 @@ pub enum TerminalEvent {
 
 /// Who is acting on a terminal session, resolved from the connection's
 /// access grant. `Root` is the owner lane (trusted local dashboards,
-/// unbound mTLS root certificates) and sees every session; everyone else
+/// explicitly enrolled direct-mTLS root principals) and sees every session;
+/// everyone else
 /// acts as their IAM principal id and sees only sessions they own or
 /// sessions marked shared.
 #[derive(Debug, Clone, PartialEq, Eq)]

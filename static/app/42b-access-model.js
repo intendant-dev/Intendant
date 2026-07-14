@@ -1,6 +1,6 @@
 // ── Access model + rendering ──
 // The Access surface model + render domain: fleet targets (remembered +
-// live, hosted sync, petnames), enrollments, Connect status/claim, the
+// live, hosted sync, petnames), enrollments, Connect status/account link, the
 // IAM overview model (roles/policies/permissions, fallback catalog),
 // target rows/feature chips/lane badges, grant forms + fanout, the
 // permission matrix, and the coordinator route preview. The Access pane
@@ -270,11 +270,7 @@ function accessFleetTargetUrl(target) {
   const explicit = target?.url || target?.browser_tcp_via_url || target?.ws_url || '';
   if (explicit) return explicit;
   if (target?.local && DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
-    const base = String(target?.connect_signaling_base || '').trim().replace(/\/+$/, '');
-    const extra = base && base !== window.location.origin
-      ? `&connect_base=${encodeURIComponent(base)}`
-      : '';
-    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${extra}`;
+    return '/connect';
   }
   if (target?.local && window.location.origin) return window.location.origin;
   return '';
@@ -514,8 +510,8 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
 }
 
 /* Intendant Connect status for THIS daemon (hosted rendezvous
-   reachability + claim binding). Pull-based like the overview. The
-   twelve-word claim phrase is NEVER in this payload — it has its own
+   reachability + discovery/account link). Pull-based like the overview. The
+   one-time twelve-word claim code is NEVER in this payload — it has its own
    manage-gated fetch (`accessConnectFetchClaimCode`), pulled only on an
    explicit reveal click. */
 let accessConnectStatus = null;
@@ -623,23 +619,6 @@ async function accessSetTier(tier) {
   renderAccessAdminSummaries();
 }
 
-async function accessSetHostedCeiling(roleId) {
-  const payload = { role_id: roleId };
-  try {
-    // daemonApi (transport F4): POST twin — verb-derived no-replay.
-    const resp = await daemonApi.request('api_access_set_hosted_ceiling', payload);
-    const data = resp.body;
-    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    showControlToast?.('success', roleId === 'role:none'
-      ? 'Hosted-origin control refused. Reach this daemon directly, through the app, or from an enrolled peer — a hosted tab can no longer change this back.'
-      : `Hosted control ceiling set to ${roleId.replace(/^role:/, '')}`);
-  } catch (err) {
-    showControlToast?.('error', err?.message || 'Hosted ceiling change failed');
-  }
-  await refreshAccessOverviewFromApi().catch(() => null);
-  renderAccessAdminSummaries();
-}
-
 async function accessFleetCertRequest() {
   try {
     // daemonApi (transport F4): POST twin — verb-derived no-replay. The
@@ -672,9 +651,9 @@ async function accessConnectUnclaim() {
     const resp = await daemonApi.request('api_access_connect_unclaim', {});
     const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    showControlToast?.('success', 'Claim released — a fresh claim phrase will mint shortly');
+    showControlToast?.('success', 'Account unlinked — a fresh one-time claim code will be issued shortly');
   } catch (err) {
-    showControlToast?.('error', err?.message || 'Unclaim failed');
+    showControlToast?.('error', err?.message || 'Unlink failed');
   }
   await refreshAccessConnectStatus({ silent: true }).catch(() => null);
   renderAccessAdminSummaries();
@@ -814,7 +793,7 @@ function dashboardAccessRoleLabel(roleId) {
     'role:files-read': 'Files read',
     'role:files-write': 'Files write',
     'role:operator': 'Operator',
-  }[key] || (key ? key.replace(/^role:/, '').replace(/-/g, ' ') : 'Root');
+  }[key] || (key ? key.replace(/^role:/, '').replace(/-/g, ' ') : 'Unknown');
 }
 
 function dashboardCurrentAccessRouteInfo() {
@@ -825,7 +804,6 @@ function dashboardCurrentAccessRouteInfo() {
   const source = String(principal.source || '').trim();
   const transport = String(principal.transport || '').trim();
   const kind = String(principal.kind || '').trim();
-  const roleLabel = dashboardAccessRoleLabel(principal.role_id || 'role:root');
   const connectAccount = principal.account?.account_name
     ? `@${principal.account.account_name}`
     : (principal.account?.user_id ? 'Connect account' : 'Connect account');
@@ -833,20 +811,24 @@ function dashboardCurrentAccessRouteInfo() {
     source === 'connect-account' ||
     transport.includes('connect') ||
     kind === 'connect_account';
+  const roleLabel = principal.role_id
+    ? dashboardAccessRoleLabel(principal.role_id)
+    : 'No access';
   if (isConnect) {
     return {
       domain: 'User/client access',
       route: 'Intendant Connect',
-      auth: 'connect_account',
-      authLabel: connectAccount,
-      role: roleLabel,
-      detail: `${connectAccount} over the hosted dashboard tunnel`,
+      auth: 'connect_account_metadata',
+      authLabel: 'Connect account metadata',
+      role: 'No access',
+      detail: `${connectAccount} is discovery metadata only; hosted Connect never exercises browser-key or daemon authority in the default build`,
     };
   }
   const isBrowserCert = kind === 'browser_certificate' ||
+    kind === 'browser_mtls_cert' ||
     source === 'browser-mtls' ||
-    transport === 'https' ||
-    location.protocol === 'https:';
+    transport === 'browser-mtls' ||
+    transport === 'mtls';
   if (isBrowserCert) {
     return {
       domain: 'User/client access',
@@ -857,7 +839,12 @@ function dashboardCurrentAccessRouteInfo() {
       detail: 'trusted browser client certificate',
     };
   }
-  return {
+  const isTrustedLocal = kind === 'root_session' ||
+    source === 'trusted_dashboard_session' ||
+    source === 'trusted-local' ||
+    transport === 'trusted-local' ||
+    transport === 'loopback';
+  if (isTrustedLocal) return {
     domain: 'User/client access',
     route: 'Local/debug',
     auth: 'trusted_dashboard',
@@ -865,11 +852,20 @@ function dashboardCurrentAccessRouteInfo() {
     role: roleLabel,
     detail: 'local browser session',
   };
+  return {
+    domain: 'User/client access',
+    route: 'Locked',
+    auth: 'none',
+    authLabel: 'No authenticated anchor',
+    role: 'No access',
+    detail: 'HTTPS and page origin do not authenticate this browser; use loopback, the native mTLS bridge, or a direct mTLS client certificate',
+  };
 }
 
 function decorateDashboardAccessTarget(target) {
   if (!target || !target.local) return target;
   const route = dashboardCurrentAccessRouteInfo();
+  const principalRole = String(dashboardControlTransport?.lastStatus?.access_principal?.role_id || '');
   return {
     ...target,
     access_domain: 'user_client',
@@ -878,7 +874,7 @@ function decorateDashboardAccessTarget(target) {
     route_label: route.route,
     auth: route.auth,
     auth_label: route.authLabel,
-    effective_role: String((dashboardControlTransport?.lastStatus?.access_principal?.role_id) || 'role:root'),
+    effective_role: principalRole || 'role:none',
     effective_role_label: route.role,
   };
 }
@@ -966,24 +962,22 @@ function dashboardTargetFeatureChips(hostId, context = '') {
   const raw = local
     ? (dashboardControlTransport?.lastStatus || {})
     : (peerDashboardControlConnectionsByHost.get(String(hostId || '').trim())?.lastStatus || {});
-  const directLocalFallback = local && !dashboardConnectModeEnabled();
   if (local) {
     return [
       {
         label: 'Sessions',
-        state: dashboardCapabilityState(raw.api_sessions_available === true || directLocalFallback),
+        state: dashboardCapabilityState(raw.api_sessions_available === true),
       },
       {
         label: 'Files',
         state: dashboardCapabilityState(
           raw.api_fs_read_available === true ||
-          dashboardByteStreamMethodAvailable('api_fs_read') ||
-          directLocalFallback
+          dashboardByteStreamMethodAvailable('api_fs_read')
         ),
       },
       {
         label: 'Shell',
-        state: dashboardCapabilityState(raw.terminal_frames_available === true || directLocalFallback),
+        state: dashboardCapabilityState(raw.terminal_frames_available === true),
       },
     ];
   }
@@ -1399,11 +1393,11 @@ function accessLocalTargetModel() {
     access_domain_label: 'User/client access',
     route: 'current_dashboard',
     route_label: 'Current dashboard',
-    auth: 'trusted_dashboard',
-    auth_label: 'Trusted dashboard session',
-    effective_role: 'root',
-    effective_role_label: 'Root',
-    connected: true,
+    auth: 'none',
+    auth_label: 'No authenticated anchor',
+    effective_role: 'role:none',
+    effective_role_label: 'No access',
+    connected: false,
     capabilities: [],
   }));
 }
@@ -1458,7 +1452,7 @@ function accessIamLoadLabel(iam) {
 
 function accessIamEnforcementReason(iam) {
   const enforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
-  return accessModelLabel(enforcement.reason, 'Active scoped user/client grants are enforced when requests bind to browser mTLS or Connect account identities.');
+  return accessModelLabel(enforcement.reason, 'Active scoped user/client grants are enforced when requests bind to trusted local sessions or mTLS certificates. Browser identity-key and Connect account records do not authenticate alpha control traffic.');
 }
 
 function accessFallbackIamRoles() {
@@ -1488,7 +1482,7 @@ function accessFallbackIamRoles() {
     id: 'role:scoped-human',
     label: 'Scoped human',
     status: 'enforced',
-    summary: 'Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.',
+    summary: 'Minimal user/client IAM role for stable browser identity-key and mTLS request bindings.',
     permissions: ['access.inspect'],
     source: 'builtin',
   }, {
@@ -1622,18 +1616,16 @@ function accessOverviewModel() {
   const localTarget = targets.find(t => t.local) || {};
   const localTargetId = targetId(localTarget) || selfPeerId || SHELL_HOST_ID || 'local';
   const principals = [{
-    id: 'principal:current-browser-session',
+    id: 'principal:current-browser-unauthenticated',
     kind: 'browser_session',
-    kind_label: 'Current browser session',
-    label: 'Current browser',
-    source: 'trusted_dashboard_session',
+    kind_label: 'Unauthenticated browser',
+    label: 'Unauthenticated browser',
+    source: 'no_authenticated_anchor',
     local: true,
     account: null,
     organization: null,
-    authn: [{
-      kind: 'trusted_dashboard_session',
-      label: 'Trusted dashboard session',
-    }],
+    authn: [],
+    role_id: 'role:none',
   }, ...peerTargets.map(target => ({
     id: `principal:peer-daemon:${targetId(target)}`,
     kind: 'peer_daemon',
@@ -1649,19 +1641,7 @@ function accessOverviewModel() {
       label: 'Daemon mTLS identity',
     }],
   }))];
-  const grants = [{
-    id: `grant:current-browser:${localTargetId}:root`,
-    principal_id: 'principal:current-browser-session',
-    target_id: localTargetId,
-    kind: 'user_client_root',
-    kind_label: 'User/client root',
-    policy_id: 'policy:root',
-    role: 'root',
-    role_label: 'Root',
-    transport_id: 'transport:current-dashboard',
-    source: 'trusted_dashboard_session',
-    status: 'active',
-  }, ...peerTargets.map(target => ({
+  const grants = [...peerTargets.map(target => ({
     id: `grant:peer-route:${targetId(target)}:profile`,
     principal_id: `principal:peer-daemon:${targetId(target)}`,
     target_id: targetId(target),
@@ -1679,8 +1659,8 @@ function accessOverviewModel() {
     kind: 'current_dashboard',
     kind_label: 'Current dashboard transport',
     label: 'Current dashboard',
-    status: 'connected',
-    implementation: 'local_mtls_or_hosted_tunnel',
+    status: 'locked',
+    implementation: 'no_authenticated_anchor',
     target_id: localTargetId,
   }, ...peerTargets.map(target => ({
     id: `transport:peer-route:${targetId(target)}`,
@@ -1714,7 +1694,7 @@ function accessOverviewModel() {
       ],
     },
     iam: {
-      schema_version: 1,
+      schema_version: 2,
       load_status: 'derived',
       state_path: '',
       managed_principals: 0,
@@ -1734,12 +1714,12 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'client_key', 'connect_account'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys, browser mTLS certificates, or Connect account identities.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to trusted local sessions or browser mTLS certificates. Browser identity-key and Connect account records do not authenticate alpha control traffic.',
       },
       role_ceilings: {
-        connect_account: 'role:operator',
-        client_key: 'role:operator',
+        connect_account: 'role:none',
+        client_key: 'role:none',
       },
       hosted_origins: ['https://connect.intendant.dev'],
     },
@@ -2122,8 +2102,11 @@ function accessGrantsBy(overview, key) {
 function accessGrantWhy(grant) {
   const kind = accessModelLabel(grant.kind);
   const source = accessModelLabel(grant.source);
+  if (kind === 'connect_account_metadata') {
+    return 'Legacy discovery metadata only. It authenticates no request, carries no daemon authority, and is read-only.';
+  }
   if (kind === 'user_client_root') {
-    return 'This browser is trusted as the owner/root client for this daemon. Connect and browser mTLS are transports for that authority.';
+    return 'This browser was enrolled as an owner/root client by a trusted anchor. The default build never exercises that root grant through hosted Connect.';
   }
   if (kind === 'daemon_peer_profile') {
     return 'This outbound daemon peer route was configured on this daemon. It gives this daemon peer-profile authority on the target daemon.';
@@ -2132,7 +2115,7 @@ function accessGrantWhy(grant) {
     return 'This inbound daemon mTLS identity was approved for this daemon. The peer profile bounds what the remote daemon may do here.';
   }
   if (kind === 'user_client_local_iam') {
-    return 'This local IAM grant is enforced when a request binds to its browser certificate or Connect account metadata.';
+    return 'This local IAM grant is enforced when a request binds to an active transport credential such as its mTLS certificate. Browser-key and Connect-account records do not authenticate alpha requests.';
   }
   return source ? `Authority comes from ${source}.` : 'Authority is described by this grant.';
 }
@@ -2257,25 +2240,6 @@ function accessCurrentUserClientCandidate() {
       organization_name: accessModelLabel(principal?.organization?.name),
     };
   }
-  const connectAuthn = authnList.find(item =>
-    accessModelLabel(item?.kind) === 'connect_account' &&
-    (accessModelLabel(item?.user_id) || accessModelLabel(item?.account_name))
-  );
-  if (connectAuthn) {
-    const accountName = accessModelLabel(connectAuthn.account_name || principal?.account?.account_name);
-    const userId = accessModelLabel(connectAuthn.user_id || principal?.account?.user_id);
-    return {
-      kind: 'connect_account',
-      label: accessModelLabel(principal?.label, accountName ? `@${accountName}` : 'Current Connect account'),
-      fingerprint: '',
-      user_id: userId,
-      account_name: accountName,
-      account_provider: accessModelLabel(principal?.account?.provider),
-      verified_provider: accessModelLabel(principal?.account?.verified_provider),
-      organization_id: accessModelLabel(principal?.organization?.id),
-      organization_name: accessModelLabel(principal?.organization?.name),
-    };
-  }
   return null;
 }
 
@@ -2310,23 +2274,12 @@ function accessSyncUserClientGrantFields(form) {
     card.classList.toggle('selected', selected);
     card.classList.toggle('warn', selected && accessRoleMeta(input?.value).warn === true);
   });
-  // Warn when the chosen role exceeds what the binding's ceiling will let a
-  // session actually do (connect accounts always; client keys only matter
-  // here when the key was enrolled from a hosted origin, which a manually
-  // pasted fingerprint usually was not).
+  // Connect account records are not a grantable kind in the default build.
+  // No grant-kind-specific ceiling warning is currently needed.
   const note = form.querySelector('#access-grant-ceiling-note');
   if (note) {
-    const ceiling = kind === 'connect_account' ? accessRoleCeilingFor('connect_account') : null;
-    const selectedRole = form.querySelector('input[name="access-user-client-role"]:checked')?.value || '';
-    const ceilingRole = ceiling ? accessIamRoleById(ceiling) : null;
-    const selectedRoleObj = selectedRole ? accessIamRoleById(selectedRole) : null;
-    const exceeds = Boolean(ceiling && selectedRoleObj && ceilingRole
-      && Array.isArray(selectedRoleObj.permissions) && Array.isArray(ceilingRole.permissions)
-      && selectedRoleObj.permissions.some(perm => !ceilingRole.permissions.includes(perm)));
-    note.style.display = exceeds ? '' : 'none';
-    if (exceeds) {
-      note.textContent = `Hosted-route sessions for this account are capped at ${ceiling.replace(/^role:/, '')} by this daemon's role ceiling — the grant saves as ${selectedRole.replace(/^role:/, '')}, but Connect sessions won't exceed the ceiling. The "Hosted tabs may" control on the Overview tab moves it.`;
-    }
+    note.style.display = 'none';
+    note.textContent = '';
   }
 }
 
@@ -2356,20 +2309,16 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
 
 const ACCESS_GRANT_KIND_CHOICES = [{
   value: 'client_key',
-  title: 'A browser identity key',
-  desc: 'The key a browser holds in its own storage — signed into every session, no certificate install needed.',
+  title: 'A browser identity record (inactive)',
+  desc: 'A browser identity record for future direct authentication. In this alpha it is not an active sign-in credential: use loopback, the native app’s mTLS bridge, or a direct mTLS client certificate. Hosted Connect never exercises the grant.',
 }, {
   value: 'browser_certificate',
   title: 'A browser certificate',
   desc: 'Pin one browser’s mTLS client certificate to a role on this daemon.',
 }, {
-  value: 'connect_account',
-  title: 'A Connect account',
-  desc: 'Authorize an Intendant Connect account so its hosted dashboard can open this daemon.',
-}, {
   value: 'human_user',
   title: 'A person',
-  desc: 'One human record that can carry a key, a certificate, and a Connect account.',
+  desc: 'One human record that can carry a key or certificate plus optional Connect account metadata.',
 }];
 
 const ACCESS_ROLE_PICKER_ORDER = [
@@ -2472,7 +2421,7 @@ function accessMountHoldsUserWork(mount) {
   if (!mount) return false;
   // Focus counts for FIELDS only (the vault section's own guard set the
   // precedent): a focused button must not block the rebuild its own click
-  // handler asks for (e.g. Reveal claim phrase re-rendering to show it).
+  // handler asks for (e.g. Reveal claim code re-rendering to show it).
   const active = document.activeElement;
   if (active && mount.contains(active)
     && active.matches('input, textarea, select, [contenteditable]')) return true;
@@ -2491,8 +2440,8 @@ function accessGuardedRender(mountId, fp, renderFn) {
   const mount = document.getElementById(mountId);
   if (!mount) return;
   // Store a short digest, never the fingerprint itself: fp strings are
-  // whole model slices (large, and some carry secrets like the claim
-  // phrase) and must not land in a DOM attribute.
+  // whole model slices (large, and some carry secrets like the one-time
+  // claim code) and must not land in a DOM attribute.
   const fpKey = fp === null ? null : accessFpHash(fp);
   if (fpKey !== null && mount.dataset.accessGuardFp === fpKey) return;
   if (accessMountHoldsUserWork(mount)) return;
@@ -2601,11 +2550,9 @@ function renderAccessUserClientGrantForm() {
     detected.className = 'acc-detected';
     detected.textContent = candidate.kind === 'client_key'
       ? `Detected: this browser’s identity key ${String(candidate.client_key_fingerprint || '').slice(0, 12)}… — fields are pre-filled`
-      : (candidate.kind === 'connect_account'
-        ? `Detected: your Connect account ${candidate.account_name ? `@${candidate.account_name}` : candidate.user_id} — fields are pre-filled`
-        : (candidate.kind === 'human_user'
-          ? 'Detected: your mTLS user — fields are pre-filled'
-          : 'Detected: this browser’s certificate — fields are pre-filled'));
+      : (candidate.kind === 'human_user'
+        ? 'Detected: your mTLS user — fields are pre-filled'
+        : 'Detected: this browser’s certificate — fields are pre-filled');
     form.appendChild(detected);
   }
 
@@ -2629,12 +2576,12 @@ function renderAccessUserClientGrantForm() {
   }, {
     id: 'access-user-client-user-id',
     label: 'Connect user id',
-    kind: 'connect_account|human_user',
+    kind: 'human_user',
     placeholder: 'from the Connect account page',
   }, {
     id: 'access-user-client-account-name',
     label: 'Connect handle',
-    kind: 'connect_account|human_user',
+    kind: 'human_user',
     placeholder: 'name without the @',
   }];
   for (const field of textFields) {
@@ -2663,11 +2610,11 @@ function renderAccessUserClientGrantForm() {
   const advancedFields = [{
     id: 'access-user-client-account-provider',
     label: 'Account provider',
-    kind: 'connect_account|human_user',
+    kind: 'human_user',
   }, {
     id: 'access-user-client-verified-provider',
     label: 'Verified by',
-    kind: 'connect_account|human_user',
+    kind: 'human_user',
   }, {
     id: 'access-user-client-organization-id',
     label: 'Org id',
@@ -2909,7 +2856,7 @@ async function accessSubmitUserClientGrant(event) {
   const kind = accessSelectedUserClientKind(form);
   const kindHasFingerprint = kind === 'browser_certificate' || kind === 'human_user';
   const kindHasClientKey = kind === 'client_key' || kind === 'human_user';
-  const kindHasAccount = kind === 'connect_account' || kind === 'human_user';
+  const kindHasAccount = kind === 'human_user';
   const clientKeyFingerprint = kindHasClientKey
     ? (form.querySelector('#access-user-client-client-key-fingerprint')?.value?.trim() || null)
     : null;
@@ -2965,16 +2912,10 @@ async function accessSubmitUserClientGrant(event) {
     showControlToast?.('error', 'Browser key fingerprint is required');
     return;
   }
-  if (kind === 'connect_account' && !payload.user_id && !payload.account_name) {
-    showControlToast?.('error', 'User id or account name is required');
-    return;
-  }
   if (kind === 'human_user'
     && !payload.fingerprint
-    && !payload.client_key_fingerprint
-    && !payload.user_id
-    && !payload.account_name) {
-    showControlToast?.('error', 'A person needs at least one binding: key, certificate, or account');
+    && !payload.client_key_fingerprint) {
+    showControlToast?.('error', 'A person needs a browser identity key or certificate; Connect account fields are metadata only');
     return;
   }
   if (payload.role_id === 'role:root') {

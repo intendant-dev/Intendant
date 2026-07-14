@@ -964,7 +964,6 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[test]
     fn buffered_idle_agent_event_preempts_and_disables_on_disconnect() {

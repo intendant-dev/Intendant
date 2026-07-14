@@ -205,7 +205,6 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_access_connect_config: { verb: 'POST', path: '/api/access/connect/config' },
   api_access_connect_unclaim: { verb: 'POST', path: '/api/access/connect/unclaim' },
   api_access_set_tier: { verb: 'POST', path: '/api/access/tier' },
-  api_access_set_hosted_ceiling: { verb: 'POST', path: '/api/access/hosted-ceiling' },
   api_fleet_cert_request: { verb: 'POST', path: '/api/access/fleet-cert/request' },
   api_dashboard_targets: { verb: 'GET', path: '/api/dashboard/targets' },
   api_dashboard_tabs: { verb: 'GET', path: '/api/dashboard/tabs' },

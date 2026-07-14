@@ -126,6 +126,29 @@ pub(crate) fn dashboard_http_operation(
     }
 }
 
+/// IAM classification for the small legacy non-table read surface. These
+/// handlers predate `gateway_routes::ROUTES`; keeping their classification in
+/// one explicit residue prevents unknown/revoked mTLS certificates from
+/// bypassing the table gate while they are migrated.
+pub(crate) fn legacy_protected_http_operation(
+    path: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
+    use crate::peer::access_policy::PeerOperation;
+
+    if path.starts_with("/recordings/") || path == "/recordings" {
+        Some(PeerOperation::RuntimeControl)
+    } else if path.starts_with("/frames/") || path == "/debug" {
+        Some(PeerOperation::SessionInspect)
+    } else if path == "/config" {
+        // The dashboard needs ICE/TURN configuration before its realtime
+        // surfaces can boot. Every usable builtin human role carries
+        // presence.read; role:none and narrower scoped grants do not.
+        Some(PeerOperation::PresenceRead)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn http_access_forbidden_response(
     access: &HttpAccessContext,
     decision: crate::access::iam::AccessDecision,
@@ -143,11 +166,12 @@ pub(crate) fn http_access_forbidden_response(
 }
 
 pub(crate) fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
-    let Some(path) = request_line.split_whitespace().nth(1) else {
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
         return false;
     };
     let path = path.split('?').next().unwrap_or(path);
-    matches!(path, "/connect/bootstrap" | "/connect/status")
+    method == "GET" && matches!(path, "/connect/bootstrap" | "/connect/status")
 }
 
 pub(crate) fn is_connect_dashboard_signaling_path(path: &str) -> bool {
@@ -155,6 +179,94 @@ pub(crate) fn is_connect_dashboard_signaling_path(path: &str) -> bool {
         path,
         "/connect/dashboard/offer" | "/connect/dashboard/ice" | "/connect/dashboard/close"
     )
+}
+
+/// Dashboard authority outside a direct loopback browser connection always
+/// needs a verified client identity.
+/// TLS encryption, a bearer copied from the daemon page, and an
+/// `intendant://` Origin are transport/CSRF properties, not an IAM anchor.
+/// The local/debug exception requires all three facts the daemon can verify:
+/// a loopback socket peer, a loopback Host authority, and no reverse-proxy
+/// provenance headers. A proxy cannot inherit root merely because its upstream
+/// hop terminates on loopback.
+pub(crate) fn remote_dashboard_client_auth_missing(
+    peer_addr: std::net::SocketAddr,
+    header_text: &str,
+    tls_client_cert_fingerprint: Option<&str>,
+    peer_identity: Option<&PeerConnectionIdentity>,
+) -> bool {
+    !direct_loopback_dashboard_request(peer_addr, header_text)
+        && tls_client_cert_fingerprint
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        && peer_identity.is_none()
+}
+
+fn direct_loopback_dashboard_request(peer_addr: std::net::SocketAddr, header_text: &str) -> bool {
+    // A dual-stack wildcard listener reports a 127.0.0.1 client as
+    // ::ffff:127.0.0.1 on several platforms. Canonicalize before the
+    // loopback check so the trusted-local lane matches the actual network
+    // boundary rather than the listener's address-family representation.
+    if !client_ip_is_loopback(peer_addr.ip()) || has_reverse_proxy_provenance(header_text) {
+        return false;
+    }
+    let Some(authority) = extract_host_header(header_text) else {
+        return false;
+    };
+    // Parse as an authority, then reject every URL component a legal Host
+    // header cannot carry. This avoids treating `localhost/path` or
+    // `user@localhost` as a local authority.
+    let Ok(url) = url::Url::parse(&format!("http://{}", authority.trim())) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => client_ip_is_loopback(ip.into()),
+        Some(url::Host::Ipv6(ip)) => client_ip_is_loopback(ip.into()),
+        None => false,
+    }
+}
+
+fn has_reverse_proxy_provenance(header_text: &str) -> bool {
+    header_text.lines().skip(1).any(|line| {
+        let Some((name, _)) = line.split_once(':') else {
+            return false;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        matches!(name.as_str(), "forwarded" | "via" | "x-real-ip")
+            || name.starts_with("x-forwarded-")
+    })
+}
+
+/// Public, authority-free bytes a remote browser may fetch before it has an
+/// enrolled client identity: daemon-served application code and the public
+/// agent card. Dynamic `/config` is intentionally excluded (it can contain
+/// ICE/TURN configuration) and every state/action route stays behind IAM.
+pub(crate) fn is_public_dashboard_shell_or_asset(method: &str, path: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
+        && (matches!(path, "/" | "/index.html" | "/app" | "/access")
+            || path == "/.well-known/agent-card.json"
+            || embedded_static_asset(path).is_some())
+}
+
+/// The complete authority-free HTTP carve-out for a remote client that has
+/// no verified certificate/peer identity. Keep this explicit and test-pinned:
+/// bootstrap/status are inert discovery bytes, while all signaling mutations,
+/// dynamic config, debug/media reads, source-viewer fallthroughs, and state or
+/// action APIs still require an authenticated anchor.
+pub(crate) fn allows_remote_certless_http(request_line: &str, method: &str, path: &str) -> bool {
+    is_public_peer_access_request_path(request_line)
+        || is_public_org_grant_path(request_line)
+        || is_public_connect_bootstrap_path(request_line)
+        || is_public_dashboard_shell_or_asset(method, path)
 }
 
 pub(crate) fn peer_identity_allows_ws_control(
@@ -220,9 +332,10 @@ pub(crate) fn ws_frame_operation(
 /// frame was denied and fully handled — a denial frame has been sent (plus
 /// the pane-visible `terminal_error` shape for terminal frames) and a
 /// once-per-frame-type warning logged — so the caller drops the frame.
-/// Root-equivalent grants (plain local dashboards, unbound mTLS root
-/// certificates) short-circuit to allow inside the evaluator; the check is
-/// pure in-memory, safe at keystroke/audio-frame rates.
+/// Root-equivalent grants (the trusted-local dashboard and explicitly
+/// enrolled direct-mTLS root principals) short-circuit to allow inside the
+/// evaluator; the check is pure in-memory, safe at keystroke/audio-frame
+/// rates.
 pub(crate) fn deny_ws_frame_if_unauthorized(
     grant: &crate::dashboard_control::DashboardControlGrant,
     json: &serde_json::Value,
@@ -538,6 +651,12 @@ mod tests {
             "GET /connect/status?poll=1 HTTP/1.1"
         ));
         assert!(!is_public_connect_bootstrap_path(
+            "POST /connect/bootstrap HTTP/1.1"
+        ));
+        assert!(!is_public_connect_bootstrap_path(
+            "HEAD /connect/status HTTP/1.1"
+        ));
+        assert!(!is_public_connect_bootstrap_path(
             "POST /connect/dashboard/offer HTTP/1.1"
         ));
         assert!(!is_public_connect_bootstrap_path(
@@ -561,6 +680,123 @@ mod tests {
     }
 
     #[test]
+    fn remote_certless_dashboard_is_denied_but_loopback_and_verified_peers_survive() {
+        let loopback = "127.0.0.1:4444".parse().unwrap();
+        let remote = "192.0.2.44:4444".parse().unwrap();
+        let local_headers = "GET /config HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        assert!(!remote_dashboard_client_auth_missing(
+            loopback,
+            local_headers,
+            None,
+            None
+        ));
+        assert!(remote_dashboard_client_auth_missing(
+            remote,
+            local_headers,
+            None,
+            None
+        ));
+        assert!(!remote_dashboard_client_auth_missing(
+            remote,
+            "GET /config HTTP/1.1\r\nHost: daemon.example\r\n\r\n",
+            Some("aa11"),
+            None
+        ));
+
+        let peer = PeerConnectionIdentity {
+            fingerprint: "peer-fingerprint".to_string(),
+            label: "trusted peer".to_string(),
+            profile: "observer".to_string(),
+            filesystem: Default::default(),
+            record: None,
+        };
+        assert!(!remote_dashboard_client_auth_missing(
+            remote,
+            "GET /config HTTP/1.1\r\nHost: daemon.example\r\n\r\n",
+            None,
+            Some(&peer)
+        ));
+
+        for headers in [
+            "GET /config HTTP/1.1\r\nHost: daemon.example\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nForwarded: for=192.0.2.1\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nVia: 1.1 proxy.example\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For:\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Host: localhost\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Port: 8765\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: 192.0.2.1\r\n\r\n",
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: https\r\n\r\n",
+            "GET /config HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(
+                remote_dashboard_client_auth_missing(loopback, headers, None, None),
+                "loopback upstream must not synthesize root for {headers:?}"
+            );
+        }
+        for host in ["127.0.0.1:8765", "[::1]:8765", "LOCALHOST:8765"] {
+            let headers = format!("GET /config HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert!(!remote_dashboard_client_auth_missing(
+                loopback, &headers, None, None
+            ));
+        }
+        let mapped_loopback = "[::ffff:127.0.0.1]:4444".parse().unwrap();
+        assert!(!remote_dashboard_client_auth_missing(
+            mapped_loopback,
+            "GET /config HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
+            None,
+            None,
+        ));
+        assert!(!remote_dashboard_client_auth_missing(
+            mapped_loopback,
+            "GET /config HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n\r\n",
+            None,
+            None,
+        ));
+
+        for path in [
+            "/",
+            "/index.html",
+            "/app",
+            "/access",
+            "/.well-known/agent-card.json",
+            "/wasm-web/presence_web.js",
+            "/icon-128.png",
+        ] {
+            assert!(is_public_dashboard_shell_or_asset("GET", path), "{path}");
+        }
+        for path in ["/config", "/debug", "/recordings", "/frames/f1"] {
+            assert!(!is_public_dashboard_shell_or_asset("GET", path), "{path}");
+        }
+        assert!(!is_public_dashboard_shell_or_asset("POST", "/"));
+
+        for (method, path) in [("GET", "/connect/bootstrap"), ("GET", "/connect/status")] {
+            let line = format!("{method} {path} HTTP/1.1");
+            assert!(
+                allows_remote_certless_http(&line, method, path),
+                "{method} {path} is authority-free discovery"
+            );
+        }
+        for (method, path) in [
+            ("POST", "/connect/dashboard/offer"),
+            ("POST", "/connect/dashboard/ice"),
+            ("POST", "/connect/dashboard/close"),
+            ("GET", "/config"),
+            ("GET", "/frames/frame-1"),
+            ("GET", "/recordings"),
+            ("GET", "/recordings/run-1/segment"),
+            ("GET", "/debug"),
+            ("GET", "/tmp/arbitrary-source.rs"),
+            ("GET", "/ws"),
+        ] {
+            let line = format!("{method} {path} HTTP/1.1");
+            assert!(
+                !allows_remote_certless_http(&line, method, path),
+                "{method} {path} must require mTLS/peer identity"
+            );
+        }
+    }
+
+    #[test]
     fn dashboard_http_operation_maps_access_and_dashboard_routes() {
         use crate::peer::access_policy::PeerOperation;
 
@@ -580,6 +816,11 @@ mod tests {
             dashboard_http_operation("GET", "/api/session/current/uploads"),
             Some(PeerOperation::SessionManage)
         );
+        assert_eq!(
+            dashboard_http_operation("POST", "/session"),
+            Some(PeerOperation::CredentialsManage)
+        );
+        assert_eq!(dashboard_http_operation("GET", "/session"), None);
         assert_eq!(
             dashboard_http_operation("GET", "/api/fs/read"),
             Some(PeerOperation::FilesystemRead)
@@ -614,6 +855,27 @@ mod tests {
             Some(PeerOperation::PeerUse)
         );
         assert_eq!(dashboard_http_operation("GET", "/config"), None);
+        assert_eq!(
+            legacy_protected_http_operation("/recordings"),
+            Some(PeerOperation::RuntimeControl)
+        );
+        assert_eq!(
+            legacy_protected_http_operation("/recordings/run-1"),
+            Some(PeerOperation::RuntimeControl)
+        );
+        assert_eq!(
+            legacy_protected_http_operation("/frames/frame-1"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(
+            legacy_protected_http_operation("/debug"),
+            Some(PeerOperation::SessionInspect)
+        );
+        assert_eq!(
+            legacy_protected_http_operation("/config"),
+            Some(PeerOperation::PresenceRead)
+        );
+        assert_eq!(legacy_protected_http_operation("/configuration"), None);
         // The prefix families use the same boundary rule as dispatch:
         // exact or a real `/` segment — dispatch's look-alike non-routes
         // must be non-routes for the classifier too.
@@ -693,6 +955,62 @@ mod tests {
             crate::gateway_routes::allowed_methods_for_path("/api/settings").as_deref(),
             Some("GET, POST, OPTIONS")
         );
+    }
+
+    #[test]
+    fn legacy_sensitive_reads_deny_ungranted_and_revoked_certificates() {
+        use crate::peer::access_policy::PeerOperation;
+
+        let unknown = RequestAuthority {
+            principal: crate::access::iam::AccessPrincipal::ungranted_browser_mtls(
+                Some("unknown-cert"),
+                "https",
+            ),
+            iam_state: Some(crate::access::iam::LocalIamState::default()),
+        };
+        let root = RequestAuthority {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "trusted-loopback",
+                "http",
+            ),
+            iam_state: None,
+        };
+
+        let mut revoked_state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        crate::access::iam::upsert_user_client_grant(
+            &mut revoked_state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                fingerprint: Some("revoked-cert".to_string()),
+                role_id: Some("role:observer".to_string()),
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let revoked_principal = crate::access::iam::principal_for_browser_mtls_cert_any_status(
+            &revoked_state,
+            "revoked-cert",
+            "https",
+        )
+        .expect("revoked binding remains attributable");
+        let revoked = RequestAuthority {
+            principal: revoked_principal,
+            iam_state: Some(revoked_state),
+        };
+
+        for (path, operation) in [
+            ("/recordings", PeerOperation::RuntimeControl),
+            ("/frames/frame-1", PeerOperation::SessionInspect),
+            ("/debug", PeerOperation::SessionInspect),
+            ("/config", PeerOperation::PresenceRead),
+        ] {
+            assert_eq!(legacy_protected_http_operation(path), Some(operation));
+            assert!(!unknown.decision(operation).allowed, "{path}: unknown");
+            assert!(!revoked.decision(operation).allowed, "{path}: revoked");
+            assert!(root.decision(operation).allowed, "{path}: local root");
+        }
     }
 
     // -----------------------------------------------------------------

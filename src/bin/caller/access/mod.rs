@@ -12,6 +12,7 @@
 use std::{fmt, net::IpAddr, path::PathBuf};
 
 pub mod access_policy;
+pub(crate) mod authority_store;
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
 // platform, so it stays ungated — `read_server_cert_fingerprint` backs the
@@ -153,6 +154,7 @@ pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
     std::fs::create_dir_all(&cert_dir)
         .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
     certs::ensure_certs(&cert_dir, &server_names, &resolve_host_label(), false)?;
+    iam::seed_generated_browser_mtls_owner_root(&cert_dir)?;
     Ok(Some(cert_dir))
 }
 
@@ -384,6 +386,7 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     print_public_ip_warnings(&server_names);
 
     let state = certs::ensure_certs(&cert_dir, &server_names, &label, args.force)?;
+    iam::seed_generated_browser_mtls_owner_root(&cert_dir)?;
     state::write_host_label(&cert_dir, &label)?;
 
     println!();
@@ -395,8 +398,9 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     println!("  Start or restart the dashboard with:");
     println!("    intendant");
     println!("  That default requires enrolled browser/client certificates.");
-    println!("  Use `intendant --tls` only when you intentionally want TLS without");
-    println!("  client-certificate authentication.");
+    println!("  `intendant --tls` can serve the public shell and discovery without a");
+    println!("  client certificate, but remote dashboard/API/WebSocket control still");
+    println!("  requires enrolled mTLS (or the signed native app). Loopback remains root.");
     println!();
     println!(
         "  Dashboard URL: https://{dashboard_host}:{}",

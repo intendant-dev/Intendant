@@ -591,6 +591,7 @@ impl HttpResponse {
         Self::with_content(status, "text/html; charset=utf-8", body)
             .header("Cache-Control", "no-cache")
             .header("Access-Control-Allow-Origin", "*")
+            .deny_framing()
             .header("Connection", "close")
     }
 
@@ -620,6 +621,15 @@ impl HttpResponse {
     /// historical `with_public_cors` post-processor.
     pub(crate) fn public_cors(self) -> Self {
         self.header("Access-Control-Allow-Origin", "*")
+    }
+
+    /// Root-capable dashboard pages must never be embedded by a foreign page.
+    /// Origin checks protect requests made by the foreign page; frame denial
+    /// also protects genuine same-origin requests induced through clickjacking
+    /// inside an embedded Intendant page.
+    pub(crate) fn deny_framing(self) -> Self {
+        self.header("Content-Security-Policy", "frame-ancestors 'none'")
+            .header("X-Frame-Options", "DENY")
     }
 
     /// Set this response's connection tail from the exchange's keep-alive
@@ -723,7 +733,10 @@ pub(crate) fn query_param(request_line: &str, key: &str) -> Option<String> {
         let mut it = pair.splitn(2, '=');
         let k = it.next()?;
         let v = it.next().unwrap_or("");
-        if k == key {
+        // Browsers' URLSearchParams decodes both names and values. Match
+        // that behavior so security decisions cannot be bypassed with an
+        // encoded parameter name such as `%63onnect`.
+        if url_decode(k) == key {
             return Some(url_decode(v));
         }
     }
@@ -833,7 +846,11 @@ pub(crate) fn extract_host_header(header_text: &str) -> Option<String> {
 /// True for the request's own origin (Origin matches the Host header under
 /// the connection's scheme) and for the macOS app bundle's custom scheme —
 /// web content can never carry a custom-scheme origin, and the app's native
-/// proxy is not subject to CORS anyway.
+/// proxy is not subject to CORS anyway. Cleartext browser authority is local
+/// only: accepting an arbitrary matching hostname would let an attacker DNS-
+/// rebind its HTTP origin to the loopback listener while preserving matching
+/// Origin and Host values. Non-loopback browser access must use HTTPS (and,
+/// for trusted-root authority, mTLS).
 pub(crate) fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str) -> bool {
     let origin = origin.trim();
     if origin.eq_ignore_ascii_case("null") || origin.is_empty() {
@@ -848,10 +865,30 @@ pub(crate) fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str
     if let Some(host) = extract_host_header(header_text) {
         let scheme = if is_tls { "https" } else { "http" };
         if normalized_origin(&format!("{scheme}://{host}")).as_deref() == Some(&normalized) {
-            return true;
+            return is_tls || is_cleartext_loopback_origin(origin);
         }
     }
     false
+}
+
+fn is_cleartext_loopback_origin(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "ws") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(client_ip_is_loopback)
 }
 
 /// Public doorbell responses stay wildcard-readable. Authority-bearing
@@ -1027,6 +1064,8 @@ mod tests {
              Content-Length: 13\r\n\
              Cache-Control: no-cache\r\n\
              Access-Control-Allow-Origin: *\r\n\
+             Content-Security-Policy: frame-ancestors 'none'\r\n\
+             X-Frame-Options: DENY\r\n\
              Connection: close\r\n\
              \r\n\
              <h1>gone</h1>"
@@ -1259,7 +1298,6 @@ mod tests {
             "/api/access/connect/config",
             "/api/access/connect/unclaim",
             "/api/access/tier",
-            "/api/access/hosted-ceiling",
             "/api/access/fleet-cert/request",
         ] {
             assert!(is_fleet_cors_access_path(path), "{path}");
@@ -1298,6 +1336,42 @@ mod tests {
             true,
             "GET / HTTP/1.1\r\nHost: daemon.local:8765\r\n",
         ));
+        assert!(is_own_or_app_origin(
+            "http://localhost:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: localhost:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://127.0.0.1:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://[::1]:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: [::1]:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://[::ffff:127.0.0.1]:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n",
+        ));
+        assert!(
+            !is_own_or_app_origin(
+                "http://attacker.example:8765",
+                false,
+                "GET / HTTP/1.1\r\nHost: attacker.example:8765\r\n",
+            ),
+            "matching Origin and Host are not enough on cleartext: DNS rebinding"
+        );
+        assert!(
+            !is_own_or_app_origin(
+                "http://192.0.2.10:8765",
+                false,
+                "GET / HTTP/1.1\r\nHost: 192.0.2.10:8765\r\n",
+            ),
+            "non-loopback browser authority requires HTTPS"
+        );
         assert!(is_own_or_app_origin("intendant://backend", true, ""));
         assert!(!is_own_or_app_origin("null", true, ""));
         assert!(!is_own_or_app_origin(

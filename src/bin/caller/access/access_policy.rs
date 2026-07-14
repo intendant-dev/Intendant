@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::CallerError;
 use crate::event::ControlMsg;
 
+fn with_identity_store_lock<T>(
+    cert_dir: &Path,
+    operation: impl FnOnce() -> Result<T, CallerError>,
+) -> Result<T, CallerError> {
+    super::authority_store::with_lock(cert_dir, || {
+        operation().map_err(|error| super::AccessError(error.to_string()))
+    })
+    .map_err(|error| CallerError::Config(error.to_string()))
+}
+
 pub(crate) fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -38,7 +48,7 @@ pub enum PeerIdentityStatus {
     Revoked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerIdentityRecord {
     pub version: u8,
     pub fingerprint: String,
@@ -848,6 +858,20 @@ pub fn filesystem_access_allowed(
     kind: FilesystemAccessKind,
     path: &Path,
 ) -> Result<(), String> {
+    filesystem_access_canonical_subject(policy, kind, path).map(|_| ())
+}
+
+/// Resolve and authorize the filesystem object used for an access decision.
+///
+/// Callers that subsequently open an existing object should use the returned
+/// canonical path instead of resolving the untrusted input a second time.
+/// For writes to a not-yet-existing path, the returned value is the nearest
+/// existing parent used for the policy decision.
+pub fn filesystem_access_canonical_subject(
+    policy: &FilesystemAccessPolicy,
+    kind: FilesystemAccessKind,
+    path: &Path,
+) -> Result<PathBuf, String> {
     let root_candidates: Vec<&PathBuf> = match kind {
         FilesystemAccessKind::Read => policy
             .read_roots
@@ -879,7 +903,7 @@ pub fn filesystem_access_allowed(
             Err(_) => continue,
         };
         if canonical_subject == canonical_root || canonical_subject.starts_with(&canonical_root) {
-            return Ok(());
+            return Ok(canonical_subject);
         }
     }
 
@@ -995,26 +1019,28 @@ pub fn write_approved_identity(
     card_url: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<PeerIdentityRecord, CallerError> {
-    let fingerprint = normalize_fingerprint(fingerprint)?;
-    let profile = normalize_profile(profile)?;
-    let record = PeerIdentityRecord {
-        version: 1,
-        fingerprint,
-        label: label.trim().to_string(),
-        profile,
-        status: PeerIdentityStatus::Approved,
-        card_url: card_url.map(str::to_string),
-        request_id: request_id.map(str::to_string),
-        filesystem: FilesystemAccessPolicy::default(),
-        created_at_unix: unix_timestamp(),
-        revoked_at_unix: None,
-        expires_at_unix: None,
-        source: None,
-        org_grant_id: None,
-        issued_via: None,
-    };
-    write_identity_record(cert_dir, &record)?;
-    Ok(record)
+    with_identity_store_lock(cert_dir, || {
+        let fingerprint = normalize_fingerprint(fingerprint)?;
+        let profile = normalize_profile(profile)?;
+        let record = PeerIdentityRecord {
+            version: 1,
+            fingerprint,
+            label: label.trim().to_string(),
+            profile,
+            status: PeerIdentityStatus::Approved,
+            card_url: card_url.map(str::to_string),
+            request_id: request_id.map(str::to_string),
+            filesystem: FilesystemAccessPolicy::default(),
+            created_at_unix: unix_timestamp(),
+            revoked_at_unix: None,
+            expires_at_unix: None,
+            source: None,
+            org_grant_id: None,
+            issued_via: None,
+        };
+        write_identity_record(cert_dir, &record)?;
+        Ok(record)
+    })
 }
 
 pub fn lookup_identity(
@@ -1058,37 +1084,39 @@ pub fn revoke_identity(
     cert_dir: &Path,
     fingerprint_or_label: &str,
 ) -> Result<PeerIdentityRecord, CallerError> {
-    let needle = fingerprint_or_label.trim();
-    if needle.is_empty() {
-        return Err(CallerError::Config("peer identity is required".into()));
-    }
-    let mut record = if let Ok(fp) = normalize_fingerprint(needle) {
-        lookup_identity(cert_dir, &fp)?.ok_or_else(|| {
-            CallerError::Config(format!("no peer identity found for fingerprint {needle}"))
-        })?
-    } else {
-        let matches: Vec<_> = list_identities(cert_dir)?
-            .into_iter()
-            .filter(|r| r.label == needle || r.request_id.as_deref() == Some(needle))
-            .collect();
-        match matches.len() {
-            1 => matches.into_iter().next().unwrap(),
-            0 => {
-                return Err(CallerError::Config(format!(
-                    "no peer identity found for {needle}"
-                )))
-            }
-            _ => {
-                return Err(CallerError::Config(format!(
-                    "multiple peer identities match {needle}; use fingerprint"
-                )))
-            }
+    with_identity_store_lock(cert_dir, || {
+        let needle = fingerprint_or_label.trim();
+        if needle.is_empty() {
+            return Err(CallerError::Config("peer identity is required".into()));
         }
-    };
-    record.status = PeerIdentityStatus::Revoked;
-    record.revoked_at_unix = Some(unix_timestamp());
-    write_identity_record(cert_dir, &record)?;
-    Ok(record)
+        let mut record = if let Ok(fp) = normalize_fingerprint(needle) {
+            lookup_identity(cert_dir, &fp)?.ok_or_else(|| {
+                CallerError::Config(format!("no peer identity found for fingerprint {needle}"))
+            })?
+        } else {
+            let matches: Vec<_> = list_identities(cert_dir)?
+                .into_iter()
+                .filter(|r| r.label == needle || r.request_id.as_deref() == Some(needle))
+                .collect();
+            match matches.len() {
+                1 => matches.into_iter().next().unwrap(),
+                0 => {
+                    return Err(CallerError::Config(format!(
+                        "no peer identity found for {needle}"
+                    )))
+                }
+                _ => {
+                    return Err(CallerError::Config(format!(
+                        "multiple peer identities match {needle}; use fingerprint"
+                    )))
+                }
+            }
+        };
+        record.status = PeerIdentityStatus::Revoked;
+        record.revoked_at_unix = Some(unix_timestamp());
+        write_identity_record(cert_dir, &record)?;
+        Ok(record)
+    })
 }
 
 /// Outcome of [`set_identity_profile`]: the updated record plus the
@@ -1115,19 +1143,21 @@ pub fn set_identity_profile(
     selector: &str,
     profile: &str,
 ) -> Result<ProfileChange, CallerError> {
-    let profile = require_known_profile(profile)?;
-    let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
-    if !matches!(record.status, PeerIdentityStatus::Approved) {
-        return Err(CallerError::Config(format!(
-            "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
-            record.fingerprint, record.label
-        )));
-    }
-    let previous_profile = std::mem::replace(&mut record.profile, profile);
-    write_identity_record(cert_dir, &record)?;
-    Ok(ProfileChange {
-        record,
-        previous_profile,
+    with_identity_store_lock(cert_dir, || {
+        let profile = require_known_profile(profile)?;
+        let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
+        if !matches!(record.status, PeerIdentityStatus::Approved) {
+            return Err(CallerError::Config(format!(
+                "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
+                record.fingerprint, record.label
+            )));
+        }
+        let previous_profile = std::mem::replace(&mut record.profile, profile);
+        write_identity_record(cert_dir, &record)?;
+        Ok(ProfileChange {
+            record,
+            previous_profile,
+        })
     })
 }
 
@@ -1199,10 +1229,15 @@ pub fn write_identity_record(
     cert_dir: &Path,
     record: &PeerIdentityRecord,
 ) -> Result<(), CallerError> {
-    std::fs::create_dir_all(identities_dir(cert_dir))?;
-    let body = serde_json::to_string_pretty(record)?;
-    std::fs::write(identity_path(cert_dir, &record.fingerprint), body)?;
-    Ok(())
+    with_identity_store_lock(cert_dir, || {
+        let mut body = serde_json::to_vec_pretty(record)?;
+        body.push(b'\n');
+        super::authority_store::atomic_write_private_locked(
+            &identity_path(cert_dir, &record.fingerprint),
+            &body,
+        )
+        .map_err(|error| CallerError::Config(error.to_string()))
+    })
 }
 
 fn identities_dir(cert_dir: &Path) -> PathBuf {

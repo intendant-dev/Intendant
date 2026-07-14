@@ -12,6 +12,7 @@ pub(crate) struct PeerConnectionIdentity {
     pub(crate) label: String,
     pub(crate) profile: String,
     pub(crate) filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+    pub(crate) record: Option<crate::peer::access_policy::PeerIdentityRecord>,
 }
 
 /// Build the canonical dashboard target list.
@@ -20,14 +21,15 @@ pub(crate) struct PeerConnectionIdentity {
 /// workflows. This deliberately separates the product-level target from the
 /// underlying security domain:
 ///
-/// - the local daemon is user/client dashboard access and carries root
-///   operator authority for the current browser session;
+/// - the local daemon is user/client dashboard access and reports only the
+///   authority of the principal authenticated on this request;
 /// - registry entries are daemon-to-daemon peer routes and carry peer-profile
 ///   authority, refined by the peer dashboard-control handshake when opened.
 pub(crate) fn dashboard_targets_response_value(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     local_tier: Option<&str>,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
     let local_id = agent_card
         .get("id")
@@ -45,6 +47,72 @@ pub(crate) fn dashboard_targets_response_value(
         .cloned()
         .unwrap_or_default();
 
+    let (route, route_label, auth, auth_label, effective_role, effective_role_label, connected) =
+        match current_principal {
+            Some(principal) => {
+                let role = principal
+                    .role_id
+                    .strip_prefix("role:")
+                    .unwrap_or(principal.role_id.as_str());
+                let role = if role.trim().is_empty() { "none" } else { role };
+                let role_label = match role {
+                    "root" => "Root".to_string(),
+                    "none" => "No access".to_string(),
+                    "scoped-human" => "Scoped human".to_string(),
+                    "session-reader" => "Session reader".to_string(),
+                    "files-read" => "Files read".to_string(),
+                    "files-write" => "Files write".to_string(),
+                    "peer-user" => "Peer user".to_string(),
+                    other => {
+                        let mut chars = other.replace('-', " ").chars().collect::<Vec<_>>();
+                        if let Some(first) = chars.first_mut() {
+                            first.make_ascii_uppercase();
+                        }
+                        chars.into_iter().collect()
+                    }
+                };
+                let browser_mtls = principal.kind == "browser_certificate"
+                    || principal.authn_kind.as_deref() == Some("browser_mtls_cert");
+                let peer_mtls = principal.kind == "peer_daemon";
+                let trusted_local = principal.kind == "root_session";
+                let (route, route_label, auth) = if browser_mtls {
+                    ("browser_mtls", "Browser mTLS", "browser_mtls_cert")
+                } else if peer_mtls {
+                    ("peer_mtls", "Peer mTLS", "daemon_mutual_tls")
+                } else if trusted_local {
+                    (
+                        "trusted_local",
+                        "Trusted local dashboard",
+                        "trusted_dashboard",
+                    )
+                } else {
+                    (
+                        "authenticated_principal",
+                        "Authenticated principal",
+                        "principal",
+                    )
+                };
+                (
+                    route,
+                    route_label,
+                    auth,
+                    principal.label.clone(),
+                    role.to_string(),
+                    role_label,
+                    true,
+                )
+            }
+            None => (
+                "locked",
+                "Locked",
+                "none",
+                "No authenticated anchor".to_string(),
+                "none".to_string(),
+                "No access".to_string(),
+                false,
+            ),
+        };
+
     let mut local_target = serde_json::json!({
         "id": local_id,
         "host_id": local_id,
@@ -53,14 +121,14 @@ pub(crate) fn dashboard_targets_response_value(
         "source": "agent-card",
         "access_domain": "user_client",
         "access_domain_label": "User/client access",
-        "route": "current_dashboard",
-        "route_label": "Current dashboard",
-        "auth": "trusted_dashboard",
-        "auth_label": "Trusted dashboard session",
-        "effective_role": "root",
-        "effective_role_label": "Root",
-        "connected": true,
-        "connection_state": { "state": "connected" },
+        "route": route,
+        "route_label": route_label,
+        "auth": auth,
+        "auth_label": auth_label,
+        "effective_role": effective_role,
+        "effective_role_label": effective_role_label,
+        "connected": connected,
+        "connection_state": { "state": if connected { "connected" } else { "locked" } },
         "capabilities": local_capabilities,
     });
     // Phase 7: surface the advertised rendezvous so the dashboard's fleet
@@ -131,8 +199,10 @@ pub(crate) fn dashboard_targets_response_body(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     local_tier: Option<&str>,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> String {
-    dashboard_targets_response_value(agent_card, registry, local_tier).to_string()
+    dashboard_targets_response_value(agent_card, registry, local_tier, current_principal)
+        .to_string()
 }
 
 /// The daemon's own trust tier for the targets payload, resolved from
@@ -191,11 +261,13 @@ pub(crate) async fn handle_dashboard_targets(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
     local_tier: Option<&str>,
+    current_principal: crate::access::iam::AccessPrincipal,
 ) {
     let response = dashboard_targets_api_response(
         &agent_card_value_for_targets,
         peer_registry.as_ref(),
         local_tier,
+        Some(&current_principal),
     );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
@@ -399,7 +471,7 @@ pub(crate) async fn handle_access_iam_state(
 }
 
 /// Connect status for the Access card — inspect-grade. Everything EXCEPT
-/// the claim phrase/URL: those are manage-gated on their own route
+/// the one-time claim code/URL: those are manage-gated on their own route
 /// (`/api/access/connect/claim-code`), so this response only says whether
 /// a code exists and when it expires.
 pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
@@ -434,10 +506,10 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "claimed_by_user_id": status.claimed_by_user_id,
         "claimed_by_handle": status.claimed_by_handle,
         "claim_binding": status.claim_binding,
+        "claim_authority": "none",
         "signed_claim": status.signed_claim,
         "claim_code_available": status.claim_code.is_some(),
         "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
-        "bootstrap": status.bootstrap,
         "default_rendezvous_url": crate::project::DEFAULT_CONNECT_RENDEZVOUS_URL,
         "fleet_cert": fleet_cert_value,
         "hosted_bundle_state": hosted_bundle.state,
@@ -466,6 +538,7 @@ pub(crate) fn access_connect_claim_code_response_value() -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
         "claimed": status.claimed,
+        "claim_authority": "none",
         "claim_code": status.claim_code,
         "claim_url": status.claim_url,
         "claim_code_expires_unix_ms": status.claim_code_expires_unix_ms,
@@ -478,10 +551,10 @@ pub(crate) async fn handle_access_connect_claim_code(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    // Belt and suspenders on the one secret-bearing response: the
+    // Belt and suspenders on the sensitive one-time-code response: the
     // pre-dispatch gate already enforced AccessManage from the route
     // row; re-verify so a dispatch refactor can't quietly downgrade the
-    // claim phrase to inspect-grade. The denial keeps its historical
+    // one-time claim code to inspect-grade. The denial keeps its historical
     // PLAIN tail (own-origin render, no fleet echo).
     let decision =
         http_access_context.decision(crate::peer::access_policy::PeerOperation::AccessManage);
@@ -675,11 +748,15 @@ pub(crate) fn dashboard_targets_api_response(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     local_tier: Option<&str>,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> ApiResponse {
     ApiResponse::json(
         200,
         JsonBody::PreSerialized(dashboard_targets_response_body(
-            agent_card, registry, local_tier,
+            agent_card,
+            registry,
+            local_tier,
+            current_principal,
         )),
     )
 }
@@ -732,10 +809,18 @@ pub(crate) fn access_connect_status_api_response() -> ApiResponse {
 /// `api_access_connect_claim_code` (the manage gate stays at each
 /// transport's edge: the row/method op plus the HTTP shim's re-check).
 pub(crate) fn access_connect_claim_code_api_response() -> ApiResponse {
-    ApiResponse::json(
-        200,
-        JsonBody::PreSerialized(access_connect_claim_code_response_value().to_string()),
-    )
+    ApiResponse::Json {
+        status: 200,
+        body: JsonBody::PreSerialized(access_connect_claim_code_response_value().to_string()),
+        // Unlike `no-cache`, `no-store` forbids an intermediary or browser
+        // cache from retaining this one-time plaintext claim code/URL. The
+        // tunnel adapter ignores HTTP headers and emits the body only in its
+        // solicited response frame; neither lane logs or persists the value.
+        headers: vec![
+            ("Cache-Control", "no-store".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
 }
 
 /// POST /api/access/connect/config + the tunnel's
@@ -762,20 +847,13 @@ pub(crate) async fn access_connect_unclaim_api_response(
     )
 }
 
-/// POST /api/access/tier | /api/access/hosted-ceiling + the tunnel's
-/// `api_access_set_tier` / `api_access_set_hosted_ceiling`.
+/// POST /api/access/tier + the tunnel's `api_access_set_tier`.
 pub(crate) fn access_tier_settings_api_response(
     cert_dir: &std::path::Path,
-    hosted_ceiling: bool,
     params: serde_json::Value,
     actor: &crate::access::iam::AccessPrincipal,
 ) -> ApiResponse {
-    let result = if hosted_ceiling {
-        access_set_hosted_ceiling_response_value(cert_dir, params, actor)
-    } else {
-        access_set_tier_response_value(cert_dir, params, actor)
-    };
-    access_result_api_response(result, 400)
+    access_result_api_response(access_set_tier_response_value(cert_dir, params, actor), 400)
 }
 
 /// Transport-owned body decode for the manage POST shims: the
@@ -1045,8 +1123,12 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
     iam_state: &crate::access::iam::LoadedIamState,
     current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
-    let targets_value =
-        dashboard_targets_response_value(agent_card, registry, iam_state.state.tier.as_deref());
+    let targets_value = dashboard_targets_response_value(
+        agent_card,
+        registry,
+        iam_state.state.tier.as_deref(),
+        current_principal,
+    );
     let targets = targets_value
         .get("targets")
         .and_then(|v| v.as_array())
@@ -1237,7 +1319,7 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
             "kind_label": "Local user/client binding",
             "label": "Local user/client binding",
             "status": "active",
-            "implementation": "browser mTLS fingerprints and hosted Connect account metadata",
+            "implementation": "mTLS fingerprints authenticate; browser identity keys are record-only in this alpha; Connect account data is metadata only",
             "target_id": local_target_id.clone()
         }));
     }
@@ -1265,11 +1347,7 @@ pub(crate) fn access_overview_response_value_with_identities_and_iam(
         }, {
             "kind": "passkey_account",
             "label": "Passkey account",
-            "status": "current_hosted_transport"
-        }, {
-            "kind": "connect_account",
-            "label": "Connect account",
-            "status": "current_local_iam"
+            "status": "account_metadata_only"
         }, {
             "kind": "browser_certificate",
             "label": "Browser certificate",
@@ -1309,39 +1387,25 @@ pub(crate) fn current_access_overview_subject(
     let Some(principal) = current_principal else {
         return (
             vec![serde_json::json!({
-                "id": "principal:current-browser-session",
+                "id": "principal:current-browser-unauthenticated",
                 "kind": "browser_session",
-                "kind_label": "Current browser session",
-                "label": "Current browser",
-                "source": "trusted_dashboard_session",
+                "kind_label": "Unauthenticated browser",
+                "label": "Unauthenticated browser",
+                "source": "no_authenticated_anchor",
                 "local": true,
                 "account": serde_json::Value::Null,
                 "organization": serde_json::Value::Null,
-                "authn": [{
-                    "kind": "trusted_dashboard_session",
-                    "label": "Trusted dashboard session"
-                }]
+                "authn": [],
+                "role_id": "role:none"
             })],
-            vec![serde_json::json!({
-                "id": format!("grant:current-browser:{local_target_id}:root"),
-                "principal_id": "principal:current-browser-session",
-                "target_id": local_target_id,
-                "kind": "user_client_root",
-                "kind_label": "User/client root",
-                "policy_id": "policy:root",
-                "role": "root",
-                "role_label": "Root",
-                "transport_id": "transport:current-dashboard",
-                "source": "trusted_dashboard_session",
-                "status": "active"
-            })],
+            Vec::new(),
             vec![serde_json::json!({
                 "id": "transport:current-dashboard",
                 "kind": "current_dashboard",
                 "kind_label": "Current dashboard transport",
                 "label": "Current dashboard",
-                "status": "connected",
-                "implementation": "local_mtls_or_hosted_tunnel",
+                "status": "locked",
+                "implementation": "no authenticated local, native-mTLS, direct-mTLS, or peer anchor",
                 "target_id": local_target_id
             })],
         );
@@ -1353,7 +1417,7 @@ pub(crate) fn current_access_overview_subject(
         principal.id.clone()
     };
     let role_id = if principal.role_id.trim().is_empty() {
-        "role:scoped-human"
+        "role:none"
     } else {
         principal.role_id.as_str()
     };
@@ -1369,6 +1433,23 @@ pub(crate) fn current_access_overview_subject(
     };
     let (transport_id, transport_kind, transport_label, implementation) =
         current_access_overview_transport(principal);
+    let grants = if role_id == "role:none" || principal.grant_id.is_none() {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({
+            "id": principal.grant_id.as_deref().expect("checked above"),
+            "principal_id": principal_id.clone(),
+            "target_id": local_target_id,
+            "kind": grant_kind,
+            "kind_label": grant_kind_label,
+            "policy_id": if role_id == "role:root" { "policy:root" } else { "policy:local-user-client" },
+            "role": role_value,
+            "role_label": current_access_overview_role_label(role_id),
+            "transport_id": transport_id,
+            "source": principal.source.clone(),
+            "status": "active"
+        })]
+    };
     (
         vec![serde_json::json!({
             "id": principal_id.clone(),
@@ -1384,19 +1465,7 @@ pub(crate) fn current_access_overview_subject(
             "grant_id": principal.grant_id.clone(),
             "transport": principal.transport.clone()
         })],
-        vec![serde_json::json!({
-            "id": principal.grant_id.as_deref().unwrap_or("grant:current-dashboard"),
-            "principal_id": principal_id,
-            "target_id": local_target_id,
-            "kind": grant_kind,
-            "kind_label": grant_kind_label,
-            "policy_id": if role_id == "role:root" { "policy:root" } else { "policy:local-user-client" },
-            "role": role_value,
-            "role_label": current_access_overview_role_label(role_id),
-            "transport_id": transport_id,
-            "source": principal.source.clone(),
-            "status": "active"
-        })],
+        grants,
         vec![serde_json::json!({
             "id": transport_id,
             "kind": transport_kind,
@@ -1413,7 +1482,7 @@ pub(crate) fn current_access_overview_principal_kind_label(kind: &str) -> &'stat
     match kind {
         "root_session" => "Root dashboard session",
         "browser_certificate" => "Browser certificate",
-        "connect_account" => "Connect account",
+        "connect_account" => "Connect account (legacy metadata only)",
         "human_user" => "Human user",
         "peer_daemon" => "Peer daemon",
         _ => "Current access principal",
@@ -1422,6 +1491,7 @@ pub(crate) fn current_access_overview_principal_kind_label(kind: &str) -> &'stat
 
 pub(crate) fn current_access_overview_role_label(role_id: &str) -> &'static str {
     match role_id {
+        "role:none" | "none" => "No access",
         "role:root" | "root" => "Root",
         "role:peer-profile" | "peer_profile" => "Peer profile",
         "role:scoped-human" | "scoped_human" => "Scoped human",
@@ -1445,9 +1515,12 @@ pub(crate) fn current_access_overview_transport(
             "transport:connect-rendezvous",
             "connect_rendezvous",
             "Intendant Connect rendezvous",
-            "hosted rendezvous with daemon-local IAM enforcement",
+            "hosted rendezvous metadata only; no daemon authority",
         )
-    } else if source == "browser-mtls" || transport == "https" {
+    } else if principal.kind == "browser_certificate"
+        || principal.authn_kind.as_deref() == Some("browser_mtls_cert")
+        || source == "browser-mtls"
+    {
         (
             "transport:browser-mtls",
             "browser_mtls",
@@ -1507,12 +1580,11 @@ pub(crate) fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
 ) -> Result<serde_json::Value, String> {
     let request: crate::access::iam::UserClientGrantUpsertRequest =
         serde_json::from_value(params).map_err(|e| format!("invalid request body: {e}"))?;
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let result = crate::access::iam::upsert_user_client_grant(&mut state, request, actor)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let result = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let result = crate::access::iam::upsert_user_client_grant(state, request, actor)?;
+        Ok((result, true))
+    })
+    .map_err(|e| format!("update local IAM state: {e}"))?;
     let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -1540,12 +1612,13 @@ pub(crate) fn access_set_tier_response_value(
         Some(serde_json::Value::String(value)) => Some(value.as_str()),
         Some(_) => return Err("tier must be a string or null".to_string()),
     };
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let stored =
-        crate::access::iam::set_daemon_tier(&mut state, tier, actor).map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let stored = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let before = state.tier.clone();
+        let stored = crate::access::iam::set_daemon_tier(state, tier, actor)?;
+        let changed = state.tier != before;
+        Ok((stored, changed))
+    })
+    .map_err(|e| format!("update local IAM state: {e}"))?;
     let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -1554,42 +1627,10 @@ pub(crate) fn access_set_tier_response_value(
     }))
 }
 
-/// Set the hosted-control ceiling (docs/src/trust-tiers.md):
-/// `{"role_id": "role:operator" | "role:observer" | "role:none" | …}` —
-/// any defined, enforced role. Writes both hosted-provenance binding
-/// ceilings; per-binding divergence stays an `iam.json` edit. `cert_dir`
-/// arrives from the transport edges (hermeticity convention).
-pub(crate) fn access_set_hosted_ceiling_response_value(
-    cert_dir: &std::path::Path,
-    params: serde_json::Value,
-    actor: &crate::access::iam::AccessPrincipal,
-) -> Result<serde_json::Value, String> {
-    let role_id = params
-        .get("role_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "role_id is required".to_string())?;
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    crate::access::iam::set_hosted_control_ceiling(&mut state, role_id, actor)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
-    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
-    Ok(serde_json::json!({
-        "schema_version": 1,
-        "role_ceilings": loaded.state.role_ceilings,
-        "iam": crate::access::iam::overview_metadata(&loaded),
-    }))
-}
-
-/// One handler for the trust-tier settings pair; `req_path` picks the
-/// mutation. Both are manage-gated POSTs mirroring the IAM grant writes.
+/// Manage-gated trust-tier mutation shared by the HTTP and tunnel edges.
 pub(crate) async fn handle_access_tier_settings(
     stream: DemuxStream,
     body_text: String,
-    req_path: &str,
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
     cors: crate::gateway_routes::CorsPosture,
@@ -1630,12 +1671,8 @@ pub(crate) async fn handle_access_tier_settings(
             }
         }
     };
-    let response = access_tier_settings_api_response(
-        &cert_dir,
-        req_path == "/api/access/hosted-ceiling",
-        params,
-        &http_access_context.principal,
-    );
+    let response =
+        access_tier_settings_api_response(&cert_dir, params, &http_access_context.principal);
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -1864,23 +1901,30 @@ pub(crate) fn org_target_agent_card_ids(agent_card: &serde_json::Value) -> Vec<S
 /// signed document/list is the authorization, and each is rate-limited
 /// and size-capped.
 pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
-    let Some(path) = request_line.split_whitespace().nth(1) else {
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
         return false;
     };
     let path = path.split('?').next().unwrap_or(path);
-    path == "/api/access/org-grants"
-        || path == "/api/access/org-grants/renew"
-        || path == "/api/access/orgs/revocations/apply"
-        || (path
-            .strip_prefix("/api/access/orgs/")
-            .and_then(|rest| rest.strip_suffix("/revocations"))
-            .is_some_and(crate::access::org::valid_org_handle))
+    (method == "POST"
+        && matches!(
+            path,
+            "/api/access/org-grants"
+                | "/api/access/org-grants/renew"
+                | "/api/access/orgs/revocations/apply"
+        ))
+        || (method == "GET"
+            && path
+                .strip_prefix("/api/access/orgs/")
+                .and_then(|rest| rest.strip_suffix("/revocations"))
+                .is_some_and(crate::access::org::valid_org_handle))
 }
 
 /// Public presentation of a signed org grant document. The document itself
 /// is the authorization (verified against locally trusted org keys), so
 /// this sits in the doorbell class: unauthenticated, rate-limited, and
-/// size-capped; a failure changes nothing.
+/// size-capped. Peer authority is enabled only after its IAM audit commits;
+/// a failed identity write may leave inert audit history, never extra access.
 /// `cert_dir` arrives from the transport edges (hermeticity convention)
 /// — as on the other doorbell fns below.
 pub(crate) fn access_org_present_response_value(
@@ -1928,19 +1972,18 @@ pub(crate) fn access_org_trust_response_value(
         .unwrap_or("")
         .to_string();
     let max_role = params.get("max_role").and_then(|v| v.as_str());
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let entry = crate::access::org::trust_org(
-        &mut state,
-        &handle,
-        &root_key,
-        max_role,
-        params.get("max_peer_profile").and_then(|v| v.as_str()),
-        crate::access::client_key::now_unix_ms() as u64,
-    )
-    .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let entry = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let entry = crate::access::org::trust_org(
+            state,
+            &handle,
+            &root_key,
+            max_role,
+            params.get("max_peer_profile").and_then(|v| v.as_str()),
+            crate::access::client_key::now_unix_ms() as u64,
+        )?;
+        Ok((entry, true))
+    })
+    .map_err(|e| format!("update local IAM state: {e}"))?;
     let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -1958,17 +2001,16 @@ pub(crate) fn access_org_revoke_response_value(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let revoked = crate::access::org::revoke_org(
-        &mut state,
-        cert_dir,
-        &handle,
-        crate::access::client_key::now_unix_ms() as u64,
-    )
-    .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let revoked = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let revoked = crate::access::org::revoke_org(
+            state,
+            cert_dir,
+            &handle,
+            crate::access::client_key::now_unix_ms() as u64,
+        )?;
+        Ok((revoked, true))
+    })
+    .map_err(|e| format!("update local authority state: {e}"))?;
     let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -2171,7 +2213,8 @@ pub(crate) fn access_org_orl_response_value(
 
 /// Public doorbell: anyone may carry a signed revocation list here; the
 /// signature is the authority and a stale `seq` is refused, so the
-/// courier is irrelevant. A failure changes nothing.
+/// courier is irrelevant. Peer revocations commit before the IAM sequence;
+/// a partial failure is therefore fail-closed and remains retryable.
 pub(crate) fn access_org_orl_apply_response_value(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
@@ -2189,21 +2232,20 @@ pub(crate) fn access_org_orl_apply_response_value(
     }
     let orl: crate::access::org::OrgRevocationList =
         serde_json::from_value(params).map_err(|e| format!("invalid org revocation list: {e}"))?;
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let applied = crate::access::org::apply_orl(&mut state, cert_dir, &orl, now)
-        .map_err(|e| e.to_string())?;
-    if applied.changed {
-        crate::access::iam::save_state(cert_dir, &state)
-            .map_err(|e| format!("save local IAM state: {e}"))?;
-    }
+    let applied = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let applied = crate::access::org::apply_orl(state, cert_dir, &orl, now)?;
+        let changed = applied.changed;
+        Ok((applied, changed))
+    })
+    .map_err(|e| format!("update local authority state: {e}"))?;
     Ok(serde_json::json!({ "schema_version": 1, "applied": applied }))
 }
 
 /// Org-daemon manage action: extend the revocation list (by document
 /// grant_id and/or subject fingerprint), bump `seq`, re-sign — then apply
-/// it to this daemon's own IAM as a best-effort courtesy when it trusts
-/// its own org, so the org daemon never lags its own list.
+/// it to this daemon's own IAM when it trusts its own org. A local apply is
+/// mandatory in that case: returning success while a revoked member remains
+/// live here would make the owner-facing revocation result misleading.
 pub(crate) fn access_org_revoke_member_response_value(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
@@ -2262,7 +2304,7 @@ pub(crate) fn access_org_revoke_member_response_value(
         )
     })?;
     let now = crate::access::client_key::now_unix_ms() as u64;
-    let orl = crate::access::org::orl_revoke(
+    let revoke_result = crate::access::org::orl_revoke(
         &identity,
         cert_dir,
         &handle,
@@ -2270,16 +2312,40 @@ pub(crate) fn access_org_revoke_member_response_value(
         &subjects,
         &issuer_keys,
         now,
-    )?;
-    let applied = crate::access::iam::load_state(cert_dir)
-        .ok()
-        .and_then(|mut state| {
-            let applied = crate::access::org::apply_orl(&mut state, cert_dir, &orl, now).ok()?;
-            if applied.changed {
-                crate::access::iam::save_state(cert_dir, &state).ok()?;
-            }
-            Some(applied)
+    );
+    let requested_any = grant_ids.iter().any(|value| !value.trim().is_empty())
+        || subjects.iter().any(|value| !value.trim().is_empty())
+        || issuer_keys.iter().any(|value| !value.trim().is_empty());
+    let orl = match revoke_result {
+        Ok(orl) => orl,
+        // The ORL may have committed before a local IAM apply failed. Treat
+        // an exact retry as delivery of the current list so the owner can
+        // finish the local revocation without minting another sequence.
+        Err(error) if requested_any && error.starts_with("nothing new to revoke:") => {
+            crate::access::org::load_or_init_orl(&identity, cert_dir, &handle, now)?
+        }
+        Err(error) => return Err(error),
+    };
+    let root_key = identity.public_key_b64u();
+    let applied = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let trusted_here = state.trusted_orgs.iter().any(|trusted| {
+            trusted.handle == handle
+                && trusted.root_key == root_key
+                && crate::access::iam::is_enforced_status(&trusted.status)
         });
+        if !trusted_here {
+            return Ok((None, false));
+        }
+        let applied = crate::access::org::apply_orl(state, cert_dir, &orl, now)?;
+        let changed = applied.changed;
+        Ok((Some(applied), changed))
+    })
+    .map_err(|error| {
+        format!(
+            "org revocation list seq {} was persisted, but applying it to this daemon's trusted IAM failed: {error}; retry this revocation to finish the local apply",
+            orl.seq
+        )
+    })?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "orl": orl,
@@ -2437,12 +2503,11 @@ pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
 ) -> Result<serde_json::Value, String> {
     let request: crate::access::iam::IamGrantUpdateRequest =
         serde_json::from_value(params).map_err(|e| format!("invalid request body: {e}"))?;
-    let mut state = crate::access::iam::load_state(cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let result = crate::access::iam::update_user_client_grant(&mut state, request, actor)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let result = crate::access::iam::transact_state(cert_dir, |state, _transaction| {
+        let result = crate::access::iam::update_user_client_grant(state, request, actor)?;
+        Ok((result, true))
+    })
+    .map_err(|e| format!("update local IAM state: {e}"))?;
     let loaded = crate::access::iam::load_state_for_overview(cert_dir);
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -2461,6 +2526,38 @@ pub(crate) fn access_iam_update_grant_response_value_with_cert_dir(
 /// tunnel lane converges on the same type.
 pub(crate) type HttpAccessContext = RequestAuthority;
 
+fn browser_mtls_state_for_request(
+    cert_dir: &std::path::Path,
+    fingerprint: &str,
+) -> Result<crate::access::iam::LocalIamState, String> {
+    if crate::access::iam::browser_mtls_initialized_path(cert_dir).exists() {
+        return load_local_iam_state_for_request(cert_dir).map(|state| state.unwrap_or_default());
+    }
+    crate::access::iam::initialize_browser_mtls_root_if_needed(cert_dir, fingerprint)
+        .map_err(|error| format!("initialize browser mTLS IAM: {error}"))
+}
+
+fn browser_mtls_principal_for_state(
+    state: &crate::access::iam::LocalIamState,
+    fingerprint: Option<&str>,
+    transport: &str,
+) -> crate::access::iam::AccessPrincipal {
+    fingerprint
+        .and_then(|fingerprint| {
+            crate::access::iam::principal_for_browser_mtls_cert(state, fingerprint, transport)
+                .or_else(|| {
+                    crate::access::iam::principal_for_browser_mtls_cert_any_status(
+                        state,
+                        fingerprint,
+                        transport,
+                    )
+                })
+        })
+        .unwrap_or_else(|| {
+            crate::access::iam::AccessPrincipal::ungranted_browser_mtls(fingerprint, transport)
+        })
+}
+
 pub(crate) fn http_access_context(
     cert_dir: &std::path::Path,
     identity: Option<&PeerConnectionIdentity>,
@@ -2476,38 +2573,25 @@ pub(crate) fn http_access_context(
     }
     let transport = if is_tls { "https" } else { "http" };
     if let Some(fingerprint) = tls_client_cert_fingerprint {
-        if let Some(state) = load_local_iam_state_for_request(cert_dir)? {
-            if let Some(principal) =
-                crate::access::iam::principal_for_browser_mtls_cert(&state, fingerprint, transport)
-            {
-                return Ok(HttpAccessContext {
-                    principal,
-                    iam_state: Some(state),
-                });
-            }
-            if let Some(principal) = crate::access::iam::principal_for_browser_mtls_cert_any_status(
-                &state,
-                fingerprint,
-                transport,
-            ) {
-                return Ok(HttpAccessContext {
-                    principal,
-                    iam_state: Some(state),
-                });
-            }
-        }
+        let state = browser_mtls_state_for_request(cert_dir, fingerprint)?;
+        let principal = browser_mtls_principal_for_state(&state, Some(fingerprint), transport);
         return Ok(HttpAccessContext {
-            principal: browser_mtls_root_principal(fingerprint, transport),
-            iam_state: None,
+            principal,
+            iam_state: Some(state),
         });
     }
-    let source = if tls_client_cert_present {
-        "browser-mtls"
-    } else {
-        "trusted-dashboard-http"
-    };
+    if tls_client_cert_present {
+        let state = load_local_iam_state_for_request(cert_dir)?.unwrap_or_default();
+        return Ok(HttpAccessContext {
+            principal: browser_mtls_principal_for_state(&state, None, transport),
+            iam_state: Some(state),
+        });
+    }
     Ok(HttpAccessContext {
-        principal: crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport),
+        principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "trusted-dashboard-http",
+            transport,
+        ),
         iam_state: None,
     })
 }
@@ -2532,6 +2616,7 @@ pub(crate) fn dashboard_control_grant_for_client(
     cert_dir: &std::path::Path,
     identity: Option<&PeerConnectionIdentity>,
     tls_client_cert_fingerprint: Option<&str>,
+    tls_client_cert_present: bool,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     if let Some(identity) = identity {
         return Ok(crate::dashboard_control::DashboardControlGrant::Peer {
@@ -2539,72 +2624,37 @@ pub(crate) fn dashboard_control_grant_for_client(
             label: identity.label.clone(),
             profile: identity.profile.clone(),
             filesystem: identity.filesystem.clone(),
+            identity_record: identity.record.clone(),
+            iam_cert_dir: Some(cert_dir.to_path_buf()),
             // The mTLS entrance carries no signed-offer fields today;
             // attribution rides the relayed-signaling path.
             attributed: None,
         });
     }
     if let Some(fingerprint) = tls_client_cert_fingerprint {
-        if let Some(state) = load_local_iam_state_for_request(cert_dir)? {
-            if let Some(principal) = crate::access::iam::principal_for_browser_mtls_cert(
-                &state,
-                fingerprint,
-                "webrtc-datachannel",
-            ) {
-                return Ok(
-                    crate::dashboard_control::DashboardControlGrant::UserClient {
-                        principal,
-                        iam_state: state,
-                    },
-                );
-            }
-            if let Some(principal) = crate::access::iam::principal_for_browser_mtls_cert_any_status(
-                &state,
-                fingerprint,
-                "webrtc-datachannel",
-            ) {
-                return Ok(
-                    crate::dashboard_control::DashboardControlGrant::UserClient {
-                        principal,
-                        iam_state: state,
-                    },
-                );
-            }
-        }
+        let state = browser_mtls_state_for_request(cert_dir, fingerprint)?;
+        let principal =
+            browser_mtls_principal_for_state(&state, Some(fingerprint), "webrtc-datachannel");
         return Ok(
-            crate::dashboard_control::DashboardControlGrant::UserClientRoot {
-                principal: browser_mtls_root_principal(fingerprint, "webrtc-datachannel"),
+            crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+                iam_cert_dir: Some(cert_dir.to_path_buf()),
+            },
+        );
+    }
+    if tls_client_cert_present {
+        let state = load_local_iam_state_for_request(cert_dir)?.unwrap_or_default();
+        let principal = browser_mtls_principal_for_state(&state, None, "webrtc-datachannel");
+        return Ok(
+            crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+                iam_cert_dir: Some(cert_dir.to_path_buf()),
             },
         );
     }
     Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal)
-}
-
-pub(crate) fn browser_mtls_root_principal(
-    fingerprint: &str,
-    transport: &str,
-) -> crate::access::iam::AccessPrincipal {
-    let fingerprint = crate::access::iam::normalize_browser_mtls_fingerprint(fingerprint);
-    let label = if fingerprint.is_empty() {
-        "Current browser certificate".to_string()
-    } else {
-        format!(
-            "Browser certificate {}",
-            fingerprint.chars().take(12).collect::<String>()
-        )
-    };
-    crate::access::iam::AccessPrincipal::root_user_client(
-        "browser-mtls",
-        transport,
-        label,
-        None,
-        None,
-        vec![serde_json::json!({
-            "kind": "browser_mtls_cert",
-            "label": "Browser mTLS certificate",
-            "fingerprint": fingerprint,
-        })],
-    )
 }
 
 pub(crate) fn peer_identity_access_principal(
@@ -2758,10 +2808,11 @@ pub(crate) fn resolve_peer_connection_identity_from_cert_dir(
     let now_unix = crate::access::client_key::now_unix_ms() / 1000;
     match record {
         Some(record) if record.is_active(now_unix) => Ok(Some(PeerConnectionIdentity {
-            fingerprint: record.fingerprint,
-            label: record.label,
-            profile: record.profile,
-            filesystem: record.filesystem,
+            fingerprint: record.fingerprint.clone(),
+            label: record.label.clone(),
+            profile: record.profile.clone(),
+            filesystem: record.filesystem.clone(),
+            record: Some(record),
         })),
         Some(record) => Err((
             403,
@@ -2796,6 +2847,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_org_doorbell_exemption_is_method_exact() {
+        for request in [
+            "POST /api/access/org-grants HTTP/1.1",
+            "POST /api/access/org-grants/renew HTTP/1.1",
+            "POST /api/access/orgs/revocations/apply HTTP/1.1",
+            "GET /api/access/orgs/example-org/revocations?seq=1 HTTP/1.1",
+        ] {
+            assert!(is_public_org_grant_path(request), "{request}");
+        }
+        for request in [
+            "GET /api/access/org-grants HTTP/1.1",
+            "DELETE /api/access/org-grants/renew HTTP/1.1",
+            "GET /api/access/orgs/revocations/apply HTTP/1.1",
+            "POST /api/access/orgs/example-org/revocations HTTP/1.1",
+            "GET /api/access/orgs/not.valid/revocations HTTP/1.1",
+        ] {
+            assert!(!is_public_org_grant_path(request), "{request}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revoke_member_fails_loud_and_same_request_retries_local_apply() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let identity =
+            crate::access::org::load_or_create_org_identity(directory.path(), "acme").unwrap();
+        let now = crate::access::client_key::now_unix_ms() as u64;
+        let mut state = crate::access::iam::LocalIamState::default();
+        crate::access::org::trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        let document = crate::access::org::issue_org_grant(
+            &identity,
+            &state,
+            crate::access::org::IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "member-key",
+                peer_fingerprint: "",
+                subject_label: "Member",
+                role_id: "role:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            now,
+        )
+        .unwrap();
+        crate::access::org::materialize_org_grant(&mut state, &document, &["*".to_string()], now)
+            .unwrap();
+        crate::access::iam::save_state(directory.path(), &state).unwrap();
+        let params = serde_json::json!({
+            "handle": "acme",
+            "grant_id": document.grant_id,
+        });
+
+        // The ORL lives in org/acme (still writable), while iam.json's
+        // unique temp lives directly in cert_dir. Force only the local IAM
+        // commit to fail after the signed list has durably advanced.
+        let writable = std::fs::metadata(directory.path()).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(directory.path(), readonly).unwrap();
+        let first = access_org_revoke_member_response_value(directory.path(), params.clone());
+        std::fs::set_permissions(directory.path(), writable).unwrap();
+
+        let error = first.unwrap_err();
+        assert!(error.contains("was persisted"), "{error}");
+        let after_failure = crate::access::iam::load_state(directory.path()).unwrap();
+        assert!(after_failure.grants.iter().any(|grant| {
+            grant.id == format!("grant:org:acme:{}", document.grant_id) && grant.status == "active"
+        }));
+
+        // Retrying the exact owner action must deliver the already-persisted
+        // list rather than fail with "nothing new", and this time revoke the
+        // live local grant.
+        let retried = access_org_revoke_member_response_value(directory.path(), params).unwrap();
+        assert_eq!(retried["applied"]["changed"], serde_json::json!(true));
+        let persisted = crate::access::iam::load_state(directory.path()).unwrap();
+        assert!(persisted.grants.iter().any(|grant| {
+            grant.id == format!("grant:org:acme:{}", document.grant_id) && grant.status == "revoked"
+        }));
+    }
+
+    #[test]
     fn connect_toggle_works_on_a_projectless_daemon_via_the_daemon_store() {
         // The bundled app's daemon has no project root; the toggle must
         // round-trip through the daemon-scoped connect.toml instead of
@@ -2825,13 +2967,16 @@ mod tests {
         let card = serde_json::json!({
             "id": "d-abc", "label": "box", "capabilities": []
         });
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("tier-test", "local");
         // Tier set: the local target carries it; peer targets never do.
-        let value = dashboard_targets_response_value(&card, None, Some("integrated"));
+        let value =
+            dashboard_targets_response_value(&card, None, Some("integrated"), Some(&principal));
         let targets = value["targets"].as_array().unwrap();
         assert_eq!(targets[0]["tier"], serde_json::json!("integrated"));
         // Unset / blank tier: the key is absent, not an empty string.
         for tier in [None, Some(""), Some("  ")] {
-            let value = dashboard_targets_response_value(&card, None, tier);
+            let value = dashboard_targets_response_value(&card, None, tier, Some(&principal));
             assert!(
                 value["targets"][0].get("tier").is_none(),
                 "blank tier must not stamp ({tier:?})"
@@ -2841,6 +2986,32 @@ mod tests {
         // reaches only the authorized targets payload (beacon rule,
         // docs/src/trust-tiers.md § metadata carriers).
         assert!(card.get("tier").is_none());
+    }
+
+    #[test]
+    fn dashboard_targets_never_invent_local_root_without_a_principal() {
+        let card = serde_json::json!({
+            "id": "d-locked", "label": "locked box", "capabilities": []
+        });
+        let locked = dashboard_targets_response_value(&card, None, None, None);
+        let local = &locked["targets"][0];
+        assert_eq!(local["route"], "locked");
+        assert_eq!(local["auth"], "none");
+        assert_eq!(local["effective_role"], "none");
+        assert_eq!(local["effective_role_label"], "No access");
+        assert_eq!(local["connected"], false);
+
+        let mut scoped =
+            crate::access::iam::AccessPrincipal::ungranted_browser_mtls(Some("aa11bb22"), "https");
+        scoped.label = "Scoped browser certificate".to_string();
+        scoped.role_id = "role:observer".to_string();
+        let scoped_value = dashboard_targets_response_value(&card, None, None, Some(&scoped));
+        let scoped_local = &scoped_value["targets"][0];
+        assert_eq!(scoped_local["route"], "browser_mtls");
+        assert_eq!(scoped_local["auth"], "browser_mtls_cert");
+        assert_eq!(scoped_local["effective_role"], "observer");
+        assert_eq!(scoped_local["effective_role_label"], "Observer");
+        assert_ne!(scoped_local["effective_role"], "root");
     }
 
     #[test]
@@ -3129,12 +3300,16 @@ mod tests {
             state: crate::access::iam::LocalIamState::default(),
             status: crate::access::iam::IamStateStatus::Missing,
         };
+        let root = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "same-host-collision-test",
+            "local",
+        );
         let payload = access_overview_response_value_with_identities_and_iam(
             &agent_card,
             Some(&registry),
             &[],
             &iam_state,
-            None,
+            Some(&root),
         );
 
         let targets = payload["targets"].as_array().expect("targets");
@@ -3435,6 +3610,7 @@ mod tests {
         let scoped_grant = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal: scoped.principal.clone(),
             iam_state: scoped.iam_state.clone().expect("scoped iam state"),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
         };
         assert!(!ws_grant_allows_control(&scoped_grant, None, &signal, &bus));
         assert!(!ws_grant_allows_control(
@@ -3546,6 +3722,7 @@ mod tests {
         let scoped = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state: state,
+            iam_cert_dir: None,
         };
 
         let bus = EventBus::new();
@@ -3605,6 +3782,7 @@ mod tests {
         let observer = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal: observer_principal,
             iam_state: observer_state,
+            iam_cert_dir: None,
         };
         assert!(deny_ws_frame_if_unauthorized(
             &observer,
@@ -3654,12 +3832,15 @@ mod tests {
             profile: "viewer".to_string(),
             filesystem: Default::default(),
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let peer_identity = PeerConnectionIdentity {
             fingerprint: "fp".to_string(),
             label: "peer".to_string(),
             profile: "viewer".to_string(),
             filesystem: Default::default(),
+            record: None,
         };
         assert!(ws_grant_allows_control(
             &peer_grant,
@@ -3667,6 +3848,44 @@ mod tests {
             &steer,
             &bus
         ));
+    }
+
+    #[test]
+    fn direct_dashboard_signaling_preserves_a_scoped_mtls_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "http");
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:22".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        let grant =
+            dashboard_control_grant_for_client(tmp.path(), None, Some("AA:22"), true).unwrap();
+        let crate::dashboard_control::DashboardControlGrant::UserClient { principal, .. } = grant
+        else {
+            panic!("a scoped mTLS certificate must not be upgraded to root");
+        };
+        assert_eq!(principal.role_id, "role:terminal");
+
+        // A second CA-valid certificate has no implicit authority. It reaches
+        // neither the WebSocket nor DataChannel stage because the pre-session
+        // gate sees no effective operation.
+        let unknown =
+            dashboard_control_grant_for_client(tmp.path(), None, Some("BB:33"), true).unwrap();
+        assert!(matches!(
+            unknown,
+            crate::dashboard_control::DashboardControlGrant::UserClient { .. }
+        ));
+        assert!(!unknown.has_any_effective_operation());
     }
 
     // ── S6 golden transcripts: access inspect/connect/tier family ──
@@ -3738,6 +3957,24 @@ mod tests {
         )
     }
 
+    /// The claim-code endpoint is the sensitive one-time-code Connect admin
+    /// response. Its fleet CORS tail matches the normal JSON envelope, but
+    /// the cache directive must remain `no-store` rather than `no-cache`.
+    fn golden_access_claim_code_transcript(
+        status_line: &str,
+        body: &str,
+        echoed_origin: Option<&str>,
+    ) -> String {
+        let echo = match echoed_origin {
+            Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\n"),
+            None => String::new(),
+        };
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     /// The CORS posture dispatch hands the shim — read from the route
     /// table AND asserted, so a row-posture change fails these byte pins
     /// instead of silently changing the wire.
@@ -3771,9 +4008,11 @@ mod tests {
         // An empty agent card and no registry produce the deterministic
         // local-only target list through the untouched builder.
         let card = serde_json::json!({});
-        let body = dashboard_targets_response_body(&card, None, None);
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("golden-test", "local");
+        let body = dashboard_targets_response_body(&card, None, None, Some(&principal));
         let response = collect_access_handler_response(|stream| {
-            handle_dashboard_targets(stream, None, card.clone(), cors, None, None)
+            handle_dashboard_targets(stream, None, card.clone(), cors, None, None, principal)
         })
         .await;
         assert_eq!(
@@ -3878,8 +4117,14 @@ mod tests {
                 text,
                 golden_access_fleet_json_transcript("200 OK", body, origin)
             );
+            assert!(text.contains("Cache-Control: no-cache\r\n"), "{text}");
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(parsed["schema_version"], 1, "{body}");
+            assert_eq!(parsed["claim_authority"], "none", "{body}");
+            assert!(
+                parsed.get("bootstrap").is_none(),
+                "Connect status must not advertise a hosted authority bootstrap: {body}"
+            );
         }
     }
 
@@ -3945,10 +4190,17 @@ mod tests {
             let (_, body) = split_transcript(&text);
             assert_eq!(
                 text,
-                golden_access_fleet_json_transcript("200 OK", body, origin)
+                golden_access_claim_code_transcript("200 OK", body, origin)
             );
+            assert!(text.contains("Cache-Control: no-store\r\n"), "{text}");
+            assert!(!text.contains("Cache-Control: no-cache\r\n"), "{text}");
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(parsed["schema_version"], 1, "{body}");
+            assert_eq!(parsed["claim_authority"], "none", "{body}");
+            assert!(
+                parsed.get("bootstrap").is_none(),
+                "claim-code responses must never advertise authority bootstrap: {body}"
+            );
         }
 
         // Denied: the belt-and-suspenders re-check answers 403 under the
@@ -4091,11 +4343,6 @@ mod tests {
             "/api/access/tier",
             crate::gateway_routes::CorsPosture::FleetAllowlist,
         );
-        let ceiling_cors = access_route_cors(
-            "POST",
-            "/api/access/hosted-ceiling",
-            crate::gateway_routes::CorsPosture::FleetAllowlist,
-        );
         let root_context = || HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
                 "golden", "https",
@@ -4110,7 +4357,6 @@ mod tests {
             handle_access_tier_settings(
                 stream,
                 r#"{"tier":123}"#.to_string(),
-                "/api/access/tier",
                 cert_dir.clone(),
                 root_context(),
                 cors,
@@ -4139,7 +4385,6 @@ mod tests {
             handle_access_tier_settings(
                 stream,
                 invalid.to_string(),
-                "/api/access/tier",
                 cert_dir.clone(),
                 root_context(),
                 cors,
@@ -4159,7 +4404,6 @@ mod tests {
             handle_access_tier_settings(
                 stream,
                 String::new(),
-                "/api/access/tier",
                 cert_dir.clone(),
                 root_context(),
                 cors,
@@ -4176,28 +4420,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["tier"], serde_json::Value::Null, "{body}");
-
-        // Hosted ceiling, missing role_id: the validation 400.
-        let response = collect_access_handler_response(|stream| {
-            handle_access_tier_settings(
-                stream,
-                "{}".to_string(),
-                "/api/access/hosted-ceiling",
-                cert_dir.clone(),
-                root_context(),
-                ceiling_cors,
-                None,
-            )
-        })
-        .await;
-        assert_eq!(
-            golden_access_transcript(&response),
-            golden_access_fleet_json_transcript(
-                "400 Bad Request",
-                r#"{"error":"role_id is required"}"#,
-                None
-            )
-        );
     }
 
     // ── S6 golden transcripts (second slice): IAM grants / enrollment

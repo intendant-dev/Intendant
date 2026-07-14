@@ -387,13 +387,17 @@ pub(crate) fn build_static_asset_response(
         ""
     };
     if if_none_match_matches(header_text, asset.etag) {
-        return HttpResponse::new("304 Not Modified")
+        let response = HttpResponse::new("304 Not Modified")
             .header("ETag", format!("\"{}\"", asset.etag))
             .header("Cache-Control", cache_control)
             .header_segment(vary)
-            .header("Access-Control-Allow-Origin", "*")
-            .connection_reuse(keep_alive)
-            .into_bytes();
+            .header("Access-Control-Allow-Origin", "*");
+        let response = if asset.content_type.starts_with("text/html") {
+            response.deny_framing()
+        } else {
+            response
+        };
+        return response.connection_reuse(keep_alive).into_bytes();
     }
     let gzip_body = asset
         .gzip
@@ -409,9 +413,11 @@ pub(crate) fn build_static_asset_response(
         .header("ETag", format!("\"{}\"", asset.etag))
         .header("Cache-Control", cache_control)
         .header_segment(vary)
-        .header("Access-Control-Allow-Origin", "*")
-        .connection_reuse(keep_alive)
-        .into_bytes();
+        .header("Access-Control-Allow-Origin", "*");
+    if asset.content_type.starts_with("text/html") {
+        response = response.deny_framing();
+    }
+    let mut response = response.connection_reuse(keep_alive).into_bytes();
     if method != "HEAD" {
         response.extend_from_slice(payload);
     }

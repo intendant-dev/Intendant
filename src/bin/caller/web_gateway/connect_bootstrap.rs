@@ -7,7 +7,6 @@ use super::*;
 pub(crate) async fn connect_dashboard_offer_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
-    agent_card: &serde_json::Value,
     grant: crate::dashboard_control::DashboardControlGrant,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
@@ -24,44 +23,11 @@ pub(crate) async fn connect_dashboard_offer_response(
         .map(str::trim)
         .filter(|nonce| !nonce.is_empty())
         .map(str::to_string);
-    // The HTTP edge resolved authority from the actual trusted transport
-    // (local/app origin, browser mTLS, or peer mTLS) before reading this
-    // offer. The optional browser identity signature binds the SDP but must
-    // never manufacture or upgrade authority of its own.
-    let client_key_fields: crate::access::client_key::ClientKeyOfferFields =
-        serde_json::from_value(body.clone()).unwrap_or_default();
-    let verified_client_key = match client_key_fields.verify(
-        "",
-        client_nonce.as_deref().unwrap_or(""),
-        sdp,
-        crate::access::client_key::now_unix_ms(),
-    ) {
-        Ok(verified) => verified,
-        Err(e) => {
-            return json_error(
-                "400 Bad Request",
-                format!("client key verification failed: {e}"),
-            )
-        }
-    };
-    // Org-grant ride-along (phase 6 step 4), same as the rendezvous path:
-    // materialize before grant resolution so a member's first offer binds
-    // its scoped principal instead of falling back to trusted-transport
-    // root. Failure changes nothing here — the transport already earned
-    // its authority — but the error is surfaced for the console.
-    let org_grant_error = body
-        .get("org_grant")
-        .filter(|doc| !doc.is_null())
-        .and_then(|doc| {
-            crate::access::org::present_org_grant_value(
-                &crate::access::backend::select_backend().cert_dir(),
-                doc,
-                &org_target_agent_card_ids(agent_card),
-                crate::access::client_key::now_unix_ms() as u64,
-            )
-            .err()
-        });
-    let _verified_client_key = verified_client_key;
+    // The HTTP edge resolved authority from the trusted transport before
+    // reading this offer. Offer-body client keys and org documents are not an
+    // authentication lane: org grants must first be presented through the
+    // explicit public doorbell, then the client retries over its enrolled
+    // transport identity.
     match dashboard_control
         .answer_offer_with_grant(sdp.to_string(), None, client_nonce, grant)
         .await
@@ -72,16 +38,13 @@ pub(crate) async fn connect_dashboard_offer_response(
             if let Some(tab) = body.get("tab_id").and_then(|v| v.as_str()) {
                 dashboard_control.note_tab_id(&answer.session_id, tab);
             }
-            let mut response = serde_json::json!({
+            let response = serde_json::json!({
                 "ok": true,
                 "signaling": "connect-bootstrap-local",
                 "session_id": answer.session_id,
                 "sdp": answer.sdp,
                 "binding": answer.binding,
             });
-            if let Some(org_error) = org_grant_error {
-                response["org_grant_error"] = serde_json::Value::String(org_error);
-            }
             json_ok(response)
         }
         Err(e) => json_error("500 Internal Server Error", e),
@@ -91,6 +54,7 @@ pub(crate) async fn connect_dashboard_offer_response(
 pub(crate) async fn connect_dashboard_ice_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
+    grant: &crate::dashboard_control::DashboardControlGrant,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
         Ok(body) => body,
@@ -109,11 +73,19 @@ pub(crate) async fn connect_dashboard_ice_response(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     match dashboard_control
-        .add_ice_candidate(session_id, &candidate)
+        .add_ice_candidate_for_grant(session_id, &candidate, grant)
         .await
     {
-        Ok(true) => json_ok(serde_json::json!({ "ok": true })),
-        Ok(false) => json_error("404 Not Found", "dashboard control session not found"),
+        Ok(crate::dashboard_control::DashboardControlSessionMutation::Applied) => {
+            json_ok(serde_json::json!({ "ok": true }))
+        }
+        Ok(crate::dashboard_control::DashboardControlSessionMutation::NotFound) => {
+            json_error("404 Not Found", "dashboard control session not found")
+        }
+        Ok(crate::dashboard_control::DashboardControlSessionMutation::Forbidden) => json_error(
+            "403 Forbidden",
+            "dashboard control session belongs to a different authenticated principal or grant",
+        ),
         Err(e) => json_error("500 Internal Server Error", e),
     }
 }
@@ -121,6 +93,7 @@ pub(crate) async fn connect_dashboard_ice_response(
 pub(crate) async fn connect_dashboard_close_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
+    grant: &crate::dashboard_control::DashboardControlGrant,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
         Ok(body) => body,
@@ -134,8 +107,18 @@ pub(crate) async fn connect_dashboard_close_response(
     if session_id.is_empty() {
         return json_error("400 Bad Request", "missing session_id");
     }
-    dashboard_control.close(session_id).await;
-    json_ok(serde_json::json!({ "ok": true }))
+    match dashboard_control.close_for_grant(session_id, grant).await {
+        crate::dashboard_control::DashboardControlSessionMutation::Applied => {
+            json_ok(serde_json::json!({ "ok": true }))
+        }
+        crate::dashboard_control::DashboardControlSessionMutation::NotFound => {
+            json_error("404 Not Found", "dashboard control session not found")
+        }
+        crate::dashboard_control::DashboardControlSessionMutation::Forbidden => json_error(
+            "403 Forbidden",
+            "dashboard control session belongs to a different authenticated principal or grant",
+        ),
+    }
 }
 
 pub(crate) fn connect_bootstrap_html() -> String {
