@@ -1047,21 +1047,93 @@ fn frontier_negative(vector: &Json) -> Result<SemStatus, String> {
 
 // --------------------------------------------------------- family 8
 
-/// §2.4 exact: `seed = PBKDF2-HMAC-SHA512(mnemonic, "mnemonic",
-/// 2048, 64)`, then the HKDF stage, then the Ed25519 keypair. The
-/// reducer derives from the PHRASE (the entropy→mnemonic leg is the
-/// core's — fixture convention); the corpus phrases are ASCII, so
-/// NFKD normalization is the identity.
+/// The reducer's OWN BIP-39 validation (§2.4): NFKD-normalize, split
+/// into exactly 24 wordlist words, rebuild the 256-bit entropy from
+/// the 11-bit indexes, and verify the 8-bit checksum = the first
+/// byte of SHA-256(entropy). The wordlist itself is standard DATA
+/// (the `bip39` crate's English table — like the CRC polynomial);
+/// the math here is independent of core's entropy→mnemonic leg.
+/// `Err` = the §2.4 rejection (checksum-invalid mnemonics are
+/// rejected BEFORE derivation).
+fn validate_bip39(normalized: &str) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    let list = bip39::Language::English.word_list();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.len() != 24 {
+        return Err(format!("{} words (24 required)", words.len()));
+    }
+    let mut bits: Vec<bool> = Vec::with_capacity(264);
+    for w in &words {
+        let Ok(idx) = list.binary_search(w) else {
+            return Err(format!("{w:?} is not a wordlist word"));
+        };
+        for b in (0..11).rev() {
+            bits.push(idx >> b & 1 == 1);
+        }
+    }
+    let mut entropy = [0u8; 32];
+    for (i, chunk) in bits[..256].chunks(8).enumerate() {
+        entropy[i] = chunk.iter().fold(0u8, |acc, &b| acc << 1 | b as u8);
+    }
+    let checksum = bits[256..264]
+        .iter()
+        .fold(0u8, |acc, &b| acc << 1 | b as u8);
+    if checksum != Sha256::digest(entropy)[0] {
+        return Err("checksum mismatch".into());
+    }
+    Ok(entropy)
+}
+
+/// §2.4 exact: NFKD, the reducer's own BIP-39 checksum validation
+/// (rejection BEFORE derivation — the pinned classification is
+/// (key-malformed, reject-permanent)), then
+/// `seed = PBKDF2-HMAC-SHA512(mnemonic, "mnemonic", 2048, 64)`, the
+/// HKDF stage, and the Ed25519 keypair. When the vector carries
+/// `entropy`, the reducer's rebuilt entropy must equal it — the
+/// phrase↔entropy relationship made executable on this side too.
 fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
     use hkdf::Hkdf;
     use sha2::{Sha256, Sha512};
+    use unicode_normalization::UnicodeNormalization;
     let Some(phrase) = vector["inputs"]["phrase"].as_str() else {
         return Ok(SemStatus::Unimplemented(
             "entropy-only phrase-derive (the mnemonic leg is core-side)".into(),
         ));
     };
+    let normalized: String = phrase.nfkd().collect();
+    let want_pair = (
+        vector["expected"]["outcome"].as_str(),
+        vector["expected"]["disposition"].as_str(),
+    );
+    match validate_bip39(&normalized) {
+        Err(_) => {
+            return Ok(match want_pair {
+                (Some("key-malformed"), Some("reject-permanent")) => SemStatus::Pass,
+                (Some(o), Some(d)) => SemStatus::Fail(format!(
+                    "checksum rejection: expected ({o}, {d}), reducer derived (key-malformed, reject-permanent)"
+                )),
+                _ => SemStatus::Fail(
+                    "reducer rejected the mnemonic checksum; the vector expects keys".into(),
+                ),
+            });
+        }
+        Ok(rebuilt) => {
+            if want_pair.0.is_some() {
+                return Ok(SemStatus::Fail(
+                    "reducer accepted a mnemonic the vector expects rejected".into(),
+                ));
+            }
+            if let Some(want_hex) = vector["inputs"]["entropy"].as_str() {
+                if unhex(want_hex)? != rebuilt.to_vec() {
+                    return Ok(SemStatus::Fail(
+                        "rebuilt entropy differs from the declared entropy".into(),
+                    ));
+                }
+            }
+        }
+    }
     let mut seed = [0u8; 64];
-    pbkdf2::pbkdf2_hmac::<Sha512>(phrase.as_bytes(), b"mnemonic", 2048, &mut seed);
+    pbkdf2::pbkdf2_hmac::<Sha512>(normalized.as_bytes(), b"mnemonic", 2048, &mut seed);
     let hk = Hkdf::<Sha256>::new(Some(b"intendant/recovery/v1"), &seed);
     let mut ed_seed = [0u8; 32];
     hk.expand(b"ed25519-seed", &mut ed_seed)

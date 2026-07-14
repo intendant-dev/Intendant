@@ -891,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            138,
-            "the corpus through the repair tranche's D5/D9 negatives"
+            139,
+            "the corpus through the repair tranche's D1 checksum negative"
         );
         for r in &reports {
             assert!(

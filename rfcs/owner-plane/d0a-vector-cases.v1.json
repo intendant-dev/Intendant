@@ -552,18 +552,24 @@
                 }
               },
               "expected": {
-                "properties": {
-                  "result": {
-                    "type": "object", "additionalProperties": false, "required": ["keys"],
+                "$comment": "Amendment 3 (repair tranche): the negative arm — a checksum-invalid mnemonic is rejected BEFORE derivation (spec 2.4), so a phrase-derive case may carry an (outcome, disposition) pair instead of derived keys.",
+                "anyOf": [
+                  {
                     "properties": {
-                      "keys": {
-                        "type": "object", "minProperties": 1,
-                        "additionalProperties": { "$ref": "#/$defs/hexnz" }
+                      "result": {
+                        "type": "object", "additionalProperties": false, "required": ["keys"],
+                        "properties": {
+                          "keys": {
+                            "type": "object", "minProperties": 1,
+                            "additionalProperties": { "$ref": "#/$defs/hexnz" }
+                          }
+                        }
                       }
-                    }
-                  }
-                },
-                "required": ["result"]
+                    },
+                    "required": ["result"]
+                  },
+                  { "required": ["outcome", "disposition"] }
+                ]
               }
             }
           } },

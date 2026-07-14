@@ -33,6 +33,41 @@ fn hex(b: &[u8]) -> String {
 
 // --------------------------------------------------------- family 8
 
+/// §2.4: "Checksum-invalid mnemonics are rejected before
+/// derivation" — 24 valid wordlist words whose final word breaks the
+/// checksum. The pinned classification is (key-malformed,
+/// reject-permanent): malformed key material, the intrinsic-failure
+/// family (the D1 resolution ratified by the repair tranche;
+/// register entry).
+fn phrase_checksum_invalid() -> Vector {
+    let mnemonic = bip39::Mnemonic::from_entropy(&[0u8; 32]).expect("32-byte entropy");
+    let mut words: Vec<&str> = mnemonic.words().collect();
+    // Swap the checksum-bearing final word for another wordlist
+    // word; assert the result really fails BIP-39 parsing.
+    let last = *words.last().expect("24 words");
+    words[23] = if last == "ability" { "able" } else { "ability" };
+    let phrase = words.join(" ");
+    assert!(
+        bip39::Mnemonic::parse_normalized(&phrase).is_err(),
+        "the mutated mnemonic must fail its checksum"
+    );
+    let mut inputs = JsonMap::new();
+    inputs.insert("phrase".into(), json!(phrase));
+    Vector {
+        family: 8,
+        name: "phrase-checksum-invalid-rejects".into(),
+        case_kind: "phrase-derive".into(),
+        source: "2.4".into(),
+        surfaces: vec!["native-crypto".into(), "browser".into()],
+        rng: None,
+        inputs,
+        expected: Expected::Negative {
+            outcome: "key-malformed".into(),
+            disposition: "reject-permanent".into(),
+        },
+    }
+}
+
 fn phrase_vector(name: &str, entropy: &[u8; 32]) -> Vector {
     let mnemonic = bip39::Mnemonic::from_entropy(entropy).expect("32-byte entropy");
     let phrase = mnemonic.to_string();
@@ -358,6 +393,7 @@ pub fn f11_export_import_rederive() -> Vector {
 pub fn corpus_recovery() -> Vec<Vector> {
     let mut out = vec![
         phrase_vector("phrase-derive-zero-entropy", &[0u8; 32]),
+        phrase_checksum_invalid(),
         phrase_vector("phrase-derive-fixed-entropy", &[0x42u8; 32]),
         commitment_vector(),
     ];

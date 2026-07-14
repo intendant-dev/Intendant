@@ -19,6 +19,11 @@ hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkd
 aes-gcm = "0.10"
 hkdf = "0.12"
 pbkdf2 = "0.12"
+# The BIP-39 English wordlist as standard DATA (the index/checksum
+# math is the reducer's own — §2.4's independent rejection leg).
+bip39 = "2"
+# §2.4 NFKD normalization of mnemonic and passphrase.
+unicode-normalization = "0.1"
 
 # Standalone: NOT a member of the intendant workspace — lives and
 # versions with the spec, like core/.
