@@ -22,6 +22,7 @@ pub mod corpus_fold;
 pub mod corpus_migration;
 pub mod corpus_recovery;
 pub mod corpus_status;
+pub mod corpus_time;
 pub mod domains;
 pub mod keyschedule;
 pub mod outcomes;

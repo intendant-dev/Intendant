@@ -21,7 +21,8 @@ use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
     ctrl_header, AdminKey, Ccutoff, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate,
-    Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, RevokeMode, CSPACECREATE_OP_TYPE,
+    Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, Czonepolicy, RevokeMode,
+    CSPACECREATE_OP_TYPE,
 };
 use crate::shapes::envelope::{
     gen_start, seal_op, Actor, ActorKind, Header, OpSigner, Signedop, Tenant, Writer,
@@ -32,8 +33,8 @@ use crate::shapes::identity::{
 };
 use crate::shapes::journal::AbortReason;
 use crate::shapes::journal::{
-    sign_receipt, Frontier, Itemcommit, Itemwrap, MissingRec, Pendingxfer, Receiptstmt, Signedstmt,
-    Txn, Txnrec, Xferabort, Xferdone, Xferreopen,
+    sign_lease, sign_receipt, Frontier, Itemcommit, Itemwrap, Leasestmt, MissingRec, Pendingxfer,
+    Receiptstmt, Signedstmt, Txn, Txnrec, Xferabort, Xferdone, Xferreopen,
 };
 use crate::shapes::memory::{
     merkle_root, Bundleleaf, Bundlerec, Mclaim, Merasereq, Mexportrel, Mimport,
@@ -662,6 +663,72 @@ impl PlaneRig {
         self.seal_ctrl(Ccutoff::OP_TYPE, proof, body.to_value())
     }
 
+    /// `c.zone_policy` (D-69: acceptance advances the zone's
+    /// capability epoch by 1; under strict, `cutoffs` ∪ staged closes
+    /// must cover every live lineage).
+    pub fn zone_policy_op(
+        &mut self,
+        policy: crate::shapes::Zonepolicy,
+        cutoffs: Vec<Frontierclose>,
+    ) -> Signedop {
+        let body = Czonepolicy {
+            policy,
+            cutoffs: if cutoffs.is_empty() {
+                None
+            } else {
+                Some(cutoffs)
+            },
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Czonepolicy::OP_TYPE, proof, body.to_value())
+    }
+
+    /// A qualified-witness `accept` receipt (§4.7; T2 excludes the
+    /// operation's own signer, so `dev` is the witness device).
+    pub fn accept_receipt(&mut self, dev: &Device, subject: Bytes32, seen_ms: u64) -> Signedstmt {
+        let stmt = Receiptstmt::Accept {
+            issuer: Issuerid::Device {
+                cert: h_cert(&dev.cert),
+            },
+            plane_id: self.plane_id,
+            zone_id: self.zone_id,
+            subject,
+            seen_ms,
+            issuer_seq: 1,
+            prev_stmt: [0; 32],
+        };
+        sign_receipt(&stmt, &OpSigner::Ed25519(&dev.sig_sk))
+    }
+
+    /// A `LeaseStmt` for `(grant_id, lineage)` (§4.7/T5).
+    pub fn lease_stmt(
+        &mut self,
+        dev: &Device,
+        grant_id: Bytes16,
+        lineage: Bytes16,
+        issued_ms: u64,
+        expires_ms: u64,
+    ) -> Signedstmt {
+        let stmt = Leasestmt {
+            issuer: Issuerid::Device {
+                cert: h_cert(&dev.cert),
+            },
+            plane_id: self.plane_id,
+            zone_id: self.zone_id,
+            grant_id,
+            lineage,
+            issued_ms,
+            expires_ms,
+            ctrl_frontier: self.ctrl_head,
+            issuer_seq: 1,
+            prev_stmt: [0; 32],
+        };
+        sign_lease(&stmt, &OpSigner::Ed25519(&dev.sig_sk))
+    }
+
     /// `c.cap_epoch_bump` with closure cutoffs (advancing form).
     pub fn epoch_bump(&mut self, new_epoch: u64, cutoffs: Vec<Frontierclose>) -> Signedop {
         let body = Cepochbump {
@@ -907,6 +974,49 @@ impl PlaneRig {
             body.to_value(),
             writer_sequence,
             previous_writer_hash,
+        )
+    }
+
+    /// [`Self::claim`] with header overrides (epoch-2 writers, §9.4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_over(
+        &mut self,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        statement: &str,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+        over: TenantOverrides,
+    ) -> Signedop {
+        let body = Mclaim {
+            kind: Kind::Observation,
+            statement: statement.into(),
+            sensitivity: Class::Private,
+            observed_at_ms: Some(self.hlc_ms),
+            valid_from_ms: None,
+            valid_until_ms: None,
+            expires_at_ms: None,
+            session: None,
+            project: None,
+            model: None,
+            evidence: vec![],
+            supersedes: None,
+            labels: None,
+        };
+        let (zone_id, space_id) = (self.zone_id, self.home_space);
+        self.tenant_op_over(
+            zone_id,
+            space_id,
+            ActorKind::Daemon,
+            dev,
+            grant,
+            tag,
+            Mclaim::OP_TYPE,
+            body.to_value(),
+            writer_sequence,
+            previous_writer_hash,
+            over,
         )
     }
 

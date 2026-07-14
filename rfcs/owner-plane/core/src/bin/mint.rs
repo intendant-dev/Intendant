@@ -6,7 +6,7 @@
 
 use owner_plane_core::{
     corpus, corpus_edge, corpus_erase, corpus_fold, corpus_migration, corpus_recovery,
-    corpus_status, tranche, vector,
+    corpus_status, corpus_time, tranche, vector,
 };
 
 fn main() {
@@ -27,6 +27,7 @@ fn main() {
     all.extend(corpus_migration::corpus_migration());
     all.extend(corpus_status::corpus_status());
     all.extend(corpus_erase::corpus_erase());
+    all.extend(corpus_time::corpus_time());
     for v in all {
         vector::check(&v.to_json(), &companion)
             .unwrap_or_else(|e| panic!("{} fails mint-time check: {e}", v.name));

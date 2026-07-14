@@ -220,7 +220,8 @@ fn run_export_import(vector: &Json) -> Result<SemStatus, String> {
         );
     }
     let fresh_order: Vec<String> = items.keys().cloned().collect();
-    let (_, state) = match crate::fold::run_delivery_with_state(&items, &fresh_order) {
+    let aux = parse_aux(vector)?;
+    let (_, state) = match crate::fold::run_delivery_full(&items, &aux, &fresh_order) {
         Ok(v) => v,
         Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
     };
@@ -317,15 +318,16 @@ fn run_status_derive(vector: &Json) -> Result<SemStatus, String> {
         })
         .collect::<Result<_, _>>()?;
 
+    let aux = parse_aux(vector)?;
     let mut runs = Vec::new();
     for order in &deliveries {
-        match crate::fold::run_delivery(&items, order) {
-            Ok(run) => runs.push(run),
+        match crate::fold::run_delivery_full(&items, &aux, order) {
+            Ok((run, _)) => runs.push(run),
             Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
         }
     }
     let fresh_order: Vec<String> = items.keys().cloned().collect();
-    let (fresh, state) = match crate::fold::run_delivery_with_state(&items, &fresh_order) {
+    let (fresh, state) = match crate::fold::run_delivery_full(&items, &aux, &fresh_order) {
         Ok(v) => v,
         Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
     };
@@ -503,6 +505,16 @@ fn run_journal_vector(vector: &Json) -> Result<SemStatus, String> {
     Ok(SemStatus::Pass)
 }
 
+fn parse_aux(vector: &Json) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    let mut aux = std::collections::BTreeMap::new();
+    if let Some(m) = vector["inputs"]["aux"].as_object() {
+        for (name, hv) in m {
+            aux.insert(name.clone(), unhex(hv.as_str().ok_or("aux not a string")?)?);
+        }
+    }
+    Ok(aux)
+}
+
 fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
     use std::collections::BTreeMap;
 
@@ -516,6 +528,7 @@ fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
             unhex(hv.as_str().ok_or("item not a string")?)?,
         );
     }
+    let aux = parse_aux(vector)?;
     let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
         .as_array()
         .ok_or("deliveries missing")?
@@ -534,14 +547,14 @@ fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
     // The three-run standard.
     let mut runs = Vec::new();
     for order in &deliveries {
-        match crate::fold::run_delivery(&items, order) {
-            Ok(run) => runs.push(run),
+        match crate::fold::run_delivery_full(&items, &aux, order) {
+            Ok((run, _)) => runs.push(run),
             Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
         }
     }
     let fresh_order: Vec<String> = items.keys().cloned().collect();
-    let fresh = match crate::fold::run_delivery(&items, &fresh_order) {
-        Ok(run) => run,
+    let fresh = match crate::fold::run_delivery_full(&items, &aux, &fresh_order) {
+        Ok((run, _)) => run,
         Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
     };
     for (i, run) in runs.iter().enumerate() {
@@ -694,8 +707,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            112,
-            "the tranche plus the corpus through the erase-crash slice"
+            119,
+            "the tranche plus the corpus through the time/lease slice"
         );
         for r in &reports {
             assert!(

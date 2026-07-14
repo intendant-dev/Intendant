@@ -76,6 +76,8 @@ struct HeldCert {
     /// must equal.
     kem_key_id: [u8; 32],
     revocation_id: [u8; 16],
+    /// §9.1: a certificate deadline binds like a grant deadline.
+    expiry_deadline_ms: Option<u64>,
     /// Set at a `c.revoke_device` compound's COMPLETING acceptance
     /// (D-195 — a pending compound ends nothing yet).
     revoked: bool,
@@ -111,6 +113,11 @@ struct HeldGrant {
     ctrl_pos: u64,
     class_ceiling: Option<u8>,
     flows: Vec<FlowFacts>,
+    /// §9.1: a present deadline always binds, in every posture.
+    expiry_deadline_ms: Option<u64>,
+    /// T5: both lease legs required when set.
+    online_lease: bool,
+    max_age_ms: Option<u64>,
     /// `c.revoke_grant`, or derived revocation at a device compound's
     /// completion (D-85).
     revoked: bool,
@@ -332,6 +339,80 @@ pub struct State {
     /// §11.1: targets flagged retrieval-excluded IMMEDIATELY at the
     /// erase request's acceptance.
     retrieval_excluded: Vec<[u8; 32]>,
+    /// (zone, capability epoch) → the policy-in-force's
+    /// `time_witnesses` devices (the T2 anchor, D-69). Absent epochs
+    /// resolve DOWNWARD — a bare bump carries policy(e−1) forward.
+    policies: BTreeMap<([u8; 16], u64), Vec<[u8; 16]>>,
+    /// Held `accept` receipts (aux, §4.7) — validated lazily at
+    /// admission: qualification is a pure function of (receipt
+    /// bytes, operation bytes, control history).
+    receipts: Vec<AuxReceipt>,
+    /// Held leases (aux, §4.7/T5).
+    leases: Vec<AuxLease>,
+    /// The §5.6 local index (aux `index`): item_addr → op hash.
+    item_index: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+/// A held Signed `accept` receipt from aux — unvalidated until an
+/// operation cites time evidence.
+#[derive(Debug, Clone)]
+struct AuxReceipt {
+    issuer_cert: [u8; 32],
+    plane: [u8; 32],
+    zone: [u8; 16],
+    subject: [u8; 32],
+    seen_ms: u64,
+    stmt_raw: Vec<u8>,
+    sig: Vec<u8>,
+}
+
+/// A held Signed lease from aux (§4.7/T5).
+#[derive(Debug, Clone)]
+struct AuxLease {
+    issuer_cert: [u8; 32],
+    plane: [u8; 32],
+    zone: [u8; 16],
+    grant_id: [u8; 16],
+    lineage: [u8; 16],
+    issued_ms: u64,
+    expires_ms: u64,
+    stmt_raw: Vec<u8>,
+    sig: Vec<u8>,
+}
+
+/// Verify a `Signed<…>` statement: sig over `msg(tag, stmt bytes)`.
+fn verify_stmt(pk: &[u8; 32], tag: &str, stmt_raw: &[u8], sig: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(pk) else {
+        return false;
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig) else {
+        return false;
+    };
+    vk.verify_strict(
+        &domains::msg(tag, stmt_raw),
+        &Signature::from_bytes(&sig_arr),
+    )
+    .is_ok()
+}
+
+/// A zone policy's `time_witnesses` as device ids (`"connect"` has
+/// no engine yet).
+fn policy_witness_devices(policy: Option<&Node>) -> Result<Vec<[u8; 16]>, Unimplemented> {
+    let mut out = Vec::new();
+    if let Some(ws) = policy
+        .and_then(|p| p.get("time_witnesses"))
+        .and_then(|w| w.as_array())
+    {
+        for w in ws {
+            if let Some(d) = w.bytes_n::<16>() {
+                out.push(d);
+            } else if w.as_text() == Some("connect") {
+                return Err(Unimplemented("connect time witness".into()));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// §11.6 classification lattice rank.
@@ -446,6 +527,9 @@ impl State {
                 .unwrap_or_default(),
             kem_key_id: domains::key_id("hpke-p256-v1", kem_pk),
             revocation_id: b16_field(cert_node, "revocation_id").unwrap_or_default(),
+            expiry_deadline_ms: cert_node
+                .get("expiry_deadline_ms")
+                .and_then(|n| n.as_uint()),
             revoked: false,
         });
         ok(())
@@ -544,6 +628,11 @@ impl State {
                 .and_then(|c| c.as_text())
                 .and_then(class_rank),
             flows,
+            expiry_deadline_ms: grant_node
+                .get("expiry_deadline_ms")
+                .and_then(|n| n.as_uint()),
+            online_lease: grant_node.get("online_lease").and_then(|n| n.as_bool()) == Some(true),
+            max_age_ms: grant_node.get("max_age_ms").and_then(|n| n.as_uint()),
             revoked: false,
             revoke_caps: None,
         });
@@ -786,6 +875,10 @@ impl State {
             .and_then(|s| s.as_text())
             == Some("strict");
         self.zone_strict.insert(zone_id.unwrap_or_default(), strict);
+        self.policies.insert(
+            (zone_id.unwrap_or_default(), 1),
+            policy_witness_devices(body.get("zone_policy"))?,
+        );
         for r in recipients {
             self.record_wrap(zone_id.unwrap_or_default(), 1, r);
         }
@@ -1579,6 +1672,105 @@ impl State {
         ok(Ok(()))
     }
 
+    /// `c.zone_policy` — install a full ZonePolicy (§7.1, D-28:
+    /// policy never changes implicitly); acceptance advances the
+    /// zone's capability epoch by 1 (D-69) under the same
+    /// union-coverage rule as a bare bump; the new policy governs
+    /// operations signed at the new epoch onward (§9.4 anchoring).
+    fn admit_zone_policy(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let Some(policy) = body.get("policy") else {
+            return ok(Err(bad()));
+        };
+        if policy.get("v").and_then(|n| n.as_uint()) != Some(1) {
+            return ok(Err(bad()));
+        }
+        let Some(zone) = b16_field(policy, "zone_id") else {
+            return ok(Err(bad()));
+        };
+        let strictness = policy.get("strictness").and_then(|n| n.as_text());
+        if !matches!(strictness, Some("strict") | Some("lenient")) {
+            return ok(Err(bad()));
+        }
+        let fallback = policy.get("deadline_fallback").and_then(|n| n.as_text());
+        let require_cert = policy
+            .get("require_cert_deadlines")
+            .and_then(|n| n.as_bool());
+        match (fallback, require_cert) {
+            // D-76 cross-field: fail-closed REQUIRES the certificate
+            // half.
+            (Some("fail-closed"), Some(true)) | (Some("budgets"), Some(_)) => {}
+            _ => return ok(Err(bad())),
+        }
+        let witnesses = policy_witness_devices(Some(policy))?;
+        if witnesses.len() > 64 {
+            return ok(Err(bad()));
+        }
+        // connect_service_key is REQUIRED iff "connect" is listed
+        // (D-70) — "connect" itself has no engine yet, so a present
+        // key can never be legal here.
+        if policy.get("connect_service_key").is_some() {
+            return ok(Err(bad()));
+        }
+        let Some(&cur) = self.cap_epochs.get(&zone) else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if self.zone_strict.get(&zone) != Some(&true) {
+            return Err(Unimplemented("non-strict zone coverage".into()));
+        }
+        // Closure entries + union coverage — the bump's rule (D-153).
+        let live = self.live_lineages(zone);
+        let mut entries: Vec<[u8; 16]> = Vec::new();
+        if let Some(cs) = body.get("cutoffs") {
+            let Some(cs) = cs.as_array() else {
+                return ok(Err(bad()));
+            };
+            for cn in cs {
+                let (Some(cz), Some(cl)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage"))
+                else {
+                    return ok(Err(bad()));
+                };
+                if cz != zone || !live.contains(&cl) {
+                    return ok(Err(bad()));
+                }
+                match cn.get("heads").and_then(|h| h.as_array()) {
+                    None => return ok(Err(bad())),
+                    Some(a) if !a.is_empty() => {
+                        return Err(Unimplemented("frontierclose heads".into()))
+                    }
+                    Some(_) => entries.push(cl),
+                }
+            }
+        }
+        let covered = |l: &[u8; 16]| {
+            entries.contains(l)
+                || self
+                    .staged_closes
+                    .iter()
+                    .any(|&(sz, sl)| sz == zone && sl == *l)
+        };
+        if live.iter().any(|l| !covered(l)) {
+            return ok(Err(bad()));
+        }
+
+        // Accept: advance the epoch, consume the zone's stages
+        // one-shot, and anchor the NEW policy at the new epoch.
+        self.cap_epochs.insert(zone, cur + 1);
+        self.staged_closes.retain(|&(sz, _)| sz != zone);
+        self.zone_strict.insert(zone, strictness == Some("strict"));
+        self.policies.insert((zone, cur + 1), witnesses);
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
     /// `c.kek_rotate` — §5.5's admission face: dense per-zone epochs
     /// (every earlier control op is already folded at this chain
     /// position, so consecutiveness is a plain body invariant),
@@ -1684,6 +1876,8 @@ impl State {
         self.cap_epochs.insert(zone_id, 1);
         let strict = policy.get("strictness").and_then(|s| s.as_text()) == Some("strict");
         self.zone_strict.insert(zone_id, strict);
+        self.policies
+            .insert((zone_id, 1), policy_witness_devices(Some(policy))?);
         for r in recipients {
             self.record_wrap(zone_id, 1, r);
         }
@@ -2015,7 +2209,220 @@ impl State {
                 "quarantine-reproposal",
             )));
         }
+
+        // Time stage (§9.1 deadlines / §4.7 T5 leases) — only where
+        // deadline fields exist (D-28); a present deadline always
+        // binds, in every posture (D-12/D-56).
+        let mut deadlines: Vec<u64> = Vec::new();
+        deadlines.extend(grant.expiry_deadline_ms);
+        deadlines.extend(held_cert.expiry_deadline_ms);
+        if !deadlines.is_empty() || grant.online_lease {
+            let accepts = self.qualified_accepts(op, &held_cert);
+            for d in deadlines {
+                if !accepts.iter().any(|&seen| seen <= d) {
+                    return ok(Err(Verdict::Pending(
+                        "deadline-unreceipted",
+                        "pending-dependency",
+                    )));
+                }
+            }
+            if grant.online_lease {
+                let max_age = grant.max_age_ms.unwrap_or(0);
+                let windows = self.qualified_lease_windows(op, &held_cert, &grant, max_age);
+                if windows.is_empty() {
+                    return ok(Err(Verdict::Pending("lease-missing", "pending-dependency")));
+                }
+                // T5: skew = 300000 ms, fixed.
+                const SKEW_MS: u64 = 300_000;
+                let in_window = windows
+                    .iter()
+                    .any(|&(i, e)| accepts.iter().any(|&s| s >= i && s <= e + SKEW_MS));
+                if !in_window {
+                    if accepts.is_empty() {
+                        // No observation held at all: still awaiting
+                        // evidence (pending, §9.1's pairing).
+                        return ok(Err(Verdict::Pending("lease-missing", "pending-dependency")));
+                    }
+                    // A held qualified observation OUTSIDE every
+                    // valid window is conclusive staleness.
+                    return ok(Err(Verdict::Rejected(
+                        "lease-stale",
+                        "quarantine-reproposal",
+                    )));
+                }
+            }
+        }
         ok(Ok(grant))
+    }
+
+    /// The T2 anchor: the policy in force at `(zone, epoch)` —
+    /// absent epochs resolve downward (a bare bump carries
+    /// policy(e−1) forward, §9.4).
+    fn witnesses_at(&self, zone: [u8; 16], epoch: u64) -> Vec<[u8; 16]> {
+        self.policies
+            .range((zone, 0)..=(zone, epoch))
+            .next_back()
+            .map(|(_, w)| w.clone())
+            .unwrap_or_default()
+    }
+
+    /// §9.1/T2-qualified `accept` receipts for THIS operation: plane
+    /// and zone bound, subject resolved through the §5.6 index,
+    /// issuer a held cert of a DIFFERENT device that the operation's
+    /// anchored policy lists, signature valid. Returns `seen_ms`
+    /// values.
+    fn qualified_accepts(&self, op: &SignedOp, signer: &HeldCert) -> Vec<u64> {
+        let h = &op.header;
+        let witnesses = self.witnesses_at(h.zone_id, h.capability_epoch);
+        let op_hash = op.op_hash();
+        self.receipts
+            .iter()
+            .filter_map(|r| {
+                if Some(r.plane) != self.plane_id || r.zone != h.zone_id {
+                    return None;
+                }
+                if self.item_index.get(&r.subject) != Some(&op_hash) {
+                    return None;
+                }
+                let cert = self.certs.iter().find(|c| c.h_cert == r.issuer_cert)?;
+                if cert.device_id == signer.device_id {
+                    return None; // T2: a signer never receipts itself
+                }
+                if !witnesses.contains(&cert.device_id) {
+                    return None;
+                }
+                verify_stmt(&cert.sig_pk, "receipt", &r.stmt_raw, &r.sig).then_some(r.seen_ms)
+            })
+            .collect()
+    }
+
+    /// T5-valid, T2-qualified lease windows for `(grant_id,
+    /// lineage)`: `expires − issued ≤ max_age_ms`, same
+    /// qualification predicate as receipts.
+    fn qualified_lease_windows(
+        &self,
+        op: &SignedOp,
+        signer: &HeldCert,
+        grant: &HeldGrant,
+        max_age: u64,
+    ) -> Vec<(u64, u64)> {
+        let h = &op.header;
+        let witnesses = self.witnesses_at(h.zone_id, h.capability_epoch);
+        self.leases
+            .iter()
+            .filter_map(|l| {
+                if Some(l.plane) != self.plane_id || l.zone != h.zone_id {
+                    return None;
+                }
+                if l.grant_id != grant.grant_id || l.lineage != h.writer_lineage {
+                    return None;
+                }
+                if l.expires_ms < l.issued_ms || l.expires_ms - l.issued_ms > max_age {
+                    return None;
+                }
+                let cert = self.certs.iter().find(|c| c.h_cert == l.issuer_cert)?;
+                if cert.device_id == signer.device_id {
+                    return None;
+                }
+                if !witnesses.contains(&cert.device_id) {
+                    return None;
+                }
+                verify_stmt(&cert.sig_pk, "lease", &l.stmt_raw, &l.sig)
+                    .then_some((l.issued_ms, l.expires_ms))
+            })
+            .collect()
+    }
+
+    /// Install the vector's held context (the fold lane's `aux`):
+    /// the §5.6 `index` plus `Signed<…>` receipts and leases (§4.7).
+    /// Aux is STATE, not events — nothing here folds.
+    pub(crate) fn install_aux(
+        &mut self,
+        aux: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), Unimplemented> {
+        for (name, bytes) in aux {
+            let Ok(node) = crate::cbor::decode(bytes) else {
+                return Err(Unimplemented(format!("aux {name}: not canonical CBOR")));
+            };
+            if name == "index" {
+                let Some(entries) = node.as_array() else {
+                    return Err(Unimplemented("aux index: not an array".into()));
+                };
+                for e in entries {
+                    let (Some(addr), Some(op)) = (
+                        e.get("item_addr").and_then(|n| n.bytes_n::<32>()),
+                        e.get("op").and_then(|n| n.bytes_n::<32>()),
+                    ) else {
+                        return Err(Unimplemented("aux index entry shape".into()));
+                    };
+                    self.item_index.insert(addr, op);
+                }
+                continue;
+            }
+            let (Some(stmt), Some(sig)) = (node.get("stmt"), node.get("sig")) else {
+                return Err(Unimplemented(format!("aux {name}: unrecognized shape")));
+            };
+            let Some(sig) = sig.as_bytes() else {
+                return Err(Unimplemented(format!("aux {name}: sig shape")));
+            };
+            let Some(issuer) = stmt.get("issuer") else {
+                return Err(Unimplemented(format!("aux {name}: no issuer")));
+            };
+            if issuer.get("src").and_then(|n| n.as_text()) != Some("device") {
+                return Err(Unimplemented("service-issued statements".into()));
+            }
+            let (Some(issuer_cert), Some(plane), Some(zone)) = (
+                issuer.get("cert").and_then(|n| n.bytes_n::<32>()),
+                stmt.get("plane_id").and_then(|n| n.bytes_n::<32>()),
+                stmt.get("zone_id").and_then(|n| n.bytes_n::<16>()),
+            ) else {
+                return Err(Unimplemented(format!("aux {name}: statement binding")));
+            };
+            if let Some(kind) = stmt.get("kind").and_then(|k| k.as_text()) {
+                if kind == "accept" {
+                    let (Some(subject), Some(seen_ms)) = (
+                        stmt.get("subject").and_then(|n| n.bytes_n::<32>()),
+                        stmt.get("seen_ms").and_then(|n| n.as_uint()),
+                    ) else {
+                        return Err(Unimplemented(format!("aux {name}: accept shape")));
+                    };
+                    self.receipts.push(AuxReceipt {
+                        issuer_cert,
+                        plane,
+                        zone,
+                        subject,
+                        seen_ms,
+                        stmt_raw: stmt.raw.to_vec(),
+                        sig: sig.to_vec(),
+                    });
+                }
+                // storage/replica/witness receipts have no fold
+                // consumer yet — held, inert.
+            } else if stmt.get("grant_id").is_some() {
+                let (Some(grant_id), Some(lineage), Some(issued_ms), Some(expires_ms)) = (
+                    stmt.get("grant_id").and_then(|n| n.bytes_n::<16>()),
+                    stmt.get("lineage").and_then(|n| n.bytes_n::<16>()),
+                    stmt.get("issued_ms").and_then(|n| n.as_uint()),
+                    stmt.get("expires_ms").and_then(|n| n.as_uint()),
+                ) else {
+                    return Err(Unimplemented(format!("aux {name}: lease shape")));
+                };
+                self.leases.push(AuxLease {
+                    issuer_cert,
+                    plane,
+                    zone,
+                    grant_id,
+                    lineage,
+                    issued_ms,
+                    expires_ms,
+                    stmt_raw: stmt.raw.to_vec(),
+                    sig: sig.to_vec(),
+                });
+            } else {
+                return Err(Unimplemented(format!("aux {name}: unrecognized statement")));
+            }
+        }
+        Ok(())
     }
 
     /// §11.4 derived actor class. Human evidence + full judgment
@@ -2857,6 +3264,7 @@ impl State {
             "c.revoke_device" => self.admit_revoke_device(op),
             "c.cutoff" => self.admit_cutoff(op),
             "c.cap_epoch_bump" => self.admit_cap_epoch_bump(op),
+            "c.zone_policy" => self.admit_zone_policy(op),
             "c.kek_rotate" => self.admit_kek_rotate(op),
             "c.zone_create" => self.admit_zone_create(op),
             "c.space_create" => self.admit_space_create(op),
@@ -2884,7 +3292,7 @@ pub fn run_delivery(
     items: &BTreeMap<String, Vec<u8>>,
     order: &[String],
 ) -> Result<Run, Unimplemented> {
-    run_delivery_with_state(items, order).map(|(run, _)| run)
+    run_delivery_full(items, &BTreeMap::new(), order).map(|(run, _)| run)
 }
 
 /// [`run_delivery`] returning the final [`State`] too — the
@@ -2893,7 +3301,18 @@ pub fn run_delivery_with_state(
     items: &BTreeMap<String, Vec<u8>>,
     order: &[String],
 ) -> Result<(Run, State), Unimplemented> {
+    run_delivery_full(items, &BTreeMap::new(), order)
+}
+
+/// The full fold entry: `aux` = the vector's HELD context (§5.6
+/// index, §4.7 receipts/leases) — installed before anything folds.
+pub fn run_delivery_full(
+    items: &BTreeMap<String, Vec<u8>>,
+    aux: &BTreeMap<String, Vec<u8>>,
+    order: &[String],
+) -> Result<(Run, State), Unimplemented> {
     let mut state = State::default();
+    state.install_aux(aux)?;
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut snapshots = Vec::new();
     // Pending queue in arrival order.
