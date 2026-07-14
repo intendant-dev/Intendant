@@ -188,6 +188,7 @@ fn run_semantics(vector: &Json) -> SemStatus {
         "frame-roundtrip" => crate::edge::frame_roundtrip(vector),
         "corruption-negative" => crate::edge::corruption_negative(vector),
         "crash-replay" => crate::edge::crash_replay(vector),
+        "erase-crash-matrix" => crate::erase::erase_crash_matrix(vector),
         "lock-matrix" => crate::edge::lock_matrix(vector),
         _ => crate::kat::run(vector),
     };
@@ -693,8 +694,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            104,
-            "the tranche plus the corpus through the status-derive slice"
+            112,
+            "the tranche plus the corpus through the erase-crash slice"
         );
         for r in &reports {
             assert!(
