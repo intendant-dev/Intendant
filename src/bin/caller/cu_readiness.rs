@@ -229,6 +229,11 @@ fn readiness_summary(target: &str, layers: &[ReadinessLayer]) -> String {
 /// when the preflight positively indicates the permission is missing.
 /// `preflight_granted: None` (probe unavailable) passes the raw error
 /// through unchanged: never blame a permission the probe didn't confirm.
+///
+/// Runtime caller is the macOS arm of [`enrich_capture_failure`] (the
+/// capture-permission preflight is a macOS concept); compiled under `test`
+/// everywhere so the pure-function tests run on every host.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn capture_failure_with_permission_hint(
     raw: &str,
     preflight_granted: Option<bool>,
@@ -250,6 +255,10 @@ pub(crate) fn capture_failure_with_permission_hint(
 }
 
 /// The label used when naming the affected process in permission guidance.
+/// Callers are the macOS TCC paths (`enrich_capture_failure`,
+/// `macos_probes`) — the only platform whose permission fixes name the
+/// binary the grant is keyed to.
+#[cfg(target_os = "macos")]
 fn process_binary_label() -> String {
     std::env::current_exe()
         .ok()
@@ -631,7 +640,10 @@ async fn windows_probes(target: DisplayTarget, session_resolution: Option<(u32, 
 
 /// `":0"`-style display string → the X socket path that backs it.
 /// Returns `None` for non-local display strings.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+///
+/// Runtime caller is `linux_probes`; compiled under `test` everywhere so
+/// the pure parsing tests run on every host.
+#[cfg(any(target_os = "linux", test))]
 fn x11_socket_path(display: &str) -> Option<std::path::PathBuf> {
     let rest = display.strip_prefix(':')?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
