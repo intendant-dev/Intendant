@@ -875,11 +875,12 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::SettingsPost => {
+                let settings_root = runtime_settings.settings_root.or(project_root);
                 return handle_settings_post(
                     stream,
                     route_body,
                     bus,
-                    project_root,
+                    settings_root,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

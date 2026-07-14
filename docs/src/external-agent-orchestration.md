@@ -729,9 +729,11 @@ own away-from-keyboard fallback.
 ## Configuration
 
 External-agent settings live under `[agent]` in `intendant.toml`
-(`ExternalAgentConfig` in `project.rs`). `default_backend` selects the mode; the
-per-backend subtables tune each tool. All keys have defaults, so a bare `[agent]`
-with just `default_backend` works.
+(`ExternalAgentConfig` in `project.rs`). An attached project uses its own file;
+a projectless daemon uses `<state-root>/intendant.toml` (normally
+`~/.intendant/intendant.toml`) for daemon-wide defaults. `default_backend`
+selects the mode; the per-backend subtables tune each tool. All keys have
+defaults, so a bare `[agent]` with just `default_backend` works.
 
 ```toml
 [agent]
@@ -741,7 +743,7 @@ default_backend = "codex"
 
 [agent.codex]
 command          = "codex"            # binary on PATH or absolute path
-model            = "gpt-5.6"          # optional; omit to use Codex's default
+model            = "gpt-5.6-sol"      # optional; omit to use Codex's default
 approval_policy  = "on-request"       # untrusted | on-request | never
 sandbox          = "workspace-write"  # read-only | workspace-write | danger-full-access
 reasoning_effort = "medium"           # ""(default) | none | minimal | low | medium | high | xhigh | max | ultra
