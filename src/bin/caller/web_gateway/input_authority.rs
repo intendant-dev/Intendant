@@ -127,15 +127,9 @@ impl DisplayInputHolder {
     /// equality-comparison pitfalls in collections / `.contains()` /
     /// pattern guards.
     ///
-    /// Production callers don't need this yet — every F-1 / F-2
-    /// release-or-preempt site already knows which provenance kind it's
-    /// matching against and uses `matches_local_ws` /
-    /// `matches_federated` directly. The method is pinned by unit
-    /// tests as the documented identity-equality contract for future
-    /// arbitration work (e.g. F-2's per-primary multi-operator
-    /// scoping, where the comparison is against an opaque
-    /// `DisplayInputHolder` snapshot).
-    #[allow(dead_code)]
+    /// Grant installation uses this contract to make a repeated request by
+    /// the current holder idempotent: the notification handle may refresh,
+    /// but the authority epoch must not advance and break an in-flight drag.
     pub(crate) fn same_identity(&self, other: &DisplayInputHolder) -> bool {
         match (self, other) {
             (
@@ -165,11 +159,13 @@ impl DisplayInputHolder {
     }
 }
 
-/// Holder map and its monotonic mutation revision, owned by one gateway.
-/// Mutations advance `revision` while holding the write lock; queued input
-/// snapshots it at admission and rechecks it at injection. Keeping both in
-/// one object prevents fast A -> B -> A handoffs from resurrecting stale
-/// events without coupling independent gateways or parallel tests.
+/// Holder map and its monotonic identity-transition revision, owned by one
+/// gateway. Identity changes advance `revision` while holding the write lock;
+/// same-identity re-grants may refresh a notification handle without changing
+/// the epoch. Queued input snapshots the revision at admission and rechecks it
+/// at injection. Keeping both in one object prevents fast A -> B -> A handoffs
+/// from resurrecting stale events without coupling independent gateways or
+/// parallel tests.
 pub(crate) struct DisplayInputAuthority {
     holders: StdRwLock<HashMap<u32, DisplayInputHolder>>,
     revisions: Mutex<HashMap<u32, Arc<AtomicU64>>>,
@@ -213,6 +209,43 @@ impl DisplayInputAuthority {
         self.revision(display_id)
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
+    }
+
+    /// Install a holder and return `(prior, revision)`. Repeating a grant for
+    /// the same provenance + identity replaces the stored value (refreshing a
+    /// local WS notification sender) but deliberately preserves the revision;
+    /// only a real authority handoff starts a new input epoch.
+    fn install_holder(
+        &self,
+        display_id: u32,
+        new_holder: DisplayInputHolder,
+    ) -> (Option<DisplayInputHolder>, u64) {
+        let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        let same_identity = holders
+            .get(&display_id)
+            .is_some_and(|current| current.same_identity(&new_holder));
+        let prior = holders.insert(display_id, new_holder);
+        let revision = if same_identity {
+            self.revision(display_id).load(Ordering::SeqCst)
+        } else {
+            self.bump_revision(display_id)
+        };
+        (prior, revision)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_entry_counts(&self) -> (usize, usize) {
+        let holder_count = self
+            .holders
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        let revision_count = self
+            .revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        (holder_count, revision_count)
     }
 
     fn revision_is_current(&self, display_id: u32, revision: u64) -> bool {
@@ -409,12 +442,7 @@ pub(crate) fn apply_grant_input_authority(
     // downstream but cheap because mpsc::UnboundedSender is
     // Arc-backed).
     let broadcast_holder = new_holder.clone();
-    let (prior, revision) = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        let prior = map.insert(display_id, new_holder);
-        let revision = authority.bump_revision(display_id);
-        (prior, revision)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     // Only `LocalWs` prior holders get the direct revoke confirmation
     // — `direct_tx` is local-only by design (see `DisplayInputHolder`
     // doc). A `FederatedWebRtc` prior holder learns of the preempt
@@ -510,12 +538,7 @@ pub(crate) fn apply_grant_input_authority_federated(
         session_id: session_id.clone(),
     };
     let broadcast_holder = new_holder.clone();
-    let (prior, revision) = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        let prior = map.insert(display_id, new_holder);
-        let revision = authority.bump_revision(display_id);
-        (prior, revision)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     // Prior LocalWs holder gets the legacy direct revoke; prior
     // FederatedWebRtc gets nothing here because the personalized
     // broadcast below carries `"other"` to it on its own data channel.
@@ -618,12 +641,7 @@ pub(crate) fn apply_grant_input_authority_dashboard_control(
         session_id: session_id.clone(),
     };
     let broadcast_holder = new_holder.clone();
-    let (prior, revision) = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        let prior = map.insert(display_id, new_holder);
-        let revision = authority.bump_revision(display_id);
-        (prior, revision)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     if let Some(DisplayInputHolder::LocalWs {
         direct_tx: prior_tx,
         ..
@@ -1414,6 +1432,79 @@ mod tests {
 
         assert_eq!(display_a.load(Ordering::SeqCst), 0);
         assert_eq!(display_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn same_identity_regrants_preserve_revision_across_all_input_lanes() {
+        let authority = empty_authority_map();
+        let (change_tx, mut change_rx) = broadcast::channel(16);
+
+        let (local_tx_first, mut local_rx_first) = mpsc::unbounded_channel();
+        apply_grant_input_authority(
+            10,
+            "local-A".to_string(),
+            local_tx_first,
+            &authority,
+            &change_tx,
+        );
+        let local_first = change_rx.try_recv().expect("first local grant");
+        let (local_tx_refresh, _local_rx_refresh) = mpsc::unbounded_channel();
+        let local_prior = apply_grant_input_authority(
+            10,
+            "local-A".to_string(),
+            local_tx_refresh,
+            &authority,
+            &change_tx,
+        )
+        .expect("same local holder is returned as prior");
+        let local_refresh = change_rx.try_recv().expect("local refresh broadcast");
+        assert!(local_prior.matches_local_ws("local-A"));
+        assert_eq!(local_refresh.revision, local_first.revision);
+        assert_eq!(authority.revision(10).load(Ordering::SeqCst), 1);
+        assert!(
+            local_rx_first.try_recv().is_err(),
+            "refreshing the current local holder must not revoke it"
+        );
+
+        apply_grant_input_authority_federated(
+            11,
+            "federation-A".to_string(),
+            "peer-session-A".to_string(),
+            &authority,
+            &change_tx,
+        );
+        let federated_first = change_rx.try_recv().expect("first federated grant");
+        let federated_prior = apply_grant_input_authority_federated(
+            11,
+            "federation-A".to_string(),
+            "peer-session-A".to_string(),
+            &authority,
+            &change_tx,
+        )
+        .expect("same federated holder is returned as prior");
+        let federated_refresh = change_rx.try_recv().expect("federated refresh broadcast");
+        assert!(federated_prior.matches_federated("federation-A", "peer-session-A"));
+        assert_eq!(federated_refresh.revision, federated_first.revision);
+        assert_eq!(authority.revision(11).load(Ordering::SeqCst), 1);
+
+        apply_grant_input_authority_dashboard_control(
+            12,
+            "control-A".to_string(),
+            &authority,
+            &change_tx,
+        );
+        let dashboard_first = change_rx.try_recv().expect("first dashboard grant");
+        let dashboard_prior = apply_grant_input_authority_dashboard_control(
+            12,
+            "control-A".to_string(),
+            &authority,
+            &change_tx,
+        )
+        .expect("same dashboard holder is returned as prior");
+        let dashboard_refresh = change_rx.try_recv().expect("dashboard refresh broadcast");
+        assert!(dashboard_prior.matches_dashboard_control("control-A"));
+        assert_eq!(dashboard_refresh.revision, dashboard_first.revision);
+        assert_eq!(authority.revision(12).load(Ordering::SeqCst), 1);
     }
 
     #[test]

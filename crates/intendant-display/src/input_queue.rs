@@ -190,7 +190,7 @@ impl InputQueue {
 
         if let Some(admitted_revision) = admitted_authority_revision {
             match inner.authority_revision {
-                Some(current) if current != admitted_revision => {
+                Some(current) if serial_revision_precedes(current, admitted_revision) => {
                     // Couple an authority epoch change to the same ordered
                     // pump before admitting the new holder's event. This
                     // releases native state from the old holder before the
@@ -200,10 +200,20 @@ impl InputQueue {
                         &mut inner,
                         "browser input arrived under a new authority revision",
                     );
+                    inner.authority_revision = Some(admitted_revision);
                 }
-                _ => {}
+                Some(current) if current == admitted_revision => {}
+                Some(_) => {
+                    // Admission raced a newer transition that already reached
+                    // this queue. Reject instead of regressing the queue epoch
+                    // and clearing the new holder's backlog.
+                    let kind = event.wire_tag();
+                    drop(inner);
+                    input_telemetry::record_authority_drop(kind);
+                    return None;
+                }
+                None => inner.authority_revision = Some(admitted_revision),
             }
-            inner.authority_revision = Some(admitted_revision);
         }
 
         let generation = inner.generation;
@@ -375,6 +385,39 @@ impl InputQueue {
         true
     }
 
+    /// Reset for an authority transition only when this queue has not already
+    /// admitted input from that transition (or a newer one). The comparison
+    /// and revision advance share the queue mutex with [`Self::push_guarded`],
+    /// so exactly one side of the observer/event race performs the reset:
+    ///
+    /// - observer first: reset + advance, then the new event enqueues directly;
+    /// - event first: its inline reset + advance wins, and the observer skips.
+    ///
+    /// Advancing here is load-bearing. A reset that left the old revision in
+    /// place would make the first new-holder event reset the queue a second
+    /// time. Treat revisions as wrapping serial numbers; a difference of less
+    /// than half the `u64` range is forward, which also makes a delayed older
+    /// observer unable to clear a newer holder's backlog.
+    pub(crate) fn reset_before_authority_revision(
+        &self,
+        authority_revision: u64,
+        reason: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed
+            || inner
+                .authority_revision
+                .is_some_and(|current| !serial_revision_precedes(current, authority_revision))
+        {
+            return false;
+        }
+        Self::reset_locked(&mut inner, reason);
+        inner.authority_revision = Some(authority_revision);
+        drop(inner);
+        self.notify.notify_one();
+        true
+    }
+
     fn reset_locked(inner: &mut Inner, reason: &str) {
         inner.generation = inner.generation.wrapping_add(1);
         Self::discard_pending(inner);
@@ -469,6 +512,20 @@ impl InputQueue {
     pub(crate) fn is_tripped(&self) -> bool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).tripped
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+}
+
+/// RFC-1982-style ordering for the practically monotonic `u64` authority
+/// revision. The half-range case is deliberately not considered forward:
+/// reaching it would require 2^63 unseen transitions, and skipping is safer
+/// than letting an ancient observer clear current input.
+fn serial_revision_precedes(current: u64, candidate: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < (1_u64 << 63)
 }
 
 #[derive(Clone)]
@@ -640,7 +697,15 @@ pub(crate) fn spawn_input_pump(
                 })
             {
                 input_telemetry::record_authority_drop(kind);
-                queue.reset("a buffered event lost its live input epoch or authority");
+                // The event was already popped, so an authority observer may
+                // have advanced the queue and admitted the replacement
+                // holder's input while this task was descheduled. Only reset
+                // the epoch this event came from; an unconditional reset here
+                // would erase that newer backlog.
+                queue.reset_if_generation(
+                    queued.generation,
+                    "a buffered event lost its live input epoch or authority",
+                );
                 continue;
             }
             pressed.before_inject(&queued.event);
@@ -1399,5 +1464,178 @@ mod tests {
             .await
             .expect("shutdown must stop the pump")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_authority_observer_preserves_new_holder_backlog() {
+        let queue = Arc::new(InputQueue::new());
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+
+        let admitted_a = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(kd("StaleA"), authorization.clone(), admitted_a);
+
+        revision.store(2, std::sync::atomic::Ordering::SeqCst);
+        let admitted_b = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(ku("FreshB"), authorization.clone(), admitted_b);
+        let generation_after_b = queue.current_generation();
+        assert_eq!(queue.queued_tags(), vec!["ku"]);
+
+        assert!(
+            !queue.reset_before_authority_revision(2, "delayed authority observer"),
+            "the event-side handoff already advanced the queue to revision 2"
+        );
+        assert_eq!(queue.current_generation(), generation_after_b);
+        assert_eq!(
+            queue.queued_tags(),
+            vec!["ku"],
+            "the delayed observer must not discard B's admitted event"
+        );
+
+        let (injected_tx, mut rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(RecordingBackend {
+                injected: injected_tx,
+            }),
+            shutdown.clone(),
+        );
+        assert_eq!(drain_n(&mut rx, 1).await, vec!["ku:FreshB"]);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the pump")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn popped_stale_event_cannot_reset_new_holder_backlog() {
+        let queue = Arc::new(InputQueue::new());
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+
+        let admitted_a = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(kd("StaleA"), authorization.clone(), admitted_a);
+        let popped_a = match queue.recv().await {
+            Some(PumpItem::Input(queued)) => queued,
+            _ => panic!("expected A's queued input"),
+        };
+
+        // Reproduce the exact pump/observer interleaving: the pump has removed
+        // A from the queue but has not yet acted on its failed live check; the
+        // observer advances to B, and B queues input in the new epoch.
+        revision.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(queue.reset_before_authority_revision(2, "authority moved to B"));
+        let admitted_b = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(ku("FreshB"), authorization, admitted_b);
+        let generation_b = queue.current_generation();
+        assert_eq!(queue.queued_tags(), vec!["ku"]);
+
+        assert!(
+            !queue.reset_if_generation(
+                popped_a.generation,
+                "the popped A event failed its delayed live check"
+            ),
+            "stale pump work must not reset B's epoch"
+        );
+        assert_eq!(queue.current_generation(), generation_b);
+        assert_eq!(
+            queue.queued_tags(),
+            vec!["ku"],
+            "B's admitted input must survive the stale A pump check"
+        );
+
+        let (injected_tx, mut rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(RecordingBackend {
+                injected: injected_tx,
+            }),
+            shutdown.clone(),
+        );
+        assert_eq!(drain_n(&mut rx, 1).await, vec!["ku:FreshB"]);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the pump")
+            .unwrap();
+    }
+
+    #[test]
+    fn observer_first_advances_revision_without_a_second_event_reset() {
+        let queue = InputQueue::new();
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+        let admitted_a = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(kd("StaleA"), authorization.clone(), admitted_a);
+
+        assert!(queue.reset_before_authority_revision(2, "authority observer won"));
+        let observer_generation = queue.current_generation();
+        assert_eq!(queue.len(), 0);
+
+        revision.store(2, std::sync::atomic::Ordering::SeqCst);
+        let admitted_b = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(ku("FreshB"), authorization, admitted_b);
+        assert_eq!(
+            queue.current_generation(),
+            observer_generation,
+            "B must not reset again after the observer advanced the revision"
+        );
+        assert_eq!(queue.queued_tags(), vec!["ku"]);
+    }
+
+    #[test]
+    fn stale_authority_observer_cannot_regress_a_newer_queue_revision() {
+        let queue = InputQueue::new();
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+        let admitted_a = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(kd("StaleA"), authorization.clone(), admitted_a);
+
+        revision.store(3, std::sync::atomic::Ordering::SeqCst);
+        let admitted_c = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(ku("FreshC"), authorization, admitted_c);
+        let generation_c = queue.current_generation();
+
+        assert!(
+            !queue.reset_before_authority_revision(2, "late revision-2 observer"),
+            "revision 2 predates the already-admitted revision 3"
+        );
+        assert_eq!(queue.current_generation(), generation_c);
+        assert_eq!(queue.queued_tags(), vec!["ku"]);
+    }
+
+    #[test]
+    fn stale_admitted_event_cannot_regress_a_newer_queue_revision() {
+        let queue = InputQueue::new();
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+        let admitted_c = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(ku("FreshC"), authorization.clone(), admitted_c);
+        let generation_c = queue.current_generation();
+
+        assert_eq!(
+            queue.push_browser_authorized(ku("StaleB"), authorization, Some(2)),
+            None,
+            "an event admitted before revision 3 must be rejected after revision 3 wins"
+        );
+        assert_eq!(queue.current_generation(), generation_c);
+        assert_eq!(queue.queued_tags(), vec!["ku"]);
+    }
+
+    #[test]
+    fn serial_revision_order_handles_wrap_without_accepting_older_values() {
+        assert!(serial_revision_precedes(u64::MAX, 0));
+        assert!(serial_revision_precedes(0, 1));
+        assert!(!serial_revision_precedes(1, 1));
+        assert!(!serial_revision_precedes(3, 2));
+        assert!(!serial_revision_precedes(0, 1_u64 << 63));
     }
 }

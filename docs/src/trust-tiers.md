@@ -195,7 +195,12 @@ Three rungs, ordered by what betrayal costs the attacker:
    fleet SNI like the hosted tab for authority: public shell and discovery
    bytes only, with protected HTTP/MCP, signaling, and WebSocket traffic
    refused before mTLS or IAM resolution. The CT tripwire remains a useful
-   diagnostic for the route directory.
+   diagnostic for the route directory. Assigned fleet names are remembered
+   durably even when Connect is later disabled or reports no current zone; a
+   previously service-controlled name never decays into a direct anchor.
+   Pre-provenance installs recover exact names from `fleet-cert.pem` on
+   startup; malformed or incomplete recovery conservatively treats unknown
+   DNS browser-key origins as fleet provenance until repaired.
 3. **Directory only — the hosted tab.** The rendezvous origin serves
    the code itself, so betrayal is a silently different bundle to one
    visitor, once, with no artifact anywhere. No evidence machinery can

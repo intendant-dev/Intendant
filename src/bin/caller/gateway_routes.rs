@@ -1416,7 +1416,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::AccessEnrollmentDecide,
-        "Approve or deny a pending enrollment request",
+        "Staged decision API; the default product has no queue writer",
     )
     .with_tunnel(tunnel_method("api_access_enrollment_decide")),
     fleet_route(
@@ -1425,7 +1425,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessInspect,
         BodyPolicy::None,
         RouteHandlerId::AccessEnrollmentRequests,
-        "Pending enrollment requests",
+        "Staged enrollment capability and normally empty queue",
     )
     .with_tunnel(tunnel_method("api_access_enrollment_requests")),
     fleet_route(

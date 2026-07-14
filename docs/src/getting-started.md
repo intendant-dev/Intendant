@@ -656,7 +656,7 @@ cargo test -- --list      # list all test names
 ```
 
 Unit tests are inline `#[cfg(test)]` modules across the binaries and library
-crates. The 20 `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
+crates. The `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
 binaries against the deterministic scripted mock provider (`PROVIDER=mock` +
 `INTENDANT_MOCK_SCRIPT`). They need no API key or network, use the synthetic
 1280×720 display backend rather than native capture, and run in CI on macOS,

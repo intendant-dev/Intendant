@@ -752,15 +752,23 @@ fn note_register_response(response: &RegisterResponse, base_url: &Url) {
             status.claimed_by_user_id = None;
             status.claimed_by_handle = None;
             status.claim_binding = None;
-            // New services retain only the daemon-minted hash. Keep parsing
-            // legacy plaintext fields, but prefer the local code that was
-            // actually signed into this registration.
+            // New services retain only the daemon-minted hash and return
+            // null plaintext fields. Older services ignore that hash, mint
+            // their own plaintext code, and return the code/URL pair that
+            // they can actually redeem. Treat any legacy fields as a
+            // coherent pair; mixing their URL or code with the local phrase
+            // would display an unclaimable credential during a rolling
+            // service upgrade.
             let local_code = peek_route_claim_code();
-            let effective_code = local_code.clone().or_else(|| response.claim_code.clone());
-            let effective_url = local_code
-                .as_ref()
-                .map(|code| route_claim_url(base_url, code))
-                .or_else(|| response.claim_url.clone());
+            let (effective_code, effective_url) =
+                if response.claim_code.is_some() || response.claim_url.is_some() {
+                    (response.claim_code.clone(), response.claim_url.clone())
+                } else {
+                    let local_url = local_code
+                        .as_deref()
+                        .map(|code| route_claim_url(base_url, code));
+                    (local_code, local_url)
+                };
             if status.claim_code != effective_code {
                 print_claim = match (&effective_url, &effective_code) {
                     (Some(url), _) if !url.is_empty() => Some(format!(
@@ -2057,7 +2065,12 @@ mod tests {
             Some(ClaimBinding::Mismatch)
         );
 
-        // Unclaimed responses clear the claim view and surface the code.
+        // During a mixed-version rollout an older service ignores the
+        // daemon-minted hash and returns the different plaintext phrase it
+        // can redeem. Its coherent response pair must outrank the local
+        // phrase; otherwise the dashboard displays an unclaimable code.
+        let local_code = current_route_claim_code().unwrap();
+        assert_ne!(local_code, "word-word-word");
         note_register_response(
             &RegisterResponse {
                 claimed: false,
@@ -2066,7 +2079,7 @@ mod tests {
                 claim_code: Some("word-word-word".to_string()),
                 claim_code_expires_unix_ms: Some(1_700_000_600_000),
                 claim_url: Some(
-                    "https://connect.example/connect#claim_code=word-word-word".to_string(),
+                    "https://connect.example/connect?claim_code=word-word-word".to_string(),
                 ),
                 daemon_session_token: None,
                 daemon_session_expires_unix_ms: None,
@@ -2079,10 +2092,39 @@ mod tests {
         assert_eq!(status.claimed, Some(false));
         assert_eq!(status.claim_binding, None);
         assert_eq!(status.claim_code.as_deref(), Some("word-word-word"));
+        assert_eq!(
+            status.claim_url.as_deref(),
+            Some("https://connect.example/connect?claim_code=word-word-word")
+        );
         assert_eq!(status.claim_code_expires_unix_ms, Some(1_700_000_600_000));
+
+        // A new service returns null plaintext fields because it retained the
+        // signed local hash. In that case the same local phrase and its
+        // fragment URL are the claim surface.
+        note_register_response(
+            &RegisterResponse {
+                claimed: false,
+                claimed_by_user_id: None,
+                claimed_by_handle: None,
+                claim_code: None,
+                claim_code_expires_unix_ms: Some(1_700_001_200_000),
+                claim_url: None,
+                daemon_session_token: None,
+                daemon_session_expires_unix_ms: None,
+                observed_ip: None,
+                fleet_dns: None,
+            },
+            &base_url,
+        );
+        let status = status_snapshot();
+        assert_eq!(status.claim_code.as_deref(), Some(local_code.as_str()));
+        let local_url = route_claim_url(&base_url, &local_code);
+        assert_eq!(status.claim_url.as_deref(), Some(local_url.as_str()));
+        assert_eq!(status.claim_code_expires_unix_ms, Some(1_700_001_200_000));
 
         // Leave no residue for other tests sharing the process-global
         // registry.
+        clear_route_claim_code();
         with_status(|status| *status = ConnectStatus::default());
     }
 }

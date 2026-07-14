@@ -816,6 +816,15 @@ or update local user/client grants through the People & Devices pane,
 drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
 dashboard-control `api_access_iam_update_grant`.
 
+An active grant whose only credential is a browser key is refused when that
+key records a hosted or rendezvous-controlled fleet origin. Renaming the
+principal `human_user` does not change that composition check. A human record
+that also carries a valid browser mTLS certificate remains grantable; its key
+and account fields are metadata beside the certificate authenticator. Older
+IAM files can still contain active hosted/fleet pure-key grants, but the access
+overview projects them as `status: inactive_binding`, `enforced: false`, and
+`authority: none`, and the lifecycle API refuses to activate them.
+
 The grant flow's **Apply to** step fans one grant out across the fleet: the
 page calls each selected daemon's
 `POST /api/access/iam/user-client-grants` directly and reports per-daemon
@@ -854,16 +863,19 @@ app is unaffected: its custom-scheme pages are proxied natively, and the
 `intendant://` scheme is treated as the daemon's own origin.
 
 Device enrollment has implemented queue/state/UI plumbing, but it is staged in
-this alpha: direct `/ws` and dashboard-control offers do not present a browser
-identity-key proof, so ordinary alpha traffic cannot create a usable key-login
-enrollment. `GET /api/access/enrollment-requests` /
+this alpha: the production queue intentionally has no writer, direct `/ws` and
+dashboard-control offers do not present a browser identity-key proof, and
+hosted/fleet traffic is refused before enrollment. The GET response reports
+`status: staged` and `writer_available: false`; ordinary alpha traffic therefore
+cannot create a request or a usable key-login enrollment.
+`GET /api/access/enrollment-requests` /
 `api_access_enrollment_requests` list the queue (`access.inspect`), and
 `POST /api/access/enrollment-requests/decide` / `api_access_enrollment_decide`
 (`access.manage`) approve with a role or deny. Approval reuses the normal
 user-client grant upsert with the queued key's public key and route origin
-attached, so role ceilings and audit apply as usual for fixtures/future
-transports. People & Devices shows any queued records, but remote alpha
-enrollment uses mTLS certificates.
+attached, so the ordinary active-binding validation and audit apply for
+test-seeded/legacy records. People & Devices can render such records, but its
+queue is empty in production and remote alpha enrollment uses mTLS certificates.
 
 The same IAM evaluator now protects the direct dashboard HTTP routes that expose
 Access, target discovery, settings, filesystem reads/writes, sessions,
@@ -1598,8 +1610,8 @@ shell only.
 | POST | `/api/access/org-grants/issuers/init` | AccessManage | own origin | bounded | Initialize an org issuer key |
 | POST | `/api/access/org-grants/issuers/delegate` | AccessManage | own origin | bounded | Delegate to an org issuer |
 | POST | `/api/access/org-grants/issuers/install` | AccessManage | own origin | bounded | Install a delegated org issuer key |
-| POST | `/api/access/enrollment-requests/decide` | AccessManage | fleet allowlist | bounded | Approve or deny a pending enrollment request |
-| GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
+| POST | `/api/access/enrollment-requests/decide` | AccessManage | fleet allowlist | bounded | Staged decision API; the default product has no queue writer |
+| GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Staged enrollment capability and normally empty queue |
 | GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
 | GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
 | GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (discovery-link state and provenance; no claim code) |

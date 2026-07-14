@@ -19,6 +19,7 @@ use super::{AccessError, AccessResult};
 pub const IAM_STATE_FILE: &str = "iam.json";
 pub const BROWSER_MTLS_INITIALIZED_FILE: &str = "browser-mtls-root.initialized";
 pub const IAM_SCHEMA_VERSION: u32 = 2;
+const DEFAULT_HOSTED_ORIGIN: &str = "https://connect.intendant.dev";
 
 fn default_schema_version() -> u32 {
     // A missing version is a legacy state and must run migrations.
@@ -109,7 +110,7 @@ fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
 }
 
 pub fn default_hosted_origins() -> Vec<String> {
-    vec!["https://connect.intendant.dev".to_string()]
+    vec![DEFAULT_HOSTED_ORIGIN.to_string()]
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -233,9 +234,9 @@ pub struct UserClientGrantUpsertRequest {
     /// Optional full public key (base64url raw point) kept for audit/display.
     #[serde(default)]
     pub client_key: Option<String>,
-    /// Origin the key was enrolled from, recorded by the trusted session
-    /// that creates the grant. Role ceilings use this to distinguish
-    /// anchor-origin keys from hosted-origin keys.
+    /// Origin the key was recorded from. Active pure-key grants from hosted
+    /// or fleet origins are refused; an mTLS-backed human may retain the key
+    /// and its origin as non-authoritative metadata.
     #[serde(default)]
     pub client_key_origin: Option<String>,
     /// Intendant session id for `agent_session` principals — binds a grant
@@ -1276,9 +1277,21 @@ pub fn upsert_user_client_grant(
     request: UserClientGrantUpsertRequest,
     actor: &AccessPrincipal,
 ) -> AccessResult<UserClientGrantUpsertResult> {
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    upsert_user_client_grant_with_fleet_zone(state, request, actor, fleet_zone.as_deref())
+}
+
+fn upsert_user_client_grant_with_fleet_zone(
+    state: &mut LocalIamState,
+    request: UserClientGrantUpsertRequest,
+    actor: &AccessPrincipal,
+    fleet_zone: Option<&str>,
+) -> AccessResult<UserClientGrantUpsertResult> {
     // Normalize before refreshing built-ins so a rejected legacy-only kind
     // cannot mutate IAM state at all.
     let kind = normalize_user_client_kind(&request)?;
+    let status = normalize_user_client_status(request.status.as_deref())?;
+    validate_active_pure_client_key_origin(state, &kind, &status, &request, fleet_zone)?;
     for role in builtin_role_templates() {
         if !state.roles.iter().any(|existing| existing.id == role.id) {
             state.roles.push(role);
@@ -1292,7 +1305,6 @@ pub fn upsert_user_client_grant(
         .unwrap_or("role:scoped-human")
         .to_string();
     validate_user_client_role(state, &role_id)?;
-    let status = normalize_user_client_status(request.status.as_deref())?;
     let target_id = request
         .target_id
         .as_deref()
@@ -1461,12 +1473,16 @@ pub fn update_user_client_grant(
     request: IamGrantUpdateRequest,
     actor: &AccessPrincipal,
 ) -> AccessResult<IamGrantUpdateResult> {
-    for role in builtin_role_templates() {
-        if !state.roles.iter().any(|existing| existing.id == role.id) {
-            state.roles.push(role);
-        }
-    }
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    update_user_client_grant_with_fleet_zone(state, request, actor, fleet_zone.as_deref())
+}
 
+fn update_user_client_grant_with_fleet_zone(
+    state: &mut LocalIamState,
+    request: IamGrantUpdateRequest,
+    actor: &AccessPrincipal,
+    fleet_zone: Option<&str>,
+) -> AccessResult<IamGrantUpdateResult> {
     let grant_id = request.grant_id.as_str().trim().to_string();
     if grant_id.is_empty() {
         return Err(AccessError("grant_id is required".to_string()));
@@ -1513,13 +1529,30 @@ pub fn update_user_client_grant(
         .as_deref()
         .and_then(trimmed_nonempty)
         .map(ToOwned::to_owned);
-    if let Some(role_id) = role_id.as_deref() {
-        validate_user_client_role(state, role_id)?;
-    }
     let status = match request.status.as_deref() {
         Some(_) => Some(normalize_user_client_status(request.status.as_deref())?),
         None => None,
     };
+    let effective_status = status
+        .as_deref()
+        .unwrap_or(state.grants[grant_index].status.as_str());
+    if is_enforced_status(effective_status) {
+        if let Some(origin_class) = inactive_pure_client_key_origin_class(
+            state,
+            &state.principals[principal_index],
+            fleet_zone,
+        ) {
+            return Err(inactive_client_key_grant_error(origin_class));
+        }
+    }
+    for role in builtin_role_templates() {
+        if !state.roles.iter().any(|existing| existing.id == role.id) {
+            state.roles.push(role);
+        }
+    }
+    if let Some(role_id) = role_id.as_deref() {
+        validate_user_client_role(state, role_id)?;
+    }
     let reason = request
         .reason
         .as_deref()
@@ -2438,6 +2471,21 @@ pub fn evaluate_principal_operation_with_state(
     principal: &AccessPrincipal,
     op: crate::access::access_policy::PeerOperation,
 ) -> AccessDecision {
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    evaluate_principal_operation_with_state_and_fleet_zone(
+        state,
+        principal,
+        op,
+        fleet_zone.as_deref(),
+    )
+}
+
+fn evaluate_principal_operation_with_state_and_fleet_zone(
+    state: &LocalIamState,
+    principal: &AccessPrincipal,
+    op: crate::access::access_policy::PeerOperation,
+    fleet_zone: Option<&str>,
+) -> AccessDecision {
     // Connect account assertions are service-owned route/display metadata,
     // never a daemon authentication binding. Keep this invariant in the
     // central evaluator as well as the Connect offer resolver so a future
@@ -2456,6 +2504,27 @@ pub fn evaluate_principal_operation_with_state(
             op,
             "hosted Connect transport can never exercise a trusted-root or peer principal",
         );
+    }
+    // A composite human record may retain a browser key as audit/attribution
+    // metadata beside an independently verified mTLS certificate. The
+    // credential used for THIS session is what matters: authenticating with
+    // that browser key must not inherit the certificate's authority merely
+    // because both bindings name the same principal.
+    if principal.authn_kind.as_deref() == Some("client_key") {
+        let origin_class = client_key_origin_route_class(
+            principal.authn_origin.as_deref().unwrap_or_default(),
+            &state.hosted_origins,
+            fleet_zone,
+        );
+        if matches!(origin_class, "hosted" | "fleet") {
+            return AccessDecision::denied(
+                principal,
+                op,
+                format!(
+                    "the default build treats {origin_class}-origin browser keys as discovery-only; current client-key authentication cannot exercise daemon authority"
+                ),
+            );
+        }
     }
     if is_hosted_session(state, principal) {
         return AccessDecision::denied(
@@ -2561,12 +2630,7 @@ pub fn is_hosted_session(state: &LocalIamState, principal: &AccessPrincipal) -> 
         return false;
     }
     let origin = principal.authn_origin.as_deref().unwrap_or("");
-    origin == "connect-bootstrap"
-        || (!origin.is_empty()
-            && state
-                .hosted_origins
-                .iter()
-                .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/')))
+    client_key_origin_route_class(origin, &state.hosted_origins, None) == "hosted"
 }
 
 /// Origin class of a session for the custody trail
@@ -2591,11 +2655,7 @@ pub fn session_origin_class(
         Some("connect_account") => "hosted",
         Some("client_key") => {
             let origin = principal.authn_origin.as_deref().unwrap_or("");
-            let hosted = origin == "connect-bootstrap"
-                || (!origin.is_empty()
-                    && hosted_origins.iter().any(|candidate| {
-                        candidate.trim_end_matches('/') == origin.trim_end_matches('/')
-                    }));
+            let hosted = client_key_origin_route_class(origin, hosted_origins, None) == "hosted";
             if hosted {
                 "hosted"
             } else {
@@ -2616,7 +2676,8 @@ pub fn session_origin_class(
 /// Routing provenance of an enrollment origin — the first-contact rung it
 /// arrived on (docs/src/trust-tiers.md, "First contact"):
 ///
-/// - `hosted`: one of `hosted_origins` — the rendezvous serves the code.
+/// - `hosted`: the compiled Connect origin or one of `hosted_origins` — the
+///   rendezvous serves the code.
 /// - `fleet`: a name under the rendezvous's delegated fleet zone — the
 ///   daemon may serve public discovery code, but the rendezvous names the
 ///   route and can redirect it or mint another certificate. The gateway
@@ -2633,29 +2694,170 @@ pub fn origin_route_class(
     hosted_origins: &[String],
     fleet_zone: Option<&str>,
 ) -> &'static str {
+    origin_route_class_with_provenance_state(
+        origin,
+        hosted_origins,
+        fleet_zone,
+        crate::fleet_cert::fleet_origin_provenance_is_incomplete(),
+    )
+}
+
+fn origin_route_class_with_provenance_state(
+    origin: &str,
+    hosted_origins: &[String],
+    fleet_zone: Option<&str>,
+    fleet_provenance_incomplete: bool,
+) -> &'static str {
     let origin = origin.trim();
     if origin.is_empty() {
         return "unknown";
     }
     if hosted_origins
         .iter()
-        .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'))
+        .map(String::as_str)
+        .chain(std::iter::once(DEFAULT_HOSTED_ORIGIN))
+        .any(|candidate| network_origins_match(candidate, origin))
     {
         return "hosted";
     }
+    let host = url::Url::parse(origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
     if let Some(zone) = fleet_zone.map(str::trim).filter(|zone| !zone.is_empty()) {
         let zone = zone.trim_end_matches('.').to_ascii_lowercase();
-        let host = url::Url::parse(origin)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
-        if let Some(host) = host {
+        if let Some(host) = host.as_deref() {
             let host = host.trim_end_matches('.');
             if host == zone || host.ends_with(&format!(".{zone}")) {
                 return "fleet";
             }
         }
     }
+    // The current zone can be absent (offline startup, Connect disabled) or
+    // replaced. The TLS resolver retains every rendezvous-assigned exact name
+    // from durable fleet-origin provenance; consult that source too so a
+    // formerly service-controlled origin can never decay into `direct`.
+    if crate::web_tls::is_fleet_server_name(host.as_deref()) {
+        return "fleet";
+    }
+    // A malformed provenance file or an installed pre-migration certificate
+    // whose exact DNS SAN could not be recovered means the daemon cannot
+    // prove that an otherwise unknown DNS origin was independently chosen.
+    // Fail closed for browser-key bindings until the local authority store is
+    // repaired. IP literals cannot have been rendezvous-assigned fleet names
+    // and retain their direct classification.
+    if fleet_provenance_incomplete
+        && host
+            .as_deref()
+            .is_some_and(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        return "fleet";
+    }
     "direct"
+}
+
+fn network_origins_match(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> Option<(String, String, Option<u16>)> {
+        let parsed = url::Url::parse(value.trim()).ok()?;
+        let host = parsed
+            .host_str()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        Some((
+            parsed.scheme().to_ascii_lowercase(),
+            host,
+            parsed.port_or_known_default(),
+        ))
+    }
+
+    normalized(left).is_some_and(|left| normalized(right) == Some(left))
+}
+
+/// Classify the provenance stored on a browser-key binding. The retired
+/// `connect-bootstrap` sentinel predates URL origins but is still hosted
+/// provenance and must never escape the same fail-closed rule.
+fn client_key_origin_route_class(
+    origin: &str,
+    hosted_origins: &[String],
+    fleet_zone: Option<&str>,
+) -> &'static str {
+    if origin.trim() == "connect-bootstrap" {
+        "hosted"
+    } else {
+        origin_route_class(origin, hosted_origins, fleet_zone)
+    }
+}
+
+fn inactive_client_key_grant_error(origin_class: &str) -> AccessError {
+    AccessError(format!(
+        "active pure client_key grants from {origin_class} origins are refused; bind the person to an independently verified browser mTLS certificate instead"
+    ))
+}
+
+fn validate_active_pure_client_key_origin(
+    state: &LocalIamState,
+    kind: &str,
+    status: &str,
+    request: &UserClientGrantUpsertRequest,
+    fleet_zone: Option<&str>,
+) -> AccessResult<()> {
+    let has_client_key = request
+        .client_key_fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .is_some();
+    let has_browser_mtls = request
+        .fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(normalize_fingerprint)
+        .is_some_and(|fingerprint| !fingerprint.is_empty());
+    let pure_client_key =
+        kind == "client_key" || (kind == "human_user" && has_client_key && !has_browser_mtls);
+    if !pure_client_key || !is_enforced_status(status) {
+        return Ok(());
+    }
+    let origin_class = client_key_origin_route_class(
+        request.client_key_origin.as_deref().unwrap_or_default(),
+        &state.hosted_origins,
+        fleet_zone,
+    );
+    if matches!(origin_class, "hosted" | "fleet") {
+        return Err(inactive_client_key_grant_error(origin_class));
+    }
+    Ok(())
+}
+
+fn has_valid_browser_mtls_authn(principal: &IamPrincipal) -> bool {
+    principal.authn.iter().any(|authn| {
+        authn.get("kind").and_then(Value::as_str) == Some("browser_mtls_cert")
+            && authn
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .map(normalize_fingerprint)
+                .is_some_and(|fingerprint| !fingerprint.is_empty())
+    })
+}
+
+/// A pure browser-key principal recorded from a service-controlled origin is
+/// historical/staged data, not an authority. A composite `human_user` may
+/// carry the same key as metadata while independently authenticating with a
+/// valid mTLS certificate; only that composite binding is excluded.
+fn inactive_pure_client_key_origin_class(
+    state: &LocalIamState,
+    principal: &IamPrincipal,
+    fleet_zone: Option<&str>,
+) -> Option<&'static str> {
+    if has_valid_browser_mtls_authn(principal) {
+        return None;
+    }
+    principal.authn.iter().find_map(|authn| {
+        if authn.get("kind").and_then(Value::as_str) != Some("client_key") {
+            return None;
+        }
+        let origin = authn.get("origin").and_then(Value::as_str)?;
+        let origin_class = client_key_origin_route_class(origin, &state.hosted_origins, fleet_zone);
+        matches!(origin_class, "hosted" | "fleet").then_some(origin_class)
+    })
 }
 
 /// True when a permission list grants `permission`. The legacy aggregate id
@@ -2722,20 +2924,39 @@ pub fn operation_permission_id(op: crate::access::access_policy::PeerOperation) 
 }
 
 pub fn principal_overview_values(state: &LocalIamState) -> Vec<Value> {
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    principal_overview_values_with_fleet_zone(state, fleet_zone.as_deref())
+}
+
+pub(crate) fn principal_overview_values_with_fleet_zone(
+    state: &LocalIamState,
+    fleet_zone: Option<&str>,
+) -> Vec<Value> {
     state
         .principals
         .iter()
         .map(|principal| {
             let metadata_only = principal.kind == "connect_account";
+            let inactive_origin_class =
+                inactive_pure_client_key_origin_class(state, principal, fleet_zone);
+            let inactive_binding = inactive_origin_class.is_some();
+            let stored_status = if principal.status.is_empty() {
+                "draft"
+            } else {
+                principal.status.as_str()
+            };
             json!({
                 "id": principal.id.clone(),
                 "kind": if principal.kind.is_empty() { "human_user" } else { principal.kind.as_str() },
                 "kind_label": principal_kind_label(&principal.kind),
                 "label": if principal.label.is_empty() { principal.id.as_str() } else { principal.label.as_str() },
                 "source": if principal.source.is_empty() { "local_iam_state" } else { principal.source.as_str() },
-                "status": if metadata_only { "metadata_only" } else if principal.status.is_empty() { "draft" } else { principal.status.as_str() },
+                "status": if metadata_only { "metadata_only" } else if inactive_binding { "inactive_binding" } else { stored_status },
+                "stored_status": stored_status,
                 "metadata_only": metadata_only,
-                "authority": if metadata_only { "none" } else { "local_iam" },
+                "inactive_binding": inactive_binding,
+                "origin_class": inactive_origin_class,
+                "authority": if metadata_only || inactive_binding { "none" } else { "local_iam" },
                 "local": false,
                 "account": principal.account.clone(),
                 "organization": principal.organization.clone(),
@@ -2748,14 +2969,30 @@ pub fn principal_overview_values(state: &LocalIamState) -> Vec<Value> {
 }
 
 pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> Vec<Value> {
+    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    grant_overview_values_with_fleet_zone(state, default_target_id, fleet_zone.as_deref())
+}
+
+pub(crate) fn grant_overview_values_with_fleet_zone(
+    state: &LocalIamState,
+    default_target_id: &str,
+    fleet_zone: Option<&str>,
+) -> Vec<Value> {
     let now = crate::access::client_key::now_unix_ms();
     state
         .grants
         .iter()
         .map(|grant| {
-            let metadata_only = state.principals.iter().any(|principal| {
-                principal.id == grant.principal_id && principal.kind == "connect_account"
+            let principal = state
+                .principals
+                .iter()
+                .find(|principal| principal.id == grant.principal_id);
+            let metadata_only =
+                principal.is_some_and(|principal| principal.kind == "connect_account");
+            let inactive_origin_class = principal.and_then(|principal| {
+                inactive_pure_client_key_origin_class(state, principal, fleet_zone)
             });
+            let inactive_binding = inactive_origin_class.is_some();
             let role_id = if grant.role_id.is_empty() {
                 "role:scoped-human"
             } else {
@@ -2781,21 +3018,29 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
                 "" | "local" => default_target_id,
                 other => other,
             };
+            let projected_role_label = if inactive_binding {
+                format!("Stored {} (inactive binding)", role_label(state, role_id))
+            } else {
+                role_label(state, role_id)
+            };
             json!({
                 "id": grant.id.clone(),
                 "principal_id": grant.principal_id.clone(),
                 "target_id": target_id,
                 "kind": if metadata_only { "connect_account_metadata" } else { "user_client_local_iam" },
-                "kind_label": if metadata_only { "Legacy Connect account metadata (no authority)" } else { "Local IAM user/client grant" },
+                "kind_label": if metadata_only { "Legacy Connect account metadata (no authority)" } else if inactive_binding { "Stored browser-key grant (inactive binding)" } else { "Local IAM user/client grant" },
                 "policy_id": if grant.policy_id.is_empty() { "policy:scoped-human" } else { grant.policy_id.as_str() },
                 "role": role_id,
-                "role_label": role_label(state, role_id),
+                "role_label": projected_role_label,
                 "transport_id": "transport:local-user-client-binding",
                 "source": if grant.source.is_empty() { "local_iam_state" } else { grant.source.as_str() },
-                "status": if metadata_only { "metadata_only" } else { status },
-                "enforced": !metadata_only && grant.is_active_at(now),
+                "status": if metadata_only { "metadata_only" } else if inactive_binding { "inactive_binding" } else { status },
+                "stored_status": status,
+                "enforced": !metadata_only && !inactive_binding && grant.is_active_at(now),
                 "metadata_only": metadata_only,
-                "authority": if metadata_only { "none" } else { "local_iam" },
+                "inactive_binding": inactive_binding,
+                "origin_class": inactive_origin_class,
+                "authority": if metadata_only || inactive_binding { "none" } else { "local_iam" },
                 // The dashboard's grant-row fs chip reads this; a grant
                 // without a scope serializes null so the chip stays off.
                 "fs_scope": grant.fs_scope.as_ref().filter(|scope| !scope.is_empty()),
@@ -3287,6 +3532,46 @@ fn set_private_perms(path: &Path) -> AccessResult<()> {
 mod tests {
     use super::*;
 
+    /// Build the shape an older release could persist before active
+    /// service-controlled browser-key grants became a refused mutation.
+    fn insert_legacy_active_client_key_grant(
+        state: &mut LocalIamState,
+        fingerprint: &str,
+        origin: &str,
+        role_id: &str,
+        fleet_zone: Option<&str>,
+    ) -> UserClientGrantUpsertResult {
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let mut result = upsert_user_client_grant_with_fleet_zone(
+            state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some(fingerprint.to_string()),
+                client_key_origin: Some(origin.to_string()),
+                role_id: Some(role_id.to_string()),
+                status: Some("draft".to_string()),
+                ..Default::default()
+            },
+            &actor,
+            fleet_zone,
+        )
+        .unwrap();
+        let principal = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.id == result.principal.id)
+            .unwrap();
+        principal.status = "active".to_string();
+        result.principal.status = "active".to_string();
+        let grant = state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == result.grant.id)
+            .unwrap();
+        grant.status = "active".to_string();
+        result.grant.status = "active".to_string();
+        result
+    }
+
     fn generate_owner_access_cert(cert_dir: &Path) -> String {
         let names = super::super::certs::ServerNames::new(
             "127.0.0.1".parse().unwrap(),
@@ -3617,17 +3902,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = LocalIamState::default();
         let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
-        let legacy = upsert_user_client_grant(
+        let legacy = insert_legacy_active_client_key_grant(
             &mut state,
-            UserClientGrantUpsertRequest {
-                client_key_fingerprint: Some("legacy-key".to_string()),
-                client_key_origin: Some("connect-bootstrap".to_string()),
-                role_id: Some("role:root".to_string()),
-                ..Default::default()
-            },
-            &actor,
-        )
-        .unwrap();
+            "legacy-key",
+            "connect-bootstrap",
+            "role:root",
+            None,
+        );
         let direct = upsert_user_client_grant(
             &mut state,
             UserClientGrantUpsertRequest {
@@ -4803,17 +5084,13 @@ mod tests {
             &actor,
         )
         .unwrap();
-        upsert_user_client_grant(
+        insert_legacy_active_client_key_grant(
             &mut state,
-            UserClientGrantUpsertRequest {
-                client_key_fingerprint: Some("hosted-key".to_string()),
-                client_key_origin: Some("https://connect.intendant.dev".to_string()),
-                role_id: Some("role:root".to_string()),
-                ..Default::default()
-            },
-            &actor,
-        )
-        .unwrap();
+            "hosted-key",
+            "https://connect.intendant.dev",
+            "role:root",
+            None,
+        );
 
         // Keys born on daemon-served origins keep their explicitly granted
         // direct authority.
@@ -4878,20 +5155,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fleet_key_sessions_are_immutably_denied_by_the_central_evaluator() {
+        let mut state = LocalIamState::default();
+        insert_legacy_active_client_key_grant(
+            &mut state,
+            "legacy-fleet-session-key",
+            "https://d-legacy.fleet.intendant.dev:8765",
+            "role:root",
+            Some("fleet.intendant.dev"),
+        );
+        let fleet = principal_for_client_key(&state, "legacy-fleet-session-key", "direct").unwrap();
+
+        for op in crate::access::access_policy::ALL_OPERATIONS {
+            let denied = evaluate_principal_operation_with_state_and_fleet_zone(
+                &state,
+                &fleet,
+                op,
+                Some("fleet.intendant.dev"),
+            );
+            assert!(!denied.allowed, "fleet-origin key must deny {op:?}");
+            assert!(denied.reason.contains("fleet-origin browser keys"));
+            assert!(denied.reason.contains("discovery-only"));
+        }
+    }
+
+    #[test]
     fn hosted_none_ceiling_ignores_tampered_persisted_roles() {
         let mut state = LocalIamState::default();
-        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
-        upsert_user_client_grant(
+        insert_legacy_active_client_key_grant(
             &mut state,
-            UserClientGrantUpsertRequest {
-                client_key_fingerprint: Some("hosted-key".to_string()),
-                client_key_origin: Some("https://connect.intendant.dev".to_string()),
-                role_id: Some("role:root".to_string()),
-                ..Default::default()
-            },
-            &actor,
-        )
-        .unwrap();
+            "hosted-key",
+            "https://connect.intendant.dev",
+            "role:root",
+            None,
+        );
         state
             .role_ceilings
             .insert("client_key".to_string(), "role:root".to_string());
@@ -4927,6 +5224,23 @@ mod tests {
             "hosted"
         );
         assert_eq!(
+            origin_route_class("https://CONNECT.INTENDANT.DEV:443/some/path", &hosted, zone),
+            "hosted"
+        );
+        assert_eq!(
+            origin_route_class("https://connect.intendant.dev.", &hosted, zone),
+            "hosted"
+        );
+        assert_eq!(
+            origin_route_class("http://connect.intendant.dev", &hosted, zone),
+            "direct"
+        );
+        assert_eq!(
+            origin_route_class("https://connect.intendant.dev", &[], zone),
+            "hosted",
+            "the compiled default must survive an empty/tampered state list"
+        );
+        assert_eq!(
             origin_route_class(
                 "https://d-30a08371a38c1b.fleet.intendant.dev:8765",
                 &hosted,
@@ -4954,6 +5268,341 @@ mod tests {
         );
         assert_eq!(origin_route_class("", &hosted, zone), "unknown");
         assert_eq!(origin_route_class("   ", &hosted, zone), "unknown");
+    }
+
+    #[test]
+    fn incomplete_fleet_provenance_refuses_unknown_dns_but_not_ip_origins() {
+        let hosted = default_hosted_origins();
+        assert_eq!(
+            origin_route_class_with_provenance_state(
+                "https://possibly-former-fleet.example.test:8765",
+                &hosted,
+                None,
+                true,
+            ),
+            "fleet"
+        );
+        assert_eq!(
+            origin_route_class_with_provenance_state(
+                "https://192.168.1.50:8765",
+                &hosted,
+                None,
+                true,
+            ),
+            "direct",
+            "rendezvous fleet names are DNS names, never IP literals"
+        );
+        assert_eq!(
+            origin_route_class_with_provenance_state(
+                "https://connect.intendant.dev",
+                &hosted,
+                None,
+                true,
+            ),
+            "hosted",
+            "the more specific hosted provenance must remain visible"
+        );
+        assert_eq!(
+            origin_route_class_with_provenance_state("", &hosted, None, true),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn remembered_exact_fleet_name_stays_inactive_without_current_zone() {
+        let fleet_name = "remembered-fleet-origin.unit.invalid";
+        let fleet_origin = format!("https://{fleet_name}:8765");
+        crate::web_tls::register_fleet_server_name(fleet_name);
+        assert_eq!(
+            origin_route_class(&fleet_origin, &default_hosted_origins(), None),
+            "fleet",
+            "an exact rendezvous-assigned name must survive a missing current zone"
+        );
+
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let mut active_state = LocalIamState::default();
+        let before = active_state.clone();
+        let error = upsert_user_client_grant_with_fleet_zone(
+            &mut active_state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("remembered-fleet-key".to_string()),
+                client_key_origin: Some(fleet_origin.clone()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fleet origins"));
+        assert_eq!(active_state, before);
+
+        let mut legacy_state = LocalIamState::default();
+        let legacy = insert_legacy_active_client_key_grant(
+            &mut legacy_state,
+            "legacy-remembered-fleet-key",
+            &fleet_origin,
+            "role:operator",
+            None,
+        );
+        let principals = principal_overview_values_with_fleet_zone(&legacy_state, None);
+        let principal = principals
+            .iter()
+            .find(|principal| principal["id"] == legacy.principal.id)
+            .unwrap();
+        assert_eq!(principal["status"], "inactive_binding");
+        assert_eq!(principal["origin_class"], "fleet");
+        assert_eq!(principal["authority"], "none");
+        let grants = grant_overview_values_with_fleet_zone(&legacy_state, "local", None);
+        let grant = grants
+            .iter()
+            .find(|grant| grant["id"] == legacy.grant.id)
+            .unwrap();
+        assert_eq!(grant["status"], "inactive_binding");
+        assert_eq!(grant["enforced"], false);
+    }
+
+    #[test]
+    fn active_service_controlled_pure_client_key_grants_are_refused() {
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+
+        let mut hosted_state = LocalIamState::default();
+        let before = hosted_state.clone();
+        let error = upsert_user_client_grant(
+            &mut hosted_state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("hosted-key".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("hosted origins"));
+        assert_eq!(hosted_state, before, "a refused upsert must not mutate IAM");
+
+        let mut fleet_state = LocalIamState::default();
+        let before = fleet_state.clone();
+        let error = upsert_user_client_grant_with_fleet_zone(
+            &mut fleet_state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("fleet-key".to_string()),
+                client_key_origin: Some("https://d-123.fleet.intendant.dev:8765".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+            Some("fleet.intendant.dev"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fleet origins"));
+        assert_eq!(fleet_state, before, "a refused upsert must not mutate IAM");
+
+        // Renaming a pure key record to human_user cannot bypass the guard.
+        let mut keyed_human_state = LocalIamState::default();
+        let error = upsert_user_client_grant(
+            &mut keyed_human_state,
+            UserClientGrantUpsertRequest {
+                kind: "human_user".to_string(),
+                handle: Some("alice".to_string()),
+                client_key_fingerprint: Some("hosted-human-key".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("active pure client_key"));
+
+        // A staged record may be retained, but the lifecycle API cannot
+        // turn it active later.
+        let draft = upsert_user_client_grant(
+            &mut hosted_state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("hosted-draft".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                status: Some("draft".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let before = hosted_state.clone();
+        let error = update_user_client_grant(
+            &mut hosted_state,
+            IamGrantUpdateRequest {
+                grant_id: draft.grant.id,
+                status: Some("active".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("hosted origins"));
+        assert_eq!(
+            hosted_state, before,
+            "a refused activation must not mutate IAM"
+        );
+    }
+
+    #[test]
+    fn mtls_human_may_keep_service_controlled_key_metadata() {
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let mut state = LocalIamState::default();
+        let result = upsert_user_client_grant_with_fleet_zone(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "human_user".to_string(),
+                label: Some("Alice".to_string()),
+                handle: Some("alice".to_string()),
+                fingerprint: Some("AB:CD".to_string()),
+                client_key_fingerprint: Some("fleet-metadata-key".to_string()),
+                client_key_origin: Some("https://d-123.fleet.intendant.dev:8765".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+            Some("fleet.intendant.dev"),
+        )
+        .unwrap();
+        assert!(result
+            .principal
+            .authn
+            .iter()
+            .any(|authn| authn["kind"] == "browser_mtls_cert"));
+        assert!(result
+            .principal
+            .authn
+            .iter()
+            .any(|authn| authn["kind"] == "client_key"));
+
+        let principals =
+            principal_overview_values_with_fleet_zone(&state, Some("fleet.intendant.dev"));
+        assert_eq!(principals[0]["status"], "active");
+        assert_eq!(principals[0]["inactive_binding"], false);
+        assert_eq!(principals[0]["authority"], "local_iam");
+        let grants =
+            grant_overview_values_with_fleet_zone(&state, "local", Some("fleet.intendant.dev"));
+        assert_eq!(grants[0]["status"], "active");
+        assert_eq!(grants[0]["enforced"], true);
+        assert_eq!(grants[0]["authority"], "local_iam");
+
+        // The binding is active because mTLS can authenticate it. The same
+        // principal reached through its fleet-origin browser key remains
+        // inert: merely carrying both bindings must not let the ambient key
+        // borrow the certificate's authority.
+        let via_client_key =
+            principal_for_client_key(&state, "fleet-metadata-key", "direct").unwrap();
+        let key_decision = evaluate_principal_operation_with_state_and_fleet_zone(
+            &state,
+            &via_client_key,
+            crate::access::access_policy::PeerOperation::AccessInspect,
+            Some("fleet.intendant.dev"),
+        );
+        assert!(!key_decision.allowed);
+        assert!(key_decision.reason.contains("fleet-origin browser keys"));
+
+        let via_mtls = principal_for_browser_mtls_cert(&state, "abcd", "direct").unwrap();
+        assert_eq!(via_mtls.authn_kind.as_deref(), Some("browser_mtls_cert"));
+        assert!(
+            evaluate_principal_operation_with_state_and_fleet_zone(
+                &state,
+                &via_mtls,
+                crate::access::access_policy::PeerOperation::AccessInspect,
+                Some("fleet.intendant.dev"),
+            )
+            .allowed,
+            "the independently verified mTLS session keeps the composite human's grant"
+        );
+    }
+
+    #[test]
+    fn legacy_service_controlled_key_grants_project_as_inactive() {
+        let mut state = LocalIamState::default();
+        let hosted = insert_legacy_active_client_key_grant(
+            &mut state,
+            "legacy-hosted",
+            "https://connect.intendant.dev",
+            "role:root",
+            Some("fleet.intendant.dev"),
+        );
+        let fleet = insert_legacy_active_client_key_grant(
+            &mut state,
+            "legacy-fleet",
+            "https://d-legacy.fleet.intendant.dev:8765",
+            "role:operator",
+            Some("fleet.intendant.dev"),
+        );
+
+        // A legacy/tampered record may contain several key entries. A direct
+        // key listed first must not hide a later hosted key from either the
+        // mutation guard or the overview projection.
+        state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.id == hosted.principal.id)
+            .unwrap()
+            .authn
+            .insert(
+                0,
+                client_key_authn_entry(
+                    "legacy-direct-first",
+                    None,
+                    Some("https://anchor.local:8765"),
+                ),
+            );
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let before = state.clone();
+        let error = update_user_client_grant_with_fleet_zone(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: hosted.grant.id.clone(),
+                reason: Some("attempt to preserve active legacy record".to_string()),
+                ..Default::default()
+            },
+            &actor,
+            Some("fleet.intendant.dev"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("hosted origins"));
+        assert_eq!(state, before);
+
+        let principals =
+            principal_overview_values_with_fleet_zone(&state, Some("fleet.intendant.dev"));
+        for (principal_id, origin_class) in [
+            (hosted.principal.id.as_str(), "hosted"),
+            (fleet.principal.id.as_str(), "fleet"),
+        ] {
+            let principal = principals
+                .iter()
+                .find(|principal| principal["id"] == principal_id)
+                .unwrap();
+            assert_eq!(principal["status"], "inactive_binding");
+            assert_eq!(principal["stored_status"], "active");
+            assert_eq!(principal["inactive_binding"], true);
+            assert_eq!(principal["origin_class"], origin_class);
+            assert_eq!(principal["authority"], "none");
+        }
+
+        let grants =
+            grant_overview_values_with_fleet_zone(&state, "local", Some("fleet.intendant.dev"));
+        for (grant_id, origin_class) in [
+            (hosted.grant.id.as_str(), "hosted"),
+            (fleet.grant.id.as_str(), "fleet"),
+        ] {
+            let grant = grants.iter().find(|grant| grant["id"] == grant_id).unwrap();
+            assert_eq!(grant["status"], "inactive_binding");
+            assert_eq!(grant["stored_status"], "active");
+            assert_eq!(grant["enforced"], false);
+            assert_eq!(grant["inactive_binding"], true);
+            assert_eq!(grant["origin_class"], origin_class);
+            assert_eq!(grant["authority"], "none");
+            assert!(grant["role_label"]
+                .as_str()
+                .unwrap()
+                .contains("inactive binding"));
+        }
     }
 
     #[test]
@@ -4986,17 +5635,13 @@ mod tests {
     fn hosted_control_is_immutable_none_and_direct_sessions_are_untouched() {
         let mut state = LocalIamState::default();
         let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
-        upsert_user_client_grant(
+        insert_legacy_active_client_key_grant(
             &mut state,
-            UserClientGrantUpsertRequest {
-                client_key_fingerprint: Some("hosted-key".to_string()),
-                client_key_origin: Some("https://connect.intendant.dev".to_string()),
-                role_id: Some("role:root".to_string()),
-                ..Default::default()
-            },
-            &actor,
-        )
-        .unwrap();
+            "hosted-key",
+            "https://connect.intendant.dev",
+            "role:root",
+            None,
+        );
         upsert_user_client_grant(
             &mut state,
             UserClientGrantUpsertRequest {

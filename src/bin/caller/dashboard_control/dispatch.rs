@@ -2192,11 +2192,13 @@ async fn forward_dashboard_display_input(
     let Some(session_registry) = session_registry else {
         return;
     };
-    let display_session = {
-        let registry = session_registry.read().await;
-        registry.get(display_id)
-    };
-    if let Some(display_session) = display_session {
+    // Retain the registry read guard through the final synchronous enqueue.
+    // Removal/replacement closes the old queue under the write guard, so each
+    // raw frame is linearized wholly before or wholly after that lifecycle
+    // boundary. `get_any` is intentional: this is an owner dashboard lane and
+    // private user views remain controllable by their owner.
+    let registry = session_registry.read().await;
+    if let Some(display_session) = registry.get_any(display_id) {
         // The registry reads above yield. Re-check after them so a live IAM,
         // peer-identity, or holder change cannot race the final enqueue.
         if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
@@ -2237,6 +2239,7 @@ async fn forward_dashboard_display_input(
             source.enqueue(input_event);
         }
     }
+    drop(registry);
 }
 
 /// Revalidate a frame that already passed the operation gate in
@@ -2673,6 +2676,70 @@ mod tests {
                 .unwrap(),
             Some("ku"),
             "overload cancellation must synthesize a release for held input"
+        );
+        display.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dashboard_input_reaches_private_user_view() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let display = Arc::new(crate::display::DisplaySession::new(
+            17,
+            Arc::new(ForwarderResetBackend {
+                injected: injected_tx,
+            }),
+        ));
+        display.set_agent_visible(false);
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(17, Arc::clone(&display));
+
+        let (change_tx, _change_rx) = tokio::sync::broadcast::channel(1);
+        let subscribe_tx = change_tx.clone();
+        let bridge = DashboardDisplayAuthorityBridge::new(
+            |_session_id, _display_ids| Vec::new(),
+            |_session_id, _display_id| None,
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| true,
+            |_display_id| Arc::new(AtomicU64::new(0)),
+            |_session_id| {},
+            move || subscribe_tx.subscribe(),
+        );
+        let mut rt = runtime();
+        rt.display_authority = Some(bridge);
+        rt.shared_session.write().await.session_registry = Some(registry);
+        let rt = Arc::new(rt);
+        let shutdown = CancellationToken::new();
+        let sources = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut input_sources = HashMap::new();
+
+        forward_dashboard_display_input(
+            serde_json::json!({
+                "display_id": 17,
+                "event": {
+                    "t": "kd",
+                    "code": "KeyA",
+                    "key": "a",
+                    "shift": false,
+                    "ctrl": false,
+                    "alt": false,
+                    "meta": false
+                }
+            }),
+            &rt,
+            &shutdown,
+            &sources,
+            &mut input_sources,
+        )
+        .await;
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .expect("private display input must reach the backend"),
+            Some("kd")
         );
         display.stop().await;
     }

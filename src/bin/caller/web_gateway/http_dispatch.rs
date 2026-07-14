@@ -10,6 +10,10 @@ use super::*;
 /// Everything plain-HTTP serving shares with the rest of the gateway,
 /// cloned once per connection at the call site.
 pub(crate) struct HttpRequestCtx {
+    /// Gateway-scoped access/IAM store resolved once at the transport edge.
+    /// Tests inject a temp store so request authentication never consults the
+    /// runner's real account.
+    pub(crate) access_cert_dir: PathBuf,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -75,6 +79,7 @@ pub(crate) async fn serve_http_request(
     peer_connection_identity: Option<PeerConnectionIdentity>,
 ) {
     let HttpRequestCtx {
+        access_cert_dir,
         bus,
         config_json,
         session_provider,
@@ -105,6 +110,7 @@ pub(crate) async fn serve_http_request(
         runtime_settings,
         file_watcher,
     } = ctx;
+    let cert_dir = access_cert_dir;
     // Re-derived rather than passed: the original borrowed header_text.
     let request_line = header_text.lines().next().unwrap_or("");
     // Plain HTTP: consume the peeked request bytes, then send response.
@@ -211,7 +217,6 @@ pub(crate) async fn serve_http_request(
             }
         } else if fleet_scoped {
             let methods = table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
-            let cert_dir = crate::access::backend::select_backend().cert_dir();
             let allowed = extract_origin_header(header_text).filter(|origin| {
                 fleet_access_origin_allowed(
                     origin,
@@ -265,7 +270,6 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path);
 
     // A public fleet/WebPKI name is convenient discovery, but it is not an
@@ -1197,11 +1201,9 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::DashboardTargets => {
-                // Transport edge resolves the ambient cert dir (hermeticity
-                // convention) — the handler takes the tier as a parameter.
-                let local_tier = crate::web_gateway::local_daemon_tier(
-                    &crate::access::backend::select_backend().cert_dir(),
-                );
+                // The transport edge resolves the gateway-scoped cert dir;
+                // the handler takes the derived tier as a parameter.
+                let local_tier = crate::web_gateway::local_daemon_tier(&cert_dir);
                 return handle_dashboard_targets(
                     stream,
                     peer_registry,

@@ -27266,7 +27266,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'cb846c78996d85f1';
+const INTENDANT_APP_BUILD = '812372c71a467900';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -56213,8 +56213,9 @@ async function refreshAccessOverviewFromApi(options = {}) {
   }
 }
 
-/* Pending browser-key enrollment requests (devices knocking on this daemon).
-   Pull-based like the overview; renderers read the cached list. */
+/* Reserved browser-key enrollment queue. The daemon reports this capability
+   as staged with writer_available:false in the default product; the polling
+   path remains so future/fixture records render without inventing a writer. */
 let accessPendingEnrollments = [];
 
 async function refreshAccessEnrollments(options = {}) {
@@ -56251,7 +56252,9 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
     const resp = await daemonApi.request('api_access_enrollment_decide', payload);
     const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
+    showControlToast?.('success', approve
+      ? 'Enrollment record approved; browser-key sign-in remains inactive'
+      : 'Enrollment record denied');
   } catch (err) {
     showControlToast?.('error', err?.message || 'Enrollment decision failed');
   }
@@ -57856,6 +57859,10 @@ function accessGrantsBy(overview, key) {
 function accessGrantWhy(grant) {
   const kind = accessModelLabel(grant.kind);
   const source = accessModelLabel(grant.source);
+  if (grant.inactive_binding === true) {
+    const originClass = accessModelLabel(grant.origin_class, 'service-controlled');
+    return `This is a stored ${originClass}-origin browser-key record, not live authority. It authenticates no alpha request; re-enroll the person with an independently verified browser mTLS certificate.`;
+  }
   if (kind === 'connect_account_metadata') {
     return 'Legacy discovery metadata only. It authenticates no request, carries no daemon authority, and is read-only.';
   }
@@ -57901,7 +57908,10 @@ function accessAuditGrantCards() {
   return accessOverviewArray(overview, 'grants').map(grant => {
     const grantId = accessModelLabel(grant.id);
     const status = accessModelLabel(grant.status, 'active');
+    const storedStatus = accessModelLabel(grant.stored_status, status);
     const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
+    const canActivate = grant.inactive_binding !== true
+      && accessModelLabel(grant.authority, 'local_iam') !== 'none';
     const lifecycleBusy = accessGrantLifecycleSubmitting.has(grantId);
     // daemonApi availability (transport F4): tunnel status boolean when
     // connected, HTTP-twin reachability otherwise — honest in Connect
@@ -57909,7 +57919,7 @@ function accessAuditGrantCards() {
     const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
     const actions = [];
     if (localIamGrant && grantId) {
-      if (status !== 'active') {
+      if (storedStatus !== 'active' && canActivate) {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Activate',
           primary: true,
@@ -57917,14 +57927,14 @@ function accessAuditGrantCards() {
           onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'active' }),
         });
       }
-      if (status !== 'draft') {
+      if (storedStatus !== 'draft') {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Draft',
           disabled: lifecycleBusy || !canManage,
           onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'draft' }),
         });
       }
-      if (status !== 'revoked') {
+      if (storedStatus !== 'revoked') {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Revoke',
           danger: true,
@@ -60318,8 +60328,8 @@ function renderAccessConnectCard() {
   mount.appendChild(card);
 }
 
-/* People & Devices: devices knocking on this daemon, awaiting a decision.
-   Empty (and invisible) when nothing is pending. */
+/* People & Devices: staged/fixture enrollment records awaiting a decision.
+   The production queue has no writer and is normally empty/invisible. */
 function renderAccessEnrollmentRequests() {
   const mount = document.getElementById('access-enrollment-requests');
   if (!mount) return;
@@ -60334,7 +60344,7 @@ function renderAccessEnrollmentRequests() {
   title.textContent = 'Pending devices';
   const sub = document.createElement('div');
   sub.className = 'acc-section-sub';
-  sub.textContent = 'Browser identity records seen by this daemon. In this alpha, approving a key record does not create an active authentication path; remote access requires mTLS.';
+  sub.textContent = 'Staged browser identity records. The default product has no queue writer, and approving a fixture/legacy record does not create an active authentication path; remote access requires mTLS.';
   head.append(title, sub);
   mount.appendChild(head);
 
@@ -60489,6 +60499,7 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
   row.className = 'acc-grant-row';
   const grantId = accessModelLabel(grant.id);
   const status = accessModelLabel(grant.status, 'active');
+  const storedStatus = accessModelLabel(grant.stored_status, status);
   const roleId = accessModelLabel(grant.role_id || grant.role);
   row.appendChild(accessRoleBadge(roleId.startsWith('role:') ? roleId : `role:${roleId}`, accessModelLabel(grant.role_label || grant.profile || grant.role, 'Role')));
   const target = document.createElement('span');
@@ -60502,6 +60513,13 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     chip.className = 'acc-chip route-connect';
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
     chip.title = `Compatibility metadata marks this principal's ${capped.binding.replace(/_/g, ' ')} binding as ${capped.ceiling}. The default binary admits no hosted/browser-key control session, regardless of this grant.`;
+    row.appendChild(chip);
+  }
+  if (grant.inactive_binding === true) {
+    const chip = document.createElement('span');
+    chip.className = 'acc-chip route-connect';
+    chip.textContent = 'inactive binding';
+    chip.title = `This stored ${accessModelLabel(grant.origin_class, 'service-controlled')}-origin browser key authenticates no request and carries no authority. Re-enroll through independently verified direct mTLS.`;
     row.appendChild(chip);
   }
   const fsScope = grant.fs_scope;
@@ -60531,6 +60549,8 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
   const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
   if (localIamGrant && grantId) {
     const busy = accessGrantLifecycleSubmitting.has(grantId);
+    const canActivate = grant.inactive_binding !== true
+      && accessModelLabel(grant.authority, 'local_iam') !== 'none';
     const actions = document.createElement('div');
     actions.className = 'acc-grant-row-actions';
     const mkBtn = (label, opts, onClick) => {
@@ -60542,9 +60562,9 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
       btn.addEventListener('click', onClick);
       return btn;
     };
-    if (status !== 'active') actions.appendChild(mkBtn('Activate', { primary: true }, () => accessUpdateGrantLifecycle(grantId, { status: 'active' })));
-    if (status !== 'draft') actions.appendChild(mkBtn('Draft', {}, () => accessUpdateGrantLifecycle(grantId, { status: 'draft' })));
-    if (status !== 'revoked') actions.appendChild(mkBtn('Revoke', { danger: true }, () => accessConfirmRevokeGrant(grantId)));
+    if (storedStatus !== 'active' && canActivate) actions.appendChild(mkBtn('Activate', { primary: true }, () => accessUpdateGrantLifecycle(grantId, { status: 'active' })));
+    if (storedStatus !== 'draft') actions.appendChild(mkBtn('Draft', {}, () => accessUpdateGrantLifecycle(grantId, { status: 'draft' })));
+    if (storedStatus !== 'revoked') actions.appendChild(mkBtn('Revoke', { danger: true }, () => accessConfirmRevokeGrant(grantId)));
     row.appendChild(actions);
   }
   const why = document.createElement('div');

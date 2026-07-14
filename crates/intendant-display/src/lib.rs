@@ -3573,6 +3573,22 @@ impl DisplaySession {
         self.peers.read().await.get(&peer_id).cloned()
     }
 
+    /// Register a minimal test peer through the same replacement and gauge
+    /// semantics as a successful offer. This gives caller-bin cleanup tests a
+    /// real session peer to remove without constructing an SDP transport.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn register_test_peer_for_cleanup(&self, peer_id: PeerId) {
+        let peer = Arc::new(self::webrtc::WebRtcPeer::new_for_test(peer_id, Vec::new()));
+        let replaced = self.peers.write().await.insert(peer_id, Arc::clone(&peer));
+        match replaced {
+            Some(old) => old.close().await,
+            None => {
+                self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.spawn_peer_reaper(peer_id, &peer);
+    }
+
     /// Inject an input event into the display backend, awaiting its
     /// completion.
     ///
@@ -3623,6 +3639,31 @@ impl DisplaySession {
     /// A event from resurrecting after an A -> B -> A holder sequence.
     pub fn reset_browser_input(&self, reason: &str) {
         self.input_queue.reset(reason);
+    }
+
+    /// Authority-observer variant that atomically advances the queue's
+    /// admitted authority revision while resetting. If input from this or a
+    /// newer revision already won the queue mutex, the reset is skipped so a
+    /// delayed observer cannot discard the new holder's backlog.
+    pub fn reset_browser_input_before_authority_revision(
+        &self,
+        authority_revision: u64,
+        reason: &str,
+    ) -> bool {
+        self.input_queue
+            .reset_before_authority_revision(authority_revision, reason)
+    }
+
+    /// Begin teardown synchronously. Registry lifecycle mutations call this
+    /// while holding their write guard, before an old session is removed or
+    /// replaced. Cancellation invalidates every WebRTC interactive predicate
+    /// (input-authority and clipboard included), while closing the ordered
+    /// queue rejects already-open raw/data-channel input immediately. The
+    /// async [`Self::stop`] method remains responsible for joining tasks and
+    /// closing peers/backend resources.
+    fn begin_stop(&self) {
+        self.shutdown.cancel();
+        self.input_queue.close();
     }
 
     /// Spawn the input pump exactly once. Sync (used from the sync
@@ -3738,6 +3779,14 @@ impl SessionRegistry {
     }
 
     pub fn insert(&mut self, display_id: u32, session: Arc<DisplaySession>) {
+        // Close a replaced session before advancing authority. WebRTC input
+        // sources retain their own Arc and do not consult this registry, so
+        // the queue itself is the synchronous lifecycle boundary.
+        if let Some(existing) = self.sessions.get(&display_id) {
+            if !Arc::ptr_eq(existing, &session) {
+                existing.begin_stop();
+            }
+        }
         // Invalidate authority before publishing the new session. This is the
         // security boundary for remove/recreate and replacement under the same
         // stable display ID; an asynchronous DisplayReady observer is too late.
@@ -3753,6 +3802,13 @@ impl SessionRegistry {
     }
 
     pub fn remove(&mut self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        // Stop browser input before revoking authority: an unclaimed display
+        // is permissive, so a retained WebRTC source could otherwise observe
+        // the new revision and enqueue between the revision bump and the
+        // caller's asynchronous `DisplaySession::stop`.
+        if let Some(existing) = self.sessions.get(&display_id) {
+            existing.begin_stop();
+        }
         // Revoke authority before the old session disappears. Notify even for
         // an absent ID so a stale holder cannot survive a duplicate teardown.
         self.notify_lifecycle_change(display_id);
@@ -3764,6 +3820,9 @@ impl SessionRegistry {
     /// lost; callers own stopping the returned sessions outside the lock.
     pub fn drain(&mut self) -> Vec<Arc<DisplaySession>> {
         let display_ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for session in self.sessions.values() {
+            session.begin_stop();
+        }
         for display_id in display_ids {
             self.notify_lifecycle_change(display_id);
         }
@@ -4006,6 +4065,31 @@ mod tests {
         counters.peer_count.store(0, Ordering::Relaxed);
         assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
         assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_peer_cleanup_registration_matches_real_peer_gauge_semantics() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        session.register_test_peer_for_cleanup(7).await;
+        assert!(session.get_peer(7).await.is_some());
+        assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 1);
+
+        session.register_test_peer_for_cleanup(7).await;
+        assert_eq!(
+            session.counters.peer_count.load(Ordering::Relaxed),
+            1,
+            "replacing a peer must not inflate the gauge"
+        );
+
+        session.remove_peer(7).await;
+        assert!(session.get_peer(7).await.is_none());
+        assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -4615,6 +4699,46 @@ mod tests {
         drain_calls.sort_unstable();
         assert_eq!(drain_calls, vec![8, 9]);
         assert!(registry.all_display_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_registry_closes_detached_browser_input_synchronously() {
+        let mut registry = SessionRegistry::new();
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+
+        let removed = Arc::new(DisplaySession::new(41, Arc::clone(&backend) as _));
+        let removed_source =
+            removed.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        registry.insert(41, Arc::clone(&removed));
+        assert!(!removed.input_queue.is_closed());
+        assert!(registry.remove(41).is_some());
+        assert!(removed.input_queue.is_closed());
+        assert!(removed.shutdown.is_cancelled());
+        removed_source.enqueue(InputEvent::KeyDown {
+            code: "KeyA".to_string(),
+            key: "a".to_string(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        });
+        assert_eq!(removed.input_queue.len(), 0);
+
+        let replaced = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
+        registry.insert(42, Arc::clone(&replaced));
+        let replacement = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
+        registry.insert(42, replacement);
+        assert!(replaced.input_queue.is_closed());
+        assert!(replaced.shutdown.is_cancelled());
+
+        let drained = Arc::new(DisplaySession::new(43, backend as _));
+        registry.insert(43, Arc::clone(&drained));
+        registry.drain();
+        assert!(drained.input_queue.is_closed());
+        assert!(drained.shutdown.is_cancelled());
     }
 
     #[test]

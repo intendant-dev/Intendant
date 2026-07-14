@@ -1349,8 +1349,8 @@ function renderAccessConnectCard() {
   mount.appendChild(card);
 }
 
-/* People & Devices: devices knocking on this daemon, awaiting a decision.
-   Empty (and invisible) when nothing is pending. */
+/* People & Devices: staged/fixture enrollment records awaiting a decision.
+   The production queue has no writer and is normally empty/invisible. */
 function renderAccessEnrollmentRequests() {
   const mount = document.getElementById('access-enrollment-requests');
   if (!mount) return;
@@ -1365,7 +1365,7 @@ function renderAccessEnrollmentRequests() {
   title.textContent = 'Pending devices';
   const sub = document.createElement('div');
   sub.className = 'acc-section-sub';
-  sub.textContent = 'Browser identity records seen by this daemon. In this alpha, approving a key record does not create an active authentication path; remote access requires mTLS.';
+  sub.textContent = 'Staged browser identity records. The default product has no queue writer, and approving a fixture/legacy record does not create an active authentication path; remote access requires mTLS.';
   head.append(title, sub);
   mount.appendChild(head);
 
@@ -1520,6 +1520,7 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
   row.className = 'acc-grant-row';
   const grantId = accessModelLabel(grant.id);
   const status = accessModelLabel(grant.status, 'active');
+  const storedStatus = accessModelLabel(grant.stored_status, status);
   const roleId = accessModelLabel(grant.role_id || grant.role);
   row.appendChild(accessRoleBadge(roleId.startsWith('role:') ? roleId : `role:${roleId}`, accessModelLabel(grant.role_label || grant.profile || grant.role, 'Role')));
   const target = document.createElement('span');
@@ -1533,6 +1534,13 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     chip.className = 'acc-chip route-connect';
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
     chip.title = `Compatibility metadata marks this principal's ${capped.binding.replace(/_/g, ' ')} binding as ${capped.ceiling}. The default binary admits no hosted/browser-key control session, regardless of this grant.`;
+    row.appendChild(chip);
+  }
+  if (grant.inactive_binding === true) {
+    const chip = document.createElement('span');
+    chip.className = 'acc-chip route-connect';
+    chip.textContent = 'inactive binding';
+    chip.title = `This stored ${accessModelLabel(grant.origin_class, 'service-controlled')}-origin browser key authenticates no request and carries no authority. Re-enroll through independently verified direct mTLS.`;
     row.appendChild(chip);
   }
   const fsScope = grant.fs_scope;
@@ -1562,6 +1570,8 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
   const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
   if (localIamGrant && grantId) {
     const busy = accessGrantLifecycleSubmitting.has(grantId);
+    const canActivate = grant.inactive_binding !== true
+      && accessModelLabel(grant.authority, 'local_iam') !== 'none';
     const actions = document.createElement('div');
     actions.className = 'acc-grant-row-actions';
     const mkBtn = (label, opts, onClick) => {
@@ -1573,9 +1583,9 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
       btn.addEventListener('click', onClick);
       return btn;
     };
-    if (status !== 'active') actions.appendChild(mkBtn('Activate', { primary: true }, () => accessUpdateGrantLifecycle(grantId, { status: 'active' })));
-    if (status !== 'draft') actions.appendChild(mkBtn('Draft', {}, () => accessUpdateGrantLifecycle(grantId, { status: 'draft' })));
-    if (status !== 'revoked') actions.appendChild(mkBtn('Revoke', { danger: true }, () => accessConfirmRevokeGrant(grantId)));
+    if (storedStatus !== 'active' && canActivate) actions.appendChild(mkBtn('Activate', { primary: true }, () => accessUpdateGrantLifecycle(grantId, { status: 'active' })));
+    if (storedStatus !== 'draft') actions.appendChild(mkBtn('Draft', {}, () => accessUpdateGrantLifecycle(grantId, { status: 'draft' })));
+    if (storedStatus !== 'revoked') actions.appendChild(mkBtn('Revoke', { danger: true }, () => accessConfirmRevokeGrant(grantId)));
     row.appendChild(actions);
   }
   const why = document.createElement('div');

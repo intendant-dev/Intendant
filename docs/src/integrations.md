@@ -207,14 +207,14 @@ registered per-repo, and the default `GITHUB_TOKEN` is read-only.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | every PR + merge group; no push trigger | **Required.** Cross-platform test/check matrix for Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`). A merge group runs the unit suite plus the 20 headless mock-provider e2e cases on all three platforms; a PR runs that full battery on Linux and `cargo check` on the other two. The Linux leg then reuses its checkout and build tree for the keyless `session-vitals`, `native-goal`, and `peer-sessions` smokes plus the headless dashboard-boot probe. All legs build with `CARGO_PROFILE_DEV_DEBUG=0` |
+| `windows.yml` | every PR + merge group; no push trigger | **Required.** Cross-platform test/check matrix for Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`). A merge group runs the unit suite plus the headless mock-provider e2e suite on all three platforms; a PR runs that full battery on Linux and `cargo check` on the other two. The Linux leg then reuses its checkout and build tree for the keyless `session-vitals`, `native-goal`, and `peer-sessions` smokes plus the headless dashboard-boot probe. All legs build with `CARGO_PROFILE_DEV_DEBUG=0` |
 | `app-html.yml` | every PR + merge group; push to `main` (fragment/assembler paths) | **Required.** Reruns the assembler and fails when the committed `static/app.html` doesn't match the fragments |
 | `agents-md-sync.yml` | every PR + merge group; push touching `CLAUDE.md`/`AGENTS.md`; manual dispatch | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
 | `wasm-drift.yml` | every PR + merge group; in-job relevance skip | **Required.** On the canonical macOS host, rebuilds both browser WASM crates with the pinned Rust/wasm-pack versions and byte-compares the committed artifacts |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |
 | `docs.yml` | docs changes on `main` | Build and deploy this mdBook to GitHub Pages |
 
-`tests/e2e/main.rs` currently contains 20 hermetic `#[tokio::test]` cases. They
+`tests/e2e/main.rs` contains hermetic `#[tokio::test]` cases. They
 spawn the real binaries against the scripted mock provider, use the synthetic
 1280×720 display rather than native capture, need no API key or network, and
 run in CI on all three supported operating systems. The `tests/skills/`

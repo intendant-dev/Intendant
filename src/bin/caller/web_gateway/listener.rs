@@ -62,6 +62,75 @@ pub(crate) fn log_tls_failure_rate_limited(
     }
 }
 
+/// Apply a dashboard-control authority request only while its display is
+/// present in the live registry. The active-session and registry read guards
+/// stay held through the synchronous authority mutation, so a concurrent
+/// session replacement or display removal cannot clear the display and then
+/// lose a race to a stale grant. `try_read` keeps this synchronous bridge
+/// non-blocking; contention rejects the request closed and the user can retry.
+fn apply_dashboard_grant_for_existing_display(
+    shared_session: &SharedActiveSession,
+    display_id: u32,
+    session_id: &str,
+    authority: &Arc<DisplayInputAuthority>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let Ok(session) = shared_session.try_read() else {
+        return false;
+    };
+    let Some(session_registry) = session.session_registry.as_ref() else {
+        return false;
+    };
+    let Ok(registry) = session_registry.try_read() else {
+        return false;
+    };
+    if registry.get_any(display_id).is_none() {
+        return false;
+    }
+    apply_grant_input_authority_dashboard_control(
+        display_id,
+        session_id.to_string(),
+        authority,
+        authority_change_tx,
+    );
+    true
+}
+
+#[cfg(test)]
+mod authority_grant_validation_tests {
+    use super::*;
+
+    #[test]
+    fn nonexistent_dashboard_authority_requests_do_not_grow_global_maps() {
+        let session_registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let shared_session = ActiveSessionState::empty();
+        shared_session
+            .try_write()
+            .expect("fresh active session is uncontended")
+            .session_registry = Some(session_registry);
+        let authority = Arc::new(DisplayInputAuthority::default());
+        let (change_tx, mut change_rx) = broadcast::channel(8);
+
+        for display_id in 1..=2_048 {
+            assert!(!apply_dashboard_grant_for_existing_display(
+                &shared_session,
+                display_id,
+                "dashboard-session",
+                &authority,
+                &change_tx,
+            ));
+        }
+
+        assert_eq!(authority.tracked_entry_counts(), (0, 0));
+        assert!(
+            change_rx.try_recv().is_err(),
+            "rejected requests must not publish authority changes"
+        );
+    }
+}
+
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
 // below parses compact Codex token lines without materializing full JSON values.
 // Exact fork baselines come from scanning the parent's log (results
@@ -74,8 +143,74 @@ pub(crate) use intendant_core::net::{
     rebind_dead_tcp_listener, should_continue_after_accept_error, FATAL_ACCEPT_REBIND_THRESHOLD,
 };
 
+#[cfg(not(test))]
+fn default_access_cert_dir() -> std::path::PathBuf {
+    crate::access::backend::select_backend().cert_dir()
+}
+
+/// Unit-test callers historically reached the production wrapper and thereby
+/// read the runner's live access store. Keep those transport tests isolated by
+/// giving every gateway its own process-lifetime temp store. Tests that need a
+/// populated store use `spawn_web_gateway_from_cert_dir` explicitly.
+#[cfg(test)]
+fn default_access_cert_dir() -> std::path::PathBuf {
+    static TEST_STORES: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::TempDir>>> =
+        std::sync::OnceLock::new();
+    let store = tempfile::tempdir().expect("create isolated gateway access store");
+    let path = store.path().to_path_buf();
+    TEST_STORES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(store);
+    path
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn spawn_web_gateway(
+    listener: TcpListener,
+    bus: EventBus,
+    broadcast_tx: broadcast::Sender<String>,
+    config: WebGatewayConfig,
+    shared_session: SharedActiveSession,
+    transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
+    task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
+    project_root: Option<std::path::PathBuf>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+    advertise_urls: Vec<String>,
+    inbound_bearer_token: Option<String>,
+    local_card_auth: crate::peer::AuthRequirements,
+    tls_client_cert_required: bool,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_web_gateway_from_cert_dir(
+        listener,
+        bus,
+        broadcast_tx,
+        config,
+        shared_session,
+        transcriber,
+        task_tx,
+        project_root,
+        mcp_server,
+        peer_registry,
+        advertise_urls,
+        inbound_bearer_token,
+        local_card_auth,
+        tls_client_cert_required,
+        tls_acceptor,
+        default_access_cert_dir(),
+    )
+}
+
+/// Spawn a gateway against an explicit access-certificate store.
+///
+/// Production resolves the installed platform store in [`spawn_web_gateway`].
+/// Keeping the path explicit below that transport edge makes request IAM and
+/// peer-identity resolution testable without reading the runner's real home.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_web_gateway_from_cert_dir(
     listener: TcpListener,
     bus: EventBus,
     broadcast_tx: broadcast::Sender<String>,
@@ -129,6 +264,7 @@ pub fn spawn_web_gateway(
     // `0x16` handshake-record first byte, which is disjoint from both the
     // STUN length-prefix and HTTP method bytes.
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    access_cert_dir: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
@@ -351,7 +487,10 @@ pub fn spawn_web_gateway(
                                 if let Some(session) =
                                     session_registry.read().await.get_any(change.display_id)
                                 {
-                                    session.reset_browser_input("display input authority changed");
+                                    session.reset_browser_input_before_authority_revision(
+                                        change.revision,
+                                        "display input authority changed",
+                                    );
                                 }
                             }
                         }
@@ -371,11 +510,19 @@ pub fn spawn_web_gateway(
                                 registry
                                     .all_display_ids()
                                     .into_iter()
-                                    .filter_map(|display_id| registry.get_any(display_id))
+                                    .filter_map(|display_id| {
+                                        registry
+                                            .get_any(display_id)
+                                            .map(|session| (display_id, session))
+                                    })
                                     .collect::<Vec<_>>()
                             };
-                            for session in sessions {
-                                session.reset_browser_input(
+                            for (display_id, session) in sessions {
+                                let revision = observer_authority
+                                    .revision(display_id)
+                                    .load(Ordering::SeqCst);
+                                session.reset_browser_input_before_authority_revision(
+                                    revision,
                                     "display input authority updates were lost",
                                 );
                             }
@@ -391,6 +538,7 @@ pub fn spawn_web_gateway(
         let state_authority = Arc::clone(&display_input_authority);
         let request_authority = Arc::clone(&display_input_authority);
         let request_change_tx = authority_change_tx.clone();
+        let request_shared_session = shared_session.clone();
         let release_authority = Arc::clone(&display_input_authority);
         let release_change_tx = authority_change_tx.clone();
         let input_authority = Arc::clone(&display_input_authority);
@@ -414,12 +562,15 @@ pub fn spawn_web_gateway(
                 ))
             },
             move |session_id, display_id| {
-                apply_grant_input_authority_dashboard_control(
+                if !apply_dashboard_grant_for_existing_display(
+                    &request_shared_session,
                     display_id,
-                    session_id.to_string(),
+                    session_id,
                     &request_authority,
                     &request_change_tx,
-                );
+                ) {
+                    return Vec::new();
+                }
                 vec![dashboard_control_authority_state_frame(
                     session_id,
                     display_id,
@@ -574,7 +725,7 @@ pub fn spawn_web_gateway(
     crate::display_requests::mark_approver_surface_available();
     // Fleet certificates: restore any stored certificate into the live
     // SNI resolver and keep it renewed (fleet_cert.rs).
-    crate::fleet_cert::refresh_installed_state();
+    crate::fleet_cert::refresh_installed_state_in(&access_cert_dir);
     crate::fleet_cert::spawn_renewal_loop();
     // Hosted-bundle code transparency: when Connect is enabled,
     // periodically verify what the rendezvous serves against its public
@@ -895,6 +1046,7 @@ pub fn spawn_web_gateway(
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
+            let access_cert_dir = access_cert_dir.clone();
             let tls_client_cert_required = tls_client_cert_required;
             let source_hint = peer_addr.ip().to_string();
             let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
@@ -1182,31 +1334,33 @@ pub fn spawn_web_gateway(
                     served += 1;
                     let n = head_segment.len();
                     let header_text = String::from_utf8_lossy(&head_segment).to_string();
-                    let peer_connection_identity = match resolve_peer_connection_identity(
-                        &header_text,
-                        tls_client_cert_fingerprint.as_deref(),
-                    ) {
-                        Ok(identity) => identity,
-                        Err((status, body)) => {
-                            use tokio::io::AsyncWriteExt;
-                            let reason = match status {
-                                401 => "Unauthorized",
-                                403 => "Forbidden",
-                                _ => "Error",
-                            };
-                            let response = HttpResponse::with_content(
-                                format!("{} {}", status, reason),
-                                "application/json",
-                                body,
-                            )
-                            .header("Cache-Control", "no-cache")
-                            .header("Connection", "close")
-                            .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
-                            finalize_http_stream(&mut stream).await;
-                            return;
-                        }
-                    };
+                    let peer_connection_identity =
+                        match resolve_peer_connection_identity_from_cert_dir(
+                            &access_cert_dir,
+                            &header_text,
+                            tls_client_cert_fingerprint.as_deref(),
+                        ) {
+                            Ok(identity) => identity,
+                            Err((status, body)) => {
+                                use tokio::io::AsyncWriteExt;
+                                let reason = match status {
+                                    401 => "Unauthorized",
+                                    403 => "Forbidden",
+                                    _ => "Error",
+                                };
+                                let response = HttpResponse::with_content(
+                                    format!("{} {}", status, reason),
+                                    "application/json",
+                                    body,
+                                )
+                                .header("Cache-Control", "no-cache")
+                                .header("Connection", "close")
+                                .into_string();
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        };
                     let is_websocket = header_text
                         .lines()
                         .any(|l| l.to_lowercase().contains("upgrade: websocket"));
@@ -1249,6 +1403,7 @@ pub fn spawn_web_gateway(
                             && segment_is_single_request(&head_segment),
                     );
                     let http_ctx = HttpRequestCtx {
+                        access_cert_dir: access_cert_dir.clone(),
                         bus: bus.clone(),
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
@@ -1426,9 +1581,8 @@ pub fn spawn_web_gateway(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
-                    let cert_dir = crate::access::backend::select_backend().cert_dir();
                     let dashboard_control_grant_for_ws = match dashboard_control_grant_for_client(
-                        &cert_dir,
+                        &access_cert_dir,
                         peer_connection_identity.as_ref(),
                         tls_client_cert_fingerprint.as_deref(),
                         tls_client_cert_present,

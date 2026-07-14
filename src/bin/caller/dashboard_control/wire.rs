@@ -349,6 +349,7 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     // separate WebRTC and may reap a beat later; it must not retain input or
     // clipboard authority during that window.
     shutdown.cancel();
+    remove_dashboard_display_peers(&runtime).await;
     for (_, token) in pending_requests {
         token.cancel();
     }

@@ -1508,6 +1508,7 @@ impl DashboardControlPeer {
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant,
             shutdown: shutdown.clone(),
             tabs,
@@ -1595,6 +1596,12 @@ pub(crate) struct ControlRuntime {
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
+    /// Display sessions on which this control transport has attempted to
+    /// register `display_peer_id`. A display's media WebRTC transport is
+    /// separate from this control peer, so the control driver must retain the
+    /// sessions long enough to close that media peer on disconnect or IAM
+    /// revocation. The vector is pointer-deduplicated when offers arrive.
+    display_peer_sessions: Arc<Mutex<Vec<Arc<crate::display::DisplaySession>>>>,
     grant: DashboardControlGrant,
     /// Lifetime of the authenticated control transport. Interactive display
     /// channels created through it retain this token so queued input and
@@ -3002,6 +3009,7 @@ mod tests {
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: 1,
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant: DashboardControlGrant::TrustedLocal,
             shutdown: CancellationToken::new(),
             tabs: crate::web_gateway::DashboardTabsRegistry::new(

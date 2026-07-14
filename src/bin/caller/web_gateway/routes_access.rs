@@ -2421,6 +2421,11 @@ pub(crate) fn access_enrollment_requests_response_value(
             .collect();
     serde_json::json!({
         "schema_version": 1,
+        // Capability truth for clients: this queue is deliberately unwired
+        // in the default product. Tests can seed it through the cfg(test)
+        // fixture writer, but ordinary daemon traffic cannot add requests.
+        "status": "staged",
+        "writer_available": false,
         "requests": requests,
     })
 }
@@ -2429,10 +2434,10 @@ pub(crate) fn access_enrollment_requests_response_body(cert_dir: &std::path::Pat
     access_enrollment_requests_response_value(cert_dir).to_string()
 }
 
-/// Approve or deny a pending browser-key enrollment. Approval reuses the
-/// ordinary user-client grant upsert with the queued key's public key and
-/// route origin attached, so ceilings and audit behave exactly as if the
-/// owner had typed the grant by hand.
+/// Staged decision half of browser-key enrollment. The default product has no
+/// queue writer, so this is reachable only for test-seeded/legacy in-memory
+/// entries. Approval reuses the ordinary user-client grant upsert; its active
+/// hosted/fleet-key guard remains authoritative.
 pub(crate) fn access_enrollment_decide_response_value(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
@@ -2777,18 +2782,6 @@ pub(crate) fn peer_client_header_present(header_text: &str) -> bool {
         name.eq_ignore_ascii_case(crate::peer::transport::intendant::PEER_CLIENT_HEADER)
             && value.trim() == crate::peer::transport::intendant::PEER_CLIENT_HEADER_VALUE
     })
-}
-
-pub(crate) fn resolve_peer_connection_identity(
-    header_text: &str,
-    tls_client_cert_fingerprint: Option<&str>,
-) -> Result<Option<PeerConnectionIdentity>, (u16, String)> {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    resolve_peer_connection_identity_from_cert_dir(
-        &cert_dir,
-        header_text,
-        tls_client_cert_fingerprint,
-    )
 }
 
 pub(crate) fn resolve_peer_connection_identity_from_cert_dir(
@@ -4119,6 +4112,10 @@ mod tests {
             crate::gateway_routes::CorsPosture::FleetAllowlist,
         );
         let body = access_enrollment_requests_response_body(&cert_dir);
+        let capability: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(capability["status"], "staged");
+        assert_eq!(capability["writer_available"], false);
+        assert!(capability["requests"].is_array());
         for origin in [None, Some(GOLDEN_FLEET_ORIGIN)] {
             let dir = cert_dir.clone();
             let response = collect_access_handler_response(|stream| {

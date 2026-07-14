@@ -1,14 +1,13 @@
-//! Pending browser-key enrollment requests.
+//! Staged browser-key enrollment registry.
 //!
-//! Phase 3 of the trust architecture (docs/src/trust-architecture.md):
-//! when a *verified* browser identity key reaches this daemon but has no
-//! local grant, the refusal also records a pending enrollment. The owner
-//! approves or denies it from Access → People & Devices in an
-//! already-trusted session; approval writes an ordinary IAM grant through
-//! the normal upsert path. The queue is advisory and in-memory: it grants
-//! nothing by itself, loses nothing important on restart (the requesting
-//! browser retries on its next offer), and is capped and TTL'd so an
-//! unauthenticated route cannot grow daemon state unboundedly.
+//! This preserves the bounded queue and decision vocabulary planned for a
+//! future trusted enrollment transport. The default product intentionally
+//! has no production writer: hosted/fleet traffic is discovery-only and the
+//! shipped direct dashboard transports do not submit browser-key proofs.
+//! `record_refused_client_key` is therefore test-only, while the read/decide
+//! APIs remain inert compatibility scaffolding (an empty queue in production).
+//! A future writer must arrive with its own trust review; merely making this
+//! function callable would not make browser keys an authentication path.
 
 use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
@@ -25,9 +24,7 @@ pub struct PendingClientKeyEnrollment {
     pub fingerprint: String,
     /// base64url raw public key, kept so approval can store it for audit.
     pub public_key_b64u: String,
-    /// The hosted origin the route implies (recorded onto the grant so role
-    /// ceilings treat the key as hosted-provenance until re-enrolled from an
-    /// anchor origin). Empty when unknown.
+    /// First-contact origin the staged route implies. Empty when unknown.
     pub origin: String,
     /// Transport the refused offer arrived on.
     pub transport: String,
@@ -53,8 +50,9 @@ fn prune_locked(pending: &mut Vec<PendingClientKeyEnrollment>, now_unix_ms: i64)
     pending.retain(|entry| now_unix_ms - entry.last_seen_unix_ms <= PENDING_TTL_MS);
 }
 
-/// Record a refused-but-verified key. Repeated attempts collapse into one
-/// entry with a bumped counter; overflow evicts the stalest entry.
+/// Test fixture writer for a refused-but-verified key. Production code has no
+/// caller by design. Repeated attempts collapse into one entry with a bumped
+/// counter; overflow evicts the stalest entry.
 #[cfg(test)]
 pub fn record_refused_client_key(
     fingerprint: &str,

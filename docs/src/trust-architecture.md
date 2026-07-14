@@ -557,6 +557,19 @@ The pieces that implement the model, mapped to the codebase:
   session. Any future hosted-control
   offering would have to be a deliberately separate binary/product and is not
   part of this release.
+  The local IAM write boundary also refuses an active pure browser-key grant
+  whose recorded origin is hosted, under the currently learned fleet zone, or
+  an exact fleet name the daemon learned previously. Fleet-name provenance is
+  retained in `fleet-origin-provenance.json` beside the access certificates so
+  offline or Connect-disabled startup cannot reclassify an old service-named
+  route as a direct anchor. On upgrade, an older `fleet-cert.pem` backfills its
+  exact DNS SANs before the gateway accepts requests. If that provenance is
+  malformed or cannot be recovered completely, unknown DNS browser-key origins
+  fail closed as fleet provenance until the local authority store is repaired.
+  A `human_user` label is not a bypass. A valid
+  independently verified browser mTLS binding may carry that key as metadata.
+  Legacy records are displayed as inactive bindings with `enforced: false` and
+  `authority: none`, and cannot be reactivated through the grant lifecycle API.
   Upgrading only Connect cannot tear down a legacy P2P session that is already
   established; complete the migration by restarting upgraded daemons, closing
   old Connect tabs, and allowing IAM schema v2 to revoke legacy
@@ -572,12 +585,15 @@ The pieces that implement the model, mapped to the codebase:
   `--owner` from old service commands (the parser now rejects it), restart the
   upgraded daemon, close old Connect tabs, and run `intendant access setup`
   locally to establish the generated owner mTLS credential.
-- **Device enrollment (staged UI/state)**: the daemon has a bounded pending
-  enrollment queue and ordinary key-grant upsert machinery, but the alpha
-  shipped local/direct-mTLS transports do not present browser-key authentication, so this
-  is not a usable sign-in path. Connect events are dropped before key parsing
-  and never create an enrollment request. Remote alpha enrollment uses mTLS
-  certificate setup instead; a claim never substitutes for trusted approval.
+- **Device enrollment (staged UI/state)**: the daemon retains a bounded pending
+  enrollment queue and decision/upsert scaffolding, but the default product has
+  no production writer for that queue. The alpha local/direct-mTLS transports do
+  not present browser-key authentication, and Connect/fleet events are refused
+  before enrollment, so the GET capability reports `status: staged`,
+  `writer_available: false`, and an empty queue during ordinary operation. Test
+  fixtures can still exercise the decision plumbing. Remote alpha enrollment
+  uses mTLS certificate setup instead; a claim never substitutes for trusted
+  approval.
 - **Encrypted fleet sync**: the private fields of a synced fleet record
   (daemon URLs) are sealed with an AES-GCM key derived from the account
   passkey via the WebAuthn PRF extension — bytes the browser evaluates

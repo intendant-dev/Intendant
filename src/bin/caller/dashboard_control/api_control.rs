@@ -284,6 +284,21 @@ pub(crate) async fn api_display_webrtc_offer_response(
     let Some(display_session) = active_display_session(runtime, display_id).await else {
         return display_signal_error_response(id, 404, display_id, "display session not found");
     };
+    let Some(display_authority) = runtime.display_authority.as_ref() else {
+        return display_signal_error_response(
+            id,
+            503,
+            display_id,
+            "display input authority unavailable",
+        );
+    };
+
+    // The media WebRTC peer outlives this RPC and is distinct from the
+    // dashboard-control peer. Register the owning session before awaiting the
+    // offer so teardown can close the media peer even when revocation races
+    // offer construction. The post-offer authority check below covers the
+    // inverse race, where teardown drains this list before the peer is inserted.
+    track_dashboard_display_session(runtime, Arc::clone(&display_session)).await;
 
     let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
     if let Some(control_frames_tx) = runtime.control_frames_tx.clone() {
@@ -319,32 +334,63 @@ pub(crate) async fn api_display_webrtc_offer_response(
             ice_tx,
             crate::display::BrowserInputAuthorization::versioned(
                 input_authorized,
-                runtime
-                    .display_authority
-                    .as_ref()
-                    .expect("display offer requires authority bridge")
-                    .input_revision(display_id),
+                display_authority.input_revision(display_id),
             ),
             authority_handler,
         )
         .await
     {
-        Ok(answer_sdp) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": true,
-            "result": {
-                "t": "display_answer",
-                "display_id": display_id,
-                "sdp": answer_sdp,
-            },
-        }),
+        Ok(answer_sdp) => {
+            if runtime.shutdown.is_cancelled() || !runtime.grant.opening_authority_is_current() {
+                display_session.remove_peer(runtime.display_peer_id).await;
+                display_signal_error_response(
+                    id,
+                    403,
+                    display_id,
+                    "dashboard control authority expired during display offer",
+                )
+            } else {
+                serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": {
+                        "t": "display_answer",
+                        "display_id": display_id,
+                        "sdp": answer_sdp,
+                    },
+                })
+            }
+        }
         Err(e) => display_signal_error_response(
             id,
             502,
             display_id,
             &format!("display offer failed: {e}"),
         ),
+    }
+}
+
+pub(crate) async fn track_dashboard_display_session(
+    runtime: &ControlRuntime,
+    display_session: Arc<crate::display::DisplaySession>,
+) {
+    let mut sessions = runtime.display_peer_sessions.lock().await;
+    if !sessions
+        .iter()
+        .any(|tracked| Arc::ptr_eq(tracked, &display_session))
+    {
+        sessions.push(display_session);
+    }
+}
+
+pub(crate) async fn remove_dashboard_display_peers(runtime: &ControlRuntime) {
+    let sessions = {
+        let mut sessions = runtime.display_peer_sessions.lock().await;
+        std::mem::take(&mut *sessions)
+    };
+    for display_session in sessions {
+        display_session.remove_peer(runtime.display_peer_id).await;
     }
 }
 
@@ -392,7 +438,9 @@ pub(crate) async fn active_display_session(
         session.session_registry.clone()
     }?;
     let registry = session_registry.read().await;
-    registry.get(display_id)
+    // Dashboard media includes private user views; agent-facing callers use
+    // the registry's filtered `get` path instead.
+    registry.get_any(display_id)
 }
 
 pub(crate) fn dashboard_display_interactive_authorizer(
@@ -467,6 +515,19 @@ pub(crate) async fn api_display_input_authority_request_response(
     };
     let display_id = display_id_param(params);
     let frames = bridge.request(&runtime.session_id, display_id);
+    if frames.is_empty() {
+        // A valid grant always emits the resulting authority-state frame.
+        // The bridge uses an empty result to fail closed when the display no
+        // longer exists (or the registry is contended); preserve that refusal
+        // at the RPC boundary instead of reporting a grant the daemon did not
+        // install and leaving the browser to time out.
+        return display_signal_error_response(
+            id,
+            404,
+            display_id,
+            "display input authority request was rejected",
+        );
+    }
     let frame_count = frames.len();
     serde_json::json!({
         "t": "response",
@@ -575,7 +636,7 @@ pub(crate) async fn display_ready_bootstrap_frames(
     display_ids
         .into_iter()
         .filter_map(|display_id| {
-            registry.get(display_id).map(|session| {
+            registry.get_any(display_id).map(|session| {
                 let (width, height) = session.resolution();
                 serde_json::json!({
                     "event": "display_ready",
@@ -598,7 +659,7 @@ pub(crate) async fn active_display_ids(runtime: &ControlRuntime) -> Vec<u32> {
     };
 
     let registry = session_registry.read().await;
-    let mut display_ids = registry.display_ids();
+    let mut display_ids = registry.all_display_ids();
     display_ids.sort_unstable();
     display_ids
 }
@@ -3804,6 +3865,124 @@ mod tests {
         assert_eq!(response["status"], 404);
         assert_eq!(response["display_id"], 99);
         assert_eq!(response["error"], "display session not found");
+    }
+
+    #[tokio::test]
+    async fn display_offer_without_authority_bridge_returns_error_instead_of_panicking() {
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(
+            7,
+            Arc::new(crate::display::DisplaySession::new(
+                7,
+                Arc::new(DashboardControlStubDisplayBackend),
+            )),
+        );
+        rt.shared_session.write().await.session_registry = Some(registry);
+
+        let response = api_display_webrtc_offer_response(
+            "sig-no-authority".to_string(),
+            &serde_json::json!({
+                "display_id": 7,
+                "sdp": "browser-controlled-offer",
+            }),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 503);
+        assert_eq!(response["display_id"], 7);
+        assert_eq!(response["error"], "display input authority unavailable");
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_display_helpers_include_private_user_views() {
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let private_session = Arc::new(crate::display::DisplaySession::new(
+            12,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private_session.set_agent_visible(false);
+        registry
+            .write()
+            .await
+            .insert(12, Arc::clone(&private_session));
+        rt.shared_session.write().await.session_registry = Some(registry);
+
+        let resolved = active_display_session(&rt, 12)
+            .await
+            .expect("owner dashboard must resolve its private user view");
+        assert!(Arc::ptr_eq(&resolved, &private_session));
+        assert_eq!(active_display_ids(&rt).await, vec![12]);
+        let ready = display_ready_bootstrap_frames(&rt).await;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["display_id"], 12);
+    }
+
+    #[tokio::test]
+    async fn display_authority_request_reports_bridge_rejection() {
+        let mut rt = runtime();
+        let (authority_change_tx, _) = tokio::sync::broadcast::channel(1);
+        rt.display_authority = Some(DashboardDisplayAuthorityBridge::new(
+            |_, _| Vec::new(),
+            |_, _| None,
+            |_, _| Vec::new(),
+            |_, _| Vec::new(),
+            |_, _| false,
+            |_| Arc::new(AtomicU64::new(0)),
+            |_| {},
+            move || authority_change_tx.subscribe(),
+        ));
+
+        let response = api_display_input_authority_request_response(
+            "authority-missing-display".to_string(),
+            Some(&serde_json::json!({ "display_id": 99 })),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["id"], "authority-missing-display");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 404);
+        assert_eq!(response["display_id"], 99);
+        assert_eq!(
+            response["error"],
+            "display input authority request was rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_teardown_closes_every_tracked_display_media_peer() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            11,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        display_session
+            .register_test_peer_for_cleanup(rt.display_peer_id)
+            .await;
+        assert_eq!(display_session.metrics().await.peer_count, 1);
+
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        assert_eq!(
+            rt.display_peer_sessions.lock().await.len(),
+            1,
+            "repeated offers on one display session must not grow teardown state"
+        );
+
+        rt.shutdown.cancel();
+        remove_dashboard_display_peers(&rt).await;
+        assert_eq!(display_session.metrics().await.peer_count, 0);
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
     }
 
     #[tokio::test]

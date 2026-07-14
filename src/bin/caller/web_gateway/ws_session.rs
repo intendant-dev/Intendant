@@ -6,6 +6,8 @@
 use super::*;
 use tokio_util::sync::CancellationToken;
 
+type LocalDisplayInputAuthorizer = Arc<dyn Fn() -> bool + Send + Sync>;
+
 fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: &str) -> bool {
     !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
 }
@@ -34,6 +36,64 @@ fn bind_input_authorizer_to_ws_session(
             && grant.opening_authority_is_current()
             && holder_authorized()
     })
+}
+
+fn frame_display_id(json: &serde_json::Value) -> Option<u32> {
+    json.get("display_id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// Return a resolved display together with its cached input guard, but only
+/// after the display exists and the live guard authorizes this connection.
+/// Keeping the insertion behind both checks makes client-chosen nonexistent
+/// IDs and denied valid IDs allocation-free in the per-connection cache.
+fn authorized_display_with_cached_input_authorizer<T>(
+    display: Option<T>,
+    display_id: u32,
+    authorizers: &mut HashMap<u32, LocalDisplayInputAuthorizer>,
+    build: impl FnOnce() -> LocalDisplayInputAuthorizer,
+) -> Option<(T, LocalDisplayInputAuthorizer)> {
+    let display = display?;
+    if let Some(authorizer) = authorizers.get(&display_id) {
+        let authorizer = Arc::clone(authorizer);
+        return authorizer().then_some((display, authorizer));
+    }
+    let authorizer = build();
+    if !authorizer() {
+        return None;
+    }
+    authorizers.insert(display_id, Arc::clone(&authorizer));
+    Some((display, authorizer))
+}
+
+/// Grant local-WS input authority only while the target display exists. The
+/// registry read guard remains held through the synchronous grant so removal's
+/// lifecycle invalidator cannot run first and then be followed by a stale
+/// grant for the disappeared ID.
+async fn apply_local_grant_for_existing_display(
+    session_registry: Option<&crate::display::SharedSessionRegistry>,
+    display_id: u32,
+    connection_id: &str,
+    direct_tx: &mpsc::UnboundedSender<String>,
+    authority: &Arc<DisplayInputAuthority>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let Some(session_registry) = session_registry else {
+        return false;
+    };
+    let registry = session_registry.read().await;
+    if registry.get_any(display_id).is_none() {
+        return false;
+    }
+    apply_grant_input_authority(
+        display_id,
+        connection_id.to_string(),
+        direct_tx.clone(),
+        authority,
+        authority_change_tx,
+    );
+    true
 }
 
 /// Cache-backed resync lines for a `/ws` connection that lagged the
@@ -411,7 +471,9 @@ pub(crate) async fn ws_inbound_task(
 
     // Display IDs this peer has WebRTC connections to,
     // used for cleanup when the WebSocket disconnects.
-    let mut peer_display_ids: Vec<u32> = Vec::new();
+    // One teardown target per display. Repeated successful renegotiations on
+    // the same valid display must not grow connection-owned state forever.
+    let mut peer_display_ids: HashSet<u32> = HashSet::new();
     let mut dashboard_control_session_ids: Vec<String> = Vec::new();
 
     // Frame types already denied+logged once on this
@@ -421,7 +483,7 @@ pub(crate) async fn ws_inbound_task(
     // One composite guard per display, shared by WebRTC and raw `/ws` input.
     // Pointer-rate frames clone this Arc instead of allocating two trait
     // objects and capturing the grant/authority map for every event.
-    let mut local_display_input_authorizers: HashMap<u32, Arc<dyn Fn() -> bool + Send + Sync>> =
+    let mut local_display_input_authorizers: HashMap<u32, LocalDisplayInputAuthorizer> =
         HashMap::new();
     let mut local_display_input_sources: HashMap<
         u32,
@@ -1349,8 +1411,13 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("display_offer") => {
                         // WebRTC SDP offer from browser for a display session
-                        let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
-                        let sdp = json["sdp"].as_str().unwrap_or("").to_string();
+                        let Some(display_id) = frame_display_id(&json) else {
+                            continue;
+                        };
+                        let Some(sdp) = json.get("sdp").and_then(|value| value.as_str()) else {
+                            continue;
+                        };
+                        let sdp = sdp.to_string();
 
                         // Clone the Arc<DisplaySession> out of the read
                         // lock before calling handle_offer. Holding the
@@ -1393,21 +1460,21 @@ pub(crate) async fn ws_inbound_task(
                             // map, or connection IDs.  See
                             // [`build_local_ws_input_authorizer`] for the
                             // closure semantics + tests.
-                            let input_authorized = Arc::clone(
-                                local_display_input_authorizers
-                                    .entry(display_id)
-                                    .or_insert_with(|| {
-                                        bind_input_authorizer_to_ws_session(
-                                            build_local_ws_input_authorizer(
-                                                display_id,
-                                                connection_id_inbound.clone(),
-                                                Arc::clone(&display_input_authority_inbound),
-                                            ),
-                                            Arc::clone(&dashboard_control_grant_live),
-                                            session_cancel.clone(),
-                                        )
-                                    }),
-                            );
+                            let cached_input_authorizer =
+                                local_display_input_authorizers.get(&display_id).cloned();
+                            let cache_input_authorizer_after_offer =
+                                cached_input_authorizer.is_none();
+                            let input_authorized = cached_input_authorizer.unwrap_or_else(|| {
+                                bind_input_authorizer_to_ws_session(
+                                    build_local_ws_input_authorizer(
+                                        display_id,
+                                        connection_id_inbound.clone(),
+                                        Arc::clone(&display_input_authority_inbound),
+                                    ),
+                                    Arc::clone(&dashboard_control_grant_live),
+                                    session_cancel.clone(),
+                                )
+                            });
                             // F-1.3b2 transport plumbing: local DisplaySlot's
                             // browser doesn't create the
                             // `display_input_authority` data channel
@@ -1428,7 +1495,7 @@ pub(crate) async fn ws_inbound_task(
                                     tcp_advertised_addr,
                                     ice_tx,
                                     crate::display::BrowserInputAuthorization::versioned(
-                                        input_authorized,
+                                        Arc::clone(&input_authorized),
                                         display_input_authority_inbound.revision(display_id),
                                     ),
                                     authority_handler,
@@ -1436,7 +1503,12 @@ pub(crate) async fn ws_inbound_task(
                                 .await
                             {
                                 Ok(answer_sdp) => {
-                                    peer_display_ids.push(display_id);
+                                    if cache_input_authorizer_after_offer {
+                                        local_display_input_authorizers
+                                            .entry(display_id)
+                                            .or_insert(input_authorized);
+                                    }
+                                    peer_display_ids.insert(display_id);
                                     let answer = serde_json::json!({
                                         "t": "display_answer",
                                         "display_id": display_id,
@@ -1811,7 +1883,32 @@ pub(crate) async fn ws_inbound_task(
                         // order); the enqueue is sync and non-blocking, so
                         // this read loop never stalls on slow injection and
                         // the registry read lock is released immediately.
-                        let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                        let Some(display_id) = frame_display_id(&json) else {
+                            continue;
+                        };
+                        let Some(event) = json.get("event").cloned() else {
+                            continue;
+                        };
+                        let Ok(input_event) =
+                            serde_json::from_value::<crate::display::InputEvent>(event)
+                        else {
+                            continue;
+                        };
+
+                        // Resolve the client-chosen ID before constructing or
+                        // caching any guard. `get_any`: dashboard input drives
+                        // private user views too (that's the remote-control
+                        // point of "View this machine").
+                        let Some(session_registry) = session_registry_inbound.as_ref() else {
+                            continue;
+                        };
+                        // Keep the guard through the final sync enqueue. A
+                        // lifecycle writer closes the old input queue before
+                        // removing it, so the raw frame lands entirely before
+                        // or after removal rather than retaining a detached
+                        // Arc across the boundary.
+                        let registry = session_registry.read().await;
+                        let session = registry.get_any(display_id);
 
                         // Phase 5 authority gate: if someone has claimed
                         // input authority for this display, only that
@@ -1820,10 +1917,12 @@ pub(crate) async fn ws_inbound_task(
                         // every connection can input. See the
                         // `DisplayInputHolder` doc for the full
                         // contract.
-                        let input_authorized = Arc::clone(
-                            local_display_input_authorizers
-                                .entry(display_id)
-                                .or_insert_with(|| {
+                        let Some((session, input_authorized)) =
+                            authorized_display_with_cached_input_authorizer(
+                                session,
+                                display_id,
+                                &mut local_display_input_authorizers,
+                                || {
                                     bind_input_authorizer_to_ws_session(
                                         build_local_ws_input_authorizer(
                                             display_id,
@@ -1833,61 +1932,42 @@ pub(crate) async fn ws_inbound_task(
                                         Arc::clone(&dashboard_control_grant_live),
                                         session_cancel.clone(),
                                     )
-                                }),
-                        );
-                        if !input_authorized() {
+                                },
+                            )
+                        else {
                             // Silent drop — matches the "force_disconnect_voice"
                             // convention where demoted connections don't get
                             // per-message denial feedback; the browser already
                             // knows it's passive from the authority_revoked
                             // notification it received when it was demoted.
                             continue;
-                        }
+                        };
 
-                        if let Some(evt) = json.get("event") {
-                            if let Ok(input_event) =
-                                serde_json::from_value::<crate::display::InputEvent>(evt.clone())
-                            {
-                                // `get_any`: dashboard input drives private
-                                // user views too (that's the remote-control
-                                // point of "View this machine").
-                                let session: Option<Arc<crate::display::DisplaySession>> =
-                                    match session_registry_inbound.as_ref() {
-                                        Some(sr) => sr.read().await.get_any(display_id),
-                                        None => None,
-                                    };
-                                if let Some(session) = session {
-                                    let replace = local_display_input_sources
-                                        .get(&display_id)
-                                        .and_then(|(known, _)| known.upgrade())
-                                        .is_none_or(|known| !Arc::ptr_eq(&known, &session));
-                                    if replace {
-                                        local_display_input_sources.insert(
-                                            display_id,
-                                            (
-                                                Arc::downgrade(&session),
-                                                session.browser_input_source(
-                                                    crate::display::BrowserInputAuthorization::versioned(
-                                                        Arc::clone(&input_authorized),
-                                                        display_input_authority_inbound
-                                                            .revision(display_id),
-                                                    ),
-                                                ),
-                                            ),
-                                        );
-                                    }
-                                    if let Some((_, source)) =
-                                        local_display_input_sources.get(&display_id)
-                                    {
-                                        // Fire-and-forget: the source binds
-                                        // buffered events to this WS lifetime;
-                                        // the pump rechecks that guard at the
-                                        // injection boundary.
-                                        source.enqueue(input_event);
-                                    }
-                                }
-                            }
+                        let replace = local_display_input_sources
+                            .get(&display_id)
+                            .and_then(|(known, _)| known.upgrade())
+                            .is_none_or(|known| !Arc::ptr_eq(&known, &session));
+                        if replace {
+                            local_display_input_sources.insert(
+                                display_id,
+                                (
+                                    Arc::downgrade(&session),
+                                    session.browser_input_source(
+                                        crate::display::BrowserInputAuthorization::versioned(
+                                            Arc::clone(&input_authorized),
+                                            display_input_authority_inbound.revision(display_id),
+                                        ),
+                                    ),
+                                ),
+                            );
                         }
+                        if let Some((_, source)) = local_display_input_sources.get(&display_id) {
+                            // Fire-and-forget: the source binds buffered events
+                            // to this WS lifetime; the pump rechecks that guard
+                            // at the injection boundary.
+                            source.enqueue(input_event);
+                        }
+                        drop(registry);
                     }
                     Some("set_diagnostics_visual_marker") => {
                         // **Phase 0 visual-freshness diagnostic toggle**
@@ -2015,13 +2095,21 @@ pub(crate) async fn ws_inbound_task(
                                 // arm keeps the bus log + the per-connection
                                 // confirm message at the call site to avoid
                                 // baking logging dependencies into the helper.
-                                apply_grant_input_authority(
+                                if !apply_local_grant_for_existing_display(
+                                    session_registry_inbound.as_ref(),
                                     display_id,
-                                    connection_id_inbound.clone(),
-                                    direct_tx_inbound.clone(),
+                                    &connection_id_inbound,
+                                    &direct_tx_inbound,
                                     &display_input_authority_inbound,
                                     &authority_change_tx_inbound,
-                                );
+                                )
+                                .await
+                                {
+                                    // A client-chosen nonexistent ID is not an
+                                    // authority namespace. Reject it without a
+                                    // confirmation or persistent map entry.
+                                    continue;
+                                }
                                 // Confirm to the new holder (kept here so the
                                 // helper has no dependency on the call site's
                                 // direct_tx — and so the failure-to-send case
@@ -2243,11 +2331,15 @@ pub(crate) async fn ws_inbound_task(
     // teardown must find private user views too, or their RTC peers leak.
     if !peer_display_ids.is_empty() {
         if let Some(ref sr) = session_registry_inbound {
-            let reg = sr.read().await;
-            for did in &peer_display_ids {
-                if let Some(session) = reg.get_any(*did) {
-                    session.remove_peer(peer_id).await;
-                }
+            let sessions = {
+                let reg = sr.read().await;
+                peer_display_ids
+                    .iter()
+                    .filter_map(|display_id| reg.get_any(*display_id))
+                    .collect::<Vec<_>>()
+            };
+            for session in sessions {
+                session.remove_peer(peer_id).await;
             }
         }
     }
@@ -2256,6 +2348,118 @@ pub(crate) async fn ws_inbound_task(
     }
     // Tab presence: this event-lane connection is gone.
     dashboard_tabs_inbound.unregister(&connection_id_inbound);
+}
+
+#[cfg(test)]
+mod input_authorizer_cache_tests {
+    use super::*;
+
+    #[test]
+    fn display_frame_ids_are_strict_u32_values() {
+        assert_eq!(
+            frame_display_id(&serde_json::json!({"display_id": u32::MAX})),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            frame_display_id(&serde_json::json!({"display_id": u64::from(u32::MAX) + 1})),
+            None
+        );
+        assert_eq!(
+            frame_display_id(&serde_json::json!({"display_id": -1})),
+            None
+        );
+        assert_eq!(
+            frame_display_id(&serde_json::json!({"display_id": "7"})),
+            None
+        );
+        assert_eq!(frame_display_id(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn unresolved_and_denied_display_ids_do_not_grow_authorizer_cache() {
+        let mut authorizers = HashMap::<u32, LocalDisplayInputAuthorizer>::new();
+
+        for display_id in 0..2_048 {
+            let unresolved = authorized_display_with_cached_input_authorizer(
+                None::<()>,
+                display_id,
+                &mut authorizers,
+                || panic!("an unresolved display must not construct an authorizer"),
+            );
+            assert!(unresolved.is_none());
+        }
+        assert!(authorizers.is_empty());
+
+        for display_id in 0..2_048 {
+            let denied = authorized_display_with_cached_input_authorizer(
+                Some(()),
+                display_id,
+                &mut authorizers,
+                || Arc::new(|| false),
+            );
+            assert!(denied.is_none());
+        }
+        assert!(
+            authorizers.is_empty(),
+            "denied valid displays must not leave persistent guards either"
+        );
+
+        assert!(authorized_display_with_cached_input_authorizer(
+            Some(()),
+            7,
+            &mut authorizers,
+            || Arc::new(|| true),
+        )
+        .is_some());
+        assert!(authorized_display_with_cached_input_authorizer(
+            Some(()),
+            7,
+            &mut authorizers,
+            || panic!("a valid cached display must reuse its guard"),
+        )
+        .is_some());
+        assert_eq!(authorizers.len(), 1);
+
+        let mut peer_displays = HashSet::new();
+        for _ in 0..2_048 {
+            peer_displays.insert(7_u32);
+        }
+        assert_eq!(
+            peer_displays.len(),
+            1,
+            "renegotiating one valid display must keep one teardown target"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_local_authority_requests_do_not_grow_global_maps() {
+        let session_registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let authority = Arc::new(DisplayInputAuthority::default());
+        let (change_tx, mut change_rx) = broadcast::channel(8);
+        let (direct_tx, _direct_rx) = mpsc::unbounded_channel();
+
+        for display_id in 1..=2_048 {
+            assert!(
+                !apply_local_grant_for_existing_display(
+                    Some(&session_registry),
+                    display_id,
+                    "local-connection",
+                    &direct_tx,
+                    &authority,
+                    &change_tx,
+                )
+                .await
+            );
+        }
+
+        assert_eq!(authority.tracked_entry_counts(), (0, 0));
+        assert!(
+            change_rx.try_recv().is_err(),
+            "rejected requests must not publish authority changes"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2352,10 +2352,6 @@ mod tests {
         bearer_token: Option<String>,
         tls_client_cert_required: bool,
     ) -> (u16, tokio::task::JoinHandle<()>) {
-        let bus = EventBus::new();
-        let (broadcast_tx, _) = broadcast::channel::<String>(16);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
         // same construction the production `--tls` self-signed path uses.
         let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
@@ -2363,7 +2359,34 @@ mod tests {
             hostname: None,
         })
         .expect("self-signed acceptor builds");
-        let handle = spawn_web_gateway(
+        spawn_test_gateway_with_tls_acceptor(bearer_token, tls_client_cert_required, acceptor).await
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            bearer_token,
+            tls_client_cert_required,
+            acceptor,
+            crate::access::backend::select_backend().cert_dir(),
+        )
+        .await
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+        access_cert_dir: std::path::PathBuf,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway_from_cert_dir(
             listener,
             bus,
             broadcast_tx,
@@ -2379,6 +2402,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             tls_client_cert_required,
             Some(acceptor),
+            access_cert_dir,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -2448,14 +2472,32 @@ mod tests {
     }
 
     async fn https_request_for_server_name(port: u16, server_name: &str, request: &str) -> String {
+        https_request_for_server_name_with_client_identity(port, server_name, request, None).await
+    }
+
+    async fn https_request_for_server_name_with_client_identity(
+        port: u16,
+        server_name: &str,
+        request: &str,
+        client_identity: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)));
+        let config = match client_identity {
+            Some((cert_path, key_path)) => {
+                let (cert_chain, key) = crate::web_tls::load_pem_cert_and_key(cert_path, key_path)
+                    .expect("test client identity loads");
+                builder
+                    .with_client_auth_cert(cert_chain, key)
+                    .expect("test client identity is usable")
+            }
+            None => builder.with_no_client_auth(),
+        };
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
         let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -2492,7 +2534,44 @@ mod tests {
 
     #[tokio::test]
     async fn public_fleet_name_is_discovery_only_even_at_its_own_origin() {
-        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let access_dir = tempfile::tempdir().unwrap();
+        let server_names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(
+            access_dir.path(),
+            &server_names,
+            "fleet-sni-client-cert",
+            false,
+        )
+        .unwrap();
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(
+                access_dir.path()
+            )
+            .unwrap(),
+            "fixture client certificate must be enrolled before the fleet request"
+        );
+        let acceptor = crate::web_tls::build_acceptor_with_client_auth(
+            &crate::web_tls::TlsCertSource::Files {
+                cert_path: access_dir.path().join("server.crt"),
+                key_path: access_dir.path().join("server.key"),
+            },
+            &crate::web_tls::ClientAuth::RequireCa {
+                ca_path: access_dir.path().join("ca.crt"),
+            },
+        )
+        .expect("access-CA TLS acceptor builds");
+        let (port, handle) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            None,
+            true,
+            acceptor,
+            access_dir.path().to_path_buf(),
+        )
+        .await;
         let fleet_name = "discovery-only-fleet.test";
         let fleet_cert = rcgen::generate_simple_self_signed(vec![fleet_name.to_string()]).unwrap();
         crate::web_tls::install_fleet_certificate(
@@ -2502,6 +2581,24 @@ mod tests {
         )
         .unwrap();
 
+        let client_cert_path = access_dir.path().join("client.crt");
+        let client_key_path = access_dir.path().join("client.key");
+        // This is a protected route, not the authority-free dashboard shell:
+        // RequireCa proves rustls received and verified the certificate, and
+        // the 200 proves request IAM resolved that same fingerprint through
+        // the injected temp store as the enrolled owner root.
+        let authenticated_direct = https_request_for_server_name_with_client_identity(
+            port,
+            "localhost",
+            &format!("GET /api/project-root HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
+        )
+        .await;
+        assert!(
+            authenticated_direct.starts_with("HTTP/1.1 200"),
+            "the enrolled access-CA client certificate must authorize the protected direct-SNI route: {authenticated_direct}"
+        );
+
         for request in [
             format!("GET /api/project-root HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
             format!("POST /mcp HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nContent-Length: 0\r\n\r\n"),
@@ -2509,7 +2606,13 @@ mod tests {
                 "GET /ws HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nOrigin: https://{fleet_name}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
             ),
         ] {
-            let response = https_request_for_server_name(port, fleet_name, &request).await;
+            let response = https_request_for_server_name_with_client_identity(
+                port,
+                fleet_name,
+                &request,
+                Some((&client_cert_path, &client_key_path)),
+            )
+            .await;
             assert!(
                 response.starts_with("HTTP/1.1 403"),
                 "fleet control route was not refused: {response}"
@@ -2517,10 +2620,11 @@ mod tests {
             assert!(response.contains("discovery-only"));
         }
 
-        let public_shell = https_request_for_server_name(
+        let public_shell = https_request_for_server_name_with_client_identity(
             port,
             fleet_name,
             &format!("GET / HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
         )
         .await;
         assert!(

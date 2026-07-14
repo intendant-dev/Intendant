@@ -653,7 +653,7 @@ message-lane wire contract against the real binary
 (`supervised_session_writes_task_ask_human_and_steer_message_rows`,
 `headless_rollback_writes_a_conversation_rewound_cut` in `tests/e2e/`).
 
-The 20 integration cases in `tests/e2e/main.rs` spawn the real binaries against
+The integration cases in `tests/e2e/main.rs` spawn the real binaries against
 the deterministic mock provider and synthetic display; they are keyless,
 headless, network-independent, and run in CI on all three supported platforms.
 They cover direct execution and runtime file writes; daemon session/project and

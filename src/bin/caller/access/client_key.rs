@@ -1,11 +1,12 @@
-//! Browser client identity keys.
+//! Reserved browser client-identity-key wire vocabulary.
 //!
-//! The anchor-daemon trust model (see docs/src/trust-architecture.md) gives
-//! every browser a durable identity: a WebCrypto P-256 keypair whose private
-//! key never leaves the browser's origin-scoped storage. Dashboard-control
-//! offers carry the public key plus a signature binding the offer to this
-//! daemon, the session nonce, and the SDP, so any daemon can resolve the key
-//! fingerprint against its local IAM without trusting the signaling path.
+//! The default product does not admit browser keys as an authority-bearing
+//! direct or hosted dashboard credential, and its pending-enrollment registry
+//! has no production writer. These parsers/verifiers remain as compatibility
+//! fixtures and vocabulary for a future trusted enrollment transport; no
+//! production ingress currently calls them. Verifying a signature here would
+//! authenticate only the stated key; it would not enroll that key, create a
+//! session, or grant daemon authority.
 //!
 //! Wire format (all base64url, no padding):
 //! - `client_key`: the 65-byte uncompressed SEC1 point (`0x04 || x || y`),
@@ -28,12 +29,11 @@ use crate::daemon_identity::b64u;
 use base64::Engine as _;
 
 pub const CLIENT_KEY_OFFER_PROTOCOL: &str = "intendant-client-key-offer-v1";
-/// v2 extends the signed payload with the browser's own account claim
-/// (`\n{account_user_id}\n{account_name}`), so the account shown on a
-/// pending enrollment can be **attested by the device key** instead of
-/// taken from whatever the signaling relay asserts. Old browsers keep
-/// signing v1; a v1 offer carrying account fields is rejected outright —
-/// nothing may ride outside the signature.
+/// v2 extends the signed payload with the key holder's account claim
+/// (`\n{account_user_id}\n{account_name}`), so staged/test attribution can
+/// distinguish key-attested metadata from a relay assertion. A v1 offer
+/// carrying account fields is rejected outright — nothing may ride outside
+/// the signature. Neither version is an enrollment or authority proof.
 pub const CLIENT_KEY_OFFER_PROTOCOL_V2: &str = "intendant-client-key-offer-v2";
 
 /// Accept signatures whose timestamp is at most this far from daemon time in

@@ -459,8 +459,9 @@ async function refreshAccessOverviewFromApi(options = {}) {
   }
 }
 
-/* Pending browser-key enrollment requests (devices knocking on this daemon).
-   Pull-based like the overview; renderers read the cached list. */
+/* Reserved browser-key enrollment queue. The daemon reports this capability
+   as staged with writer_available:false in the default product; the polling
+   path remains so future/fixture records render without inventing a writer. */
 let accessPendingEnrollments = [];
 
 async function refreshAccessEnrollments(options = {}) {
@@ -497,7 +498,9 @@ async function accessDecideEnrollment(fingerprint, approve, roleId) {
     const resp = await daemonApi.request('api_access_enrollment_decide', payload);
     const data = resp.body;
     if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
+    showControlToast?.('success', approve
+      ? 'Enrollment record approved; browser-key sign-in remains inactive'
+      : 'Enrollment record denied');
   } catch (err) {
     showControlToast?.('error', err?.message || 'Enrollment decision failed');
   }
@@ -2102,6 +2105,10 @@ function accessGrantsBy(overview, key) {
 function accessGrantWhy(grant) {
   const kind = accessModelLabel(grant.kind);
   const source = accessModelLabel(grant.source);
+  if (grant.inactive_binding === true) {
+    const originClass = accessModelLabel(grant.origin_class, 'service-controlled');
+    return `This is a stored ${originClass}-origin browser-key record, not live authority. It authenticates no alpha request; re-enroll the person with an independently verified browser mTLS certificate.`;
+  }
   if (kind === 'connect_account_metadata') {
     return 'Legacy discovery metadata only. It authenticates no request, carries no daemon authority, and is read-only.';
   }
@@ -2147,7 +2154,10 @@ function accessAuditGrantCards() {
   return accessOverviewArray(overview, 'grants').map(grant => {
     const grantId = accessModelLabel(grant.id);
     const status = accessModelLabel(grant.status, 'active');
+    const storedStatus = accessModelLabel(grant.stored_status, status);
     const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
+    const canActivate = grant.inactive_binding !== true
+      && accessModelLabel(grant.authority, 'local_iam') !== 'none';
     const lifecycleBusy = accessGrantLifecycleSubmitting.has(grantId);
     // daemonApi availability (transport F4): tunnel status boolean when
     // connected, HTTP-twin reachability otherwise — honest in Connect
@@ -2155,7 +2165,7 @@ function accessAuditGrantCards() {
     const canManage = daemonApi.availability('api_access_iam_update_grant').ok;
     const actions = [];
     if (localIamGrant && grantId) {
-      if (status !== 'active') {
+      if (storedStatus !== 'active' && canActivate) {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Activate',
           primary: true,
@@ -2163,14 +2173,14 @@ function accessAuditGrantCards() {
           onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'active' }),
         });
       }
-      if (status !== 'draft') {
+      if (storedStatus !== 'draft') {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Draft',
           disabled: lifecycleBusy || !canManage,
           onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'draft' }),
         });
       }
-      if (status !== 'revoked') {
+      if (storedStatus !== 'revoked') {
         actions.push({
           label: lifecycleBusy ? 'Saving' : 'Revoke',
           danger: true,
