@@ -5,8 +5,8 @@
 //! the committed bytes to the builders.
 
 use owner_plane_core::{
-    corpus, corpus_ctrl, corpus_edge, corpus_erase, corpus_fold, corpus_migration, corpus_recovery,
-    corpus_status, corpus_time, tranche, vector,
+    corpus, corpus_budget, corpus_ctrl, corpus_edge, corpus_erase, corpus_fold, corpus_migration,
+    corpus_recovery, corpus_status, corpus_time, tranche, vector,
 };
 
 fn main() {
@@ -29,6 +29,7 @@ fn main() {
     all.extend(corpus_erase::corpus_erase());
     all.extend(corpus_time::corpus_time());
     all.extend(corpus_ctrl::corpus_ctrl());
+    all.extend(corpus_budget::corpus_budget());
     for v in all {
         vector::check(&v.to_json(), &companion)
             .unwrap_or_else(|e| panic!("{} fails mint-time check: {e}", v.name));

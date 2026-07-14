@@ -113,6 +113,9 @@ struct HeldGrant {
     ctrl_pos: u64,
     class_ceiling: Option<u8>,
     flows: Vec<FlowFacts>,
+    /// §4.3 `budget: {max_ops, max_bytes}` — per-(grant, lineage)
+    /// window accounting.
+    budget: Option<(u64, u64)>,
     /// §9.1: a present deadline always binds, in every posture.
     expiry_deadline_ms: Option<u64>,
     /// T5: both lease legs required when set.
@@ -149,6 +152,11 @@ struct HeldTenantOp {
     human_evidence: bool,
     /// §11.4 derived actor class.
     actor_class: &'static str,
+    /// The signed capability epoch — the §4.3 budget-window anchor.
+    cap_epoch: u64,
+    /// Canonical triple byte length (the §4.3 `max_bytes` charge;
+    /// verb surcharges are unimplemented).
+    op_len: u64,
     /// m.claim content — (kind, statement, sensitivity rank): the
     /// D-134 source-equality material.
     claim: Option<(String, String, u8)>,
@@ -299,6 +307,8 @@ type ChainHead = (u64, [u8; 32]);
 type ZoneLineage = ([u8; 16], [u8; 16]);
 /// An O5 replay-registry key: (zone, lineage, request_id).
 type ReplayKey = ([u8; 16], [u8; 16], [u8; 16]);
+/// A §4.3 budget-accounting key: (grant hash, lineage, window).
+type BudgetKey = ([u8; 32], [u8; 16], u64);
 /// A held release's re-derivation facts:
 /// (op_hash, export_id, content_digest, sources).
 type ReleaseView = ([u8; 32], [u8; 16], [u8; 32], Vec<[u8; 32]>);
@@ -404,6 +414,10 @@ pub struct State {
     /// arriving AT that position is cut-branch material, never C2
     /// (the §7.4 precedence exception).
     recovery_placement: Option<u64>,
+    /// §4.3/D-79 budget windows: (zone, capability epoch) → window
+    /// ordinal. A bump opens a NEW window; a zone-policy advance
+    /// carries the old one (re-arms nothing).
+    zone_windows: BTreeMap<([u8; 16], u64), u64>,
 }
 
 /// A held Signed `accept` receipt from aux — unvalidated until an
@@ -681,6 +695,9 @@ impl State {
                 .and_then(|c| c.as_text())
                 .and_then(class_rank),
             flows,
+            budget: grant_node
+                .get("budget")
+                .and_then(|b| Some((b.get("max_ops")?.as_uint()?, b.get("max_bytes")?.as_uint()?))),
             expiry_deadline_ms: grant_node
                 .get("expiry_deadline_ms")
                 .and_then(|n| n.as_uint()),
@@ -931,6 +948,8 @@ impl State {
         self.zones.push(zone_id.unwrap_or_default());
         self.kek_epochs.insert(zone_id.unwrap_or_default(), 1);
         self.cap_epochs.insert(zone_id.unwrap_or_default(), 1);
+        self.zone_windows
+            .insert((zone_id.unwrap_or_default(), 1), 0);
         let strict = body
             .get("zone_policy")
             .and_then(|p| p.get("strictness"))
@@ -1407,6 +1426,52 @@ impl State {
             };
             out.insert(rec.op_hash, v);
         }
+        // §4.3 budgets — a pure fold in canonical (gen, seq) order
+        // over the ACCEPTED set per (grant, lineage, window): only
+        // accepted operations consume (D-94), and everything past
+        // the line displaces to (budget, quarantine-reproposal) —
+        // arrival order is immaterial by construction (D-86).
+        let mut groups: BTreeMap<BudgetKey, Vec<&HeldTenantOp>> = BTreeMap::new();
+        for rec in &self.held_tenant {
+            if out.get(&rec.op_hash) != Some(&Verdict::Admitted) {
+                continue;
+            }
+            let Some(grant) = self.grants.iter().find(|g| g.h_grant == rec.cited_grant) else {
+                continue;
+            };
+            if grant.budget.is_none() {
+                continue;
+            }
+            let window = self
+                .zone_windows
+                .get(&(rec.zone, rec.cap_epoch))
+                .copied()
+                .unwrap_or(0);
+            groups
+                .entry((rec.cited_grant, rec.lineage, window))
+                .or_default()
+                .push(rec);
+        }
+        for ((grant_hash, _, _), mut recs) in groups {
+            let (max_ops, max_bytes) = self
+                .grants
+                .iter()
+                .find(|g| g.h_grant == grant_hash)
+                .and_then(|g| g.budget)
+                .expect("grouped on a budgeted grant");
+            recs.sort_by_key(|r| (r.gen, r.seq));
+            let (mut ops, mut bytes) = (0u64, 0u64);
+            for rec in recs {
+                ops += 1;
+                bytes += rec.op_len;
+                if ops > max_ops || bytes > max_bytes {
+                    out.insert(
+                        rec.op_hash,
+                        Verdict::Rejected("budget", "quarantine-reproposal"),
+                    );
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -1734,6 +1799,8 @@ impl State {
         // later coverage). Budget-window state (D-79) has no consumer
         // in the engine yet.
         self.cap_epochs.insert(zone, cur + 1);
+        let w = self.zone_windows.get(&(zone, cur)).copied().unwrap_or(0);
+        self.zone_windows.insert((zone, cur + 1), w + 1);
         self.staged_closes.retain(|&(sz, _)| sz != zone);
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
@@ -1831,6 +1898,9 @@ impl State {
         // Accept: advance the epoch, consume the zone's stages
         // one-shot, and anchor the NEW policy at the new epoch.
         self.cap_epochs.insert(zone, cur + 1);
+        // D-79: a policy advance re-arms NO budget window.
+        let w = self.zone_windows.get(&(zone, cur)).copied().unwrap_or(0);
+        self.zone_windows.insert((zone, cur + 1), w);
         self.staged_closes.retain(|&(sz, _)| sz != zone);
         self.zone_strict.insert(zone, strictness == Some("strict"));
         self.policies.insert((zone, cur + 1), witnesses);
@@ -1942,6 +2012,7 @@ impl State {
         self.zones.push(zone_id);
         self.kek_epochs.insert(zone_id, 1);
         self.cap_epochs.insert(zone_id, 1);
+        self.zone_windows.insert((zone_id, 1), 0);
         let strict = policy.get("strictness").and_then(|s| s.as_text()) == Some("strict");
         self.zone_strict.insert(zone_id, strict);
         self.policies
@@ -2767,6 +2838,8 @@ impl State {
             actor_id: h.actor_id.to_string(),
             human_evidence: h.actor_kind == "human" && h.attested_by.is_none(),
             actor_class: Self::actor_class(op, grant),
+            cap_epoch: h.capability_epoch,
+            op_len: op.raw.len() as u64,
             claim,
             release,
             import,

@@ -16,6 +16,7 @@
 
 pub mod cbor;
 pub mod corpus;
+pub mod corpus_budget;
 pub mod corpus_ctrl;
 pub mod corpus_edge;
 pub mod corpus_erase;
