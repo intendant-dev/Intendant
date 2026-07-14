@@ -11,9 +11,16 @@
 //! Scope so far: `c.genesis` (the §7.1 row's D-68 cross-field rules),
 //! `c.enroll` (new-device shape: chain, one-live-lineage,
 //! import-grant uniqueness, the exact-SEC1 freshness domain — D-190's
-//! acceptance side), and `m.claim` under the dev arm (D-199:
-//! unresolved certificate/grant citations pend `ref-unresolved` and
-//! admit on arrival).
+//! acceptance side), `m.claim` under the dev arm (D-199: unresolved
+//! certificate/grant citations pend `ref-unresolved` and admit on
+//! arrival), and the revocation compound: `c.grant` (D-92/D-139
+//! issuance gates), `c.revoke_grant` (D-93 cutoff equality),
+//! `c.revoke_device` in exclude mode (the D-180/D-186 one completion
+//! law over the D-173 decryptable-wrap domain, with the D-195
+//! reservation — a pending compound HOLDS its chain position, unlike
+//! a failed op which exerts no precedence, D-112), and
+//! `c.kek_rotate` (dense epochs, wrap-set validation, the D-81
+//! last-holder floor).
 
 use std::collections::BTreeMap;
 
@@ -51,14 +58,19 @@ struct HeldCert {
     h_cert: [u8; 32],
     device_id: [u8; 16],
     sig_pk: [u8; 32],
-    // Consumed by the revocation slice (the next engine layer).
-    #[allow(dead_code)]
+    /// `H_key({kem_alg, kem_pk})` — what a wrap's `recipient_kem_key`
+    /// must equal.
+    kem_key_id: [u8; 32],
     revocation_id: [u8; 16],
+    /// Set at a `c.revoke_device` compound's COMPLETING acceptance
+    /// (D-195 — a pending compound ends nothing yet).
+    revoked: bool,
 }
 
 #[derive(Debug, Clone)]
 struct HeldGrant {
     h_grant: [u8; 32],
+    grant_id: [u8; 16],
     subject_device: [u8; 16],
     lineage: Option<[u8; 16]>,
     zone: Option<[u8; 16]>,
@@ -68,12 +80,56 @@ struct HeldGrant {
     kinds: Option<Vec<String>>,
     capability_epoch: u64,
     imports: bool,
+    /// `c.revoke_grant`, or derived revocation at a device compound's
+    /// completion (D-85).
+    revoked: bool,
 }
+
+/// §11.1 (D-60): the verbs whose operations append tenant chain
+/// state. A grant carrying any of them requires `lineage` and exactly
+/// one finite zone (D-32).
+const OP_AUTHORING: &[&str] = &[
+    "propose",
+    "assert",
+    "judge.safe",
+    "judge.full",
+    "pin.safe",
+    "pin.full",
+    "erase.request",
+    "raise",
+    "declassify",
+    "export",
+    "import",
+    "audit.write",
+];
+
+/// §11.1's closed grant-verb vocabulary.
+const VERBS: &[&str] = &[
+    "search",
+    "read",
+    "evidence.read",
+    "propose",
+    "assert",
+    "judge.safe",
+    "judge.full",
+    "pin.safe",
+    "pin.full",
+    "erase.request",
+    "raise",
+    "declassify",
+    "export",
+    "import",
+    "curate.instruction",
+    "audit.write",
+    "admin",
+];
 
 /// (zone, lineage, gen) — one tenant chain's coordinates.
 type ChainKey = ([u8; 16], [u8; 16], u64);
 /// (next expected seq, current head op hash).
 type ChainHead = (u64, [u8; 32]);
+/// A frontierclose's (zone, lineage) coordinates.
+type ZoneLineage = ([u8; 16], [u8; 16]);
 
 /// Derived plane state — grown only by ACCEPTED operations.
 #[derive(Debug, Clone, Default)]
@@ -92,6 +148,19 @@ pub struct State {
     freshness: Vec<[u8; 32]>,
     /// Tenant chain heads: (zone, lineage, gen) → (next_seq, head op).
     tenant_chains: BTreeMap<ChainKey, ChainHead>,
+    /// zone → latest accepted KEK epoch (dense from 1, §5.5).
+    kek_epochs: BTreeMap<[u8; 16], u64>,
+    /// (zone, epoch) → recipient devices holding an effective wrap
+    /// there (re-wraps supersede by `(zone, epoch, device)`, so
+    /// membership is a set of devices).
+    wrap_sets: BTreeMap<([u8; 16], u64), Vec<[u8; 16]>>,
+    /// Pending `c.revoke_device` compounds that already HOLD their
+    /// control position (the reservation — the chain continues past a
+    /// pending compound; only the compound's own effects wait):
+    /// op_hash → target revocation_id.
+    pending_compounds: BTreeMap<[u8; 32], [u8; 16]>,
+    /// Completed (effect-applied) revocation_ids.
+    revoked_ids: Vec<[u8; 16]>,
 }
 
 fn ok<T>(v: T) -> Result<T, Unimplemented> {
@@ -191,7 +260,9 @@ impl State {
                 .get("sig_pk")
                 .and_then(|n| n.bytes_n::<32>())
                 .unwrap_or_default(),
+            kem_key_id: domains::key_id("hpke-p256-v1", kem_pk),
             revocation_id: b16_field(cert_node, "revocation_id").unwrap_or_default(),
+            revoked: false,
         });
         ok(())
     }
@@ -242,6 +313,7 @@ impl State {
         });
         self.grants.push(HeldGrant {
             h_grant: domains::h("grant", grant_node.raw),
+            grant_id: b16_field(grant_node, "grant_id").unwrap_or_default(),
             subject_device: b16_field(grant_node, "subject_device").unwrap_or_default(),
             lineage: b16_field(grant_node, "lineage"),
             zone,
@@ -254,8 +326,110 @@ impl State {
                 .get("capability_epoch")
                 .and_then(|n| n.as_uint())
                 .unwrap_or(0),
+            revoked: false,
         });
         ok(())
+    }
+
+    /// Universal grant-object gates shared by every grant-bearing
+    /// operation (`c.grant` AND `c.enroll.grants[]`): the closed §11.1
+    /// verb vocabulary, the reserved `admin` verb (D-61: rejects at
+    /// issuance), and D-60/D-32 — an op-authoring grant carries a
+    /// `lineage` and exactly ONE finite zone (`"*"` is read-only),
+    /// and the subject device owns the named lineage. `enrolling` is
+    /// the `(lineage, device)` the CURRENT operation creates (genesis
+    /// and enroll grants ride the op that mints their lineage).
+    fn grant_static_checks(
+        &self,
+        gn: &Node,
+        plane: [u8; 32],
+        enrolling: Option<([u8; 16], [u8; 16])>,
+    ) -> Option<Verdict> {
+        let bad = Some(Verdict::Rejected("body-invariant", "reject-permanent"));
+        if gn.get("plane_id").and_then(|n| n.bytes_n::<32>()) != Some(plane) {
+            return bad;
+        }
+        let verbs: Vec<&str> = gn
+            .get("ops")
+            .and_then(|n| n.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_text()).collect())
+            .unwrap_or_default();
+        if verbs.is_empty() || verbs.iter().any(|v| !VERBS.contains(v)) || verbs.contains(&"admin")
+        {
+            return bad;
+        }
+        if verbs.iter().any(|v| OP_AUTHORING.contains(v)) {
+            let zone_finite = gn.get("zone").is_some_and(|z| z.bytes_n::<16>().is_some());
+            let owned = match (b16_field(gn, "lineage"), b16_field(gn, "subject_device")) {
+                (Some(l), Some(s)) => {
+                    enrolling == Some((l, s))
+                        || self.lineages.iter().any(|(li, d)| *li == l && *d == s)
+                }
+                _ => false,
+            };
+            if !zone_finite || !owned {
+                return bad;
+            }
+        }
+        None
+    }
+
+    /// Validate one `kekwrap` node against its context and return the
+    /// recipient device. `expect_recipient` pins the recipient (the
+    /// genesis/enroll shapes, D-76); `None` (rotations) requires a
+    /// held certificate and checks the KEM key against it.
+    fn check_wrap(
+        &self,
+        wn: &Node,
+        plane: [u8; 32],
+        zone: [u8; 16],
+        epoch: u64,
+        expect_recipient: Option<([u8; 16], [u8; 32])>,
+    ) -> Result<Result<[u8; 16], Verdict>, Unimplemented> {
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        if wn.get("v").and_then(|n| n.as_uint()) != Some(1)
+            || wn.get("kem").and_then(|n| n.as_text()) != Some("hpke-p256-v1")
+            || wn.get("plane_id").and_then(|n| n.bytes_n::<32>()) != Some(plane)
+            || b16_field(wn, "zone_id") != Some(zone)
+            || wn.get("epoch").and_then(|n| n.as_uint()) != Some(epoch)
+        {
+            return ok(Err(bad()));
+        }
+        let Some(recipient) = b16_field(wn, "recipient_device") else {
+            return ok(Err(bad()));
+        };
+        let kem_key = wn.get("recipient_kem_key").and_then(|n| n.bytes_n::<32>());
+        match expect_recipient {
+            Some((device, key_id)) => {
+                if recipient != device || kem_key != Some(key_id) {
+                    return ok(Err(bad()));
+                }
+            }
+            None => {
+                let Some(cert) = self.certs.iter().find(|c| c.device_id == recipient) else {
+                    // The recipient's enrollment may still arrive
+                    // (interpretation: unheld recipient pends —
+                    // register #24; no vector pins it yet).
+                    return ok(Err(Verdict::Pending(
+                        "ref-unresolved",
+                        "pending-dependency",
+                    )));
+                };
+                if kem_key != Some(cert.kem_key_id) {
+                    return ok(Err(bad()));
+                }
+            }
+        }
+        ok(Ok(recipient))
+    }
+
+    /// Add `device` to the `(zone, epoch)` recipient set (idempotent —
+    /// a re-wrap supersedes by `(zone, epoch, device)`).
+    fn record_wrap(&mut self, zone: [u8; 16], epoch: u64, device: [u8; 16]) {
+        let set = self.wrap_sets.entry((zone, epoch)).or_default();
+        if !set.contains(&device) {
+            set.push(device);
+        }
     }
 
     /// `c.genesis` — control seq 1 only, genesis arm, D-68
@@ -306,10 +480,48 @@ impl State {
             .and_then(|n| n.bytes_n::<32>())
             .expect("verify_genesis proved shape");
 
+        // The zone opens at KEK epoch 1 with the wrap to the first
+        // device (row pins: zone_id/epoch/recipient/recipient_kem_key;
+        // verify_genesis proved header.plane_id = H_genesis(descriptor)).
+        let plane = op.header.plane_id;
+        if zone.get("initial_epoch").and_then(|n| n.as_uint()) != Some(1) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        let kem_key_id = domains::key_id(
+            "hpke-p256-v1",
+            cert.get("kem_pk").and_then(|n| n.as_bytes()).unwrap_or(&[]),
+        );
+        let mut recipients = Vec::new();
+        for wn in zone.get("wraps").and_then(|n| n.as_array()).unwrap_or(&[]) {
+            match self.check_wrap(
+                wn,
+                plane,
+                zone_id.unwrap_or_default(),
+                1,
+                Some((device_id.unwrap(), kem_key_id)),
+            )? {
+                Ok(r) => recipients.push(r),
+                Err(v) => return ok(Err(v)),
+            }
+        }
+        for g in ["grant", "audit_grant"] {
+            let enrolling = Some((lineage_id.unwrap(), device_id.unwrap()));
+            if let Some(v) = body
+                .get(g)
+                .and_then(|gn| self.grant_static_checks(gn, plane, enrolling))
+            {
+                return ok(Err(v));
+            }
+        }
+
         // Accept: install the plane.
-        self.plane_id = Some(op.header.plane_id);
+        self.plane_id = Some(plane);
         self.root_pk = Some(root_pk);
         self.zones.push(zone_id.unwrap_or_default());
+        self.kek_epochs.insert(zone_id.unwrap_or_default(), 1);
+        for r in recipients {
+            self.record_wrap(zone_id.unwrap_or_default(), 1, r);
+        }
         self.spaces
             .push((home_id.unwrap(), zone_id.unwrap_or_default()));
         self.spaces
@@ -327,28 +539,30 @@ impl State {
         ok(Ok(()))
     }
 
-    /// `c.enroll`, new-device shape (`cert.renews` absent).
-    fn admit_enroll(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
-        if let Err(v) = Self::ctrl_header_pins(op) {
-            return ok(Err(v));
-        }
-        if let Err(v) = self.ctrl_chain(op) {
-            return ok(Err(v));
-        }
+    /// The shared post-genesis admin-arm preamble: O7 pins, §9.3
+    /// chain arithmetic, admin-key resolution, signature, body hash.
+    fn ctrl_admin_preamble(&self, op: &SignedOp) -> Result<(), Verdict> {
+        Self::ctrl_header_pins(op)?;
+        self.ctrl_chain(op)?;
         let Proof::Admin { epoch, .. } = op.header.proof else {
-            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+            return Err(Verdict::Rejected("proof-arm", "reject-permanent"));
         };
-        let admin_pk = match self.admin_key(epoch) {
-            Ok(pk) => pk,
-            Err(v) => return ok(Err(v)),
-        };
+        let admin_pk = self.admin_key(epoch)?;
         if !op.verify_ed25519(&admin_pk)
             || op.header.signer_key_id != domains::key_id("ed25519", &admin_pk)
         {
-            return ok(Err(Verdict::Rejected("sig-invalid", "reject-permanent")));
+            return Err(Verdict::Rejected("sig-invalid", "reject-permanent"));
         }
         if !op.body_hash_ok() {
-            return ok(Err(Verdict::Rejected("body-hash", "reject-permanent")));
+            return Err(Verdict::Rejected("body-hash", "reject-permanent"));
+        }
+        Ok(())
+    }
+
+    /// `c.enroll`, new-device shape (`cert.renews` absent).
+    fn admit_enroll(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
         }
         let body = &op.body;
         let Some(cert) = body.get("cert") else {
@@ -395,14 +609,22 @@ impl State {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
 
-        // Grants: every entry targets the enrolled device; a second
-        // active import-verb grant for a destination zone rejects
-        // (D-139/D-146).
+        // Grants: every entry targets the enrolled device; the
+        // universal grant gates apply (the invariant binds EVERY
+        // grant-bearing operation); a second active import-verb grant
+        // for a destination zone rejects (D-139/D-146).
+        let plane = self
+            .plane_id
+            .expect("admin key resolved ⇒ genesis installed");
         let mut new_grants = Vec::new();
         if let Some(grants) = body.get("grants").and_then(|g| g.as_array()) {
             for gn in grants {
                 if b16_field(gn, "subject_device") != Some(device_id) {
                     return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                }
+                if let Some(v) = self.grant_static_checks(gn, plane, Some((lineage_id, device_id)))
+                {
+                    return ok(Err(v));
                 }
                 let has_import = gn
                     .get("ops")
@@ -410,11 +632,38 @@ impl State {
                     .is_some_and(|a| a.iter().any(|v| v.as_text() == Some("import")));
                 if has_import {
                     let gzone = gn.get("zone").and_then(|z| z.bytes_n::<16>());
-                    if self.grants.iter().any(|g| g.imports && g.zone == gzone) {
+                    if self
+                        .grants
+                        .iter()
+                        .any(|g| g.imports && !g.revoked && g.zone == gzone)
+                    {
                         return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
                     }
                 }
                 new_grants.push(gn.clone());
+            }
+        }
+
+        // Wraps: each targets the enrolled device (D-76) at a known
+        // zone's CURRENT accepted epoch (the only shape the tranche
+        // mints — other epochs are unpinned, honest abort).
+        let kem_key_id = domains::key_id("hpke-p256-v1", kem_pk);
+        let mut new_wraps = Vec::new();
+        if let Some(wraps) = body.get("wraps").and_then(|w| w.as_array()) {
+            for wn in wraps {
+                let Some(wz) = b16_field(wn, "zone_id") else {
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                };
+                let Some(&cur) = self.kek_epochs.get(&wz) else {
+                    return Err(Unimplemented("enroll wrap for unknown zone".into()));
+                };
+                if wn.get("epoch").and_then(|n| n.as_uint()) != Some(cur) {
+                    return Err(Unimplemented("enroll wrap at non-current epoch".into()));
+                }
+                match self.check_wrap(wn, plane, wz, cur, Some((device_id, kem_key_id)))? {
+                    Ok(r) => new_wraps.push((wz, cur, r)),
+                    Err(v) => return ok(Err(v)),
+                }
             }
         }
 
@@ -423,6 +672,381 @@ impl State {
         self.record_cert(cert)?;
         for gn in &new_grants {
             self.record_grant(gn)?;
+        }
+        for (z, e, d) in new_wraps {
+            self.record_wrap(z, e, d);
+        }
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// `c.grant` — issue one capability. Row gates implemented:
+    /// D-92 (issuance to a revoked device rejects), D-139 (one active
+    /// import-verb grant per destination zone), the universal grant
+    /// object gates. Deliberately deferred to later slices (their
+    /// state does not exist yet; corpus vectors pin them): the D-109
+    /// 129-held-zone cap, capability-epoch currency, and the
+    /// budget-required-under-`budgets`-policy rule.
+    fn admit_grant(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let Some(gn) = op.body.get("grant") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let plane = self
+            .plane_id
+            .expect("admin key resolved ⇒ genesis installed");
+        if let Some(v) = self.grant_static_checks(gn, plane, None) {
+            return ok(Err(v));
+        }
+        let Some(subject) = b16_field(gn, "subject_device") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let Some(cert) = self.certs.iter().find(|c| c.device_id == subject) else {
+            // The subject's enrollment may arrive later (D-199
+            // spirit; interpretation register #25 — unpinned).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        // D-92: issuance to a device whose revocation_id is REVOKED
+        // rejects. A pending compound deactivates nothing (D-195 —
+        // the window; this tranche's window grant admits).
+        if self.revoked_ids.contains(&cert.revocation_id) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        let has_import = gn
+            .get("ops")
+            .and_then(|o| o.as_array())
+            .is_some_and(|a| a.iter().any(|v| v.as_text() == Some("import")));
+        if has_import {
+            let gzone = gn.get("zone").and_then(|z| z.bytes_n::<16>());
+            if self
+                .grants
+                .iter()
+                .any(|g| g.imports && !g.revoked && g.zone == gzone)
+            {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            }
+        }
+
+        // Accept.
+        self.record_grant(gn)?;
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// `c.revoke_grant` — an op-authoring grant's revocation carries
+    /// a REQUIRED `frontierclose` naming that grant's zone and
+    /// lineage exactly (D-78/D-143, equality D-93).
+    fn admit_revoke_grant(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let Some(gid) = b16_field(body, "grant_id") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let Some(idx) = self.grants.iter().position(|g| g.grant_id == gid) else {
+            // Unheld grant citation — the issuance may arrive later
+            // (interpretation register #25 — unpinned).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if self.grants[idx].revoked {
+            return Err(Unimplemented("re-revocation of a revoked grant".into()));
+        }
+        let op_authoring = self.grants[idx]
+            .verbs
+            .iter()
+            .any(|v| OP_AUTHORING.contains(&v.as_str()));
+        let cutoff = body.get("cutoff");
+        if op_authoring {
+            let Some(cn) = cutoff else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            if b16_field(cn, "zone_id") != self.grants[idx].zone
+                || b16_field(cn, "lineage") != self.grants[idx].lineage
+            {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            }
+            match cn.get("heads").and_then(|h| h.as_array()) {
+                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+                Some(a) if !a.is_empty() => {
+                    return Err(Unimplemented("frontierclose heads".into()))
+                }
+                Some(_) => {}
+            }
+        } else if cutoff.is_some() {
+            return Err(Unimplemented(
+                "cutoff on a read-only grant revocation".into(),
+            ));
+        }
+
+        // Accept. (The boundary's quarantine consumers arrive with
+        // later slices; state records the deactivation.)
+        self.grants[idx].revoked = true;
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// Parse a compound's `cutoffs` into `(zone, lineage)` pairs.
+    /// Only the empty-heads shape is implemented (D-143 — the shape
+    /// the tranche mints; carried heads await their consumer slice).
+    fn compound_cutoffs(body: &Node) -> Result<Result<Vec<ZoneLineage>, Verdict>, Unimplemented> {
+        let mut out = Vec::new();
+        let Some(cs) = body.get("cutoffs").and_then(|c| c.as_array()) else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        for cn in cs {
+            let (Some(z), Some(l)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage")) else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            match cn.get("heads").and_then(|h| h.as_array()) {
+                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+                Some(a) if !a.is_empty() => {
+                    return Err(Unimplemented("frontierclose heads".into()))
+                }
+                Some(_) => out.push((z, l)),
+            }
+        }
+        ok(Ok(out))
+    }
+
+    /// Evaluate the one completion law (D-180/D-186) at the current
+    /// position and, when it holds, apply the compound's effects: the
+    /// certificates cease HERE (D-195), grant revocation is derived
+    /// (D-85). Incomplete → `ref-unresolved` (awaiting completing
+    /// exclusions/cutoffs).
+    fn try_complete_compound(
+        &mut self,
+        oh: [u8; 32],
+        rid: [u8; 16],
+        cutoffs: &[ZoneLineage],
+    ) -> Result<(), Verdict> {
+        let pend = Verdict::Pending("ref-unresolved", "pending-dependency");
+        let targets: Vec<[u8; 16]> = self
+            .certs
+            .iter()
+            .filter(|c| c.revocation_id == rid)
+            .map(|c| c.device_id)
+            .collect();
+        // (2) Authorship-domain totality (D-159/D-141): every zone
+        // named by the targets' active op-authoring grants has a
+        // cutoff naming it and the target lineage.
+        for g in self
+            .grants
+            .iter()
+            .filter(|g| !g.revoked && targets.contains(&g.subject_device))
+        {
+            if !g.verbs.iter().any(|v| OP_AUTHORING.contains(&v.as_str())) {
+                continue;
+            }
+            let (Some(zone), Some(lineage)) = (g.zone, g.lineage) else {
+                // Op-authoring grants carry a finite zone + lineage
+                // (issuance-gated) — unreachable for held state, but
+                // pend rather than assert.
+                return Err(pend);
+            };
+            if !cutoffs.contains(&(zone, lineage)) {
+                return Err(pend);
+            }
+        }
+        // (3) The decryptable-wrap domain (D-173) is EMPTY: no zone
+        // has an accepted epoch at which a target holds an effective
+        // wrap not already followed by an accepted rotation excluding
+        // it (the row's literal predicate — the current-membership
+        // shortcut reading was voided by D-173).
+        for d in &targets {
+            for (&zone, &cur) in &self.kek_epochs {
+                let in_domain = (1..=cur).any(|e| {
+                    let holds = self
+                        .wrap_sets
+                        .get(&(zone, e))
+                        .is_some_and(|r| r.contains(d));
+                    holds
+                        && ((e + 1)..=cur).all(|e2| {
+                            self.wrap_sets
+                                .get(&(zone, e2))
+                                .is_some_and(|r| r.contains(d))
+                        })
+                });
+                if in_domain {
+                    return Err(pend);
+                }
+            }
+        }
+        // Complete.
+        for c in self.certs.iter_mut().filter(|c| c.revocation_id == rid) {
+            c.revoked = true;
+        }
+        for g in self
+            .grants
+            .iter_mut()
+            .filter(|g| targets.contains(&g.subject_device))
+        {
+            g.revoked = true;
+        }
+        self.revoked_ids.push(rid);
+        self.pending_compounds.remove(&oh);
+        Ok(())
+    }
+
+    /// `c.revoke_device`, exclude mode — the D-180/D-186 compound. A
+    /// valid-but-incomplete compound RESERVES its chain position
+    /// (D-195: the control chain continues past a pending compound —
+    /// pendency blocks only the compound's own effects; contrast
+    /// D-112, where a FAILED op exerts no precedence) and re-evaluates
+    /// toward completion as exclusions and cutoffs accumulate.
+    fn admit_revoke_device(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let oh = op.op_hash();
+        if let Some(&rid) = self.pending_compounds.get(&oh) {
+            // Reserved re-evaluation: the position is already held
+            // and the bytes were validated at reservation — only the
+            // completion question remains.
+            let cutoffs = match Self::compound_cutoffs(&op.body)? {
+                Ok(c) => c,
+                Err(v) => return ok(Err(v)),
+            };
+            return ok(self.try_complete_compound(oh, rid, &cutoffs));
+        }
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        match body.get("mode").and_then(|m| m.as_text()) {
+            Some("exclude") => {}
+            Some("compromise") => {
+                return Err(Unimplemented("compromise mode (T4 receipt cutoffs)".into()))
+            }
+            _ => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+        }
+        if body.get("receipt_cutoffs").is_some() {
+            return Err(Unimplemented("receipt_cutoffs under exclude".into()));
+        }
+        let Some(rid) = b16_field(body, "revocation_id") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        // At most one live compound per revocation_id; a completed
+        // target has no live certificate left to revoke.
+        if self.pending_compounds.values().any(|r| *r == rid) || self.revoked_ids.contains(&rid) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        // rotation_refs are typed linkage, never coverage — the
+        // tranche mints none (legal: completion is state-derived).
+        match body.get("rotation_refs").and_then(|r| r.as_array()) {
+            None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+            Some(a) if !a.is_empty() => return Err(Unimplemented("rotation_refs linkage".into())),
+            Some(_) => {}
+        }
+        // The target: every certificate bearing the revocation_id.
+        let targets: Vec<[u8; 16]> = self
+            .certs
+            .iter()
+            .filter(|c| c.revocation_id == rid)
+            .map(|c| c.device_id)
+            .collect();
+        if targets.is_empty() {
+            // Whether an unknown-target compound pends — and whether
+            // it may reserve a position it could later fail
+            // validation at — is unpinned; honest abort until a
+            // vector decides it.
+            return Err(Unimplemented("compound target not enrolled".into()));
+        }
+        // Cutoffs name the target's lineage exactly, in a known zone.
+        let cutoffs = match Self::compound_cutoffs(body)? {
+            Ok(c) => c,
+            Err(v) => return ok(Err(v)),
+        };
+        for &(cz, cl) in &cutoffs {
+            let names_target = self
+                .lineages
+                .iter()
+                .any(|(l, d)| *l == cl && targets.contains(d));
+            if !names_target || !self.zones.contains(&cz) {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            }
+            // Empty heads are legal for a lineage with no accepted
+            // ops (D-143) — the only shape the tranche mints.
+            if self
+                .tenant_chains
+                .keys()
+                .any(|(z, l, _)| *z == cz && *l == cl)
+            {
+                return Err(Unimplemented("cutoff heads below accepted ops".into()));
+            }
+        }
+        // Reserve the position, then evaluate (the compound may
+        // complete immediately).
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = oh;
+        self.pending_compounds.insert(oh, rid);
+        ok(self.try_complete_compound(oh, rid, &cutoffs))
+    }
+
+    /// `c.kek_rotate` — §5.5's admission face: dense per-zone epochs
+    /// (every earlier control op is already folded at this chain
+    /// position, so consecutiveness is a plain body invariant),
+    /// validated wraps at the new epoch, and the D-81 last-holder
+    /// floor (≥ 1 recipient — the CDDL's `[+ kekwrap]`). The Fence/
+    /// rewrap/destroy states are local storage, not admission.
+    fn admit_kek_rotate(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let Some(zone) = b16_field(body, "zone_id") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let Some(&cur) = self.kek_epochs.get(&zone) else {
+            // The zone's creation may arrive later (interpretation
+            // register #24 — unpinned).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if body.get("new_epoch").and_then(|n| n.as_uint()) != Some(cur + 1) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        match body.get("erase_manifest").and_then(|m| m.as_array()) {
+            None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+            Some(a) if !a.is_empty() => return Err(Unimplemented("erase manifest".into())),
+            Some(_) => {}
+        }
+        let plane = self
+            .plane_id
+            .expect("admin key resolved ⇒ genesis installed");
+        let wraps = match body.get("wraps").and_then(|w| w.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+        };
+        let mut recipients: Vec<[u8; 16]> = Vec::new();
+        for wn in wraps {
+            match self.check_wrap(wn, plane, zone, cur + 1, None)? {
+                Ok(r) => {
+                    if recipients.contains(&r) {
+                        // Duplicate set key (zone, epoch, device).
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    }
+                    recipients.push(r);
+                }
+                Err(v) => return ok(Err(v)),
+            }
+        }
+
+        // Accept: the new epoch's recipient set IS the wrap set.
+        // Pending compounds re-evaluate through the fold's fixpoint.
+        self.kek_epochs.insert(zone, cur + 1);
+        for r in recipients {
+            self.record_wrap(zone, cur + 1, r);
         }
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
@@ -454,6 +1078,15 @@ impl State {
                 "pending-dependency",
             )));
         };
+        // Post-revocation claims need D-86 position-relative validity
+        // (the signed-before-the-boundary prefix stands) — a later
+        // slice; no tranche fixture claims across a revocation.
+        if held_cert.revoked {
+            return Err(Unimplemented("claim under a revoked certificate".into()));
+        }
+        if grant.revoked {
+            return Err(Unimplemented("claim under a revoked grant".into()));
+        }
 
         // Signature under the resolved certificate key.
         if h.signer_alg != "ed25519" {
@@ -568,6 +1201,10 @@ impl State {
         match op.header.operation_type {
             "c.genesis" => self.admit_genesis(op),
             "c.enroll" => self.admit_enroll(op),
+            "c.grant" => self.admit_grant(op),
+            "c.revoke_grant" => self.admit_revoke_grant(op),
+            "c.revoke_device" => self.admit_revoke_device(op),
+            "c.kek_rotate" => self.admit_kek_rotate(op),
             "m.claim" => self.admit_claim(op),
             other => Err(Unimplemented(format!("op_type {other}"))),
         }
@@ -700,16 +1337,48 @@ mod tests {
         assert_eq!(run2.final_verdicts, run.final_verdicts);
     }
 
-    /// Unimplemented op types abort honestly.
+    /// The D-195 story: the compound pends `ref-unresolved` while the
+    /// wrap domain is nonempty, HOLDS its chain position (g and k
+    /// admit past it), the window grant admits, and the completing
+    /// rotation flips the compound at fixpoint. Both delivery orders
+    /// converge.
     #[test]
-    fn revocation_fixture_reports_unimplemented() {
-        let (items, v) = load("f07-pending-revocation-window-grant-completing-rotation.json");
-        let order: Vec<String> = v["inputs"]["deliveries"][0]
-            .as_array()
-            .unwrap()
+    fn pending_revocation_reserves_and_completes_at_the_rotation() {
+        let (items, _) = load("f07-pending-revocation-window-grant-completing-rotation.json");
+        let all = ["c1", "c2", "r", "g", "k"];
+
+        let o1: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+        let run = run_delivery(&items, &o1).unwrap();
+        assert_eq!(
+            run.snapshots[2]["r"],
+            Verdict::Pending("ref-unresolved", "pending-dependency")
+        );
+        // The window grant admits while the compound pends (its
+        // previous_writer_hash cites the RESERVED position's op).
+        assert_eq!(run.snapshots[3]["g"], Verdict::Admitted);
+        assert_eq!(
+            run.snapshots[3]["r"].pair(),
+            Some(("ref-unresolved", "pending-dependency"))
+        );
+        for k in all {
+            assert_eq!(run.final_verdicts[k], Verdict::Admitted, "{k}");
+        }
+
+        // Order 2: g and k pend causal-missing below the compound's
+        // unfilled seq; r's arrival fills it and cascades.
+        let o2: Vec<String> = ["c1", "c2", "g", "k", "r"]
             .iter()
-            .map(|s| s.as_str().unwrap().to_string())
+            .map(|s| s.to_string())
             .collect();
-        assert!(run_delivery(&items, &order).is_err());
+        let run2 = run_delivery(&items, &o2).unwrap();
+        assert_eq!(
+            run2.snapshots[2]["g"],
+            Verdict::Pending("causal-missing", "pending-dependency")
+        );
+        assert_eq!(
+            run2.snapshots[3]["k"],
+            Verdict::Pending("causal-missing", "pending-dependency")
+        );
+        assert_eq!(run2.final_verdicts, run.final_verdicts);
     }
 }

@@ -381,6 +381,7 @@ mod tests {
         let expect_pass = [
             "f07-delayed-reference-convergence-c1-i-c2.json",
             "f07-negation-residual-acceptance.json",
+            "f07-pending-revocation-window-grant-completing-rotation.json",
         ];
         for r in &reports {
             assert!(
