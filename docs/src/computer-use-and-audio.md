@@ -79,7 +79,13 @@ recovery path to the error (permission missing **or** invalidated by a
 re-signed build; toggle it off/on under System Settings → Privacy &
 Security → Screen & System Audio Recording, then relaunch — grants are only
 re-read at launch), and requests screen-capture access once per process so
-a fresh install gets the native prompt.
+a fresh install gets the native prompt. The CU executor's raw
+`screencapture` fallback gets the same treatment
+(`cu_readiness::enrich_capture_failure`): when the capture fails **and**
+`CGPreflightScreenCaptureAccess` confirms the permission is missing, the
+error names Screen Recording, the affected binary path, and the System
+Settings destination instead of the bare "could not create image from
+display".
 
 `scripts/bundle-macos.sh` defends the identity's stability:
 
@@ -116,6 +122,16 @@ available. Exposed as an MCP tool (in the `core` bootstrap profile) and as
 `intendant ctl cu elements [--format json]`. Pixels remain the fallback for
 visual verification and for apps with sparse accessibility trees (web views
 notably).
+
+Long element values and window titles (a `data:` URL, a whole document in a
+text view) are length-capped **once, centrally**
+(`computer_use::cap_screen_elements_texts`, 80 chars) with a stable marker —
+`prefix… [N chars total, #hash8]` — so one long value cannot dominate the
+observation while staying distinguishable from other long values sharing its
+prefix. The platform readers deliberately do not pre-truncate; the
+`full_values: true` tool param (`ctl cu elements --full-values`) skips the
+cap for exact-value requests (Linux AT-SPI still bounds each text fetch at a
+documented 4096-char transport cap).
 
 ### Who Can Call CU
 
@@ -184,6 +200,39 @@ Computer Use, the operator must enable **Allow Remote Interaction** in the
 physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
+
+### CU Readiness Diagnosis (`display_readiness`)
+
+The display grant is **Intendant authority only** — OS-level capability is a
+separate set of layers, and any of them can block actual CU while the grant
+reads as held (the classic macOS shape: `already_granted`, yet Screen
+Recording denies every capture). `src/bin/caller/cu_readiness.rs` probes five
+layers independently and names the non-ready ones, each with a fix:
+
+1. **`intendant_display_authority`** — the user-display grant / caller trust
+   (virtual targets need none).
+2. **`screen_capture_permission`** — macOS Screen Recording
+   (`CGPreflightScreenCaptureAccess`); Linux Wayland portal session or X11
+   socket; Windows desktop capture session.
+3. **`accessibility_permission`** — macOS Accessibility (`AXIsProcessTrusted`);
+   Linux AT-SPI bus reachability (bounded probe); Windows UIA client
+   instantiation.
+4. **`target_display`** — the requested display exists / has a live capture
+   session.
+5. **`input_backend`** — CGEvent (macOS, rides Accessibility), XTest (X11),
+   portal remote desktop (Wayland), SendInput via session (Windows).
+
+Probes are cheap, strictly read-only (they never pop permission prompts), and
+**never cached** — TCC and portal state can change or be revoked at any
+moment. A probe that cannot determine its layer reports `unknown`, and
+unknown counts as **not ready** (fail closed). Surfaces:
+
+- the `display_readiness` MCP tool (display-view IAM class; listed in the
+  `core` and `screen` profiles),
+- `intendant ctl display status [--target TARGET]`,
+- `request_user_display` answers (`already_granted` and approvals) carry an
+  `os_readiness` gap block naming any still-blocked OS layers, so a granted
+  request can never masquerade as a CU-ready one.
 
 ### Three separate concepts: private view, agent share, presence streaming
 
