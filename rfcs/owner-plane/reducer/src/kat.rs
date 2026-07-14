@@ -32,7 +32,7 @@ use crate::harness::SemStatus;
 // ------------------------------------------------- the mini writer
 
 /// The reducer's canonical encoder — maps sort by ENCODED key bytes.
-enum Enc {
+pub(crate) enum Enc {
     U(u64),
     B(Vec<u8>),
     T(&'static str),
@@ -60,7 +60,7 @@ fn header(major: u8, n: u64) -> Vec<u8> {
     }
 }
 
-fn encode(e: &Enc) -> Vec<u8> {
+pub(crate) fn encode(e: &Enc) -> Vec<u8> {
     match e {
         Enc::U(n) => header(0, *n),
         Enc::B(b) => {

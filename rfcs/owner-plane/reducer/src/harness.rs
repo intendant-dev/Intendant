@@ -183,6 +183,7 @@ fn run_semantics(vector: &Json) -> SemStatus {
         "fold" => run_fold_vector(vector),
         "journal-replay" => run_journal_vector(vector),
         "export-import" => run_export_import(vector),
+        "status-derive" => run_status_derive(vector),
         "edge-admission" => crate::edge::edge_admission(vector),
         "frame-roundtrip" => crate::edge::frame_roundtrip(vector),
         "corruption-negative" => crate::edge::corruption_negative(vector),
@@ -280,6 +281,82 @@ fn run_export_import(vector: &Json) -> Result<SemStatus, String> {
         return Ok(SemStatus::Fail(
             "held release_op differs from the expected".into(),
         ));
+    }
+    Ok(SemStatus::Pass)
+}
+
+/// The status-derive lane (§11.2): a fold vector whose result
+/// carries `derived` rows — the reducer re-derives each named
+/// claim's status through its own five-step fold at `as_of_ms`.
+fn run_status_derive(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let as_of = vector["inputs"]["as_of_ms"].as_u64().ok_or("as_of_ms")?;
+    let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?
+        .iter()
+        .map(|d| {
+            d.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or("delivery not an array")
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut runs = Vec::new();
+    for order in &deliveries {
+        match crate::fold::run_delivery(&items, order) {
+            Ok(run) => runs.push(run),
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+        }
+    }
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let (fresh, state) = match crate::fold::run_delivery_with_state(&items, &fresh_order) {
+        Ok(v) => v,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    for (i, run) in runs.iter().enumerate() {
+        if run.final_verdicts != fresh.final_verdicts {
+            return Ok(SemStatus::Fail(format!(
+                "delivery {i} final state diverges from the fresh fold"
+            )));
+        }
+    }
+
+    let rows = vector["expected"]["result"]["derived"]
+        .as_array()
+        .ok_or("result.derived")?;
+    for row in rows {
+        let name = row["item"].as_str().ok_or("row.item")?;
+        let want = row["value"].as_str().ok_or("row.value")?;
+        let bytes = items.get(name).ok_or("derived names unknown item")?;
+        let hash = crate::domains::h("op", bytes);
+        match state.claim_status(&hash, as_of) {
+            Some(got) if got == want => {}
+            Some(got) => {
+                return Ok(SemStatus::Fail(format!(
+                    "{name}: expected status {want}, reducer derived {got}"
+                )))
+            }
+            None => {
+                return Ok(SemStatus::Fail(format!(
+                    "{name}: not a held claim in the final state"
+                )))
+            }
+        }
     }
     Ok(SemStatus::Pass)
 }
@@ -616,8 +693,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            97,
-            "the tranche plus the corpus through family 14"
+            104,
+            "the tranche plus the corpus through the status-derive slice"
         );
         for r in &reports {
             assert!(

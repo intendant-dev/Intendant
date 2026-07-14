@@ -132,11 +132,31 @@ struct HeldTenantOp {
     gen: u64,
     seq: u64,
     cited_grant: [u8; 32],
+    /// The signed actor (kind, id) — the §11.2 authoring principal is
+    /// (lineage, kind, id).
+    actor_kind: String,
+    actor_id: String,
+    /// §10.1 shape-1 direct-human evidence: human kind, no
+    /// attestation (class-compatibility rides the §7.6 table; the
+    /// tranche's classes all admit human presence).
+    human_evidence: bool,
+    /// §11.4 derived actor class.
+    actor_class: &'static str,
     /// m.claim content — (kind, statement, sensitivity rank): the
     /// D-134 source-equality material.
     claim: Option<(String, String, u8)>,
     release: Option<ReleaseFacts>,
     import: Option<ImportFacts>,
+    judge: Option<JudgeFacts>,
+}
+
+/// One admitted judgment's §11.2 counting facts.
+#[derive(Debug, Clone)]
+struct JudgeFacts {
+    verdict: String,
+    target: [u8; 32],
+    /// Supersede only.
+    replacement: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +189,20 @@ struct TenantBoundary {
     selector_grant: Option<[u8; 32]>,
     /// (gen, max seq) pairs — empty = nothing stands.
     caps: Vec<(u64, u64)>,
+}
+
+/// One registered space: id, zone, class, and its bound status
+/// policy (id + carried hash — the polref every judgment must match).
+#[derive(Debug, Clone)]
+struct SpaceInfo {
+    space_id: [u8; 16],
+    /// Recorded for the space→zone consistency checks later slices
+    /// add (space-retire, cross-zone scope).
+    #[allow(dead_code)]
+    zone_id: [u8; 16],
+    space_class: String,
+    policy_id: String,
+    policy_hash: [u8; 32],
 }
 
 /// One accepted C3′: named entries preserve at-or-below (immutable
@@ -240,7 +274,7 @@ pub struct State {
     ctrl_next_seq: u64,
     ctrl_head: [u8; 32],
     zones: Vec<[u8; 16]>,
-    spaces: Vec<([u8; 16], [u8; 16])>, // (space_id, zone_id)
+    spaces: Vec<SpaceInfo>,
     certs: Vec<HeldCert>,
     grants: Vec<HeldGrant>,
     lineages: Vec<([u8; 16], [u8; 16])>, // (lineage, device_id)
@@ -755,10 +789,11 @@ impl State {
         for r in recipients {
             self.record_wrap(zone_id.unwrap_or_default(), 1, r);
         }
-        self.spaces
-            .push((home_id.unwrap(), zone_id.unwrap_or_default()));
-        self.spaces
-            .push((audit_id.unwrap(), zone_id.unwrap_or_default()));
+        for sd in [home, audit] {
+            if let Some(v) = self.record_space(sd, zone_id.unwrap_or_default())? {
+                return ok(Err(v));
+            }
+        }
         self.lineages
             .push((lineage_id.unwrap(), device_id.unwrap()));
         self.record_cert(cert)?;
@@ -1678,12 +1713,14 @@ impl State {
                 "pending-dependency",
             )));
         }
-        if self.spaces.iter().any(|(s, _)| *s == space_id) {
+        if self.spaces.iter().any(|s| s.space_id == space_id) {
             return ok(Err(bad()));
+        }
+        if let Some(v) = self.record_space(body, zone_id)? {
+            return ok(Err(v));
         }
 
         // Accept.
-        self.spaces.push((space_id, zone_id));
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
         ok(Ok(()))
@@ -1981,6 +2018,32 @@ impl State {
         ok(Ok(grant))
     }
 
+    /// §11.4 derived actor class. Human evidence + full judgment
+    /// rights = owner; human otherwise = safe-human; an attested
+    /// actor = session (shape 2); service kind = service. A BARE
+    /// non-human unattested writer (autonomous daemon/browser) has
+    /// no §11.4 row — derived as `session` here (the closest §10.1
+    /// reading; a register/audit item, not settled prose).
+    fn actor_class(op: &SignedOp, grant: &HeldGrant) -> &'static str {
+        let h = &op.header;
+        let human = h.actor_kind == "human" && h.attested_by.is_none();
+        if human {
+            let full = grant
+                .verbs
+                .iter()
+                .any(|v| matches!(v.as_str(), "judge.full" | "pin.full" | "curate.instruction"));
+            if full {
+                "owner"
+            } else {
+                "safe-human"
+            }
+        } else if h.actor_kind == "service" {
+            "service"
+        } else {
+            "session"
+        }
+    }
+
     /// Accept a tenant op into its chain and the held registry. The
     /// held record's FOLD verdict is thereafter derived (§10.5).
     fn record_tenant(
@@ -1990,6 +2053,7 @@ impl State {
         claim: Option<(String, String, u8)>,
         release: Option<ReleaseFacts>,
         import: Option<ImportFacts>,
+        judge: Option<JudgeFacts>,
     ) {
         let h = &op.header;
         let key = (h.zone_id, h.writer_lineage, h.writer_gen);
@@ -2003,10 +2067,56 @@ impl State {
             gen: h.writer_gen,
             seq: h.writer_sequence,
             cited_grant: grant.h_grant,
+            actor_kind: h.actor_kind.to_string(),
+            actor_id: h.actor_id.to_string(),
+            human_evidence: h.actor_kind == "human" && h.attested_by.is_none(),
+            actor_class: Self::actor_class(op, grant),
             claim,
             release,
             import,
+            judge,
         });
+    }
+
+    /// Register a spacedef: class + the bound status policy. The
+    /// polref's hash must equal the reducer's OWN derivation of the
+    /// named built-in (B.2/B.3); an unknown policy id has no local
+    /// table to validate against.
+    fn record_space(
+        &mut self,
+        sd: &Node,
+        zone_id: [u8; 16],
+    ) -> Result<Option<Verdict>, Unimplemented> {
+        let bad = Some(Verdict::Rejected("body-invariant", "reject-permanent"));
+        let (Some(space_id), Some(class)) = (
+            b16_field(sd, "space_id"),
+            sd.get("space_class").and_then(|c| c.as_text()),
+        ) else {
+            return Ok(bad);
+        };
+        let Some(pol) = sd.get("status_policy") else {
+            return Ok(bad);
+        };
+        let (Some(pid), Some(phash)) = (
+            pol.get("id").and_then(|n| n.as_text()),
+            pol.get("hash").and_then(|n| n.bytes_n::<32>()),
+        ) else {
+            return Ok(bad);
+        };
+        let Some(known) = crate::policies::policy_hash(pid) else {
+            return Err(Unimplemented(format!("status policy {pid}")));
+        };
+        if known != phash {
+            return Ok(bad);
+        }
+        self.spaces.push(SpaceInfo {
+            space_id,
+            zone_id,
+            space_class: class.to_string(),
+            policy_id: pid.to_string(),
+            policy_hash: phash,
+        });
+        Ok(None)
     }
 
     /// Tenant `m.claim` (plain propose).
@@ -2042,6 +2152,7 @@ impl State {
             op,
             &grant,
             Some((kind.to_string(), statement.to_string(), sens)),
+            None,
             None,
             None,
         );
@@ -2152,6 +2263,7 @@ impl State {
                 dest_zone,
                 dest_space,
             }),
+            None,
             None,
         );
         ok(Ok(()))
@@ -2297,6 +2409,7 @@ impl State {
                 key: (from_plane, release_op, source_op),
                 grant_pos: grant.ctrl_pos,
             }),
+            None,
         );
         ok(Ok(()))
     }
@@ -2353,7 +2466,7 @@ impl State {
         }
 
         // Accept.
-        self.record_tenant(op, &grant, None, None, None);
+        self.record_tenant(op, &grant, None, None, None, None);
         for t in resolved {
             if !self.erase_queue.contains(&t) {
                 self.erase_queue.push(t);
@@ -2417,6 +2530,323 @@ impl State {
             .and_then(|r| r.claim.clone())
     }
 
+    /// Tenant `m.judge` (§11.1's judgment rows + §11.2 admission).
+    /// Verb selection is row-driven: judge.full requires the OWNER
+    /// class (§11.4); judge.safe requires direct-human evidence and
+    /// an observation/episode target; retract/supersede additionally
+    /// admit through a claim-authoring verb under the AUTHOR
+    /// relation (supersede only on workflow spaces). Counting toward
+    /// status is the SEPARATE §11.2 policy question — an admitted
+    /// judgment may be recorded and never status-changing.
+    fn admit_judge(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        // Resolve the citations first (the verb decision needs the
+        // grant AND the target).
+        let h = &op.header;
+        if h.tenant != "memory" {
+            return Err(Unimplemented(format!("tenant {}", h.tenant)));
+        }
+        let Proof::Dev { cap, .. } = h.proof else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        let Some(grant) = self.grants.iter().find(|g| g.h_grant == cap).cloned() else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        let body = &op.body;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let Some(verdict) = body.get("verdict").and_then(|v| v.as_text()) else {
+            return ok(Err(bad()));
+        };
+        let Some(target) = body.get("target").and_then(|n| n.bytes_n::<32>()) else {
+            return ok(Err(bad()));
+        };
+        let Some(target_rec) = self
+            .held_tenant
+            .iter()
+            .find(|r| r.op_hash == target)
+            .cloned()
+        else {
+            // The target claim may arrive later (D-199 spirit).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        let Some((target_kind, _, _)) = &target_rec.claim else {
+            return ok(Err(bad()));
+        };
+        let replacement = match verdict {
+            "supersede" => match body.get("replacement").and_then(|n| n.bytes_n::<32>()) {
+                Some(r) => {
+                    if !self.held_tenant.iter().any(|x| x.op_hash == r) {
+                        return ok(Err(Verdict::Pending(
+                            "ref-unresolved",
+                            "pending-dependency",
+                        )));
+                    }
+                    Some(r)
+                }
+                None => return ok(Err(bad())),
+            },
+            "accept" | "dispute" | "retract" | "retire" => None,
+            "raise_class" | "declassify" => {
+                return Err(Unimplemented("classification judgment arms".into()))
+            }
+            _ => return ok(Err(bad())),
+        };
+
+        // Verb selection (§11.1 rows).
+        let human = h.actor_kind == "human" && h.attested_by.is_none();
+        let has = |v: &str| grant.verbs.iter().any(|g| g == v);
+        let owner_class = human && has("judge.full");
+        let safe_kind = matches!(target_kind.as_str(), "observation" | "episode");
+        // The AUTHOR relation for the authoring-verb rows: principal
+        // equality, or same lineage with human evidence (§11.2).
+        let author = (h.writer_lineage == target_rec.lineage
+            && h.actor_kind == target_rec.actor_kind
+            && h.actor_id == target_rec.actor_id)
+            || (h.writer_lineage == target_rec.lineage && human);
+        let target_space_class = self
+            .spaces
+            .iter()
+            .find(|sp| sp.space_id == target_rec.space)
+            .map(|sp| sp.space_class.clone());
+        let verb = match verdict {
+            "accept" | "dispute" | "retire" => {
+                if owner_class {
+                    "judge.full"
+                } else if has("judge.safe") && human && safe_kind {
+                    "judge.safe"
+                } else if has("judge.safe") || has("judge.full") {
+                    // The verb exists; a row invariant fails
+                    // (evidence / class / kind).
+                    return ok(Err(bad()));
+                } else {
+                    return ok(Err(Verdict::Rejected("scope-op", "reject-permanent")));
+                }
+            }
+            "retract" => {
+                if owner_class {
+                    "judge.full"
+                } else if author && has("propose") {
+                    "propose"
+                } else if author && has("assert") {
+                    "assert"
+                } else if has("judge.full") || has("propose") || has("assert") {
+                    return ok(Err(bad()));
+                } else {
+                    return ok(Err(Verdict::Rejected("scope-op", "reject-permanent")));
+                }
+            }
+            "supersede" => {
+                let in_workflow = target_space_class.as_deref() == Some("workflow");
+                if owner_class {
+                    "judge.full"
+                } else if author && in_workflow && has("propose") {
+                    "propose"
+                } else if author && in_workflow && has("assert") {
+                    "assert"
+                } else if has("judge.full") || has("propose") || has("assert") {
+                    return ok(Err(bad()));
+                } else {
+                    return ok(Err(Verdict::Rejected("scope-op", "reject-permanent")));
+                }
+            }
+            _ => unreachable!("verdict vetted above"),
+        };
+
+        // The shared preamble under the selected verb.
+        let grant = match self.tenant_preamble(op, verb)? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        // Target in grant scope (zone/space axes against the CITING
+        // grant; the kind axis binds the TARGET's kind).
+        if grant.zone.is_some_and(|z| z != target_rec.zone) {
+            return ok(Err(Verdict::Rejected("scope-zone", "reject-permanent")));
+        }
+        if grant
+            .spaces
+            .as_ref()
+            .is_some_and(|sp| !sp.contains(&target_rec.space))
+        {
+            return ok(Err(Verdict::Rejected("scope-space", "reject-permanent")));
+        }
+        if grant
+            .kinds
+            .as_ref()
+            .is_some_and(|ks| !ks.iter().any(|k| k == target_kind))
+        {
+            return ok(Err(Verdict::Rejected("scope-kind", "reject-permanent")));
+        }
+
+        // The cited polref must match the TARGET space's bound
+        // policy (§13.3: a policy hash mismatch is `policy-missing`).
+        let Some(pol) = body.get("policy") else {
+            return ok(Err(bad()));
+        };
+        let (Some(pid), Some(phash)) = (
+            pol.get("id").and_then(|n| n.as_text()),
+            pol.get("hash").and_then(|n| n.bytes_n::<32>()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        let Some(space) = self
+            .spaces
+            .iter()
+            .find(|sp| sp.space_id == target_rec.space)
+        else {
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if space.policy_id != pid || space.policy_hash != phash {
+            return ok(Err(Verdict::Pending(
+                "policy-missing",
+                "pending-dependency",
+            )));
+        }
+
+        self.record_tenant(
+            op,
+            &grant,
+            None,
+            None,
+            None,
+            Some(JudgeFacts {
+                verdict: verdict.to_string(),
+                target,
+                replacement,
+            }),
+        );
+        ok(Ok(()))
+    }
+
+    /// Does judgment `j` COUNT toward `target`'s status under the
+    /// target space's bound policy (§11.2)? Admission already passed
+    /// (j is held); this is the five-axis rule match.
+    fn judgment_counts(&self, j: &HeldTenantOp, target: &HeldTenantOp) -> bool {
+        let Some(jf) = &j.judge else { return false };
+        let Some((target_kind, _, _)) = &target.claim else {
+            return false;
+        };
+        let Some(space) = self.spaces.iter().find(|sp| sp.space_id == target.space) else {
+            return false;
+        };
+        let Some(rules) = crate::policies::rules_for(&space.policy_id) else {
+            return false;
+        };
+        let relation_holds = |rel: &str| -> bool {
+            match rel {
+                "any" => true,
+                "self" => {
+                    j.lineage == target.lineage
+                        && j.actor_kind == target.actor_kind
+                        && j.actor_id == target.actor_id
+                }
+                "author" => {
+                    (j.lineage == target.lineage
+                        && j.actor_kind == target.actor_kind
+                        && j.actor_id == target.actor_id)
+                        || (j.lineage == target.lineage && j.human_evidence)
+                }
+                _ => false,
+            }
+        };
+        rules.iter().any(|r| {
+            r.verdict == jf.verdict
+                && r.kinds.is_none_or(|ks| ks.contains(&target_kind.as_str()))
+                && r.space_classes
+                    .is_none_or(|scs| scs.contains(&space.space_class.as_str()))
+                && r.actor_classes.contains(&j.actor_class)
+                && relation_holds(r.relation)
+        })
+    }
+
+    /// The §11.2 status fold. `as_of` is carried for the temporal
+    /// terms (none of the corpus claims carry validity windows yet —
+    /// the parameter is threaded, unused). Cycle detection per rule 2
+    /// (a supersession cycle derives `disputed`).
+    pub(crate) fn claim_status(&self, target_hash: &[u8; 32], as_of: u64) -> Option<&'static str> {
+        self.claim_status_inner(target_hash, as_of, &mut Vec::new())
+    }
+
+    // The `as_of` parameter is threaded for the temporal terms no
+    // corpus claim exercises yet (valid_from/expires) — deliberately
+    // recursion-only today.
+    #[allow(clippy::only_used_in_recursion)]
+    fn claim_status_inner(
+        &self,
+        target_hash: &[u8; 32],
+        as_of: u64,
+        visiting: &mut Vec<[u8; 32]>,
+    ) -> Option<&'static str> {
+        let target = self
+            .held_tenant
+            .iter()
+            .find(|r| r.op_hash == *target_hash && r.claim.is_some())?;
+        if !self.op_standing(target) {
+            // A quarantined claim holds no status lane here; the
+            // derived verdict already carries its state.
+            return Some("candidate");
+        }
+        let judgments: Vec<&HeldTenantOp> = self
+            .held_tenant
+            .iter()
+            .filter(|j| {
+                j.judge.as_ref().is_some_and(|jf| jf.target == *target_hash)
+                    && self.op_standing(j)
+                    && self.judgment_counts(j, target)
+            })
+            .collect();
+        // 1: retract/retire.
+        if judgments.iter().any(|j| {
+            matches!(
+                j.judge.as_ref().expect("filtered").verdict.as_str(),
+                "retract" | "retire"
+            )
+        }) {
+            return Some("retired");
+        }
+        // 2: supersede with an ACCEPTED replacement; cycles dispute.
+        for j in &judgments {
+            let jf = j.judge.as_ref().expect("filtered");
+            if jf.verdict != "supersede" {
+                continue;
+            }
+            let Some(r) = jf.replacement else { continue };
+            if visiting.contains(&r) || r == *target_hash {
+                return Some("disputed");
+            }
+            visiting.push(*target_hash);
+            let r_status = self.claim_status_inner(&r, as_of, visiting);
+            visiting.pop();
+            if r_status == Some("accepted") {
+                return Some("superseded");
+            }
+        }
+        // 3: an authorized dispute (ancestor-exempt accepts need
+        // causal references, which no corpus fixture carries yet).
+        if judgments
+            .iter()
+            .any(|j| j.judge.as_ref().expect("filtered").verdict == "dispute")
+        {
+            return Some("disputed");
+        }
+        // 4: accept.
+        if judgments
+            .iter()
+            .any(|j| j.judge.as_ref().expect("filtered").verdict == "accept")
+        {
+            return Some("accepted");
+        }
+        // 5.
+        Some("candidate")
+    }
+
     /// Dispatch one operation.
     fn admit(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
         match op.header.operation_type {
@@ -2432,6 +2862,7 @@ impl State {
             "c.space_create" => self.admit_space_create(op),
             "c.recovery_succession" => self.admit_recovery(op),
             "m.claim" => self.admit_claim(op),
+            "m.judge" => self.admit_judge(op),
             "m.export.release" => self.admit_release(op),
             "m.import.claim" => self.admit_import(op),
             "m.erase_request" => self.admit_erase_request(op),

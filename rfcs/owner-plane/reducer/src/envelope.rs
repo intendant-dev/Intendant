@@ -415,9 +415,9 @@ mod tests {
             "unexpected body-hash failures"
         );
         // Every fold fixture folds its genesis (6 tranche + 12
-        // fold-lane + 1 export-import corpus); the two byte-level
-        // journal fixtures deliver Txn frames only.
-        assert_eq!(geneses, 19);
+        // fold-lane + 1 export-import + 7 status corpus); the two
+        // byte-level journal fixtures deliver Txn frames only.
+        assert_eq!(geneses, 26);
     }
 
     /// Tampering any byte of the header breaks the signature; the
