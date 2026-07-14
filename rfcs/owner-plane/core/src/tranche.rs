@@ -99,6 +99,26 @@ fn trusted_verbs() -> Vec<Verb> {
     ]
 }
 
+/// −P and its scalar: the SEC1 point negation of a P-256 key and the
+/// matching secret n − d — derivable by ANY holder of d, which is
+/// exactly D-190's residual (freshness equivalence is exact SEC1
+/// bytes; negation is deliberately NOT detected).
+pub fn negate_p256(pk: &[u8; 65], sk: &[u8; 32]) -> ([u8; 65], [u8; 32]) {
+    use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+    use p256::elliptic_curve::PrimeField;
+    let ep = p256::EncodedPoint::from_bytes(&pk[..]).expect("SEC1 parses");
+    let aff = p256::AffinePoint::from_encoded_point(&ep).expect("point on curve");
+    let neg = (-p256::ProjectivePoint::from(aff)).to_affine();
+    let neg_pk: [u8; 65] = neg
+        .to_encoded_point(false)
+        .as_bytes()
+        .try_into()
+        .expect("uncompressed SEC1");
+    let d = p256::Scalar::from_repr((*sk).into()).expect("scalar in range");
+    let neg_sk: [u8; 32] = (-d).to_repr().into();
+    (neg_pk, neg_sk)
+}
+
 /// Draw a 16-byte real ID (N1: the first 8 bytes must not be all
 /// zero — astronomically improbable from the stream; asserted).
 fn draw_id(rng: &mut RecordingRng, name: &str) -> Bytes16 {
@@ -135,12 +155,20 @@ impl Device {
 }
 
 /// Draw a device: ed25519 signing keypair, P-256 KEM keypair
-/// (RFC 9180 DeriveKeyPair), ids, and its daemon-class certificate.
-fn mint_device(rng: &mut RecordingRng, tag: &str, plane_id: Bytes32) -> Device {
+/// (RFC 9180 DeriveKeyPair — or the caller-supplied pair, in which
+/// case no KEM ikm is drawn), ids, and its daemon-class certificate.
+fn mint_device_inner(
+    rng: &mut RecordingRng,
+    tag: &str,
+    plane_id: Bytes32,
+    kem: Option<([u8; 32], [u8; 65])>,
+) -> Device {
     let sig_seed = rng.draw32(&format!("{tag}.sig_seed"));
     let (sig_sk, sig_pk) = suite::ed25519::keypair(&sig_seed);
-    let kem_ikm = rng.draw32(&format!("{tag}.kem_ikm"));
-    let (kem_sk, kem_pk) = hpke_wrap::derive_keypair(&kem_ikm);
+    let (kem_sk, kem_pk) = kem.unwrap_or_else(|| {
+        let kem_ikm = rng.draw32(&format!("{tag}.kem_ikm"));
+        hpke_wrap::derive_keypair(&kem_ikm)
+    });
     let device_id = draw_id(rng, &format!("{tag}.device_id"));
     let lineage = draw_id(rng, &format!("{tag}.lineage"));
     let revocation_id = draw_id(rng, &format!("{tag}.revocation_id"));
@@ -218,7 +246,7 @@ impl PlaneRig {
             &cbor::encode(&descriptor.to_value()).expect("descriptor encodes"),
         );
 
-        let dev1 = mint_device(&mut rng, "dev1", plane_id);
+        let dev1 = mint_device_inner(&mut rng, "dev1", plane_id, None);
         let zone_id = draw_id(&mut rng, "zone_id");
         let home_space_id = draw_id(&mut rng, "home.space_id");
         let home_name_hash = rng.draw32("home.name_hash");
@@ -362,9 +390,18 @@ impl PlaneRig {
         }
     }
 
-    /// Draw a device (see [`mint_device`]).
+    /// Draw a device (see [`mint_device_inner`]).
     pub fn mint_device(&mut self, tag: &str) -> Device {
-        mint_device(&mut self.rng, tag, self.plane_id)
+        mint_device_inner(&mut self.rng, tag, self.plane_id, None)
+    }
+
+    /// Draw a device whose KEM key is the NEGATION of the given pair
+    /// (D-190): fresh signing key and ids, `kem_pk = −P`,
+    /// `kem_sk = n − d`. No KEM ikm is drawn — the key material is
+    /// derived, which is the point of the residual.
+    pub fn mint_device_negated(&mut self, tag: &str, of_pk: [u8; 65], of_sk: [u8; 32]) -> Device {
+        let (neg_pk, neg_sk) = negate_p256(&of_pk, &of_sk);
+        mint_device_inner(&mut self.rng, tag, self.plane_id, Some((neg_sk, neg_pk)))
     }
 
     /// An epoch-1 wrap of the zone KEK to `dev`.
@@ -593,9 +630,46 @@ pub fn f7_delayed_reference_convergence() -> Vector {
     }
 }
 
+/// Tranche #8 — family 7 fold: negation-residual acceptance (D-190):
+/// dev1's KEM point P is enrolled at genesis; a candidate device
+/// enrolls with `kem_pk = −P` (and a fresh signing key). The
+/// freshness domain compares EXACT SEC1 bytes — `−P ≠ P`, `mat_id`
+/// differs — so the enrollment ADMITS. The residual is deliberate
+/// (§14): a holder of scalar d derives −P's scalar, and no public
+/// identifier can detect the relation; the fixture's internals test
+/// demonstrates exactly that derivation opening the new wrap.
+pub fn f7_negation_residual() -> Vector {
+    let name = "negation-residual-acceptance";
+    let mut rig = PlaneRig::new(name);
+
+    let (p, d) = (rig.dev1.kem_pk, rig.dev1.kem_sk);
+    let dev2 = rig.mint_device_negated("dev2", p, d);
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+
+    let c1 = &rig.genesis_op;
+    let mut inputs = JsonMap::new();
+    inputs.insert("items".into(), items(&[("c1", c1), ("c2", &c2)]));
+    inputs.insert("deliveries".into(), json!([["c1", "c2"]]));
+
+    Vector {
+        family: 7,
+        name: name.into(),
+        case_kind: "fold".into(),
+        source: "7.1".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [admits("c1"), admits("c2")],
+            "converge": true,
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
-    vec![f7_delayed_reference_convergence()]
+    vec![f7_delayed_reference_convergence(), f7_negation_residual()]
 }
 
 #[cfg(test)]
@@ -631,6 +705,9 @@ mod tests {
         r#"authproof = { arm: "dev", cert: bytes32, cap: bytes32 }
             ; cert = H_cert(certificate bytes);
             ;   cap = H_grant(grant bytes) (D-77)"#,
+        // D-190 — the negation residual this tranche pins.
+        "**P-vs-−P negation reuse** (exact-SEC1 equality is deliberate — a holder of scalar d derives −P's scalar, and negation is NOT detected; D-190)",
+        "all under EXACT-SEC1 identity — −P and related keys are outside the equivalence, stated §14 residuals, D-190",
     ];
 
     #[test]
@@ -758,6 +835,42 @@ mod tests {
                 &w1.ct
             ),
             Some(rig.kek_e1)
+        );
+    }
+
+    /// D-190 internals: the negated certificate really carries −P
+    /// (distinct SEC1 bytes, distinct key_id and mat_id — outside the
+    /// freshness equivalence), and the scalar n − d that any holder
+    /// of d can derive opens the wrap addressed to −P — the stated
+    /// residual, demonstrated.
+    #[test]
+    fn f7_negation_residual_internals() {
+        use crate::shapes::envelope::mat_id;
+        let name = "negation-residual-acceptance";
+        let mut rig = PlaneRig::new(name);
+        let (p, d) = (rig.dev1.kem_pk, rig.dev1.kem_sk);
+        let dev2 = rig.mint_device_negated("dev2", p, d);
+
+        // −P is a different SEC1 point with different identifiers…
+        assert_ne!(dev2.kem_pk, p);
+        assert_eq!(dev2.kem_pk[1..33], p[1..33], "same X coordinate");
+        assert_ne!(dev2.kem_pk[33..], p[33..], "negated Y coordinate");
+        assert_ne!(
+            suite::key_id("hpke-p256-v1", &dev2.kem_pk),
+            suite::key_id("hpke-p256-v1", &p)
+        );
+        assert_ne!(mat_id(&dev2.kem_pk), mat_id(&p));
+
+        // …and the derived scalar opens a wrap addressed to it.
+        let w = rig.wrap_to(&dev2, "wrap.dev2.eph");
+        assert_eq!(
+            keyschedule::open_kek(&dev2.kem_sk, &rig.plane_id, &rig.zone_id, 1, &w.enc, &w.ct),
+            Some(rig.kek_e1)
+        );
+        // dev1's own scalar does NOT open it (it is a real distinct key).
+        assert_eq!(
+            keyschedule::open_kek(&d, &rig.plane_id, &rig.zone_id, 1, &w.enc, &w.ct),
+            None
         );
     }
 }
