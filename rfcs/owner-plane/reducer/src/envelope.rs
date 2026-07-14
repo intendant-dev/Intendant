@@ -429,8 +429,8 @@ mod tests {
         // Every fold fixture folds its genesis (6 tranche + 12
         // fold-lane + 1 export-import + 7 status + 7 time/lease +
         // 6 control-fold + 3 budget + 8 audit + 9 time corpus minus
-        // the journal pair; every fold fixture delivers c1); the two
-        // fixtures deliver Txn frames only.
+        // the journal four; every fold fixture delivers c1); the
+        // four journal fixtures deliver Txn frames only.
         assert_eq!(geneses, 54);
     }
 

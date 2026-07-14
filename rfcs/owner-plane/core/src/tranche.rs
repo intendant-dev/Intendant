@@ -1552,12 +1552,17 @@ pub fn f7_pending_revocation_window_grant() -> Vector {
     }
 }
 
-/// The shared journal preamble both journal fixtures mint: a real
+/// The shared journal preamble the journal fixtures mint: a real
 /// release triple sealed into its ItemCommit, committed in ONE Txn
 /// with the PendingXfer (§6.2 — the source-zone commit shape), plus
-/// the revocation op the abort bases cite (held via `aux`).
+/// the revocation op the abort bases cite (held via `aux`) and the
+/// control position just below it (a reopen's killing recovery
+/// bases there).
 struct JournalPreamble {
     rig: PlaneRig,
+    /// `(seq, op)` at the head BEFORE the revocation was sealed —
+    /// a recovery basing here cuts exactly the revocation.
+    pre_revoke: (u64, Bytes32),
     export_id: Bytes16,
     release_op: Bytes32,
     srcs: Vec<Bytes32>,
@@ -1577,6 +1582,7 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
     let g3 = rig.simple_grant("grant3", &dev2, vec![Verb::Import]);
     let g3_id = g3.grant_id;
     let grant3_op = rig.grant_op(g3);
+    let pre_revoke = rig.ctrl_position();
     let revoke_op = rig.revoke_grant_op(
         g3_id,
         // import is op-authoring: the revocation carries the target
@@ -1630,6 +1636,7 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
 
     JournalPreamble {
         rig,
+        pre_revoke,
         export_id,
         release_op,
         srcs,
@@ -1639,16 +1646,62 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
     }
 }
 
+/// An owner recovery based at `base` (§7.4): everything above the
+/// base lands on the cut branch and dissolves. Based at
+/// `pre_revoke`, the cut covers exactly the revocation — the
+/// semantically valid op-kind invalidation of the reopen traces
+/// (held, the journal machine verifies `base.seq <` the basis's
+/// chain position, D-163 verifiable-when-held; unheld, the citation
+/// pends). Based at or above the revocation, the basis SURVIVES and
+/// a reopen citing the recovery is verified-false.
+fn recovery_based_at(p: &mut JournalPreamble, base: (u64, Bytes32), tag: &str) -> Signedop {
+    let (base_seq, base_op) = base;
+    let admin2_seed = p.rig.rng.draw32(&format!("{tag}.admin.sig_seed"));
+    let (_a2_sk, a2_pk) = suite::ed25519::keypair(&admin2_seed);
+    let recovery2_seed = p.rig.rng.draw32(&format!("{tag}.recovery.sig_seed"));
+    let (_r2_sk, r2_pk) = suite::ed25519::keypair(&recovery2_seed);
+    p.rig.recovery_op_tagged(
+        tag,
+        Crecovsucc {
+            base_seq,
+            base_op,
+            epoch: 2,
+            repoch: 1,
+            new_admin: AdminKey {
+                alg: Sigalg::Ed25519,
+                pk: a2_pk.to_vec(),
+            },
+            new_recovery_commitment: h_tag(Tag::Drill, &r2_pk),
+            // Empty = the revivable blanket for every base-enrolled
+            // (zone, lineage) — the trace's owner rebases wholesale.
+            tenant_cutoffs: vec![],
+            adopted_renewals: None,
+            retired_keys: None,
+            adopted_rotations: vec![],
+        },
+    )
+}
+
+/// [`recovery_based_at`] below the revocation — the killing cut.
+fn recovery_cutting_revocation(p: &mut JournalPreamble) -> Signedop {
+    let base = p.pre_revoke;
+    recovery_based_at(p, base, "recovery-cut")
+}
+
 /// Tranche #4 — family 13 journal-replay: Abort/Reopen inside one
 /// Txn, then competing terminals inside one Txn (D-200). Journal
 /// order is `(frame ordinal, record index)`: t2's abort terminals
 /// interval 0 and its reopen — validating SEQUENTIALLY against
 /// transaction-local state — opens interval 1 (frame order alone
-/// could never order the pair). t3 then carries a Done AND an Abort
-/// for interval 1: the second terminal in one interval is a journal
-/// invariant violation, `(log-corrupt, storage-quarantine)`, and the
-/// commit is all-or-nothing — the Done is DISCARDED with it, so
-/// interval 1 stays open (the intervals result proves the discard).
+/// could never order the pair). The reopen's citations are a
+/// coherent D-163 trace: basis = the revocation the abort recorded,
+/// invalidation = the held recovery that cuts the chain below it —
+/// the machine VERIFIES the kill before admitting. t3 then carries a
+/// Done AND an Abort for interval 1: the second terminal in one
+/// interval is a journal invariant violation, `(log-corrupt,
+/// storage-quarantine)`, and the commit is all-or-nothing — the Done
+/// is DISCARDED with it, so interval 1 stays open (the intervals
+/// result proves the discard).
 pub fn f13_txn_internal_order() -> Vector {
     let name = "txn-internal-order-and-competing-terminals";
     let mut p = journal_preamble(name, 2);
@@ -1656,12 +1709,12 @@ pub fn f13_txn_internal_order() -> Vector {
     let x = Opfactref(p.revoke_op.op_hash());
     let (r1, r2) = (p.srcs[0], p.srcs[1]);
 
-    // The reopen's invalidation: a real signed statement, HELD via
-    // aux (the journal machine checks holding and basis-match; cause
-    // sufficiency is fold territory).
-    let d1 = p.rig.dev1.clone();
-    let fork_stmt = p.rig.storage_receipt(&d1, rop);
-    let s_id = fork_stmt.stmt_id();
+    // The reopen's invalidation: a REAL killer, held via aux — an
+    // owner recovery based below the revocation, whose §7.4 branch
+    // cut dissolves the recorded cause. The journal machine verifies
+    // the kill (base.seq < the basis's chain position) — a held
+    // citation is verifiable (D-163), never taken on faith.
+    let recovery = recovery_cutting_revocation(&mut p);
 
     let t2 = Txn {
         records: vec![
@@ -1686,7 +1739,7 @@ pub fn f13_txn_internal_order() -> Vector {
                 release_op: rop,
                 incarnation: 0,
                 basis: x,
-                invalidation: Factref::Stmt(s_id),
+                invalidation: Factref::Op(recovery.op_hash()),
             }),
         ],
     };
@@ -1723,7 +1776,7 @@ pub fn f13_txn_internal_order() -> Vector {
     let mut aux = JsonMap::new();
     aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
     aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
-    aux.insert("fork.stmt".into(), json!(hex(&enc(&fork_stmt))));
+    aux.insert("recovery.op".into(), json!(hex(&recovery.encode())));
     inputs.insert("aux".into(), Json::Object(aux));
 
     Vector {
@@ -1852,6 +1905,159 @@ pub fn f11_reopen_basis_types() -> Vector {
                 { "rec": "t2" },
                 { "rec": "t3", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
                 { "rec": "t4", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
+/// Family 11 journal-replay, the op-kind invalidation's pend arm:
+/// t3's reopen cites the REAL killer — the recovery that cuts the
+/// chain below its basis — but the recovery is not yet held, so the
+/// citation pends `ref-unresolved` (verifiable-when-held,
+/// D-163/D-185), reserving the interval across both orders. The
+/// basis itself IS held (aux), isolating the pend on the
+/// invalidation; the held sibling trace (where the same recovery
+/// rides aux and the reopen ADMITS) is
+/// `txn-internal-order-and-competing-terminals`.
+pub fn f11_reopen_recovery_invalidation_pends() -> Vector {
+    let name = "reopen-recovery-invalidation-unheld-pends";
+    let mut p = journal_preamble(name, 1);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let r1 = p.srcs[0];
+    // Minted so the citation names a real, well-formed killer —
+    // deliberately NEVER placed in aux.
+    let recovery = recovery_cutting_revocation(&mut p);
+
+    let t2 = Txn {
+        records: vec![Txnrec::XferAbort(Xferabort {
+            export_id: eid,
+            release_op: rop,
+            reason: AbortReason::RejectPermanent,
+            incarnation: 0,
+            missing: vec![MissingRec {
+                rec: r1,
+                basis: Some(x),
+            }],
+        })],
+    };
+    let t3 = Txn {
+        records: vec![Txnrec::XferReopen(Xferreopen {
+            export_id: eid,
+            release_op: rop,
+            incarnation: 0,
+            basis: x,
+            invalidation: Factref::Op(recovery.op_hash()),
+        })],
+    };
+
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["t1", "t2", "t3"], ["t3", "t2", "t1"]]),
+    );
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+            ],
+            "per_record": [
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
+/// Family 11 journal-replay, the kill predicate's teeth: t3's reopen
+/// cites a HELD recovery that bases AT the revocation's own position
+/// — the cut keeps the basis alive, so the citation is
+/// verified-FALSE: `(log-corrupt, storage-quarantine)` (D-163's
+/// uncited/unverifiable arm — a held citation is never taken on
+/// faith). Interval 0 stays aborted across both orders.
+pub fn f11_reopen_recovery_keeps_basis() -> Vector {
+    let name = "reopen-recovery-keeps-basis-rejects";
+    let mut p = journal_preamble(name, 1);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let r1 = p.srcs[0];
+    // Based at the post-revocation head: the revocation is at or
+    // below the base, so the branch cut does NOT dissolve it.
+    let keep = p.rig.ctrl_position();
+    let recovery = recovery_based_at(&mut p, keep, "recovery-keep");
+
+    let t2 = Txn {
+        records: vec![Txnrec::XferAbort(Xferabort {
+            export_id: eid,
+            release_op: rop,
+            reason: AbortReason::RejectPermanent,
+            incarnation: 0,
+            missing: vec![MissingRec {
+                rec: r1,
+                basis: Some(x),
+            }],
+        })],
+    };
+    let t3 = Txn {
+        records: vec![Txnrec::XferReopen(Xferreopen {
+            export_id: eid,
+            release_op: rop,
+            incarnation: 0,
+            basis: x,
+            invalidation: Factref::Op(recovery.op_hash()),
+        })],
+    };
+
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["t1", "t2", "t3"], ["t3", "t2", "t1"]]),
+    );
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    aux.insert("recovery.op".into(), json!(hex(&recovery.encode())));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+            ],
+            "per_record": [
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
             ],
             "converge": true,
         })),
@@ -2453,6 +2659,8 @@ pub fn tranche() -> Vec<Vector> {
         f11_collision_loser_reentry(),
         f11_erase_deferral(),
         f11_reopen_basis_types(),
+        f11_reopen_recovery_invalidation_pends(),
+        f11_reopen_recovery_keeps_basis(),
         f13_txn_internal_order(),
     ]
 }

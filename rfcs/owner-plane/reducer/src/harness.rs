@@ -891,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            141,
-            "the corpus through the repair tranche's D4 freeze-precedence pair"
+            143,
+            "the corpus through the repair tranche's D6/6b reopen-kill triple"
         );
         for r in &reports {
             assert!(

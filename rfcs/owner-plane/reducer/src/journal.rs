@@ -15,6 +15,21 @@
 //! discards every record in it. A shape-valid record whose cited fact
 //! is unheld PENDS `(ref-unresolved, pending-dependency)`, reserving
 //! the interval (verifiable-when-held, D-163/D-185).
+//!
+//! HELD citations are verified, never taken on faith: an aux op must
+//! carry a sound `body_hash` binding to register as held; a
+//! `source-erased` abort is a basis-FORBIDDEN cause class (D-193) so
+//! any basis row in one is malformed; and a reopen's held
+//! invalidation must actually KILL its basis — the one
+//! wire-expressible killer of a control-chain fact is a
+//! `c.recovery_succession` whose branch cut covers it (`base.seq <`
+//! the basis's chain position, §7.4/D-163). Statement killers
+//! (fork-discovery) have no §4.7 wire shape — a held stmt-kind
+//! invalidation is honestly Unimplemented until one exists (an audit
+//! finding); full cause SUFFICIENCY (this fact makes THAT record
+//! resolved-negative) needs source dereferencing and stays fold
+//! territory — the D-193 request-fork cause admits any op kind, so
+//! no closed kind check exists for abort bases.
 
 use std::collections::BTreeMap;
 
@@ -50,18 +65,27 @@ pub struct JournalState {
     /// release_op → journal (transfer identity is `release_op`,
     /// D-123).
     journals: BTreeMap<[u8; 32], Journal>,
-    /// Held facts for reference resolution: aux operation hashes and
-    /// aux statement ids.
-    held_ops: Vec<[u8; 32]>,
+    /// Held facts for reference resolution: aux operations by op hash
+    /// (bytes retained — held citations are VERIFIED against them)
+    /// and aux statement ids.
+    held_ops: BTreeMap<[u8; 32], Vec<u8>>,
     held_stmts: Vec<[u8; 32]>,
 }
 
 impl JournalState {
     /// Register one `aux` entry: an operation triple or a signed
-    /// statement (`{stmt, sig}` — `stmt_id = H_stmtid(bytes)`).
+    /// statement (`{stmt, sig}` — `stmt_id = H_stmtid(bytes)`). An op
+    /// whose carried `body_hash` does not bind its body never
+    /// registers as held (O1 — a broken triple resolves nothing).
     fn hold_aux(&mut self, bytes: &[u8]) -> Result<(), Unimplemented> {
-        if parse_op(bytes).is_ok() {
-            self.held_ops.push(domains::h("op", bytes));
+        if let Ok(op) = parse_op(bytes) {
+            if !op.body_hash_ok() {
+                return Err(Unimplemented(
+                    "aux op with a broken body_hash binding".into(),
+                ));
+            }
+            self.held_ops
+                .insert(domains::h("op", bytes), bytes.to_vec());
             return Ok(());
         }
         let node = decode(bytes).map_err(|e| Unimplemented(format!("aux decode: {e:?}")))?;
@@ -73,7 +97,7 @@ impl JournalState {
     }
 
     fn op_held(&self, h: &[u8; 32], fold: &State) -> bool {
-        self.held_ops.contains(h) || fold.holds_op(h)
+        self.held_ops.contains_key(h) || fold.holds_op(h)
     }
 
     /// Replay one txn frame. `Err(inner Verdict)` semantics ride the
@@ -301,8 +325,9 @@ impl JournalState {
         ) {
             return bad;
         }
+        let reason = rec.get("reason").and_then(|r| r.as_text());
         if !matches!(
-            rec.get("reason").and_then(|r| r.as_text()),
+            reason,
             Some("source-erased" | "reject-permanent" | "release-rejected")
         ) {
             return bad;
@@ -322,6 +347,17 @@ impl JournalState {
                 return bad;
             }
             if let Some(b) = m.get("basis") {
+                // Basis sufficiency, the checkable slice: the D-193
+                // cause table forbids a basis on `source-erased`
+                // rows (an erased source is basis-free by kind); the
+                // op-kind universe stays OPEN for the other reasons
+                // (request-fork's conflicting operation may be any
+                // op), so kind is not narrowed here — full cause
+                // sufficiency needs the sources and is fold
+                // territory.
+                if reason == Some("source-erased") {
+                    return bad;
+                }
                 let Some(op) = opfactref(b) else {
                     return bad;
                 };
@@ -393,9 +429,9 @@ impl JournalState {
                 "pending-dependency",
             )));
         }
-        let held = match invalidation {
-            Fact::Op(h) => self.op_held(&h, fold),
-            Fact::Stmt(id) => self.held_stmts.contains(&id),
+        let held = match &invalidation {
+            Fact::Op(h) => self.op_held(h, fold),
+            Fact::Stmt(id) => self.held_stmts.contains(id),
         };
         if !held {
             return Ok(Err(Verdict::Pending(
@@ -432,6 +468,70 @@ impl JournalState {
                     "ref-unresolved",
                     "pending-dependency",
                 )))
+            }
+        }
+        // Kill verification (D-163/D-179): a HELD citation is
+        // verifiable — the invalidation must actually dissolve the
+        // recorded basis, never be taken on faith. The one
+        // wire-expressible killer of a control-chain fact is a
+        // recovery whose §7.4 branch cut covers it: `base.seq`
+        // strictly below the basis's chain position on the SAME
+        // writer chain. A held recovery that KEEPS the basis is a
+        // verified-false citation — log-corrupt (D-163's
+        // "uncited/unverifiable"). Statement killers
+        // (fork-discovery) have no §4.7 wire shape, and other op
+        // kinds / cross-chain cuts have no vectors — both stay
+        // honestly Unimplemented.
+        let Some(basis_bytes) = self.held_ops.get(&basis) else {
+            return Err(Unimplemented(
+                "reopen kill verification needs the basis bytes held in aux".into(),
+            ));
+        };
+        let basis_op = parse_op(basis_bytes)
+            .map_err(|e| Unimplemented(format!("held basis re-parse: {e:?}")))?;
+        match &invalidation {
+            Fact::Op(h) => {
+                let Some(inv_bytes) = self.held_ops.get(h) else {
+                    return Err(Unimplemented(
+                        "reopen kill verification needs the invalidation bytes held in aux".into(),
+                    ));
+                };
+                let inv = parse_op(inv_bytes)
+                    .map_err(|e| Unimplemented(format!("held invalidation re-parse: {e:?}")))?;
+                if inv.header.operation_type != "c.recovery_succession" {
+                    return Err(Unimplemented(format!(
+                        "reopen kill verification for {:?} invalidations awaits vectors",
+                        inv.header.operation_type
+                    )));
+                }
+                if inv.header.writer_lineage != basis_op.header.writer_lineage {
+                    return Err(Unimplemented(
+                        "recovery-cut kill for a basis outside the recovery's chain awaits \
+                         vectors"
+                            .into(),
+                    ));
+                }
+                let base_seq = inv
+                    .body
+                    .get("base")
+                    .and_then(|b| b.get("seq"))
+                    .and_then(|n| n.as_uint());
+                let Some(base_seq) = base_seq else {
+                    // A held recovery without a readable base cannot
+                    // verify the kill.
+                    return bad;
+                };
+                if base_seq >= basis_op.header.writer_sequence {
+                    // The recovery keeps the basis: verified-false.
+                    return bad;
+                }
+            }
+            Fact::Stmt(_) => {
+                return Err(Unimplemented(
+                    "stmt-kind invalidation kill verification awaits a fork-discovery statement \
+                     wire shape (§4.7 carries none — audit finding)"
+                        .into(),
+                ));
             }
         }
         j.intervals.push(None);
@@ -702,6 +802,39 @@ mod tests {
             Verdict::Rejected("log-corrupt", "storage-quarantine")
         );
         assert_eq!(run.intervals, vec![(0, "abort"), (1, "open")]);
+    }
+
+    /// f11 pend arm: the reopen cites the REAL killing recovery
+    /// (based below its basis), but unheld — the citation pends,
+    /// reserving the interval in both orders.
+    #[test]
+    fn reopen_recovery_invalidation_unheld_pends() {
+        let (items, aux, v) = load("f11-reopen-recovery-invalidation-unheld-pends.json");
+        let run = run_journal(&items, &aux, &order(&v)).unwrap();
+        assert_eq!(run.final_verdicts["t1"], Verdict::Admitted);
+        assert_eq!(run.final_verdicts["t2"], Verdict::Admitted);
+        assert_eq!(
+            run.final_verdicts["t3"],
+            Verdict::Pending("ref-unresolved", "pending-dependency")
+        );
+        assert_eq!(run.intervals, vec![(0, "abort")]);
+    }
+
+    /// f11 verified-false arm: the reopen cites a HELD recovery that
+    /// bases AT the revocation — the basis survives the cut, so the
+    /// citation fails verification: log-corrupt, interval 0 stays
+    /// aborted.
+    #[test]
+    fn reopen_recovery_keeping_basis_rejects() {
+        let (items, aux, v) = load("f11-reopen-recovery-keeps-basis-rejects.json");
+        let run = run_journal(&items, &aux, &order(&v)).unwrap();
+        assert_eq!(run.final_verdicts["t1"], Verdict::Admitted);
+        assert_eq!(run.final_verdicts["t2"], Verdict::Admitted);
+        assert_eq!(
+            run.final_verdicts["t3"],
+            Verdict::Rejected("log-corrupt", "storage-quarantine")
+        );
+        assert_eq!(run.intervals, vec![(0, "abort")]);
     }
 
     /// f11-reopen: a shape-valid reopen with an unheld stmt-kind
