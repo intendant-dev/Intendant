@@ -19,7 +19,9 @@ use crate::cbor;
 use crate::domains::{h_tag, Tag};
 use crate::keyschedule;
 use crate::scenario;
-use crate::shapes::control::{ctrl_header, Cenrollnew, Cgenesis};
+use crate::shapes::control::{
+    ctrl_header, Cenrollnew, Cgenesis, Cgrant, Ckekrotate, Crevokedev, RevokeMode,
+};
 use crate::shapes::envelope::{
     gen_start, seal_op, Actor, ActorKind, Header, OpSigner, Signedop, Tenant, Writer,
 };
@@ -28,8 +30,8 @@ use crate::shapes::identity::{
 };
 use crate::shapes::memory::Mclaim;
 use crate::shapes::{
-    Bytes16, Bytes32, Class, Devclass, Hlc, Kekwrap, Kind, Lineagedef, Polref, Sigalg, Spaceclass,
-    Spacedef, ToValue, Verb,
+    Bytes16, Bytes32, Class, Devclass, Frontierclose, Hlc, Kekwrap, Kind, Lineagedef, Polref,
+    Sigalg, Spaceclass, Spacedef, ToValue, Verb,
 };
 use crate::suite::{self, hpke_wrap};
 use crate::vector::{hex, Expected, RecordingRng, Vector};
@@ -406,22 +408,30 @@ impl PlaneRig {
 
     /// An epoch-1 wrap of the zone KEK to `dev`.
     pub fn wrap_to(&mut self, dev: &Device, draw: &str) -> Kekwrap {
+        let kek = self.kek_e1;
+        self.wrap_at(dev.device_id, &dev.kem_pk.clone(), 1, &kek, draw)
+    }
+
+    /// A wrap of `kek` at `epoch` to the given recipient (rotations
+    /// mint fresh KEKs at `new_epoch = current + 1`).
+    pub fn wrap_at(
+        &mut self,
+        device_id: Bytes16,
+        kem_pk: &[u8; 65],
+        epoch: u64,
+        kek: &[u8; 32],
+        draw: &str,
+    ) -> Kekwrap {
         let eph = self.rng.draw32(draw);
-        let (enc, ct) = keyschedule::wrap_kek(
-            &dev.kem_pk,
-            &self.plane_id,
-            &self.zone_id,
-            1,
-            &self.kek_e1,
-            &eph,
-        )
-        .expect("derived recipient key is well-formed");
+        let (enc, ct) =
+            keyschedule::wrap_kek(kem_pk, &self.plane_id, &self.zone_id, epoch, kek, &eph)
+                .expect("derived recipient key is well-formed");
         Kekwrap {
             plane_id: self.plane_id,
             zone_id: self.zone_id,
-            epoch: 1,
-            recipient_device: dev.device_id,
-            recipient_kem_key: suite::key_id("hpke-p256-v1", &dev.kem_pk),
+            epoch,
+            recipient_device: device_id,
+            recipient_kem_key: suite::key_id("hpke-p256-v1", kem_pk),
             enc,
             ct,
         }
@@ -502,6 +512,54 @@ impl PlaneRig {
             ctrl_frontier: self.ctrl_head,
         };
         self.seal_ctrl(Cenrollnew::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.grant` — issue one grant (admin arm).
+    pub fn grant_op(&mut self, grant: Grant) -> Signedop {
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Cgrant::OP_TYPE, proof, Cgrant { grant }.to_value())
+    }
+
+    /// `c.revoke_device` (exclude mode) targeting `target`'s
+    /// `revocation_id`, with the given authorship-domain cutoffs and
+    /// no rotation references (legal on a trusted plane — references
+    /// are typed linkage, never coverage; D-180/D-195).
+    pub fn revoke_device_exclude(
+        &mut self,
+        target: &Device,
+        cutoffs: Vec<Frontierclose>,
+    ) -> Signedop {
+        let body = Crevokedev {
+            mode: RevokeMode::Exclude,
+            revocation_id: target.revocation_id,
+            cutoffs,
+            receipt_cutoffs: None,
+            rotation_refs: vec![],
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Crevokedev::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.kek_rotate` to `new_epoch` with the given wraps and an
+    /// empty erase manifest.
+    pub fn kek_rotate(&mut self, new_epoch: u64, wraps: Vec<Kekwrap>) -> Signedop {
+        let body = Ckekrotate {
+            zone_id: self.zone_id,
+            new_epoch,
+            wraps,
+            erase_manifest: vec![],
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Ckekrotate::OP_TYPE, proof, body.to_value())
     }
 
     /// A tenant `m.claim` (plain propose) by `dev` under `grant`, at
@@ -667,9 +725,111 @@ pub fn f7_negation_residual() -> Vector {
     }
 }
 
+/// Tranche #5 — family 7 fold: pending `c.revoke_device` → grant
+/// issued in the window → completing continuation (D-195). The
+/// compound `r` covers dev2's authorship domain (one zone, empty
+/// heads — nothing authored) but dev2's decryptable-wrap domain is
+/// nonempty, so `r` pends `ref-unresolved`. `g` issues dev2 a grant
+/// in the window — the certificate ceases only at the COMPLETING
+/// acceptance's position, so `g` was issued while it was effective
+/// and ADMITS. `k` (an epoch-2 rotation excluding dev2) empties the
+/// wrap domain: cessation = `k`'s position. The out-of-order delivery
+/// additionally pins §9.3's chain arithmetic on the CONTROL chain: a
+/// successor citing an unknown predecessor is `causal-missing`.
+pub fn f7_pending_revocation_window_grant() -> Vector {
+    let name = "pending-revocation-window-grant-completing-rotation";
+    let mut rig = PlaneRig::new(name);
+
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+
+    // r: authorship cutoffs total (the zone, empty heads — D-143);
+    // wrap domain nonempty (the epoch-1 wrap) → pends.
+    let r = {
+        let cutoff = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: dev2.lineage,
+            heads: vec![],
+        };
+        rig.revoke_device_exclude(&dev2, vec![cutoff])
+    };
+
+    // g: a window-issued grant to the pending-revocation device.
+    let grant3 = rig.simple_grant("grant3", &dev2, vec![Verb::Propose]);
+    let g = rig.grant_op(grant3);
+
+    // k: the completing exclusion — fresh epoch-2 KEK wrapped to dev1
+    // only (the last-holder precondition retains a recipient).
+    let k = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (d1_id, d1_pk) = (rig.dev1.device_id, rig.dev1.kem_pk);
+        let w = rig.wrap_at(d1_id, &d1_pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+
+    let c1 = &rig.genesis_op;
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items(&[("c1", c1), ("c2", &c2), ("r", &r), ("g", &g), ("k", &k)]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["c1", "c2", "r", "g", "k"], ["c1", "c2", "g", "k", "r"],]),
+    );
+
+    Vector {
+        family: 7,
+        name: name.into(),
+        case_kind: "fold".into(),
+        source: "7.1".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [
+                admits("c1"),
+                admits("c2"),
+                admits("r"),
+                admits("g"),
+                admits("k"),
+            ],
+            "converge": true,
+            "trace": [
+                {
+                    "delivery": 0,
+                    "after": "r",
+                    "item": "r",
+                    "outcome": "ref-unresolved",
+                    "disposition": "pending-dependency",
+                },
+                {
+                    "delivery": 1,
+                    "after": "g",
+                    "item": "g",
+                    "outcome": "causal-missing",
+                    "disposition": "pending-dependency",
+                },
+                {
+                    "delivery": 1,
+                    "after": "k",
+                    "item": "k",
+                    "outcome": "causal-missing",
+                    "disposition": "pending-dependency",
+                },
+            ],
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
-    vec![f7_delayed_reference_convergence(), f7_negation_residual()]
+    vec![
+        f7_delayed_reference_convergence(),
+        f7_negation_residual(),
+        f7_pending_revocation_window_grant(),
+    ]
 }
 
 #[cfg(test)]
