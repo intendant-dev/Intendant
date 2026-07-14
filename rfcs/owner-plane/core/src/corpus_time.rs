@@ -25,8 +25,10 @@
 //! - `lease-missing` vs `lease-stale`: no held in-window evidence
 //!   AND no receipt at all = `lease-missing` (awaiting arrival —
 //!   pending-dependency); a held QUALIFIED receipt outside every
-//!   valid lease window = `lease-stale` (conclusive staleness —
-//!   quarantine-reproposal, per the §10.5 disposition split).
+//!   valid lease window = `lease-stale` (staleness on the HELD
+//!   evidence — quarantine-reproposal, per the §10.5 disposition
+//!   split; whether a later timely receipt re-opens the verdict is
+//!   the open D5 lifecycle question, decisions-pending.md).
 
 use crate::cbor;
 use crate::keyschedule::{item_addr, seal_item};
@@ -361,8 +363,8 @@ pub fn f9_lease_stale_quarantines() -> Vector {
     let lease = a
         .rig
         .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 86_400_000);
-    // seen_ms = expires + skew + 100 s — conclusively outside T5's
-    // window.
+    // seen_ms = expires + skew + 100 s — outside T5's window on the
+    // held evidence.
     let rcpt = a
         .rig
         .accept_receipt(&d2, addr, T0_MS + 86_400_000 + 300_000 + 100_000);

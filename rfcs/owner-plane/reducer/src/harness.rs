@@ -398,13 +398,14 @@ fn run_status_derive(vector: &Json) -> Result<SemStatus, String> {
         let bytes = items.get(name).ok_or("derived names unknown item")?;
         let hash = crate::domains::h("op", bytes);
         match state.claim_status(&hash, as_of) {
-            Some(got) if got == want => {}
-            Some(got) => {
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+            Ok(Some(got)) if got == want => {}
+            Ok(Some(got)) => {
                 return Ok(SemStatus::Fail(format!(
                     "{name}: expected status {want}, reducer derived {got}"
                 )))
             }
-            None => {
+            Ok(None) => {
                 return Ok(SemStatus::Fail(format!(
                     "{name}: not a held claim in the final state"
                 )))
