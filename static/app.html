@@ -28045,7 +28045,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '22fcab42c072bcd5';
+const INTENDANT_APP_BUILD = 'eecaf6cd30987a85';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -102380,6 +102380,9 @@ function handleDisplayRequestResolved(d) {
     // A target materializing mid-turn is the first-message case: the send
     // happened before any session existed, so the phase edge fired with
     // nothing to show — open now that there is a transcript to watch.
+    // Same replay guard as the phase edge: rebinds driven by bootstrap
+    // replay are history, not a turn in flight.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
     if (PEEK_WORKING_CATS.has(peekLastPhaseCat) && !peekDismissed && !peekComposerPill()) {
       peekOpen();
     }
@@ -102401,6 +102404,10 @@ function handleDisplayRequestResolved(d) {
       return;
     }
     if (wasWorking || peekDismissed || peekIsOpen() || peekComposerPill()) return;
+    // Bootstrap replay re-drives historical phase edges through the
+    // mirror — auto-opening on those would pop the peek on every page
+    // load of a dashboard with any past task.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
     peekOpen();
   }
 
@@ -102475,6 +102482,12 @@ function handleDisplayRequestResolved(d) {
     });
   }
 
+  // Boot autofocus (and any other programmatic focus before the user has
+  // touched the page) must not open the peek — a sheet popping over the
+  // content on every load of a dashboard with history is a surprise, not
+  // an affordance. Focus counts as intent only after a real gesture.
+  let peekSawUserGesture = false;
+
   const peekWire = () => {
     const root = document.getElementById('ui2-composer-peek');
     const bar = root ? root.closest('.global-task-bar') : null;
@@ -102483,7 +102496,11 @@ function handleDisplayRequestResolved(d) {
     peekBarEl = bar;
     peekBuild(root);
 
+    document.addEventListener('pointerdown', () => { peekSawUserGesture = true; }, { capture: true, passive: true });
+    document.addEventListener('keydown', () => { peekSawUserGesture = true; }, { capture: true });
+
     bar.addEventListener('focusin', (e) => {
+      if (!peekSawUserGesture) return;
       if (peekIsOpen() || peekComposerPill()) return;
       // Focus moving WITHIN the dock (input → Send, the close button's
       // refocus) is not an entry — reopening there would undo an Esc/×
