@@ -18,7 +18,9 @@
 // PeerFileTransferConnection instances; helpers touch only fields the
 // callers already share (`pc`, `_answerApplied`, `_pendingCandidates`,
 // `_heldKeys`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
-// `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`).
+// `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`, plus
+// the liveness-guard state this file owns: `_pauseGuard`,
+// `_resumeVideoPending`, `_freezeWatch`, `_freezeWatchGen`).
 // Per-class UX (status vocabulary, toasts, chip DOM ids, log copy) stays
 // in the classes and reaches the core through the hook parameters.
 
@@ -598,6 +600,259 @@ function displayViewerClearNoTrackWatchdog(viewer) {
     window.clearTimeout(viewer._noTrackTimer);
     viewer._noTrackTimer = null;
   }
+}
+
+// ── Live-video pause guard (shared driver) ──────────────────────────────
+// WebKit pauses a muted live <video> on tab switches and on every DOM
+// reparent (the local stage moves whole through the thumb / fullscreen /
+// Station containers; peer pane DOM is rebuilt on every daemons-list
+// re-render) and does NOT auto-resume; Chromium mostly resumes srcObject
+// streams on its own, which is why this never surfaced before Safari
+// became a supported consumer. A paused element under a live track shows
+// a frozen frame while the input datachannels keep working — it reads as
+// catastrophic remote-control lag (live incident, 2026-07-13). While the
+// viewer is live, every pause is spurious: resume it.
+//
+// The guard state lives on `owner._pauseGuard` and is REBOUND by every
+// `displayViewerArmPauseGuard` call: the local DisplaySlot arms once (its
+// element lives for the slot's whole life), the peer path re-arms on
+// every pane rebuild so the resume path always targets the CURRENT
+// element. Stale listeners on replaced elements go inert via the
+// owner/element identity checks rather than being removed (the old
+// element is garbage as soon as the pane rebuild drops it).
+const DISPLAY_VIEWER_PAUSE_RESUME_DELAY_MS = 120;
+
+function displayViewerArmPauseGuard(owner, videoEl, isLive, onResume) {
+  owner._pauseGuard = {
+    videoEl: videoEl || null,
+    isLive: isLive || (() => true),
+    onResume: onResume || null,
+  };
+  if (!videoEl || videoEl._displayViewerPauseGuardFor === owner) return;
+  videoEl._displayViewerPauseGuardFor = owner;
+  videoEl.addEventListener('pause', () => {
+    const guard = owner._pauseGuard;
+    // Inert when the guard was rebound to a replacement element (peer
+    // pane rebuild) or the element to a newer connection (peer retry
+    // reuses the pane): the CURRENT binding owns resumes.
+    if (!guard || guard.videoEl !== videoEl) return;
+    if (videoEl._displayViewerPauseGuardFor !== owner) return;
+    displayViewerResumeLiveVideoSoon(owner);
+  });
+}
+
+function displayViewerResumeLiveVideoSoon(owner) {
+  const guard = owner._pauseGuard;
+  if (!guard || owner._resumeVideoPending) return;
+  if (!guard.isLive() || !guard.videoEl || !guard.videoEl.srcObject) return;
+  owner._resumeVideoPending = true;
+  // Next macrotask: a reparent's pause fires between the removal and the
+  // re-insert, and a play() issued while the element is out of the
+  // document is voided by the move itself.
+  setTimeout(() => {
+    owner._resumeVideoPending = false;
+    // Re-read the guard: a pane rebuild inside the delay retargets the
+    // resume at the current element (the replaced one is garbage).
+    const g = owner._pauseGuard;
+    if (!g || !g.isLive() || !g.videoEl || !g.videoEl.srcObject) return;
+    if (!g.videoEl.paused) return;
+    const p = g.videoEl.play();
+    if (p && p.catch) p.catch(() => {});
+    if (g.onResume) g.onResume();
+  }, DISPLAY_VIEWER_PAUSE_RESUME_DELAY_MS);
+}
+
+// Re-kick playback if the element sits paused under a live connection
+// (tab return, missed pause event during a reparent). Safe to call any
+// time; no-ops unless the owner's guard says live with a stream attached.
+function displayViewerResumeLiveVideoIfPaused(owner) {
+  const guard = owner._pauseGuard;
+  if (guard && guard.videoEl && guard.videoEl.paused) {
+    displayViewerResumeLiveVideoSoon(owner);
+  }
+}
+
+// ── Post-first-frame freeze watchdog (shared driver) ────────────────────
+// The no-track watchdog above covers "connected but no video EVER
+// arrived"; this covers the rest of the session: a stream that rendered
+// fine and then stopped advancing. Progress is measured as PRESENTED
+// frames via a requestVideoFrameCallback pump where the engine supports
+// it (the pump is the honest signal for the incident class — a paused or
+// wedged element under a live track, where DECODE keeps advancing);
+// engines without rVFC fall back to framesDecoded deltas from the shared
+// 3s stats sampler (`viewer._statsPrev`), which catches stream-level
+// freezes but cannot see a stalled element.
+//
+// Honesty of the timeout: the daemon-side capture bridge re-pushes the
+// latest frame once per second on idle desktops (IDLE_HEARTBEAT in
+// crates/intendant-display), so ≥1 fps reaches a healthy viewer even
+// with nothing changing on screen — six missed heartbeats is evidence of
+// a stall, not an idle desktop.
+//
+// Escalation ladder (never an auto-reconnect loop): after
+// DISPLAY_VIEWER_FREEZE_TIMEOUT_MS without progress, ONE automatic
+// resume attempt through the pause-guard path; if frames still don't
+// advance within the grace window, `onStalled(seconds)` fires once so
+// the class surfaces its stage overlay with the manual reconnect
+// affordance. `onRecovered()` fires only on real frame progress after
+// either step, so the class can clear that overlay.
+//
+// Gating: ticks are inert while the connection isn't live (retry /
+// disconnect machinery owns messaging then — the watchdog never stomps
+// their overlays), while the tab is hidden, and while the element isn't
+// actually rendered (display:none pane, deselected `ui2-live-inactive`
+// stage, tile-mode-hidden peer video, 0-dim containers) — rVFC
+// legitimately stops firing in all of those, so freshness is unknowable
+// and the pause-guard visibility sweep owns resume-on-return instead.
+const DISPLAY_VIEWER_FREEZE_TIMEOUT_MS = 6000;
+const DISPLAY_VIEWER_FREEZE_RESUME_GRACE_MS = 2000;
+const DISPLAY_VIEWER_FREEZE_POLL_MS = 1000;
+
+// `hooks`: { videoEl(), isLive(), tryResume(), onStalled(seconds),
+// onRecovered() } — all required. Arm on first rendered frame; re-arming
+// replaces the previous watchdog (fresh negotiation = fresh baseline).
+function displayViewerArmFreezeWatchdog(viewer, hooks) {
+  displayViewerClearFreezeWatchdog(viewer);
+  const gen = (viewer._freezeWatchGen || 0) + 1;
+  viewer._freezeWatchGen = gen;
+  viewer._freezeWatch = {
+    gen,
+    hooks,
+    lastProgressAt: performance.now(),
+    lastFrames: viewer._statsPrev ? viewer._statsPrev.frames : null,
+    resumeAttempted: false,
+    overlayShown: false,
+    pumpEl: null,
+    timer: window.setInterval(
+      () => displayViewerFreezeWatchTick(viewer, gen),
+      DISPLAY_VIEWER_FREEZE_POLL_MS,
+    ),
+  };
+  displayViewerFreezeWatchBindPump(viewer);
+}
+
+function displayViewerClearFreezeWatchdog(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  if (w.timer) window.clearInterval(w.timer);
+  viewer._freezeWatch = null;
+}
+
+// (Re)bind the rVFC pump to the CURRENT video element. The local slot's
+// element is constructor-owned so the arm-time bind is final; the peer
+// path calls this again from attachToDom because its pane <video> is
+// rebuilt on every daemons-list re-render. A pump on a replaced element
+// stops re-arming itself the next time it fires and sees it lost the
+// element identity check.
+function displayViewerFreezeWatchBindPump(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  const el = w.hooks.videoEl();
+  if (!el || typeof el.requestVideoFrameCallback !== 'function') return;
+  if (w.pumpEl === el) return;
+  w.pumpEl = el;
+  const gen = w.gen;
+  const pump = () => {
+    const cur = viewer._freezeWatch;
+    if (!cur || cur.gen !== gen) return; // watchdog cleared or re-armed
+    if (cur.hooks.videoEl() !== el) {
+      // Element replaced; the attachToDom rebind owns the new one. Fall
+      // back to stats probing until it lands.
+      if (cur.pumpEl === el) cur.pumpEl = null;
+      return;
+    }
+    displayViewerFreezeWatchMarkProgress(viewer);
+    el.requestVideoFrameCallback(pump);
+  };
+  el.requestVideoFrameCallback(pump);
+}
+
+function displayViewerFreezeWatchMarkProgress(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  w.lastProgressAt = performance.now();
+  w.resumeAttempted = false;
+  if (w.overlayShown) {
+    w.overlayShown = false;
+    w.hooks.onRecovered();
+  }
+}
+
+// An element is "rendered" when it has a laid-out box with real area:
+// covers detached nodes, display:none ancestors (deselected stages,
+// hidden tab panels, the peer video hidden under tile mode), and 0-dim
+// containers. visibility:hidden still measures — acceptable: engines
+// keep presenting those, so the watchdog stays honest there.
+function displayViewerElementRendered(el) {
+  if (!el || !el.isConnected) return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 1 && rect.height > 1;
+}
+
+function displayViewerFreezeWatchTick(viewer, gen) {
+  const w = viewer._freezeWatch;
+  if (!w || w.gen !== gen) return;
+  const hooks = w.hooks;
+  const now = performance.now();
+  if (!hooks.isLive()) {
+    // Retry/teardown machinery owns status + overlay from here; stand
+    // down without touching them (a shown freeze overlay stays until
+    // frames really resume or the class clears the watchdog).
+    w.lastProgressAt = now;
+    w.resumeAttempted = false;
+    return;
+  }
+  // Fallback progress probe: only when no rVFC pump is driving (decode
+  // progress cannot vouch for presentation, so it must not mask a
+  // stalled element when the pump is available).
+  if (!w.pumpEl) {
+    const frames = viewer._statsPrev ? viewer._statsPrev.frames : null;
+    if (frames !== null && frames !== undefined && frames !== w.lastFrames) {
+      w.lastFrames = frames;
+      displayViewerFreezeWatchMarkProgress(viewer);
+      return;
+    }
+  }
+  const el = hooks.videoEl();
+  if (document.hidden || !displayViewerElementRendered(el)) {
+    // Not being presented anywhere the user can see: freshness is
+    // unknowable (rVFC legitimately idles), so reset the clock instead
+    // of alarming. The visibilitychange/pageshow sweep owns resume.
+    w.lastProgressAt = now;
+    w.resumeAttempted = false;
+    return;
+  }
+  const stalledMs = now - w.lastProgressAt;
+  if (stalledMs < DISPLAY_VIEWER_FREEZE_TIMEOUT_MS) return;
+  if (!w.resumeAttempted) {
+    // Step 1, once per episode: the pause-guard resume path (a paused
+    // element under a live track is the incident class; play() on an
+    // already-playing element is harmless).
+    w.resumeAttempted = true;
+    hooks.tryResume();
+    return;
+  }
+  if (stalledMs < DISPLAY_VIEWER_FREEZE_TIMEOUT_MS + DISPLAY_VIEWER_FREEZE_RESUME_GRACE_MS) return;
+  if (!w.overlayShown) {
+    // Step 2, once per episode: a visible, actionable state. The class
+    // decides the copy + retry affordance; no automatic reconnects.
+    w.overlayShown = true;
+    hooks.onStalled(Math.max(1, Math.round(stalledMs / 1000)));
+  }
+}
+
+// QA snapshot of a viewer's freeze-watchdog state (null when unarmed) —
+// consumed by qa.liveDisplay() / qa.peerDisplays().
+function displayViewerFreezeWatchQa(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return null;
+  return {
+    armed: true,
+    source: w.pumpEl ? 'rvfc' : 'stats',
+    stalledMs: Math.max(0, Math.round(performance.now() - w.lastProgressAt)),
+    resumeAttempted: Boolean(w.resumeAttempted),
+    overlayShown: Boolean(w.overlayShown),
+  };
 }
 
 // ── Frame capture + attach lane ─────────────────────────────────────────
