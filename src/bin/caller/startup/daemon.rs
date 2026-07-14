@@ -164,13 +164,16 @@ pub(crate) async fn run_daemon(
 
     let shared_codex_config = shared_codex_config_from_project(project);
     let shared_claude_config = shared_claude_config_from_project(project);
+    let settings_root = project_root
+        .clone()
+        .unwrap_or_else(project::daemon_settings_config_root);
     let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
         autonomy: autonomy.clone(),
         external_agent: shared_external_agent.clone(),
         codex_config: shared_codex_config.clone(),
         claude_config: shared_claude_config.clone(),
         bus: bus.clone(),
-        project_root: project_root.clone(),
+        project_root: Some(settings_root),
     });
 
     // Session vitals: cache/limits are usage-driven and cover every

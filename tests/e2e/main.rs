@@ -712,6 +712,15 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     use futures_util::SinkExt;
 
     let rig = TestRig::new();
+    // Projectless daemons keep durable dashboard defaults under their state
+    // root without turning that root into a session project.
+    let daemon_state = rig.home.path().join(".intendant");
+    std::fs::create_dir_all(&daemon_state).expect("create daemon state root");
+    std::fs::write(
+        daemon_state.join("intendant.toml"),
+        "[agent.codex]\nmodel = \"gpt-5.6-sol\"\n\n[agent.claude_code]\nmodel = \"fable\"\n",
+    )
+    .expect("seed daemon-wide settings");
     let script = rig.write_script(&serde_json::json!({
         "profiles": [{
             "steps": [
@@ -782,6 +791,42 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
             .is_some_and(|v| v.is_null()),
         "projectless daemon must report project_root: null, got {project_root_body}"
     );
+
+    // Config scope is independent of project scope: Settings loads and saves
+    // against the daemon root while /api/project-root remains null.
+    let mut settings: serde_json::Value = http
+        .get(format!("{base}/api/settings"))
+        .send()
+        .await
+        .expect("GET projectless settings")
+        .error_for_status()
+        .expect("projectless settings status")
+        .json()
+        .await
+        .expect("projectless settings JSON");
+    assert_eq!(settings["codex_model"], "gpt-5.6-sol");
+    assert_eq!(settings["claude_model"], "fable");
+    assert!(settings["codex_models"]
+        .as_array()
+        .is_some_and(|models| models.iter().all(|model| model["id"] != "gpt-5.6")));
+    settings["codex_model"] = serde_json::json!("gpt-5.6-terra");
+    settings["claude_model"] = serde_json::json!("sonnet");
+    let save: serde_json::Value = http
+        .post(format!("{base}/api/settings"))
+        .json(&settings)
+        .send()
+        .await
+        .expect("POST projectless settings")
+        .error_for_status()
+        .expect("projectless settings save status")
+        .json()
+        .await
+        .expect("projectless settings save JSON");
+    assert_eq!(save["ok"], true);
+    let saved = std::fs::read_to_string(daemon_state.join("intendant.toml"))
+        .expect("read daemon-wide settings");
+    assert!(saved.contains("model = \"gpt-5.6-terra\""), "{saved}");
+    assert!(saved.contains("model = \"sonnet\""), "{saved}");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await

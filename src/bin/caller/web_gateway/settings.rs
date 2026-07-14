@@ -3,6 +3,7 @@
 //! set/status, and the thin per-route stream handlers.
 
 use super::*;
+use std::io::Read;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CodexModelChoice {
@@ -10,6 +11,158 @@ pub struct CodexModelChoice {
     pub display_name: String,
     pub default_reasoning_effort: String,
     pub reasoning_efforts: Vec<String>,
+}
+
+const MAX_CODEX_MODELS_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CODEX_AUTH_METADATA_BYTES: usize = 64 * 1024;
+
+#[derive(serde::Deserialize)]
+struct CodexModelsCache {
+    #[serde(default)]
+    models: Vec<CachedCodexModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct CachedCodexModel {
+    slug: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CachedCodexReasoningLevel>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    supported_in_api: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct CachedCodexReasoningLevel {
+    effort: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexAuthMetadata {
+    #[serde(default)]
+    auth_mode: Option<String>,
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+/// Match Codex's picker filter: ChatGPT and agent-identity auth use the
+/// Codex backend and can expose subscription-only models; API-key (or
+/// unknown) auth only gets entries marked `supported_in_api`.
+fn codex_auth_uses_codex_backend(codex_home: &Path) -> bool {
+    let bytes =
+        match read_bounded_file(&codex_home.join("auth.json"), MAX_CODEX_AUTH_METADATA_BYTES) {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+    let auth: CodexAuthMetadata = match serde_json::from_slice(&bytes) {
+        Ok(auth) => auth,
+        Err(_) => return false,
+    };
+    matches!(
+        auth.auth_mode
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("chatgpt" | "chatgptauthtokens" | "agentidentity")
+    )
+}
+
+/// Read the model vocabulary Codex cached for its currently signed-in
+/// account. The cache is advisory UI data only: Codex remains the launch-time
+/// authority, malformed/oversized files fall back to the conservative daemon
+/// catalog, and custom ids remain available in the picker.
+fn codex_model_choices_from_cache(codex_home: &Path) -> Option<Vec<CodexModelChoice>> {
+    let bytes = read_bounded_file(
+        &codex_home.join("models_cache.json"),
+        MAX_CODEX_MODELS_CACHE_BYTES,
+    )?;
+    let cache: CodexModelsCache = serde_json::from_slice(&bytes).ok()?;
+    let uses_codex_backend = codex_auth_uses_codex_backend(codex_home);
+    let mut seen = std::collections::HashSet::new();
+    let mut choices = Vec::new();
+    for cached in cache.models {
+        if cached
+            .visibility
+            .as_deref()
+            .is_some_and(|visibility| !visibility.eq_ignore_ascii_case("list"))
+            || (!uses_codex_backend && cached.supported_in_api == Some(false))
+        {
+            continue;
+        }
+        let id = cached.slug.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let static_entry = crate::project::codex_model_catalog_entry(id);
+        let mut reasoning_efforts = Vec::new();
+        for level in cached.supported_reasoning_levels {
+            let effort = level.effort.trim();
+            if !effort.is_empty()
+                && !reasoning_efforts
+                    .iter()
+                    .any(|existing: &String| existing == effort)
+            {
+                reasoning_efforts.push(effort.to_string());
+            }
+        }
+        if reasoning_efforts.is_empty() {
+            if let Some(entry) = static_entry {
+                reasoning_efforts = entry
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| (*effort).to_string())
+                    .collect();
+            }
+        }
+        let mut default_reasoning_effort = cached
+            .default_reasoning_level
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_string)
+            .or_else(|| static_entry.map(|entry| entry.default_reasoning_effort.to_string()))
+            .or_else(|| {
+                reasoning_efforts
+                    .iter()
+                    .find(|effort| effort.as_str() == "medium")
+                    .cloned()
+            })
+            .or_else(|| reasoning_efforts.first().cloned())
+            .unwrap_or_default();
+        if !default_reasoning_effort.is_empty()
+            && !reasoning_efforts.contains(&default_reasoning_effort)
+        {
+            reasoning_efforts.push(default_reasoning_effort.clone());
+        }
+        if default_reasoning_effort.is_empty() && !reasoning_efforts.is_empty() {
+            default_reasoning_effort = reasoning_efforts[0].clone();
+        }
+        let display_name = cached.display_name.trim();
+        choices.push(CodexModelChoice {
+            id: id.to_string(),
+            display_name: if display_name.is_empty() {
+                id.to_string()
+            } else {
+                display_name.to_string()
+            },
+            default_reasoning_effort,
+            reasoning_efforts,
+        });
+    }
+    (!choices.is_empty()).then_some(choices)
 }
 
 /// Settings payload for GET/POST /api/settings.
@@ -76,11 +229,11 @@ pub struct SettingsPayload {
     #[serde(default)]
     pub codex_service_tier: Option<String>,
     #[serde(default)]
-    pub codex_web_search: bool,
+    pub codex_web_search: Option<bool>,
     #[serde(default)]
-    pub codex_network_access: bool,
+    pub codex_network_access: Option<bool>,
     #[serde(default)]
-    pub codex_writable_roots: Vec<String>,
+    pub codex_writable_roots: Option<Vec<String>>,
     #[serde(default, alias = "codex_context_recovery")]
     pub codex_managed_context: Option<String>,
     #[serde(default)]
@@ -215,9 +368,9 @@ pub(crate) fn settings_payload_from_config(
         codex_service_tier: crate::project::normalize_codex_service_tier(
             config.agent.codex.service_tier.as_deref(),
         ),
-        codex_web_search: config.agent.codex.web_search,
-        codex_network_access: config.agent.codex.network_access,
-        codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        codex_web_search: Some(config.agent.codex.web_search),
+        codex_network_access: Some(config.agent.codex.network_access),
+        codex_writable_roots: Some(config.agent.codex.writable_roots.clone()),
         codex_managed_context: Some(crate::project::normalize_codex_managed_context(
             &config.agent.codex.managed_context,
         )),
@@ -257,6 +410,22 @@ pub(crate) async fn settings_payload_with_runtime_overrides(
             .as_ref()
             .map(|backend| backend.as_short_str().to_string());
     }
+    if let Some(codex_home) = runtime.codex_home.as_deref() {
+        if let Some(models) = codex_model_choices_from_cache(codex_home) {
+            // Preserve the daemon's canonical custom-id vocabulary, then
+            // append any account-advertised effort that is newer than this
+            // build so the picker remains forward-compatible.
+            for effort in models
+                .iter()
+                .flat_map(|model| model.reasoning_efforts.iter())
+            {
+                if !payload.codex_reasoning_efforts.contains(effort) {
+                    payload.codex_reasoning_efforts.push(effort.clone());
+                }
+            }
+            payload.codex_models = models;
+        }
+    }
     payload
 }
 
@@ -264,7 +433,8 @@ pub(crate) async fn settings_get_response_body(
     project_root: Option<&Path>,
     runtime_settings: &RuntimeSettingsState,
 ) -> String {
-    match project_root {
+    let settings_root = runtime_settings.settings_root.as_deref().or(project_root);
+    match settings_root {
         Some(root) => match crate::project::Project::from_root(root.to_path_buf()) {
             Ok(proj) => {
                 let payload =
@@ -327,9 +497,37 @@ pub(crate) fn apply_settings_payload(
     if let Some(policy) = payload.codex_approval_policy.as_deref() {
         config.agent.codex.approval_policy = crate::project::normalize_approval_policy(policy);
     }
+    if payload.codex_model.is_some() {
+        // Empty clears the override (Codex chooses its account/config
+        // default). Omission leaves the existing value untouched for older
+        // partial API clients.
+        config.agent.codex.model = payload
+            .codex_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+    }
+    if payload.codex_reasoning_effort.is_some() {
+        config.agent.codex.reasoning_effort =
+            crate::project::normalize_reasoning_effort(payload.codex_reasoning_effort.as_deref());
+    }
     if payload.codex_service_tier.is_some() {
         config.agent.codex.service_tier =
             crate::project::normalize_codex_service_tier(payload.codex_service_tier.as_deref());
+    }
+    if let Some(enabled) = payload.codex_web_search {
+        config.agent.codex.web_search = enabled;
+    }
+    if let Some(enabled) = payload.codex_network_access {
+        config.agent.codex.network_access = enabled;
+    }
+    if let Some(roots) = payload.codex_writable_roots.as_ref() {
+        config.agent.codex.writable_roots = roots
+            .iter()
+            .map(|root| root.trim().to_string())
+            .filter(|root| !root.is_empty())
+            .collect();
     }
     if let Some(mode) = payload.codex_managed_context.as_deref() {
         config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
@@ -392,14 +590,14 @@ pub(crate) fn settings_post_result(
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
         Ok(()) => {
-            dispatch_codex_settings_control_msgs(bus, &payload);
+            dispatch_agent_settings_control_msgs(bus, &payload);
             (200, serde_json::json!({"ok": true}).to_string())
         }
         Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
-/// Mirror just-persisted `[agent.codex]` settings into the live control plane.
+/// Mirror just-persisted external-agent settings into the live control plane.
 ///
 /// `apply_settings_payload` + `save_config` update the TOML, but session
 /// launches read the live `CodexRuntimeConfig`, which OVERLAYS the TOML
@@ -414,10 +612,14 @@ pub(crate) fn settings_post_result(
 /// own synchronous TOML write (kept above) is what makes an immediate
 /// GET /api/settings read back the saved values.
 ///
-/// Only fields actually present in the payload are dispatched, mirroring
-/// `apply_settings_payload`'s conditional writes; only codex fields with a
-/// live control-plane setter are covered.
-pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
+/// Optional fields dispatch only when present, mirroring
+/// `apply_settings_payload`'s partial-client compatibility. The dashboard's
+/// full payload includes the bool and list fields, while older partial API
+/// clients can omit them without clearing live state.
+pub(crate) fn dispatch_agent_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
+    bus.send(AppEvent::ControlCommand(ControlMsg::SetExternalAgent {
+        agent: payload.external_agent.clone(),
+    }));
     if payload.codex_command.is_some() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
             command: payload.codex_command.clone(),
@@ -440,10 +642,37 @@ pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &Set
             ControlMsg::SetCodexApprovalPolicy { policy },
         ));
     }
+    if payload.codex_model.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexModel {
+            model: payload.codex_model.clone(),
+        }));
+    }
+    if payload.codex_reasoning_effort.is_some() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: payload.codex_reasoning_effort.clone(),
+            },
+        ));
+    }
     if payload.codex_service_tier.is_some() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
             service_tier: payload.codex_service_tier.clone(),
         }));
+    }
+    if let Some(enabled) = payload.codex_web_search {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled,
+        }));
+    }
+    if let Some(enabled) = payload.codex_network_access {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexNetworkAccess { enabled },
+        ));
+    }
+    if let Some(roots) = payload.codex_writable_roots.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexWritableRoots { roots },
+        ));
     }
     if let Some(mode) = payload.codex_managed_context.clone() {
         bus.send(AppEvent::ControlCommand(
@@ -453,6 +682,21 @@ pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &Set
     if let Some(mode) = payload.codex_context_archive.clone() {
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexContextArchive { mode },
+        ));
+    }
+    if payload.claude_model.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeModel {
+            model: payload.claude_model.clone(),
+        }));
+    }
+    if let Some(mode) = payload.claude_permission_mode.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetClaudePermissionMode { mode },
+        ));
+    }
+    if let Some(tools) = payload.claude_allowed_tools.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetClaudeAllowedTools { tools },
         ));
     }
 }
@@ -758,6 +1002,124 @@ pub(crate) async fn handle_external_agents(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn settings_catalog_uses_the_signed_in_codex_account_cache() {
+        let codex_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.path().join("models_cache.json"),
+            serde_json::json!({
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6-Sol",
+                        "default_reasoning_level": "low",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "medium"},
+                            {"effort": "ultra"}
+                        ],
+                        "visibility": "list",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "gpt-5.3-codex-spark",
+                        "display_name": "GPT-5.3-Codex-Spark",
+                        "default_reasoning_level": "high",
+                        "supported_reasoning_levels": [{"effort": "high"}],
+                        "visibility": "list",
+                        "supported_in_api": false
+                    },
+                    {
+                        "slug": "gpt-5.6",
+                        "display_name": "GPT-5.6 API alias",
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [{"effort": "medium"}],
+                        "visibility": "hide",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "codex-auto-review",
+                        "display_name": "Codex Auto Review",
+                        "visibility": "hide",
+                        "supported_in_api": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = RuntimeSettingsState {
+            codex_home: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let payload = settings_payload_with_runtime_overrides(
+            &crate::project::ProjectConfig::default(),
+            &runtime,
+        )
+        .await;
+
+        assert_eq!(
+            payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-5.3-codex-spark"]
+        );
+        assert_eq!(payload.codex_models[0].default_reasoning_effort, "low");
+        assert_eq!(
+            payload.codex_models[0].reasoning_efforts,
+            vec!["low", "medium", "ultra"]
+        );
+
+        // Codex filters the same cache by auth mode: API-key auth must not
+        // offer subscription-only entries.
+        std::fs::write(
+            codex_home.path().join("auth.json"),
+            r#"{"auth_mode":"apikey"}"#,
+        )
+        .unwrap();
+        let api_payload = settings_payload_with_runtime_overrides(
+            &crate::project::ProjectConfig::default(),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            api_payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol"]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_get_uses_daemon_settings_root_without_a_project_root() {
+        let settings_root = tempfile::tempdir().unwrap();
+        let mut project =
+            crate::project::Project::from_root(settings_root.path().to_path_buf()).unwrap();
+        project.config.agent.codex.model = Some("gpt-5.6-sol".to_string());
+        project.config.agent.claude_code.model = Some("fable".to_string());
+        project.save_config().unwrap();
+        let runtime = RuntimeSettingsState {
+            settings_root: Some(settings_root.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let body = settings_get_response_body(None, &runtime).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["codex_model"], "gpt-5.6-sol");
+        assert_eq!(value["claude_model"], "fable");
+    }
+
     #[test]
     fn settings_payload_accepts_settings_tab_save_without_agent_runtime_fields() {
         let body = serde_json::json!({
@@ -910,7 +1272,7 @@ mod tests {
     /// which overrides the file. The gateway does that by re-dispatching
     /// the codex fields as control-plane intents after a successful save.
     #[test]
-    fn settings_post_dispatches_codex_control_msgs_for_live_state() {
+    fn settings_post_dispatches_external_agent_control_msgs_for_live_state() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
@@ -937,9 +1299,17 @@ mod tests {
             "codex_command": "/opt/codex/bin/codex",
             "codex_sandbox": "danger-full-access",
             "codex_approval_policy": "never",
+            "codex_model": "gpt-5.6-sol",
+            "codex_reasoning_effort": "high",
             "codex_service_tier": "priority",
+            "codex_web_search": true,
+            "codex_network_access": true,
+            "codex_writable_roots": ["/tmp/work"],
             "codex_managed_context": "managed",
-            "codex_context_archive": "exact"
+            "codex_context_archive": "exact",
+            "claude_model": "fable",
+            "claude_permission_mode": "plan",
+            "claude_allowed_tools": ["Read"]
         })
         .to_string();
 
@@ -949,9 +1319,12 @@ mod tests {
         let mut saw_command = false;
         let mut saw_sandbox = false;
         let mut saw_approval = false;
+        let mut saw_codex_model = false;
         let mut saw_service_tier = false;
         let mut saw_managed = false;
         let mut saw_archive = false;
+        let mut saw_claude_model = false;
+        let mut saw_claude_permission = false;
         while let Ok(event) = rx.try_recv() {
             let AppEvent::ControlCommand(msg) = event else {
                 continue;
@@ -969,6 +1342,10 @@ mod tests {
                     assert_eq!(policy, "never");
                     saw_approval = true;
                 }
+                ControlMsg::SetCodexModel { model } => {
+                    assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                    saw_codex_model = true;
+                }
                 ControlMsg::SetCodexServiceTier { service_tier } => {
                     assert_eq!(service_tier.as_deref(), Some("priority"));
                     saw_service_tier = true;
@@ -981,20 +1358,36 @@ mod tests {
                     assert_eq!(mode, "exact");
                     saw_archive = true;
                 }
+                ControlMsg::SetClaudeModel { model } => {
+                    assert_eq!(model.as_deref(), Some("fable"));
+                    saw_claude_model = true;
+                }
+                ControlMsg::SetClaudePermissionMode { mode } => {
+                    assert_eq!(mode, "plan");
+                    saw_claude_permission = true;
+                }
                 _ => {}
             }
         }
         assert!(saw_command, "SetCodexCommand was not dispatched");
         assert!(saw_sandbox, "SetCodexSandbox was not dispatched");
         assert!(saw_approval, "SetCodexApprovalPolicy was not dispatched");
+        assert!(saw_codex_model, "SetCodexModel was not dispatched");
         assert!(saw_service_tier, "SetCodexServiceTier was not dispatched");
         assert!(saw_managed, "SetCodexManagedContext was not dispatched");
         assert!(saw_archive, "SetCodexContextArchive was not dispatched");
+        assert!(saw_claude_model, "SetClaudeModel was not dispatched");
+        assert!(
+            saw_claude_permission,
+            "SetClaudePermissionMode was not dispatched"
+        );
 
         // The synchronous TOML write still happened (read-after-write
         // consistency for an immediate GET /api/settings).
         let saved = std::fs::read_to_string(dir.path().join("intendant.toml")).unwrap();
         assert!(saved.contains("managed_context = \"managed\""));
+        assert!(saved.contains("model = \"gpt-5.6-sol\""));
+        assert!(saved.contains("model = \"fable\""));
     }
 
     // ── S5 golden transcripts: settings / keys family ──
@@ -1392,9 +1785,17 @@ mod tests {
                         ControlMsg::SetCodexCommand { .. }
                             | ControlMsg::SetCodexSandbox { .. }
                             | ControlMsg::SetCodexApprovalPolicy { .. }
+                            | ControlMsg::SetCodexModel { .. }
+                            | ControlMsg::SetCodexReasoningEffort { .. }
                             | ControlMsg::SetCodexServiceTier { .. }
+                            | ControlMsg::SetCodexWebSearch { .. }
+                            | ControlMsg::SetCodexNetworkAccess { .. }
+                            | ControlMsg::SetCodexWritableRoots { .. }
                             | ControlMsg::SetCodexManagedContext { .. }
                             | ControlMsg::SetCodexContextArchive { .. }
+                            | ControlMsg::SetClaudeModel { .. }
+                            | ControlMsg::SetClaudePermissionMode { .. }
+                            | ControlMsg::SetClaudeAllowedTools { .. }
                     ),
                     "unexpected codex control msg for absent payload field: {msg:?}"
                 );

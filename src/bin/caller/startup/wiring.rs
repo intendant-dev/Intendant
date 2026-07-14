@@ -266,6 +266,10 @@ pub(crate) fn spawn_mode_web_gateway(
     config.external_agent = initial_agent_backend
         .as_ref()
         .map(|backend| backend.as_short_str().to_string());
+    let settings_root = project_root
+        .clone()
+        .unwrap_or_else(crate::project::daemon_settings_config_root);
+    let codex_home = crate::session_config::effective_codex_home().map(PathBuf::from);
     let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
         daemon_session_id: session_log_id(session_log),
         query_ctx,
@@ -278,6 +282,8 @@ pub(crate) fn spawn_mode_web_gateway(
         runtime_settings: web_gateway::RuntimeSettingsState {
             external_agent: Some(shared_external_agent.clone()),
             presence_enabled: Some(runtime_presence_enabled),
+            settings_root: Some(settings_root),
+            codex_home,
         },
         file_watcher: shared_file_watcher.clone(),
     }));

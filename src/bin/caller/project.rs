@@ -290,15 +290,12 @@ const CODEX_EFFORTS_THROUGH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"]
 const CODEX_EFFORTS_THROUGH_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS_THROUGH_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
-/// Current public Codex picker models, with recommended models before the
-/// still-supported "other models" group. Hidden/internal models stay out.
+/// Conservative offline Codex picker fallback. The dashboard replaces this
+/// with Codex's signed-in-account catalog whenever `models_cache.json` is
+/// available. Keep only actual Codex CLI model ids here; account/API aliases
+/// belong in the live catalog (or the picker's custom-id escape), not this
+/// fallback.
 pub const CODEX_MODEL_CATALOG: &[CodexModelCatalogEntry] = &[
-    CodexModelCatalogEntry {
-        id: "gpt-5.6",
-        display_name: "GPT-5.6 (Sol alias)",
-        default_reasoning_effort: "medium",
-        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
-    },
     CodexModelCatalogEntry {
         id: "gpt-5.6-sol",
         display_name: "GPT-5.6-Sol",
@@ -791,13 +788,23 @@ struct DaemonConnectFile {
     connect: ConnectConfig,
 }
 
+/// Root carrying durable, daemon-wide settings when no project is attached.
+///
+/// A projectless daemon must not pretend this is a session project (doing so
+/// would widen sandbox and file-watcher scope), but it still needs a durable
+/// place for dashboard defaults. Its `intendant.toml` lives directly under
+/// this state root.
+pub fn daemon_settings_config_root() -> PathBuf {
+    crate::platform::intendant_home()
+}
+
 /// Where a projectless daemon persists its Connect client config. Rooted
 /// daemons keep `[connect]` in the project's `intendant.toml`; a daemon
-/// with no project (the bundled app's normal shape) has no intendant.toml
-/// to write, so the config lives with the rest of the machine-local daemon
-/// state under the state root.
+/// with no project (the bundled app's normal shape) keeps Connect's
+/// credential-bearing table in its existing owner-only file beside the
+/// general daemon settings file.
 pub fn daemon_connect_config_path() -> PathBuf {
-    crate::platform::intendant_home().join("connect.toml")
+    daemon_settings_config_root().join("connect.toml")
 }
 
 /// Load the daemon-scoped Connect config. An absent file is the normal
@@ -2294,6 +2301,10 @@ default_backend = "codex"
         let ids: std::collections::BTreeSet<_> =
             CODEX_MODEL_CATALOG.iter().map(|entry| entry.id).collect();
         assert_eq!(ids.len(), CODEX_MODEL_CATALOG.len(), "duplicate model id");
+        assert!(
+            !ids.contains("gpt-5.6"),
+            "the bare alias Codex does not advertise must not be in the offline fallback"
+        );
         for entry in CODEX_MODEL_CATALOG {
             assert!(
                 entry
