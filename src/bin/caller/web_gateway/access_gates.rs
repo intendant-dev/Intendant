@@ -350,7 +350,11 @@ pub(crate) fn deny_ws_frame_if_unauthorized(
     let Some(op) = ws_frame_operation(frame_type) else {
         return false;
     };
-    let decision = grant.access_decision(op);
+    let mut decision = grant.access_decision(op);
+    if frame_type == "set_diagnostics_visual_marker" && !grant.has_owner_dashboard_authority() {
+        decision.allowed = false;
+        decision.reason = "owner dashboard authority is required for this frame".to_string();
+    }
     if decision.allowed {
         return false;
     }
@@ -396,6 +400,16 @@ pub(crate) fn ws_grant_allows_control(
     ctrl: &ControlMsg,
     bus: &EventBus,
 ) -> bool {
+    if crate::access::access_policy::control_msg_requires_owner_dashboard(ctrl)
+        && !grant.has_owner_dashboard_authority()
+    {
+        bus.send(AppEvent::PresenceLog {
+            message: format!("[ws] denied {} owner-only control frame", grant.wire_kind(),),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
+    }
     if peer_identity.is_some() {
         return true;
     }
@@ -424,8 +438,7 @@ pub(crate) fn ws_grant_allows_control(
         });
         return false;
     }
-    let op = crate::peer::access_policy::control_msg_operation(ctrl);
-    let decision = grant.access_decision(op);
+    let decision = grant.control_msg_access_decision(ctrl);
     if decision.allowed {
         return true;
     }

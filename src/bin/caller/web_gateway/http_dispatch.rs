@@ -1042,6 +1042,7 @@ pub(crate) async fn serve_http_request(
                 return handle_displays(
                     stream,
                     session_registry,
+                    http_access_context.principal.role_id == "role:root",
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

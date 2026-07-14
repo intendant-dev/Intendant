@@ -3680,6 +3680,76 @@ mod tests {
     }
 
     #[test]
+    fn ws_owner_only_actions_are_checked_before_the_peer_fast_path() {
+        let bus = EventBus::new();
+        let local = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+
+        let peer_grant = crate::dashboard_control::DashboardControlGrant::Peer {
+            fingerprint: "fp".to_string(),
+            label: "peer".to_string(),
+            profile: "peer-root".to_string(),
+            filesystem: Default::default(),
+            attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
+        };
+        let peer_identity = PeerConnectionIdentity {
+            fingerprint: "fp".to_string(),
+            label: "peer".to_string(),
+            profile: "peer-root".to_string(),
+            filesystem: Default::default(),
+            record: None,
+        };
+        for ctrl in [
+            ControlMsg::GrantUserDisplay {
+                display_id: Some(7),
+                agent_visible: Some(false),
+            },
+            ControlMsg::SetupDebugScreen,
+            ControlMsg::StartDebugRecording,
+        ] {
+            assert!(ws_grant_allows_control(&local, None, &ctrl, &bus));
+            assert!(!ws_grant_allows_control(
+                &peer_grant,
+                Some(&peer_identity),
+                &ctrl,
+                &bus,
+            ));
+        }
+
+        assert!(
+            peer_grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+        assert!(
+            peer_grant
+                .access_decision(crate::peer::access_policy::PeerOperation::RuntimeControl)
+                .allowed
+        );
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel();
+        let mut logged = std::collections::HashSet::new();
+        assert!(deny_ws_frame_if_unauthorized(
+            &peer_grant,
+            &serde_json::json!({
+                "t": "set_diagnostics_visual_marker",
+                "display_id": 7,
+                "enabled": true,
+            }),
+            &direct_tx,
+            &bus,
+            &mut logged,
+        ));
+        let denied: serde_json::Value =
+            serde_json::from_str(&direct_rx.try_recv().expect("owner-only denial frame")).unwrap();
+        assert_eq!(denied["permission"], "display.input");
+        assert!(denied["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("owner dashboard authority"));
+    }
+
+    #[test]
     fn access_iam_upsert_user_client_grant_persists_browser_binding() {
         let tmp = tempfile::TempDir::new().unwrap();
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(

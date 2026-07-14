@@ -127,20 +127,25 @@ external-agent approval routing through `external_approval_decision`.
 access to the user's display for the rest of the session (used by both
 [computer use](./computer-use-and-audio.md) and WebRTC streaming). Revoke from
 the same places to drop it. The grant is enforced fail-closed at the CU
-executor on every platform; only the owner's own surfaces (dashboard, local
-`ctl`, the owner-wired stdio MCP transport) may reach the user display
-without it, because their call is the opt-in. Note the grant is a single
-per-daemon flag: once granted, it holds for every principal the IAM layer
-lets at the display tools until revoked.
+executor on every platform; only an owner/root surface (an owner/root
+dashboard, local `ctl`, or the owner-wired stdio MCP transport) may reach the
+user display without it, because its call is the opt-in. A scoped role's
+`display.view` or `display.input` permission covers agent-visible displays
+only; neither permission is proof that the owner chose to expose the private
+user session. Note the grant is a single per-daemon flag: once granted, it
+holds for every principal the IAM layer lets at the display tools until
+revoked.
 
 The dashboard's **View this machine** action is *not* a `DisplayControl`
 grant: it opens a **private user view** — a capture session flagged
-`agent_visible = false` that streams to the owner's dashboards only. It
-never touches this grant, and the session itself is skipped by every
-agent-facing display lookup (a second fence, independent of the flag —
-see [Computer Use](./computer-use-and-audio.md)). Revoking *any*
-user-display session — shared or private — clears the per-daemon grant
-flag: over-revocation is the fail-closed direction.
+`agent_visible = false` that streams only to owner/root dashboards. That
+ceiling applies on both browser transports: the legacy `/ws` signaling/input
+lane and the verified dashboard-control DataChannel. The action never touches
+the standing grant, and the session itself is skipped by every generic,
+agent-facing display lookup (a second fence, independent of the flag — see
+[Computer Use](./computer-use-and-audio.md)). Revoking *any* user-display
+session — shared or private — clears the per-daemon grant flag: over-revocation
+is the fail-closed direction.
 
 ## The display request rail (doorbell)
 
@@ -156,12 +161,15 @@ access level, then blocks until the user decides or the wait window
 own registry and id space, deliberately outside the approval registry:
 `approve` / `approve_all` / any autonomy level or per-category rule cannot
 reach them. The only resolution is the dedicated
-`resolve_display_request` control message — the popup's **Allow** /
-**Deny** / **Deny for this session** buttons — accepted from owner
-surfaces and classified `display.input` exactly like `GrantUserDisplay`
-(resolving a request is as powerful as granting directly). On approve, the
-control plane mints the grant through the same state flip and events the
-owner's own grant takes.
+`ResolveDisplayRequest` control message — the popup's **Allow** /
+**Deny** / **Deny for this session** buttons — accepted only from an
+owner/root surface. Both it and `GrantUserDisplay` are classified
+`display.input`, but that permission is only the coarse admission floor:
+resolving or granting additionally requires owner/root authority on either
+browser transport. `RevokeUserDisplay` remains available to an otherwise
+authorized scoped caller because de-escalation is the fail-safe direction. On
+approve, the control plane mints the grant through the same state flip and
+events the owner's own grant takes.
 
 Two access levels:
 

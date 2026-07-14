@@ -71,6 +71,7 @@ pub(crate) fn log_tls_failure_rate_limited(
 fn apply_dashboard_grant_for_existing_display(
     shared_session: &SharedActiveSession,
     display_id: u32,
+    include_private: bool,
     session_id: &str,
     authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
@@ -84,7 +85,12 @@ fn apply_dashboard_grant_for_existing_display(
     let Ok(registry) = session_registry.try_read() else {
         return false;
     };
-    if registry.get_any(display_id).is_none() {
+    let display_exists = if include_private {
+        registry.get_any(display_id).is_some()
+    } else {
+        registry.get(display_id).is_some()
+    };
+    if !display_exists {
         return false;
     }
     apply_grant_input_authority_dashboard_control(
@@ -100,6 +106,36 @@ fn apply_dashboard_grant_for_existing_display(
 mod authority_grant_validation_tests {
     use super::*;
 
+    struct AuthorityTestDisplayBackend;
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for AuthorityTestDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, crate::error::CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn kind(&self) -> &'static str {
+            "authority-test"
+        }
+    }
+
     #[test]
     fn nonexistent_dashboard_authority_requests_do_not_grow_global_maps() {
         let session_registry = Arc::new(tokio::sync::RwLock::new(
@@ -109,7 +145,7 @@ mod authority_grant_validation_tests {
         shared_session
             .try_write()
             .expect("fresh active session is uncontended")
-            .session_registry = Some(session_registry);
+            .session_registry = Some(Arc::clone(&session_registry));
         let authority = Arc::new(DisplayInputAuthority::default());
         let (change_tx, mut change_rx) = broadcast::channel(8);
 
@@ -117,6 +153,7 @@ mod authority_grant_validation_tests {
             assert!(!apply_dashboard_grant_for_existing_display(
                 &shared_session,
                 display_id,
+                false,
                 "dashboard-session",
                 &authority,
                 &change_tx,
@@ -128,6 +165,32 @@ mod authority_grant_validation_tests {
             change_rx.try_recv().is_err(),
             "rejected requests must not publish authority changes"
         );
+
+        let private = Arc::new(crate::display::DisplaySession::new(
+            9,
+            Arc::new(AuthorityTestDisplayBackend),
+        ));
+        private.set_agent_visible(false);
+        session_registry
+            .try_write()
+            .expect("registry is uncontended")
+            .insert(9, private);
+        assert!(!apply_dashboard_grant_for_existing_display(
+            &shared_session,
+            9,
+            false,
+            "non-owner-session",
+            &authority,
+            &change_tx,
+        ));
+        assert!(apply_dashboard_grant_for_existing_display(
+            &shared_session,
+            9,
+            true,
+            "owner-session",
+            &authority,
+            &change_tx,
+        ));
     }
 }
 
@@ -561,10 +624,11 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     &state_authority,
                 ))
             },
-            move |session_id, display_id| {
+            move |session_id, display_id, include_private| {
                 if !apply_dashboard_grant_for_existing_display(
                     &request_shared_session,
                     display_id,
+                    include_private,
                     session_id,
                     &request_authority,
                     &request_change_tx,
@@ -1612,6 +1676,19 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                         Err(_) => return,
                     };
 
+                    // Assign a collision-free peer ID before registering any
+                    // connection state. Dashboard-control and federated
+                    // viewers share each DisplaySession's peer map, so the
+                    // central allocator reserves a distinct namespace for
+                    // this legacy WS lane. Exhaustion closes the socket
+                    // without leaving a phantom dashboard-tab registration.
+                    let Some(peer_id) =
+                        crate::display_peer_ids::allocate_legacy_ws_display_peer_id()
+                    else {
+                        eprintln!("[web_gateway] display peer-id namespace exhausted");
+                        return;
+                    };
+
                     let (ws_tx, ws_rx) = ws_stream.split();
                     let outbound_rx = broadcast_tx.subscribe();
 
@@ -1779,7 +1856,9 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     // (the dashboard's HTML default is "off").
                     if let Ok(guard) = last_user_display_json.lock() {
                         if let Some(ref ud_json) = *guard {
-                            let _ = direct_tx.send(ud_json.clone());
+                            if dashboard_control_grant_for_ws.allows_dashboard_event_line(ud_json) {
+                                let _ = direct_tx.send(ud_json.clone());
+                            }
                         }
                     }
 
@@ -1788,21 +1867,23 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     // attention nudge just summoned) shows the popup.
                     // Requests are short-lived; expired entries are
                     // filtered by the snapshot.
-                    for pending in crate::display_requests::registry()
-                        .pending_snapshot(crate::display_requests::now_unix_ms())
-                    {
-                        let line = serde_json::to_string(
-                            &crate::types::OutboundEvent::DisplayRequestRaised {
-                                session_id: Some(pending.session_key.clone())
-                                    .filter(|s| s != "main"),
-                                id: pending.id,
-                                access: pending.access.as_str().to_string(),
-                                reason: pending.reason.clone(),
-                                expires_unix_ms: pending.expires_unix_ms,
-                            },
-                        );
-                        if let Ok(line) = line {
-                            let _ = direct_tx.send(line);
+                    if dashboard_control_grant_for_ws.has_owner_dashboard_authority() {
+                        for pending in crate::display_requests::registry()
+                            .pending_snapshot(crate::display_requests::now_unix_ms())
+                        {
+                            let line = serde_json::to_string(
+                                &crate::types::OutboundEvent::DisplayRequestRaised {
+                                    session_id: Some(pending.session_key.clone())
+                                        .filter(|s| s != "main"),
+                                    id: pending.id,
+                                    access: pending.access.as_str().to_string(),
+                                    reason: pending.reason.clone(),
+                                    expires_unix_ms: pending.expires_unix_ms,
+                                },
+                            );
+                            if let Ok(line) = line {
+                                let _ = direct_tx.send(line);
+                            }
                         }
                     }
 
@@ -1846,21 +1927,20 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     let bootstrap_authority_snapshots: Vec<(u32, &'static str)> =
                         if let Some(ref sr) = session_registry {
                             let reg = sr.read().await;
-                            // Dashboards are the user surface: replay
-                            // private user views too (they exist FOR this
-                            // surface), tagged so the tile renders its
-                            // "private view" chip.
-                            let active_ids: Vec<u32> = reg.all_display_ids();
+                            let active_ids: Vec<u32> =
+                                dashboard_control_grant_for_ws.display_ids(&reg);
                             // Snapshot resolutions + auth states under the
                             // std lock, then drop the guard before any
                             // direct_tx.send calls.
                             let resolutions: Vec<(u32, u32, u32, bool)> = active_ids
                                 .iter()
                                 .filter_map(|&did| {
-                                    reg.get_any(did).map(|session| {
-                                        let (w, h) = session.resolution();
-                                        (did, w, h, session.agent_visible())
-                                    })
+                                    dashboard_control_grant_for_ws
+                                        .display_session(&reg, did)
+                                        .map(|session| {
+                                            let (w, h) = session.resolution();
+                                            (did, w, h, session.agent_visible())
+                                        })
                                 })
                                 .collect();
                             let auth_snapshots = {
@@ -1895,7 +1975,11 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                             // display_ready JSON, no holder state.
                             if let Ok(guard) = display_ready_cache.lock() {
                                 for display_json in guard.values() {
-                                    let _ = direct_tx.send(display_json.clone());
+                                    if dashboard_control_grant_for_ws
+                                        .allows_dashboard_event_line(display_json)
+                                    {
+                                        let _ = direct_tx.send(display_json.clone());
+                                    }
                                 }
                             }
                             Vec::new()
@@ -1933,7 +2017,19 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
                             }
-                            let _ = direct_tx.send(replay);
+                            if dashboard_control_grant_for_ws.has_owner_dashboard_authority() {
+                                let _ = direct_tx.send(replay);
+                            } else if let Ok(mut replay) =
+                                serde_json::from_str::<serde_json::Value>(&replay)
+                            {
+                                dashboard_control_grant_for_ws
+                                    .filter_dashboard_replay_payload(&mut replay);
+                                let _ = direct_tx.send(replay.to_string());
+                            } else {
+                                eprintln!(
+                                    "[web] refusing malformed session replay for scoped dashboard"
+                                );
+                            }
                         }
                     }
 
@@ -2004,8 +2100,6 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
-                    // Assign a unique peer ID for WebRTC signaling
-                    let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
                     let ws_session_cancel = tokio_util::sync::CancellationToken::new();
 
                     let inbound_ctx = WsInboundCtx {

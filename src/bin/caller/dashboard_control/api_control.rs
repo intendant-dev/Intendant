@@ -35,7 +35,11 @@ pub(crate) async fn api_displays_response(
     };
     frame_api_json_body_response(
         id,
-        crate::web_gateway::displays_api_response(&session_registry).await,
+        crate::web_gateway::displays_api_response(
+            &session_registry,
+            runtime.grant.has_owner_dashboard_authority(),
+        )
+        .await,
         "displays",
     )
 }
@@ -162,6 +166,7 @@ pub(crate) async fn api_session_log_replay_response(
                 "available": false,
             })
         });
+    runtime.grant.filter_dashboard_replay_payload(&mut replay);
     if let Some(map) = replay.as_object_mut() {
         map.entry("available".to_string())
             .or_insert(serde_json::Value::Bool(true));
@@ -188,9 +193,16 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     if let Some(result) = response_result(cached_bootstrap_events_response_frame(
         "bootstrap-cached".into(),
         &runtime.bootstrap_caches,
+        &runtime.grant,
     )) {
         if let Some(events) = result.get("events").and_then(|value| value.as_array()) {
-            frames.extend(events.iter().cloned());
+            frames.extend(events.iter().filter_map(|event| {
+                let line = serde_json::to_string(event).ok()?;
+                runtime
+                    .grant
+                    .allows_dashboard_event_line(&line)
+                    .then(|| event.clone())
+            }));
         }
     }
     if let Some(frame) =
@@ -276,7 +288,9 @@ pub(crate) async fn api_display_webrtc_offer_response(
     params: &serde_json::Value,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let display_id = display_id_param(Some(params));
+    let Some(display_id) = display_id_param(Some(params)) else {
+        return invalid_display_id_response(id);
+    };
     let sdp = string_param(params, &["sdp", "offer", "offer_sdp"]);
     if sdp.is_empty() {
         return missing_param_response(id, "sdp");
@@ -376,9 +390,11 @@ pub(crate) async fn track_dashboard_display_session(
     display_session: Arc<crate::display::DisplaySession>,
 ) {
     let mut sessions = runtime.display_peer_sessions.lock().await;
+    sessions.retain(|tracked| tracked.strong_count() > 0);
+    let display_session = Arc::downgrade(&display_session);
     if !sessions
         .iter()
-        .any(|tracked| Arc::ptr_eq(tracked, &display_session))
+        .any(|tracked| std::sync::Weak::ptr_eq(tracked, &display_session))
     {
         sessions.push(display_session);
     }
@@ -390,7 +406,9 @@ pub(crate) async fn remove_dashboard_display_peers(runtime: &ControlRuntime) {
         std::mem::take(&mut *sessions)
     };
     for display_session in sessions {
-        display_session.remove_peer(runtime.display_peer_id).await;
+        if let Some(display_session) = display_session.upgrade() {
+            display_session.remove_peer(runtime.display_peer_id).await;
+        }
     }
 }
 
@@ -399,7 +417,9 @@ pub(crate) async fn api_display_webrtc_ice_response(
     params: &serde_json::Value,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let display_id = display_id_param(Some(params));
+    let Some(display_id) = display_id_param(Some(params)) else {
+        return invalid_display_id_response(id);
+    };
     let Some(candidate) = params.get("candidate").cloned() else {
         return missing_param_response(id, "candidate");
     };
@@ -438,9 +458,7 @@ pub(crate) async fn active_display_session(
         session.session_registry.clone()
     }?;
     let registry = session_registry.read().await;
-    // Dashboard media includes private user views; agent-facing callers use
-    // the registry's filtered `get` path instead.
-    registry.get_any(display_id)
+    runtime.grant.display_session(&registry, display_id)
 }
 
 pub(crate) fn dashboard_display_interactive_authorizer(
@@ -513,8 +531,14 @@ pub(crate) async fn api_display_input_authority_request_response(
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return display_authority_unavailable_response(id);
     };
-    let display_id = display_id_param(params);
-    let frames = bridge.request(&runtime.session_id, display_id);
+    let Some(display_id) = display_id_param(params) else {
+        return invalid_display_id_response(id);
+    };
+    let frames = bridge.request(
+        &runtime.session_id,
+        display_id,
+        runtime.grant.has_owner_dashboard_authority(),
+    );
     if frames.is_empty() {
         // A valid grant always emits the resulting authority-state frame.
         // The bridge uses an empty result to fail closed when the display no
@@ -550,7 +574,9 @@ pub(crate) async fn api_display_input_authority_release_response(
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return display_authority_unavailable_response(id);
     };
-    let display_id = display_id_param(params);
+    let Some(display_id) = display_id_param(params) else {
+        return invalid_display_id_response(id);
+    };
     let frames = bridge.release(&runtime.session_id, display_id);
     let frame_count = frames.len();
     serde_json::json!({
@@ -581,7 +607,7 @@ pub(crate) fn display_authority_unavailable_response(id: String) -> serde_json::
     })
 }
 
-pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
+pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> Option<u32> {
     params
         .and_then(|params| {
             params
@@ -591,7 +617,16 @@ pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
         })
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0)
+}
+
+pub(crate) fn invalid_display_id_response(id: String) -> serde_json::Value {
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": false,
+        "status": 400,
+        "error": "missing or invalid display_id",
+    })
 }
 
 pub(crate) async fn display_authority_snapshot_frames(
@@ -636,15 +671,19 @@ pub(crate) async fn display_ready_bootstrap_frames(
     display_ids
         .into_iter()
         .filter_map(|display_id| {
-            registry.get_any(display_id).map(|session| {
-                let (width, height) = session.resolution();
-                serde_json::json!({
-                    "event": "display_ready",
-                    "display_id": display_id,
-                    "width": width,
-                    "height": height,
+            runtime
+                .grant
+                .display_session(&registry, display_id)
+                .map(|session| {
+                    let (width, height) = session.resolution();
+                    serde_json::json!({
+                        "event": "display_ready",
+                        "display_id": display_id,
+                        "width": width,
+                        "height": height,
+                        "agent_visible": session.agent_visible(),
+                    })
                 })
-            })
         })
         .collect()
 }
@@ -659,7 +698,7 @@ pub(crate) async fn active_display_ids(runtime: &ControlRuntime) -> Vec<u32> {
     };
 
     let registry = session_registry.read().await;
-    let mut display_ids = registry.all_display_ids();
+    let mut display_ids = runtime.grant.display_ids(&registry);
     display_ids.sort_unstable();
     display_ids
 }
@@ -1145,6 +1184,10 @@ pub(crate) async fn api_control_msg_response(
             "control message",
         );
     }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "control message");
+    }
     let action = dashboard_control_msg_action(&ctrl);
     runtime.bus.send(AppEvent::PresenceLog {
         message: format!("[dashboard-control] ControlMsg: {action}"),
@@ -1187,6 +1230,10 @@ pub(crate) async fn api_session_control_msg_response(
             "session control message",
         );
     }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "session control message");
+    }
     let action = dashboard_control_msg_action(&ctrl);
     dispatch_dashboard_control_msg(&runtime.bus, ctrl, "session-control");
     serde_json::json!({
@@ -1223,6 +1270,10 @@ pub(crate) async fn api_dashboard_action_msg_response(
             .to_string(),
             "dashboard action message",
         );
+    }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "dashboard action message");
     }
     let action = dashboard_control_msg_action(&ctrl);
     let marker_apply = match &ctrl {
@@ -1262,6 +1313,24 @@ pub(crate) async fn api_dashboard_action_msg_response(
         "ok": true,
         "result": result,
     })
+}
+
+fn control_msg_denied_response(
+    id: String,
+    decision: crate::access::iam::AccessDecision,
+    label: &str,
+) -> serde_json::Value {
+    http_body_response(
+        id,
+        403,
+        serde_json::json!({
+            "ok": false,
+            "permission": decision.permission,
+            "error": format!("not allowed: {}", decision.reason),
+        })
+        .to_string(),
+        label,
+    )
 }
 
 /// `state_dir` arrives from the dispatch arm — the transport edge
@@ -2398,13 +2467,13 @@ mod tests {
             window_title: None,
         }];
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::displays_api_response_from(displays.clone(), &None).await,
+            crate::web_gateway::displays_api_response_from(displays.clone(), &None, true).await,
         );
         assert_eq!(status, 200);
         assert!(http_body["displays"].is_array(), "{http_body}");
         let frame = frame_api_json_body_response(
             "parity-displays".to_string(),
-            crate::web_gateway::displays_api_response_from(displays, &None).await,
+            crate::web_gateway::displays_api_response_from(displays, &None, true).await,
             "displays",
         );
         assert_eq!(frame["ok"], true);
@@ -2412,6 +2481,44 @@ mod tests {
             .as_object()
             .is_some_and(|map| !map.contains_key("_httpStatus")));
         assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn displays_api_hides_private_capture_state_from_non_owners() {
+        let displays = vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }];
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let private = Arc::new(crate::display::DisplaySession::new(
+            1,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private.set_agent_visible(false);
+        registry.write().await.insert(1, private);
+        let registry = Some(registry);
+
+        let (_, scoped) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response_from(displays.clone(), &registry, false)
+                .await,
+        );
+        assert!(scoped["displays"][0].get("capture_active").is_none());
+        assert!(scoped["displays"][0].get("agent_visible").is_none());
+
+        let (_, owner) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response_from(displays, &registry, true).await,
+        );
+        assert_eq!(owner["displays"][0]["capture_active"], true);
+        assert_eq!(owner["displays"][0]["agent_visible"], false);
     }
 
     #[tokio::test]
@@ -3296,6 +3403,23 @@ mod tests {
         }
     }
 
+    fn non_owner_grant_with_permissions(permissions: &[&str]) -> DashboardControlGrant {
+        let mut grant = observer_display_grant();
+        let DashboardControlGrant::UserClient { iam_state, .. } = &mut grant else {
+            unreachable!("observer fixture is a user client")
+        };
+        let role = iam_state
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:observer")
+            .expect("observer role");
+        role.permissions = permissions
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        grant
+    }
+
     /// The SPA mirrors the action-message allowlist as
     /// `DASHBOARD_ACTION_MSG_RPC_ACTIONS` (static/app/31-init-identity-fleet.js)
     /// to pick the RPC lane before dispatching. That copy can't derive from
@@ -3683,6 +3807,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_action_rpc_authorizes_the_inner_control_message() {
+        let mut rt = runtime();
+        rt.grant = non_owner_grant_with_permissions(&["message.send"]);
+        assert!(
+            rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::Message)
+                .allowed
+        );
+
+        let denied = api_dashboard_action_msg_response(
+            "inner-auth-grant".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "grant_user_display",
+                    "display_id": 7,
+                    "agent_visible": false,
+                }
+            })),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(denied["result"]["ok"], false);
+        assert_eq!(denied["result"]["_httpStatus"], 403);
+        assert_eq!(denied["result"]["permission"], "display.input");
+    }
+
+    #[tokio::test]
+    async fn every_multiplexed_rpc_rechecks_its_inner_operation() {
+        let mut rt = runtime();
+        rt.grant = non_owner_grant_with_permissions(&["message.send"]);
+
+        let settings = api_control_msg_response(
+            "inner-auth-settings".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_codex_sandbox",
+                    "mode": "workspace-write",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(settings["result"]["_httpStatus"], 403);
+        assert_eq!(settings["result"]["permission"], "settings.manage");
+
+        let task = api_session_control_msg_response(
+            "inner-auth-task".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "create_session",
+                    "task": "do something",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(task["result"]["_httpStatus"], 403);
+        assert_eq!(task["result"]["permission"], "task.run");
+    }
+
+    #[tokio::test]
+    async fn owner_only_actions_stay_closed_while_revoke_and_stop_deescalate() {
+        let mut rt = runtime();
+        rt.grant =
+            non_owner_grant_with_permissions(&["message.send", "display.input", "runtime.control"]);
+
+        for (id, message) in [
+            (
+                "owner-only-grant",
+                serde_json::json!({
+                    "action": "grant_user_display",
+                    "display_id": 7,
+                    "agent_visible": false,
+                }),
+            ),
+            (
+                "owner-only-resolve",
+                serde_json::json!({
+                    "action": "resolve_display_request",
+                    "session_id": "session-a",
+                    "id": 1,
+                    "decision": "approve",
+                    "duration": "this_session",
+                }),
+            ),
+            (
+                "owner-only-record",
+                serde_json::json!({
+                    "action": "start_recording",
+                    "stream_name": "display-7",
+                }),
+            ),
+            (
+                "owner-only-debug-screen",
+                serde_json::json!({"action": "setup_debug_screen"}),
+            ),
+            (
+                "owner-only-debug-recording",
+                serde_json::json!({"action": "start_debug_recording"}),
+            ),
+            (
+                "owner-only-diagnostics-marker",
+                serde_json::json!({
+                    "action": "set_diagnostics_visual_marker",
+                    "display_id": 7,
+                    "enabled": true,
+                }),
+            ),
+        ] {
+            let denied = api_dashboard_action_msg_response(
+                id.to_string(),
+                Some(&serde_json::json!({"message": message})),
+                &rt,
+            )
+            .await;
+            assert_eq!(denied["result"]["ok"], false, "{id}: {denied}");
+            assert_eq!(denied["result"]["_httpStatus"], 403, "{id}: {denied}");
+            assert!(denied["result"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("owner dashboard authority"));
+        }
+
+        for (id, message, action) in [
+            (
+                "deescalate-revoke",
+                serde_json::json!({"action": "revoke_user_display", "display_id": 7}),
+                "revoke_user_display",
+            ),
+            (
+                "deescalate-stop",
+                serde_json::json!({"action": "stop_recording", "stream_name": "display-7"}),
+                "stop_recording",
+            ),
+        ] {
+            let accepted = api_dashboard_action_msg_response(
+                id.to_string(),
+                Some(&serde_json::json!({"message": message})),
+                &rt,
+            )
+            .await;
+            assert_eq!(accepted["result"]["ok"], true, "{id}: {accepted}");
+            assert_eq!(accepted["result"]["action"], action);
+        }
+    }
+
+    #[tokio::test]
     async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
         // Injected state dir: the append lands in the fixture's tempdir,
         // never the live diagnostics store (hermeticity convention; the
@@ -3929,6 +4201,94 @@ mod tests {
         let ready = display_ready_bootstrap_frames(&rt).await;
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0]["display_id"], 12);
+        assert_eq!(ready[0]["agent_visible"], false);
+    }
+
+    #[tokio::test]
+    async fn non_owner_display_helpers_exclude_private_user_views() {
+        let mut rt = runtime();
+        rt.grant = observer_display_grant();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let public_session = Arc::new(crate::display::DisplaySession::new(
+            11,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let private_session = Arc::new(crate::display::DisplaySession::new(
+            12,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private_session.set_agent_visible(false);
+        {
+            let mut registry = registry.write().await;
+            registry.insert(11, Arc::clone(&public_session));
+            registry.insert(12, Arc::clone(&private_session));
+        }
+        rt.shared_session.write().await.session_registry = Some(Arc::clone(&registry));
+
+        let registry_guard = registry.read().await;
+        assert!(rt.grant.dashboard_event_targets_hidden_display(
+            r#"{"event":"display_resize","display_id":12,"width":80,"height":80}"#,
+            &registry_guard,
+        ));
+        assert!(!rt.grant.dashboard_event_targets_hidden_display(
+            r#"{"event":"display_resize","display_id":11,"width":80,"height":80}"#,
+            &registry_guard,
+        ));
+        drop(registry_guard);
+
+        let resolved = active_display_session(&rt, 11)
+            .await
+            .expect("agent-visible display remains viewable");
+        assert!(Arc::ptr_eq(&resolved, &public_session));
+        assert!(active_display_session(&rt, 12).await.is_none());
+        assert_eq!(active_display_ids(&rt).await, vec![11]);
+        let ready = display_ready_bootstrap_frames(&rt).await;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["display_id"], 11);
+        assert_eq!(ready[0]["agent_visible"], true);
+    }
+
+    #[test]
+    fn display_id_parameters_are_strict_but_zero_remains_valid() {
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": 0}))),
+            Some(0)
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"displayId": 7}))),
+            Some(7)
+        );
+        assert_eq!(display_id_param(Some(&serde_json::json!({}))), None);
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": "7"}))),
+            None
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": -1}))),
+            None
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({
+                "display_id": u64::from(u32::MAX) + 1,
+            }))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn display_signaling_rejects_missing_id_instead_of_targeting_zero() {
+        let rt = runtime();
+        let response = api_display_webrtc_offer_response(
+            "missing-display-id".to_string(),
+            &serde_json::json!({"sdp": "synthetic-offer"}),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 400);
+        assert_eq!(response["error"], "missing or invalid display_id");
     }
 
     #[tokio::test]
@@ -3938,7 +4298,7 @@ mod tests {
         rt.display_authority = Some(DashboardDisplayAuthorityBridge::new(
             |_, _| Vec::new(),
             |_, _| None,
-            |_, _| Vec::new(),
+            |_, _, _| Vec::new(),
             |_, _| Vec::new(),
             |_, _| false,
             |_| Arc::new(AtomicU64::new(0)),
@@ -3987,6 +4347,52 @@ mod tests {
         rt.shutdown.cancel();
         remove_dashboard_display_peers(&rt).await;
         assert_eq!(display_session.metrics().await.peer_count, 0);
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn display_peer_namespaces_coexist_and_teardown_independently() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            13,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let ws = crate::display_peer_ids::allocate_legacy_ws_display_peer_id().unwrap();
+        let control = rt.display_peer_id;
+        let federated =
+            crate::display_peer_ids::peer_id_for_federated_session("connection", "coexistence");
+
+        for peer_id in [ws, control, federated] {
+            display_session
+                .register_test_peer_for_cleanup(peer_id)
+                .await;
+        }
+        assert_eq!(display_session.metrics().await.peer_count, 3);
+
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        remove_dashboard_display_peers(&rt).await;
+        assert_eq!(display_session.metrics().await.peer_count, 2);
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+
+        display_session.remove_peer(ws).await;
+        assert_eq!(display_session.metrics().await.peer_count, 1);
+        display_session.remove_peer(federated).await;
+        assert_eq!(display_session.metrics().await.peer_count, 0);
+    }
+
+    #[tokio::test]
+    async fn display_peer_tracking_does_not_retain_finished_sessions() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            14,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let weak = Arc::downgrade(&display_session);
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        drop(display_session);
+
+        assert!(weak.upgrade().is_none());
+        remove_dashboard_display_peers(&rt).await;
         assert!(rt.display_peer_sessions.lock().await.is_empty());
     }
 

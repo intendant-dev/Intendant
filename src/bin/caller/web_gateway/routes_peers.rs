@@ -1960,13 +1960,15 @@ pub(crate) async fn handle_federated_webrtc_signal(
         }
     };
 
-    // Stable PeerId per session_id. Same string hashes to the same
-    // u64, so subsequent IceCandidate / Close signals — and the
-    // federation WS-close cleanup path — all route to the same
-    // WebRtcPeer in the session's peer map. Centralized via
-    // `peer_id_for_federated_session` so the cleanup path can't drift
-    // from this derivation.
-    let peer_id: crate::display::PeerId = peer_id_for_federated_session(&session_id);
+    // Stable PeerId per authenticated federation connection + browser
+    // session. The browser session id is connection-scoped, so including both
+    // prevents another connection from replacing or tearing down this peer.
+    // Subsequent IceCandidate / Close signals — and federation WS-close
+    // cleanup — use the same centralized derivation.
+    let peer_id: crate::display::PeerId = crate::display_peer_ids::peer_id_for_federated_session(
+        &federation_connection_id,
+        &session_id,
+    );
 
     match signal {
         crate::peer::WebRtcSignal::Offer {
@@ -3201,17 +3203,19 @@ mod tests {
         );
     }
 
-    /// Same `session_id` → same `PeerId` on every call. The Offer
-    /// arm in `handle_federated_webrtc_signal` derives the
-    /// `WebRtcPeer` key from this; WS-close cleanup must derive
-    /// the same key to find the inserted peer. A divergence here
-    /// would leak peers (cleanup would target a different key than
-    /// the one Offer inserted), which is exactly the bug the helper
-    /// extraction prevents.
+    /// Same federation connection + `session_id` → same `PeerId` on every
+    /// call. The Offer arm in `handle_federated_webrtc_signal` derives the
+    /// `WebRtcPeer` key from this; WS-close cleanup must derive the same key to
+    /// find the inserted peer. A divergence here would leak peers (cleanup
+    /// would target a different key than the one Offer inserted), which is
+    /// exactly the bug the helper extraction prevents.
     #[test]
     fn peer_id_for_federated_session_is_deterministic() {
-        let a = peer_id_for_federated_session("sess-A");
-        let b = peer_id_for_federated_session("sess-A");
-        assert_eq!(a, b, "the same session id must hash to the same peer id");
+        let a = crate::display_peer_ids::peer_id_for_federated_session("connection-A", "sess-A");
+        let b = crate::display_peer_ids::peer_id_for_federated_session("connection-A", "sess-A");
+        assert_eq!(
+            a, b,
+            "the same connection/session pair must hash to the same peer id"
+        );
     }
 }

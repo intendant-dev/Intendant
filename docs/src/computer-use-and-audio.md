@@ -219,7 +219,7 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   autonomy system — enforced fail-closed at the `execute_actions` chokepoint
   on **every** backend (the raw X11/macOS capture/injection paths included,
   not just by session existence on Wayland/Windows), with one exemption: an
-  **owner surface** (the trusted dashboard, an enrolled root user client,
+  **owner surface** (an owner/root dashboard, an enrolled root user client,
   local loopback `ctl`, or the stdio MCP transport the owner wired up —
   `ToolCallerTrust` in `mcp/mod.rs`, derived from the bound
   `AccessPrincipal`) may target its own desktop ungranted, because the
@@ -374,8 +374,11 @@ distinct things, and the surfaces never conflate them:
    view/control of this machine's display from the owner's dashboards.
    The capture session is created with **`agent_visible = false`**
    (`ControlMsg::GrantUserDisplay { agent_visible: false }`): it streams
-   over WebRTC to connected dashboards and accepts dashboard input like
-   any display, but it is invisible to agents, **fail closed**, at two
+   over WebRTC only to owner/root dashboard connections and accepts input only
+   from those connections. The same ceiling is enforced on the legacy `/ws`
+   path and the verified dashboard-control DataChannel; a scoped role's
+   `display.view` or `display.input` permission covers agent-visible displays
+   only. The private view is invisible to agents, **fail closed**, at two
    independent layers:
    - the `DisplayControl` autonomy grant is never set (so the CU
      `execute_actions` chokepoint, `INTENDANT_USER_DISPLAY_GRANTED` on
@@ -389,10 +392,14 @@ distinct things, and the surfaces never conflate them:
      peer display announcements, presence's available-display list, and
      the 1 Hz FrameRegistry sampler (`display_<id>` model-feed frames,
      hence `list_frames`/`read_frame` and conversation auto-attach) all
-     read it as absent. Dashboard surfaces use the unfiltered
-     `get_any` / `all_display_ids` accessors.
-   Auto-recording also skips private views (an explicit user-initiated
-   `StartRecording` still works — that is the user's own decision).
+     read it as absent. Owner/root dashboard paths may use the unfiltered
+     `get_any` / `all_display_ids` accessors after that authority check;
+     scoped dashboards and federated peers stay on the filtered accessors.
+   Auto-recording also skips private views. For the alpha, an explicit
+   `StartRecording` is owner/root-only and still requires an active
+   agent-visible display. A private or absent display is rejected before
+   ffmpeg starts: recording artifacts live in the ordinary session tree, so
+   private pixels must never be written there in the first place.
 2. **Agent share** (dashboard **Share with agent**, MCP
    `grant_user_display`, ctl `display grant-user`) — the classic grant:
    `agent_visible = true`, the autonomy grant is set, and the display is
@@ -411,13 +418,14 @@ the per-daemon grant flag. On the wire, `GrantUserDisplay` without
 `agent_visible` keeps its historical meaning (`true` — the agent share),
 so pre-split frontends and scripts are unaffected.
 
-Granting is itself owner-surface-only: `grant_user_display` from a scoped
-caller is refused (revoke stays open — de-escalation is fail-safe), and the
-shared-view tools (`show_shared_view`, `focus_shared_view`,
-`request_shared_view_input`, `capture_shared_view_frame`) activate a
-user-session target only for a granted or owner caller instead of flipping
-the grant themselves. Sharing an agent-owned virtual display never touches
-the user-display grant.
+Granting and resolving a display request are themselves owner/root-only:
+`GrantUserDisplay` and `ResolveDisplayRequest` from a scoped caller are refused
+on both dashboard transports. `RevokeUserDisplay` stays open to an otherwise
+authorized scoped caller — de-escalation is fail-safe. The shared-view tools
+(`show_shared_view`, `focus_shared_view`, `request_shared_view_input`,
+`capture_shared_view_frame`) activate a user-session target only for a granted
+or owner caller instead of flipping the grant themselves. Sharing an
+agent-owned virtual display never touches the user-display grant.
 
 ### Dashboard Live workspace
 

@@ -889,6 +889,7 @@ pub(crate) fn control_frame_response(
                 "api_cached_bootstrap_events" => Some(cached_bootstrap_events_response_frame(
                     id,
                     &runtime.bootstrap_caches,
+                    &runtime.grant,
                 )),
                 "api_sessions_stream" => {
                     spawn_control_stream(
@@ -2171,11 +2172,13 @@ async fn forward_dashboard_display_input(
         ),
     >,
 ) {
-    let display_id = frame
+    let Some(display_id) = frame
         .get("display_id")
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
+    else {
+        return;
+    };
     let Some(event) = frame.get("event").cloned() else {
         return;
     };
@@ -2195,10 +2198,9 @@ async fn forward_dashboard_display_input(
     // Retain the registry read guard through the final synchronous enqueue.
     // Removal/replacement closes the old queue under the write guard, so each
     // raw frame is linearized wholly before or wholly after that lifecycle
-    // boundary. `get_any` is intentional: this is an owner dashboard lane and
-    // private user views remain controllable by their owner.
+    // boundary. The grant-aware lookup keeps private views owner-only.
     let registry = session_registry.read().await;
-    if let Some(display_session) = registry.get_any(display_id) {
+    if let Some(display_session) = runtime.grant.display_session(&registry, display_id) {
         // The registry reads above yield. Re-check after them so a live IAM,
         // peer-identity, or holder change cannot race the final enqueue.
         if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
@@ -2262,6 +2264,7 @@ fn dashboard_display_input_remains_authorized(
 pub(crate) fn cached_bootstrap_events_response_frame(
     id: String,
     caches: &DashboardBootstrapCaches,
+    grant: &DashboardControlGrant,
 ) -> serde_json::Value {
     let mut events = Vec::new();
     let mut malformed = Vec::new();
@@ -2313,6 +2316,11 @@ pub(crate) fn cached_bootstrap_events_response_frame(
             }
         }
     }
+    events.retain(|event| {
+        serde_json::to_string(event)
+            .ok()
+            .is_some_and(|line| grant.allows_dashboard_event_line(&line))
+    });
     let event_count = events.len();
 
     serde_json::json!({
@@ -2700,7 +2708,7 @@ mod tests {
         let bridge = DashboardDisplayAuthorityBridge::new(
             |_session_id, _display_ids| Vec::new(),
             |_session_id, _display_id| None,
-            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id, _include_private| Vec::new(),
             |_session_id, _display_id| Vec::new(),
             |_session_id, _display_id| true,
             |_display_id| Arc::new(AtomicU64::new(0)),
@@ -2773,7 +2781,7 @@ mod tests {
         let bridge = DashboardDisplayAuthorityBridge::new(
             |_session_id, _display_ids| Vec::new(),
             |_session_id, _display_id| None,
-            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id, _include_private| Vec::new(),
             |_session_id, _display_id| Vec::new(),
             |_session_id, _display_id| true,
             |_display_id| Arc::new(AtomicU64::new(0)),

@@ -390,6 +390,30 @@ impl AccessPrincipal {
             || self.id == "principal:local-process:loopback"
     }
 
+    /// True when this request was authenticated by an independently enrolled
+    /// browser mTLS certificate whose active local-IAM grant is `role:root`.
+    ///
+    /// This is intentionally separate from [`Self::is_owner_surface`]. The
+    /// latter identifies synthetic/local ambient owner surfaces without
+    /// consulting an IAM grant; widening it to every root-compatible principal
+    /// would also admit supervised agents and MCP token holders. Callers use
+    /// this narrower predicate only after their normal live-IAM operation gate
+    /// has accepted the request.
+    pub fn is_enrolled_root_mtls_user_client(&self) -> bool {
+        matches!(self.kind.as_str(), "browser_certificate" | "human_user")
+            && self.role_id == "role:root"
+            && self.authn_kind.as_deref() == Some("browser_mtls_cert")
+            && self
+                .authn_binding
+                .as_deref()
+                .is_some_and(|binding| !binding.trim().is_empty())
+            && self
+                .grant_id
+                .as_deref()
+                .is_some_and(|grant_id| !grant_id.trim().is_empty())
+            && !self.hosted_connect
+    }
+
     pub fn root_dashboard_session(source: impl Into<String>, transport: impl Into<String>) -> Self {
         Self {
             id: "principal:root:dashboard".to_string(),
@@ -4888,6 +4912,39 @@ mod tests {
         assert!(
             !AccessPrincipal::peer_daemon("fp", "dell", "peer-root", "mtls").is_owner_surface()
         );
+    }
+
+    #[test]
+    fn enrolled_root_mtls_user_client_is_a_distinct_owner_anchor() {
+        let mut state = active_browser_cert_state();
+        state.grants[0].role_id = "role:root".to_string();
+        let principal = principal_for_browser_mtls_cert(&state, "ab123", "https").unwrap();
+
+        assert!(principal.is_enrolled_root_mtls_user_client());
+        assert!(
+            !principal.is_owner_surface(),
+            "the global owner-surface predicate must keep excluding IAM clients"
+        );
+
+        let mut scoped = principal.clone();
+        scoped.role_id = "role:operator".to_string();
+        assert!(!scoped.is_enrolled_root_mtls_user_client());
+
+        let mut ambient_key = principal.clone();
+        ambient_key.authn_kind = Some("client_key".to_string());
+        assert!(!ambient_key.is_enrolled_root_mtls_user_client());
+
+        let mut wrong_principal_kind = principal.clone();
+        wrong_principal_kind.kind = "root_session".to_string();
+        assert!(!wrong_principal_kind.is_enrolled_root_mtls_user_client());
+
+        let mut unenrolled = principal.clone();
+        unenrolled.grant_id = None;
+        assert!(!unenrolled.is_enrolled_root_mtls_user_client());
+
+        let mut hosted = principal;
+        hosted.hosted_connect = true;
+        assert!(!hosted.is_enrolled_root_mtls_user_client());
     }
 
     #[test]

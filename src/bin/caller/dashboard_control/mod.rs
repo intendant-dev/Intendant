@@ -69,7 +69,6 @@ const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
-static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// One dashboard-control method's declared surface. The effective method
 /// table (`all_control_methods`) is the single source the method authorizer
 /// (`authorize_dashboard_control_method`), the advertised feature list
@@ -752,6 +751,129 @@ impl DashboardControlGrant {
         }
     }
 
+    /// Whether this connection is one of the owner's authenticated dashboard
+    /// surfaces. Private user-session displays and actions that mint access to
+    /// them must never be exposed merely by granting `display.view` or
+    /// `display.input` to a delegate.
+    pub(crate) fn has_owner_dashboard_authority(&self) -> bool {
+        match self {
+            Self::TrustedLocal => true,
+            Self::UserClient { principal, .. } => {
+                principal.role_id == "role:root" && self.opening_authority_is_current()
+            }
+            Self::Peer { .. } => false,
+        }
+    }
+
+    /// Resolve a display through this connection's visibility boundary.
+    /// Generic display permissions expose agent-visible displays only; the
+    /// owner's authenticated dashboard may additionally resolve private user
+    /// views.
+    pub(crate) fn display_session(
+        &self,
+        registry: &crate::display::SessionRegistry,
+        display_id: u32,
+    ) -> Option<Arc<crate::display::DisplaySession>> {
+        if self.has_owner_dashboard_authority() {
+            registry.get_any(display_id)
+        } else {
+            registry.get(display_id)
+        }
+    }
+
+    /// Enumerate displays through the same visibility boundary as
+    /// [`Self::display_session`].
+    pub(crate) fn display_ids(&self, registry: &crate::display::SessionRegistry) -> Vec<u32> {
+        if self.has_owner_dashboard_authority() {
+            registry.all_display_ids()
+        } else {
+            registry.display_ids()
+        }
+    }
+
+    /// Apply the owner-only boundary to dashboard event streams. This hides
+    /// explicit private ready/grant records, display-request prompts, and
+    /// portal approval prompts from scoped dashboards. Display lifecycle
+    /// failure/teardown metadata does not carry the original visibility bit
+    /// and remains audit metadata rather than a secrecy boundary.
+    pub(crate) fn allows_dashboard_event_line(&self, line: &str) -> bool {
+        self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
+    }
+
+    pub(crate) fn dashboard_event_line_requires_owner(line: &str) -> bool {
+        if !line.contains("display_request_raised")
+            && !line.contains("display_request_resolved")
+            && !line.contains("display_approval_pending")
+            && !line.contains("\"agent_visible\"")
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        match value.get("event").and_then(serde_json::Value::as_str) {
+            Some(
+                "display_request_raised" | "display_request_resolved" | "display_approval_pending",
+            ) => true,
+            Some("display_ready" | "user_display_granted") => {
+                value
+                    .get("agent_visible")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove owner-only display events from a browser bootstrap replay.
+    ///
+    /// Session logs remain the daemon's audit record; this filters only the
+    /// live dashboard projection so a historical private `display_ready`
+    /// cannot recreate a denied display slot for a scoped client.
+    pub(crate) fn filter_dashboard_replay_payload(&self, replay: &mut serde_json::Value) {
+        if self.has_owner_dashboard_authority() {
+            return;
+        }
+        let Some(entries) = replay
+            .get_mut("entries")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        entries.retain(|entry| {
+            serde_json::to_string(entry)
+                .ok()
+                .is_none_or(|line| !Self::dashboard_event_line_requires_owner(&line))
+        });
+    }
+
+    /// Display target carried by a serialized dashboard event, when present.
+    /// Live event loops use it to suppress every event for an active private
+    /// session, including variants such as resize that do not repeat the
+    /// `agent_visible` bit.
+    pub(crate) fn dashboard_event_display_id(line: &str) -> Option<u32> {
+        if !line.contains("\"display_id\"") {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()?
+            .get("display_id")?
+            .as_u64()
+            .and_then(|display_id| u32::try_from(display_id).ok())
+    }
+
+    pub(crate) fn dashboard_event_targets_hidden_display(
+        &self,
+        line: &str,
+        registry: &crate::display::SessionRegistry,
+    ) -> bool {
+        let Some(display_id) = Self::dashboard_event_display_id(line) else {
+            return false;
+        };
+        registry.get_any(display_id).is_some()
+            && self.display_session(registry, display_id).is_none()
+    }
+
     pub(crate) fn access_decision(
         &self,
         op: crate::peer::access_policy::PeerOperation,
@@ -777,6 +899,28 @@ impl DashboardControlGrant {
             }
             _ => crate::access::iam::evaluate_principal_operation(&self.access_principal(), op),
         }
+    }
+
+    /// Authorize the concrete action carried inside a multiplexed control RPC.
+    /// The outer method's permission is only a conservative admission floor;
+    /// it must not become a confused-deputy grant for every action in the
+    /// method's allowlist.
+    pub(crate) fn control_msg_access_decision(
+        &self,
+        ctrl: &ControlMsg,
+    ) -> crate::access::iam::AccessDecision {
+        let operation = crate::access::access_policy::control_msg_operation(ctrl);
+        if crate::access::access_policy::control_msg_requires_owner_dashboard(ctrl)
+            && !self.has_owner_dashboard_authority()
+        {
+            let principal = self.access_principal();
+            return crate::access::iam::AccessDecision::denied(
+                &principal,
+                operation,
+                "owner dashboard authority is required for this action",
+            );
+        }
+        self.access_decision(operation)
     }
 
     /// Pre-session fail-closed gate for transports that push snapshots or
@@ -928,6 +1072,7 @@ impl DashboardPresenceBridge {
 /// dashboard client id (and a display id / id list) and returns event JSON.
 type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
+type AuthorityRequestFn = dyn Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
 type AuthorityInputRevisionFn = dyn Fn(u32) -> Arc<AtomicU64> + Send + Sync;
@@ -936,7 +1081,7 @@ type AuthorityInputRevisionFn = dyn Fn(u32) -> Arc<AtomicU64> + Send + Sync;
 pub struct DashboardDisplayAuthorityBridge {
     snapshot: Arc<AuthoritySnapshotFn>,
     state_frame: Arc<AuthorityStateFrameFn>,
-    request: Arc<AuthorityEventsFn>,
+    request: Arc<AuthorityRequestFn>,
     release: Arc<AuthorityEventsFn>,
     input_authorized: Arc<AuthorityInputAuthorizedFn>,
     input_revision: Arc<AuthorityInputRevisionFn>,
@@ -949,7 +1094,7 @@ impl DashboardDisplayAuthorityBridge {
     pub fn new(
         snapshot: impl Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync + 'static,
         state_frame: impl Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync + 'static,
-        request: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        request: impl Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync + 'static,
         release: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
         input_authorized: impl Fn(&str, u32) -> bool + Send + Sync + 'static,
         input_revision: impl Fn(u32) -> Arc<AtomicU64> + Send + Sync + 'static,
@@ -976,8 +1121,13 @@ impl DashboardDisplayAuthorityBridge {
         (self.state_frame)(session_id, display_id)
     }
 
-    fn request(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
-        (self.request)(session_id, display_id)
+    fn request(
+        &self,
+        session_id: &str,
+        display_id: u32,
+        include_private: bool,
+    ) -> Vec<serde_json::Value> {
+        (self.request)(session_id, display_id, include_private)
     }
 
     fn release(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
@@ -1483,6 +1633,10 @@ impl DashboardControlPeer {
             session_grant.as_deref(),
             client_nonce.as_deref(),
         );
+        let display_peer_id = crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+            .ok_or_else(|| {
+                CallerError::WebRtc("dashboard display peer-id namespace exhausted".to_string())
+            })?;
         let shutdown = CancellationToken::new();
         let runtime = ControlRuntime {
             session_id,
@@ -1509,7 +1663,7 @@ impl DashboardControlPeer {
             tcp_advertised,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
+            display_peer_id,
             display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant,
             shutdown: shutdown.clone(),
@@ -1600,10 +1754,11 @@ pub(crate) struct ControlRuntime {
     display_peer_id: crate::display::PeerId,
     /// Display sessions on which this control transport has attempted to
     /// register `display_peer_id`. A display's media WebRTC transport is
-    /// separate from this control peer, so the control driver must retain the
-    /// sessions long enough to close that media peer on disconnect or IAM
-    /// revocation. The vector is pointer-deduplicated when offers arrive.
-    display_peer_sessions: Arc<Mutex<Vec<Arc<crate::display::DisplaySession>>>>,
+    /// separate from this control peer, so the control driver tracks sessions
+    /// so teardown can close a still-live media peer on disconnect or IAM
+    /// revocation without retaining a completed display session. The weak
+    /// vector is pointer-deduplicated and pruned when offers arrive.
+    display_peer_sessions: Arc<Mutex<Vec<std::sync::Weak<crate::display::DisplaySession>>>>,
     grant: DashboardControlGrant,
     /// Lifetime of the authenticated control transport. Interactive display
     /// channels created through it retain this token so queued input and
@@ -1865,6 +2020,53 @@ mod fs_scope_grant_tests {
     }
 
     #[test]
+    fn private_display_owner_authority_requires_local_or_current_root() {
+        let local = DashboardControlGrant::TrustedLocal;
+        let root = browser_grant_for_role("role:root", "AA:ROOT");
+        let observer = browser_grant_for_role("role:observer", "AA:OBSERVER");
+        assert!(local.has_owner_dashboard_authority());
+        assert!(root.has_owner_dashboard_authority());
+        assert!(
+            !browser_grant_for_role("role:operator", "AA:OPERATOR").has_owner_dashboard_authority()
+        );
+        assert!(!observer.has_owner_dashboard_authority());
+
+        let private_ready = r#"{"event":"display_ready","display_id":9,"agent_visible":false}"#;
+        let public_ready = r#"{"event":"display_ready","display_id":8,"agent_visible":true}"#;
+        let request = r#"{"event":"display_request_raised","id":1}"#;
+        let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
+        assert!(root.allows_dashboard_event_line(private_ready));
+        assert!(!observer.allows_dashboard_event_line(private_ready));
+        assert!(observer.allows_dashboard_event_line(public_ready));
+        assert!(!observer.allows_dashboard_event_line(request));
+        assert!(!observer.allows_dashboard_event_line(approval));
+
+        let replay = serde_json::json!({
+            "t": "log_replay",
+            "entries": [
+                serde_json::from_str::<serde_json::Value>(private_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(public_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(request).unwrap(),
+                serde_json::from_str::<serde_json::Value>(approval).unwrap(),
+                {"event": "display_capture_lost", "display_id": 9, "reason": "closed"},
+            ],
+        });
+        let mut owner_replay = replay.clone();
+        root.filter_dashboard_replay_payload(&mut owner_replay);
+        assert_eq!(owner_replay, replay);
+
+        let mut replay = replay;
+        observer.filter_dashboard_replay_payload(&mut replay);
+        let events = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("event").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec!["display_ready", "display_capture_lost"]);
+    }
+
+    #[test]
     fn live_iam_change_or_reload_failure_invalidates_opening_authority() {
         use crate::peer::access_policy::PeerOperation;
 
@@ -1896,6 +2098,7 @@ mod fs_scope_grant_tests {
             iam_cert_dir: Some(tmp.path().to_path_buf()),
         };
         assert!(grant.opening_authority_is_current());
+        assert!(grant.has_owner_dashboard_authority());
         assert!(grant.access_decision(PeerOperation::RuntimeControl).allowed);
 
         crate::access::iam::update_user_client_grant(
@@ -1910,6 +2113,7 @@ mod fs_scope_grant_tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
         assert!(!grant.opening_authority_is_current());
+        assert!(!grant.has_owner_dashboard_authority());
         assert!(!grant.access_decision(PeerOperation::RuntimeControl).allowed);
         assert!(matches!(
             grant.terminal_actor(),
@@ -3010,7 +3214,8 @@ mod tests {
             tcp_advertised: None,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: 1,
+            display_peer_id: crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+                .expect("test dashboard-control peer id"),
             display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant: DashboardControlGrant::TrustedLocal,
             shutdown: CancellationToken::new(),
@@ -3679,6 +3884,23 @@ mod tests {
         assert!(
             authorize_dashboard_control_method(&rt, "api_credential_lease_grant", None).is_ok()
         );
+    }
+
+    #[test]
+    fn cached_bootstrap_hides_private_display_grants_from_non_owners() {
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+        *rt.bootstrap_caches.last_user_display_json.lock().unwrap() = Some(
+            r#"{"event":"user_display_granted","display_id":9,"agent_visible":false}"#.to_string(),
+        );
+
+        let filtered = cached_bootstrap_events_response_frame(
+            "private-cache".to_string(),
+            &rt.bootstrap_caches,
+            &rt.grant,
+        );
+        assert_eq!(filtered["result"]["event_count"], 0);
+        assert_eq!(filtered["result"]["events"], serde_json::json!([]));
     }
 
     #[test]

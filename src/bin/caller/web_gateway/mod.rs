@@ -79,10 +79,6 @@ pub(crate) use ws_session::*;
 mod http_dispatch;
 pub(crate) use http_dispatch::*;
 
-/// Monotonically increasing counter for assigning unique peer IDs to WebSocket
-/// connections.  Used for WebRTC signaling so that each browser tab gets a
-/// stable identity within a display session.
-static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_LIST_LIMITED_RESPONSE_CACHE: OnceLock<
     Mutex<HashMap<usize, SessionListResponseCacheEntry>>,
 > = OnceLock::new();
@@ -336,13 +332,11 @@ fn ensure_idle(
 pub(crate) async fn displays_response_body_from(
     displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
 ) -> String {
-    // This route serves the owner's dashboards (the display picker), so
-    // each entry is annotated with its live capture state via the
-    // unfiltered registry view: `capture_active` plus `agent_visible`
-    // (false = private user view). Agent-facing display enumeration
-    // (MCP `list_displays`, ctl) uses the filtered lookups and never
-    // sees a private view's session.
+    // Annotate live capture state through the caller's visibility boundary.
+    // Generic display.view callers see agent-visible capture sessions only;
+    // an authenticated owner dashboard may additionally see private views.
     let mut displays: Vec<serde_json::Value> = displays
         .iter()
         .map(|d| serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({})))
@@ -353,7 +347,12 @@ pub(crate) async fn displays_response_body_from(
             let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
                 continue;
             };
-            if let Some(session) = reg.get_any(id as u32) {
+            let session = if include_private {
+                reg.get_any(id as u32)
+            } else {
+                reg.get(id as u32)
+            };
+            if let Some(session) = session {
                 entry["capture_active"] = serde_json::json!(true);
                 entry["agent_visible"] = serde_json::json!(session.agent_visible());
             }
@@ -2346,21 +2345,39 @@ mod tests {
         (port, handle)
     }
 
+    /// Own the scratch access store for a default TLS test gateway for as
+    /// long as its listener task can run. Aborting on drop prevents a test
+    /// panic from detaching the listener after its temporary store disappears.
+    struct TlsTestGatewayHandle {
+        task: tokio::task::JoinHandle<()>,
+        _access_cert_dir: tempfile::TempDir,
+    }
+
+    impl TlsTestGatewayHandle {
+        fn abort(&self) {
+            self.task.abort();
+        }
+    }
+
+    impl Drop for TlsTestGatewayHandle {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     /// Spawn a gateway with a self-signed TLS acceptor wired in (strict
     /// HTTPS/WSS mode) plus an optional inbound bearer token. Used by the
     /// strict-TLS demux tests and the TLS variant of the /ws bearer test
     /// (audit F2), which only manifests over TLS — rustls buffers the
     /// response ciphertext, so a missing flush truncates it to empty.
-    async fn spawn_test_gateway_tls(
-        bearer_token: Option<String>,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn spawn_test_gateway_tls(bearer_token: Option<String>) -> (u16, TlsTestGatewayHandle) {
         spawn_test_gateway_tls_with_client_cert_requirement(bearer_token, false).await
     }
 
     async fn spawn_test_gateway_tls_with_client_cert_requirement(
         bearer_token: Option<String>,
         tls_client_cert_required: bool,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    ) -> (u16, TlsTestGatewayHandle) {
         // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
         // same construction the production `--tls` self-signed path uses.
         let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
@@ -2375,14 +2392,22 @@ mod tests {
         bearer_token: Option<String>,
         tls_client_cert_required: bool,
         acceptor: tokio_rustls::TlsAcceptor,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
-        spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+    ) -> (u16, TlsTestGatewayHandle) {
+        let access_cert_dir = tempfile::tempdir().expect("TLS test access store");
+        let (port, task) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
             bearer_token,
             tls_client_cert_required,
             acceptor,
-            crate::access::backend::select_backend().cert_dir(),
+            access_cert_dir.path().to_path_buf(),
         )
-        .await
+        .await;
+        (
+            port,
+            TlsTestGatewayHandle {
+                task,
+                _access_cert_dir: access_cert_dir,
+            },
+        )
     }
 
     async fn spawn_test_gateway_with_tls_acceptor_and_cert_dir(

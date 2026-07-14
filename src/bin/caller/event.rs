@@ -435,8 +435,8 @@ pub enum AppEvent {
         /// [`crate::display::DisplaySession::agent_visible`]). `false`
         /// marks a private user view: consumers that surface displays to
         /// agents or peers (presence display list, peer upcasters,
-        /// recording auto-start) must skip it; dashboards use it to
-        /// render the "private view" chip on the tile.
+        /// recording auto-start) must skip it; only authority-checked
+        /// owner/root dashboards use it to render the "private view" chip.
         agent_visible: bool,
     },
 
@@ -1752,9 +1752,10 @@ pub enum ControlMsg {
         /// message always meant "share with the agent for computer
         /// use", and old frontends keep that meaning. `Some(false)` is
         /// the dashboard's "View this machine": a private remote view
-        /// streamed to the user's dashboards only, invisible to agent
-        /// display enumeration/screenshot/CU paths and never touching
-        /// the autonomy user-display grant.
+        /// streamed to authority-checked owner/root dashboards only,
+        /// invisible to scoped dashboards and agent display
+        /// enumeration/screenshot/CU paths, and never touching the autonomy
+        /// user-display grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_visible: Option<bool>,
     },
@@ -2083,9 +2084,10 @@ impl EventBus {
     /// intents must never lose one. This lane mirrors the session-log
     /// fan-out: an unbounded mpsc fed at the emit point, carrying only the
     /// low-volume [`app_event_rides_intent_lane`] subset, delivered in
-    /// emission order. Intents are human-scale, so the unbounded queue is
-    /// bounded in practice by what a person can click; the failure mode of a
-    /// wedged consumer is memory growth, never a silently dropped intent.
+    /// emission order. Human actions and the lifecycle events ordered with
+    /// them are low-volume, so the unbounded queue is bounded in practice;
+    /// the failure mode of a wedged consumer is memory growth, never a
+    /// silently dropped action.
     ///
     /// The broadcast copy of every intent still exists for display-only
     /// consumers (waiters, UIs) that tolerate loss.
@@ -2100,10 +2102,11 @@ impl EventBus {
 
 /// The event subset carried by the lossless intent lane
 /// ([`EventBus::subscribe_intents`]): the user intents themselves plus the
-/// low-volume session-bookkeeping events the intent-acting consumers
-/// (control plane, task dispatcher, session supervisor) fold into the same
-/// ordered stream — alias/relationship mapping that routes FUTURE intents,
-/// and the end-of-session / display-revoke hygiene the control plane owns.
+/// low-volume lifecycle/bookkeeping events the intent-acting consumers
+/// (control plane, task dispatcher, session supervisor, recording listener)
+/// fold into the same ordered stream — alias/relationship mapping that routes
+/// FUTURE intents, the end-of-session / display-revoke hygiene the control
+/// plane owns, and display/task boundaries that start or stop recording.
 /// `SharedView` rides along for the same hygiene: the control plane's
 /// focus-annotation tracker (`shared_view_lifecycle`) must fold the
 /// human-scale shared-view verbs in emission order to know what a later
@@ -2118,6 +2121,8 @@ pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
             | AppEvent::SessionEnded { .. }
             | AppEvent::UserDisplayRevoked { .. }
             | AppEvent::SharedView { .. }
+            | AppEvent::DisplayReady { .. }
+            | AppEvent::TaskComplete { .. }
     )
 }
 
@@ -3796,6 +3801,40 @@ mod tests {
         assert!(matches!(
             intents.recv().await,
             Some(AppEvent::SessionIdentity { .. })
+        ));
+        assert!(intents.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn intent_lane_orders_recording_lifecycle_with_controls() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        bus.send(AppEvent::DisplayReady {
+            display_id: 7,
+            width: 1280,
+            height: 720,
+            agent_visible: true,
+        });
+        bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
+            stream_name: "display_7".to_string(),
+        }));
+        bus.send(AppEvent::TaskComplete {
+            session_id: Some("s1".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::DisplayReady { display_id: 7, .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::ControlCommand(ControlMsg::StopRecording { .. }))
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::TaskComplete { .. })
         ));
         assert!(intents.try_recv().is_err());
     }

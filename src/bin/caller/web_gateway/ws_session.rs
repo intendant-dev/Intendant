@@ -73,6 +73,7 @@ fn authorized_display_with_cached_input_authorizer<T>(
 /// grant for the disappeared ID.
 async fn apply_local_grant_for_existing_display(
     session_registry: Option<&crate::display::SharedSessionRegistry>,
+    grant: &crate::dashboard_control::DashboardControlGrant,
     display_id: u32,
     connection_id: &str,
     direct_tx: &mpsc::UnboundedSender<String>,
@@ -83,7 +84,7 @@ async fn apply_local_grant_for_existing_display(
         return false;
     };
     let registry = session_registry.read().await;
-    if registry.get_any(display_id).is_none() {
+    if grant.display_session(&registry, display_id).is_none() {
         return false;
     }
     apply_grant_input_authority(
@@ -225,6 +226,20 @@ pub(crate) async fn ws_outbound_task(
                 }
                 match msg {
                     Ok(line) => {
+                        let owner = grant.has_owner_dashboard_authority();
+                        if !owner
+                            && crate::dashboard_control::DashboardControlGrant::dashboard_event_line_requires_owner(&line)
+                        {
+                            continue;
+                        }
+                        if !owner {
+                            if let Some(session_registry) = session_registry.as_ref() {
+                                let registry = session_registry.read().await;
+                                if grant.dashboard_event_targets_hidden_display(&line, &registry) {
+                                    continue;
+                                }
+                            }
+                        }
                         if ws_tx
                             .send(Message::Text(line.into()))
                             .await
@@ -245,6 +260,7 @@ pub(crate) async fn ws_outbound_task(
                         })
                         .to_string()];
                         frames.extend(bootstrap_cache_resync_lines(&bootstrap_caches));
+                        frames.retain(|line| grant.allows_dashboard_event_line(line));
                         // Live display slots: rebuild display_ready from the
                         // authoritative session registry (browser-side
                         // addDisplaySlot is idempotent for live slots).
@@ -252,11 +268,11 @@ pub(crate) async fn ws_outbound_task(
                         // awaited sends.
                         if let Some(sr) = session_registry.as_ref() {
                             let reg = sr.read().await;
-                            let ready_frames: Vec<String> = reg
-                                .all_display_ids()
+                            let ready_frames: Vec<String> = grant
+                                .display_ids(&reg)
                                 .into_iter()
                                 .filter_map(|did| {
-                                    reg.get_any(did).map(|session| {
+                                    grant.display_session(&reg, did).map(|session| {
                                         let (w, h) = session.resolution();
                                         serde_json::json!({
                                             "event": "display_ready",
@@ -300,6 +316,15 @@ pub(crate) async fn ws_outbound_task(
                         if !change.is_current(&display_input_authority) {
                             continue;
                         }
+                        let visible = match session_registry.as_ref() {
+                            Some(registry) => grant
+                                .display_session(&*registry.read().await, change.display_id)
+                                .is_some(),
+                            None => false,
+                        };
+                        if !visible {
+                            continue;
+                        }
                         // Personalize: never ship the holder's identity.
                         let state = match &change.holder {
                             Some(h) if h.matches_local_ws(&connection_id) => "you",
@@ -330,11 +355,8 @@ pub(crate) async fn ws_outbound_task(
                         // tokio lock for the active-display list — order
                         // matters: take the std lock LAST and drop it before
                         // awaiting the send to avoid awaiting under a sync guard.
-                                        // `all_display_ids`: authority chips are a
-                        // dashboard surface — private user views hold
-                        // input authority like any other display.
                         let display_ids: Vec<u32> = match session_registry.as_ref() {
-                            Some(sr) => sr.read().await.all_display_ids(),
+                            Some(sr) => grant.display_ids(&*sr.read().await),
                             None => Vec::new(),
                         };
                         let snapshots: Vec<(u32, &'static str)> = {
@@ -1425,12 +1447,13 @@ pub(crate) async fn ws_inbound_task(
                         // (notably deactivate_user_display's
                         // registry.write()) for as long as this block
                         // runs. The Arc keeps the session alive
-                        // independently of the lock. `get_any`: local
-                        // dashboard viewers are the user surface —
-                        // private user views stream here (and only here).
+                        // independently of the lock. The grant-aware lookup
+                        // exposes private user views only to an authenticated
+                        // owner dashboard.
                         let session: Option<Arc<crate::display::DisplaySession>> =
                             match session_registry_inbound.as_ref() {
-                                Some(sr) => sr.read().await.get_any(display_id),
+                                Some(sr) => dashboard_control_grant_live
+                                    .display_session(&*sr.read().await, display_id),
                                 None => None,
                             };
                         if let Some(session) = session {
@@ -1561,9 +1584,12 @@ pub(crate) async fn ws_inbound_task(
                         // same "mdns resolve failed" diagnostic; losing
                         // a candidate is survivable (ICE has others),
                         // whereas blocking the reader is not.
-                        let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                        let Some(display_id) = frame_display_id(&json) else {
+                            continue;
+                        };
                         let candidate = json["candidate"].to_string();
                         let sr_clone = session_registry_inbound.clone();
+                        let grant = Arc::clone(&dashboard_control_grant_live);
                         let pid = peer_id;
                         tokio::spawn(async move {
                             // Clone the session Arc out of the read
@@ -1578,12 +1604,13 @@ pub(crate) async fn ws_inbound_task(
                             // first lets deactivate proceed
                             // immediately; the session Arc keeps the
                             // target alive while mDNS resolves.
-                            // `get_any`: same local-dashboard leg as the
-                            // display_offer handler — private user views
-                            // stream to the owner's dashboards.
+                            // The grant-aware lookup matches display_offer:
+                            // private views are owner-dashboard-only.
                             let session: Option<Arc<crate::display::DisplaySession>> =
                                 match sr_clone.as_ref() {
-                                    Some(sr) => sr.read().await.get_any(display_id),
+                                    Some(sr) => {
+                                        grant.display_session(&*sr.read().await, display_id)
+                                    }
                                     None => None,
                                 };
                             if let Some(session) = session {
@@ -1896,9 +1923,9 @@ pub(crate) async fn ws_inbound_task(
                         };
 
                         // Resolve the client-chosen ID before constructing or
-                        // caching any guard. `get_any`: dashboard input drives
-                        // private user views too (that's the remote-control
-                        // point of "View this machine").
+                        // caching any guard. Generic display.input reaches
+                        // agent-visible sessions only; private user views are
+                        // reserved for authenticated owner dashboards.
                         let Some(session_registry) = session_registry_inbound.as_ref() else {
                             continue;
                         };
@@ -1908,7 +1935,8 @@ pub(crate) async fn ws_inbound_task(
                         // or after removal rather than retaining a detached
                         // Arc across the boundary.
                         let registry = session_registry.read().await;
-                        let session = registry.get_any(display_id);
+                        let session =
+                            dashboard_control_grant_live.display_session(&registry, display_id);
 
                         // Phase 5 authority gate: if someone has claimed
                         // input authority for this display, only that
@@ -1980,14 +2008,12 @@ pub(crate) async fn ws_inbound_task(
                         // `display_input` arm above for the same reason
                         // (direct session access, no bus round-trip).
                         //
-                        // No authority gate: diagnostics is operator-
-                        // initiated and the marker affects every viewer
-                        // of this display when on (it's stamped pre-
-                        // encoder, lands in every encoded layer). An
-                        // operator running a smoke run sets it, all
-                        // viewers see the marker until they unset it.
-                        // No covert-stamp scenario worth gating against.
-                        let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                        // The frame gate above requires owner-dashboard
+                        // authority: the marker is stamped pre-encoder and
+                        // affects every viewer, including private views.
+                        let Some(display_id) = frame_display_id(&json) else {
+                            continue;
+                        };
                         let enabled = json["enabled"].as_bool().unwrap_or(false);
                         match session_registry_inbound.as_ref() {
                             Some(sr) => {
@@ -2097,6 +2123,7 @@ pub(crate) async fn ws_inbound_task(
                                 // baking logging dependencies into the helper.
                                 if !apply_local_grant_for_existing_display(
                                     session_registry_inbound.as_ref(),
+                                    &dashboard_control_grant_inbound,
                                     display_id,
                                     &connection_id_inbound,
                                     &direct_tx_inbound,
@@ -2322,8 +2349,12 @@ pub(crate) async fn ws_inbound_task(
         &display_input_authority_inbound,
         &authority_change_tx_inbound,
     );
-    close_federated_peers_for_sessions(&released_federated_subs, session_registry_inbound.as_ref())
-        .await;
+    close_federated_peers_for_sessions(
+        connection_id_inbound.as_str(),
+        &released_federated_subs,
+        session_registry_inbound.as_ref(),
+    )
+    .await;
     if is_presence_connected && is_active {
         bus_inbound.send(AppEvent::PresenceDisconnected);
     }
@@ -2353,6 +2384,36 @@ pub(crate) async fn ws_inbound_task(
 #[cfg(test)]
 mod input_authorizer_cache_tests {
     use super::*;
+
+    struct WsInputTestDisplayBackend;
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for WsInputTestDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, crate::error::CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn kind(&self) -> &'static str {
+            "ws-input-test"
+        }
+    }
 
     #[test]
     fn display_frame_ids_are_strict_u32_values() {
@@ -2444,6 +2505,7 @@ mod input_authorizer_cache_tests {
             assert!(
                 !apply_local_grant_for_existing_display(
                     Some(&session_registry),
+                    &crate::dashboard_control::DashboardControlGrant::TrustedLocal,
                     display_id,
                     "local-connection",
                     &direct_tx,
@@ -2458,6 +2520,58 @@ mod input_authorizer_cache_tests {
         assert!(
             change_rx.try_recv().is_err(),
             "rejected requests must not publish authority changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_authority_requests_keep_private_displays_owner_only() {
+        let session_registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let private = Arc::new(crate::display::DisplaySession::new(
+            9,
+            Arc::new(WsInputTestDisplayBackend),
+        ));
+        private.set_agent_visible(false);
+        session_registry.write().await.insert(9, private);
+
+        let authority = Arc::new(DisplayInputAuthority::default());
+        let (change_tx, _change_rx) = broadcast::channel(8);
+        let (direct_tx, _direct_rx) = mpsc::unbounded_channel();
+        let non_owner = crate::dashboard_control::DashboardControlGrant::Peer {
+            fingerprint: "test-peer".to_string(),
+            label: "test peer".to_string(),
+            profile: "controller".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        assert!(
+            !apply_local_grant_for_existing_display(
+                Some(&session_registry),
+                &non_owner,
+                9,
+                "scoped-connection",
+                &direct_tx,
+                &authority,
+                &change_tx,
+            )
+            .await
+        );
+        assert_eq!(authority.tracked_entry_counts(), (0, 0));
+
+        assert!(
+            apply_local_grant_for_existing_display(
+                Some(&session_registry),
+                &crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+                9,
+                "owner-connection",
+                &direct_tx,
+                &authority,
+                &change_tx,
+            )
+            .await
         );
     }
 }

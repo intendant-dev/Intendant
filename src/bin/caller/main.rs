@@ -31,6 +31,7 @@ mod diagnostics;
 mod display_requests;
 pub(crate) use intendant_core::error;
 pub(crate) use intendant_display as display;
+mod display_peer_ids;
 mod event;
 mod external_agent;
 mod external_wrapper_index;

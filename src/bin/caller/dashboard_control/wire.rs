@@ -280,6 +280,31 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 }
                 match event {
                     Ok(line) => {
+                        let owner = runtime.grant.has_owner_dashboard_authority();
+                        if !owner
+                            && DashboardControlGrant::dashboard_event_line_requires_owner(&line)
+                        {
+                            continue;
+                        }
+                        if !owner {
+                            let private = {
+                                let active_session = runtime.shared_session.read().await;
+                                match active_session.session_registry.as_ref() {
+                                    Some(session_registry) => {
+                                        let registry = session_registry.read().await;
+                                        runtime
+                                            .grant
+                                            .dashboard_event_targets_hidden_display(
+                                                &line, &registry,
+                                            )
+                                    }
+                                    None => false,
+                                }
+                            };
+                            if private {
+                                continue;
+                            }
+                        }
                         runtime.events_sent = runtime.events_sent.saturating_add(1);
                         let frame = event_lane_frame(runtime.events_sent, &line);
                         send_control_text(&mut rtc, &channels, frame);
@@ -420,6 +445,24 @@ pub(crate) fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
     runtime: &mut ControlRuntime,
     display_id: u32,
 ) {
+    if !runtime.grant.has_owner_dashboard_authority() {
+        let Ok(active_session) = runtime.shared_session.try_read() else {
+            return;
+        };
+        let Some(session_registry) = active_session.session_registry.as_ref() else {
+            return;
+        };
+        let Ok(registry) = session_registry.try_read() else {
+            return;
+        };
+        if runtime
+            .grant
+            .display_session(&registry, display_id)
+            .is_none()
+        {
+            return;
+        }
+    }
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return;
     };

@@ -382,16 +382,20 @@ launchers, and the user's own screen (see
 - **Recording replay** — browse and play back recorded sessions with timeline
   seeking and speed control (1x / 2x / 4x). Live recording controls show a
   pending command but change REC/activity state only on daemon confirmation.
+  Starting a recording is owner/root-only for the alpha and succeeds only for
+  an active agent-visible display. Private views are never recordable: their
+  pixels must not enter the ordinary session artifact tree, where recording
+  and filesystem APIs follow their existing broader grants.
 
 The live rail's **Your screen** card keeps the three screen-on-the-wire
 concepts separate (see
 [Computer Use](./computer-use-and-audio.md#three-separate-concepts-private-view-agent-share-presence-streaming)):
 
-- **View this machine** — a private remote view: watch and control this
-  machine's display from the dashboard. The agent cannot see it — the
-  session is `agent_visible = false` and every agent-facing display
-  lookup skips it. The tile wears a **Private view** chip and the live
-  rail row a `PRIVATE` tag.
+- **View this machine** — a private remote view: an owner/root dashboard may
+  watch and control this machine's display. The agent cannot see it — the
+  session is `agent_visible = false` and every agent-facing display lookup
+  skips it. The tile wears a **Private view** chip and the live rail row a
+  `PRIVATE` tag.
 - **Share with agent** — the classic `DisplayControl` grant: the screen
   becomes visible to the agent for computer-use tasks until revoked. The
   tile wears an **Agent can see this** chip. Sharing while a private
@@ -404,6 +408,20 @@ Both modes revoke from the same card (**Stop viewing** / **Revoke
 access**), and
 `GET /api/displays` annotates entries with `capture_active` +
 `agent_visible` so pickers and chips can render live state.
+
+The private-view ceiling is identical on the legacy `/ws` transport and the
+verified dashboard-control DataChannel: only an owner/root dashboard may
+create a private user-session display, enumerate it through the live registry,
+receive its media, or send it input. Generic `display.view` and
+`display.input` permissions enumerate and control only agent-visible displays.
+The browser bootstrap filters explicit private ready/grant records so replay
+cannot recreate a private display tile for a scoped client. Display lifecycle
+failure/teardown records do not carry the original visibility bit, however,
+so live fanout and historical session/event logs may disclose audit metadata
+such as a display ID, capture failure, or revocation. The private-view ceiling
+protects pixels and control; it is not an existence-metadata secrecy promise
+and does not rewrite owner audit history. Revocation remains available to an
+otherwise authorized scoped caller as a de-escalation path.
 
 Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
@@ -731,7 +749,10 @@ contributes directory metadata only; it is not an Access or control surface:
   compatibility). Owner/root dashboard sessions have all of these. Existing
   peer profiles are mapped conservatively: `peer-root` can inspect access and
   inspect/manage/use peer topology, but `access.manage` remains reserved for
-  trusted root user/client sessions.
+  trusted root user/client sessions. Display permissions carry the same
+  private-view ceiling: `display.view` and `display.input` reach only
+  `agent_visible` sessions; private user-session displays additionally require
+  an owner/root dashboard.
 - A **transport** is only how an authorized route is carried: browser mTLS,
   loopback HTTP, trusted daemon-origin WebRTC control, or daemon-to-daemon peer
   mTLS. Hosted Connect is a directory/link surface, not an access transport.
@@ -1150,6 +1171,19 @@ generic settings-style `api_control_msg`. Smaller dashboard action controls use
 take/release/grant/revoke, the diagnostics visual-marker toggle, recording and
 debug toggles, and browser workspace create/acquire/close/release. It has its
 own allowlist and the same no-replay fallback rule as the other mutation RPCs.
+All three control-message RPCs are multiplexers, not authorization buckets:
+after admitting the outer method, the daemon authorizes every parsed inner
+`ControlMsg` against that action's operation and any extra owner requirement.
+The outer method can never launder its coarse permission into another action's
+authority. In particular, `GrantUserDisplay` and `ResolveDisplayRequest` are
+owner/root-only, `RevokeUserDisplay` remains available for de-escalation, and
+`StartRecording` plus the pre-encoder diagnostics marker are owner/root-only
+for the alpha. Setting up the debug screen and starting its recorder are also
+owner/root-only; stopping a debug recording or tearing its screen down remains
+available for de-escalation. Recording also requires an active agent-visible
+display; private views never produce artifacts. The legacy `/ws` control lane
+applies the same inner-message authorization, so switching transports does not
+change authority.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP. The visual-freshness sampler follows

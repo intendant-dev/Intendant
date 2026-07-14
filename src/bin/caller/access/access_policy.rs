@@ -891,8 +891,6 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::ReleaseDisplay { .. }
         | ControlMsg::GrantUserDisplay { .. }
         | ControlMsg::RevokeUserDisplay { .. }
-        // Resolving a user-display request mints the same grant the
-        // direct GrantUserDisplay path does — identical gate.
         | ControlMsg::ResolveDisplayRequest { .. }
         | ControlMsg::CreateVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. } => PeerOperation::DisplayInput,
@@ -960,6 +958,22 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::InterveneControllerLoop { .. }
         | ControlMsg::GetControllerLoopStatus => PeerOperation::RuntimeControl,
     }
+}
+
+/// Actions whose operation permission is only a coarse floor. These mutate
+/// owner-only display state or initiate durable capture, so they additionally
+/// require an authenticated owner dashboard at the transport edge. The
+/// recording layer separately rejects private and absent displays.
+pub fn control_msg_requires_owner_dashboard(ctrl: &ControlMsg) -> bool {
+    matches!(
+        ctrl,
+        ControlMsg::GrantUserDisplay { .. }
+            | ControlMsg::ResolveDisplayRequest { .. }
+            | ControlMsg::SetupDebugScreen
+            | ControlMsg::StartDebugRecording
+            | ControlMsg::StartRecording { .. }
+            | ControlMsg::SetDiagnosticsVisualMarker { .. }
+    )
 }
 
 #[allow(dead_code)]

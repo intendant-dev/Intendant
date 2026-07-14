@@ -43,7 +43,7 @@ pub(crate) fn spawn_session_listeners(
     frame_registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
 ) -> SessionListeners {
     let _recording_listener = recording::spawn_recording_listener(
-        bus.subscribe(),
+        bus.subscribe_intents(),
         recording_registry.clone(),
         bus.clone(),
         Some(session_registry.clone()),

@@ -402,9 +402,11 @@ Lane rules, stated once:
    relayed, channel-bound exchange — giving peer-routed connections an
    *attributed-to* identity beside their *admitted-under* profile,
    giving the pairing doorbell a verifiable caller ID (the prerequisite
-   named below), and unlocking cross-owner tier comparison. Displays
-   already prototype the split locally: viewing rides the peer grant,
-   input requires a user-granted authority.
+   named below), and unlocking cross-owner tier comparison. Displays already
+   prototype the split locally: a peer grant exposes only agent-visible
+   displays; a private user-session view never enters the delegation lane,
+   while input to a shared user session still requires authority minted by the
+   target's owner.
 
 ## Where fleet metadata rides
 

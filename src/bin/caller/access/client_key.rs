@@ -2,11 +2,13 @@
 //!
 //! The default product does not admit browser keys as an authority-bearing
 //! direct or hosted dashboard credential, and its pending-enrollment registry
-//! has no production writer. These parsers/verifiers remain as compatibility
-//! fixtures and vocabulary for a future trusted enrollment transport; no
-//! production ingress currently calls them. Verifying a signature here would
-//! authenticate only the stated key; it would not enroll that key, create a
-//! session, or grant daemon authority.
+//! has no production writer. The peer-offer attribution lane uses these
+//! parsers/verifiers to bind audit metadata to one exact signed offer, and
+//! they also preserve the vocabulary for a future trusted enrollment
+//! transport. Verifying a signature here authenticates only the stated key;
+//! no request ingress treats that result as an authority-bearing IAM
+//! principal, and verification does not enroll the key, create a session, or
+//! grant daemon authority.
 //!
 //! Wire format (all base64url, no padding):
 //! - `client_key`: the 65-byte uncompressed SEC1 point (`0x04 || x || y`),

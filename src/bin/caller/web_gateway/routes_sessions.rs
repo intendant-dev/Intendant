@@ -3850,28 +3850,36 @@ pub(crate) async fn handle_worktrees_list(
 /// instead of touching machine display state.
 pub(crate) async fn displays_api_response(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
 ) -> ApiResponse {
     let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
-    displays_api_response_from(displays, session_registry).await
+    displays_api_response_from(displays, session_registry, include_private).await
 }
 
 pub(crate) async fn displays_api_response_from(
     displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
 ) -> ApiResponse {
     session_wildcard_json_response(
         200,
-        crate::web_gateway::displays_response_body_from(displays, session_registry).await,
+        crate::web_gateway::displays_response_body_from(
+            displays,
+            session_registry,
+            include_private,
+        )
+        .await,
     )
 }
 
 pub(crate) async fn handle_displays(
     stream: DemuxStream,
     session_registry: Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = displays_api_response(&session_registry).await;
+    let response = displays_api_response(&session_registry, include_private).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -6726,7 +6734,7 @@ mod tests {
         // `_from` core the production edge delegates to is the
         // byte-exact pin.
         let displays = golden_fixture_displays();
-        let body = displays_response_body_from(displays.clone(), &None).await;
+        let body = displays_response_body_from(displays.clone(), &None, true).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(parsed["displays"].is_array(), "displays array: {body}");
         assert!(
@@ -6740,7 +6748,7 @@ mod tests {
         let response = collect_session_handler_response(|stream| async move {
             write_api_response(
                 stream,
-                displays_api_response_from(displays, &None).await,
+                displays_api_response_from(displays, &None, true).await,
                 cors,
                 None,
             )

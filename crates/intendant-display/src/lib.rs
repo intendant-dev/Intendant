@@ -3535,24 +3535,28 @@ impl DisplaySession {
         }
     }
 
-    /// Deregister the peer from the session maps when its driver tears
-    /// down. `remove_peer` only covers gateway-WS-signaled viewers (the
-    /// WS teardown path is its sole caller) — peers signaled over the
-    /// dashboard-control channel (trusted direct/native clients) or torn down by ICE
-    /// failure had no deregistration path at all, leaving `peer_count`
-    /// and the presence policy's peer map stale, so the layer-pause idle
-    /// policy never engaged (observed live: `peers=1` forever on a cloud
-    /// box after its only viewer left). Identity-guarded (`Arc::ptr_eq`)
-    /// so a replaced peer's reaper cannot remove its successor under the
-    /// same id, and idempotent alongside `remove_peer`.
+    /// Deregister the peer from the session maps when its driver tears down or
+    /// the owning display session begins stopping.
+    /// Explicit gateway-WS, dashboard-control, and federated teardown paths
+    /// call `remove_peer`; this reaper is the independent backstop for a peer
+    /// whose driver or ICE transport closes first. Without it, `peer_count`
+    /// and the presence policy's peer map can stay stale, so the layer-pause
+    /// idle policy never engages (observed live: `peers=1` forever on a cloud
+    /// box after its only viewer left). Identity-guarded (`Arc::ptr_eq`) so a
+    /// replaced peer's reaper cannot remove its successor under the same id,
+    /// and idempotent alongside `remove_peer`.
     fn spawn_peer_reaper(&self, peer_id: PeerId, peer: &Arc<self::webrtc::WebRtcPeer>) {
         let peers = Arc::clone(&self.peers);
         let tile_subscribers = Arc::clone(&self.tile_subscribers);
         let counters = Arc::clone(&self.counters);
         let peer = Arc::clone(peer);
         let closed = peer.closed();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            closed.await;
+            tokio::select! {
+                _ = closed => {}
+                _ = shutdown.cancelled() => peer.close().await,
+            }
             let _ =
                 reap_peer_registration(&peers, &tile_subscribers, &counters, peer_id, &peer).await;
         });
@@ -3769,11 +3773,12 @@ impl SessionRegistry {
             .cloned()
     }
 
-    /// Unfiltered lookup for **user/dashboard surfaces only** (WebRTC
-    /// offers and input from the owner's dashboards, lifecycle teardown,
-    /// activation dedupe, explicit user-initiated recording). Returns
-    /// private user views too — never call this from a path whose output
-    /// reaches an agent.
+    /// Unfiltered lookup for authority-checked **owner/root dashboard** paths
+    /// (their WebRTC offers and input) and trusted lifecycle internals such as
+    /// teardown and activation dedupe. Returns private user views too — never
+    /// call this merely because a caller has generic dashboard/display access,
+    /// or from a path whose output reaches an agent or ordinary artifact
+    /// reader.
     pub fn get_any(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
         self.sessions.get(&display_id).cloned()
     }
@@ -3840,8 +3845,9 @@ impl SessionRegistry {
     }
 
     /// All active display IDs including private user views — for
-    /// user/dashboard surfaces only (bootstrap replay, input-authority
-    /// snapshots, virtual-display id allocation).
+    /// authority-checked owner/root dashboard bootstrap and input-authority
+    /// snapshots, plus trusted lifecycle internals such as virtual-display id
+    /// allocation. Generic dashboard/display callers use [`Self::display_ids`].
     pub fn all_display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
     }
@@ -4645,8 +4651,9 @@ mod tests {
             "agent-facing enumeration must exclude the private view"
         );
 
-        // Dashboard surfaces see everything.
-        assert!(reg.get_any(0).is_some(), "dashboard get_any sees the view");
+        // An authority-checked owner/root dashboard path can opt into the
+        // unfiltered accessors; generic dashboard paths cannot.
+        assert!(reg.get_any(0).is_some(), "owner/root get_any sees the view");
         let mut all = reg.all_display_ids();
         all.sort_unstable();
         assert_eq!(all, vec![0, 99]);
@@ -4728,11 +4735,20 @@ mod tests {
         assert_eq!(removed.input_queue.len(), 0);
 
         let replaced = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
+        replaced.register_test_peer_for_cleanup(99).await;
+        assert_eq!(replaced.metrics().await.peer_count, 1);
         registry.insert(42, Arc::clone(&replaced));
         let replacement = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
         registry.insert(42, replacement);
         assert!(replaced.input_queue.is_closed());
         assert!(replaced.shutdown.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while replaced.metrics().await.peer_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement shutdown must close and reap live media peers");
 
         let drained = Arc::new(DisplaySession::new(43, backend as _));
         registry.insert(43, Arc::clone(&drained));
