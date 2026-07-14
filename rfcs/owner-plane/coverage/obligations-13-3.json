@@ -1,0 +1,1239 @@
+{
+ "$comment": "The §13.3 obligation ledger, hand-transcribed at clause-cluster granularity and machine-enforced by core coverage::tests::obligations_ledger_is_sound: quotes are verbatim §13.3 substrings, line ranges (1-indexed within the section) must jointly cover the whole section, vector names must exist, and statuses must match the vector lists. Statuses: vectored (fully exercised), partial (some clauses exercised - the note says which), pending (unvectored debt), code-test (executed by named Rust unit tests, no vector shape), structural (non-obligation lines).",
+ "executed_surfaces": [
+  "rust-core",
+  "rust-reducer"
+ ],
+ "surface_annotation_note": "A vector's surfaces array declares §13.2 applicability; it is NOT execution. See execution-lanes-plan.md for the browser and per-OS storage lanes.",
+ "section_lines": 492,
+ "obligations": [
+  {
+   "id": "s-header",
+   "family": 0,
+   "lines": [
+    1,
+    2
+   ],
+   "quote": "### 13.3 Families",
+   "obligation": "Section heading.",
+   "vectors": [],
+   "status": "structural"
+  },
+  {
+   "id": "f1-encoding-caps",
+   "family": 1,
+   "lines": [
+    3,
+    5
+   ],
+   "quote": "1 encoding+caps",
+   "obligation": "Encoding + caps incl. encoder-exact joint fits (314 B/132 B worst widths, 128+128 rotation fit, 48-KiB checkpoint budget, D-96).",
+   "vectors": [
+    "checkpoint-joint-budget",
+    "depth-nine",
+    "duplicate-map-key",
+    "erasemref-worst-width",
+    "float-rejected",
+    "frontierclose-sixty-six-heads",
+    "indefinite-length-array",
+    "kekwrap-worst-width",
+    "map-key-encoded-byte-order",
+    "negative-int-rejected",
+    "nonminimal-uint",
+    "rotation-128-wraps-128-manifest-joint-fit",
+    "trailing-bytes",
+    "txn-seventeen-records",
+    "uint-above-2p53",
+    "uint-boundary-widths",
+    "unsorted-map-keys"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f2-domains",
+   "family": 2,
+   "lines": [
+    6,
+    6
+   ],
+   "quote": "2 domains/key-ids;",
+   "obligation": "Hash domains and key ids.",
+   "vectors": [
+    "hash-domain-frontier-empty",
+    "hash-domain-genstart",
+    "hash-domain-op",
+    "key-id-hpke-p256",
+    "key-id-p256",
+    "mat-id-role-neutral",
+    "separation-op-vs-body"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f3-signatures",
+   "family": 3,
+   "lines": [
+    7,
+    7
+   ],
+   "quote": "3 signatures (low-S);",
+   "obligation": "Ed25519 + P-256 signatures incl. low-S.",
+   "vectors": [
+    "ed25519-sign-then-verify",
+    "ed25519-verify-tampered",
+    "ed25519-verify-valid",
+    "p256-sign-then-verify-low-s",
+    "p256-verify-high-s-rejected",
+    "p256-verify-low-s-valid"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f4-hpke",
+   "family": 4,
+   "lines": [
+    8,
+    8
+   ],
+   "quote": "4 HPKE (incl. malformed-point/identity-DH);",
+   "obligation": "HPKE seal/open incl. malformed point and identity DH.",
+   "vectors": [
+    "identity-point-rejected",
+    "malformed-point-rejected",
+    "seal-open-roundtrip",
+    "tampered-ciphertext-rejected"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f5-item-crypto",
+   "family": 5,
+   "lines": [
+    8,
+    9
+   ],
+   "quote": "5 item crypto (per-item wrap-key derivation +",
+   "obligation": "Per-item wrap-key derivation, rewrap byte-idempotence, wrapper-mismatch.",
+   "vectors": [
+    "item-aead-tamper",
+    "item-open-full-chain",
+    "rewrap-byte-idempotence",
+    "wrapper-address-mismatch"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f6-frontier",
+   "family": 6,
+   "lines": [
+    9,
+    10
+   ],
+   "quote": "6 frontier (sort key,",
+   "obligation": "Frontier sort key, retirement, cap.",
+   "vectors": [
+    "duplicate-lineage-gen-pair",
+    "fold-sort-and-replace",
+    "retire-above-head-noop",
+    "retire-at-or-below-drops",
+    "unsorted-heads"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f7-walkthroughs",
+   "family": 7,
+   "lines": [
+    10,
+    13
+   ],
+   "quote": "bootability walkthroughs",
+   "obligation": "Trusted-solo/hosted-solo/multi bootability; solo-to-multi transition; witness loss; C2 freeze; C3-prime placement/precedence/unknown-branch cut.",
+   "vectors": [
+    "walkthrough-c2-freeze-both",
+    "walkthrough-c3-branch-cut-below-head",
+    "walkthrough-hosted-solo-boot"
+   ],
+   "status": "partial",
+   "note": "trusted-solo and multi walkthroughs, solo-to-multi transition, and witness loss are unvectored."
+  },
+  {
+   "id": "f7-hosted-ceiling",
+   "family": 7,
+   "lines": [
+    13,
+    18
+   ],
+   "quote": "hosted ceiling incl. safe-verb grants accepted,",
+   "obligation": "Hosted ceiling: safe-verb grants, excluded verbs, system-only audit grant boot, exclusion-shaped rotation pair, recovery-succession admissibility, attested multi-head self-cutoff, lineage_reauth, consumed request_ids, drill.",
+   "vectors": [
+    "consumed-request-id-fork",
+    "hosted-ceiling-grant-verb-excluded",
+    "hosted-ceiling-zone-policy-inadmissible",
+    "walkthrough-drill-acceptance",
+    "walkthrough-hosted-solo-boot"
+   ],
+   "status": "partial",
+   "note": "exclusion-shaped rotation pair, recovery-succession admissibility, attested self-cutoff, and lineage_reauth are unvectored; the audit-grant boot rides the hosted-solo walkthrough."
+  },
+  {
+   "id": "f7-zone-policy-position",
+   "family": 7,
+   "lines": [
+    19,
+    28
+   ],
+   "quote": "zone-policy-advances-epoch",
+   "obligation": "Zone-policy epoch advance + arrival-order equivalence; position-relative authorization; strict-zone closure; grant-revocation cutoff + issuance-to-revoked-device; hosted cross-lineage negative; cutoff max-compose; renewal shapes.",
+   "vectors": [
+    "issuance-to-revoked-device-rejects"
+   ],
+   "status": "partial",
+   "note": "the issuance negative is vectored; the equivalence pairs and renewal shapes are not."
+  },
+  {
+   "id": "f7-compound-pipeline",
+   "family": 7,
+   "lines": [
+    29,
+    37
+   ],
+   "quote": "one-live-compound-per-revocation_id",
+   "obligation": "One live compound per revocation_id; derived grant revocation; the arm-indexed control pipeline (body-before-precedence, D-99); cutoff algebra (D-93); authored-but-unwrapped revocation.",
+   "vectors": [
+    "c2-post-freeze-sig-invalid-kept",
+    "c2-post-freeze-valid-op-frozen",
+    "control-body-tamper",
+    "control-signature-tamper",
+    "control-wrong-proof-arm",
+    "second-live-compound-rejects"
+   ],
+   "status": "partial",
+   "note": "cutoff algebra and the authored-but-unwrapped revocation are unvectored; the D-99/D4 stage order is the post-freeze pair."
+  },
+  {
+   "id": "f7-revocation-constructibility",
+   "family": 7,
+   "lines": [
+    38,
+    47
+   ],
+   "quote": "revocation constructibility",
+   "obligation": "Revocation constructibility across author/wrap domain shapes (D-165/D-173/D-180/D-200).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-recovery-adoption",
+   "family": 7,
+   "lines": [
+    48,
+    54
+   ],
+   "quote": "recovery storage adoption",
+   "obligation": "Recovery storage adoption, storage-orphaned, provisional precedence (D-104/D-105/D-112).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-abandon-seal",
+   "family": 7,
+   "lines": [
+    54,
+    59
+   ],
+   "quote": "abandon-seal vectors",
+   "obligation": "Abandon-seal per generation; the hosted composition (D-101/D-107/D-122).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-snapshot-wins",
+   "family": 7,
+   "lines": [
+    60,
+    63
+   ],
+   "quote": "snapshot-wins cutoff five ways",
+   "obligation": "Snapshot-wins cutoff five ways + composition negatives (D-108/D-114).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-ratify-ceremonies",
+   "family": 7,
+   "lines": [
+    63,
+    76
+   ],
+   "quote": "the multi-generation",
+   "obligation": "Multi-generation ratify ceremony, requester-form negatives, total-override snapshot, close-staging, cross-lineage negative, equation-only ceremony (D-120/D-129/D-135/D-136).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-override-growth",
+   "family": 7,
+   "lines": [
+    76,
+    84
+   ],
+   "quote": "override/growth cycle",
+   "obligation": "Override/growth cycle, tagged-state probes, repeated-seal min-compose (D-121/D-135).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-per-gen-ratify",
+   "family": 7,
+   "lines": [
+    84,
+    88
+   ],
+   "quote": "per-generation ratify",
+   "obligation": "Per-generation ratify inertia and owner truncation (D-114/D-122).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-incorporation-cap",
+   "family": 7,
+   "lines": [
+    89,
+    98
+   ],
+   "quote": "held-bytes incorporation cap",
+   "obligation": "Held-bytes incorporation cap convergence + cap eligibility (D-122/D-128/D-141).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-adoption-bound",
+   "family": 7,
+   "lines": [
+    99,
+    101
+   ],
+   "quote": "adoption bound (65th entry rejects",
+   "obligation": "Adoption bound; accepted-but-unFenced non-adoption (D-117).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-consumed-boundary",
+   "family": 7,
+   "lines": [
+    101,
+    111
+   ],
+   "quote": "promotion as frontier materialization",
+   "obligation": "Consumed-boundary promotion, multi-head closure trace, maximum-lineage bound (D-152).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-staging-cycle",
+   "family": 7,
+   "lines": [
+    112,
+    127
+   ],
+   "quote": "the one-shot staging cycle",
+   "obligation": "One-shot staging, the stage state machine, staged-lineage-revoked vacuous consumption (D-153/D-176/D-196).",
+   "vectors": [
+    "staged-frontier-consumed-no-resurrection"
+   ],
+   "status": "partial",
+   "note": "the D-196 vacuous-consumption/no-resurrection trace is vectored; the pending-carrier machine is not."
+  },
+  {
+   "id": "f7-delayed-completion",
+   "family": 7,
+   "lines": [
+    128,
+    135
+   ],
+   "quote": "delayed-completion cessation",
+   "obligation": "Delayed-completion cessation (D-195) and delayed-reference convergence (D-199).",
+   "vectors": [
+    "delayed-reference-convergence-c1-i-c2",
+    "pending-revocation-window-grant-completing-rotation"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f7-old-signer",
+   "family": 7,
+   "lines": [
+    136,
+    143
+   ],
+   "quote": "old-signer resurrection negative",
+   "obligation": "Old-signer resurrection negatives, proven-incompatible pair lifecycles, the four-axis recovery-frontier predicate (D-174/D-181).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-post-advance-wgen",
+   "family": 7,
+   "lines": [
+    144,
+    147
+   ],
+   "quote": "a post-advance `w.gen`",
+   "obligation": "Post-advance w.gen at the old epoch dies on the total override; below-frontier ratify revival (D-136/D-143).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-fork-selection",
+   "family": 7,
+   "lines": [
+    148,
+    151
+   ],
+   "quote": "exact-Head fork selection",
+   "obligation": "Exact-Head fork selection convergence (D-130).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-selector-reservation",
+   "family": 7,
+   "lines": [
+    151,
+    157
+   ],
+   "quote": "reservation race",
+   "obligation": "Pending-selector reservation races (D-137/D-145/D-154).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-cap-anchor-race",
+   "family": 7,
+   "lines": [
+    157,
+    162
+   ],
+   "quote": "cap-anchor",
+   "obligation": "The cap-anchor race: chain-membership never terminality (D-144/D-159).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-supersede-immutability",
+   "family": 7,
+   "lines": [
+    162,
+    164
+   ],
+   "quote": "supersede-boundary immutability",
+   "obligation": "Supersede-boundary immutability (D-102).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f6-comparator",
+   "family": 6,
+   "lines": [
+    163,
+    165
+   ],
+   "quote": "comparator",
+   "obligation": "Comparator negatives: equal coordinates, differing hash.",
+   "vectors": [
+    "equal-coordinates-differing-hash"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f7-checkpoint-chain",
+   "family": 7,
+   "lines": [
+    165,
+    168
+   ],
+   "quote": "checkpoint chain",
+   "obligation": "Checkpoint chain linkage, retirement, fold transition, coverage (D-88/D-96).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-genesis-renewal",
+   "family": 7,
+   "lines": [
+    169,
+    180
+   ],
+   "quote": "genesis grant completeness",
+   "obligation": "Genesis grant completeness, class table, renewal non-resetting, current-membership renewal set, authorship-domain history coverage (D-125/D-133/D-141/D-151).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f7-custody-freshness",
+   "family": 7,
+   "lines": [
+    180,
+    198
+   ],
+   "quote": "transitive-custody chain",
+   "obligation": "Transitive custody, KEM-key freshness, role-neutral material identity, alternate-role matching, negation-residual acceptance, effective-certificate wrap negative (D-141/D-150/D-175/D-182/D-190/D-197).",
+   "vectors": [
+    "mat-id-role-neutral",
+    "negation-residual-acceptance"
+   ],
+   "status": "partial",
+   "note": "mat_id role-neutrality and the D-197 negation residual are vectored; custody chains and alternate-role matching are not."
+  },
+  {
+   "id": "f8-recovery-derivation",
+   "family": 8,
+   "lines": [
+    198,
+    209
+   ],
+   "quote": "8 recovery",
+   "obligation": "Recovery derivation: the phrase/commitment KATs plus omitted-pair override, naming-terminates vs omission-continues, post-recovery first write (D-132/D-138/D-151/D-159).",
+   "vectors": [
+    "commitment-from-recovery-pk",
+    "phrase-checksum-invalid-rejects",
+    "phrase-derive-fixed-entropy",
+    "phrase-derive-zero-entropy"
+   ],
+   "status": "partial",
+   "note": "the derivation KATs (incl. the D1 checksum negative) are vectored; the omission/naming fold shapes are not."
+  },
+  {
+   "id": "f8-total-refold",
+   "family": 8,
+   "lines": [
+    209,
+    215
+   ],
+   "quote": "re-fold: a cut reauth re-quarantines",
+   "obligation": "The total re-fold: cut reauth/retirement re-derivation, dissolved caps, fork-selector removal (D-128/D-131/D-138/D-149).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f8-kem-adoption",
+   "family": 8,
+   "lines": [
+    215,
+    232
+   ],
+   "quote": "KEM-renewal adoption",
+   "obligation": "KEM-renewal adoption, adopted-key reuse negatives, post-recovery-enrollment write, the cut-unadopted key differential (D-150/D-158/D-164/D-167/D-172).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f9-receipts-deadlines",
+   "family": 9,
+   "lines": [
+    232,
+    237
+   ],
+   "quote": "self-receipt",
+   "obligation": "Self-receipt non-qualification, renewed-key self-receipt, deadline at/past, deadline-bearing vs deadline-free (D-56).",
+   "vectors": [
+    "deadline-receipted-admits",
+    "deadline-self-receipt-nonqualifying",
+    "deadline-unreceipted-pends"
+   ],
+   "status": "partial",
+   "note": "renewed-key self-receipt and the fence-hardened pending arm are unvectored."
+  },
+  {
+   "id": "f9-t5-lease",
+   "family": 9,
+   "lines": [
+    237,
+    243
+   ],
+   "quote": "T5 window binding",
+   "obligation": "T5 window binding; issuer-fork recovery; GC-fence hardening; service-key resolution; per-posture issuance; witnessless-zone unusability.",
+   "vectors": [
+    "lease-missing-pends",
+    "lease-online-grant-admits",
+    "lease-overlong-window-invalid",
+    "lease-present-no-receipt-pends",
+    "lease-stale-quarantines",
+    "witnessless-zone-deadline-unusable"
+   ],
+   "status": "partial",
+   "note": "the T5/lease shapes (incl. the D5 negatives) and witnessless zone are vectored; issuer-fork recovery, GC hardening, service keys, and posture issuance are not."
+  },
+  {
+   "id": "f9-succession-anchor",
+   "family": 9,
+   "lines": [
+    242,
+    249
+   ],
+   "quote": "succession trio",
+   "obligation": "Succession trio, epoch-anchor qualification across a policy change, attestation freshness (D-108/D-114).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f9-chained-feeds",
+   "family": 9,
+   "lines": [
+    248,
+    254
+   ],
+   "quote": "chained feeds",
+   "obligation": "Chained feeds: issuer-gap, backfill issuer-fork, boundary ancestry gating, min-merge, compromise cutoffs over leases (D-87/D-95).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f9-reauth-freeze",
+   "family": 9,
+   "lines": [
+    254,
+    266
+   ],
+   "quote": "the durable one-shot reauth posture",
+   "obligation": "One-shot reauth, issuer-fork freeze-both, the cross-carrier registry (D-100/D-115/D-124/D-131).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f9-key-freshness",
+   "family": 9,
+   "lines": [
+    265,
+    272
+   ],
+   "quote": "plane-wide signing-key freshness",
+   "obligation": "Plane-wide signing-key freshness over the portable domain (D-131/D-141/D-150).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f9-feed-closure",
+   "family": 9,
+   "lines": [
+    272,
+    280
+   ],
+   "quote": "(ancestry gating + min-merge + hardening exemption",
+   "obligation": "Feed closure as a T3 boundary, retro-disqualification, renewal closure, dropped-witness forever-pending (D-88/D-111/D-118/D-124).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f10-budget-core",
+   "family": 10,
+   "lines": [
+    279,
+    286
+   ],
+   "quote": "10 lineage/budget",
+   "obligation": "Generation non-reset, window exhaustion, cutoff across generations, epoch-bump-only reset (D-79), canonical budget order, signed window anchor, displacement revival (D-86/D-94).",
+   "vectors": [
+    "f10-budget-bump-reset",
+    "f10-budget-displacement",
+    "f10-budget-policy-noreset"
+   ],
+   "status": "partial",
+   "note": "bump reset, displacement order, and the zone-policy no-reset are vectored; exhaustion/cascade shapes are not."
+  },
+  {
+   "id": "f10-effect-finality",
+   "family": 10,
+   "lines": [
+    286,
+    292
+   ],
+   "quote": "effect-finality gating",
+   "obligation": "Effect-finality gating and the incorporation-cap clamp (D-101/D-107/D-122).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f10-cap-negatives",
+   "family": 10,
+   "lines": [
+    292,
+    297
+   ],
+   "quote": "64-open-gap cap negative",
+   "obligation": "The 64-gap, held-zones, and zone-recipient cap negatives; split-brain convergence; wildcard exclusion (D-103/D-109/D-110/D-125).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f10-portable-currency",
+   "family": 10,
+   "lines": [
+    296,
+    302
+   ],
+   "quote": "grant-epoch",
+   "obligation": "Grant-epoch lower bound; portable currency (epoch-unopened pending + equivalence, monotonicity, slack, closure-cutoff) (D-78/D-93).",
+   "vectors": [
+    "epoch-unopened-pends-until-the-bump",
+    "grant-epoch-lower-bound"
+   ],
+   "status": "partial",
+   "note": "the lower bound and epoch-unopened pendency are vectored; monotonicity/slack/closure negatives are not."
+  },
+  {
+   "id": "f10-chain-arithmetic",
+   "family": 10,
+   "lines": [
+    302,
+    303
+   ],
+   "quote": "chain arithmetic",
+   "obligation": "w.gen axis bypass; chain arithmetic negatives per axis.",
+   "vectors": [
+    "tenant-gap-pends-causal-missing",
+    "tenant-same-seq-fork"
+   ],
+   "status": "partial",
+   "note": "the same-seq fork and gap-pends axes are vectored; the remaining axes are not."
+  },
+  {
+   "id": "f10-last-known",
+   "family": 10,
+   "lines": [
+    303,
+    310
+   ],
+   "quote": "`last_known` validation negatives",
+   "obligation": "last_known validation and effective-accepted-head retirement (D-167/D-175).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f10-reauth-widening",
+   "family": 10,
+   "lines": [
+    309,
+    312
+   ],
+   "quote": "reauth-widening revival",
+   "obligation": "Reauth-widening revival on both orders (D-132).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f10-space-retirement",
+   "family": 10,
+   "lines": [
+    311,
+    318
+   ],
+   "quote": "space retirement with mandatory frontier closure",
+   "obligation": "Space retirement with mandatory frontier closure (D-132/D-138/D-143).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-status-rows",
+   "family": 11,
+   "lines": [
+    318,
+    322
+   ],
+   "quote": "all §11.2 rows",
+   "obligation": "All §11.2 status rows, unauthorized dispute, revival, hosted safe-human accept, assert batch, pin.safe limits, erase-request immediate exclusion.",
+   "vectors": [
+    "erase-deferral-nonterminal-journal",
+    "status-author-retract",
+    "status-dispute-recorded-not-counting",
+    "status-owner-accept",
+    "status-revival-on-replacement-loss",
+    "status-safe-human-dispute-counts",
+    "status-superseded-by-accepted-replacement"
+   ],
+   "status": "partial",
+   "note": "the status rows, revival, and immediate exclusion are vectored; hosted accept, assert batch, and pin.safe are not."
+  },
+  {
+   "id": "f11-classification",
+   "family": 11,
+   "lines": [
+    321,
+    324
+   ],
+   "quote": "classification floor preservation",
+   "obligation": "Classification floor, concurrent-raise-beats-declassify, raise quota, dangling-evidence sensitive.",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-export-import",
+   "family": 11,
+   "lines": [
+    323,
+    327
+   ],
+   "quote": "export/import digest match",
+   "obligation": "Export/import digest match/mismatch/replay incl. source_op binding and cross-plane fail-closed; record-level transfer.",
+   "vectors": [
+    "export-import-construct-and-rederive"
+   ],
+   "status": "partial",
+   "note": "construct-and-rederive is vectored; the mismatch/replay/cross-plane negatives are not."
+  },
+  {
+   "id": "f11-typed-erase",
+   "family": 11,
+   "lines": [
+    326,
+    328
+   ],
+   "quote": "typed-erase recovery",
+   "obligation": "Typed-erase recovery: manifest to derived tombstones to erased status; target_op membership.",
+   "vectors": [
+    "erase-crash-state5-tombstone-rederivation",
+    "erase-crash-state6-complete"
+   ],
+   "status": "partial",
+   "note": "the storage-lane manifest binding is vectored (post-D6); the fold-side erased-status projection is not."
+  },
+  {
+   "id": "f11-actor-id",
+   "family": 11,
+   "lines": [
+    328,
+    329
+   ],
+   "quote": "actor-id minting per kind",
+   "obligation": "Actor-id minting per kind; non-conforming id rejects.",
+   "vectors": [
+    "actor-id-mint-negative"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f11-audit-partition",
+   "family": 11,
+   "lines": [
+    329,
+    334
+   ],
+   "quote": "audit trigger all three branches",
+   "obligation": "Audit trigger branches, typed principal, partition exactness, result-id domain, the 4096 cap, flow-deadline bound.",
+   "vectors": [
+    "audit-changed-count",
+    "audit-changed-principal",
+    "audit-changed-scope",
+    "audit-chunk-index-out-of-range",
+    "audit-duplicate-chunk-index",
+    "audit-overlapping-result-sets",
+    "audit-partition-two-chunks",
+    "audit-zero-result-single-chunk"
+   ],
+   "status": "partial",
+   "note": "partition exactness (incl. the D9 conflicts) is vectored; trigger branches, the 4096 cap, and flow-deadline are not."
+  },
+  {
+   "id": "f11-surcharge",
+   "family": 11,
+   "lines": [
+    333,
+    339
+   ],
+   "quote": "content-independent surcharge accounting",
+   "obligation": "Content-independent surcharge accounting; consumer mirrors on effect finality; the release_op critical section; PendingXfer dormancy (D-98/D-101/D-106/D-113/D-123).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-stamp-precedence",
+   "family": 11,
+   "lines": [
+    339,
+    345
+   ],
+   "quote": "frozen-stamp",
+   "obligation": "Frozen-stamp recovery, stamp finality, state-derived terminal precedence (D-98/D-106).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-release-identity",
+   "family": 11,
+   "lines": [
+    345,
+    353
+   ],
+   "quote": "release_op identity",
+   "obligation": "release_op identity vs export_id correlation; the one-record abort; the reason split (D-123/D-126).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-release-rederive",
+   "family": 11,
+   "lines": [
+    353,
+    356
+   ],
+   "quote": "construct-and-rederive (sources + keys",
+   "obligation": "Release construct-and-rederive: content_digest and release_op independently re-derived (D-127).",
+   "vectors": [
+    "export-import-construct-and-rederive"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f11-import-ownership",
+   "family": 11,
+   "lines": [
+    355,
+    382
+   ],
+   "quote": "derived import ownership",
+   "obligation": "Derived import ownership, collision reservation/unfreeze cluster (D-139/D-146/D-155/D-161/D-169/D-177/D-196).",
+   "vectors": [
+    "collision-loser-reenters-on-winner-death"
+   ],
+   "status": "partial",
+   "note": "the loser-reentry unfreeze trace is vectored; the reservation and issuance shapes are not."
+  },
+  {
+   "id": "f11-effect-keys",
+   "family": 11,
+   "lines": [
+    382,
+    386
+   ],
+   "quote": "effect-key granularity",
+   "obligation": "Effect-key granularity and incarnation-keyed terminals (D-134/D-142/D-148).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-quarantine-cleanup",
+   "family": 11,
+   "lines": [
+    385,
+    389
+   ],
+   "quote": "permanent-quarantine cleanup",
+   "obligation": "Permanent-quarantine cleanup aborts (D-134).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-reopenable-journal",
+   "family": 11,
+   "lines": [
+    388,
+    405
+   ],
+   "quote": "the reopenable journal fold",
+   "obligation": "The reopenable journal fold: independent bases, C3-prime-cut reopen, collision-terminal unreachability, reopen before/after its invalidation, terminal-first reservation, the T0-R0-T1 battery (D-163/D-177/D-185/D-192/D-193).",
+   "vectors": [
+    "reopen-basis-op-kind-and-unheld-invalidation",
+    "reopen-recovery-invalidation-unheld-pends",
+    "reopen-recovery-keeps-basis-rejects",
+    "txn-internal-order-and-competing-terminals"
+   ],
+   "status": "partial",
+   "note": "reopen citation mechanics (pend/apply/verified-false, stmt-basis parse rejection, incarnation ordering, D-185 reservation) are vectored post-6b; the independent-bases pair and the full battery are not. The clause's held stmt-kind invalidation VERIFYING has no §4.7 wire shape to verify against - a Gate-A audit finding."
+  },
+  {
+   "id": "f11-monotone-cause",
+   "family": 11,
+   "lines": [
+    405,
+    411
+   ],
+   "quote": "monotone-cause trace",
+   "obligation": "The monotone-cause trace: recorded cause dies, survivor re-terminals; stmt-kind fork-discovery invalidation (D-179/D-185).",
+   "vectors": [],
+   "status": "pending",
+   "note": "blocked in part by the same §4.7 fork-discovery wire gap."
+  },
+  {
+   "id": "f11-deferral-schedules",
+   "family": 11,
+   "lines": [
+    411,
+    421
+   ],
+   "quote": "schedules (an erase request against a live transfer",
+   "obligation": "Erase-vs-transfer deferral schedules and the journal-closure remedy (D-112/D-198).",
+   "vectors": [
+    "erase-deferral-nonterminal-journal"
+   ],
+   "status": "partial",
+   "note": "the nonterminal-journal deferral is vectored; the closure remedy and adopted-erasure residual are not."
+  },
+  {
+   "id": "f11-incarnation-dedupe",
+   "family": 11,
+   "lines": [
+    421,
+    426
+   ],
+   "quote": "consume-once dedupe",
+   "obligation": "Abort-Reopen-Done through a consume-once store; wrong-incarnation reopen; XferDone never reopens (D-140/D-148/D-157/D-189/D-200).",
+   "vectors": [
+    "txn-internal-order-and-competing-terminals"
+   ],
+   "status": "partial",
+   "note": "incarnation ordering and competing terminals are vectored; the dedupe-store walkthrough and reopen-after-Done are not."
+  },
+  {
+   "id": "f11-merkle",
+   "family": 11,
+   "lines": [
+    425,
+    437
+   ],
+   "quote": "Merkle-proof battery",
+   "obligation": "The Merkle-proof and self-describing-leaf batteries + validator equivalence (D-147/D-156/D-162).",
+   "vectors": [
+    "merkle-leftover-sibling-rejects",
+    "merkle-promotion-path-valid",
+    "merkle-wrong-index-invalid"
+   ],
+   "status": "partial",
+   "note": "proof construction, wrong-index, sibling, and odd-promotion shapes are vectored; the 127/128 trees, erasure interplay, and validator-equivalence trace are not."
+  },
+  {
+   "id": "f11-mimport-shape",
+   "family": 11,
+   "lines": [
+    437,
+    443
+   ],
+   "quote": "narrow-shape battery",
+   "obligation": "The mimport narrow-shape battery and mirror-matrix equalities (D-142/D-151).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f11-relations-policies",
+   "family": 11,
+   "lines": [
+    443,
+    448
+   ],
+   "quote": "relation-principal vectors",
+   "obligation": "Relation-principal vectors, valid_from/erased/revival, B.2/B.3 literal hash reproduction, policy hash mismatch.",
+   "vectors": [
+    "judge-policy-hash-mismatch-pends",
+    "status-author-retract",
+    "status-revival-on-replacement-loss"
+   ],
+   "status": "partial",
+   "note": "author relation, revival, and the policy-hash mismatch are vectored; cross-session denial is not. B.2/B.3 byte reproduction is executed as unit tests (reducer policies module + core scenario), not as a vector shape."
+  },
+  {
+   "id": "f12-iam",
+   "family": 12,
+   "lines": [
+    447,
+    453
+   ],
+   "quote": "12 IAM",
+   "obligation": "IAM: outcome-member coverage, six allow paths across four shapes, audit lane, enumerated fold outcomes, multi-fault precedence.",
+   "vectors": [
+    "shape1-enrolled-device-read",
+    "shape1-revoked-device",
+    "shape1-second-device-search",
+    "shape1-unenrolled-no-cert",
+    "shape2-attested-session",
+    "shape2-ended-session",
+    "shape2-missing-session",
+    "shape3-bearer-read",
+    "shape3-bearer-search-in-scope",
+    "shape3-missing-token",
+    "shape3-revoked-token",
+    "shape3-token-out-of-scope",
+    "shape3-token-session-ended",
+    "shape4-exhausted-quota",
+    "shape4-mediated-grant-plus-token"
+   ],
+   "status": "partial",
+   "note": "the four shapes and their deny paths are vectored; per-outcome completeness is quantified by coverage/outcomes-map.json (22 of 59 uncovered), and the audit lane plus multi-fault precedence are unvectored."
+  },
+  {
+   "id": "f13-framing",
+   "family": 13,
+   "lines": [
+    453,
+    456
+   ],
+   "quote": "framing v2",
+   "obligation": "Framing v2: truncation vs quarantine, mid-file corruption, resync, nlen mismatch, Txn atomicity.",
+   "vectors": [
+    "crash-inside-sync-truncates",
+    "crash-mid-final-frame-truncates",
+    "framing-bad-sync-quarantines",
+    "framing-final-frame-bad-crc-quarantines",
+    "framing-nlen-mismatch-quarantines",
+    "framing-three-frame-roundtrip",
+    "txn-internal-order-and-competing-terminals"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f13-journal-recovery",
+   "family": 13,
+   "lines": [
+    456,
+    462
+   ],
+   "quote": "PendingXfer/XferDone/XferAbort",
+   "obligation": "Journal record recovery; zone-scoped frontier + checkpoint fence coverage (D-118).",
+   "vectors": [
+    "txn-internal-order-and-competing-terminals"
+   ],
+   "status": "partial",
+   "note": "journal replay is vectored; the checkpoint/fence storage shapes are not."
+  },
+  {
+   "id": "f13-lock",
+   "family": 13,
+   "lines": [
+    462,
+    463
+   ],
+   "quote": "cross-process lock",
+   "obligation": "Cross-process lock: the exclusive loser is read-only.",
+   "vectors": [
+    "lock-exclusive-loser-read-only"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f13-erase-crash",
+   "family": 13,
+   "lines": [
+    463,
+    469
+   ],
+   "quote": "erase crash matrix",
+   "obligation": "The erase crash matrix across all six states, survivor completeness, third-rotation survivor, queue serialization, Fence activation (D-73/D-89/D-92).",
+   "vectors": [
+    "erase-crash-fence-before-tombstones-nonconformant",
+    "erase-crash-state1-accepted-unfenced",
+    "erase-crash-state2-fence-intent-recovered",
+    "erase-crash-state3-rewrap-progress",
+    "erase-crash-state4-third-rotation-epoch1-survivor",
+    "erase-crash-state5-tombstone-rederivation",
+    "erase-crash-state6-complete",
+    "erase-crash-survivor-omission-blocks-destruction"
+   ],
+   "status": "vectored"
+  },
+  {
+   "id": "f13-staged-membership",
+   "family": 13,
+   "lines": [
+    469,
+    473
+   ],
+   "quote": "staged >128-membership ceremony",
+   "obligation": "The staged >128-membership ceremony; committed Fence intent recovery (D-97/D-106).",
+   "vectors": [
+    "erase-crash-state2-fence-intent-recovered"
+   ],
+   "status": "partial",
+   "note": "Fence-intent recovery is vectored; the wrap-add ceremony is not."
+  },
+  {
+   "id": "f13-renewal-custody",
+   "family": 13,
+   "lines": [
+    473,
+    479
+   ],
+   "quote": "latest-epoch renewal wraps",
+   "obligation": "Latest-epoch renewal wraps and predecessor-KEM custody predicates (D-116/D-125/D-133).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f13-orphaned-wrapadd",
+   "family": 13,
+   "lines": [
+    479,
+    481
+   ],
+   "quote": "`storage-orphaned` on mismatched/unadopted activation",
+   "obligation": "storage-orphaned on unadopted activation; the effective wrap-add map as storage state (D-117).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f13-recipientset-deferral",
+   "family": 13,
+   "lines": [
+    481,
+    484
+   ],
+   "quote": "`recipientset` constructibility",
+   "obligation": "recipientset constructibility at the 256 cap; the durable-attempt deferral (D-110/D-119/D-125).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f13-journal-identity",
+   "family": 13,
+   "lines": [
+    483,
+    487
+   ],
+   "quote": "release_op journal",
+   "obligation": "release_op journal identity; renewal wrap supersession (D-123).",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f13-erase-covers",
+   "family": 13,
+   "lines": [
+    487,
+    488
+   ],
+   "quote": "erase-covers-index/view/checkpoint/backup",
+   "obligation": "Erasure covers index, views, checkpoints, and backups.",
+   "vectors": [],
+   "status": "pending"
+  },
+  {
+   "id": "f14-migration",
+   "family": 14,
+   "lines": [
+    487,
+    491
+   ],
+   "quote": "14 migration/projection",
+   "obligation": "Migration/projection: re-encapsulation byte equality, stamp completeness, the offline-confirmation fixture (umbrella App C #2).",
+   "vectors": [
+    "offline-expiry-confirmation-pending",
+    "projection-release-stamp-complete",
+    "projection-stamp-incomplete-rejects",
+    "reencapsulation-byte-equality"
+   ],
+   "status": "vectored",
+   "note": "the offline-confirmation fixture is minted and deliberately PENDING (owner choice, D11 open)."
+  },
+  {
+   "id": "s-tail",
+   "family": 0,
+   "lines": [
+    491,
+    492
+   ],
+   "quote": "---",
+   "obligation": "Trailing separator.",
+   "vectors": [],
+   "status": "structural"
+  }
+ ]
+}

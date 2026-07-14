@@ -1,0 +1,59 @@
+name: Owner-plane reference artifacts
+
+# ADVISORY (non-required): executes the D0-A reference artifacts — the
+# Rust core (vector mint + drift/coverage gates) and the independent
+# reducer (the differential harness) — on PRs touching the program.
+#
+# Naming is deliberate: green here means the TWO RUST SURFACES agree
+# on the committed corpus. It is not browser (WebCrypto/IndexedDB),
+# native-crypto-service, or per-OS portable-storage execution — those
+# lanes have never run and are planned in
+# rfcs/owner-plane/execution-lanes-plan.md; the §13.2 `surfaces`
+# arrays on vectors are applicability annotations, not execution.
+#
+# Advisory like audit.yml: a red run must not block unrelated
+# landings while the program is pre-Gate-A; the strict harness step
+# exits nonzero on ANY structural failure, semantic FAIL, or
+# Unimplemented, so a red here is a real differential finding.
+
+on:
+  pull_request:
+    paths:
+      - "rfcs/owner-plane/**"
+      - ".github/workflows/owner-plane.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reference-artifacts:
+    name: owner-plane reference artifacts (Rust core + reducer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # rustup ships preinstalled on the GitHub-hosted runners; the
+      # components ride the default toolchain but are pinned here
+      # against image drift.
+      - name: toolchain components
+        run: rustup component add rustfmt clippy
+      - name: fmt
+        run: |
+          cargo fmt --check --manifest-path rfcs/owner-plane/core/Cargo.toml
+          cargo fmt --check --manifest-path rfcs/owner-plane/reducer/Cargo.toml
+      - name: core suite (drift gates, §13.2 surfaces, coverage inventory)
+        run: cargo test --manifest-path rfcs/owner-plane/core/Cargo.toml
+      - name: reducer suite (differential lanes, envelope sweep, journal machine)
+        run: cargo test --manifest-path rfcs/owner-plane/reducer/Cargo.toml
+      - name: clippy
+        run: |
+          cargo clippy --manifest-path rfcs/owner-plane/core/Cargo.toml -- -D warnings
+          cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml -- -D warnings
+      - name: strict harness gate (every vector; nonzero exit on any red)
+        run: cargo run --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin harness
+      - name: mint idempotence (vectors + coverage map reproduce byte-exactly)
+        run: |
+          cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null
+          git diff --exit-code -- rfcs/owner-plane/vectors rfcs/owner-plane/coverage

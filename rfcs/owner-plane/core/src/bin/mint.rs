@@ -38,4 +38,13 @@ fn main() {
         std::fs::write(&path, v.to_file_string()).expect("write vector");
         println!("minted {}", path.display());
     }
+
+    // The §10.4 coverage map rides the same mint (drift-gated by
+    // `coverage::tests::committed_outcomes_map_matches_generator`).
+    let cov_dir = root.join("coverage");
+    std::fs::create_dir_all(&cov_dir).expect("create coverage dir");
+    let map_path = cov_dir.join("outcomes-map.json");
+    std::fs::write(&map_path, owner_plane_core::coverage::outcomes_map_file())
+        .expect("write outcomes map");
+    println!("minted {}", map_path.display());
 }
