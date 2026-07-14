@@ -795,4 +795,65 @@ mod tests {
         assert_eq!(again.merge_parity, "conflict");
         assert_eq!(prober.merge_cache.len(), 1);
     }
+
+    /// The dashboard's vitals symbol catalog (static/app/39-session-windows.js,
+    /// VITALS_SYMBOLS_BEGIN..END) is the single source for every vitals chip,
+    /// rail tooltip, and tap-to-explain popover — and the backend-parity
+    /// surface: all three backends render the same symbol grammar from these
+    /// wire fields. Pin both directions so a `SessionVitals` schema change or
+    /// a catalog refactor fails here instead of shipping as silent drift.
+    #[test]
+    fn vitals_symbol_catalog_covers_wire_fields() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        let begin = fragment
+            .find("VITALS_SYMBOLS_BEGIN")
+            .expect("catalog begin marker");
+        let end = fragment
+            .find("VITALS_SYMBOLS_END")
+            .expect("catalog end marker");
+        let catalog = &fragment[begin..end];
+        for key in [
+            "health:",
+            "branch:",
+            "worktree:",
+            "dirty:",
+            "divergence:",
+            "parity:",
+            "unpushed:",
+            "'primary-unpushed':",
+            "'cache-hit':",
+            "'cache-ttl':",
+            "limit:",
+        ] {
+            assert!(catalog.contains(key), "catalog lost symbol {key}");
+        }
+        // The serde-camelCase wire fields of SessionVitals/SessionGitVitals/
+        // SessionCacheVitals/SessionLimitWindow the catalog must consume.
+        for field in [
+            "branch",
+            "dirtyFiles",
+            "primaryRef",
+            "ahead",
+            "behind",
+            "mergeParity",
+            "unpushed",
+            "primaryUnpushed",
+            "hitPct",
+            "ttlSeconds",
+            "lastActivityEpoch",
+            "usedPct",
+            "resetsAtEpoch",
+            "status",
+            "label",
+        ] {
+            assert!(
+                catalog.contains(field),
+                "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
+            );
+        }
+    }
 }

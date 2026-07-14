@@ -5222,73 +5222,172 @@ body.context-focus-active {
     display: none;
   }
 }
+/* ── Vitals chip row — per-symbol <button> chips (catalog-driven).
+   Truncation policy: expanded headers WRAP (nothing is ever cut);
+   collapsed headers show the health dot + severity-elevated chips + a
+   "+N" overflow chip (quiet by default). Never mid-string ellipsis. */
 .session-window-vitals {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 320px;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.session-window-vitals .vit-chip {
+  appearance: none;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 2px 7px;
+  gap: 3px;
+  margin: 0;
+  padding: 1px 7px;
   border: 1px solid color-mix(in srgb, var(--teal) 22%, transparent);
   border-radius: 999px;
   background: color-mix(in srgb, var(--teal) 6%, transparent);
   color: var(--subtext0);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1.35;
+  font: inherit;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: border-color 0.13s, background 0.13s, color 0.13s;
 }
-.session-window-vitals.conflict {
-  border-color: color-mix(in srgb, var(--red) 38%, transparent);
-  background: color-mix(in srgb, var(--red) 8%, transparent);
+.session-window-vitals .vit-chip:hover {
+  border-color: color-mix(in srgb, var(--teal) 45%, transparent);
+  color: var(--text, var(--subtext1));
 }
-.session-window-vitals.conflict .vit-git {
-  color: var(--red);
+.session-window-vitals .vit-chip:focus-visible {
+  outline: 2px solid var(--lavender);
+  outline-offset: 1px;
 }
-.session-window-vitals .vit-git,
-.session-window-vitals .vit-cache {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.session-window-vitals .vit-cache.cache-ok {
-  color: var(--green);
-}
-.session-window-vitals .vit-cache.cache-warn {
+.session-window-vitals .vit-chip[data-severity="ok"] { color: var(--green); }
+.session-window-vitals .vit-chip[data-severity="warn"] {
   color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 40%, transparent);
+  background: color-mix(in srgb, var(--yellow) 8%, transparent);
 }
-.session-window-vitals .vit-cache.cache-crit {
-  color: var(--peach);
-}
-.session-window-vitals .vit-cache.cache-expiring {
+.session-window-vitals .vit-chip[data-severity="crit"] {
   color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  background: color-mix(in srgb, var(--red) 9%, transparent);
 }
-.session-window-vitals .vit-cache.cache-cold {
-  opacity: 0.55;
+/* The health dot: one glance, one verdict — tap opens the glossary. */
+.session-window-vitals .vit-health {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 50%;
 }
-.session-window-vitals .vit-limits {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  opacity: 0.85;
+.session-window-vitals .vit-health::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
 }
-.session-window-vitals .vit-limits.limits-warn {
-  color: var(--yellow);
-  opacity: 1;
-}
-.session-window-vitals .vit-limits.limits-crit {
-  color: var(--red);
-  opacity: 1;
-}
+.session-window-vitals .vit-health[data-severity="warn"]::before { background: var(--yellow); }
+.session-window-vitals .vit-health[data-severity="crit"]::before { background: var(--red); }
+/* Collapsed header: quiet by default. */
+.session-window-vitals .vit-chip.vit-overflow { display: none; }
+.session-window.header-collapsed .session-window-vitals { flex-wrap: nowrap; }
+.session-window.header-collapsed .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
+.session-window.header-collapsed .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
 @container (max-width: 560px) {
-  .session-window-vitals {
-    display: none;
-  }
+  .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
+  .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
 }
+
+/* ── Vitals explainer: popover on fine pointers, bottom sheet on coarse/
+   narrow (tooltips are mobile-hostile; every symbol answers a tap). */
+#vitals-explainer[hidden] { display: none; }
+#vitals-explainer .vx-backdrop { display: none; }
+#vitals-explainer.sheet .vx-backdrop {
+  display: block;
+  position: fixed;
+  inset: 0;
+  z-index: 940;
+  background: rgba(0, 0, 0, 0.45);
+}
+#vitals-explainer .vx-panel {
+  position: fixed;
+  z-index: 941;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  padding: 12px 14px;
+  max-width: 340px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--subtext1);
+}
+#vitals-explainer.sheet .vx-panel {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  max-width: none;
+  border-radius: 16px 16px 0 0;
+  border-bottom: 0;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 16px 18px calc(16px + env(safe-area-inset-bottom, 0px));
+}
+.vx-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.vx-head .vx-title {
+  color: var(--text, var(--subtext1));
+  font-weight: 700;
+  font-size: 12.5px;
+}
+.vx-head .vx-value {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--subtext0);
+}
+.vx-line { margin: 4px 0; }
+.vx-action {
+  margin-top: 9px;
+  padding: 6px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  background: var(--surface0);
+  color: var(--text, var(--subtext1));
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+.vx-action:hover { background: var(--surface1); }
+.vx-row {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-top: 1px solid var(--surface0);
+}
+.vx-row .vx-glyph {
+  font-family: var(--mono, monospace);
+  font-size: 10.5px;
+  color: var(--subtext0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vx-row .vx-label { color: var(--text, var(--subtext1)); font-weight: 650; }
+.vx-row .vx-desc { margin-top: 2px; font-size: 11.5px; }
+.vx-row.absent { opacity: 0.55; }
+.vx-row.present { cursor: pointer; }
+.vx-row.present:hover .vx-label { color: var(--lavender); }
 .session-window-action-cluster {
   flex-shrink: 0;
   display: inline-flex;
@@ -28045,7 +28144,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'eecaf6cd30987a85';
+const INTENDANT_APP_BUILD = '8d27662f99f1e1c8';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -46751,6 +46850,16 @@ function applySessionIdentity(meta = {}) {
   } else if (sessionWindows.has(sid)) {
     updateSessionWindow(sid, next);
   }
+  // Vitals arrive keyed to the wrapper/log id (the git prober registers
+  // that id) and fan out through the identity group AS CACHED AT ARRIVAL.
+  // A window keyed by the backend-native id from birth (Codex announces
+  // its thread id before turn 1) therefore missed every vitals emission
+  // sent before this linkage landed — and, because the hub emits on
+  // change only, stayed chip-less until the next change. Re-fan now that
+  // the group is known.
+  if (typeof refanSessionVitalsForIdentityGroup === 'function') {
+    refanSessionVitalsForIdentityGroup(sid);
+  }
   persistSessionWindowState();
   updateTaskTargetChip();
   stationScheduleUpdate();
@@ -47909,49 +48018,163 @@ function applySessionGoalsFromReplayEntries(entries) {
   }
 }
 
-// ── Session vitals (git / cache / limits chips — the statusline port) ──
+// ── Session vitals (git / cache / limits / worktree — the statusline port)
+//
+// VITALS_SYMBOLS is THE catalog: every vitals surface — session-window
+// header chips, the Focus rail tooltips, the tap-to-explain popovers, the
+// glossary sheet — derives its glyph, label, plain-language explanation,
+// severity, and action from this one map ("derive, don't mirror"). Never
+// hand-write a vitals sentence anywhere else. Explanations are written
+// for the least technical reader first: say what the symbol MEANS for
+// them, never how it is computed. Chips are real <button>s — the header's
+// collapse-on-click guard exempts buttons, and they get keyboard and
+// screen-reader semantics for free. The wire fields consumed between the
+// markers are pinned by
+// session_vitals.rs::vitals_symbol_catalog_covers_wire_fields.
+// VITALS_SYMBOLS_BEGIN
+const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 
-function sessionVitalsGitSegment(git) {
-  if (!git || typeof git !== 'object') return null;
-  const parts = [];
-  const titleLines = [];
-  const branch = String(git.branch || '').trim();
-  if (branch) {
-    parts.push(`⎇ ${branch}`);
-    titleLines.push(`Branch: ${branch}`);
-  }
-  const dirty = Number(git.dirtyFiles) || 0;
-  if (dirty > 0) {
-    parts.push(`●${dirty}`);
-    titleLines.push(`Dirty files: ${dirty}`);
-  }
-  const primaryRef = String(git.primaryRef || '').trim();
-  if (primaryRef) {
-    const ahead = Number(git.ahead) || 0;
-    const behind = Number(git.behind) || 0;
-    parts.push(`+${ahead}/−${behind}`);
-    titleLines.push(`vs ${primaryRef}: ${ahead} ahead, ${behind} behind`);
-  }
-  const parity = String(git.mergeParity || '').trim();
-  if (parity === 'clean') {
-    parts.push('✓');
-    titleLines.push(`Merge with ${primaryRef || 'primary'}: clean`);
-  } else if (parity === 'conflict') {
-    parts.push('⚠');
-    titleLines.push(`Merge with ${primaryRef || 'primary'}: WOULD CONFLICT`);
-  }
-  if (git.unpushed !== null && git.unpushed !== undefined) {
-    parts.push(`⇡${git.unpushed}`);
-    titleLines.push(`Unpushed on ${branch || 'branch'}: ${git.unpushed}`);
-  }
-  if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
-    const primaryName = primaryRef.replace(/^origin\//, '');
-    parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
-    titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
-  }
-  if (!parts.length) return null;
-  return { text: parts.join(' '), titleLines, conflict: parity === 'conflict' };
+function vitalsLimitLabelLong(label) {
+  if (label === '5h') return '5-hour';
+  if (label === '7d') return '7-day';
+  return label;
 }
+
+const VITALS_SYMBOLS = {
+  health: {
+    label: 'Session health',
+    priority: 100,
+    chip: () => '',
+    explain: (v) => (v.severity === 'crit'
+      ? ['Something needs your attention — the highlighted symbols say what.']
+      : v.severity === 'warn'
+        ? ['Worth a look soon — the highlighted symbols say why.']
+        : ['Everything looks good.', 'Tap any symbol to learn what it tracks.']),
+  },
+  worktree: {
+    label: 'Worktree',
+    priority: 20,
+    unavailable: 'Not in a worktree — this agent works directly in the project folder.',
+    chip: () => '⧉',
+    explain: (v) => {
+      const lines = [
+        'This agent works in its own copy of the project (a git worktree), so agents working in parallel never disturb each other.',
+        `Branch: ${v.branch}`,
+      ];
+      if (v.path) lines.push(`Folder: ${v.path}`);
+      if (v.baseBranch) lines.push(`Started from ${v.baseBranch}${v.baseSha ? ` @ ${v.baseSha.slice(0, 12)}` : ''}`);
+      return lines;
+    },
+    action: (v) => (v.path ? { label: 'Copy folder path', run: () => vitalsCopyText(v.path) } : null),
+  },
+  branch: {
+    label: 'Branch',
+    priority: 30,
+    chip: (v) => `⎇ ${v.branch}`,
+    explain: (v) => [`“${v.branch}” is the git branch this agent is working on.`],
+    action: (v) => ({ label: 'Copy branch name', run: () => vitalsCopyText(v.branch) }),
+  },
+  dirty: {
+    label: 'Uncommitted changes',
+    priority: 60,
+    quiet: 'Nothing uncommitted — the working folder is clean.',
+    chip: (v) => `●${v.count}`,
+    explain: (v) => [
+      `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
+      'Normal while the agent works — they become permanent history once committed.',
+    ],
+    action: () => ({ label: 'View the changes', run: () => vitalsOpenChangesTab() }),
+  },
+  divergence: {
+    label: 'Ahead / behind',
+    priority: 40,
+    quiet: 'No primary branch to compare with.',
+    chip: (v) => `+${v.ahead}/−${v.behind}`,
+    explain: (v) => [
+      `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
+    ],
+  },
+  parity: {
+    label: 'Merge readiness',
+    priority: 90,
+    quiet: 'No merge check needed — this branch is not diverged from the primary.',
+    chip: (v) => (v.conflict ? '⚠' : '✓'),
+    explain: (v) => (v.conflict
+      ? [`Merging this work into ${v.primaryRef} would CONFLICT — overlapping edits need a decision before it can land.`]
+      : [`Merging this work into ${v.primaryRef} would apply cleanly right now.`]),
+    action: (v, sessionId) => (v.conflict
+      ? { label: 'Open the merge card', run: () => openSessionWorktreeMergeCard(sessionId) }
+      : null),
+  },
+  unpushed: {
+    label: 'Unpushed commits',
+    priority: 35,
+    quiet: 'Nothing waiting to be pushed (or no upstream is configured).',
+    chip: (v) => `⇡${v.count}`,
+    explain: (v) => [
+      `${v.count} commit${v.count === 1 ? '' : 's'} on this branch exist${v.count === 1 ? 's' : ''} only on this machine — not pushed to the shared repository yet.`,
+    ],
+  },
+  'primary-unpushed': {
+    label: 'Unpushed on primary',
+    priority: 25,
+    quiet: 'Nothing unpushed on the primary branch.',
+    chip: (v) => `${v.primaryName}⇡${v.count}`,
+    explain: (v) => [
+      `The primary branch ${v.primaryName} has ${v.count} commit${v.count === 1 ? '' : 's'} that ${v.count === 1 ? 'hasn’t' : 'haven’t'} been pushed yet.`,
+    ],
+  },
+  'cache-hit': {
+    label: 'Prompt cache',
+    priority: 15,
+    quiet: 'No cache reading on the last request.',
+    chip: (v) => `⚡${v.hitPct}%`,
+    explain: (v) => [
+      `${v.hitPct}% of the last request was answered from the provider's prompt cache.`,
+      'Cached input is far cheaper and faster than fresh input.',
+    ],
+  },
+  'cache-ttl': {
+    label: 'Cache freshness',
+    priority: 45,
+    quiet: "This provider doesn't report how long its cache stays warm.",
+    chip: (v) => (v.cold ? '✗' : `⏳${v.countdown}`),
+    explain: (v) => (v.cold
+      ? [
+        'The prompt cache went cold — the next request rebuilds it.',
+        'Nothing is broken; the next turn just costs a little more once.',
+      ]
+      : [
+        `The prompt cache stays warm for another ${v.countdown}.`,
+        'If the session idles past that, the next request rebuilds it — slower and pricier.',
+      ]),
+  },
+  limit: {
+    label: 'Rate limit',
+    priority: 80,
+    chip: (v) => (v.usedPct !== null
+      ? `▮${v.usedPct}% ${v.label}`
+      : `${v.label} ${v.statusWord}${v.reset ? ` ↻${v.reset}` : ''}`),
+    explain: (v) => {
+      const lines = [];
+      if (v.usedPct !== null) {
+        lines.push(`${v.usedPct}% of the provider's ${vitalsLimitLabelLong(v.label)} usage allowance is used.`);
+      } else {
+        lines.push(`The provider reports its ${vitalsLimitLabelLong(v.label)} allowance as “${v.statusWord}” — it doesn't share an exact percentage.`);
+      }
+      if (v.reset) lines.push(`The window resets in ~${v.reset}.`);
+      if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
+      return lines;
+    },
+  },
+};
+
+// Fixed display order for chips and the glossary (semantic, not priority:
+// priority only governs which chips stay visible when space is scarce).
+const VITALS_SYMBOL_ORDER = [
+  'health', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
+  'unpushed', 'primary-unpushed', 'cache-hit', 'cache-ttl', 'limit',
+];
 
 // Seconds until the prompt cache goes cold, from the server-stamped
 // activity anchor; null when the provider's TTL is unknown (receipt-only).
@@ -47967,37 +48190,6 @@ function formatCacheCountdown(seconds) {
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 }
 
-function sessionVitalsCacheSegment(cache) {
-  if (!cache || typeof cache !== 'object') return null;
-  const parts = [];
-  const titleLines = [];
-  let cls = 'vit-cache';
-  const hit = Number.isFinite(Number(cache.hitPct)) && cache.hitPct !== null && cache.hitPct !== undefined
-    ? Math.max(0, Math.min(100, Number(cache.hitPct)))
-    : null;
-  if (hit !== null) {
-    parts.push(`⚡${hit}%`);
-    titleLines.push(`Prompt-cache hit (latest request): ${hit}%`);
-    cls += hit >= 90 ? ' cache-ok' : hit >= 50 ? ' cache-warn' : ' cache-crit';
-  }
-  const remaining = sessionCacheCountdownSeconds(cache);
-  let ticking = false;
-  if (remaining !== null) {
-    if (remaining > 0) {
-      parts.push(`⏳${formatCacheCountdown(remaining)}`);
-      titleLines.push(`Cache expires in ${formatCacheCountdown(remaining)} (TTL ${formatCacheCountdown(cache.ttlSeconds)})`);
-      if (remaining <= 60) cls += ' cache-expiring';
-      ticking = true;
-    } else {
-      parts.push('✗');
-      titleLines.push('Prompt cache is cold — the next request rebuilds it');
-      cls += ' cache-cold';
-    }
-  }
-  if (!parts.length) return null;
-  return { text: parts.join(' '), titleLines, cls, ticking };
-}
-
 function formatLimitReset(resetsAtEpoch) {
   const remaining = Number(resetsAtEpoch) - Date.now() / 1000;
   if (!Number.isFinite(remaining) || remaining <= 0) return '';
@@ -48006,10 +48198,6 @@ function formatLimitReset(resetsAtEpoch) {
   return `${Math.max(1, Math.round(remaining / 60))}m`;
 }
 
-// The gauge shows the most-used window; the tooltip lists them all.
-// A window may arrive WITHOUT a percentage (Claude Code 2.1.2xx reports
-// status/reset only) — it still renders, as "label ok · ↻reset", with
-// severity derived from the provider status instead of the number.
 function limitStatusSeverity(status) {
   const s = String(status || '').trim().toLowerCase();
   if (!s || s === 'allowed') return '';
@@ -48017,114 +48205,529 @@ function limitStatusSeverity(status) {
   return 'crit'; // rejected / limited / queueing / anything non-allowed
 }
 
-function sessionVitalsLimitsSegment(limits) {
-  if (!Array.isArray(limits) || !limits.length) return null;
-  const windows = limits
-    .map((w) => {
-      const rawPct = Number(w?.usedPct);
-      return {
-        label: String(w?.label || '').trim() || 'window',
-        usedPct: Number.isFinite(rawPct) && w?.usedPct !== null && w?.usedPct !== undefined
-          ? Math.max(0, Math.min(100, rawPct))
-          : null,
-        resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
-        status: String(w?.status || '').trim(),
-      };
-    });
-  const top = windows.reduce((a, b) => ((b.usedPct ?? -1) > (a.usedPct ?? -1) ? b : a));
-  const statusSeverity = windows
-    .map((w) => limitStatusSeverity(w.status))
-    .reduce((a, b) => (b === 'crit' || (b === 'warn' && a !== 'crit') ? b : a), '');
-  let severity = statusSeverity;
-  let text;
-  if (top.usedPct !== null) {
-    text = `▮${top.usedPct}% ${top.label}`;
-    if (top.usedPct >= 90) severity = 'crit';
-    else if (top.usedPct >= 70 && severity !== 'crit') severity = 'warn';
-  } else {
-    const worst = windows.find((w) => limitStatusSeverity(w.status) === statusSeverity) || top;
-    const state = statusSeverity === 'crit' ? 'limited' : statusSeverity === 'warn' ? 'high' : 'ok';
-    text = `${worst.label} ${state}`;
-    const reset = worst.resetsAtEpoch ? formatLimitReset(worst.resetsAtEpoch) : '';
-    if (reset) text += ` ↻${reset}`;
-  }
-  let cls = 'vit-limits';
-  if (severity === 'crit') {
-    cls += ' limits-crit';
-    if (top.usedPct !== null) {
-      const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
-      if (reset) text += ` ↻${reset}`;
-    }
-  } else if (severity === 'warn') {
-    cls += ' limits-warn';
-  }
-  const titleLines = windows.map((w) => {
-    const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
-    const used = w.usedPct !== null ? `${w.usedPct}% used` : (w.status || 'ok');
-    return `Rate limit ${w.label}: ${used}${reset}`;
-  });
-  return { text, titleLines, cls, severity };
+function limitStatusWord(status, severity) {
+  if (severity === 'crit') return 'limited';
+  if (severity === 'warn') return 'getting high';
+  return 'ok';
 }
 
-// Renders the chip; returns true while a cache countdown is live (the
+// Chip models for one session: [{ id, key, label, text, severity,
+// elevated, priority, explainLines, action, ticking }]. `vitals` may be
+// null (a worktree session with no vitals yet still gets health +
+// worktree). The health model is synthesized last and leads the list.
+function vitalsChipModels(vitals, meta, sessionId) {
+  const models = [];
+  const push = (key, id, value, extra = {}) => {
+    const def = VITALS_SYMBOLS[key];
+    if (!def) return;
+    // severity = attention (elevates the chip, feeds the health dot);
+    // tone = cosmetic tint only. A fresh session's 0% cache hit is
+    // expensive (red TEXT) but not wrong (never a red health dot).
+    const severity = extra.severity || '';
+    const tone = extra.tone !== undefined ? extra.tone : severity;
+    models.push({
+      id: id || key,
+      key,
+      label: def.label,
+      priority: def.priority,
+      text: def.chip(value),
+      severity,
+      tone,
+      elevated: severity === 'warn' || severity === 'crit',
+      explainLines: def.explain({ ...value, severity }),
+      action: def.action ? (def.action(value, sessionId) || null) : null,
+      ticking: !!extra.ticking,
+    });
+  };
+
+  const worktree = meta?.worktree && typeof meta.worktree === 'object' ? meta.worktree : null;
+  if (worktree?.branch) {
+    push('worktree', 'worktree', {
+      branch: worktree.branch,
+      path: worktree.path || '',
+      baseBranch: worktree.baseBranch || '',
+      baseSha: worktree.baseSha || '',
+    });
+  }
+
+  const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
+  if (git) {
+    const branch = String(git.branch || '').trim();
+    if (branch) push('branch', 'branch', { branch });
+    const dirty = Number(git.dirtyFiles) || 0;
+    if (dirty > 0) push('dirty', 'dirty', { count: dirty });
+    const primaryRef = String(git.primaryRef || '').trim();
+    if (primaryRef) {
+      push('divergence', 'divergence', {
+        ahead: Number(git.ahead) || 0,
+        behind: Number(git.behind) || 0,
+        primaryRef,
+      });
+    }
+    const parity = String(git.mergeParity || '').trim();
+    if (parity === 'clean' || parity === 'conflict') {
+      const conflict = parity === 'conflict';
+      push('parity', 'parity', { conflict, primaryRef: primaryRef || 'the primary branch' },
+        { severity: conflict ? 'crit' : 'ok' });
+    }
+    if (git.unpushed !== null && git.unpushed !== undefined) {
+      push('unpushed', 'unpushed', { count: Number(git.unpushed) || 0 });
+    }
+    if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
+      push('primary-unpushed', 'primary-unpushed', {
+        primaryName: primaryRef.replace(/^origin\//, ''),
+        count: Number(git.primaryUnpushed) || 0,
+      });
+    }
+  }
+
+  const cache = vitals?.cache && typeof vitals.cache === 'object' ? vitals.cache : null;
+  if (cache) {
+    const hitRaw = Number(cache.hitPct);
+    if (Number.isFinite(hitRaw) && cache.hitPct !== null && cache.hitPct !== undefined) {
+      const hitPct = Math.max(0, Math.min(100, hitRaw));
+      push('cache-hit', 'cache-hit', { hitPct }, {
+        severity: hitPct >= 90 ? 'ok' : '',
+        tone: hitPct >= 90 ? 'ok' : hitPct >= 50 ? 'warn' : 'crit',
+      });
+    }
+    const remaining = sessionCacheCountdownSeconds(cache);
+    if (remaining !== null) {
+      if (remaining > 0) {
+        push('cache-ttl', 'cache-ttl', { cold: false, countdown: formatCacheCountdown(remaining) },
+          { severity: '', tone: remaining <= 60 ? 'crit' : '', ticking: true });
+      } else {
+        push('cache-ttl', 'cache-ttl', { cold: true, countdown: '' });
+      }
+    }
+  }
+
+  const limits = Array.isArray(vitals?.limits) ? vitals.limits : [];
+  for (const w of limits) {
+    const label = String(w?.label || '').trim() || 'window';
+    const pctRaw = Number(w?.usedPct);
+    const usedPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined
+      ? Math.max(0, Math.min(100, pctRaw))
+      : null;
+    const statusSeverity = limitStatusSeverity(w?.status);
+    let severity = statusSeverity;
+    if (usedPct !== null) {
+      if (usedPct >= 90) severity = 'crit';
+      else if (usedPct >= 70 && severity !== 'crit') severity = 'warn';
+    }
+    push('limit', `limit:${label}`, {
+      label,
+      usedPct,
+      statusWord: limitStatusWord(w?.status, statusSeverity),
+      reset: w?.resetsAtEpoch ? formatLimitReset(w.resetsAtEpoch) : '',
+      severity,
+    }, { severity });
+  }
+
+  const order = new Map(VITALS_SYMBOL_ORDER.map((key, index) => [key, index]));
+  models.sort((a, b) => (order.get(a.key) ?? 99) - (order.get(b.key) ?? 99));
+
+  const worst = models.reduce(
+    (acc, m) => (VITALS_SEVERITY_RANK[m.severity] > VITALS_SEVERITY_RANK[acc] ? m.severity : acc),
+    ''
+  );
+  const healthDef = VITALS_SYMBOLS.health;
+  models.unshift({
+    id: 'health',
+    key: 'health',
+    label: healthDef.label,
+    priority: healthDef.priority,
+    text: '',
+    severity: worst === 'ok' ? '' : worst,
+    tone: worst === 'ok' ? '' : worst,
+    elevated: true,
+    explainLines: healthDef.explain({ severity: worst }),
+    action: null,
+    ticking: false,
+  });
+  return models;
+}
+// VITALS_SYMBOLS_END
+
+const VITALS_GIT_KEYS = new Set([
+  'branch', 'dirty', 'divergence', 'parity', 'unpushed', 'primary-unpushed',
+]);
+
+// Legacy family segments — the Focus rail (ui2RailTick) and Station rows
+// consume these. Thin catalog derivations: same glyph strings, same
+// sentences as the chip popovers, so no surface can drift.
+function sessionVitalsGitSegment(git) {
+  if (!git || typeof git !== 'object') return null;
+  const models = vitalsChipModels({ git }, null, '')
+    .filter((m) => VITALS_GIT_KEYS.has(m.key));
+  if (!models.length) return null;
+  return {
+    text: models.map((m) => m.text).join(' '),
+    titleLines: models.flatMap((m) => m.explainLines),
+    conflict: models.some((m) => m.key === 'parity' && m.severity === 'crit'),
+  };
+}
+
+function sessionVitalsCacheSegment(cache) {
+  if (!cache || typeof cache !== 'object') return null;
+  const models = vitalsChipModels({ cache }, null, '')
+    .filter((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
+  if (!models.length) return null;
+  let cls = 'vit-cache';
+  const hit = models.find((m) => m.key === 'cache-hit');
+  if (hit) cls += hit.tone === 'ok' ? ' cache-ok' : hit.tone === 'warn' ? ' cache-warn' : ' cache-crit';
+  const ttl = models.find((m) => m.key === 'cache-ttl');
+  if (ttl) cls += ttl.tone === 'crit' ? ' cache-expiring' : ttl.text === '✗' ? ' cache-cold' : '';
+  return {
+    text: models.map((m) => m.text).join(' '),
+    titleLines: models.flatMap((m) => m.explainLines),
+    cls,
+    ticking: models.some((m) => m.ticking),
+  };
+}
+
+// The rail gauge shows the most-used window; the tooltip lists them all.
+function sessionVitalsLimitsSegment(limits) {
+  if (!Array.isArray(limits) || !limits.length) return null;
+  const models = vitalsChipModels({ limits }, null, '')
+    .filter((m) => m.key === 'limit');
+  if (!models.length) return null;
+  const severity = models.reduce(
+    (acc, m) => (VITALS_SEVERITY_RANK[m.severity] > VITALS_SEVERITY_RANK[acc] ? m.severity : acc),
+    ''
+  );
+  const top = models.reduce((a, b) =>
+    (VITALS_SEVERITY_RANK[b.severity] > VITALS_SEVERITY_RANK[a.severity] ? b : a));
+  let cls = 'vit-limits';
+  if (severity === 'crit') cls += ' limits-crit';
+  else if (severity === 'warn') cls += ' limits-warn';
+  return {
+    text: top.text,
+    titleLines: models.flatMap((m) => m.explainLines),
+    cls,
+    severity: severity === 'ok' ? '' : severity,
+  };
+}
+
+// Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
+//
+// Truncation policy: NEVER mid-string ellipsis. Expanded headers wrap the
+// chips onto extra lines so nothing is ever cut; collapsed headers show
+// the health dot + severity-elevated chips + a "+N" overflow chip that
+// opens the glossary (CSS keys off data-elevated / .header-collapsed).
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
-  const git = sessionVitalsGitSegment(vitals && typeof vitals === 'object' ? vitals.git : null);
-  const cache = sessionVitalsCacheSegment(vitals && typeof vitals === 'object' ? vitals.cache : null);
-  const limits = sessionVitalsLimitsSegment(vitals && typeof vitals === 'object' ? vitals.limits : null);
-  if (!git && !cache && !limits) {
+  const meta = sessionMetadataById.get(win.sessionId) || {};
+  const models = vitalsChipModels(vitals ?? meta.vitals ?? null, meta, win.sessionId);
+  // health alone means no tracked symbols at all — a verdict about
+  // nothing is noise, hide the row entirely.
+  if (models.length <= 1) {
     win.vitals.className = 'session-window-vitals hidden';
     win.vitals.replaceChildren();
-    win.vitals.title = '';
+    win.vitals.removeAttribute('title');
+    delete win.vitals.dataset.vitSig;
     return false;
   }
-  const segments = [];
-  for (const seg of [
-    git && { cls: 'vit-git', text: git.text, conflictAction: !!git.conflict },
-    cache && { cls: cache.cls, text: cache.text },
-    limits && { cls: limits.cls, text: limits.text },
-  ]) {
-    if (!seg) continue;
-    let span;
-    if (seg.conflictAction && win.sessionId) {
-      // Merge-conflict chip is actionable: a real <button> (keyboard
-      // accessible) that opens the worktree finish/merge card. Inline
-      // chrome reset because the vitals styles only know spans and this
-      // fragment cannot add CSS.
-      span = document.createElement('button');
-      span.type = 'button';
-      span.style.font = 'inherit';
-      span.style.color = 'inherit';
-      span.style.background = 'none';
-      span.style.border = '0';
-      span.style.padding = '0';
-      span.style.cursor = 'pointer';
-      const actionTitle = 'Merge would conflict — open the worktree merge card';
-      span.title = actionTitle;
-      span.setAttribute('aria-label', actionTitle);
-      const sid = win.sessionId;
-      span.addEventListener('click', (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        openSessionWorktreeMergeCard(sid);
-      });
-    } else {
-      span = document.createElement('span');
+  wireVitalsChipRow(win);
+  // Stable-DOM fast path: the 1s countdown ticker must not rebuild the
+  // row (replaced buttons detach mid-tap). When only the cache countdown
+  // moved, update that chip's text in place.
+  const signature = models
+    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : m.text}${m.tone}${m.elevated ? 1 : 0}`)
+    .join('|');
+  if (win.vitals.dataset.vitSig === signature) {
+    const ttl = models.find((m) => m.key === 'cache-ttl');
+    const ttlChip = win.vitals.querySelector('[data-chip="cache-ttl"]');
+    if (ttl && ttlChip) {
+      ttlChip.textContent = ttl.text;
+      ttlChip.title = ttl.explainLines[0] || ttl.label;
     }
-    span.className = seg.cls;
-    span.textContent = seg.text;
-    segments.push(span);
+    return models.some((m) => m.ticking);
   }
-  win.vitals.className = `session-window-vitals${git?.conflict ? ' conflict' : ''}`;
-  win.vitals.replaceChildren(...segments);
-  win.vitals.title = [
-    ...(git?.titleLines || []),
-    ...(cache?.titleLines || []),
-    ...(limits?.titleLines || []),
-  ].join('\n');
-  return !!cache?.ticking;
+  win.vitals.dataset.vitSig = signature;
+  win.vitals.className = 'session-window-vitals';
+  win.vitals.setAttribute('role', 'group');
+  win.vitals.setAttribute('aria-label', 'Session vitals — select a symbol for its meaning');
+  win.vitals.removeAttribute('title');
+  const nodes = [];
+  let foldedWhenCollapsed = 0;
+  for (const m of models) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'vit-chip' + (m.key === 'health' ? ' vit-health' : '');
+    chip.dataset.chip = m.id;
+    if (m.tone) chip.dataset.severity = m.tone;
+    const elevated = m.key === 'health' || m.elevated;
+    if (elevated) chip.dataset.elevated = '1';
+    else foldedWhenCollapsed++;
+    chip.textContent = m.text;
+    chip.title = m.explainLines[0] || m.label;
+    chip.setAttribute('aria-label', m.text ? `${m.label}: ${m.text}` : m.label);
+    nodes.push(chip);
+  }
+  if (foldedWhenCollapsed > 0) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'vit-chip vit-overflow';
+    more.dataset.chip = 'overflow';
+    more.dataset.elevated = '1';
+    more.textContent = `+${foldedWhenCollapsed}`;
+    more.title = 'Show all vitals';
+    more.setAttribute('aria-label', `${foldedWhenCollapsed} more vitals — show all`);
+    nodes.push(more);
+  }
+  win.vitals.replaceChildren(...nodes);
+  return models.some((m) => m.ticking);
 }
+
+// One delegated listener per window (chips are rebuilt every render).
+// Chips are buttons, so the header's collapse-on-click guard already
+// ignores them — stopPropagation only spares the focus/menu side effects.
+function wireVitalsChipRow(win) {
+  if (!win?.vitals || win.vitals.dataset.vitWired) return;
+  win.vitals.dataset.vitWired = '1';
+  win.vitals.addEventListener('click', (event) => {
+    const chip = event.target.closest?.('.vit-chip');
+    if (!chip) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = chip.dataset.chip || '';
+    if (id === 'health' || id === 'overflow') openVitalsGlossary(win.sessionId, chip);
+    else openVitalsExplainer(win.sessionId, id, chip);
+  });
+}
+
+// ── Tap-to-explain: popover on fine pointers, bottom sheet on coarse /
+// narrow — tooltips are mobile-hostile, so every symbol answers a tap.
+function vitalsModelsForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sessionMetadataById.get(sid) || {};
+  return vitalsChipModels(meta.vitals || null, meta, sid);
+}
+
+function vitalsExplainerUsesSheet() {
+  return window.matchMedia('(max-width: 720px)').matches
+    || window.matchMedia('(pointer: coarse)').matches;
+}
+
+function ensureVitalsExplainerHost() {
+  let host = document.getElementById('vitals-explainer');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'vitals-explainer';
+  host.hidden = true;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'vx-backdrop';
+  backdrop.addEventListener('click', closeVitalsExplainer);
+  const panel = document.createElement('div');
+  panel.className = 'vx-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Vitals explanation');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) closeVitalsExplainer();
+  });
+  // Capture phase: dismiss on any outside press without racing the
+  // chip handlers (a chip tap re-opens with fresh content instead).
+  document.addEventListener('pointerdown', (event) => {
+    if (host.hidden) return;
+    if (event.target.closest?.('#vitals-explainer .vx-panel, .vit-chip')) return;
+    closeVitalsExplainer();
+  }, true);
+  return host;
+}
+
+function closeVitalsExplainer() {
+  const host = document.getElementById('vitals-explainer');
+  if (!host) return;
+  host.hidden = true;
+  host.classList.remove('sheet', 'popover');
+}
+
+function vxEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function vxHeader(label, valueText) {
+  const head = vxEl('div', 'vx-head');
+  head.appendChild(vxEl('span', 'vx-title', label));
+  if (valueText) head.appendChild(vxEl('span', 'vx-value', valueText));
+  return head;
+}
+
+function vxActionButton(action) {
+  const btn = vxEl('button', 'vx-action', action.label);
+  btn.type = 'button';
+  btn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    closeVitalsExplainer();
+    try { action.run(); } catch (_) { /* action surfaces its own errors */ }
+  });
+  return btn;
+}
+
+function presentVitalsPanel(host, panel, anchor) {
+  const sheet = vitalsExplainerUsesSheet();
+  host.hidden = false;
+  host.classList.toggle('sheet', sheet);
+  host.classList.toggle('popover', !sheet);
+  panel.style.left = '';
+  panel.style.top = '';
+  if (sheet || !anchor?.getBoundingClientRect) return;
+  const rect = anchor.getBoundingClientRect();
+  // Measure after content mount, then clamp inside the viewport;
+  // prefer below the chip, flip above when there's no room.
+  const pw = Math.min(panel.offsetWidth || 320, window.innerWidth - 16);
+  const ph = panel.offsetHeight || 160;
+  let left = Math.max(8, Math.min(rect.left, window.innerWidth - pw - 8));
+  let top = rect.bottom + 6;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, rect.top - ph - 6);
+  panel.style.left = `${Math.round(left)}px`;
+  panel.style.top = `${Math.round(top)}px`;
+}
+
+function openVitalsExplainer(sessionId, chipId, anchor) {
+  const models = vitalsModelsForSession(sessionId);
+  const model = models.find((m) => m.id === chipId);
+  if (!model) {
+    openVitalsGlossary(sessionId, anchor);
+    return;
+  }
+  const host = ensureVitalsExplainerHost();
+  const panel = host.querySelector('.vx-panel');
+  panel.replaceChildren(
+    vxHeader(model.label, model.text),
+    ...model.explainLines.map((line) => vxEl('p', 'vx-line', line)),
+    ...(model.action ? [vxActionButton(model.action)] : [])
+  );
+  presentVitalsPanel(host, panel, anchor);
+}
+
+// The glossary is the parity surface: EVERY catalog symbol is listed —
+// present ones with their live value and sentence (tap to drill in),
+// absent ones dimmed with "not reported", so what an agent lacks is
+// visible instead of silently missing. The health dot opens this.
+function openVitalsGlossary(sessionId, anchor) {
+  const models = vitalsModelsForSession(sessionId);
+  const health = models.find((m) => m.key === 'health');
+  const host = ensureVitalsExplainerHost();
+  const panel = host.querySelector('.vx-panel');
+  const rows = [];
+  // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
+  // the symbol's family has data but this symbol is at rest, say so in
+  // its own words; only families the agent never reported read as such.
+  const hasGit = models.some((m) => VITALS_GIT_KEYS.has(m.key));
+  const hasCache = models.some((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
+  const familyPresent = (key) => (VITALS_GIT_KEYS.has(key) ? hasGit
+    : key === 'cache-hit' || key === 'cache-ttl' ? hasCache
+    : false);
+  const addRow = (model, def, label, key) => {
+    const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
+    row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
+    const body = vxEl('div', 'vx-body');
+    body.appendChild(vxEl('div', 'vx-label', label || def.label));
+    const absentText = familyPresent(key) && def.quiet
+      ? def.quiet
+      : (def.unavailable || 'Not reported by this agent yet.');
+    body.appendChild(vxEl('div', 'vx-desc',
+      model ? (model.explainLines[0] || '') : absentText));
+    row.appendChild(body);
+    if (model) {
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      const open = () => openVitalsExplainer(sessionId, model.id, anchor);
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+      });
+    }
+    rows.push(row);
+  };
+  for (const key of VITALS_SYMBOL_ORDER) {
+    if (key === 'health') continue;
+    if (key === 'limit') {
+      const limitModels = models.filter((m) => m.key === 'limit');
+      if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
+      for (const m of limitModels) addRow(m, VITALS_SYMBOLS.limit, `Rate limit ${m.id.slice('limit:'.length)}`, key);
+      continue;
+    }
+    addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
+  }
+  panel.replaceChildren(
+    vxHeader('Session vitals',
+      health?.severity === 'crit' ? 'needs attention' : health?.severity === 'warn' ? 'worth a look' : 'all good'),
+    vxEl('p', 'vx-line', health?.explainLines[0] || ''),
+    ...rows
+  );
+  presentVitalsPanel(host, panel, anchor);
+}
+
+function vitalsCopyText(text) {
+  const value = String(text || '');
+  const done = () => {
+    if (typeof showControlToast === 'function') showControlToast('info', 'Copied');
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(value).then(done).catch(() => {});
+    return;
+  }
+  const scratch = document.createElement('textarea');
+  scratch.value = value;
+  document.body.appendChild(scratch);
+  scratch.select();
+  try { document.execCommand('copy'); done(); } catch (_) {}
+  scratch.remove();
+}
+
+function vitalsOpenChangesTab() {
+  const btn = document.querySelector('#activity-subtabs [data-activity-tab="changes"]');
+  if (btn) btn.click();
+}
+
+// Vitals arrive keyed to the wrapper/log id and fan out through the
+// identity group AS CACHED AT ARRIVAL (applySessionVitals). A window
+// keyed by the backend-native id from birth missed every emission sent
+// before the SessionIdentity linkage landed — and the change-only hub
+// sends nothing again until something changes. Called from
+// applySessionIdentity the moment the linkage is recorded.
+function refanSessionVitalsForIdentityGroup(sessionId) {
+  const ids = sessionGoalUpdateIds(sessionId);
+  let vitals = null;
+  for (const id of ids) {
+    const cached = sessionMetadataById.get(id)?.vitals;
+    if (cached) { vitals = cached; break; }
+  }
+  if (!vitals) return;
+  for (const id of ids) {
+    const meta = sessionMetadataById.get(id) || {};
+    if (!meta.vitals) sessionMetadataById.set(id, { ...meta, vitals });
+    if (sessionWindows.has(id)) {
+      renderSessionWindowVitals(sessionWindows.get(id), sessionMetadataById.get(id).vitals);
+    }
+  }
+  refreshSessionVitalsTicker();
+}
+
+// QA readback (window.qa convention): the chip models a session renders,
+// serializable — e2e probes assert backend parity on this.
+window.qa = Object.assign(window.qa || {}, {
+  vitalsChips: (sessionId) => vitalsModelsForSession(sessionId).map((m) => ({
+    id: m.id,
+    key: m.key,
+    text: m.text,
+    severity: m.severity,
+    tone: m.tone,
+    elevated: m.key === 'health' || m.elevated,
+    ticking: m.ticking,
+  })),
+});
 
 // The vitals conflict chip opens the same worktree finish/merge card the
 // session-lifecycle flow renders (54-session-lifecycle.js — called by
@@ -53541,7 +54144,15 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
-  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
+  if (meta.worktree !== undefined) {
+    // Worktree presentation moved into the vitals chip row (a single ⧉
+    // glyph; tap reveals branch/path) — re-render so the chip appears as
+    // soon as the metadata lands, before any vitals event.
+    renderSessionWindowVitals(
+      win,
+      (sessionMetadataById.get(win.sessionId) || {}).vitals || null
+    );
+  }
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -53589,23 +54200,15 @@ function updateSessionWindow(sessionId, meta = {}) {
 
 // Worktree badge next to the project path: branch name up front, the full
 // linkage (checkout path, base branch/commit) in the tooltip.
-function renderSessionWindowWorktreeBadge(win, worktree) {
+// Retired into the vitals chip row (the ⧉ chip carries branch/path via
+// its tap-to-explain popover; the folder name already shows in CWD/PROJ).
+// The badge node stays in the DOM, permanently hidden, so old references
+// stay null-safe.
+function renderSessionWindowWorktreeBadge(win) {
   if (!win?.worktreeBadge) return;
-  if (!worktree?.branch) {
-    win.worktreeBadge.className = 'session-window-worktree hidden';
-    win.worktreeBadge.textContent = '';
-    win.worktreeBadge.title = '';
-    return;
-  }
-  win.worktreeBadge.className = 'session-window-worktree';
-  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
-  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
-  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
-  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
-  if (worktree.baseBranch) {
-    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
-  }
-  win.worktreeBadge.title = lines.join('\n');
+  win.worktreeBadge.className = 'session-window-worktree hidden';
+  win.worktreeBadge.textContent = '';
+  win.worktreeBadge.title = '';
 }
 
 function updateSessionWindowMinimizeState(sessionId) {

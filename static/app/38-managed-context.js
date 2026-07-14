@@ -2029,6 +2029,16 @@ function applySessionIdentity(meta = {}) {
   } else if (sessionWindows.has(sid)) {
     updateSessionWindow(sid, next);
   }
+  // Vitals arrive keyed to the wrapper/log id (the git prober registers
+  // that id) and fan out through the identity group AS CACHED AT ARRIVAL.
+  // A window keyed by the backend-native id from birth (Codex announces
+  // its thread id before turn 1) therefore missed every vitals emission
+  // sent before this linkage landed — and, because the hub emits on
+  // change only, stayed chip-less until the next change. Re-fan now that
+  // the group is known.
+  if (typeof refanSessionVitalsForIdentityGroup === 'function') {
+    refanSessionVitalsForIdentityGroup(sid);
+  }
   persistSessionWindowState();
   updateTaskTargetChip();
   stationScheduleUpdate();
