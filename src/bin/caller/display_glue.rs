@@ -2125,7 +2125,10 @@ mod tests {
             ("c5".to_string(), serde_json::json!({"action": "input"})),
             // focus_clear is an ungated cleanup verb (CU-05): no region, no
             // display resolution, callable without any grant.
-            ("c6".to_string(), serde_json::json!({"action": "focus_clear"})),
+            (
+                "c6".to_string(),
+                serde_json::json!({"action": "focus_clear"}),
+            ),
         ];
         handle_shared_view_calls(
             &calls,
