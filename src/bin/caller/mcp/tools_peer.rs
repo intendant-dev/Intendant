@@ -114,6 +114,9 @@ impl IntendantServer {
                 params.coordinate_space,
                 params.observe.map(|mode| mode.label().to_string()),
                 params.annotate,
+                params
+                    .settle
+                    .and_then(|settle| serde_json::to_value(settle).ok()),
             )
             .await,
         ))
@@ -231,6 +234,7 @@ mod tests {
                     coordinate_space: None,
                     observe: None,
                     annotate: None,
+                    settle: None,
                 }))
                 .await
                 .unwrap();

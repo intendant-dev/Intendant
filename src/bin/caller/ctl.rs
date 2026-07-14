@@ -902,6 +902,7 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                     "--actions",
                     "--target",
                     "--observe",
+                    "--settle",
                     "--coordinate-space",
                     "--output",
                 ],
@@ -925,6 +926,12 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
             insert_string(&mut map, "observe", args.one("--observe"));
             if args.has("--annotate") {
                 map.insert("annotate".to_string(), Value::Bool(true));
+            }
+            if let Some(settle) = args.one("--settle") {
+                let cap_ms: u64 = settle.parse().map_err(|_| {
+                    format!("--settle expects a cap in milliseconds (max 5000), got '{settle}'")
+                })?;
+                map.insert("settle".to_string(), Value::from(cap_ms));
             }
             insert_string(&mut map, "coordinate_space", args.one("--coordinate-space"));
             let response =
@@ -2485,7 +2492,7 @@ const CU_ACTIONS_EXAMPLE: &str = r#"[{"type":"click","x":120,"y":260},{"type":"t
 fn help_cu() {
     println!(
         "Usage:\n\
-  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
@@ -2503,7 +2510,7 @@ If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
 
 fn help_cu_actions() {
     println!(
-        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--settle MS] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
 \n\
 {CU_ACTION_SHAPES}\n\
 \n\
@@ -2513,7 +2520,10 @@ Observation (--observe): what rides the result after the batch.\n\
   auto    element tree when usable, screenshot fallback\n\
   none    per-action results only\n\
 The result names the observation it carries and why. --annotate draws click\n\
-markers on captured screenshots (off by default: clean pixels).\n\
+markers on captured screenshots (off by default: clean pixels). --settle MS\n\
+waits (bounded by MS, max 5000) until the display stops changing for ~300ms\n\
+after the last input action, instead of a guessed wait — the result reports\n\
+settled / still_loading with the elapsed time.\n\
 \n\
 Example:\n\
   intendant ctl cu actions --actions '{CU_ACTIONS_EXAMPLE}' --output after.png"

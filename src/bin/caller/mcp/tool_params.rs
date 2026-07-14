@@ -583,6 +583,16 @@ pub struct ExecuteCuActionsParams {
     /// live. The disk artifact carries the same bytes as the returned image.
     #[serde(default)]
     pub annotate: Option<bool>,
+    /// Bounded UI-quiescence wait after the last input action, before the
+    /// observation — use instead of guessed wait actions after clicks that
+    /// trigger loading/animation. `true`: wait until the display stops
+    /// changing for ~300ms, up to 2s. A number sets the cap in ms (max
+    /// 5000). The result reports settled / still_loading (+ elapsed);
+    /// platforms without a damage signal run a fixed minimal wait and say
+    /// so. Default off (a plain 300ms freshness floor still applies to
+    /// captures).
+    #[serde(default)]
+    pub settle: Option<crate::computer_use::SettleParam>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -754,6 +764,11 @@ pub struct PeerExecuteCuActionsParams {
     /// default: clean pixels). Older peers ignore it.
     #[serde(default)]
     pub annotate: Option<bool>,
+    /// Bounded quiescence wait on the peer after its last input action:
+    /// `true` (default cap 2s) or a cap in ms (max 5000). Older peers
+    /// ignore it.
+    #[serde(default)]
+    pub settle: Option<crate::computer_use::SettleParam>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

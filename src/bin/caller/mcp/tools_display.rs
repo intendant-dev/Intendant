@@ -1105,7 +1105,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set settle=true (or a cap in ms, max 5000) to wait until the display stops changing after the last input action before observing — use it instead of guessed wait actions; the result reports settled/still_loading with elapsed ms. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     pub(crate) async fn execute_cu_actions(
         &self,
@@ -1189,6 +1189,7 @@ impl IntendantServer {
         let options = crate::computer_use::CuExecOptions {
             observe: params.observe.unwrap_or_default(),
             annotate: params.annotate.unwrap_or(false),
+            settle: params.settle.and_then(|s| s.resolve()),
         };
         let outcome = execute_actions(
             &actions,
@@ -1251,8 +1252,13 @@ impl IntendantServer {
             );
         }
 
-        // Name the observation the result carries and why — a fallback
-        // (`ax sparse → pixels`) must never be silent.
+        // Report the settle outcome (settled / still_loading / fixed wait +
+        // elapsed) when one ran, then name the observation the result
+        // carries and why — a fallback (`ax sparse → pixels`) must never be
+        // silent.
+        if let Some(settle) = &outcome.settle {
+            summaries.push(format!("settle: {}", settle.describe()));
+        }
         summaries.push(format!("observation: {}", outcome.observation.describe()));
 
         // Attach the trailing observation. Pixels: the executor already
@@ -1271,7 +1277,7 @@ impl IntendantServer {
             .await;
             summaries.push("post-action screenshot captured".to_string());
             if compact_output {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "status": if all_failed { "all actions failed" } else { "actions executed" },
                     "actions": summaries,
                     "observation": {
@@ -1282,6 +1288,7 @@ impl IntendantServer {
                     "width": ss.width,
                     "height": ss.height,
                 });
+                attach_settle_json(&mut payload, outcome.settle.as_ref());
                 return Ok(if all_failed {
                     compact_image_tool_error(payload, "image/png")
                 } else {
@@ -1297,7 +1304,7 @@ impl IntendantServer {
 
         if let Some(ax_text) = &outcome.observation.ax_text {
             if compact_output {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "status": if all_failed { "all actions failed" } else { "actions executed" },
                     "actions": summaries,
                     "observation": {
@@ -1306,6 +1313,7 @@ impl IntendantServer {
                     },
                     "elements": ax_text,
                 });
+                attach_settle_json(&mut payload, outcome.settle.as_ref());
                 return Ok(if all_failed {
                     text_tool_error(payload.to_string())
                 } else {
@@ -1544,6 +1552,31 @@ impl IntendantServer {
                 .unwrap_or_else(|_| format!("{:?}", la_result)),
             Err(e) => format!("Error: {}", e),
         }
+    }
+}
+
+/// Attach the structured settle block to a compact CU payload, when a settle
+/// ran: `{"outcome": "settled"|"still_loading"|"fixed_wait", "elapsed_ms": n,
+/// "note"?: "..."}`.
+fn attach_settle_json(
+    payload: &mut serde_json::Value,
+    settle: Option<&crate::computer_use::SettleReport>,
+) {
+    let Some(settle) = settle else { return };
+    let outcome = match settle.outcome {
+        crate::computer_use::SettleOutcome::Settled => "settled",
+        crate::computer_use::SettleOutcome::StillLoading => "still_loading",
+        crate::computer_use::SettleOutcome::FixedWait => "fixed_wait",
+    };
+    let mut block = serde_json::json!({
+        "outcome": outcome,
+        "elapsed_ms": settle.elapsed_ms,
+    });
+    if let Some(note) = &settle.note {
+        block["note"] = serde_json::Value::String(note.clone());
+    }
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("settle".to_string(), block);
     }
 }
 

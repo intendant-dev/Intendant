@@ -68,6 +68,10 @@ pub struct CuExecOptions {
     /// artifact alike — they are the same bytes). Default false: clean
     /// pixels; the live dashboard already overlays actions in real time.
     pub annotate: bool,
+    /// Bounded UI-quiescence wait, anchored at the last input action, run
+    /// before the batch's observation. `None` = off (the freshness floor
+    /// still applies to captures).
+    pub settle: Option<SettleRequest>,
 }
 
 // ── Observation result ───────────────────────────────────────────────────────
@@ -124,15 +128,18 @@ pub struct CuBatchMetrics {
     /// Approximate bytes of the observation attached to the result
     /// (PNG bytes for pixels, UTF-8 text bytes for ax).
     pub observation_bytes: usize,
+    /// Settle wait duration, when a settle ran.
+    pub settle_ms: Option<u64>,
 }
 
 /// Everything `execute_actions` produces for a batch: per-action results in
 /// order (possibly plus one trailing auto-screenshot result), the observation
-/// decision, and measurements.
+/// decision, the settle report (when requested), and measurements.
 #[derive(Debug)]
 pub struct CuBatchOutcome {
     pub results: Vec<crate::computer_use::CuActionResult>,
     pub observation: CuObservation,
+    pub settle: Option<SettleReport>,
     pub metrics: CuBatchMetrics,
 }
 
@@ -156,6 +163,9 @@ impl CuBatchOutcome {
             line.push_str(&format!(" ax_ms={ms}"));
         }
         line.push_str(&format!(" obs_bytes={}", self.metrics.observation_bytes));
+        if let Some(settle) = &self.settle {
+            line.push_str(&format!(" settle=[{}]", settle.describe()));
+        }
         line
     }
 }
@@ -266,6 +276,216 @@ async fn ax_walk(target: DisplayTarget) -> Result<(String, usize, u64), String> 
     let walk_ms = start.elapsed().as_millis() as u64;
     let nodes = snapshot_node_count(&snapshot);
     Ok((format_screen_elements(&snapshot), nodes, walk_ms))
+}
+
+// ── Settle: bounded UI quiescence ────────────────────────────────────────────
+
+/// Quiet window: the UI counts as settled once no display content change has
+/// been observed for this long. Matches the scale of the freshness floor
+/// (`FRESH_FRAME_TIMEOUT`) and sits between caret-blink half-periods
+/// (~500 ms), so a blinking cursor still finds a gap.
+pub const SETTLE_QUIET_WINDOW_MS: u64 = 300;
+/// Cap when the caller enables settle without a budget (`settle: true`).
+pub const SETTLE_DEFAULT_CAP_MS: u64 = 2_000;
+/// Hard ceiling for a caller-supplied cap.
+pub const SETTLE_MAX_CAP_MS: u64 = 5_000;
+
+/// Wire form of the `settle` parameter: `true`/`false`, or a cap in
+/// milliseconds. Bounded quiescence instead of model-authored sleeps.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum SettleParam {
+    /// `true` = settle with the default cap; `false` = off.
+    Enabled(bool),
+    /// Cap in milliseconds (clamped to [`SETTLE_MAX_CAP_MS`]; `0` = off).
+    CapMs(u64),
+}
+
+impl SettleParam {
+    /// Resolve the wire form to a request, or `None` when disabled.
+    pub fn resolve(self) -> Option<SettleRequest> {
+        let cap_ms = match self {
+            SettleParam::Enabled(false) => return None,
+            SettleParam::CapMs(0) => return None,
+            SettleParam::Enabled(true) => SETTLE_DEFAULT_CAP_MS,
+            SettleParam::CapMs(ms) => ms.clamp(SETTLE_QUIET_WINDOW_MS, SETTLE_MAX_CAP_MS),
+        };
+        Some(SettleRequest {
+            quiet: std::time::Duration::from_millis(SETTLE_QUIET_WINDOW_MS),
+            cap: std::time::Duration::from_millis(cap_ms),
+        })
+    }
+}
+
+/// A resolved settle request: wait for `quiet` of no display change, give up
+/// (and say so) at `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleRequest {
+    pub quiet: std::time::Duration,
+    pub cap: std::time::Duration,
+}
+
+/// How a settle wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// No display change for the quiet window — the UI is at rest.
+    Settled,
+    /// The display was still changing when the cap elapsed.
+    StillLoading,
+    /// No usable damage signal on this path (no live capture session, the
+    /// synthetic backend's free-running test card, or a capture stream that
+    /// ended mid-wait): a fixed minimal wait ran instead, honestly labeled.
+    FixedWait,
+}
+
+/// The settle result reported alongside the batch: outcome + elapsed, plus
+/// the reason when the damage signal was unavailable.
+#[derive(Debug, Clone)]
+pub struct SettleReport {
+    pub outcome: SettleOutcome,
+    pub elapsed_ms: u64,
+    pub quiet_ms: u64,
+    pub cap_ms: u64,
+    pub note: Option<String>,
+}
+
+impl SettleReport {
+    /// One-line description for tool output.
+    pub fn describe(&self) -> String {
+        match self.outcome {
+            SettleOutcome::Settled => format!(
+                "settled after {}ms (no display change for {}ms)",
+                self.elapsed_ms, self.quiet_ms
+            ),
+            SettleOutcome::StillLoading => format!(
+                "still_loading after {}ms (display still changing at the {}ms cap)",
+                self.elapsed_ms, self.cap_ms
+            ),
+            SettleOutcome::FixedWait => format!(
+                "fixed {}ms wait ({})",
+                self.elapsed_ms,
+                self.note.as_deref().unwrap_or("no damage signal")
+            ),
+        }
+    }
+}
+
+/// Fixed minimal wait for paths without a usable damage signal: sleep the
+/// quiet window and report it as exactly that.
+pub(crate) async fn settle_fixed_wait(req: SettleRequest, note: &str) -> SettleReport {
+    tokio::time::sleep(req.quiet).await;
+    SettleReport {
+        outcome: SettleOutcome::FixedWait,
+        elapsed_ms: req.quiet.as_millis() as u64,
+        quiet_ms: req.quiet.as_millis() as u64,
+        cap_ms: req.cap.as_millis() as u64,
+        note: Some(note.to_string()),
+    }
+}
+
+/// Settle against a live capture session's frame stream.
+///
+/// The synthetic test-card backend free-runs a changing counter strip, so it
+/// has no quiescence semantics — it degrades to the fixed wait (also what
+/// keeps the e2e suite deterministic).
+pub(crate) async fn settle_via_session(
+    session: &crate::display::DisplaySession,
+    baseline: std::time::Instant,
+    req: SettleRequest,
+) -> SettleReport {
+    if crate::display::synthetic::armed() {
+        return settle_fixed_wait(req, "synthetic display has no damage signal").await;
+    }
+    let frames = session.subscribe_frames();
+    let latest = session.latest_frame().await;
+    quiesce_frames(frames, latest, baseline, req).await
+}
+
+/// FNV-1a 64 over a frame's pixel bytes: the content fingerprint behind
+/// damage detection on polling backends (X11 re-delivers unchanged frames at
+/// the capture rate, so frame *arrival* is not change).
+fn frame_fingerprint(frame: &crate::display::Frame) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in &frame.data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Whether a received frame represents display change. Platform-native dirty
+/// rects win when present (ScreenCaptureKit); otherwise the frame's content
+/// fingerprint is compared against the previous one.
+fn frame_is_damage(frame: &crate::display::Frame, fingerprint: &mut Option<u64>) -> bool {
+    if let Some(rects) = &frame.dirty_rects {
+        return !rects.is_empty();
+    }
+    let fp = frame_fingerprint(frame);
+    let changed = *fingerprint != Some(fp);
+    *fingerprint = Some(fp);
+    changed
+}
+
+/// Core quiescence wait over a frame stream: returns once no damage has been
+/// observed for `req.quiet` (counted from `baseline`, the completion of the
+/// last input action), giving up at `req.cap`.
+///
+/// `latest` (the newest frame at subscribe time) seeds the content
+/// fingerprint so a polling backend's next unchanged re-delivery does not
+/// read as damage; damage timing itself starts at `baseline` — a change that
+/// landed before the subscription is already reflected in `latest`, and the
+/// quiet window then measures stability since the input.
+pub(crate) async fn quiesce_frames(
+    mut frames: tokio::sync::broadcast::Receiver<std::sync::Arc<crate::display::Frame>>,
+    latest: Option<std::sync::Arc<crate::display::Frame>>,
+    baseline: std::time::Instant,
+    req: SettleRequest,
+) -> SettleReport {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let started = std::time::Instant::now();
+    let mut fingerprint: Option<u64> = latest.as_ref().map(|f| frame_fingerprint(f));
+    let mut last_damage = baseline;
+    let cap_deadline = started + req.cap;
+    let report = |outcome: SettleOutcome, note: Option<String>| SettleReport {
+        outcome,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        quiet_ms: req.quiet.as_millis() as u64,
+        cap_ms: req.cap.as_millis() as u64,
+        note,
+    };
+
+    loop {
+        let now = std::time::Instant::now();
+        if now.duration_since(last_damage) >= req.quiet {
+            return report(SettleOutcome::Settled, None);
+        }
+        if now >= cap_deadline {
+            return report(SettleOutcome::StillLoading, None);
+        }
+        let sleep_until = (last_damage + req.quiet).min(cap_deadline);
+        tokio::select! {
+            recv = frames.recv() => match recv {
+                Ok(frame) => {
+                    if frame_is_damage(&frame, &mut fingerprint) {
+                        last_damage = frame.timestamp.max(last_damage);
+                    }
+                }
+                // Falling behind the ring means frames are flooding in —
+                // that IS activity; count it as damage now.
+                Err(RecvError::Lagged(_)) => last_damage = std::time::Instant::now(),
+                Err(RecvError::Closed) => {
+                    return report(
+                        SettleOutcome::FixedWait,
+                        Some("capture stream ended during settle".to_string()),
+                    );
+                }
+            },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(sleep_until)) => {}
+        }
+    }
 }
 
 // ── Synthetic element tree (mock display rigs) ──────────────────────────────
@@ -561,5 +781,150 @@ mod tests {
         assert_eq!(base.as_raw(), img.as_raw());
         let png = encode_rgba_png(&img).unwrap();
         assert_eq!(&png[1..4], b"PNG");
+    }
+
+    // ── Settle ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn settle_param_resolves_bool_number_and_clamps() {
+        assert!(SettleParam::Enabled(false).resolve().is_none());
+        assert!(SettleParam::CapMs(0).resolve().is_none());
+        let default = SettleParam::Enabled(true).resolve().unwrap();
+        assert_eq!(default.cap.as_millis() as u64, SETTLE_DEFAULT_CAP_MS);
+        assert_eq!(default.quiet.as_millis() as u64, SETTLE_QUIET_WINDOW_MS);
+        let clamped_up = SettleParam::CapMs(10).resolve().unwrap();
+        assert_eq!(clamped_up.cap.as_millis() as u64, SETTLE_QUIET_WINDOW_MS);
+        let clamped_down = SettleParam::CapMs(60_000).resolve().unwrap();
+        assert_eq!(clamped_down.cap.as_millis() as u64, SETTLE_MAX_CAP_MS);
+        let exact = SettleParam::CapMs(1234).resolve().unwrap();
+        assert_eq!(exact.cap.as_millis() as u64, 1234);
+        // Wire forms: bool and number both parse.
+        assert!(matches!(
+            serde_json::from_str::<SettleParam>("true").unwrap(),
+            SettleParam::Enabled(true)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SettleParam>("2500").unwrap(),
+            SettleParam::CapMs(2500)
+        ));
+    }
+
+    fn test_frame(
+        fill: u8,
+        dirty_rects: Option<Vec<crate::display::capture::damage::Rect>>,
+    ) -> std::sync::Arc<crate::display::Frame> {
+        std::sync::Arc::new(crate::display::Frame {
+            data: vec![fill; 2 * 2 * 4],
+            format: crate::display::FrameFormat::Bgra,
+            width: 2,
+            height: 2,
+            stride: 8,
+            timestamp: std::time::Instant::now(),
+            dirty_rects,
+        })
+    }
+
+    fn small_request() -> SettleRequest {
+        SettleRequest {
+            quiet: std::time::Duration::from_millis(80),
+            cap: std::time::Duration::from_millis(400),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_settles_when_nothing_changes() {
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let report = quiesce_frames(rx, None, std::time::Instant::now(), small_request()).await;
+        assert_eq!(report.outcome, SettleOutcome::Settled, "{report:?}");
+        assert!(
+            report.elapsed_ms < 400,
+            "static content must settle inside the cap: {report:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_reports_still_loading_while_content_keeps_changing() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let feeder = tokio::spawn(async move {
+            // Changing content every 25 ms, well past the 400 ms cap.
+            for i in 0..28u8 {
+                let _ = tx.send(test_frame(i, None));
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let report = quiesce_frames(rx, None, std::time::Instant::now(), small_request()).await;
+        feeder.abort();
+        assert_eq!(report.outcome, SettleOutcome::StillLoading, "{report:?}");
+        assert!(
+            report.elapsed_ms >= 350,
+            "still_loading must run to the cap: {report:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_ignores_polled_redeliveries_of_unchanged_content() {
+        // The X11 backend re-delivers unchanged frames at the capture rate:
+        // arrival is not damage. Seed the fingerprint with the same content
+        // the feeder repeats.
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let feeder = tokio::spawn(async move {
+            for _ in 0..28u8 {
+                let _ = tx.send(test_frame(42, None));
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let report = quiesce_frames(
+            rx,
+            Some(test_frame(42, None)),
+            std::time::Instant::now(),
+            small_request(),
+        )
+        .await;
+        feeder.abort();
+        assert_eq!(report.outcome, SettleOutcome::Settled, "{report:?}");
+        assert!(
+            report.elapsed_ms < 400,
+            "unchanged polling must settle inside the cap: {report:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_trusts_empty_native_dirty_rects() {
+        // Event-driven backends may deliver frames whose dirty rects are
+        // empty — explicitly not damage, even though the bytes differ.
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let feeder = tokio::spawn(async move {
+            for i in 0..28u8 {
+                let _ = tx.send(test_frame(i, Some(Vec::new())));
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let report = quiesce_frames(rx, None, std::time::Instant::now(), small_request()).await;
+        feeder.abort();
+        assert_eq!(report.outcome, SettleOutcome::Settled, "{report:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_reports_fixed_wait_when_the_stream_ends() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        drop(tx);
+        let report = quiesce_frames(rx, None, std::time::Instant::now(), small_request()).await;
+        assert_eq!(report.outcome, SettleOutcome::FixedWait, "{report:?}");
+        assert!(
+            report
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("capture stream ended"),
+            "{report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_fixed_wait_sleeps_the_quiet_window_and_says_why() {
+        let report = settle_fixed_wait(small_request(), "no live capture session").await;
+        assert_eq!(report.outcome, SettleOutcome::FixedWait);
+        assert_eq!(report.elapsed_ms, 80);
+        assert!(report.describe().contains("no live capture session"));
     }
 }

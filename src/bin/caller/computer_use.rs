@@ -69,6 +69,7 @@ pub use intendant_platform::DisplayTarget;
 // here so computer_use stays the CU vocabulary hub for callers.
 pub use crate::cu_observation::{
     CuBatchMetrics, CuBatchOutcome, CuExecOptions, CuObservation, CuObservationKind, ObserveMode,
+    SettleOutcome, SettleParam, SettleReport, SettleRequest,
 };
 
 // ── Action types ─────────────────────────────────────────────────────────────
@@ -877,6 +878,89 @@ pub fn summarize_results_for_model(actions: &[CuAction], results: &[CuActionResu
 
 // ── Executor ─────────────────────────────────────────────────────────────────
 
+/// Pending settle threaded through the executor: at most one settle runs per
+/// batch — at the first capture point that follows the batch's last-so-far
+/// input action (a leading screenshot *before* any input never consumes it),
+/// or at the shared observation tail. A damage-verified settle also clears
+/// `last_input_at`: the frame stream was watched past the input, so the
+/// capture's freshness wait would only re-wait for change that settle
+/// already ruled out or saw.
+struct SettleState {
+    request: Option<SettleRequest>,
+    batch_has_inputs: bool,
+    started: std::time::Instant,
+    report: Option<SettleReport>,
+}
+
+impl SettleState {
+    fn new(request: Option<SettleRequest>, actions: &[CuAction]) -> Self {
+        Self {
+            request,
+            batch_has_inputs: actions.iter().any(|a| {
+                !matches!(
+                    a,
+                    CuAction::Screenshot | CuAction::Zoom { .. } | CuAction::Wait { .. }
+                )
+            }),
+            started: std::time::Instant::now(),
+            report: None,
+        }
+    }
+
+    /// Settle before an in-batch capture action, when due: an input action
+    /// has already run, or the batch has no input actions at all (a
+    /// capture-only batch settles from call start — "shoot once quiet").
+    async fn before_capture(
+        &mut self,
+        session: Option<&crate::display::DisplaySession>,
+        last_input_at: &mut Option<std::time::Instant>,
+    ) {
+        if last_input_at.is_some() || !self.batch_has_inputs {
+            self.run(session, last_input_at).await;
+        }
+    }
+
+    /// Settle at the shared observation tail, when still pending.
+    async fn at_tail(
+        &mut self,
+        session: Option<&crate::display::DisplaySession>,
+        last_input_at: &mut Option<std::time::Instant>,
+    ) {
+        self.run(session, last_input_at).await;
+    }
+
+    async fn run(
+        &mut self,
+        session: Option<&crate::display::DisplaySession>,
+        last_input_at: &mut Option<std::time::Instant>,
+    ) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let baseline = last_input_at.unwrap_or(self.started);
+        let report = match session {
+            Some(session) => {
+                crate::cu_observation::settle_via_session(session, baseline, request).await
+            }
+            None => {
+                crate::cu_observation::settle_fixed_wait(
+                    request,
+                    "no live capture session — damage signal unavailable",
+                )
+                .await
+            }
+        };
+        // Damage-verified settles subsume the capture freshness wait.
+        if matches!(
+            report.outcome,
+            SettleOutcome::Settled | SettleOutcome::StillLoading
+        ) {
+            *last_input_at = None;
+        }
+        self.report = Some(report);
+    }
+}
+
 /// Trailing-observation capture strategy: how the executing backend path
 /// takes the post-batch screenshot when the observation plan wants pixels.
 enum TrailingCapture<'a> {
@@ -937,6 +1021,7 @@ pub async fn execute_actions(
                 reason: "user_session denied".to_string(),
                 ax_text: None,
             },
+            settle: None,
             metrics: CuBatchMetrics::default(),
         };
     }
@@ -960,12 +1045,16 @@ pub async fn execute_actions(
         Vec::new()
     };
 
+    // Bounded-quiescence state (options.settle): consumed by the first
+    // capture point after the last input action, or by the tail below.
+    let mut settle = SettleState::new(options.settle, actions);
+
     // Run the action loop on the backend-appropriate path. Both paths return
     // per-action results plus the completion time of the last input action;
     // the trailing observation is attached by the shared tail below.
     let display = target.display_env_string();
     let mut results: Vec<CuActionResult>;
-    let last_input_at: Option<std::time::Instant>;
+    let mut last_input_at: Option<std::time::Instant>;
     let session: Option<std::sync::Arc<crate::display::DisplaySession>>;
     let session_only = matches!(
         effective_backend,
@@ -987,6 +1076,7 @@ pub async fn execute_actions(
                     reason: "no capture session".to_string(),
                     ax_text: None,
                 },
+                settle: None,
                 metrics: CuBatchMetrics::default(),
             };
         };
@@ -999,6 +1089,7 @@ pub async fn execute_actions(
             observer,
             target,
             &marks,
+            &mut settle,
         )
         .await;
         results = r;
@@ -1020,6 +1111,7 @@ pub async fn execute_actions(
             denorm_ref,
             observer,
             &marks,
+            &mut settle,
         )
         .await;
         results = r;
@@ -1027,7 +1119,9 @@ pub async fn execute_actions(
         session = live;
     }
 
-    // Shared tail: resolve and attach the trailing observation.
+    // Shared tail: settle (when still pending), then resolve and attach the
+    // trailing observation — the AX walk and any capture read the settled UI.
+    settle.at_tail(session.as_deref(), &mut last_input_at).await;
     let mut metrics = CuBatchMetrics::default();
     let capture = if session_only {
         TrailingCapture::ViaSession(session.as_deref().expect("session checked above"))
@@ -1061,9 +1155,11 @@ pub async fn execute_actions(
         }
     }
 
+    metrics.settle_ms = settle.report.as_ref().map(|r| r.elapsed_ms);
     let outcome = CuBatchOutcome {
         results,
         observation,
+        settle: settle.report,
         metrics,
     };
     // Per-batch measurement line (daemon log): observation choice + costs.
@@ -1091,6 +1187,7 @@ async fn execute_actions_direct(
     denorm_ref: Option<(u32, u32)>,
     observer: Option<&CuActionObserver>,
     marks: &[(i32, i32)],
+    settle: &mut SettleState,
 ) -> (Vec<CuActionResult>, Option<std::time::Instant>) {
     // Coordinate reference for emitted action events: the denorm reference
     // when the caller supplied one, else the live session resolution.
@@ -1112,6 +1209,7 @@ async fn execute_actions_direct(
         let mut dispatched_ok: Option<bool> = None;
         let result = match action {
             CuAction::Screenshot => {
+                settle.before_capture(session, &mut last_input_at).await;
                 match capture_screenshot_preferring_session(
                     session,
                     last_input_at,
@@ -1133,6 +1231,7 @@ async fn execute_actions_direct(
                 width,
                 height,
             } => {
+                settle.before_capture(session, &mut last_input_at).await;
                 match capture_zoom_screenshot(
                     session,
                     last_input_at,
@@ -2824,6 +2923,7 @@ async fn execute_via_session(
     observer: Option<&CuActionObserver>,
     target: DisplayTarget,
     marks: &[(i32, i32)],
+    settle: &mut SettleState,
 ) -> (Vec<CuActionResult>, Option<std::time::Instant>) {
     let (width, height) = denorm_ref.unwrap_or_else(|| session.resolution());
     let mut results = Vec::with_capacity(actions.len());
@@ -2832,6 +2932,9 @@ async fn execute_via_session(
     for action in actions {
         match action {
             CuAction::Screenshot => {
+                settle
+                    .before_capture(Some(session), &mut last_input_at)
+                    .await;
                 let result = take_session_screenshot(
                     session,
                     screenshot_dir,
@@ -2853,6 +2956,9 @@ async fn execute_via_session(
                 // resize-drift-proof: if the live stream resolution differs
                 // from the resolution the model's coordinates are based on,
                 // the region scales along.
+                settle
+                    .before_capture(Some(session), &mut last_input_at)
+                    .await;
                 let capture = match last_input_at {
                     Some(ts) => session.fresh_frame(ts, FRESH_FRAME_TIMEOUT).await,
                     None => session.current_frame().await,
