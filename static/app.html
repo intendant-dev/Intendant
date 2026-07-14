@@ -28045,7 +28045,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '8ba99e0073c1bc32';
+const INTENDANT_APP_BUILD = '22fcab42c072bcd5';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -102489,6 +102489,14 @@ function handleDisplayRequestResolved(d) {
       // refocus) is not an entry — reopening there would undo an Esc/×
       // dismissal the user just made.
       if (e.relatedTarget instanceof Node && bar.contains(e.relatedTarget)) return;
+      // Focus landing on the target-switch chrome is retargeting intent,
+      // not composition — opening the peek under that popover just stacks
+      // two overlays (and made Esc close the hidden one first).
+      const tsw = document.getElementById('ui2-target-switch');
+      if (e.target instanceof Node && (
+        (tsw && tsw.contains(e.target)) ||
+        (e.target.id === 'task-target-switch-btn')
+      )) return;
       peekDismissed = false;
       peekOpen();
     });
@@ -102499,6 +102507,11 @@ function handleDisplayRequestResolved(d) {
     // closes the peek, the next one reaches the dock.
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !peekIsOpen()) return;
+      // Onion ordering: the target-switch popover is the innermost open
+      // surface — its own Esc handling closes it; consuming here would
+      // close the peek hidden BEHIND the popover instead.
+      const tsw = document.getElementById('ui2-target-switch');
+      if (tsw && !tsw.hidden) return;
       if (e.target instanceof Node && peekBarEl.contains(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();

@@ -264,6 +264,9 @@
     // A target materializing mid-turn is the first-message case: the send
     // happened before any session existed, so the phase edge fired with
     // nothing to show — open now that there is a transcript to watch.
+    // Same replay guard as the phase edge: rebinds driven by bootstrap
+    // replay are history, not a turn in flight.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
     if (PEEK_WORKING_CATS.has(peekLastPhaseCat) && !peekDismissed && !peekComposerPill()) {
       peekOpen();
     }
@@ -285,6 +288,10 @@
       return;
     }
     if (wasWorking || peekDismissed || peekIsOpen() || peekComposerPill()) return;
+    // Bootstrap replay re-drives historical phase edges through the
+    // mirror — auto-opening on those would pop the peek on every page
+    // load of a dashboard with any past task.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
     peekOpen();
   }
 
@@ -359,6 +366,12 @@
     });
   }
 
+  // Boot autofocus (and any other programmatic focus before the user has
+  // touched the page) must not open the peek — a sheet popping over the
+  // content on every load of a dashboard with history is a surprise, not
+  // an affordance. Focus counts as intent only after a real gesture.
+  let peekSawUserGesture = false;
+
   const peekWire = () => {
     const root = document.getElementById('ui2-composer-peek');
     const bar = root ? root.closest('.global-task-bar') : null;
@@ -367,12 +380,24 @@
     peekBarEl = bar;
     peekBuild(root);
 
+    document.addEventListener('pointerdown', () => { peekSawUserGesture = true; }, { capture: true, passive: true });
+    document.addEventListener('keydown', () => { peekSawUserGesture = true; }, { capture: true });
+
     bar.addEventListener('focusin', (e) => {
+      if (!peekSawUserGesture) return;
       if (peekIsOpen() || peekComposerPill()) return;
       // Focus moving WITHIN the dock (input → Send, the close button's
       // refocus) is not an entry — reopening there would undo an Esc/×
       // dismissal the user just made.
       if (e.relatedTarget instanceof Node && bar.contains(e.relatedTarget)) return;
+      // Focus landing on the target-switch chrome is retargeting intent,
+      // not composition — opening the peek under that popover just stacks
+      // two overlays (and made Esc close the hidden one first).
+      const tsw = document.getElementById('ui2-target-switch');
+      if (e.target instanceof Node && (
+        (tsw && tsw.contains(e.target)) ||
+        (e.target.id === 'task-target-switch-btn')
+      )) return;
       peekDismissed = false;
       peekOpen();
     });
@@ -383,6 +408,11 @@
     // closes the peek, the next one reaches the dock.
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !peekIsOpen()) return;
+      // Onion ordering: the target-switch popover is the innermost open
+      // surface — its own Esc handling closes it; consuming here would
+      // close the peek hidden BEHIND the popover instead.
+      const tsw = document.getElementById('ui2-target-switch');
+      if (tsw && !tsw.hidden) return;
       if (e.target instanceof Node && peekBarEl.contains(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();
