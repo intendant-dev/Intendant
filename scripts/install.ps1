@@ -31,7 +31,8 @@
     Stable daemon id at the rendezvous.
 
 .PARAMETER Ref
-    Pin the fresh clone to a tag, branch, or commit instead of the
+    Pin the fresh clone to a tag, branch, or commit. Default: the newest
+    published release tag (vX.Y.Z); only when no release exists yet, the
     default branch head.
 
 .PARAMETER Service
@@ -44,7 +45,7 @@
     Build and link only; print how to start it.
 
 .PARAMETER Repo
-    Git URL to clone (default: https://github.com/lovon-spec/intendant).
+    Git URL to clone (default: https://github.com/intendant-dev/Intendant).
 
 .PARAMETER InstallDir
     Checkout directory (default: $HOME\intendant).
@@ -57,7 +58,7 @@ param(
     [string]$Ref = "",
     [switch]$Service,
     [switch]$NoRun,
-    [string]$Repo = "https://github.com/lovon-spec/intendant",
+    [string]$Repo = "https://github.com/intendant-dev/Intendant",
     [string]$InstallDir = (Join-Path $HOME "intendant")
 )
 
@@ -83,6 +84,25 @@ if (Test-Path (Join-Path $InstallDir ".git")) {
     if ($Ref) { Fail "-Ref pins fresh clones only; $InstallDir already exists -- check out the ref there yourself." }
     Say "using existing checkout at $InstallDir (leaving it exactly as-is)"
 } else {
+    if (-not $Ref) {
+        # Default fresh installs to the newest published release tag
+        # (vX.Y.Z only -- pre-releases and peeled refs are filtered) so the
+        # served installer delivers an immutable, released tree. Falling
+        # back to the mutable default-branch head happens only while no
+        # release exists, and says so out loud. -Ref overrides either way.
+        $tagLines = git ls-remote --tags $Repo "v*"
+        if ($LASTEXITCODE -eq 0 -and $tagLines) {
+            $Ref = @($tagLines) |
+                ForEach-Object { if ($_ -match 'refs/tags/(v\d+\.\d+(\.\d+){0,2})$') { $Matches[1] } } |
+                Sort-Object { [version]$_.Substring(1) } |
+                Select-Object -Last 1
+        }
+        if ($Ref) {
+            Say "pinning to the latest release tag: $Ref (override with -Ref)"
+        } else {
+            Say "note: no release tags published yet -- installing the default branch head (mutable; pin with -Ref once releases exist)."
+        }
+    }
     Say "cloning $Repo -> $InstallDir"
     git clone --depth 1 $Repo $InstallDir
     if ($LASTEXITCODE -ne 0) { Fail "git clone failed" }
