@@ -1991,18 +1991,35 @@ async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
             )
             .await;
             assert!(output.status.success(), "{}", text_of(&output));
-            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+    };
+
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously, and on the session-only backends (Windows) a CU call
+    // racing past registration fails with the no-session guidance — same
+    // race as cu_actions_broadcast_display_scoped_events_over_ws, same
+    // remedy: retry the (idempotent) batch until its per-action result
+    // reports ok. On X11/macOS a `wait` needs no session, so the first
+    // attempt already passes there.
+    let text = {
+        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        loop {
+            let text = run("ax").await;
+            if text.contains("(wait 1ms): ok") {
+                break text;
+            }
             assert!(
-                text.contains("(wait 1ms): ok"),
-                "wait action must verify ({observe}):\n{text}"
+                tokio::time::Instant::now() < deadline,
+                "CU wait batch never succeeded (capture session still absent?):\n{text}\n{}",
+                daemon.log_tail()
             );
-            text
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
 
     // observe=ax: the element tree IS the observation — synthetic tree text
     // inline, no screenshot capture at all.
-    let text = run("ax").await;
     assert!(
         text.contains("observation: ax (observe=ax"),
         "result must name the ax observation:\n{text}"
@@ -2020,6 +2037,10 @@ async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
     // deterministically picks ax and says so.
     let text = run("auto").await;
     assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (auto):\n{text}"
+    );
+    assert!(
         text.contains("observation: ax (auto: ax usable ("),
         "auto must pick the usable tree and give the reason:\n{text}"
     );
@@ -2030,6 +2051,10 @@ async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
 
     // observe=none: results only.
     let text = run("none").await;
+    assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (none):\n{text}"
+    );
     assert!(
         text.contains("observation: none (observe=none)"),
         "none must be named:\n{text}"
