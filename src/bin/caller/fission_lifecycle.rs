@@ -226,17 +226,23 @@ fn read_group(log_dir: &Path, group_id: &str) -> io::Result<Option<(FissionGroup
 /// All writes go through [`fission_ledger::record_fission_observation`] /
 /// [`fission_ledger::update_branch_work`], so the ledger's sticky/terminal
 /// no-downgrade rules apply unchanged.
+///
+/// The watcher consumes the bus's lossless session-log lane, not the bounded
+/// broadcast ring: the ledger is durable state, and a terminal event dropped
+/// under `RecvError::Lagged` (a delta flood is enough to evict one) left the
+/// branch marked `running` forever and rehydrated it as such after restart.
+/// Every event this watcher folds — `DoneSignal`, `TaskComplete`,
+/// `Interrupted`, `SessionEnded`, `FileChanged` — is in the
+/// session-log subset, and the lane also spares the watcher the per-token
+/// `ModelResponseDelta` traffic the broadcast carries.
 pub fn spawn_fission_lifecycle_watcher(
-    mut rx: tokio::sync::broadcast::Receiver<crate::event::AppEvent>,
+    bus: &crate::event::EventBus,
 ) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe_session_log();
     tokio::spawn(async move {
         let mut state = LifecycleWatcherState::default();
-        loop {
-            match rx.recv().await {
-                Ok(event) => handle_lifecycle_event(&event, &mut state),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
+        while let Some(event) = rx.recv().await {
+            handle_lifecycle_event(&event, &mut state);
         }
     })
 }
@@ -587,6 +593,64 @@ mod tests {
             .find(|branch| branch.session_id == session)
             .cloned()
             .expect("branch")
+    }
+
+    #[tokio::test]
+    async fn watcher_terminal_status_survives_a_flooded_broadcast_ring() {
+        let dir = tempdir().unwrap();
+        let group_id = register_test_branch(
+            dir.path(),
+            "lw-parent-flood",
+            "lw-call-flood",
+            "lw-child-flood",
+        );
+        register_branch("lw-child-flood", &group_id, dir.path());
+
+        let bus = crate::event::EventBus::new();
+        let _watcher = spawn_fission_lifecycle_watcher(&bus);
+
+        // Bury the terminal event in delta traffic on both sides before the
+        // watcher gets a chance to run: the bounded broadcast ring (4096
+        // slots) evicts it, so a broadcast subscriber would only observe
+        // `Lagged` plus trailing deltas and the durable ledger would keep
+        // the branch `running` forever. The lossless lane must deliver it.
+        for _ in 0..10_000 {
+            bus.send(AppEvent::ModelResponseDelta {
+                session_id: Some("flood".to_string()),
+                text: "x".to_string(),
+            });
+        }
+        bus.send(AppEvent::DoneSignal {
+            session_id: Some("lw-child-flood".to_string()),
+            message: Some("flood survivor".to_string()),
+        });
+        for _ in 0..5_000 {
+            bus.send(AppEvent::ModelResponseDelta {
+                session_id: Some("flood".to_string()),
+                text: "x".to_string(),
+            });
+        }
+
+        let outcome = wait_for_branch_terminal(
+            dir.path(),
+            &group_id,
+            Some("lw-child-flood"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let WaitOutcome::Terminal(group) = outcome else {
+            panic!("branch did not reach a terminal status: {outcome:?}");
+        };
+        let branch = group
+            .branches
+            .iter()
+            .find(|branch| branch.session_id == "lw-child-flood")
+            .unwrap();
+        assert_eq!(branch.status, "completed");
+        assert_eq!(branch.summary.as_deref(), Some("flood survivor"));
+
+        drop_pending_deliveries(&[group_id]);
     }
 
     #[test]
