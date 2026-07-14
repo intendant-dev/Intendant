@@ -864,6 +864,55 @@ function ui2FuelChipSync() {
     + (best.kind ? ` (${best.kind})` : '') + '. Display only.';
 }
 
+function ui2WireComposerMech() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const root = document.documentElement.style;
+
+  // Reservation: keep --ui2-composer-h at the bar's real border-box height.
+  // The bar wraps and grows (focus expand, the attachments row, the v1
+  // 500-600px wrap band), and the old constant reservation is exactly what
+  // let it cover the Files save row and the Live control banner on phones.
+  const measure = () => {
+    const h = Math.ceil(bar.getBoundingClientRect().height);
+    if (h > 0) root.setProperty('--ui2-composer-h', h + 'px');
+  };
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(measure).observe(bar);
+  } else {
+    bar.addEventListener('focusin', () => requestAnimationFrame(measure));
+    bar.addEventListener('focusout', () => requestAnimationFrame(measure));
+    window.addEventListener('resize', measure);
+  }
+  measure();
+
+  // Soft-keyboard lift: iOS keeps position:fixed anchored to the layout
+  // viewport, so the opened keyboard covers the bar mid-composition. Track
+  // the visual viewport and lift by the overlap — but only while focus is
+  // inside the bar: lifting for other inputs (the Files editor, a settings
+  // field) would cover the very field being edited. Android resizes the
+  // layout viewport under the keyboard instead, so the overlap computes to
+  // ~0 there and this stays inert.
+  const vv = window.visualViewport;
+  if (vv) {
+    let raf = 0;
+    const apply = () => {
+      raf = 0;
+      const composing = bar.contains(document.activeElement);
+      const overlap = window.innerHeight - vv.height - vv.offsetTop;
+      const inset = composing ? Math.max(0, Math.round(overlap)) : 0;
+      root.setProperty('--ui2-kb-inset', inset + 'px');
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(apply); };
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+    bar.addEventListener('focusin', schedule);
+    // The keyboard retracts after focus leaves; measuring in the same frame
+    // reads the pre-retraction viewport.
+    bar.addEventListener('focusout', () => setTimeout(schedule, 80));
+  }
+}
+
 ui2BuildNav();
 {
   // Single-boot: a module script executes at readyState 'interactive', so
@@ -874,6 +923,7 @@ ui2BuildNav();
   const wire = () => {
     ui2WireMirrors();
     ui2WirePalette();
+    ui2WireComposerMech();
     // Fuel chip: transport-status flips repaint it via the existing
     // #sb-dashboard-transport mirror lane; the interval keeps the lease
     // countdown honest between flips.
