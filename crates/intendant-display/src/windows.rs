@@ -78,6 +78,11 @@
 //! 0" desktop) -- see the crate-level Windows-port notes.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
+
+/// How long the focused app gets to consume the clipboard after ctrl+v
+/// before the previous content is restored (paste is consumed while the app
+/// processes the chord; a lazy re-read afterwards sees the restored content).
+const PASTE_CONSUME_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 use async_trait::async_trait;
 use intendant_core::error::CallerError;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -583,17 +588,21 @@ impl DisplayBackend for WindowsBackend {
         Ok(())
     }
 
-    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    async fn paste_text(&self, text: &str) -> Result<super::PasteOutcome, CallerError> {
         // The OS hosts clipboard content on Windows (set-and-forget), so
-        // arboard needs no serving thread. The previous clipboard is not
-        // restored — Windows CU displays are agent-owned sessions.
+        // arboard needs no serving thread — which also makes the previous
+        // *text* content capturable for restore. Non-text content (images,
+        // files) is not readable through this path and cannot be restored.
         let owned = text.to_string();
-        tokio::task::spawn_blocking(move || {
+        let previous = tokio::task::spawn_blocking(move || {
             let mut clipboard = arboard::Clipboard::new()
                 .map_err(|e| CallerError::Display(format!("open clipboard: {e}")))?;
+            // Best-effort capture: Err covers empty and non-text alike.
+            let previous = clipboard.get_text().ok();
             clipboard
                 .set_text(owned)
-                .map_err(|e| CallerError::Display(format!("set clipboard text: {e}")))
+                .map_err(|e| CallerError::Display(format!("set clipboard text: {e}")))?;
+            Ok::<_, CallerError>(previous)
         })
         .await
         .map_err(|e| CallerError::Display(format!("clipboard task join: {e}")))??;
@@ -603,7 +612,46 @@ impl DisplayBackend for WindowsBackend {
         inject_vk(VK_V, false)?;
         inject_vk(VK_V, true)?;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        inject_vk(VK_CONTROL, true)
+        inject_vk(VK_CONTROL, true)?;
+
+        // Give the focused app time to consume the paste (it reads the
+        // clipboard while processing the chord), then restore. This bounds
+        // the honest race: an app that lazily re-reads the clipboard later
+        // sees the restored content.
+        tokio::time::sleep(PASTE_CONSUME_DELAY).await;
+        let clipboard_note = tokio::task::spawn_blocking(move || match previous {
+            Some(prev) => {
+                let restored = arboard::Clipboard::new().and_then(|mut c| c.set_text(prev));
+                match restored {
+                    Ok(()) => "clipboard: previous text restored after paste".to_string(),
+                    Err(e) => format!(
+                        "clipboard: restore failed ({e}); \
+                         the pasted text remains on the clipboard"
+                    ),
+                }
+            }
+            None => {
+                // Clearing beats leaving the pasted text behind; the
+                // unreadable previous content (if any) was already replaced
+                // by set_text above.
+                let cleared = arboard::Clipboard::new().and_then(|mut c| c.clear());
+                match cleared {
+                    Ok(()) => "clipboard: previous clipboard had no text \
+                         (empty or non-text); cleared after paste"
+                        .to_string(),
+                    Err(e) => format!(
+                        "clipboard: previous clipboard had no text and clearing \
+                         failed ({e}); the pasted text remains on the clipboard"
+                    ),
+                }
+            }
+        })
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard task join: {e}")))?;
+
+        Ok(super::PasteOutcome {
+            clipboard_note: Some(clipboard_note),
+        })
     }
 
     fn resolution(&self) -> (u32, u32) {

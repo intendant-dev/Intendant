@@ -23,8 +23,9 @@ and are converted to milliseconds (clamped to 30 s) at parse time.
 The full `CuAction` vocabulary (the same tagged JSON accepted by the MCP
 `execute_cu_actions` tool and `intendant ctl cu actions`):
 `click`, `double_click`, `triple_click`, `mouse_down`, `mouse_up`, `type`,
-`paste` (clipboard + paste chord — fast for long text; restores the previous
-clipboard text on the user's macOS session), `key`, `hold_key`, `scroll`,
+`paste` (clipboard + paste chord — fast for long text; previous clipboard
+text is restored where the platform allows, see "Action results" below),
+`key`, `hold_key`, `scroll`,
 `move_mouse`, `drag`, `screenshot`, `zoom` (region capture at the highest
 resolution the platform can supply — native 2x pixels on Retina), and `wait`.
 `intendant ctl cu actions --help` prints the per-action field shapes with an
@@ -50,9 +51,11 @@ the executor returns an actionable error naming the recovery path. X11 and
 macOS inject input directly — X11 uses a persistent `x11rb`/XTest connection
 with in-process root-window capture and clipboard support; macOS posts
 CoreGraphics `CGEvent`s in-process (no `cliclick`/`osascript` subprocesses; key
-chords use ANSI-US virtual keycodes, unicode typing is layout-independent) —
-and prefer the in-memory frame of a live capture session for screenshots,
-falling back to their platform capture paths when no session exists.
+chords and typed ASCII use ANSI-US virtual keycodes, characters with no
+ANSI-US key ride paced unicode-string events, and typed text is read back via
+AX where possible — see "Action results" below) — and prefer the in-memory
+frame of a live capture session for screenshots, falling back to their
+platform capture paths when no session exists.
 
 **Post-action freshness:** capture backends are damage-driven, so a screenshot
 taken right after an input action waits (bounded, 300 ms) for a frame captured
@@ -65,6 +68,52 @@ on HiDPI and under the Wayland portal, which reports its own stream size).
 `zoom` is the deliberate exception: on macOS it captures raw physical pixels
 (2x on Retina) and crops the requested logical region, because detail is the
 point.
+
+### Action results: dispatch vs. effect
+
+OS input APIs only confirm that events were *dispatched* — not that the
+target app acted on them — so every action result carries an honest status
+(`CuActionStatus`) instead of a bare boolean:
+
+- **`ok`** — the intended effect was verified: screenshots and zooms (the
+  captured bytes are the effect), `wait`, and `type` on the macOS user
+  session when the focused element's AX value was read back and contained
+  the typed text.
+- **`injected`** — events were dispatched to the OS but the effect was not
+  verified. This is the honest ceiling for clicks, keys, scrolls, drags, and
+  typing on backends without read-back; verify from the post-action
+  screenshot. A dispatched-but-ineffective action (a click that only
+  activated an inactive window, a chord swallowed by the wrong app) reports
+  `injected`, never `ok`.
+- **`failed`** — dispatch failed, or verification contradicted the intent: a
+  macOS `type` whose read-back does not contain the typed text returns
+  `failed` with expected-vs-observed evidence rather than pretending
+  success.
+
+Type read-back is bounded and best-effort (two AX reads of the focused
+element): multi-line/control text (Return may submit, Tab may move focus),
+secure fields, and elements without an AX-readable value stay `injected`
+with the reason in the result detail.
+
+**Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
+same proven event shape as `key`), newlines as Return and tabs as Tab;
+characters with no ANSI-US key are delivered as paced unicode-string events
+(≤ 20 UTF-16 units per event, payload on both keyDown and keyUp, surrogate
+pairs never split). This replaces the 2026-07-13 failure mode where
+back-to-back `CGEventKeyboardSetUnicodeString` chunks were silently dropped
+by the focused app while the action still reported success.
+
+**Clipboard hygiene (`paste`)**: paste routes through the system clipboard,
+so each backend restores what it can and reports what it did in the result
+detail. macOS captures the previous *text* clipboard (`pbpaste`) and
+restores it ~300 ms after the chord — non-text content (images) cannot be
+captured, so the clipboard is cleared rather than left holding the paste
+payload; Windows does the same via arboard. X11 and Wayland selections are
+pull-based (the target may fetch the payload after the chord returns), so
+restore would race the paste itself: the pasted text deliberately remains
+the active selection and the result detail says so. The restore delay is an
+honest race, not a guarantee — an app that lazily re-reads the clipboard
+later sees the restored content.
 
 ### Screen-capture permissions & signing identity (macOS)
 
