@@ -418,6 +418,19 @@ pub struct State {
     /// ordinal. A bump opens a NEW window; a zone-policy advance
     /// carries the old one (re-arms nothing).
     zone_windows: BTreeMap<([u8; 16], u64), u64>,
+    /// Accepted `m.audit` rows (§11.1/D-74): the partition registry.
+    audit_rows: Vec<AuditRow>,
+}
+
+/// One accepted audit row's partition facts (D-74/D-83).
+#[derive(Debug, Clone)]
+struct AuditRow {
+    read_id: [u8; 16],
+    principal_raw: Vec<u8>,
+    scope_raw: Vec<u8>,
+    index: u64,
+    count: u64,
+    result_ids: Vec<[u8; 32]>,
 }
 
 /// A held Signed `accept` receipt from aux — unvalidated until an
@@ -499,6 +512,16 @@ fn ok<T>(v: T) -> Result<T, Unimplemented> {
 
 fn b16_field(n: &Node, key: &str) -> Option<[u8; 16]> {
     n.get(key)?.bytes_n::<16>()
+}
+
+/// Exact key-SET equality (canonical order is the reader's proof).
+fn keys_are_map(n: &Node, want: &[&str]) -> bool {
+    n.map_keys().is_some_and(|mut k| {
+        k.sort_unstable();
+        let mut w = want.to_vec();
+        w.sort_unstable();
+        k == w
+    })
 }
 
 impl State {
@@ -2664,6 +2687,15 @@ impl State {
         Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")))
     }
 
+    /// The final audit-partition chunk table — (index, count) pairs
+    /// in index order (the audit-partition lane's assertion).
+    pub(crate) fn audit_chunks(&self) -> Vec<(u64, u64)> {
+        let mut chunks: Vec<(u64, u64)> =
+            self.audit_rows.iter().map(|r| (r.index, r.count)).collect();
+        chunks.sort_unstable();
+        chunks
+    }
+
     /// The walkthrough probe registry (register #17: fixture-named
     /// canonical CBOR of the derived construct).
     pub fn probe(&self, name: &str) -> Option<Vec<u8>> {
@@ -3307,6 +3339,128 @@ impl State {
     /// relation (supersede only on workflow spaces). Counting toward
     /// status is the SEPARATE §11.2 policy question — an admitted
     /// judgment may be recorded and never status-changing.
+    /// `m.audit` (§11.1, D-74/D-83): a SERVICE actor attested by the
+    /// writing device's own certificate appends partition rows on
+    /// the audit space — one read = one `read_id`, one principal,
+    /// one canonical scope, one zone; chunk indexes exactly
+    /// `0..count−1` with disjoint result sets.
+    fn admit_audit(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        let grant = match self.tenant_preamble(op, "audit.write")? {
+            Ok(g) => g,
+            Err(v) => return ok(Err(v)),
+        };
+        let h = &op.header;
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        // Row-level actor rules: service kind, attested by the
+        // writing device's OWN certificate; space class audit.
+        let Proof::Dev { cert, .. } = h.proof else {
+            return ok(Err(Verdict::Rejected("proof-arm", "reject-permanent")));
+        };
+        if h.actor_kind != "service" || h.attested_by != Some(cert) {
+            return ok(Err(bad()));
+        }
+        if !self
+            .spaces
+            .iter()
+            .any(|s| s.space_id == h.space_id && s.space_class == "audit")
+        {
+            return ok(Err(bad()));
+        }
+        let body = &op.body;
+        if !keys_are_map(
+            body,
+            &[
+                "principal",
+                "read_id",
+                "chunk",
+                "scope",
+                "result_ids",
+                "at_ms",
+            ],
+        ) {
+            return ok(Err(bad()));
+        }
+        // Typed principal: one of the five closed auditprin shapes.
+        let Some(principal) = body.get("principal") else {
+            return ok(Err(bad()));
+        };
+        let legal_principal = keys_are_map(principal, &["shape", "device"])
+            || keys_are_map(principal, &["shape", "device", "session"])
+            || keys_are_map(principal, &["shape", "token_hash"])
+            || keys_are_map(principal, &["shape", "kind", "peer"])
+            || keys_are_map(principal, &["shape", "kind", "peer", "token_hash"])
+            || keys_are_map(principal, &["shape", "kind", "session", "token_hash"]);
+        if !legal_principal {
+            return ok(Err(bad()));
+        }
+        let (Some(read_id), Some(chunk), Some(scope), Some(at)) = (
+            body.get("read_id").and_then(|n| n.bytes_n::<16>()),
+            body.get("chunk"),
+            body.get("scope"),
+            body.get("at_ms").and_then(|n| n.as_uint()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        let _ = at; // diagnostic local time — never authority (D-64)
+        let (Some(index), Some(count)) = (
+            chunk.get("index").and_then(|n| n.as_uint()),
+            chunk.get("count").and_then(|n| n.as_uint()),
+        ) else {
+            return ok(Err(bad()));
+        };
+        // Indexes exactly 0..count−1.
+        if count == 0 || index >= count {
+            return ok(Err(bad()));
+        }
+        // One read = one zone; spaces a bounded set (≤ 64).
+        if scope.get("zone").and_then(|n| n.bytes_n::<16>()).is_none() {
+            return ok(Err(bad()));
+        }
+        let Some(spaces) = scope.get("spaces").and_then(|n| n.as_array()) else {
+            return ok(Err(bad()));
+        };
+        if spaces.is_empty() || spaces.len() > 64 {
+            return ok(Err(bad()));
+        }
+        let mut result_ids = Vec::new();
+        for r in body
+            .get("result_ids")
+            .and_then(|n| n.as_array())
+            .unwrap_or(&[])
+        {
+            let Some(id) = r.bytes_n::<32>() else {
+                return ok(Err(bad()));
+            };
+            result_ids.push(id);
+        }
+        // The partition invariants against the read's HELD rows:
+        // shared principal/scope/count, fresh index, disjoint sets.
+        let principal_raw = principal.raw.to_vec();
+        let scope_raw = scope.raw.to_vec();
+        for held in self.audit_rows.iter().filter(|r| r.read_id == read_id) {
+            if held.principal_raw != principal_raw
+                || held.scope_raw != scope_raw
+                || held.count != count
+                || held.index == index
+                || held.result_ids.iter().any(|r| result_ids.contains(r))
+            {
+                return ok(Err(bad()));
+            }
+        }
+
+        // Accept.
+        self.record_tenant(op, &grant, None, None, None, None);
+        self.audit_rows.push(AuditRow {
+            read_id,
+            principal_raw,
+            scope_raw,
+            index,
+            count,
+            result_ids,
+        });
+        ok(Ok(()))
+    }
+
     fn admit_judge(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
         // Resolve the citations first (the verb decision needs the
         // grant AND the target).
@@ -3648,6 +3802,7 @@ impl State {
             "c.recovery_succession" => self.admit_recovery(op),
             "c.drill" => self.admit_drill(op),
             "m.claim" => self.admit_claim(op),
+            "m.audit" => self.admit_audit(op),
             "m.judge" => self.admit_judge(op),
             "m.export.release" => self.admit_release(op),
             "m.import.claim" => self.admit_import(op),

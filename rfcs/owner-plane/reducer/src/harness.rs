@@ -185,6 +185,7 @@ fn run_semantics(vector: &Json) -> SemStatus {
         "journal-replay" => run_journal_vector(vector),
         "export-import" => run_export_import(vector),
         "status-derive" => run_status_derive(vector),
+        "audit-partition" => run_audit_partition(vector),
         "edge-admission" => crate::edge::edge_admission(vector),
         "frame-roundtrip" => crate::edge::frame_roundtrip(vector),
         "corruption-negative" => crate::edge::corruption_negative(vector),
@@ -516,6 +517,85 @@ fn parse_aux(vector: &Json) -> Result<std::collections::BTreeMap<String, Vec<u8>
     Ok(aux)
 }
 
+/// The audit-partition lane (§11.1/D-74): every delivered item must
+/// finally ADMIT (the contract carries no per_item rows — one read
+/// per vector by corpus convention), and the reducer's derived chunk
+/// table must equal the expected `(index, count)` rows in index
+/// order.
+fn run_audit_partition(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let aux = parse_aux(vector)?;
+    let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?
+        .iter()
+        .map(|d| {
+            d.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or("delivery not an array")
+        })
+        .collect::<Result<_, _>>()?;
+    let mut runs = Vec::new();
+    for order in &deliveries {
+        match crate::fold::run_delivery_full(&items, &aux, order) {
+            Ok((run, _)) => runs.push(run),
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+        }
+    }
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let (fresh, state) = match crate::fold::run_delivery_full(&items, &aux, &fresh_order) {
+        Ok(v) => v,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    for (i, run) in runs.iter().enumerate() {
+        if run.final_verdicts != fresh.final_verdicts {
+            return Ok(SemStatus::Fail(format!(
+                "delivery {i} final state diverges from the fresh fold"
+            )));
+        }
+    }
+    for (name, v) in &fresh.final_verdicts {
+        if v.pair().is_some() {
+            return Ok(SemStatus::Fail(format!(
+                "{name}: audit-partition items must all admit, got {:?}",
+                v.pair()
+            )));
+        }
+    }
+    let want: Vec<(u64, u64)> = vector["expected"]["result"]["chunks"]
+        .as_array()
+        .ok_or("result.chunks")?
+        .iter()
+        .map(|c| {
+            Ok((
+                c["index"].as_u64().ok_or("chunk.index")?,
+                c["count"].as_u64().ok_or("chunk.count")?,
+            ))
+        })
+        .collect::<Result<_, &str>>()?;
+    let got = state.audit_chunks();
+    if got != want {
+        return Ok(SemStatus::Fail(format!(
+            "chunks: expected {want:?}, reducer derived {got:?}"
+        )));
+    }
+    Ok(SemStatus::Pass)
+}
+
 /// The walkthrough lane: a fold vector with REQUIRED state_probes —
 /// fold semantics first, then each probe against the fresh-fold
 /// final state's registry (exact names, canonical-byte equality).
@@ -752,8 +832,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            128,
-            "the tranche plus the corpus through the budgets slice"
+            131,
+            "the tranche plus the corpus through the audit-partition slice"
         );
         for r in &reports {
             assert!(

@@ -226,6 +226,9 @@ pub struct TenantOverrides {
     pub actor_id: Option<String>,
     pub capability_epoch: u64,
     pub authored_kek_epoch: u64,
+    /// `actor.attested_by` — the audit rows attest by the writing
+    /// device's own certificate (§11.1 m.audit).
+    pub attested_by: Option<Bytes32>,
 }
 
 impl Default for TenantOverrides {
@@ -234,6 +237,7 @@ impl Default for TenantOverrides {
             actor_id: None,
             capability_epoch: 1,
             authored_kek_epoch: 1,
+            attested_by: None,
         }
     }
 }
@@ -254,6 +258,7 @@ pub struct PlaneRig {
     ctrl_head: Bytes32,
     pub dev1: Device,
     pub genesis_grant: Grant,
+    pub genesis_audit_grant: Grant,
     pub genesis_wrap: Kekwrap,
     pub genesis_op: Signedop,
 }
@@ -359,6 +364,7 @@ impl PlaneRig {
             ops: vec![Verb::AuditWrite],
             ..grant.clone()
         };
+        let genesis_audit_grant = audit_grant.clone();
 
         let body = Cgenesis {
             descriptor,
@@ -442,6 +448,7 @@ impl PlaneRig {
             ctrl_head,
             dev1,
             genesis_grant: grant,
+            genesis_audit_grant,
             genesis_wrap: wrap1,
             genesis_op,
         }
@@ -933,7 +940,7 @@ impl PlaneRig {
             actor: Actor {
                 kind: actor_kind,
                 id: over.actor_id.unwrap_or_else(|| hex(&dev.device_id)),
-                attested_by: None,
+                attested_by: over.attested_by,
             },
             authorization_proof: Authproof::Dev {
                 cert: h_cert(&dev.cert),
@@ -1066,6 +1073,38 @@ impl PlaneRig {
             writer_sequence,
             previous_writer_hash,
             over,
+        )
+    }
+
+    /// An `m.audit` row (§11.1): SERVICE actor attested by the
+    /// writing device's own certificate, on the audit space, under
+    /// the audit grant.
+    pub fn audit_row(
+        &mut self,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        body: crate::shapes::memory::Maudit,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
+        let (zone_id, audit_space) = (self.zone_id, self.audit_space);
+        let attested = h_cert(&dev.cert);
+        self.tenant_op_over(
+            zone_id,
+            audit_space,
+            ActorKind::Service,
+            dev,
+            grant,
+            tag,
+            crate::shapes::memory::Maudit::OP_TYPE,
+            body.to_value(),
+            writer_sequence,
+            previous_writer_hash,
+            TenantOverrides {
+                attested_by: Some(attested),
+                ..TenantOverrides::default()
+            },
         )
     }
 

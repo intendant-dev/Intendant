@@ -191,6 +191,7 @@ fn deadline_arc(name: &str, online_lease: bool) -> DeadlineArc {
             actor_id: None,
             capability_epoch: 2,
             authored_kek_epoch: 1,
+            attested_by: None,
         },
     );
     let addr = claim_addr(&rig, &i);
