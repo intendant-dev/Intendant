@@ -19,6 +19,7 @@ pub mod domains;
 pub mod keyschedule;
 pub mod outcomes;
 pub mod rng;
+pub mod scenario;
 pub mod shapes;
 pub mod suite;
 pub mod vector;
