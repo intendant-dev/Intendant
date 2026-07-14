@@ -162,12 +162,96 @@ pub fn f11_audit_chunk_index_out_of_range() -> Vector {
     )
 }
 
-pub fn corpus_audit() -> Vec<Vector> {
+/// One D-74 partition-conflict negative: a base row admits, the
+/// conflicting row `(body-invariant, reject-permanent)` — the chain
+/// orders the pair, so arrival order cannot flip the winner.
+fn partition_conflict(
+    name: &'static str,
+    vector_name: &'static str,
+    build_conflict: impl FnOnce(&mut PlaneRig, [u8; 16], [u8; 32], [u8; 32]) -> Maudit,
+) -> Vector {
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "the base row audits this claim", 1, None);
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 2, vec![i1.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 2, Some(i1.op_hash()));
+    let bx = build_conflict(&mut rig, read_id, i1.op_hash(), a0.op_hash());
+    let ax = rig.audit_row(&d1, &ga, "ax", bx, 3, Some(a0.op_hash()));
+    let c1 = rig.genesis_op.clone();
+    audit_vector(
+        vector_name,
+        "fold",
+        rig,
+        &[("c1", &c1), ("i1", &i1), ("a0", &a0), ("ax", &ax)],
+        json!({
+            "per_item": [
+                { "item": "a0" },
+                { "item": "ax", "outcome": "body-invariant", "disposition": "reject-permanent" },
+                { "item": "c1" },
+                { "item": "i1" },
+            ],
+            "converge": true,
+        }),
+    )
+}
+
+/// D-74 negatives: each partition invariant violated once.
+pub fn f11_audit_conflicts() -> Vec<Vector> {
     vec![
+        partition_conflict(
+            "f11-audit-dup-index",
+            "audit-duplicate-chunk-index",
+            |rig, read_id, _i1, _| {
+                // index 0 again (empty result set — only the index
+                // collides).
+                row_body(rig, read_id, 0, 2, vec![])
+            },
+        ),
+        partition_conflict(
+            "f11-audit-principal",
+            "audit-changed-principal",
+            |rig, read_id, _i1, _| {
+                let mut b = row_body(rig, read_id, 1, 2, vec![]);
+                b.principal = Auditprin::DeviceSession {
+                    device: rig.dev1.device_id,
+                    session: "s-1".into(),
+                };
+                b
+            },
+        ),
+        partition_conflict(
+            "f11-audit-scope",
+            "audit-changed-scope",
+            |rig, read_id, _i1, _| {
+                let mut b = row_body(rig, read_id, 1, 2, vec![]);
+                b.scope_spaces = vec![rig.home_space, rig.audit_space];
+                b
+            },
+        ),
+        partition_conflict(
+            "f11-audit-count",
+            "audit-changed-count",
+            |rig, read_id, _i1, _| row_body(rig, read_id, 1, 3, vec![]),
+        ),
+        partition_conflict(
+            "f11-audit-overlap",
+            "audit-overlapping-result-sets",
+            |rig, read_id, i1, _| row_body(rig, read_id, 1, 2, vec![i1]),
+        ),
+    ]
+}
+
+pub fn corpus_audit() -> Vec<Vector> {
+    let mut out = vec![
         f11_audit_partition_two_chunks(),
         f11_audit_zero_result_single_chunk(),
         f11_audit_chunk_index_out_of_range(),
-    ]
+    ];
+    out.extend(f11_audit_conflicts());
+    out
 }
 
 #[cfg(test)]

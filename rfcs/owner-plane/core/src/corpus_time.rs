@@ -404,6 +404,56 @@ fn grant_id_of(grant_op: &Signedop) -> [u8; 16] {
         .expect("grant_id field")
 }
 
+/// A valid lease held but NO receipt at all: still awaiting
+/// evidence — (lease-missing, pending-dependency), never stale.
+pub fn f9_lease_present_no_receipt_pends() -> Vector {
+    let mut a = deadline_arc("f9-lease-no-receipt", true);
+    let gid = grant_id_of(&a.ops[3].1);
+    let (d2, lineage) = (a.d2.clone(), a.d1.lineage);
+    let lease = a
+        .rig
+        .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 86_400_000);
+    let aux = [
+        ("index", index_aux(&[(a.addr, a.claim_hash)])),
+        ("lease.d2", lease.encode()),
+    ];
+    let per_item = rows(&a.ops, Some(("lease-missing", "pending-dependency")));
+    time_vector(
+        "lease-present-no-receipt-pends",
+        a.rig,
+        &refs(&a.ops),
+        &aux,
+        per_item,
+    )
+}
+
+/// A lease whose window exceeds `max_age_ms` is not a valid lease
+/// (T5): with an otherwise in-window receipt held, the claim stays
+/// (lease-missing, pending-dependency).
+pub fn f9_lease_overlong_window_invalid() -> Vector {
+    let mut a = deadline_arc("f9-lease-overlong", true);
+    let gid = grant_id_of(&a.ops[3].1);
+    let (d2, lineage, addr) = (a.d2.clone(), a.d1.lineage, a.addr);
+    // Window = 3 days > max_age 2 days.
+    let lease = a
+        .rig
+        .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 3 * 86_400_000);
+    let rcpt = a.rig.accept_receipt(&d2, addr, T0_MS + 43_200_000);
+    let aux = [
+        ("index", index_aux(&[(a.addr, a.claim_hash)])),
+        ("lease.d2", lease.encode()),
+        ("receipt.accept.d2", rcpt.encode()),
+    ];
+    let per_item = rows(&a.ops, Some(("lease-missing", "pending-dependency")));
+    time_vector(
+        "lease-overlong-window-invalid",
+        a.rig,
+        &refs(&a.ops),
+        &aux,
+        per_item,
+    )
+}
+
 pub fn corpus_time() -> Vec<Vector> {
     vec![
         f9_deadline_receipted_admits(),
@@ -413,6 +463,8 @@ pub fn corpus_time() -> Vec<Vector> {
         f9_lease_online_grant_admits(),
         f9_lease_missing_pends(),
         f9_lease_stale_quarantines(),
+        f9_lease_present_no_receipt_pends(),
+        f9_lease_overlong_window_invalid(),
     ]
 }
 

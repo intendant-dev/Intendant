@@ -891,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            131,
-            "the tranche plus the corpus through the audit-partition slice"
+            138,
+            "the corpus through the repair tranche's D5/D9 negatives"
         );
         for r in &reports {
             assert!(
