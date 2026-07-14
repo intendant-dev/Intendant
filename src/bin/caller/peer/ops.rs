@@ -149,7 +149,7 @@ impl PeerToolOutput {
 
 /// Fold a peer `/mcp` reply into [`PeerToolOutput`]. Tool-level
 /// failures keep their images (a partially failed CU batch still
-/// attaches the annotated post-action screenshot) but wrap the peer's
+/// attaches its post-action screenshot) but wrap the peer's
 /// diagnostic in the `{"ok": false, ...}` envelope so every surface
 /// reports errors the same way.
 fn peer_tool_output(result: Result<PeerToolReply, String>) -> PeerToolOutput {
@@ -223,14 +223,17 @@ pub async fn take_screenshot(
 /// `execute_cu_actions`, DisplayInput-gated peer-side — only the
 /// peer-operator and peer-root profiles hold it). `actions` is passed
 /// through verbatim in the peer's own `CuAction` vocabulary; the
-/// reply text carries per-action status and the annotated post-action
-/// screenshot rides `images`.
+/// reply text carries per-action status plus the observation the peer
+/// chose (a post-action screenshot rides `images` by default; `observe`
+/// forwards the peer's ax/auto/none policies, which older peers ignore).
 pub async fn execute_cu_actions(
     registry: Option<&PeerRegistry>,
     peer_id: &str,
     actions: serde_json::Value,
     display_target: Option<String>,
     coordinate_space: Option<String>,
+    observe: Option<String>,
+    annotate: Option<bool>,
 ) -> PeerToolOutput {
     let handle = match peer_handle(registry, peer_id) {
         Ok(handle) => handle,
@@ -243,6 +246,12 @@ pub async fn execute_cu_actions(
     }
     if let Some(space) = coordinate_space {
         arguments.insert("coordinate_space".into(), space.into());
+    }
+    if let Some(observe) = observe {
+        arguments.insert("observe".into(), observe.into());
+    }
+    if let Some(annotate) = annotate {
+        arguments.insert("annotate".into(), annotate.into());
     }
     peer_tool_output(
         mcp_http::call_peer_mcp_tool(

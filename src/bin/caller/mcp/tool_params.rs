@@ -568,6 +568,21 @@ pub struct ExecuteCuActionsParams {
     /// if the model outputs coordinates on a 0-1000 grid (e.g. Gemini CU).
     #[serde(default)]
     pub coordinate_space: Option<String>,
+    /// Post-action observation policy. "pixels" (default): attach the
+    /// post-action screenshot. "ax": attach the frontmost UI element tree
+    /// instead — a few hundred tokens instead of an image; user-session
+    /// targets only. "auto": element tree when usable, screenshot fallback.
+    /// "none": per-action results only. The result names the observation it
+    /// carries and why. An explicit trailing screenshot/zoom action always
+    /// returns its pixels.
+    #[serde(default)]
+    pub observe: Option<crate::computer_use::ObserveMode>,
+    /// Draw click markers (crosshairs at click coordinates) on captured
+    /// screenshots. Default false: screenshots are clean — markers obscure
+    /// the controls being verified; the dashboard already overlays actions
+    /// live. The disk artifact carries the same bytes as the returned image.
+    #[serde(default)]
+    pub annotate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -730,6 +745,15 @@ pub struct PeerExecuteCuActionsParams {
     /// a 0-1000 grid.
     #[serde(default)]
     pub coordinate_space: Option<String>,
+    /// Post-action observation policy, forwarded to the peer's
+    /// execute_cu_actions: "pixels" (default), "ax", "auto", or "none".
+    /// Older peers ignore it and return pixels.
+    #[serde(default)]
+    pub observe: Option<crate::computer_use::ObserveMode>,
+    /// Draw click markers on the peer's captured screenshot (off by
+    /// default: clean pixels). Older peers ignore it.
+    #[serde(default)]
+    pub annotate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -283,6 +283,53 @@ unknown counts as **not ready** (fail closed). Surfaces:
   `os_readiness` gap block naming any still-blocked OS layers, so a granted
   request can never masquerade as a CU-ready one.
 
+### Observation Policy (`observe`)
+
+Every `execute_cu_actions` batch ends with a **trailing observation**, and
+what that observation is is a per-call policy (`observe` param;
+`src/bin/caller/cu_observation.rs`), not an unconditional screenshot:
+
+- **`pixels`** (default) — the historical behavior: a post-action screenshot
+  is captured and appended as one extra result. The default stays `pixels`
+  because the tool description and the native `peer cu` guidance promise a
+  screenshot; token-sensitive callers opt in to the cheaper modes (managed
+  Codex's developer instructions teach `observe:"auto"`).
+- **`ax`** — the frontmost element tree (the `read_screen` walk, same central
+  text caps) is attached as text *instead of* pixels: a few hundred tokens
+  versus ~1.5k image tokens, and no capture/encode work at all. User-session
+  targets only (element trees exist nowhere else); a failed walk reports the
+  error as the observation rather than silently substituting an image.
+- **`auto`** — `ax` when the frontmost tree is usable (≥
+  `cu_observation::AX_AUTO_MIN_NODES` nodes), `pixels` otherwise (sparse
+  tree, walk error, virtual-display target).
+- **`none`** — per-action results only, for callers chaining batches that
+  will observe once at the end.
+
+The result always **names the observation it carries and why**
+(`observation: pixels (auto: ax sparse (2 nodes) → pixels)`), so a fallback
+is never silent. Two invariants regardless of mode: an explicit trailing
+`screenshot`/`zoom` action always returns its pixels (the action *is* the
+request), and the managed-context compact contract is preserved — path +
+metadata, no inline image bytes — with `ax`/`auto` the compact caller gets
+the element tree **inline**, which is the first time the managed path
+carries an actual observation instead of a path to fetch.
+
+**Screenshots are clean by default, encoded once.** Click markers
+(crosshairs at click coordinates) are opt-in via `annotate: true` — baked-in
+markers obscured the very controls being verified (e2e finding CU-06), and
+the dashboard Live tab already overlays actions in real time. Annotation is
+drawn on the raw frame *before* the single PNG encode; the historical
+pipeline (capture → encode → decode → draw → re-encode → rewrite the disk
+artifact) is gone, and the disk artifact now always carries the same bytes
+as the model payload. That parity is deliberate: the artifact's remaining
+reader is the managed-Codex `view_image` path (the Activity-tab
+disk-substitution consumer was retired with the Gemini CLI backend), which
+wants exactly what the model would have seen — including, on macOS, the
+logical-size (not raw-Retina) image that CU coordinates map to. Each batch
+logs a `[cu]` measurement line (observation kind/reason, capture+encode ms,
+AX walk ms, observation bytes) to the daemon log, and the native loop logs
+the same line into the session log.
+
 ### Three separate concepts: private view, agent share, presence streaming
 
 Putting the user's screen on the wire means one of three deliberately

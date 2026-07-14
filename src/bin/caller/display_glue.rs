@@ -1392,7 +1392,9 @@ pub(crate) async fn run_cu_task(
                     ))
                 });
 
-                let results = computer_use::execute_actions(
+                // Provider CU protocols expect a screenshot in every result:
+                // the native loop always observes with pixels.
+                let outcome = computer_use::execute_actions(
                     &cu_call.actions,
                     display_target,
                     backend,
@@ -1402,11 +1404,16 @@ pub(crate) async fn run_cu_task(
                     None,
                     user_display_granted,
                     Some(&cu_observer),
+                    computer_use::CuExecOptions::default(),
                 )
                 .await;
 
-                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-                let output = computer_use::summarize_results_for_model(&cu_call.actions, &results);
+                let last_screenshot = outcome.last_screenshot();
+                let output =
+                    computer_use::summarize_results_for_model(&cu_call.actions, &outcome.results);
+                slog(session_log, |l| {
+                    l.info(&format!("CU batch: {}", outcome.metrics_line()))
+                });
 
                 if let Some(screenshot) = last_screenshot {
                     let images = vec![conversation::ImageData {
@@ -1573,7 +1580,7 @@ pub(crate) async fn handle_shared_view_calls(
                 let registry = session_registry.cloned();
                 let capture_observer =
                     computer_use::CuActionObserver::new(bus.clone(), session_id.clone());
-                let results = computer_use::execute_actions(
+                let outcome = computer_use::execute_actions(
                     &[computer_use::CuAction::Screenshot],
                     target,
                     computer_use::DisplayBackend::detect(),
@@ -1583,8 +1590,10 @@ pub(crate) async fn handle_shared_view_calls(
                     None,
                     user_display_granted,
                     Some(&capture_observer),
+                    computer_use::CuExecOptions::default(),
                 )
                 .await;
+                let results = outcome.results;
                 match results.first().and_then(|r| r.screenshot.as_ref()) {
                     Some(shot) => {
                         let images = vec![conversation::ImageData {
@@ -1732,7 +1741,9 @@ pub(crate) async fn execute_cu_calls(
         slog(session_log, |l| l.info(&format!("CU: {}", desc)));
 
         let backend = computer_use::DisplayBackend::detect();
-        let results = computer_use::execute_actions(
+        // Provider CU protocols expect a screenshot in every result: the
+        // native loop always observes with pixels.
+        let outcome = computer_use::execute_actions(
             &cu_call.actions,
             display_target,
             backend,
@@ -1742,12 +1753,16 @@ pub(crate) async fn execute_cu_calls(
             None,
             user_display_granted,
             cu_observer,
+            computer_use::CuExecOptions::default(),
         )
         .await;
 
         // Find the last screenshot from results
-        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-        let output = computer_use::summarize_results_for_model(&cu_call.actions, &results);
+        let last_screenshot = outcome.last_screenshot();
+        let output = computer_use::summarize_results_for_model(&cu_call.actions, &outcome.results);
+        slog(session_log, |l| {
+            l.info(&format!("CU batch: {}", outcome.metrics_line()))
+        });
 
         if let Some(screenshot) = last_screenshot {
             let images = vec![conversation::ImageData {

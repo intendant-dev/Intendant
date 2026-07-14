@@ -21,6 +21,7 @@ mod credential_audit;
 mod credential_egress;
 mod credential_leases;
 mod ctl;
+mod cu_observation;
 mod cu_readiness;
 mod daemon_identity;
 mod daemon_log_tee;

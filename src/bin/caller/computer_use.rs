@@ -63,6 +63,14 @@ impl DisplayBackend {
 // point so existing `computer_use::DisplayTarget` paths keep working.
 pub use intendant_platform::DisplayTarget;
 
+// ── Batch observation policy ────────────────────────────────────────────────
+
+// The trailing-observation vocabulary lives in `cu_observation`; re-exported
+// here so computer_use stays the CU vocabulary hub for callers.
+pub use crate::cu_observation::{
+    CuBatchMetrics, CuBatchOutcome, CuExecOptions, CuObservation, CuObservationKind, ObserveMode,
+};
+
 // ── Action types ─────────────────────────────────────────────────────────────
 
 /// A single computer-use action, normalized across all providers.
@@ -467,6 +475,21 @@ pub async fn read_screen_elements(
 
 /// Platform dispatch for [`read_screen_elements`], before the display cap.
 async fn read_screen_elements_raw(target: DisplayTarget) -> Result<ScreenElements, String> {
+    // Synthetic display rig (PROVIDER=mock + INTENDANT_MOCK_DISPLAY=synthetic):
+    // serve the deterministic synthetic tree so element observation is
+    // exercisable headless without touching a native accessibility API
+    // (macOS AX / AT-SPI / UIA) — the same charter as synthetic capture.
+    // The user-session-only rule still applies, matching every platform.
+    if crate::display::synthetic::armed() {
+        if !target.is_user_session() {
+            return Err(
+                "element trees are only available for the user session display; \
+                 use display_target=\"user_session\""
+                    .to_string(),
+            );
+        }
+        return Ok(crate::cu_observation::synthetic_screen_elements());
+    }
     #[cfg(target_os = "macos")]
     {
         if !target.is_user_session() {
@@ -854,11 +877,29 @@ pub fn summarize_results_for_model(actions: &[CuAction], results: &[CuActionResu
 
 // ── Executor ─────────────────────────────────────────────────────────────────
 
+/// Trailing-observation capture strategy: how the executing backend path
+/// takes the post-batch screenshot when the observation plan wants pixels.
+enum TrailingCapture<'a> {
+    /// Session-only backends (Wayland portal / Windows DXGI): the session
+    /// frame is the only capture path, in session-pixel space.
+    ViaSession(&'a crate::display::DisplaySession),
+    /// X11/macOS: prefer a live session frame (normalized to logical space),
+    /// fall back to the platform screenshot subprocess.
+    PreferringSession {
+        session: Option<&'a crate::display::DisplaySession>,
+        display: &'a str,
+        backend: DisplayBackend,
+    },
+}
+
 /// Execute a batch of CU actions on the given display.
 ///
-/// Returns one result per action. A screenshot is automatically captured after
-/// the last non-Screenshot action (all providers expect a screenshot in the
-/// result).
+/// Returns one result per action, an [`CuObservation`] describing the
+/// trailing observation, and per-batch metrics. The trailing observation is
+/// policy-driven (`options.observe`): a post-action screenshot (the default,
+/// appended as one extra captured result), the frontmost element tree
+/// (`observation.ax_text`, no capture), or nothing. An explicit trailing
+/// `screenshot`/`zoom` action always serves as the observation itself.
 ///
 /// `user_session_allowed` is the single enforcement point for reaching the
 /// user's real desktop: callers pass the autonomy guard's user-display grant,
@@ -881,14 +922,23 @@ pub async fn execute_actions(
     denorm_ref: Option<(u32, u32)>,
     user_session_allowed: bool,
     observer: Option<&CuActionObserver>,
-) -> Vec<CuActionResult> {
+    options: CuExecOptions,
+) -> CuBatchOutcome {
     if target.is_user_session() && !user_session_allowed {
         // One result per action, like every other outcome of this function
         // (a screenshot-only batch still gets its one denial).
-        return actions
-            .iter()
-            .map(|_| CuActionResult::failed(user_session_denied_message()))
-            .collect();
+        return CuBatchOutcome {
+            results: actions
+                .iter()
+                .map(|_| CuActionResult::failed(user_session_denied_message()))
+                .collect(),
+            observation: CuObservation {
+                kind: CuObservationKind::None,
+                reason: "user_session denied".to_string(),
+                ax_text: None,
+            },
+            metrics: CuBatchMetrics::default(),
+        };
     }
 
     #[cfg(target_os = "linux")]
@@ -902,47 +952,157 @@ pub async fn execute_actions(
         _ => backend,
     };
 
-    match effective_backend {
+    // Marker coordinates for opt-in capture annotation: where the batch's
+    // click-family actions aimed. Empty (no drawing) unless annotate is set.
+    let marks = if options.annotate {
+        crate::cu_observation::click_points(actions)
+    } else {
+        Vec::new()
+    };
+
+    // Run the action loop on the backend-appropriate path. Both paths return
+    // per-action results plus the completion time of the last input action;
+    // the trailing observation is attached by the shared tail below.
+    let display = target.display_env_string();
+    let mut results: Vec<CuActionResult>;
+    let last_input_at: Option<std::time::Instant>;
+    let session: Option<std::sync::Arc<crate::display::DisplaySession>>;
+    let session_only = matches!(
+        effective_backend,
+        DisplayBackend::Wayland | DisplayBackend::Windows
+    );
+
+    if session_only {
         // Session-only backends: capture and input both live in the display
         // pipeline (Wayland portal / Windows DXGI + SendInput).
-        DisplayBackend::Wayland | DisplayBackend::Windows => {
-            if let Some(session) = lookup_display_session(session_registry, &target).await {
-                return execute_via_session(
-                    &session,
-                    actions,
-                    screenshot_dir,
-                    action_counter,
-                    denorm_ref,
-                    observer,
-                    target,
-                )
-                .await;
-            }
-            return vec![CuActionResult::failed(no_session_message(
-                effective_backend,
-                &target,
-                user_session_allowed,
-            ))];
-        }
-        DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
+        let Some(live) = lookup_display_session(session_registry, &target).await else {
+            return CuBatchOutcome {
+                results: vec![CuActionResult::failed(no_session_message(
+                    effective_backend,
+                    &target,
+                    user_session_allowed,
+                ))],
+                observation: CuObservation {
+                    kind: CuObservationKind::None,
+                    reason: "no capture session".to_string(),
+                    ax_text: None,
+                },
+                metrics: CuBatchMetrics::default(),
+            };
+        };
+        let (r, l) = execute_via_session(
+            &live,
+            actions,
+            screenshot_dir,
+            action_counter,
+            denorm_ref,
+            observer,
+            target,
+            &marks,
+        )
+        .await;
+        results = r;
+        last_input_at = l;
+        session = Some(live);
+    } else {
+        // X11/macOS: subprocess-injection backends. Even here, prefer the
+        // in-memory frames of a live capture session for screenshots — no
+        // fork, no disk round-trip.
+        let live = lookup_display_session(session_registry, &target).await;
+        let (r, l) = execute_actions_direct(
+            actions,
+            target,
+            effective_backend,
+            &display,
+            live.as_deref(),
+            screenshot_dir,
+            action_counter,
+            denorm_ref,
+            observer,
+            &marks,
+        )
+        .await;
+        results = r;
+        last_input_at = l;
+        session = live;
     }
-    // Even on the subprocess-input backends, prefer the in-memory frames of a
-    // live capture session for screenshots — no fork, no disk round-trip.
-    let session = lookup_display_session(session_registry, &target).await;
+
+    // Shared tail: resolve and attach the trailing observation.
+    let mut metrics = CuBatchMetrics::default();
+    let capture = if session_only {
+        TrailingCapture::ViaSession(session.as_deref().expect("session checked above"))
+    } else {
+        TrailingCapture::PreferringSession {
+            session: session.as_deref(),
+            display: &display,
+            backend: effective_backend,
+        }
+    };
+    let observation = attach_observation(
+        actions,
+        options.observe,
+        target,
+        capture,
+        screenshot_dir,
+        action_counter,
+        last_input_at,
+        &marks,
+        &mut results,
+        &mut metrics,
+    )
+    .await;
+
+    // Attach the final screenshot to the first result if it doesn't have one
+    // (convenience for callers that just want the latest screenshot from the batch).
+    let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.clone());
+    if let (Some(screenshot), Some(first)) = (last_screenshot, results.first_mut()) {
+        if first.screenshot.is_none() {
+            first.screenshot = Some(screenshot);
+        }
+    }
+
+    let outcome = CuBatchOutcome {
+        results,
+        observation,
+        metrics,
+    };
+    // Per-batch measurement line (daemon log): observation choice + costs.
+    eprintln!(
+        "[cu] batch actions={} observe={} {}",
+        actions.len(),
+        options.observe.label(),
+        outcome.metrics_line(),
+    );
+    outcome
+}
+
+/// The X11/macOS action loop: subprocess/CGEvent input injection, session
+/// frames preferred for explicit captures. Returns per-action results and the
+/// completion time of the last input action.
+#[allow(clippy::too_many_arguments)]
+async fn execute_actions_direct(
+    actions: &[CuAction],
+    target: DisplayTarget,
+    effective_backend: DisplayBackend,
+    display: &str,
+    session: Option<&crate::display::DisplaySession>,
+    screenshot_dir: &Path,
+    action_counter: &mut u64,
+    denorm_ref: Option<(u32, u32)>,
+    observer: Option<&CuActionObserver>,
+    marks: &[(i32, i32)],
+) -> (Vec<CuActionResult>, Option<std::time::Instant>) {
     // Coordinate reference for emitted action events: the denorm reference
     // when the caller supplied one, else the live session resolution.
     // (0, 0) = unknown; viewers fall back to the stream's intrinsic size.
     let observe_ref = denorm_ref
         .or_else(|| {
             session
-                .as_ref()
                 .map(|s| s.resolution())
                 .filter(|(w, h)| *w > 0 && *h > 0)
         })
         .unwrap_or((0, 0));
-    let display = target.display_env_string();
     let mut results = Vec::with_capacity(actions.len());
-    let mut last_screenshot: Option<ScreenshotData> = None;
     let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
@@ -953,12 +1113,13 @@ pub async fn execute_actions(
         let result = match action {
             CuAction::Screenshot => {
                 match capture_screenshot_preferring_session(
-                    session.as_deref(),
+                    session,
                     last_input_at,
-                    &display,
+                    display,
                     effective_backend,
                     screenshot_dir,
                     action_counter,
+                    marks,
                 )
                 .await
                 {
@@ -973,9 +1134,9 @@ pub async fn execute_actions(
                 height,
             } => {
                 match capture_zoom_screenshot(
-                    session.as_deref(),
+                    session,
                     last_input_at,
-                    &display,
+                    display,
                     effective_backend,
                     screenshot_dir,
                     action_counter,
@@ -990,7 +1151,7 @@ pub async fn execute_actions(
             _ => {
                 let result = execute_single(
                     action,
-                    &display,
+                    display,
                     effective_backend,
                     screenshot_dir,
                     action_counter,
@@ -1003,9 +1164,6 @@ pub async fn execute_actions(
                 verify_action_effect(action, result, effective_backend, target).await
             }
         };
-        if let Some(ref s) = result.screenshot {
-            last_screenshot = Some(s.clone());
-        }
         if dispatched_ok.unwrap_or_else(|| result.success()) {
             if let Some(obs) = observer {
                 obs.observe(target, observe_ref, action);
@@ -1014,40 +1172,108 @@ pub async fn execute_actions(
         results.push(result);
     }
 
-    // If the last action was not already a capture, auto-capture one.
-    let needs_auto_screenshot = actions
-        .last()
-        .is_some_and(|a| !matches!(a, CuAction::Screenshot | CuAction::Zoom { .. }));
-    if needs_auto_screenshot {
-        let auto = capture_screenshot_preferring_session(
-            session.as_deref(),
-            last_input_at,
-            &display,
-            effective_backend,
-            screenshot_dir,
-            action_counter,
-        )
-        .await;
-        match auto {
-            Ok(s) => {
-                last_screenshot = Some(s.clone());
-                results.push(CuActionResult::captured(s));
+    (results, last_input_at)
+}
+
+/// Shared observation tail for both executor paths: plan the trailing
+/// observation ([`crate::cu_observation::plan_observation`]) and attach it —
+/// a captured trailing result for pixels, `ax_text` for an element tree,
+/// nothing for `none`/explicit captures. Fills the observation slots of
+/// `metrics`.
+#[allow(clippy::too_many_arguments)]
+async fn attach_observation(
+    actions: &[CuAction],
+    observe: ObserveMode,
+    target: DisplayTarget,
+    capture: TrailingCapture<'_>,
+    screenshot_dir: &Path,
+    action_counter: &mut u64,
+    last_input_at: Option<std::time::Instant>,
+    marks: &[(i32, i32)],
+    results: &mut Vec<CuActionResult>,
+    metrics: &mut CuBatchMetrics,
+) -> CuObservation {
+    use crate::cu_observation::{plan_observation, ObservationPlan};
+
+    match plan_observation(actions, observe, target).await {
+        ObservationPlan::ExplicitCapture => {
+            let bytes = results
+                .iter()
+                .rev()
+                .find_map(|r| r.screenshot.as_ref())
+                .map(|s| s.base64_png.len() * 3 / 4)
+                .unwrap_or(0);
+            metrics.observation_bytes = bytes;
+            CuObservation {
+                kind: CuObservationKind::Pixels,
+                reason: "explicit capture action".to_string(),
+                ax_text: None,
             }
-            Err(e) => {
-                results.push(CuActionResult::failed(e));
+        }
+        ObservationPlan::None { reason } => CuObservation {
+            kind: CuObservationKind::None,
+            reason,
+            ax_text: None,
+        },
+        ObservationPlan::Ax {
+            text,
+            reason,
+            walk_ms,
+        } => {
+            metrics.ax_ms = Some(walk_ms);
+            metrics.observation_bytes = text.len();
+            CuObservation {
+                kind: CuObservationKind::Ax,
+                reason,
+                ax_text: Some(text),
+            }
+        }
+        ObservationPlan::Pixels { reason } => {
+            let started = std::time::Instant::now();
+            let captured = match capture {
+                TrailingCapture::ViaSession(session) => {
+                    session_screenshot_data(
+                        session,
+                        screenshot_dir,
+                        action_counter,
+                        last_input_at,
+                        false,
+                        marks,
+                    )
+                    .await
+                }
+                TrailingCapture::PreferringSession {
+                    session,
+                    display,
+                    backend,
+                } => {
+                    capture_screenshot_preferring_session(
+                        session,
+                        last_input_at,
+                        display,
+                        backend,
+                        screenshot_dir,
+                        action_counter,
+                        marks,
+                    )
+                    .await
+                }
+            };
+            metrics.capture_ms = Some(started.elapsed().as_millis() as u64);
+            match captured {
+                Ok(s) => {
+                    metrics.observation_bytes = s.base64_png.len() * 3 / 4;
+                    results.push(CuActionResult::captured(s));
+                }
+                Err(e) => results.push(CuActionResult::failed(e)),
+            }
+            CuObservation {
+                kind: CuObservationKind::Pixels,
+                reason,
+                ax_text: None,
             }
         }
     }
-
-    // Attach the final screenshot to the first result if it doesn't have one
-    // (convenience for callers that just want the latest screenshot from the batch).
-    if let (Some(screenshot), Some(first)) = (last_screenshot, results.first_mut()) {
-        if first.screenshot.is_none() {
-            first.screenshot = Some(screenshot);
-        }
-    }
-
-    results
 }
 
 // ── Post-dispatch verification ───────────────────────────────────────────────
@@ -1389,7 +1615,7 @@ async fn execute_single(
             },
         },
         CuAction::Screenshot => {
-            match take_screenshot(display, backend, screenshot_dir, counter).await {
+            match take_screenshot(display, backend, screenshot_dir, counter, &[]).await {
                 Ok(s) => CuActionResult::captured(s),
                 Err(e) => CuActionResult::failed(e),
             }
@@ -2341,6 +2567,7 @@ async fn take_screenshot(
     backend: DisplayBackend,
     screenshot_dir: &Path,
     counter: &mut u64,
+    marks: &[(i32, i32)],
 ) -> Result<ScreenshotData, String> {
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
@@ -2369,9 +2596,8 @@ async fn take_screenshot(
             let bytes = x11_cu::screenshot_png(display)
                 .await
                 .map_err(with_linux_gui_env_diagnostic)?;
-            // Keep the on-disk artifact: the dashboard's Activity tab (and
-            // the annotated-overwrite path in mcp.rs) read screenshots from
-            // this path.
+            // Keep the on-disk artifact: the dashboard's Activity tab and
+            // managed callers read screenshots from this path.
             tokio::fs::write(&path, &bytes)
                 .await
                 .map_err(|e| format!("write screenshot: {}", e))?;
@@ -2379,58 +2605,35 @@ async fn take_screenshot(
         }
     };
 
-    // Downscale Retina captures to logical size (macOS-only; a no-op
-    // elsewhere so model coordinates = capture = injection space), and
-    // encode as base64.
-
     let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
-    let bytes = normalize_png_to_logical(raw_bytes);
-    let (width, height) = png_dimensions(&bytes).unwrap_or((raw_w, raw_h));
+
+    // Transform only when needed — a Retina capture to downscale to logical
+    // coordinates (macOS-only; on X11 the capture resolution IS the
+    // input-injection space) or opt-in click markers. The transform decodes
+    // once and re-encodes once via `finalize_rgba_screenshot`, which also
+    // overwrites the disk artifact so disk == model payload; the common
+    // no-transform path serves the capture bytes untouched.
+    let needs_resize = cfg!(target_os = "macos") && {
+        let (logical_w, logical_h) = logical_display_size();
+        raw_w > logical_w && logical_w > 0 && logical_h > 0
+    };
+    if needs_resize || !marks.is_empty() {
+        // Best-effort: an undecodable capture is served raw rather than
+        // failing the action over a transform.
+        if let Ok(decoded) = image::load_from_memory(&raw_bytes) {
+            return finalize_rgba_screenshot(decoded.to_rgba8(), true, marks, path);
+        }
+    }
 
     use base64::Engine;
-    let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let base64_png = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
 
     Ok(ScreenshotData {
         path,
         base64_png,
-        width,
-        height,
+        width: raw_w,
+        height: raw_h,
     })
-}
-
-/// Downscale a PNG to the logical display size when the capture is larger
-/// (Retina/HiDPI captures at physical resolution), so model coordinates land
-/// in the same logical space the input tools consume. Returns the input
-/// unchanged when it already fits or cannot be decoded.
-///
-/// macOS-only by design: it exists for the Retina physical-vs-logical split.
-/// On X11 the capture resolution *is* the input-injection space, so any
-/// resize would desync model coordinates from where clicks land (this used
-/// to squish every capture wider than 1024px into the 1024x768
-/// `logical_display_size()` fallback — a 16:9 desktop became 4:3).
-fn normalize_png_to_logical(raw_bytes: Vec<u8>) -> Vec<u8> {
-    if !cfg!(target_os = "macos") {
-        return raw_bytes;
-    }
-    let (raw_w, _) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
-    let (logical_w, logical_h) = logical_display_size();
-    if raw_w > logical_w && logical_w > 0 && logical_h > 0 {
-        match image::load_from_memory(&raw_bytes) {
-            Ok(img) => {
-                let resized =
-                    img.resize_exact(logical_w, logical_h, image::imageops::FilterType::Triangle);
-                let mut buf = std::io::Cursor::new(Vec::new());
-                if resized.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
-                    buf.into_inner()
-                } else {
-                    raw_bytes
-                }
-            }
-            Err(_) => raw_bytes,
-        }
-    } else {
-        raw_bytes
-    }
 }
 
 /// Extract width and height from a PNG file header.
@@ -2600,7 +2803,9 @@ fn choose_default_display_target(
 ///
 /// Converts CU pixel coordinates to normalised 0.0..1.0 coordinates expected by
 /// `InputEvent`, and maps `CuAction` variants to sequences of `InputEvent`
-/// injections.
+/// injections. Returns per-action results and the completion time of the last
+/// input action; the trailing observation is the caller's (shared-tail)
+/// responsibility.
 ///
 /// `denorm_ref` is the resolution that was used to denormalize 0-1000 model
 /// coordinates into pixel space (from [`target_pixel_size`]).  When provided,
@@ -2609,6 +2814,7 @@ fn choose_default_display_target(
 /// `inject_input` still reads the *current* resolution — that's correct because
 /// the portal's `notify_pointer_motion_absolute` expects coordinates in the
 /// live stream space.
+#[allow(clippy::too_many_arguments)]
 async fn execute_via_session(
     session: &crate::display::DisplaySession,
     actions: &[CuAction],
@@ -2617,20 +2823,24 @@ async fn execute_via_session(
     denorm_ref: Option<(u32, u32)>,
     observer: Option<&CuActionObserver>,
     target: DisplayTarget,
-) -> Vec<CuActionResult> {
+    marks: &[(i32, i32)],
+) -> (Vec<CuActionResult>, Option<std::time::Instant>) {
     let (width, height) = denorm_ref.unwrap_or_else(|| session.resolution());
     let mut results = Vec::with_capacity(actions.len());
-    let mut needs_auto_screenshot = false;
     let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
         match action {
             CuAction::Screenshot => {
-                let result =
-                    take_session_screenshot(session, screenshot_dir, action_counter, last_input_at)
-                        .await;
+                let result = take_session_screenshot(
+                    session,
+                    screenshot_dir,
+                    action_counter,
+                    last_input_at,
+                    marks,
+                )
+                .await;
                 results.push(result);
-                needs_auto_screenshot = false;
             }
             CuAction::Zoom {
                 x,
@@ -2638,24 +2848,31 @@ async fn execute_via_session(
                 width: zw,
                 height: zh,
             } => {
-                // Crop the session frame. Passing the denorm reference as the
-                // "logical" size makes the crop resize-drift-proof: if the
-                // live stream resolution differs from the resolution the
-                // model's coordinates are based on, the region scales along.
+                // Crop the raw session frame (single PNG encode). Passing the
+                // denorm reference as the "logical" size makes the crop
+                // resize-drift-proof: if the live stream resolution differs
+                // from the resolution the model's coordinates are based on,
+                // the region scales along.
                 let capture = match last_input_at {
-                    Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
-                    None => session.screenshot().await,
+                    Some(ts) => session.fresh_frame(ts, FRESH_FRAME_TIMEOUT).await,
+                    None => session.current_frame().await,
                 };
                 let result = match capture
                     .map_err(|e| format!("Screenshot failed: {e}"))
-                    .and_then(|bytes| crop_png_region(&bytes, (*x, *y, *zw, *zh), (width, height)))
-                {
-                    Ok(cropped) => {
+                    .and_then(|frame| {
+                        crate::display::frame_to_rgba_image(&frame)
+                            .map_err(|e| format!("decode capture: {e}"))
+                    })
+                    .and_then(|img| crop_rgba_region(&img, (*x, *y, *zw, *zh), (width, height)))
+                    .and_then(|cropped| {
+                        let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
+                        Ok((cropped.width(), cropped.height(), bytes))
+                    }) {
+                    Ok((w, h, cropped)) => {
                         *action_counter += 1;
                         let path = screenshot_dir.join(format!("cu_zoom_{}.png", action_counter));
                         match std::fs::write(&path, &cropped) {
                             Ok(()) => {
-                                let (w, h) = png_dimensions(&cropped).unwrap_or((0, 0));
                                 use base64::Engine;
                                 let base64_png =
                                     base64::engine::general_purpose::STANDARD.encode(&cropped);
@@ -2674,7 +2891,6 @@ async fn execute_via_session(
                     Err(e) => CuActionResult::failed(e),
                 };
                 results.push(result);
-                needs_auto_screenshot = false;
             }
             CuAction::Click { x, y, button } => {
                 let nx = *x as f64 / width as f64;
@@ -2699,7 +2915,6 @@ async fn execute_via_session(
                 } else {
                     CuActionResult::failed(format!("Click injection failed: {}", errors.join("; ")))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::DoubleClick { x, y, button } => {
                 let nx = *x as f64 / width as f64;
@@ -2730,7 +2945,6 @@ async fn execute_via_session(
                         errors.join("; ")
                     ))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::TripleClick { x, y, button } => {
                 let nx = *x as f64 / width as f64;
@@ -2761,7 +2975,6 @@ async fn execute_via_session(
                         errors.join("; ")
                     ))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::MouseDown { x, y, button } => {
                 let nx = *x as f64 / width as f64;
@@ -2774,7 +2987,6 @@ async fn execute_via_session(
                     Ok(()) => CuActionResult::injected(),
                     Err(e) => CuActionResult::failed(format!("mouse down: {e}")),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::MouseUp { x, y, button } => {
                 let nx = *x as f64 / width as f64;
@@ -2787,7 +2999,6 @@ async fn execute_via_session(
                     Ok(()) => CuActionResult::injected(),
                     Err(e) => CuActionResult::failed(format!("mouse up: {e}")),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Type { text } => {
                 let result = session.inject_text(text).await;
@@ -2795,7 +3006,6 @@ async fn execute_via_session(
                     Ok(()) => CuActionResult::injected(),
                     Err(e) => CuActionResult::failed(e.to_string()),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Paste { text } => {
                 // Clipboard paste through the backend (Windows: arboard +
@@ -2811,7 +3021,6 @@ async fn execute_via_session(
                     },
                     Err(e) => CuActionResult::failed(e.to_string()),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Key { key } => {
                 let events = key_action_events(key);
@@ -2864,7 +3073,6 @@ async fn execute_via_session(
                 } else {
                     CuActionResult::failed(error.unwrap_or_else(|| "key injection failed".into()))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::HoldKey { key, ms } => {
                 let events = key_action_events(key);
@@ -2908,7 +3116,6 @@ async fn execute_via_session(
                 } else {
                     CuActionResult::failed(errors.join("; "))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Scroll {
                 x,
@@ -2938,7 +3145,6 @@ async fn execute_via_session(
                     Ok(()) => CuActionResult::injected(),
                     Err(e) => CuActionResult::failed(e.to_string()),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::MoveMouse { x, y } => {
                 let nx = *x as f64 / width as f64;
@@ -2954,7 +3160,6 @@ async fn execute_via_session(
                     Ok(()) => CuActionResult::injected(),
                     Err(e) => CuActionResult::failed(e.to_string()),
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Drag {
                 start_x,
@@ -3003,7 +3208,6 @@ async fn execute_via_session(
                 } else {
                     CuActionResult::failed(format!("Drag injection failed: {}", errors.join("; ")))
                 });
-                needs_auto_screenshot = true;
             }
             CuAction::Wait { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
@@ -3025,33 +3229,72 @@ async fn execute_via_session(
         }
     }
 
-    // Auto-screenshot after the last non-screenshot action (matches X11 path).
-    if needs_auto_screenshot {
-        let auto =
-            take_session_screenshot(session, screenshot_dir, action_counter, last_input_at).await;
-        if auto.success() {
-            let screenshot = auto.screenshot.clone();
-            results.push(auto);
-            // Attach to first result if it has no screenshot (convenience for callers).
-            if let (Some(ss), Some(first)) = (screenshot, results.first_mut()) {
-                if first.screenshot.is_none() {
-                    first.screenshot = Some(ss);
-                }
-            }
-        } else {
-            results.push(auto);
-        }
-    }
-
-    results
+    (results, last_input_at)
 }
 
 /// How long to wait for a frame captured after the last input action before
-/// serving the freshest available one. Capture backends are damage-driven:
-/// a post-action frame lands within a vsync or two when the action changed
-/// pixels, and never when it didn't — in which case the pre-action frame is
-/// already content-accurate.
+/// serving the freshest available one. On event-driven capture backends
+/// (ScreenCaptureKit, DXGI, PipeWire) a post-action frame lands within a
+/// vsync or two when the action changed pixels and never when it didn't —
+/// in which case the pre-action frame is already content-accurate. The X11
+/// backend polls at the capture rate, so the wait simply spans to the next
+/// poll. Either way the frame served is at most this stale.
 const FRESH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Finalize a raw RGBA capture into a [`ScreenshotData`]: optional
+/// logical-space resize (macOS Retina), optional opt-in click markers, then
+/// exactly one PNG encode, one disk write, and one base64 encode. The disk
+/// artifact and the model payload are the same bytes by construction.
+fn finalize_rgba_screenshot(
+    mut img: image::RgbaImage,
+    normalize_to_logical: bool,
+    marks: &[(i32, i32)],
+    path: PathBuf,
+) -> Result<ScreenshotData, String> {
+    if normalize_to_logical {
+        img = resize_rgba_to_logical(img);
+    }
+    if !marks.is_empty() {
+        crate::cu_observation::draw_click_markers(&mut img, marks);
+    }
+    let (width, height) = (img.width(), img.height());
+    let png_bytes = crate::cu_observation::encode_rgba_png(&img)?;
+    std::fs::write(&path, &png_bytes).map_err(|e| format!("Failed to write screenshot: {e}"))?;
+    use base64::Engine;
+    let base64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(ScreenshotData {
+        path,
+        base64_png,
+        width,
+        height,
+    })
+}
+
+/// Downscale a raw capture to the logical display size when it is larger
+/// (Retina/HiDPI captures at physical resolution), so model coordinates land
+/// in the same logical space the input tools consume.
+///
+/// macOS-only by design: it exists for the Retina physical-vs-logical split.
+/// On X11 the capture resolution *is* the input-injection space, so any
+/// resize would desync model coordinates from where clicks land (this used
+/// to squish every capture wider than 1024px into the 1024x768
+/// `logical_display_size()` fallback — a 16:9 desktop became 4:3).
+fn resize_rgba_to_logical(img: image::RgbaImage) -> image::RgbaImage {
+    if !cfg!(target_os = "macos") {
+        return img;
+    }
+    let (logical_w, logical_h) = logical_display_size();
+    if img.width() > logical_w && logical_w > 0 && logical_h > 0 {
+        image::imageops::resize(
+            &img,
+            logical_w,
+            logical_h,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    }
+}
 
 /// Capture screenshot data from a `DisplaySession`'s in-memory frame.
 ///
@@ -3069,27 +3312,18 @@ async fn session_screenshot_data(
     counter: &mut u64,
     min_fresh: Option<std::time::Instant>,
     normalize_to_logical: bool,
+    marks: &[(i32, i32)],
 ) -> Result<ScreenshotData, String> {
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
-    let mut png_bytes = match min_fresh {
-        Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
-        None => session.screenshot().await,
+    let frame = match min_fresh {
+        Some(ts) => session.fresh_frame(ts, FRESH_FRAME_TIMEOUT).await,
+        None => session.current_frame().await,
     }
     .map_err(|e| format!("Screenshot failed: {}", e))?;
-    if normalize_to_logical {
-        png_bytes = normalize_png_to_logical(png_bytes);
-    }
-    std::fs::write(&path, &png_bytes).map_err(|e| format!("Failed to write screenshot: {}", e))?;
-    let (width, height) = png_dimensions(&png_bytes).unwrap_or((0, 0));
-    use base64::Engine;
-    let base64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    Ok(ScreenshotData {
-        path,
-        base64_png,
-        width,
-        height,
-    })
+    let img = crate::display::frame_to_rgba_image(&frame)
+        .map_err(|e| format!("Screenshot failed: {e}"))?;
+    finalize_rgba_screenshot(img, normalize_to_logical, marks, path)
 }
 
 /// Capture a PNG screenshot from a `DisplaySession`.
@@ -3098,26 +3332,27 @@ async fn take_session_screenshot(
     screenshot_dir: &std::path::Path,
     counter: &mut u64,
     min_fresh: Option<std::time::Instant>,
+    marks: &[(i32, i32)],
 ) -> CuActionResult {
-    match session_screenshot_data(session, screenshot_dir, counter, min_fresh, false).await {
+    match session_screenshot_data(session, screenshot_dir, counter, min_fresh, false, marks).await {
         Ok(s) => CuActionResult::captured(s),
         Err(e) => CuActionResult::failed(e),
     }
 }
 
-/// Crop a PNG to `region` given in logical coordinates, keeping whatever
-/// extra resolution the capture has: the region is scaled by the capture's
-/// physical/logical ratio, so a Retina capture yields native 2x detail.
-fn crop_png_region(
-    png_bytes: &[u8],
+/// Crop a raw RGBA capture to `region` given in logical coordinates, keeping
+/// whatever extra resolution the capture has: the region is scaled by the
+/// capture's physical/logical ratio, so a Retina capture yields native 2x
+/// detail.
+fn crop_rgba_region(
+    img: &image::RgbaImage,
     region: (i32, i32, u32, u32),
     logical_size: (u32, u32),
-) -> Result<Vec<u8>, String> {
+) -> Result<image::RgbaImage, String> {
     let (x, y, w, h) = region;
     if w == 0 || h == 0 {
         return Err("zoom region must have a non-zero width and height".to_string());
     }
-    let img = image::load_from_memory(png_bytes).map_err(|e| format!("decode capture: {e}"))?;
     let (img_w, img_h) = (img.width(), img.height());
     let (logical_w, _) = logical_size;
     let scale = if logical_w > 0 && img_w > logical_w {
@@ -3136,12 +3371,21 @@ fn crop_png_region(
     }
     let sw = sw.min(img_w - sx).max(1);
     let sh = sh.min(img_h - sy).max(1);
-    let cropped = img.crop_imm(sx, sy, sw, sh);
-    let mut buf = std::io::Cursor::new(Vec::new());
-    cropped
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .map_err(|e| format!("encode crop: {e}"))?;
-    Ok(buf.into_inner())
+    Ok(image::imageops::crop_imm(img, sx, sy, sw, sh).to_image())
+}
+
+/// PNG-in/PNG-out wrapper of [`crop_rgba_region`] for the subprocess capture
+/// paths, whose source is already PNG bytes (one decode, one encode).
+fn crop_png_region(
+    png_bytes: &[u8],
+    region: (i32, i32, u32, u32),
+    logical_size: (u32, u32),
+) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(png_bytes)
+        .map_err(|e| format!("decode capture: {e}"))?
+        .to_rgba8();
+    let cropped = crop_rgba_region(&img, region, logical_size)?;
+    crate::cu_observation::encode_rgba_png(&cropped)
 }
 
 /// Capture just `region` (logical coordinates) at the highest resolution the
@@ -3158,50 +3402,54 @@ async fn capture_zoom_screenshot(
     counter: &mut u64,
     region: (i32, i32, u32, u32),
 ) -> Result<ScreenshotData, String> {
-    let raw = match backend {
-        DisplayBackend::MacOS => None,
-        _ => match session {
-            Some(session) => {
-                let bytes = match min_fresh {
-                    Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
-                    None => session.screenshot().await,
-                }
+    // Live-session flavor (X11): crop the raw in-memory frame — one PNG
+    // encode, no decode. The model saw the capture at native size, so the
+    // region already is in capture pixels (scale = 1 via the frame's own
+    // dimensions as the crop reference).
+    if backend != DisplayBackend::MacOS {
+        if let Some(session) = session {
+            let frame = match min_fresh {
+                Some(ts) => session.fresh_frame(ts, FRESH_FRAME_TIMEOUT).await,
+                None => session.current_frame().await,
+            }
+            .map_err(|e| format!("Screenshot failed: {e}"))?;
+            let img = crate::display::frame_to_rgba_image(&frame)
                 .map_err(|e| format!("Screenshot failed: {e}"))?;
-                Some(bytes)
-            }
-            None => None,
-        },
-    };
-    let raw = match raw {
-        Some(bytes) => bytes,
-        None => match backend {
-            // Raw capture, deliberately without the logical-size downscale
-            // (zoom's whole point is native detail).
-            DisplayBackend::MacOS => {
-                *counter += 1;
-                let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
-                let output = Command::new("screencapture")
-                    .args(["-x", &path.to_string_lossy()])
-                    .output()
-                    .await
-                    .map_err(|e| format!("screencapture exec error: {e}"))?;
-                if !output.status.success() {
-                    // Same TCC-denial naming as take_screenshot (CU-04).
-                    return Err(crate::cu_readiness::enrich_capture_failure(format!(
-                        "zoom capture failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    )));
-                }
-                let bytes = tokio::fs::read(&path)
-                    .await
-                    .map_err(|e| format!("read zoom capture: {e}"))?;
-                let _ = tokio::fs::remove_file(&path).await;
-                bytes
-            }
-            _ => x11_cu::screenshot_png(display)
+            let crop_ref = (img.width(), img.height());
+            let cropped = crop_rgba_region(&img, region, crop_ref)?;
+            let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
+            return write_zoom_screenshot(bytes, screenshot_dir, counter);
+        }
+    }
+
+    // Subprocess flavor: the source is PNG bytes (one decode, one encode).
+    let raw = match backend {
+        // Raw capture, deliberately without the logical-size downscale
+        // (zoom's whole point is native detail).
+        DisplayBackend::MacOS => {
+            *counter += 1;
+            let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
+            let output = Command::new("screencapture")
+                .args(["-x", &path.to_string_lossy()])
+                .output()
                 .await
-                .map_err(|e| format!("zoom capture failed: {e}"))?,
-        },
+                .map_err(|e| format!("screencapture exec error: {e}"))?;
+            if !output.status.success() {
+                // Same TCC-denial naming as take_screenshot (CU-04).
+                return Err(crate::cu_readiness::enrich_capture_failure(format!(
+                    "zoom capture failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("read zoom capture: {e}"))?;
+            let _ = tokio::fs::remove_file(&path).await;
+            bytes
+        }
+        _ => x11_cu::screenshot_png(display)
+            .await
+            .map_err(|e| format!("zoom capture failed: {e}"))?,
     };
 
     // Crop reference: on macOS the model's region is in logical points while
@@ -3213,6 +3461,16 @@ async fn capture_zoom_screenshot(
         _ => png_dimensions(&raw).unwrap_or_else(logical_display_size),
     };
     let cropped = crop_png_region(&raw, region, crop_ref)?;
+    write_zoom_screenshot(cropped, screenshot_dir, counter)
+}
+
+/// Write encoded zoom PNG bytes to the next `cu_zoom_N.png` artifact and
+/// package the [`ScreenshotData`].
+fn write_zoom_screenshot(
+    cropped: Vec<u8>,
+    screenshot_dir: &Path,
+    counter: &mut u64,
+) -> Result<ScreenshotData, String> {
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
     std::fs::write(&path, &cropped).map_err(|e| format!("write zoom screenshot: {e}"))?;
@@ -3239,9 +3497,12 @@ async fn capture_screenshot_preferring_session(
     backend: DisplayBackend,
     screenshot_dir: &Path,
     counter: &mut u64,
+    marks: &[(i32, i32)],
 ) -> Result<ScreenshotData, String> {
     if let Some(session) = session {
-        match session_screenshot_data(session, screenshot_dir, counter, min_fresh, true).await {
+        match session_screenshot_data(session, screenshot_dir, counter, min_fresh, true, marks)
+            .await
+        {
             Ok(s) => return Ok(s),
             Err(_) => {
                 // Session exists but has no usable frame (e.g. capture just
@@ -3249,7 +3510,7 @@ async fn capture_screenshot_preferring_session(
             }
         }
     }
-    take_screenshot(display, backend, screenshot_dir, counter).await
+    take_screenshot(display, backend, screenshot_dir, counter, marks).await
 }
 
 /// Map a `MouseButton` to the browser button index used by `InputEvent`.
@@ -4023,7 +4284,7 @@ mod tests {
             DisplayBackend::Wayland,
             DisplayBackend::Windows,
         ] {
-            let results = execute_actions(
+            let outcome = execute_actions(
                 &actions,
                 DisplayTarget::UserSession,
                 backend,
@@ -4033,10 +4294,16 @@ mod tests {
                 None,
                 false,
                 None,
+                CuExecOptions::default(),
             )
             .await;
-            assert_eq!(results.len(), actions.len(), "one result per action");
-            for result in results {
+            assert_eq!(
+                outcome.results.len(),
+                actions.len(),
+                "one result per action"
+            );
+            assert_eq!(outcome.observation.kind, CuObservationKind::None);
+            for result in outcome.results {
                 assert!(!result.success());
                 assert_eq!(
                     result.error.as_deref(),
@@ -4108,8 +4375,10 @@ mod tests {
             None,
             true,
             None,
+            CuExecOptions::default(),
         )
-        .await;
+        .await
+        .results;
         assert!(!results[0].success());
         assert_eq!(
             results[0].error.as_deref(),
@@ -4134,8 +4403,10 @@ mod tests {
             None,
             true,
             None,
+            CuExecOptions::default(),
         )
-        .await;
+        .await
+        .results;
         assert!(!results[0].success());
         assert!(
             results[0]
@@ -4181,8 +4452,10 @@ mod tests {
             None,
             false,
             None,
+            CuExecOptions::default(),
         )
-        .await;
+        .await
+        .results;
         let error = results[0].error.as_deref().unwrap_or_default();
         assert_ne!(error, user_session_denied_message());
     }

@@ -1942,6 +1942,105 @@ async fn cu_actions_broadcast_display_scoped_events_over_ws() {
     );
 }
 
+/// The CU observation policy end to end on the synthetic rig: `--observe`
+/// drives what the batch result carries, and the result names the
+/// observation and why. A `wait` action is the safe probe on every backend
+/// (no OS input path, no capture race): `ax`/`auto`/`none` never capture
+/// pixels, and under the armed synthetic backend the element walk serves the
+/// deterministic synthetic tree instead of touching a native accessibility
+/// API (macOS AX / AT-SPI / UIA) — this must stay true or CI walks a fleet
+/// runner's real desktop.
+#[tokio::test]
+async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // user_session CU requires the display grant (the synthetic backend
+    // serves the capture session it registers).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let run = |observe: &'static str| {
+        let daemon = &daemon;
+        async move {
+            let output = ctl(
+                daemon,
+                &[
+                    "cu",
+                    "actions",
+                    "--actions",
+                    r#"[{"type":"wait","ms":1}]"#,
+                    "--target",
+                    "user_session",
+                    "--observe",
+                    observe,
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{}", text_of(&output));
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                text.contains("(wait 1ms): ok"),
+                "wait action must verify ({observe}):\n{text}"
+            );
+            text
+        }
+    };
+
+    // observe=ax: the element tree IS the observation — synthetic tree text
+    // inline, no screenshot capture at all.
+    let text = run("ax").await;
+    assert!(
+        text.contains("observation: ax (observe=ax"),
+        "result must name the ax observation:\n{text}"
+    );
+    assert!(
+        text.contains("Synthetic Desktop") && text.contains("button \"OK\""),
+        "synthetic element tree must ride the result:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured"),
+        "ax observation must not capture pixels:\n{text}"
+    );
+
+    // observe=auto: the synthetic tree is above the usability floor, so auto
+    // deterministically picks ax and says so.
+    let text = run("auto").await;
+    assert!(
+        text.contains("observation: ax (auto: ax usable ("),
+        "auto must pick the usable tree and give the reason:\n{text}"
+    );
+    assert!(
+        text.contains("--- screen elements ---"),
+        "auto-chosen ax observation must carry the tree:\n{text}"
+    );
+
+    // observe=none: results only.
+    let text = run("none").await;
+    assert!(
+        text.contains("observation: none (observe=none)"),
+        "none must be named:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured")
+            && !text.contains("--- screen elements ---"),
+        "observe=none must attach nothing:\n{text}"
+    );
+}
+
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
 /// renders the question on the rail (`user_question` on /ws), a frontend
 /// answers via `answer_question`, and the blocked ctl returns the exact
