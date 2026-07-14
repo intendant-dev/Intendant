@@ -16,7 +16,8 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
 | `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
-| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine, journal machine; `cargo run --bin harness` reports per-vector status). The opening tranche is fully reproduced (8/8; the burn-down already caught and fixed one fixture-minting defect — the erase fixture's flowless release) |
+| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, B.2/B.3 transcription; `cargo run --bin harness` reports per-vector status). The full 131-vector corpus is reproduced; the differential caught and fixed four fixture-layer defects along the way |
+| `gate-a-audit.md` | **The Gate-A discrepancy audit** (2026-07-14): the differential scoreboard, twelve items for owner ratification, the conventions to codify, the coverage inventory, and the PASS-conditional recommendation |
 
 ## Provenance note
 
@@ -30,14 +31,15 @@ review record, and the byte-exact baseline outranks path cosmetics.
 
 ## Status
 
-- **Gate A: pending — currently false** (spec §16). The companion,
-  the opening tranche (8 vectors, all reproduced), the independent
-  reducer, and the differential harness exist; the corpus
-  (families 1–13), the family-14 run, the surface runs, and the
-  final prose↔CDDL↔companion↔vector discrepancy audit do not yet.
+- **Gate A: audit delivered — PASS recommended, conditional on the
+  owner ratifying `gate-a-audit.md` §2's twelve items** (spec §16).
+  The corpus stands at 131 vectors across all 14 families, every one
+  reproduced by the independent reducer (three-run convergence, all
+  structural layers green); the §13.2 surfaces gate is enforced in
+  the core suite.
 - **Durable P1 Memory writes stay prohibited** until Gate B plus the
   umbrella's P0.5/tombed-cutover prerequisites (spec header).
-- Next: the corpus (families 1–13) via `core/`, burned down through
-  the same harness; then family 14, surfaces, and the Gate-A audit
-  (which also sweeps the interpretation register kept in the
-  program ledger).
+- Next: the owner's ratification pass over the audit's §2 (eleven
+  prose/table amendments + one recorded open confirmation), then the
+  freeze stamp and new spec-hash pins per §16. The §4 coverage debt
+  is Gate-B-lane work.
