@@ -251,9 +251,9 @@ pub(crate) fn session_agent_output_api_response(
 
 /// Build a zip containing the current session's text artifacts for the
 /// Settings → "Download session report" feature. Includes session.jsonl,
-/// session_meta.json, transcript.jsonl, summary.json, daemon.log,
-/// panic.log, and everything under `turns/`. Excludes `frames/` and
-/// `recordings/` since those can be hundreds of megabytes and are not
+/// session_meta.json, transcript.jsonl, summary.json, session_summary.json,
+/// daemon.log, panic.log, and everything under `turns/`. Excludes `frames/`
+/// and `recordings/` since those can be hundreds of megabytes and are not
 /// needed to diagnose controller-side bugs.
 pub(crate) fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::{Cursor, Write};
@@ -268,6 +268,7 @@ pub(crate) fn build_session_report_zip(session_dir: &std::path::Path) -> std::io
         "session_meta.json",
         "transcript.jsonl",
         "summary.json",
+        "session_summary.json",
         "daemon.log",
         "panic.log",
     ];
@@ -6212,6 +6213,39 @@ mod tests {
             golden_transcript(&response),
             golden_text_plain_transcript("404 Not Found", "Session not found")
         );
+    }
+
+    #[test]
+    fn session_report_zip_packs_every_text_artifact_and_skips_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = [
+            "session.jsonl",
+            "session_meta.json",
+            "transcript.jsonl",
+            "summary.json",
+            "session_summary.json",
+            "daemon.log",
+            "panic.log",
+        ];
+        for name in flat {
+            std::fs::write(dir.path().join(name), format!("{{\"file\":\"{name}\"}}\n")).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("turns")).unwrap();
+        std::fs::write(dir.path().join("turns").join("turn_001_stdout.txt"), "hi\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("frames")).unwrap();
+        std::fs::write(dir.path().join("frames").join("frame_0001.png"), b"png").unwrap();
+        std::fs::create_dir_all(dir.path().join("recordings")).unwrap();
+        std::fs::write(dir.path().join("recordings").join("seg_00001.mp4"), b"mp4").unwrap();
+
+        let bytes = build_session_report_zip(dir.path()).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names: std::collections::BTreeSet<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        let mut expected: std::collections::BTreeSet<String> =
+            flat.iter().map(|n| n.to_string()).collect();
+        expected.insert("turns/turn_001_stdout.txt".to_string());
+        assert_eq!(names, expected);
     }
 
     #[tokio::test]
