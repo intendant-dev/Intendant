@@ -1,3 +1,8 @@
+// Item F4: pointer moves ('mm') deliberately dropped by displayInput's
+// bufferedAmount watermark instead of queueing behind a congested shared
+// tunnel. Page-session counter, surfaced via qa.liveDisplay().
+let dashboardControlTunnelPointerMovesDropped = 0;
+
 class DashboardControlTransport {
   constructor() {
     this.pc = null;
@@ -761,11 +766,31 @@ class DashboardControlTransport {
 
   displayInput(displayId, event) {
     if (!this.canUseRpc()) return false;
-    this.sendFrame({
-      t: 'display_input',
-      display_id: Number(displayId) || 0,
-      event,
-    });
+    // This channel is reliable+ordered and shared with every RPC,
+    // upload, and terminal frame. Continuous latest-wins pointer moves
+    // must never queue behind a backlog here — stale moves replayed in
+    // order read as catastrophic remote-control lag. Above the
+    // watermark, dropping the move is the honest choice (the next one
+    // supersedes it); discrete events (kd/ku/md/mu) always send. The
+    // per-display lossy `pointer` datachannel is the preferred mm/sc
+    // lane anyway (DisplaySlot._enterInteractive) — this path is its
+    // fallback.
+    if (event?.t === 'mm' &&
+        this.channel.bufferedAmount > DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES) {
+      dashboardControlTunnelPointerMovesDropped += 1;
+      return true; // handled: deliberately dropped — never reroute a stale move
+    }
+    try {
+      this.sendFrame({
+        t: 'display_input',
+        display_id: Number(displayId) || 0,
+        event,
+      });
+    } catch (_) {
+      // Close race / full SCTP buffer: report unsent so the slot can
+      // fall back to its own data channels.
+      return false;
+    }
     return true;
   }
 
