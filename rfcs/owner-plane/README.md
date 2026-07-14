@@ -15,6 +15,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.18) — the red baselines |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
+| `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
 
 ## Provenance note
 
