@@ -182,7 +182,7 @@ fn run_semantics(vector: &Json) -> SemStatus {
     let run = match kind {
         "fold" => run_fold_vector(vector),
         "journal-replay" => run_journal_vector(vector),
-        other => return SemStatus::Unimplemented(format!("case_kind {other}")),
+        _ => crate::kat::run(vector),
     };
     match run {
         Ok(status) => status,
@@ -520,17 +520,11 @@ mod tests {
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
-        assert_eq!(reports.len(), 8, "the opening tranche is eight vectors");
-        let expect_pass = [
-            "f07-delayed-reference-convergence-c1-i-c2.json",
-            "f07-negation-residual-acceptance.json",
-            "f07-pending-revocation-window-grant-completing-rotation.json",
-            "f07-staged-frontier-consumed-no-resurrection.json",
-            "f11-collision-loser-reenters-on-winner-death.json",
-            "f11-erase-deferral-nonterminal-journal.json",
-            "f11-reopen-basis-op-kind-and-unheld-invalidation.json",
-            "f13-txn-internal-order-and-competing-terminals.json",
-        ];
+        assert_eq!(
+            reports.len(),
+            52,
+            "8 tranche + 44 corpus (families 1-6) vectors"
+        );
         for r in &reports {
             assert!(
                 r.structural_ok(),
@@ -541,16 +535,7 @@ mod tests {
                 r.pairs_ok,
                 r.decode_ok
             );
-            if expect_pass.contains(&r.file.as_str()) {
-                assert_eq!(r.semantics, SemStatus::Pass, "{}", r.file);
-            } else {
-                assert!(
-                    matches!(r.semantics, SemStatus::Unimplemented(_)),
-                    "{}: {:?}",
-                    r.file,
-                    r.semantics
-                );
-            }
+            assert_eq!(r.semantics, SemStatus::Pass, "{}", r.file);
         }
     }
 

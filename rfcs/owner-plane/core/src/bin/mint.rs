@@ -1,10 +1,10 @@
-//! Mint the tranche vector files into `../vectors/` (relative to the
-//! crate — i.e. `rfcs/owner-plane/vectors/`). Every emitted vector is
+//! Mint the tranche + corpus vector files into `../vectors/`
+//! (relative to the crate — i.e. `rfcs/owner-plane/vectors/`). Every emitted vector is
 //! checked against the container rules and the companion vocabulary
 //! before it is written; the `tranche::tests` drift gate then pins
 //! the committed bytes to the builders.
 
-use owner_plane_core::{tranche, vector};
+use owner_plane_core::{corpus, tranche, vector};
 
 fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -16,7 +16,9 @@ fn main() {
     )
     .expect("companion parses");
 
-    for v in tranche::tranche() {
+    let mut all = tranche::tranche();
+    all.extend(corpus::corpus());
+    for v in all {
         vector::check(&v.to_json(), &companion)
             .unwrap_or_else(|e| panic!("{} fails mint-time check: {e}", v.name));
         let path = dir.join(format!("f{:02}-{}.json", v.family, v.name));

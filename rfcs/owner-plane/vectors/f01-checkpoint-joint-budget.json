@@ -1,0 +1,21 @@
+{
+  "case_kind": "cap-fit",
+  "expected": {
+    "result": {
+      "fits": false,
+      "sizes": {
+        "checkpointobj": 66685
+      }
+    }
+  },
+  "family": 1,
+  "inputs": {
+    "template": "checkpointobj-max-page"
+  },
+  "name": "checkpoint-joint-budget",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

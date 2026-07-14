@@ -1,0 +1,17 @@
+{
+  "case_kind": "canonical-reject",
+  "expected": {
+    "disposition": "reject-permanent",
+    "outcome": "non-canonical"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "1817"
+  },
+  "name": "nonminimal-uint",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

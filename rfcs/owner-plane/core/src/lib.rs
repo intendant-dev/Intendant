@@ -15,6 +15,7 @@
 //! family vocabulary at mint time.
 
 pub mod cbor;
+pub mod corpus;
 pub mod domains;
 pub mod keyschedule;
 pub mod outcomes;

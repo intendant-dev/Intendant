@@ -13,6 +13,11 @@ serde_json = "1"
 # schema AND the companion with a real JSON Schema engine (Draft
 # 2020-12) — hand-rolled validation is the reference core's lane.
 jsonschema = { version = "0.26", default-features = false }
+# Families 3-5 KAT lanes (third-party primitives, not shared code).
+p256 = { version = "0.13", features = ["ecdsa"] }
+hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 # Standalone: NOT a member of the intendant workspace — lives and
 # versions with the spec, like core/.
