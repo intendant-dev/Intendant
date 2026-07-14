@@ -65,6 +65,13 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     runtime.control_frames_tx = Some(terminal_events_tx.clone());
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
+    // Per-connection ordered display-input lane (F1): `display_input`
+    // frames are handed to ONE forwarder task in dispatch order instead
+    // of spawning a task per event (which raced kd/ku / md/mu pairs
+    // across runtime workers). Dropping `display_input_tx` when this
+    // driver exits ends the forwarder; the shared shutdown token covers
+    // the cancel path.
+    let display_input_tx = spawn_display_input_forwarder(runtime.clone(), shutdown.clone());
     let mut display_authority_rx = runtime
         .display_authority
         .as_ref()
@@ -85,6 +92,7 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
             &mut inbound_uploads,
             &terminal_events_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .await
         {
@@ -396,6 +404,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+    display_input_tx: &mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1
@@ -469,6 +478,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             inbound_uploads,
             terminal_events_tx,
             terminal_forwarders,
+            display_input_tx,
         ) {
             send_control_frame(
                 rtc,

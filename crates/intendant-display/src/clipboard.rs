@@ -2,7 +2,12 @@
 //! and browser.
 //!
 //! Polls the system clipboard every 500ms and emits changes.  Supports both
-//! text and image content.
+//! text and image content.  Polling is gated on viewer presence: while the
+//! display session has zero connected peers the tick does no clipboard
+//! access at all (see [`ClipboardMonitor::start_watching`]), because on
+//! macOS/Linux every poll otherwise shells out to `pbpaste`/`osascript`/
+//! `xclip`/`wl-paste` — a per-second subprocess tax for a sync with no
+//! recipient.
 //!
 //! Platform support:
 //! - **macOS**: `pbpaste` / `pbcopy`, `osascript` for image clipboard
@@ -51,7 +56,29 @@ impl ClipboardMonitor {
     ///
     /// Returns a receiver that emits `ClipboardContent` whenever it changes.
     /// The polling loop runs every 500ms until `stop()` is called.
-    pub fn start_watching(&self) -> mpsc::Receiver<ClipboardContent> {
+    ///
+    /// `peers_connected` gates the actual clipboard reads (F3, 2026-07-13
+    /// display review): while it returns `false` — the display session has
+    /// zero connected viewers — each tick is a no-op, so no clipboard
+    /// subprocess (`pbpaste`/`osascript`/`xclip`/`wl-paste`) or native
+    /// clipboard open is spawned for a sync nobody receives. Polling
+    /// resumes on the first tick after a peer connects. Content that
+    /// changed **during** the pause is deliberately absorbed without
+    /// emitting (a silent re-baseline): pre-gate behavior broadcast such
+    /// changes to an empty peer set — i.e. delivered them to nobody, ever
+    /// — and the gate preserves exactly that.
+    ///
+    /// Production passes a closure over the session's `peer_count` gauge —
+    /// the same peer-presence signal the encoder pool's presence policy
+    /// keys on. Tests inject an arbitrary closure.
+    ///
+    /// Known follow-up (out of scope here): replace 500ms subprocess
+    /// polling on macOS with an `NSPasteboard.changeCount` probe so even
+    /// the with-viewers steady state stops shelling out twice a second.
+    pub fn start_watching(
+        &self,
+        peers_connected: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> mpsc::Receiver<ClipboardContent> {
         let (tx, rx) = mpsc::channel::<ClipboardContent>(4);
         let last_text = Arc::clone(&self.last_text);
         let last_image_hash = Arc::clone(&self.last_image_hash);
@@ -59,10 +86,36 @@ impl ClipboardMonitor {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            // Set while paused; the first active tick after a pause
+            // re-baselines silently instead of emitting.
+            let mut rebaseline = false;
             loop {
                 interval.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
+                }
+
+                // F3 gate: zero viewers → skip all clipboard access.
+                if !peers_connected() {
+                    rebaseline = true;
+                    continue;
+                }
+                if rebaseline {
+                    rebaseline = false;
+                    // Absorb whatever changed while paused (mirror the
+                    // image-over-text priority of the live poll below)
+                    // so it is not replayed to the peer that just
+                    // connected — matching pre-gate semantics, where a
+                    // zero-peer change was polled, "sent" to an empty
+                    // peer map, and never delivered later.
+                    if let Some((_mime, data)) = read_clipboard_image().await {
+                        *last_image_hash.lock().await = simple_hash(&data);
+                        *last_text.lock().await = String::new();
+                    } else if let Some(text) = read_clipboard_text().await {
+                        *last_text.lock().await = text;
+                        *last_image_hash.lock().await = 0;
+                    }
+                    continue;
                 }
 
                 // Check for image content first (higher priority).
@@ -618,6 +671,42 @@ mod tests {
             data: vec![1, 2, 3],
         };
         assert_eq!(a, b);
+    }
+
+    /// F3 gate: with zero connected peers the watcher must emit nothing —
+    /// the `continue` fires before any platform clipboard read, so this
+    /// test is hermetic (no `pbpaste`/`xclip`/arboard subprocess or native
+    /// clipboard is ever touched). Paused tokio time auto-advances through
+    /// ~10 poll intervals deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_is_inert_while_no_peers_connected() {
+        let monitor = ClipboardMonitor::new();
+        let mut rx = monitor.start_watching(Arc::new(|| false));
+
+        let emitted = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            emitted.is_err(),
+            "a peer-gated (zero-viewer) watcher must not emit clipboard content"
+        );
+
+        monitor.stop();
+    }
+
+    /// stop() terminates the gated loop: the receiver closes even though
+    /// the peers gate never opened (the shutdown check precedes the gate).
+    #[tokio::test(start_paused = true)]
+    async fn watcher_stops_while_gated() {
+        let monitor = ClipboardMonitor::new();
+        let mut rx = monitor.start_watching(Arc::new(|| false));
+        monitor.stop();
+
+        // The loop notices the shutdown flag on its next tick and drops
+        // the sender, closing the channel.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+        assert!(
+            matches!(got, Ok(None)),
+            "stop() must end the watcher task even while peer-gated"
+        );
     }
 
     // Windows clipboard image helpers: pure RGBA<->PNG conversions, no live
