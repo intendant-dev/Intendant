@@ -2653,12 +2653,54 @@ impl State {
         Ok(())
     }
 
+    /// Arm-general pin + signature validation WITHOUT the chain gate
+    /// or body stage — what the freeze/placement classifications may
+    /// presuppose. D-76/D-99 stage order: a FORGED operation keeps
+    /// its signature outcome and never freezes the plane (anyone can
+    /// send bytes at an old position; only an authentically SIGNED
+    /// header is fork evidence), while the body stage stays BEHIND
+    /// placement (the header-only signature makes a signed header
+    /// over garbage bytes real evidence — D-99's carve-out).
+    fn ctrl_prevalidate(&self, op: &SignedOp) -> Result<(), Verdict> {
+        Self::ctrl_header_pins(op)?;
+        let pk = match op.header.proof {
+            Proof::Admin { epoch, .. } => self.admin_key(epoch)?,
+            Proof::Recovery {
+                repoch,
+                recovery_pk,
+            } => {
+                let Ok(pk) = <[u8; 32]>::try_from(recovery_pk) else {
+                    return Err(Verdict::Rejected("proof-arm", "reject-permanent"));
+                };
+                let Some(commitment) = self.recovery_commitment else {
+                    return Err(Verdict::Pending("ref-unresolved", "pending-dependency"));
+                };
+                if repoch > self.repoch + 1 || domains::h("drill", &pk) != commitment {
+                    return Err(Verdict::Rejected("proof-arm", "reject-permanent"));
+                }
+                pk
+            }
+            Proof::Genesis { .. } | Proof::Dev { .. } => {
+                return Err(Verdict::Rejected("proof-arm", "reject-permanent"))
+            }
+        };
+        if !op.verify_ed25519(&pk) || op.header.signer_key_id != domains::key_id("ed25519", &pk) {
+            return Err(Verdict::Rejected("sig-invalid", "reject-permanent"));
+        }
+        Ok(())
+    }
+
     /// The pre-admission control gate (C2/C5, §7.4): a frozen plane
     /// admits no control op but the resolving recovery; a differing
     /// op at a HELD position is cut-branch material where a cut or
-    /// recovery covers it, and fork evidence otherwise.
+    /// recovery covers it, and fork evidence otherwise. Pins and the
+    /// SIGNATURE stage precede every placement classification here
+    /// (D-76 first-failing-stage; the D4 repair).
     fn ctrl_fork_gate(&mut self, op: &SignedOp) -> Result<Option<Verdict>, Unimplemented> {
         if self.ctrl_frozen {
+            if let Err(v) = self.ctrl_prevalidate(op) {
+                return Ok(Some(v));
+            }
             return Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")));
         }
         let seq = op.header.writer_sequence;
@@ -2672,7 +2714,11 @@ impl State {
             return Ok(None);
         }
         // Byte-identical replay was consumed by the replay registry;
-        // this op DIFFERS at a held position.
+        // this op DIFFERS at a held position. A forgery keeps its
+        // signature outcome and exerts no precedence.
+        if let Err(v) = self.ctrl_prevalidate(op) {
+            return Ok(Some(v));
+        }
         if self
             .cut_chain
             .get(&seq)

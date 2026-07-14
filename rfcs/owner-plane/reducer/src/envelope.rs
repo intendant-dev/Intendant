@@ -419,7 +419,7 @@ mod tests {
         // 6 control-fold + 3 budget + 8 audit + 9 time corpus minus
         // the journal pair; every fold fixture delivers c1); the two
         // fixtures deliver Txn frames only.
-        assert_eq!(geneses, 52);
+        assert_eq!(geneses, 54);
     }
 
     /// Tampering any byte of the header breaks the signature; the

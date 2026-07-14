@@ -308,6 +308,78 @@ pub fn f7_c3_branch_cut_below_head() -> Vector {
     )
 }
 
+/// The C2 freeze rig plus one post-freeze operation `g4`, optionally
+/// signature-tampered.
+fn post_freeze_fixture(
+    name: &'static str,
+    tamper: bool,
+) -> (PlaneRig, Vec<(&'static str, Signedop)>) {
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4g = rig.simple_grant("grant4", &d1, vec![Verb::Assert]);
+    let mut g4 = rig.grant_op(g4g);
+    if tamper {
+        g4.signature[0] ^= 1;
+    }
+    let c1 = rig.genesis_op.clone();
+    (rig, vec![("c1", c1), ("e2", c2), ("x2", x2), ("g4", g4)])
+}
+
+/// D4 (a): an otherwise-VALID control operation arriving on the
+/// frozen plane classifies (ctrl-fork, freeze-control) — only
+/// recovery resolves C2.
+pub fn f7_post_freeze_valid_op_frozen() -> Vector {
+    let (rig, ops) = post_freeze_fixture("f7-post-freeze-valid", false);
+    let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
+    ctrl_vector(
+        "c2-post-freeze-valid-op-frozen",
+        "fold",
+        "7.4",
+        rig,
+        &refs,
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    )
+}
+
+/// D4 (b): a SIGNATURE-INVALID post-freeze operation keeps its
+/// signature outcome — a forgery is never fork evidence and the
+/// signature stage precedes the frozen-plane classification (D-76).
+pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
+    let (rig, ops) = post_freeze_fixture("f7-post-freeze-sig", true);
+    let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
+    ctrl_vector(
+        "c2-post-freeze-sig-invalid-kept",
+        "fold",
+        "7.4",
+        rig,
+        &refs,
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "sig-invalid", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    )
+}
+
 pub fn corpus_ctrl() -> Vec<Vector> {
     vec![
         f7_hosted_solo_boot(),
@@ -316,6 +388,8 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_drill_acceptance(),
         f7_c2_freeze_both(),
         f7_c3_branch_cut_below_head(),
+        f7_post_freeze_valid_op_frozen(),
+        f7_post_freeze_sig_invalid_kept(),
     ]
 }
 
