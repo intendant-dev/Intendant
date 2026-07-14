@@ -24,11 +24,12 @@ use std::ffi::c_void;
 
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute, kAXErrorSuccess,
-    kAXFocusedAttribute, kAXFocusedWindowAttribute, kAXPositionAttribute, kAXRoleAttribute,
-    kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef,
-    AXUIElementSetMessagingTimeout, AXValueGetTypeID, AXValueGetValue, AXValueRef,
+    kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute,
+    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueGetTypeID,
+    AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFGetTypeID, CFType, TCFType};
@@ -130,6 +131,47 @@ pub fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElemen
         } else {
             Some(notes.join("; "))
         },
+    })
+}
+
+/// The focused element's role and readable value, for bounded `type`
+/// read-back verification.
+pub struct FocusedElementText {
+    /// Normalized role (`AXTextField` → `textfield`), when readable.
+    pub role: Option<String>,
+    /// The element's `AXValue` rendered as text — `None` when the value is
+    /// missing or not a string/number/bool.
+    pub value: Option<String>,
+}
+
+/// Read the system-wide focused UI element's role and value.
+///
+/// Bounded like every AX read in this module (per-element messaging
+/// timeout, two attribute copies). The attribute copies are synchronous IPC
+/// into the focused app — call from `spawn_blocking`.
+pub fn focused_element_text() -> Result<FocusedElementText, String> {
+    if !is_trusted() {
+        return Err(
+            "reading UI elements requires the Accessibility permission — grant Intendant \
+             access in System Settings → Privacy & Security → Accessibility and retry"
+                .to_string(),
+        );
+    }
+    // SAFETY: AXUIElementCreateSystemWide follows the Create rule and has no
+    // preconditions; the wrapper takes ownership and releases on drop.
+    let system = unsafe { AXUIElement::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+    // SAFETY: system is a valid AXUIElement for the duration of the call.
+    unsafe { AXUIElementSetMessagingTimeout(system.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS) };
+    let focused: AXUIElement = copy_attr(&system, kAXFocusedUIElementAttribute)
+        .and_then(|cf| cf.downcast_into())
+        .ok_or_else(|| "no focused UI element".to_string())?;
+    // SAFETY: focused is a valid AXUIElement for the duration of the call.
+    unsafe {
+        AXUIElementSetMessagingTimeout(focused.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS)
+    };
+    Ok(FocusedElementText {
+        role: attr_string(&focused, kAXRoleAttribute).map(|r| normalize_role(&r)),
+        value: attr_value_string(&focused),
     })
 }
 

@@ -1406,13 +1406,7 @@ pub(crate) async fn run_cu_task(
                 .await;
 
                 let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-                let output = if results.iter().all(|r| r.success) {
-                    "Actions executed successfully.".to_string()
-                } else {
-                    let errors: Vec<&str> =
-                        results.iter().filter_map(|r| r.error.as_deref()).collect();
-                    format!("Some actions failed: {}", errors.join("; "))
-                };
+                let output = computer_use::summarize_results_for_model(&cu_call.actions, &results);
 
                 if let Some(screenshot) = last_screenshot {
                     let images = vec![conversation::ImageData {
@@ -1753,12 +1747,7 @@ pub(crate) async fn execute_cu_calls(
 
         // Find the last screenshot from results
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-        let output = if results.iter().all(|r| r.success) {
-            "Actions executed successfully.".to_string()
-        } else {
-            let errors: Vec<&str> = results.iter().filter_map(|r| r.error.as_deref()).collect();
-            format!("Some actions failed: {}", errors.join("; "))
-        };
+        let output = computer_use::summarize_results_for_model(&cu_call.actions, &results);
 
         if let Some(screenshot) = last_screenshot {
             let images = vec![conversation::ImageData {

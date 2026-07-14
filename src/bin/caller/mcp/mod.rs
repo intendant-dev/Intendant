@@ -2045,12 +2045,11 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
     }
 }
 
+/// The per-action status label shown to models: `ok` (effect verified),
+/// `injected` (dispatched to the OS, effect unverified — the honest ceiling
+/// for most input injection), or `failed`.
 fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
-    if result.success && result.error.is_none() {
-        "ok"
-    } else {
-        "failed"
-    }
+    result.status.label()
 }
 
 /// Draw red crosshairs on a screenshot at click/double_click coordinates.
@@ -2319,20 +2318,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cu_result_status_respects_success_flag() {
-        let result = crate::computer_use::CuActionResult {
-            success: false,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "failed");
-
-        let result = crate::computer_use::CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "ok");
+    fn cu_result_status_distinguishes_dispatch_from_verified_effect() {
+        use crate::computer_use::CuActionResult;
+        // Dispatch failure (and verification mismatch) → failed.
+        assert_eq!(cu_result_status(&CuActionResult::failed("boom")), "failed");
+        // Dispatched but unverified must NOT read as an unqualified ok.
+        assert_eq!(cu_result_status(&CuActionResult::injected()), "injected");
+        assert_eq!(
+            cu_result_status(&CuActionResult::injected_with("note")),
+            "injected"
+        );
+        // Only a verified effect earns "ok".
+        assert_eq!(cu_result_status(&CuActionResult::verified()), "ok");
     }
 
     pub(crate) fn spawn_codex_thread_action_result(

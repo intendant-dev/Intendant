@@ -632,10 +632,14 @@ pub async fn type_text(display: &str, text: &str) -> Result<(), String> {
 // ── Clipboard paste ──────────────────────────────────────────────────────────
 
 /// Set the CLIPBOARD selection to `text` (served in-process by the
-/// connection's event thread) and press ctrl+v. The previous clipboard is not
-/// restored — X11 CU displays are agent-owned. The selection keeps being
-/// served after this returns, like a normal clipboard owner, until another
-/// client takes the selection or the daemon exits.
+/// connection's event thread) and press ctrl+v. The previous clipboard is
+/// deliberately not restored: X11 selections are pull-based — the target app
+/// fetches the payload when it processes the chord, possibly after this
+/// returns — so re-owning the selection with the old content would race the
+/// paste itself. (Most CU X11 displays are agent-owned Xvfb anyway; on a
+/// real X11 user session the CU result's detail states the residue.) The
+/// selection keeps being served after this returns, like a normal clipboard
+/// owner, until another client takes the selection or the daemon exits.
 pub async fn paste(display: &str, text: &str) -> Result<(), String> {
     if text.len() > PASTE_MAX_BYTES {
         return Err(format!(
