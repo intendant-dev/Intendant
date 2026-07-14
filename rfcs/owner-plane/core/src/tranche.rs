@@ -20,23 +20,26 @@ use crate::domains::{h_tag, Tag};
 use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
-    ctrl_header, Ccutoff, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate, Crevokedev,
-    Crevokegrant, RevokeMode,
+    ctrl_header, AdminKey, Ccutoff, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate,
+    Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, RevokeMode, CSPACECREATE_OP_TYPE,
 };
 use crate::shapes::envelope::{
     gen_start, seal_op, Actor, ActorKind, Header, OpSigner, Signedop, Tenant, Writer,
 };
+use crate::shapes::identity::Flow;
 use crate::shapes::identity::{
     Authproof, Budget, Cert, Endpoint, Genesis, Grant, GrantTenant, Provenance, SpacesSel, ZoneSel,
 };
 use crate::shapes::journal::AbortReason;
 use crate::shapes::journal::{
-    sign_receipt, Itemcommit, Itemwrap, MissingRec, Pendingxfer, Receiptstmt, Signedstmt, Txn,
-    Txnrec, Xferabort, Xferdone, Xferreopen,
+    sign_receipt, Frontier, Itemcommit, Itemwrap, MissingRec, Pendingxfer, Receiptstmt, Signedstmt,
+    Txn, Txnrec, Xferabort, Xferdone, Xferreopen,
 };
-use crate::shapes::memory::{merkle_root, Bundleleaf, Bundlerec, Mclaim, Merasereq, Mexportrel};
+use crate::shapes::memory::{
+    merkle_root, Bundleleaf, Bundlerec, Mclaim, Merasereq, Mexportrel, Mimport,
+};
 use crate::shapes::{
-    Bytes16, Bytes32, Class, Devclass, Factref, Frontierclose, Hlc, Issuerid, Kekwrap, Kind,
+    Bytes16, Bytes32, Class, Devclass, Factref, Frontierclose, Head, Hlc, Issuerid, Kekwrap, Kind,
     Lineagedef, Opfactref, Polref, Sigalg, Spaceclass, Spacedef, ToValue, Verb,
 };
 use crate::suite::{self, hpke_wrap};
@@ -211,6 +214,8 @@ pub struct PlaneRig {
     pub kek_e1: [u8; 32],
     pub root_sk: ed25519_dalek::SigningKey,
     pub root_pk: [u8; 32],
+    pub recovery_sk: ed25519_dalek::SigningKey,
+    pub recovery_pk: [u8; 32],
     ctrl_seq: u64,
     ctrl_head: Bytes32,
     pub dev1: Device,
@@ -229,7 +234,7 @@ impl PlaneRig {
         let root_seed = rng.draw32("root.sig_seed");
         let (root_sk, root_pk) = suite::ed25519::keypair(&root_seed);
         let recovery_seed = rng.draw32("recovery.sig_seed");
-        let (_recovery_sk, recovery_pk) = suite::ed25519::keypair(&recovery_seed);
+        let (recovery_sk, recovery_pk) = suite::ed25519::keypair(&recovery_seed);
 
         let descriptor = Genesis {
             root_sig_alg: Sigalg::Ed25519,
@@ -370,6 +375,8 @@ impl PlaneRig {
             kek_e1,
             root_sk,
             root_pk,
+            recovery_sk,
+            recovery_pk,
             ctrl_seq: 1,
             ctrl_head,
             dev1,
@@ -408,7 +415,7 @@ impl PlaneRig {
     }
 
     /// A wrap of `kek` at `epoch` to the given recipient (rotations
-    /// mint fresh KEKs at `new_epoch = current + 1`).
+    /// mint fresh KEKs at `new_epoch = current + 1`), genesis zone.
     pub fn wrap_at(
         &mut self,
         device_id: Bytes16,
@@ -417,13 +424,26 @@ impl PlaneRig {
         kek: &[u8; 32],
         draw: &str,
     ) -> Kekwrap {
+        let zone_id = self.zone_id;
+        self.wrap_in(zone_id, kek, device_id, kem_pk, epoch, draw)
+    }
+
+    /// A wrap of `kek` into an arbitrary zone.
+    pub fn wrap_in(
+        &mut self,
+        zone_id: Bytes16,
+        kek: &[u8; 32],
+        device_id: Bytes16,
+        kem_pk: &[u8; 65],
+        epoch: u64,
+        draw: &str,
+    ) -> Kekwrap {
         let eph = self.rng.draw32(draw);
-        let (enc, ct) =
-            keyschedule::wrap_kek(kem_pk, &self.plane_id, &self.zone_id, epoch, kek, &eph)
-                .expect("derived recipient key is well-formed");
+        let (enc, ct) = keyschedule::wrap_kek(kem_pk, &self.plane_id, &zone_id, epoch, kek, &eph)
+            .expect("derived recipient key is well-formed");
         Kekwrap {
             plane_id: self.plane_id,
-            zone_id: self.zone_id,
+            zone_id,
             epoch,
             recipient_device: device_id,
             recipient_kem_key: suite::key_id("hpke-p256-v1", kem_pk),
@@ -434,14 +454,27 @@ impl PlaneRig {
 
     /// A minimal op-authoring grant on the genesis zone's home space.
     pub fn simple_grant(&mut self, tag: &str, dev: &Device, ops: Vec<Verb>) -> Grant {
+        let (zone_id, home) = (self.zone_id, self.home_space);
+        self.grant_in(tag, dev, ops, zone_id, vec![home])
+    }
+
+    /// A minimal op-authoring grant on an arbitrary zone/space set.
+    pub fn grant_in(
+        &mut self,
+        tag: &str,
+        dev: &Device,
+        ops: Vec<Verb>,
+        zone_id: Bytes16,
+        spaces: Vec<Bytes16>,
+    ) -> Grant {
         Grant {
             plane_id: self.plane_id,
             grant_id: draw_id(&mut self.rng, &format!("{tag}.grant_id")),
             subject_device: dev.device_id,
             lineage: Some(dev.lineage),
             tenants: vec![GrantTenant::Memory],
-            zone: ZoneSel::Zone(self.zone_id),
-            spaces: SpacesSel::Spaces(vec![self.home_space]),
+            zone: ZoneSel::Zone(zone_id),
+            spaces: SpacesSel::Spaces(spaces),
             ops,
             kinds: None,
             class_ceiling: Class::Sensitive,
@@ -520,6 +553,17 @@ impl PlaneRig {
     /// root key IS the epoch-1 admin key, O7).
     pub fn enroll_new(&mut self, dev: &Device, grants: Vec<Grant>, wrap_draw: &str) -> Signedop {
         let wraps = vec![self.wrap_to(dev, wrap_draw)];
+        self.enroll_new_with_wraps(dev, grants, wraps)
+    }
+
+    /// [`Self::enroll_new`] with caller-supplied wraps (multi-zone
+    /// enrollments).
+    pub fn enroll_new_with_wraps(
+        &mut self,
+        dev: &Device,
+        grants: Vec<Grant>,
+        wraps: Vec<Kekwrap>,
+    ) -> Signedop {
         let body = Cenrollnew {
             cert: dev.cert.clone(),
             grants,
@@ -675,13 +719,44 @@ impl PlaneRig {
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
+        let (zone_id, space_id) = (self.zone_id, self.home_space);
+        self.tenant_op_in(
+            zone_id,
+            space_id,
+            actor_kind,
+            dev,
+            grant,
+            tag,
+            op_type,
+            body,
+            writer_sequence,
+            previous_writer_hash,
+        )
+    }
+
+    /// The tenant-op workhorse, zone/space-parametrized (epochs stay
+    /// 1 — every fixture zone is at its creation epochs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tenant_op_in(
+        &mut self,
+        zone_id: Bytes16,
+        space_id: Bytes16,
+        actor_kind: ActorKind,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        op_type: &str,
+        body: cbor::Value,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
         let request_id = draw_id(&mut self.rng, &format!("{tag}.request_id"));
         let hlc = self.next_hlc();
         let header = Header {
             tenant: Tenant::Memory,
             plane_id: self.plane_id,
-            zone_id: self.zone_id,
-            space_id: self.home_space,
+            zone_id,
+            space_id,
             authored_kek_epoch: 1,
             capability_epoch: 1,
             signer_alg: Sigalg::Ed25519,
@@ -780,6 +855,7 @@ impl PlaneRig {
         content_digest: Bytes32,
         dest_zone: Bytes16,
         dest_space: Bytes16,
+        data_frontier: Bytes32,
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
@@ -793,7 +869,7 @@ impl PlaneRig {
                 space_id: dest_space,
             },
             class_floor: Class::Private,
-            data_frontier: self.rng.draw32(&format!("{tag}.data_frontier")),
+            data_frontier,
             control_frontier: self.ctrl_head,
             as_of_ms: self.hlc_ms,
             expiry_deadline_ms: self.hlc_ms + 86_400_000,
@@ -831,6 +907,76 @@ impl PlaneRig {
             gen: op.header.writer.gen,
             seq: op.header.writer_sequence,
         }
+    }
+
+    /// `c.zone_create` — a second zone at epoch 1 under the B.1 solo
+    /// posture, with the given recipient wraps.
+    pub fn zone_create(&mut self, zone_id: Bytes16, wraps: Vec<Kekwrap>) -> Signedop {
+        let body = Czonecreate {
+            zone_id,
+            wraps,
+            zone_policy: scenario::genesis_zone_policy(zone_id),
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Czonecreate::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.space_create` — the body is a bare `spacedef`.
+    pub fn space_create(&mut self, space: Spacedef) -> Signedop {
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(CSPACECREATE_OP_TYPE, proof, space.to_value())
+    }
+
+    /// The control chain's current `(seq, head op hash)` — C3′ bases
+    /// name these.
+    pub fn ctrl_position(&self) -> (u64, Bytes32) {
+        (self.ctrl_seq, self.ctrl_head)
+    }
+
+    /// `c.recovery_succession` (C3′): recovery-arm, signed by the
+    /// revealed recovery key; placement frozen at
+    /// `writer_sequence = base.seq + 1`, `previous_writer_hash =
+    /// base.op` (§7.4). Advances the rig chain (the fixture recovery
+    /// bases on the head and cuts nothing control-side).
+    pub fn recovery_op(&mut self, body: Crecovsucc) -> Signedop {
+        let seq = body.base_seq + 1;
+        let request_id = draw_id(&mut self.rng, &format!("ctrl{seq}.request_id"));
+        let hlc = self.next_hlc();
+        let header = ctrl_header(
+            self.plane_id,
+            CTRL_ZONE,
+            CTRL_SPACE,
+            Sigalg::Ed25519,
+            suite::key_id("ed25519", &self.recovery_pk),
+            Writer {
+                lineage: CTRL_LINEAGE,
+                gen: 1,
+            },
+            Authproof::Recovery {
+                repoch: body.repoch,
+                recovery_pk: self.recovery_pk,
+            },
+            request_id,
+            seq,
+            Some(body.base_op),
+            hlc,
+            Crecovsucc::OP_TYPE,
+        );
+        let op = seal_op(
+            header,
+            body.to_value(),
+            &OpSigner::Ed25519(&self.recovery_sk),
+        );
+        assert!(op.verify(&self.recovery_pk), "recovery op must verify");
+        self.ctrl_seq = seq;
+        self.ctrl_head = op.op_hash();
+        op
     }
 
     /// A signed storage receipt from `dev` (issuer_seq 1) — a real
@@ -1111,6 +1257,7 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
     let content_digest = rig.rng.draw32("rel.content_digest");
     let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
     let dest_space = draw_id(&mut rig.rng, "dest.space_id");
+    let data_frontier = rig.rng.draw32("rel.data_frontier");
     let grant = rig.genesis_grant.clone();
     let rel = rig.release_op_signed(
         &d1,
@@ -1121,6 +1268,7 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
         content_digest,
         dest_zone,
         dest_space,
+        data_frontier,
         1,
         None,
     );
@@ -1498,6 +1646,7 @@ pub fn f11_erase_deferral() -> Vector {
     .leaf_hash()]);
     let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
     let dest_space = draw_id(&mut rig.rng, "dest.space_id");
+    let data_frontier = rig.rng.draw32("rel.data_frontier");
     let rel = rig.release_op_signed(
         &d1,
         &g1,
@@ -1507,6 +1656,7 @@ pub fn f11_erase_deferral() -> Vector {
         digest,
         dest_zone,
         dest_space,
+        data_frontier,
         1,
         None,
     );
@@ -1607,6 +1757,306 @@ pub fn f11_erase_deferral() -> Vector {
     }
 }
 
+/// Tranche #7 — family 11 fold: the collision loser re-enters when
+/// the frozen winner dies (D-155/D-161/D-169/D-196; the §13.3
+/// family-11 arc "A-frozen → B-collision → A dies → B re-enters and
+/// may own"). dev2's import `m1` admits and is FROZEN by the
+/// revocation of its grant with a cutoff preserving it (the frontier
+/// forecloses its lineage's claim room, D-155). dev3 — the next
+/// import grant, so the next claimant in the (grant position, gen,
+/// seq) total order — imports the same released record byte-distinct:
+/// a claim against a frozen owner, `import-collision`
+/// (quarantine-reproposal, the DERIVED lane). The C3′ recovery bases
+/// on the chain head (nothing control-side cut), names dev1's and
+/// dev3's tenant histories, and OMITS (Z2, dev2.lineage): the
+/// revivable recovery-omission blanket quarantines the winner
+/// (`cutoff`, D-140). The total re-fold re-derives the claimant fold:
+/// the first SURVIVING claimant is now `m2` — the former loser owns
+/// provisionally (m1's revivable quarantine reserves the key against
+/// freezing, D-161/D-169) and ADMITS.
+pub fn f11_collision_loser_reentry() -> Vector {
+    let name = "collision-loser-reenters-on-winner-death";
+    const STMT: &str = "quarterly reconciliation ledger balanced to zero";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let (gz, home) = (rig.zone_id, rig.home_space);
+
+    // Z2: the destination zone (epoch 1, wrapped to dev1).
+    let z2 = draw_id(&mut rig.rng, "zone2.zone_id");
+    let kek2 = rig.rng.draw32("kek.zone2.e1");
+    let w1 = rig.wrap_in(z2, &kek2, d1.device_id, &d1.kem_pk, 1, "wrap.z2.dev1.eph");
+    let cz = rig.zone_create(z2, vec![w1]);
+
+    // Z2's project space (workflow-v1 status policy).
+    let z2_space = draw_id(&mut rig.rng, "zone2.space_id");
+    let z2_name_hash = rig.rng.draw32("zone2.space.name_hash");
+    let cs = rig.space_create(Spacedef {
+        space_id: z2_space,
+        zone_id: z2,
+        name_hash: z2_name_hash,
+        space_class: Spaceclass::Project,
+        class_minimum: Class::Private,
+        status_policy: Polref {
+            id: "workflow-v1".into(),
+            version: 1,
+            hash: scenario::workflow_v1().hash(),
+        },
+    });
+
+    // dev2 + the zone's FIRST import grant (one active per zone).
+    let dev2 = rig.mint_device("dev2");
+    let g2 = rig.grant_in("grant2", &dev2, vec![Verb::Import], z2, vec![z2_space]);
+    let w2 = rig.wrap_in(
+        z2,
+        &kek2,
+        dev2.device_id,
+        &dev2.kem_pk,
+        1,
+        "wrap.z2.dev2.eph",
+    );
+    let c2 = rig.enroll_new_with_wraps(&dev2, vec![g2.clone()], vec![w2]);
+
+    // dev1's export grant carrying the flow to Z2 (the genesis grant
+    // pins no flows — D-76 — so the release needs this one).
+    let mut gf_grant = rig.grant_in(
+        "grantflow",
+        &d1,
+        vec![Verb::Read, Verb::Export],
+        gz,
+        vec![home],
+    );
+    gf_grant.flows = Some(vec![Flow {
+        from_zone: gz,
+        from_space: None,
+        to: Endpoint::Plane {
+            plane_id: rig.plane_id,
+            zone_id: z2,
+            space_id: z2_space,
+        },
+        kinds: None,
+        class_ceiling: Class::Sensitive,
+        expiry_deadline_ms: T0_MS + 10 * 86_400_000,
+    }]);
+    let gf = rig.grant_op(gf_grant.clone());
+
+    // The source claim and its release (REAL stamp: the genesis
+    // zone's frontier hash at i1, and this fixture's real bundle).
+    let i1 = rig.claim(&d1, &g1, "i1", STMT, 1, None);
+    let export_id = draw_id(&mut rig.rng, "rel.export_id");
+    let digest = merkle_root(&[Bundleleaf {
+        export_id,
+        rec_index: 0,
+        rec: Bundlerec {
+            op: i1.op_hash(),
+            kind: Kind::Observation,
+            statement: STMT.into(),
+            class_floor: Class::Private,
+        },
+    }
+    .leaf_hash()]);
+    let stamp = Frontier {
+        zone_id: gz,
+        heads: vec![Head {
+            lineage: d1.lineage,
+            gen: 1,
+            seq: 1,
+            op: i1.op_hash(),
+        }],
+    }
+    .hash();
+    let rel = rig.release_op_signed(
+        &d1,
+        &gf_grant,
+        "rel",
+        export_id,
+        vec![i1.op_hash()],
+        digest,
+        z2,
+        z2_space,
+        stamp,
+        2,
+        Some(i1.op_hash()),
+    );
+
+    // m1: dev2's import — the D-134 fully-derived content; single
+    // leaf, so the Merkle path is empty and the leaf IS the root.
+    let import_body = Mimport {
+        source_op: i1.op_hash(),
+        class_floor: Class::Private,
+        kind: Kind::Observation,
+        statement: STMT.into(),
+        sensitivity: Class::Private,
+        rec_index: 0,
+        proof: vec![],
+        from_plane: rig.plane_id,
+        export_id,
+        release_op: rel.op_hash(),
+        digest,
+    };
+    let m1 = rig.tenant_op_in(
+        z2,
+        z2_space,
+        ActorKind::Daemon,
+        &dev2,
+        &g2,
+        "m1",
+        Mimport::OP_TYPE,
+        import_body.to_value(),
+        1,
+        None,
+    );
+
+    // rg: revoke g2 with the cutoff AT m1's head — m1 is preserved
+    // at-or-below and frozen by the frontier that forecloses its
+    // lineage's remaining claim room (D-155).
+    let rg = rig.revoke_grant_op(
+        g2.grant_id,
+        Some(Frontierclose {
+            zone_id: z2,
+            lineage: dev2.lineage,
+            heads: vec![Head {
+                lineage: dev2.lineage,
+                gen: 1,
+                seq: 1,
+                op: m1.op_hash(),
+            }],
+        }),
+    );
+
+    // dev3 + the successor import grant (legal: g2 is revoked).
+    let dev3 = rig.mint_device("dev3");
+    let g3 = rig.grant_in("grant3", &dev3, vec![Verb::Import], z2, vec![z2_space]);
+    let w3 = rig.wrap_in(
+        z2,
+        &kek2,
+        dev3.device_id,
+        &dev3.kem_pk,
+        1,
+        "wrap.z2.dev3.eph",
+    );
+    let c3 = rig.enroll_new_with_wraps(&dev3, vec![g3.clone()], vec![w3]);
+
+    // m2: the same record, byte-distinct (new writer, new request) —
+    // a claim against the FROZEN m1.
+    let m2 = rig.tenant_op_in(
+        z2,
+        z2_space,
+        ActorKind::Daemon,
+        &dev3,
+        &g3,
+        "m2",
+        Mimport::OP_TYPE,
+        import_body.to_value(),
+        1,
+        None,
+    );
+
+    // r: the C3′ — base = the chain head (nothing control-side cut);
+    // dev1's and dev3's tenant histories NAMED at their heads;
+    // (Z2, dev2.lineage) OMITTED — the revivable blanket kills the
+    // frozen winner.
+    let (base_seq, base_op) = rig.ctrl_position();
+    let admin2_seed = rig.rng.draw32("admin2.sig_seed");
+    let (_a2_sk, a2_pk) = suite::ed25519::keypair(&admin2_seed);
+    let recovery2_seed = rig.rng.draw32("recovery2.sig_seed");
+    let (_r2_sk, r2_pk) = suite::ed25519::keypair(&recovery2_seed);
+    let r = rig.recovery_op(Crecovsucc {
+        base_seq,
+        base_op,
+        epoch: 2,
+        repoch: 1,
+        new_admin: AdminKey {
+            alg: Sigalg::Ed25519,
+            pk: a2_pk.to_vec(),
+        },
+        new_recovery_commitment: h_tag(Tag::Drill, &r2_pk),
+        tenant_cutoffs: vec![
+            Frontierclose {
+                zone_id: gz,
+                lineage: d1.lineage,
+                heads: vec![Head {
+                    lineage: d1.lineage,
+                    gen: 1,
+                    seq: 2,
+                    op: rel.op_hash(),
+                }],
+            },
+            Frontierclose {
+                zone_id: z2,
+                lineage: dev3.lineage,
+                heads: vec![Head {
+                    lineage: dev3.lineage,
+                    gen: 1,
+                    seq: 1,
+                    op: m2.op_hash(),
+                }],
+            },
+        ],
+        adopted_renewals: None,
+        retired_keys: None,
+        adopted_rotations: vec![],
+    });
+
+    let c1 = &rig.genesis_op;
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items(&[
+            ("c1", c1),
+            ("cz", &cz),
+            ("cs", &cs),
+            ("c2", &c2),
+            ("gf", &gf),
+            ("i1", &i1),
+            ("rel", &rel),
+            ("m1", &m1),
+            ("rg", &rg),
+            ("c3", &c3),
+            ("m2", &m2),
+            ("r", &r),
+        ]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["c1", "cz", "cs", "c2", "gf", "i1", "rel", "m1", "rg", "c3", "m2", "r"]]),
+    );
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "fold".into(),
+        source: "11.8".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [
+                admits("c1"),
+                admits("cz"),
+                admits("cs"),
+                admits("c2"),
+                admits("gf"),
+                admits("i1"),
+                admits("rel"),
+                { "item": "m1", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
+                admits("rg"),
+                admits("c3"),
+                admits("m2"),
+                admits("r"),
+            ],
+            "converge": true,
+            "trace": [{
+                "delivery": 0,
+                "after": "m2",
+                "item": "m2",
+                "outcome": "import-collision",
+                "disposition": "quarantine-reproposal",
+            }],
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
     vec![
@@ -1614,6 +2064,7 @@ pub fn tranche() -> Vec<Vector> {
         f7_negation_residual(),
         f7_pending_revocation_window_grant(),
         f7_staged_frontier_consumed(),
+        f11_collision_loser_reentry(),
         f11_erase_deferral(),
         f11_reopen_basis_types(),
         f13_txn_internal_order(),
@@ -1656,6 +2107,23 @@ mod tests {
         // D-190 — the negation residual this tranche pins.
         "**P-vs-−P negation reuse** (exact-SEC1 equality is deliberate — a holder of scalar d derives −P's scalar, and negation is NOT detected; D-190)",
         "all under EXACT-SEC1 identity — −P and related keys are outside the equivalence, stated §14 residuals, D-190",
+        // D-155/D-161/D-196 — the collision-loser arc (family 11).
+        "a claim
+against a frozen owner is `import-collision` — a fold outcome in
+the DERIVED lane,
+never a terminal cause (D-177/D-196) — and the freeze basis dying
+unfreezes the key at the FOLD level: the claimant fold re-derives
+INCLUDING the former collision loser (A-frozen → B-collision →
+A's proof dies → B re-enters and may own",
+        "(an at-or-below
+preserved claimant after grant revocation is thereby CLASSIFIED:
+frozen by the frontier that forecloses its competitors, D-155)",
+        "a claimant pending
+proof AND a claimant in revivable quarantine both RESERVE the key
+against freezing",
+        "beyond a ratify boundary or the recovery-omission blanket = revivable",
+        "effective owner at any fold position is the order's first
+surviving claimant; ownership **freezes** when a derived predicate",
     ];
 
     #[test]
@@ -1820,5 +2288,77 @@ mod tests {
             keyschedule::open_kek(&d, &rig.plane_id, &rig.zone_id, 1, &w.enc, &w.ct),
             None
         );
+    }
+
+    /// #7 internals: the two imports share the replay key but are
+    /// byte-distinct; the single-leaf Merkle proof folds to the
+    /// release digest; the C3′ placement arithmetic holds and the
+    /// recovery commitment matches the revealed key.
+    #[test]
+    fn f11_collision_internals() {
+        use crate::shapes::memory::fold_proof;
+        let v = f11_collision_loser_reentry();
+        let items = &v.to_json()["inputs"]["items"];
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let m1 = unhex(items["m1"].as_str().unwrap());
+        let m2 = unhex(items["m2"].as_str().unwrap());
+        assert_ne!(m1, m2, "claimants must be byte-distinct");
+
+        // Rebuild the rig deterministically for structured access.
+        let name = "collision-loser-reenters-on-winner-death";
+        let mut rig = PlaneRig::new(name);
+        let d1 = rig.dev1.clone();
+        let z2 = draw_id(&mut rig.rng, "zone2.zone_id");
+        let kek2 = rig.rng.draw32("kek.zone2.e1");
+        let w1 = rig.wrap_in(z2, &kek2, d1.device_id, &d1.kem_pk, 1, "wrap.z2.dev1.eph");
+        // The Z2 wrap really opens to dev1 under Z2's context.
+        assert_eq!(
+            keyschedule::open_kek(&d1.kem_sk, &rig.plane_id, &z2, 1, &w1.enc, &w1.ct),
+            Some(kek2)
+        );
+
+        // The import's empty proof folds the single leaf to the root.
+        let g1 = rig.genesis_grant.clone();
+        let _cz = rig.zone_create(z2, vec![w1]);
+        let z2_space = draw_id(&mut rig.rng, "zone2.space_id");
+        let _nh = rig.rng.draw32("zone2.space.name_hash");
+        let dev2 = rig.mint_device("dev2");
+        let _g2 = rig.grant_in("grant2", &dev2, vec![Verb::Import], z2, vec![z2_space]);
+        let _w2 = rig.wrap_in(
+            z2,
+            &kek2,
+            dev2.device_id,
+            &dev2.kem_pk,
+            1,
+            "wrap.z2.dev2.eph",
+        );
+        let _gfid = draw_id(&mut rig.rng, "grantflow.grant_id");
+        let i1 = rig.claim(
+            &d1,
+            &g1,
+            "i1.probe",
+            "quarterly reconciliation ledger balanced to zero",
+            1,
+            None,
+        );
+        let export_id = draw_id(&mut rig.rng, "rel.export_id.probe");
+        let leaf = Bundleleaf {
+            export_id,
+            rec_index: 0,
+            rec: Bundlerec {
+                op: i1.op_hash(),
+                kind: Kind::Observation,
+                statement: "quarterly reconciliation ledger balanced to zero".into(),
+                class_floor: Class::Private,
+            },
+        }
+        .leaf_hash();
+        let digest = merkle_root(&[leaf]);
+        assert_eq!(fold_proof(leaf, 0, 1, &[]), Some(digest));
     }
 }
