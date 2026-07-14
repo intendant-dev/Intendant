@@ -996,12 +996,7 @@ fn find_wrapper_config_for_external_session(
         if config_source != source {
             continue;
         }
-        let jsonl = dir.join("session.jsonl");
-        let Ok(contents) = std::fs::read_to_string(jsonl) else {
-            continue;
-        };
-        let mentions = ids.iter().any(|id| contents.contains(id));
-        if mentions {
+        if wrapper_config_matches_external_session(&dir, source, &ids) {
             if config.source.is_none() {
                 config.source = Some(source.to_string());
             }
@@ -1009,6 +1004,42 @@ fn find_wrapper_config_for_external_session(
         }
     }
     None
+}
+
+/// A wrapper config belongs to an external thread only when persisted
+/// identity names it. Never infer identity from an arbitrary substring in
+/// `session.jsonl`: prompts, tool output, and project paths routinely contain
+/// other session ids (and can otherwise lend one thread another's launch
+/// config).
+fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[String]) -> bool {
+    let dir_id = dir.file_name().and_then(|name| name.to_str());
+    let canonical_id = crate::session_identity::canonical_session_id_from_meta(dir);
+    if ids
+        .iter()
+        .any(|id| dir_id == Some(id.as_str()) || canonical_id.as_deref() == Some(id.as_str()))
+    {
+        return true;
+    }
+
+    for id in ids {
+        let Some(scan) = crate::session_identity::scan_session_dir(dir, id) else {
+            continue;
+        };
+        if scan.identities.iter().any(|identity| {
+            identity.source == source
+                && (identity.backend_session_id == *id
+                    || identity.wrapper_id.as_deref() == Some(id.as_str()))
+        }) {
+            return true;
+        }
+        // Pre-structured-event logs recorded the backend id in one frozen,
+        // exact message grammar. The shared reader parses only that grammar;
+        // ordinary user/tool text cannot become identity evidence.
+        if scan.count == 0 && scan.legacy_resume_id.as_deref() == Some(id.as_str()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1440,6 +1471,91 @@ mod tests {
             loaded.codex_home.as_deref(),
             Some("/home/user/.codex-managed")
         );
+    }
+
+    #[test]
+    fn resume_does_not_borrow_config_from_arbitrary_session_id_mentions() {
+        let home = tempfile::tempdir().unwrap();
+        let unrelated_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("unrelated-wrapper");
+        let unrelated = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("haiku"),
+            ..Default::default()
+        });
+        write_log_dir_config(&unrelated_dir, &unrelated).unwrap();
+        std::fs::write(
+            unrelated_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "unrelated-wrapper",
+                "project_root": "/tmp/unrelated"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let target_id = "07ca095f-c8aa-4d95-af53-c5f67cad6c3a";
+        std::fs::write(
+            unrelated_dir.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "event": "session_identity",
+                    "data": {
+                        "session_id": "unrelated-wrapper",
+                        "source": "claude-code",
+                        "backend_session_id": "unrelated-backend"
+                    }
+                }),
+                serde_json::json!({
+                    "event": "info",
+                    "message": format!("write /tmp/{target_id}/scratchpad/file.txt")
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert!(load_for_resume(home.path(), "claude-code", target_id, Some(target_id)).is_none());
+    }
+
+    #[test]
+    fn resume_finds_wrapper_config_from_structured_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-id");
+        let config = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("fable"),
+            ..Default::default()
+        });
+        write_log_dir_config(&wrapper_dir, &config).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            serde_json::json!({
+                "event": "session_identity",
+                "data": {
+                    "session_id": "wrapper-id",
+                    "source": "claude-code",
+                    "backend_session_id": "backend-thread"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load_for_resume(
+            home.path(),
+            "claude-code",
+            "wrapper-id",
+            Some("backend-thread"),
+        )
+        .expect("structured identity should find the wrapper config");
+        assert_eq!(loaded.claude_model.as_deref(), Some("fable"));
     }
 
     #[test]
