@@ -12727,6 +12727,66 @@ html.ui-v2 .global-task-bar:focus-within {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22), var(--shadow-card);
 }
+
+/* ── composer states: expanded ⇄ pill ─────────────────────────────────
+   ui2WireComposerState stamps data-composer-state on <html>: "expanded"
+   is the full dock; "pill" collapses the same fixed element into a small
+   centered lozenge so immersive surfaces (the per-tab defaults: Live,
+   Station, Terminal, Files) keep the bottom of the viewport. The
+   reservation invariant is untouched — --ui2-composer-h simply measures
+   the pill. The child hide is !important on purpose: chip/attachment
+   children carry inline display toggles and focus-within reveals, and
+   the pill state must override every one of them. */
+html.ui-v2 .ui2-composer-pill { display: none; }
+html.ui-v2 .ui2-composer-collapse {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex-shrink: 0; padding: 0;
+  border: 0; border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-3); cursor: pointer;
+}
+html.ui-v2 .ui2-composer-collapse:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .ui2-composer-collapse svg { transform: rotate(90deg); } /* chev points down */
+html.ui-v2[data-composer-state="pill"] .global-task-bar {
+  width: auto;
+  min-width: 0;
+  max-width: min(340px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 24px));
+  padding: 8px 16px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  justify-content: center;
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar > *:not(.ui2-composer-pill) { display: none !important; }
+html.ui-v2[data-composer-state="pill"] .ui2-composer-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 700; color: var(--text-2);
+  white-space: nowrap;
+  pointer-events: none; /* the whole lozenge is the click target */
+}
+html.ui-v2 .ui2-composer-pill-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-3);
+}
+html.ui-v2 .ui2-composer-pill[data-phase="running"] .ui2-composer-pill-dot,
+html.ui-v2 .ui2-composer-pill[data-phase="thinking"] .ui2-composer-pill-dot {
+  background: var(--iris);
+  animation: ui2-pulse 1.3s infinite;
+}
+html.ui-v2 .ui2-composer-pill[data-phase="waiting"] .ui2-composer-pill-dot { background: var(--amber); }
+html.ui-v2 .ui2-composer-pill[data-phase="done"] .ui2-composer-pill-dot { background: var(--green); }
+html.ui-v2 .ui2-composer-pill-draft {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--amber);
+  display: none;
+}
+html.ui-v2 .ui2-composer-pill.has-draft .ui2-composer-pill-draft { display: inline-block; }
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .ui2-composer-pill-dot { animation: none !important; }
+}
+
 /* phase + stop live in the oversight bar under v2 */
 html.ui-v2 .global-task-bar .phase-banner { display: none; }
 html.ui-v2 .global-task-bar .stop-btn { display: none; }
@@ -12847,29 +12907,39 @@ html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
    ~40% of the viewport; focusing it (or targeting a session) expands the
    full control set. :focus-within covers typing, target chip, attach and
    Direct once expanded. */
-@media (max-width: 500px) {
+@media (max-width: 600px) {
   /* The dock hugs the edge tighter on phones; the #app reservation keeps
      following the measured bar height (the old fixed 64px was smaller
-     than the bar itself — the root of the covered-controls bug). */
+     than the bar itself — the root of the covered-controls bug). The
+     breakpoint is 600, not 500: v1's ≤600 wrap rules force the input
+     onto its own row with Send alone under it — the order/flex resets
+     below re-join them into one compact resting row across the whole
+     band, with the secondary controls appearing on focus. */
   html.ui-v2 { --ui2-composer-off: 8px; }
   html.ui-v2 .global-task-bar {
     width: calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 16px);
     padding: 6px 8px;
     flex-wrap: wrap;
   }
+  html.ui-v2 .global-task-bar .global-task-input {
+    order: 0;
+    flex: 1 1 auto;
+    width: auto;
+    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
+    max-height: 2.4em;
+  }
+  html.ui-v2 .global-task-bar .global-send-btn { order: 0; flex: 0 0 auto; }
   html.ui-v2 .global-task-bar .task-new-session-btn,
   html.ui-v2 .global-task-bar .global-attach-btn,
-  html.ui-v2 .global-task-bar .global-direct-toggle {
+  html.ui-v2 .global-task-bar .global-direct-toggle,
+  html.ui-v2 .global-task-bar .ui2-composer-collapse {
     display: none;
   }
   html.ui-v2 .global-task-bar:focus-within .task-new-session-btn,
   html.ui-v2 .global-task-bar:focus-within .global-attach-btn,
-  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle {
+  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle,
+  html.ui-v2 .global-task-bar:focus-within .ui2-composer-collapse {
     display: inline-flex;
-  }
-  html.ui-v2 .global-task-bar .global-task-input {
-    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
-    max-height: 2.4em;
   }
   html.ui-v2 .global-task-bar:focus-within .global-task-input {
     max-height: 6em;
@@ -26794,6 +26864,125 @@ function ui2WireComposerMech() {
   }
 }
 
+const UI2_COMPOSER_PILL_DEFAULT_TABS = new Set(['displays', 'station', 'terminal', 'files']);
+
+function ui2WireComposerState() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const rootEl = document.documentElement;
+  const input = document.getElementById('activity-task-input');
+
+  const pill = document.createElement('span');
+  pill.className = 'ui2-composer-pill';
+  const dot = document.createElement('span');
+  dot.className = 'ui2-composer-pill-dot';
+  const pillLabel = document.createElement('span');
+  pillLabel.textContent = 'Ask Intendant';
+  const draftDot = document.createElement('span');
+  draftDot.className = 'ui2-composer-pill-draft';
+  draftDot.title = 'Unsent draft';
+  pill.append(dot, pillLabel, draftDot);
+  bar.appendChild(pill);
+
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'ui2-composer-collapse';
+  collapse.title = 'Collapse composer (Esc)';
+  collapse.setAttribute('aria-label', 'Collapse composer');
+  collapse.innerHTML = ui2Icon('chev', 14);
+  bar.insertBefore(collapse, document.getElementById('phase-banner'));
+
+  const activeTabId = () => {
+    const pane = document.querySelector('.tab-pane.active');
+    return pane ? pane.id.replace(/^tab-/, '') : 'activity';
+  };
+  const stateKey = (tab) => 'intendant.ui2.composerState.' + tab;
+  const stateFor = (tab) => {
+    try {
+      const o = localStorage.getItem(stateKey(tab));
+      if (o === 'pill' || o === 'expanded') return o;
+    } catch (_) { /* private mode: defaults only */ }
+    return UI2_COMPOSER_PILL_DEFAULT_TABS.has(tab) ? 'pill' : 'expanded';
+  };
+  const syncDraft = () => {
+    pill.classList.toggle('has-draft', !!(input && input.value.trim()));
+  };
+
+  let current = '';
+  const setState = (next, remember = false) => {
+    if (next !== 'pill' && next !== 'expanded') return;
+    if (remember) {
+      try { localStorage.setItem(stateKey(activeTabId()), next); } catch (_) { /* private mode */ }
+    }
+    if (current === next) return;
+    current = next;
+    rootEl.dataset.composerState = next;
+    if (next === 'pill') {
+      // Children go display:none — never leave focus on a hidden control
+      // (it would also pin the keyboard lift).
+      if (bar.contains(document.activeElement)) document.activeElement.blur();
+      bar.setAttribute('role', 'button');
+      bar.setAttribute('tabindex', '0');
+      bar.setAttribute('aria-label', 'Expand composer');
+      syncDraft();
+    } else {
+      bar.removeAttribute('role');
+      bar.removeAttribute('tabindex');
+      bar.removeAttribute('aria-label');
+    }
+    window.dispatchEvent(new CustomEvent('ui2:composer-state', { detail: { state: next } }));
+  };
+
+  const expandAndFocus = (viaTouch) => {
+    setState('expanded', true);
+    // Touch keeps the keyboard down until the user taps the input.
+    if (!viaTouch && input) input.focus();
+  };
+
+  // Programmatic seam for palette/shortcut callers: expand before focusing
+  // (a pilled dock's children are display:none and cannot receive focus).
+  window.ui2ComposerExpand = () => setState('expanded');
+
+  bar.addEventListener('click', (e) => {
+    if (current !== 'pill') return;
+    expandAndFocus(e.pointerType === 'touch');
+  });
+  collapse.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setState('pill', true);
+  });
+  bar.addEventListener('keydown', (e) => {
+    if (current === 'pill' && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      expandAndFocus(false);
+      return;
+    }
+    // Bubble phase: the peek's capture-phase Esc (close-peek) stops
+    // propagation while the peek is open, so this fires only with no peek
+    // up. Esc is get-out-of-my-way, not a preference — no remember.
+    if (e.key === 'Escape' && current === 'expanded') setState('pill');
+  });
+  if (input) input.addEventListener('input', syncDraft);
+
+  ui2Mirror('phase-banner', (banner) => {
+    pill.dataset.phase = ui2PhaseCategory(banner.className);
+  });
+
+  const applyForTab = (tab) => setState(stateFor(String(tab || '')));
+  if (typeof switchTab === 'function') {
+    // One shared module scope: rebinding the declaration retargets every
+    // caller (nav, palette, router deep links), so the per-tab state rides
+    // every navigation path.
+    const origSwitchTab = switchTab;
+    switchTab = function (tabId) {
+      const r = origSwitchTab.apply(this, arguments);
+      if (r !== false) applyForTab(tabId);
+      return r;
+    };
+  }
+  applyForTab(activeTabId());
+}
+
 ui2BuildNav();
 {
   // Single-boot: a module script executes at readyState 'interactive', so
@@ -26805,6 +26994,7 @@ ui2BuildNav();
     ui2WireMirrors();
     ui2WirePalette();
     ui2WireComposerMech();
+    ui2WireComposerState();
     // Fuel chip: transport-status flips repaint it via the existing
     // #sb-dashboard-transport mirror lane; the interval keeps the lease
     // countdown honest between flips.
@@ -27401,7 +27591,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '9b5f86e4e3030e63';
+const INTENDANT_APP_BUILD = '51f2efdb2b96c3c9';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {

@@ -913,6 +913,125 @@ function ui2WireComposerMech() {
   }
 }
 
+const UI2_COMPOSER_PILL_DEFAULT_TABS = new Set(['displays', 'station', 'terminal', 'files']);
+
+function ui2WireComposerState() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const rootEl = document.documentElement;
+  const input = document.getElementById('activity-task-input');
+
+  const pill = document.createElement('span');
+  pill.className = 'ui2-composer-pill';
+  const dot = document.createElement('span');
+  dot.className = 'ui2-composer-pill-dot';
+  const pillLabel = document.createElement('span');
+  pillLabel.textContent = 'Ask Intendant';
+  const draftDot = document.createElement('span');
+  draftDot.className = 'ui2-composer-pill-draft';
+  draftDot.title = 'Unsent draft';
+  pill.append(dot, pillLabel, draftDot);
+  bar.appendChild(pill);
+
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'ui2-composer-collapse';
+  collapse.title = 'Collapse composer (Esc)';
+  collapse.setAttribute('aria-label', 'Collapse composer');
+  collapse.innerHTML = ui2Icon('chev', 14);
+  bar.insertBefore(collapse, document.getElementById('phase-banner'));
+
+  const activeTabId = () => {
+    const pane = document.querySelector('.tab-pane.active');
+    return pane ? pane.id.replace(/^tab-/, '') : 'activity';
+  };
+  const stateKey = (tab) => 'intendant.ui2.composerState.' + tab;
+  const stateFor = (tab) => {
+    try {
+      const o = localStorage.getItem(stateKey(tab));
+      if (o === 'pill' || o === 'expanded') return o;
+    } catch (_) { /* private mode: defaults only */ }
+    return UI2_COMPOSER_PILL_DEFAULT_TABS.has(tab) ? 'pill' : 'expanded';
+  };
+  const syncDraft = () => {
+    pill.classList.toggle('has-draft', !!(input && input.value.trim()));
+  };
+
+  let current = '';
+  const setState = (next, remember = false) => {
+    if (next !== 'pill' && next !== 'expanded') return;
+    if (remember) {
+      try { localStorage.setItem(stateKey(activeTabId()), next); } catch (_) { /* private mode */ }
+    }
+    if (current === next) return;
+    current = next;
+    rootEl.dataset.composerState = next;
+    if (next === 'pill') {
+      // Children go display:none — never leave focus on a hidden control
+      // (it would also pin the keyboard lift).
+      if (bar.contains(document.activeElement)) document.activeElement.blur();
+      bar.setAttribute('role', 'button');
+      bar.setAttribute('tabindex', '0');
+      bar.setAttribute('aria-label', 'Expand composer');
+      syncDraft();
+    } else {
+      bar.removeAttribute('role');
+      bar.removeAttribute('tabindex');
+      bar.removeAttribute('aria-label');
+    }
+    window.dispatchEvent(new CustomEvent('ui2:composer-state', { detail: { state: next } }));
+  };
+
+  const expandAndFocus = (viaTouch) => {
+    setState('expanded', true);
+    // Touch keeps the keyboard down until the user taps the input.
+    if (!viaTouch && input) input.focus();
+  };
+
+  // Programmatic seam for palette/shortcut callers: expand before focusing
+  // (a pilled dock's children are display:none and cannot receive focus).
+  window.ui2ComposerExpand = () => setState('expanded');
+
+  bar.addEventListener('click', (e) => {
+    if (current !== 'pill') return;
+    expandAndFocus(e.pointerType === 'touch');
+  });
+  collapse.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setState('pill', true);
+  });
+  bar.addEventListener('keydown', (e) => {
+    if (current === 'pill' && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      expandAndFocus(false);
+      return;
+    }
+    // Bubble phase: the peek's capture-phase Esc (close-peek) stops
+    // propagation while the peek is open, so this fires only with no peek
+    // up. Esc is get-out-of-my-way, not a preference — no remember.
+    if (e.key === 'Escape' && current === 'expanded') setState('pill');
+  });
+  if (input) input.addEventListener('input', syncDraft);
+
+  ui2Mirror('phase-banner', (banner) => {
+    pill.dataset.phase = ui2PhaseCategory(banner.className);
+  });
+
+  const applyForTab = (tab) => setState(stateFor(String(tab || '')));
+  if (typeof switchTab === 'function') {
+    // One shared module scope: rebinding the declaration retargets every
+    // caller (nav, palette, router deep links), so the per-tab state rides
+    // every navigation path.
+    const origSwitchTab = switchTab;
+    switchTab = function (tabId) {
+      const r = origSwitchTab.apply(this, arguments);
+      if (r !== false) applyForTab(tabId);
+      return r;
+    };
+  }
+  applyForTab(activeTabId());
+}
+
 ui2BuildNav();
 {
   // Single-boot: a module script executes at readyState 'interactive', so
@@ -924,6 +1043,7 @@ ui2BuildNav();
     ui2WireMirrors();
     ui2WirePalette();
     ui2WireComposerMech();
+    ui2WireComposerState();
     // Fuel chip: transport-status flips repaint it via the existing
     // #sb-dashboard-transport mirror lane; the interval keeps the lease
     // countdown honest between flips.
