@@ -470,7 +470,15 @@ function updateSessionWindow(sessionId, meta = {}) {
     );
   }
   refreshSessionWindowPathLabels(win);
-  renderSessionWindowWorktreeBadge(win, meta.worktree || null);
+  if (meta.worktree !== undefined) {
+    // Worktree presentation moved into the vitals chip row (a single ⧉
+    // glyph; tap reveals branch/path) — re-render so the chip appears as
+    // soon as the metadata lands, before any vitals event.
+    renderSessionWindowVitals(
+      win,
+      (sessionMetadataById.get(win.sessionId) || {}).vitals || null
+    );
+  }
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -518,23 +526,15 @@ function updateSessionWindow(sessionId, meta = {}) {
 
 // Worktree badge next to the project path: branch name up front, the full
 // linkage (checkout path, base branch/commit) in the tooltip.
-function renderSessionWindowWorktreeBadge(win, worktree) {
+// Retired into the vitals chip row (the ⧉ chip carries branch/path via
+// its tap-to-explain popover; the folder name already shows in CWD/PROJ).
+// The badge node stays in the DOM, permanently hidden, so old references
+// stay null-safe.
+function renderSessionWindowWorktreeBadge(win) {
   if (!win?.worktreeBadge) return;
-  if (!worktree?.branch) {
-    win.worktreeBadge.className = 'session-window-worktree hidden';
-    win.worktreeBadge.textContent = '';
-    win.worktreeBadge.title = '';
-    return;
-  }
-  win.worktreeBadge.className = 'session-window-worktree';
-  win.worktreeBadge.textContent = `⎇ ${worktree.branch}`;
-  const lines = [`Session runs in a git worktree on branch ${worktree.branch}`];
-  if (worktree.path) lines.push(`Checkout: ${worktree.path}`);
-  if (worktree.baseRoot) lines.push(`Base project: ${worktree.baseRoot}`);
-  if (worktree.baseBranch) {
-    lines.push(`Branched from ${worktree.baseBranch}${worktree.baseSha ? ` @ ${worktree.baseSha.slice(0, 12)}` : ''}`);
-  }
-  win.worktreeBadge.title = lines.join('\n');
+  win.worktreeBadge.className = 'session-window-worktree hidden';
+  win.worktreeBadge.textContent = '';
+  win.worktreeBadge.title = '';
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
