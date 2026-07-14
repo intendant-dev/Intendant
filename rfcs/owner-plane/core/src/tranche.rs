@@ -34,7 +34,7 @@ use crate::shapes::journal::{
     sign_receipt, Itemcommit, Itemwrap, MissingRec, Pendingxfer, Receiptstmt, Signedstmt, Txn,
     Txnrec, Xferabort, Xferdone, Xferreopen,
 };
-use crate::shapes::memory::{Mclaim, Mexportrel};
+use crate::shapes::memory::{merkle_root, Bundleleaf, Bundlerec, Mclaim, Merasereq, Mexportrel};
 use crate::shapes::{
     Bytes16, Bytes32, Class, Devclass, Factref, Frontierclose, Hlc, Issuerid, Kekwrap, Kind,
     Lineagedef, Opfactref, Polref, Sigalg, Spaceclass, Spacedef, ToValue, Verb,
@@ -149,18 +149,6 @@ pub struct Device {
     pub kem_sk: [u8; 32],
     pub kem_pk: [u8; 65],
     pub cert: Cert,
-}
-
-impl Device {
-    /// O8: `human`/`daemon`/`browser`/`service` actor ids are the
-    /// lowercase hex of the signing device's `device_id`.
-    fn actor(&self) -> Actor {
-        Actor {
-            kind: ActorKind::Daemon,
-            id: hex(&self.device_id),
-            attested_by: None,
-        }
-    }
 }
 
 /// Draw a device: ed25519 signing keypair, P-256 KEM keypair
@@ -660,6 +648,33 @@ impl PlaneRig {
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
+        self.tenant_op_as(
+            ActorKind::Daemon,
+            dev,
+            grant,
+            tag,
+            op_type,
+            body,
+            writer_sequence,
+            previous_writer_hash,
+        )
+    }
+
+    /// [`Self::tenant_op`] with an explicit actor kind — the O8 id is
+    /// always the device hex; `human` on an enrolled device with no
+    /// `attested_by` is §10.1 shape-1 direct-human evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tenant_op_as(
+        &mut self,
+        actor_kind: ActorKind,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        op_type: &str,
+        body: cbor::Value,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
         let request_id = draw_id(&mut self.rng, &format!("{tag}.request_id"));
         let hlc = self.next_hlc();
         let header = Header {
@@ -675,7 +690,11 @@ impl PlaneRig {
                 lineage: dev.lineage,
                 gen: 1,
             },
-            actor: dev.actor(),
+            actor: Actor {
+                kind: actor_kind,
+                id: hex(&dev.device_id),
+                attested_by: None,
+            },
             authorization_proof: Authproof::Dev {
                 cert: h_cert(&dev.cert),
                 cap: h_grant(grant),
@@ -790,13 +809,14 @@ impl PlaneRig {
         )
     }
 
-    /// Seal `triple` as an item at `(dev.lineage, 1, seq)` in the
-    /// genesis zone: drawn DEK + nonce, §5.3 wrap under the epoch-1
-    /// KEK — a byte-honest ItemCommit.
-    pub fn seal_commit(&mut self, dev: &Device, triple: &[u8], tag: &str, seq: u64) -> Itemcommit {
+    /// Seal `op` as an item in the genesis zone: drawn DEK + nonce,
+    /// §5.3 wrap under the epoch-1 KEK — a byte-honest ItemCommit
+    /// whose plaintext `(lineage, gen, seq)` equal the sealed
+    /// header's BY CONSTRUCTION (I4).
+    pub fn seal_commit(&mut self, op: &Signedop, tag: &str) -> Itemcommit {
         let dek = self.rng.draw32(&format!("{tag}.dek"));
         let nonce = self.rng.draw12(&format!("{tag}.nonce"));
-        let core = keyschedule::seal_item(&dek, nonce, &self.plane_id, &self.zone_id, triple);
+        let core = keyschedule::seal_item(&dek, nonce, &self.plane_id, &self.zone_id, &op.encode());
         let addr = keyschedule::item_addr(&core);
         let wrapped =
             keyschedule::wrap_dek(&self.kek_e1, &self.plane_id, &self.zone_id, 1, &addr, &dek);
@@ -807,9 +827,9 @@ impl PlaneRig {
                 key_wrap_epoch: 1,
                 wrapped_dek: wrapped,
             },
-            lineage: dev.lineage,
-            gen: 1,
-            seq,
+            lineage: op.header.writer.lineage,
+            gen: op.header.writer.gen,
+            seq: op.header.writer_sequence,
         }
     }
 
@@ -1105,7 +1125,7 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
         None,
     );
     let release_op = rel.op_hash();
-    let commit = rig.seal_commit(&d1, &rel.encode(), "rel.item", 1);
+    let commit = rig.seal_commit(&rel, "rel.item");
     let t1 = Txn {
         records: vec![
             Txnrec::ItemCommit(commit),
@@ -1433,6 +1453,160 @@ pub fn f7_staged_frontier_consumed() -> Vector {
     }
 }
 
+/// Tranche #1 — family 11 journal-replay: the D-198 deferral
+/// schedule. A claim is committed, released (the source-zone Txn
+/// opens a transfer journal — NONTERMINAL), and then erased by a
+/// direct-human `m.erase_request`. Retrieval exclusion is IMMEDIATE
+/// at the erase acceptance; the erase-queue entry exists but is
+/// manifest-INELIGIBLE while any referencing journal is nonterminal —
+/// the state probes pin all three facts, and the open interval pins
+/// the journal. (The adopted-erasure residual — `source-erased` via a
+/// C3′-adopted manifest — is a recovery-ceremony vector for the
+/// corpus phase.)
+pub fn f11_erase_deferral() -> Vector {
+    let name = "erase-deferral-nonterminal-journal";
+    const STMT: &str = "harbor crane inspection completed without findings";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+
+    // The item: dev2's claim, committed to the zone log.
+    let i1 = rig.claim(&dev2, &grant2, "i1", STMT, 1, None);
+    let i1_commit = rig.seal_commit(&i1, "i1.item");
+    let i1_addr = i1_commit.wrap.item_addr;
+    let t_i1 = Txn {
+        records: vec![Txnrec::ItemCommit(i1_commit)],
+    };
+
+    // The release: real bundle digest (single-leaf Merkle root over
+    // the exact bundlerec the destination would verify).
+    let export_id = draw_id(&mut rig.rng, "rel.export_id");
+    let digest = merkle_root(&[Bundleleaf {
+        export_id,
+        rec_index: 0,
+        rec: Bundlerec {
+            op: i1.op_hash(),
+            kind: Kind::Observation,
+            statement: STMT.into(),
+            class_floor: Class::Private,
+        },
+    }
+    .leaf_hash()]);
+    let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
+    let dest_space = draw_id(&mut rig.rng, "dest.space_id");
+    let rel = rig.release_op_signed(
+        &d1,
+        &g1,
+        "rel",
+        export_id,
+        vec![i1.op_hash()],
+        digest,
+        dest_zone,
+        dest_space,
+        1,
+        None,
+    );
+    let rel_commit = rig.seal_commit(&rel, "rel.item");
+    let t_rel = Txn {
+        records: vec![
+            Txnrec::ItemCommit(rel_commit),
+            Txnrec::PendingXfer(Pendingxfer {
+                export_id,
+                release_op: rel.op_hash(),
+                dest_zone,
+                content_digest: digest,
+                record_count: 1,
+            }),
+        ],
+    };
+
+    // The erase request: direct-human evidence (shape 1), targeting
+    // the claim's op hash (D-66).
+    let e = rig.tenant_op_as(
+        ActorKind::Human,
+        &d1,
+        &g1,
+        "e",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![i1.op_hash()],
+        }
+        .to_value(),
+        2,
+        Some(rel.op_hash()),
+    );
+
+    let c1 = rig.genesis_op.clone();
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[
+            ("c1", &c1.encode()),
+            ("c2", &c2.encode()),
+            ("i1", &i1.encode()),
+            ("t.i1", &enc(&t_i1)),
+            ("rel", &rel.encode()),
+            ("t.rel", &enc(&t_rel)),
+            ("e", &e.encode()),
+        ]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["c1", "c2", "i1", "t.i1", "rel", "t.rel", "e"]]),
+    );
+
+    let probe = |ids: &[Bytes32]| -> String {
+        use crate::shapes::bytes;
+        hex(
+            &cbor::encode(&cbor::Value::Array(ids.iter().map(|i| bytes(i)).collect()))
+                .expect("probe encodes"),
+        )
+    };
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "5.4".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "open" },
+            ],
+            "per_record": [
+                { "rec": "c1" },
+                { "rec": "c2" },
+                { "rec": "i1" },
+                { "rec": "t.i1" },
+                { "rec": "rel" },
+                { "rec": "t.rel" },
+                { "rec": "e" },
+            ],
+            "converge": true,
+            "state_probes": [
+                {
+                    "name": "erase-queue accepted entries, item_addrs (§5.4)",
+                    "value": probe(&[i1_addr]),
+                },
+                {
+                    "name": "manifest-eligible erase-queue entries, item_addrs (§5.4 D-198 — a nonterminal referencing journal defers)",
+                    "value": probe(&[]),
+                },
+                {
+                    "name": "retrieval-excluded claims, op hashes (§11.1 m.erase_request — immediate on acceptance)",
+                    "value": probe(&[i1.op_hash()]),
+                },
+            ],
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
     vec![
@@ -1440,6 +1614,7 @@ pub fn tranche() -> Vec<Vector> {
         f7_negation_residual(),
         f7_pending_revocation_window_grant(),
         f7_staged_frontier_consumed(),
+        f11_erase_deferral(),
         f11_reopen_basis_types(),
         f13_txn_internal_order(),
     ]
