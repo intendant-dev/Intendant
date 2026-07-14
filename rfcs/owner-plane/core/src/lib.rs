@@ -13,6 +13,7 @@
 
 pub mod cbor;
 pub mod domains;
+pub mod keyschedule;
 pub mod rng;
 pub mod shapes;
 pub mod suite;

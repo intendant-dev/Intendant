@@ -11,6 +11,7 @@ chacha20 = "0.9"
 ed25519-dalek = "2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 aes-gcm = "0.10"
+hkdf = "0.12"
 hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
 rand_core = "0.10"
 
