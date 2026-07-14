@@ -755,12 +755,18 @@ pub(crate) async fn handle_peer_tool_call(
             };
             let display_target = optional_str(args, "display_target");
             let coordinate_space = optional_str(args, "coordinate_space");
+            let observe = optional_str(args, "observe");
+            let annotate = args.get("annotate").and_then(|value| value.as_bool());
+            let settle = args.get("settle").filter(|value| !value.is_null()).cloned();
             crate::peer::ops::execute_cu_actions(
                 peer_registry,
                 peer_id,
                 actions,
                 display_target,
                 coordinate_space,
+                observe,
+                annotate,
+                settle,
             )
             .await
         }

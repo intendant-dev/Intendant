@@ -28,21 +28,23 @@ Options:
                   INTENDANT_CONNECT_RENDEZVOUS_URL, else the rendezvous
                   this script was fetched from (injected when served).
   --daemon-id <id>Stable daemon id at the rendezvous.
-  --ref <ref>     Pin the fresh clone to a tag, branch, or commit instead
-                  of the default branch head.
+  --ref <ref>     Pin the fresh clone to a tag, branch, or commit.
+                  Default: the newest published release tag (vX.Y.Z);
+                  only when no release exists yet, the default branch head.
   --no-run        Build and link only; print how to start it.
 
 Environment overrides:
-  INTENDANT_REPO         git URL   (default: https://github.com/lovon-spec/intendant)
+  INTENDANT_REPO         git URL   (default: https://github.com/intendant-dev/Intendant)
   INTENDANT_INSTALL_DIR  checkout  (default: ~/intendant)
+  INTENDANT_REF          same as --ref (lets a serving rendezvous pin a release)
 EOF
 }
 
-REPO="${INTENDANT_REPO:-https://github.com/lovon-spec/intendant}"
+REPO="${INTENDANT_REPO:-https://github.com/intendant-dev/Intendant}"
 INSTALL_DIR="${INTENDANT_INSTALL_DIR:-$HOME/intendant}"
 CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}"
 DAEMON_ID="${INTENDANT_CONNECT_DAEMON_ID:-}"
-REF=""
+REF="${INTENDANT_REF:-}"
 RUN=1
 SERVICE=0
 
@@ -96,6 +98,21 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   [ -z "$REF" ] || die "--ref pins fresh clones only; $INSTALL_DIR already exists — check out the ref there yourself"
   say "using existing checkout at $INSTALL_DIR (leaving it exactly as-is)"
 else
+  if [ -z "$REF" ]; then
+    # Default fresh installs to the newest published release tag (vX.Y.Z
+    # only — pre-releases and peeled refs are filtered) so the served
+    # installer delivers an immutable, released tree. Falling back to the
+    # mutable default-branch head happens only while no release exists,
+    # and says so out loud. --ref / INTENDANT_REF override either way.
+    REF="$(git ls-remote --tags "$REPO" 'v*' 2>/dev/null \
+      | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9.]*\)$|\1|p' \
+      | sort -V | tail -n 1 || true)"
+    if [ -n "$REF" ]; then
+      say "pinning to the latest release tag: $REF (override with --ref)"
+    else
+      say "note: no release tags published yet — installing the default branch head (mutable; pin with --ref once releases exist)."
+    fi
+  fi
   say "cloning $REPO -> $INSTALL_DIR"
   git clone --depth 1 "$REPO" "$INSTALL_DIR"
   if [ -n "$REF" ]; then

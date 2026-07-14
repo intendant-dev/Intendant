@@ -562,7 +562,7 @@ pub(crate) fn append_manual_http_tool_definitions(
         "peer_execute_cu_actions",
         manual_http_tool_definition!(
             "peer_execute_cu_actions",
-            "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the annotated post-action screenshot. Needs a peer-granted profile with display input (peer-operator or peer-root).",
+            "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the peer's post-action observation (a clean screenshot by default; observe=\"ax\"/\"auto\"/\"none\" forwards the peer's element-tree/no-capture policies). Needs a peer-granted profile with display input (peer-operator or peer-root).",
             PeerExecuteCuActionsParams
         ),
     );

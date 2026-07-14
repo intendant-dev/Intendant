@@ -2296,29 +2296,37 @@ impl DisplaySession {
         })
     }
 
-    /// Encode the latest frame as a PNG screenshot.
-    pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
-        let frame = self
-            .latest_frame()
+    /// The latest raw frame, erroring when the session has never captured one.
+    /// Raw twin of [`Self::screenshot`] for consumers that transform pixels
+    /// (resize, crop, annotate) before encoding — one PNG encode instead of an
+    /// encode/decode/re-encode round-trip.
+    pub async fn current_frame(&self) -> Result<Arc<Frame>, CallerError> {
+        self.latest_frame()
             .await
-            .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
-        encode_frame_png(&frame)
+            .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))
     }
 
-    /// Encode a PNG screenshot from a frame captured at or after `min_timestamp`,
-    /// waiting up to `timeout` for one to arrive.
+    /// Encode the latest frame as a PNG screenshot.
+    pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
+        encode_frame_png(&*self.current_frame().await?)
+    }
+
+    /// The freshest raw frame captured at or after `min_timestamp`, waiting up
+    /// to `timeout` for one to arrive.
     ///
-    /// Capture backends are damage-driven: after an input action the next frame
-    /// arrives within a vsync or two *if the action changed any pixels*, but no
-    /// frame arrives at all when nothing changed. Both outcomes are handled:
-    /// a fresh frame is returned as soon as it lands, and on timeout the most
-    /// recent frame is returned instead — pixel-accurate in the nothing-changed
-    /// case. Errors only when the session has never captured a frame.
-    pub async fn screenshot_fresh(
+    /// The freshness contract guarantees *recency*, not change: event-driven
+    /// backends (ScreenCaptureKit, DXGI, PipeWire) deliver a post-action frame
+    /// only when pixels changed, while the X11 backend polls at the capture
+    /// rate and re-delivers unchanged content. Both are handled: a
+    /// sufficiently-new frame is returned as soon as it lands, and on timeout
+    /// the most recent frame seen is returned instead — content-accurate on
+    /// the event-driven backends when nothing changed. Errors only when the
+    /// session has never captured a frame.
+    pub async fn fresh_frame(
         &self,
         min_timestamp: Instant,
         timeout: Duration,
-    ) -> Result<Vec<u8>, CallerError> {
+    ) -> Result<Arc<Frame>, CallerError> {
         // Subscribe before checking latest_frame so a frame landing between
         // the check and the subscription is not missed.
         let mut frames = self.subscribe_frames();
@@ -2326,7 +2334,7 @@ impl DisplaySession {
         let newest = self.latest_frame().await;
         if let Some(ref frame) = newest {
             if frame.timestamp >= min_timestamp {
-                return encode_frame_png(frame);
+                return Ok(Arc::clone(frame));
             }
         }
 
@@ -2338,7 +2346,7 @@ impl DisplaySession {
                 recv = frames.recv() => match recv {
                     Ok(frame) => {
                         if frame.timestamp >= min_timestamp {
-                            return encode_frame_png(&frame);
+                            return Ok(frame);
                         }
                         newest = Some(frame);
                     }
@@ -2350,18 +2358,32 @@ impl DisplaySession {
         }
 
         // Timed out (or the capture stream ended): fall back to the freshest
-        // frame seen, which is content-accurate when the screen did not change.
-        let frame = match self.latest_frame().await {
+        // frame seen.
+        match self.latest_frame().await {
             Some(frame) => Some(frame),
             None => newest,
         }
-        .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
-        encode_frame_png(&frame)
+        .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))
+    }
+
+    /// Encode a PNG screenshot from a frame captured at or after
+    /// `min_timestamp`, waiting up to `timeout` for one to arrive (the
+    /// [`Self::fresh_frame`] contract).
+    pub async fn screenshot_fresh(
+        &self,
+        min_timestamp: Instant,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, CallerError> {
+        encode_frame_png(&*self.fresh_frame(min_timestamp, timeout).await?)
     }
 }
 
-/// Encode a raw captured frame as PNG bytes.
-fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
+/// Convert a raw captured frame to a tightly-packed [`image::RgbaImage`].
+///
+/// Strips any stride padding and swaps BGRA to RGBA. Public so screenshot
+/// consumers can transform the raw pixels (resize, crop, annotate) and encode
+/// PNG exactly once, instead of decoding a PNG this crate just encoded.
+pub fn frame_to_rgba_image(frame: &Frame) -> Result<image::RgbaImage, CallerError> {
     let (w, h) = (frame.width, frame.height);
 
     // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
@@ -2396,9 +2418,13 @@ fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
         }
     };
 
-    let img = image::RgbaImage::from_raw(w, h, rgba_data)
-        .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))?;
+    image::RgbaImage::from_raw(w, h, rgba_data)
+        .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))
+}
 
+/// Encode a raw captured frame as PNG bytes.
+fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
+    let img = frame_to_rgba_image(frame)?;
     let mut png_buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png_buf, image::ImageFormat::Png)
         .map_err(|e| CallerError::Display(format!("PNG encode: {e}")))?;

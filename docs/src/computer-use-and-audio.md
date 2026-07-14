@@ -283,6 +283,88 @@ unknown counts as **not ready** (fail closed). Surfaces:
   `os_readiness` gap block naming any still-blocked OS layers, so a granted
   request can never masquerade as a CU-ready one.
 
+### Observation Policy (`observe`)
+
+Every `execute_cu_actions` batch ends with a **trailing observation**, and
+what that observation is is a per-call policy (`observe` param;
+`src/bin/caller/cu_observation.rs`), not an unconditional screenshot:
+
+- **`pixels`** (default) — the historical behavior: a post-action screenshot
+  is captured and appended as one extra result. The default stays `pixels`
+  because the tool description and the native `peer cu` guidance promise a
+  screenshot; token-sensitive callers opt in to the cheaper modes (managed
+  Codex's developer instructions teach `observe:"auto"`).
+- **`ax`** — the frontmost element tree (the `read_screen` walk, same central
+  text caps) is attached as text *instead of* pixels: a few hundred tokens
+  versus ~1.5k image tokens, and no capture/encode work at all. User-session
+  targets only (element trees exist nowhere else); a failed walk reports the
+  error as the observation rather than silently substituting an image.
+- **`auto`** — `ax` when the frontmost tree is usable (≥
+  `cu_observation::AX_AUTO_MIN_NODES` nodes), `pixels` otherwise (sparse
+  tree, walk error, virtual-display target).
+- **`none`** — per-action results only, for callers chaining batches that
+  will observe once at the end.
+
+The result always **names the observation it carries and why**
+(`observation: pixels (auto: ax sparse (2 nodes) → pixels)`), so a fallback
+is never silent. Two invariants regardless of mode: an explicit trailing
+`screenshot`/`zoom` action always returns its pixels (the action *is* the
+request), and the managed-context compact contract is preserved — path +
+metadata, no inline image bytes — with `ax`/`auto` the compact caller gets
+the element tree **inline**, which is the first time the managed path
+carries an actual observation instead of a path to fetch.
+
+**Screenshots are clean by default, encoded once.** Click markers
+(crosshairs at click coordinates) are opt-in via `annotate: true` — baked-in
+markers obscured the very controls being verified (e2e finding CU-06), and
+the dashboard Live tab already overlays actions in real time. Annotation is
+drawn on the raw frame *before* the single PNG encode; the historical
+pipeline (capture → encode → decode → draw → re-encode → rewrite the disk
+artifact) is gone, and the disk artifact now always carries the same bytes
+as the model payload. That parity is deliberate: the artifact's remaining
+reader is the managed-Codex `view_image` path (the Activity-tab
+disk-substitution consumer was retired with the Gemini CLI backend), which
+wants exactly what the model would have seen — including, on macOS, the
+logical-size (not raw-Retina) image that CU coordinates map to. Each batch
+logs a `[cu]` measurement line (observation kind/reason, capture+encode ms,
+AX walk ms, observation bytes, settle outcome) to the daemon log, and the
+native loop logs the same line into the session log.
+
+### Settle: bounded UI quiescence (`settle`)
+
+The 300 ms freshness floor guarantees a *recent* frame, not a *finished* UI —
+after a click that starts a page load, the model historically padded batches
+with guessed `wait` actions. `settle` replaces the guess with a bounded
+quiescence wait (`cu_observation`): after the last input action, watch the
+display and return once no content change has been observed for a ~300 ms
+quiet window, capped at 2 s (`settle: true`) or a caller-supplied cap
+(`settle: <ms>`, clamped to 5 s; `0`/`false` = off).
+
+- **Anchoring:** the wait is anchored at the last input action. It runs
+  before the batch's first capture that follows an input (`[click,
+  screenshot]` settles between the two), or before the trailing observation
+  — the AX walk and the auto-screenshot both read the settled UI. A batch
+  with no input actions settles from call start ("capture once quiet").
+- **Damage signal:** platform-native dirty rects when frames carry them
+  (ScreenCaptureKit); otherwise a per-frame content fingerprint — the X11
+  backend polls at the capture rate and re-delivers unchanged frames, so
+  frame *arrival* is deliberately not treated as change.
+- **Honest reporting:** the result carries `settle: settled after Nms (no
+  display change for 300ms)` or `still_loading after Nms (display still
+  changing at the cap)`. Paths without a usable damage signal — no live
+  capture session, a capture stream that ends mid-wait, or the synthetic
+  test-card backend (whose counter strip free-runs, which also keeps the
+  e2e suite deterministic) — degrade to a fixed minimal wait and say so
+  (`fixed 300ms wait (...)`).
+- **No double-wait:** a damage-verified settle subsumes the capture
+  freshness wait — the stream was watched past the input, so the following
+  capture serves the current frame immediately.
+
+`settle` composes with every `observe` mode (with `none` it simply bounds
+the batch's return for callers chaining batches), and is exposed on the MCP
+tool, `ctl cu actions --settle MS`, and the peer twins (older peers ignore
+it).
+
 ### Three separate concepts: private view, agent share, presence streaming
 
 Putting the user's screen on the wire means one of three deliberately

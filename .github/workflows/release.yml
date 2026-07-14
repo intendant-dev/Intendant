@@ -9,9 +9,12 @@ name: macOS app release
 # merge queue. A red release run blocks a release, not landings.
 #
 # Signing/notarization secrets (repo Settings → Secrets and variables →
-# Actions → Repository secrets). When absent the job still runs end to end
-# and produces an UNSIGNED artifact named "-unsigned-dev" — useful for
-# dry-running the pipeline. Secret names, exactly:
+# Actions → Repository secrets). On a workflow_dispatch DRY-RUN with the
+# secrets absent, the job still runs end to end and keeps an UNSIGNED
+# "-unsigned-dev" artifact on the workflow run. TAG builds fail closed
+# instead: an official release is always signed, notarized, and committed
+# to the transparency log, or the run goes red before publishing anything.
+# Secret names, exactly:
 #
 #   MACOS_SIGN_P12_B64       base64 of a "Developer ID Application" identity
 #                            exported as .p12 — export WITH the certificate
@@ -36,10 +39,12 @@ name: macOS app release
 #                            on intendant-connect) — authorizes ONLY
 #                            release-manifest submission, nothing else
 #
-# When the secret is absent (forks, dry runs) the submission step logs
-# that it is skipping and no-ops. The optional CONNECT_RELEASE_URL repo
-# *variable* points self-hosted forks at their own rendezvous (default
-# https://intendant.dev).
+# The submission step only runs on tag builds, and a missing token FAILS
+# the run there — a published-but-unlogged release is exactly the failure
+# the log exists to prevent. Forks and dry-runs exercise the pipeline via
+# workflow_dispatch, which never reaches the publish/submit steps. The
+# optional CONNECT_RELEASE_URL repo *variable* points self-hosted forks at
+# their own rendezvous (default https://intendant.dev).
 
 on:
   push:
@@ -85,6 +90,25 @@ jobs:
           # stamp a `git describe --tags` version.
           fetch-depth: 0
 
+      # One version, everywhere: the binaries and Agent Card report
+      # CARGO_PKG_VERSION, the app bundle stamps the tag, and the release
+      # manifest strips the tag's "v" — so a tag that disagrees with
+      # Cargo.toml would publish artifacts that misreport their own
+      # identity. Fail before building anything.
+      - name: Version identity gate
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="intendant"))')"
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::Version identity: Cargo.toml says $version but the tag is $tag. The tag, binaries, Agent Card, app bundle, and release manifest must agree — bump the version (and Cargo.lock) first, then re-tag."
+            exit 1
+          fi
+          echo "version identity OK: $tag matches Cargo.toml $version"
+
       - name: Gate on signing secrets
         id: gate
         shell: bash
@@ -121,8 +145,15 @@ jobs:
           echo "sign=$sign" >> "$GITHUB_OUTPUT"
           echo "notarize=$notarize" >> "$GITHUB_OUTPUT"
           echo "Signing: $sign — notarization: $notarize"
+          # Official releases fail closed: a tag build must be fully signed
+          # AND notarized, or nothing is built or published. Unsigned output
+          # stays available for workflow_dispatch dry-runs only.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && { [ "$sign" != "true" ] || [ "$notarize" != "true" ]; }; then
+            echo "::error::Official tag releases must be signed and notarized — configure the MACOS_SIGN_* and NOTARY_* secrets, or dry-run the pipeline via workflow_dispatch instead."
+            exit 1
+          fi
           if [ "$sign" = "false" ]; then
-            echo "::warning::No signing secrets configured — this run produces an unsigned-dev artifact."
+            echo "::warning::No signing secrets configured — this dry-run produces an unsigned-dev artifact."
           fi
 
       # Throwaway keychain: created fresh, added to the FRONT of the user
@@ -231,14 +262,15 @@ jobs:
           command -v gh > /dev/null || { echo "::error::gh CLI not found on the runner"; exit 1; }
           tag="$GITHUB_REF_NAME"
           zip_file="$(ls dist/Intendant-*.zip)"
+          # Belt and suspenders behind the signing gate: a less-signed
+          # artifact must never be published under an official tag, even if
+          # the bundle script's fallback behavior ever drifts.
           case "$zip_file" in
-            *-unsigned-dev.zip)
-              signing_note="**Unsigned build** — signing secrets were not configured for this run. macOS Gatekeeper will warn on first launch." ;;
-            *-signed-unnotarized.zip)
-              signing_note="Signed with a Developer ID certificate but **not notarized** (notary secrets were not configured for this run)." ;;
-            *)
-              signing_note="Signed with a Developer ID certificate, notarized by Apple, and stapled — Gatekeeper opens it without warnings." ;;
+            *-unsigned-dev.zip|*-signed-unnotarized.zip)
+              echo "::error::Refusing to publish $(basename "$zip_file") for tag $tag — official releases are signed and notarized; the signing gate should have failed this run before the build."
+              exit 1 ;;
           esac
+          signing_note="Signed with a Developer ID certificate, notarized by Apple, and stapled — Gatekeeper opens it without warnings."
           {
             echo "Native macOS app: the \`macos-app/\` WKWebView wrapper bundling the release \`intendant\` and \`intendant-runtime\` binaries (Apple Silicon)."
             echo
@@ -271,9 +303,10 @@ jobs:
       # "Release transparency"). `intendant hosted-verify --releases`
       # checks the two sides against each other out of band. Runs AFTER
       # the publish step so the log commits exactly the uploaded bytes;
-      # if submission fails, the run goes red so the operator notices a
-      # published-but-unlogged release. Skips with a clear line when the
-      # CONNECT_RELEASE_TOKEN repo secret is not configured.
+      # if submission fails — including a missing CONNECT_RELEASE_TOKEN —
+      # the run goes red so the operator notices a published-but-unlogged
+      # release. Dry-runs exercise the pipeline via workflow_dispatch,
+      # which never reaches this step.
       - name: Submit release manifest to the transparency log
         if: github.ref_type == 'tag'
         shell: bash
@@ -284,8 +317,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$CONNECT_RELEASE_TOKEN" ]; then
-            echo "CONNECT_RELEASE_TOKEN is not configured — skipping transparency-log submission (expected on forks and dry runs)."
-            exit 0
+            echo "::error::CONNECT_RELEASE_TOKEN is not configured — an official tag release must commit its manifest to the transparency log (a published-but-unlogged release is the failure this gate exists to catch). Configure the secret, or dry-run without a tag via workflow_dispatch."
+            exit 1
           fi
           manifest="$RUNNER_TEMP/release-manifest.json"
           python3 - "$RELEASE_TAG" dist/* > "$manifest" <<'PY'

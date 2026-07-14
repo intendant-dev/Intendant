@@ -187,3 +187,21 @@ only the kind and session label, never the reason text). On a headless
 daemon with no owner surface, requests are refused immediately
 (`unavailable`) instead of blocking — the same fail-closed posture as
 headless approvals.
+
+## "Approve all" scope, by surface
+
+The same two words appear on several surfaces with deliberately different
+blast radii. What each one actually grants:
+
+| Surface | What "approve all" does | Scope | Lifetime |
+|---|---|---|---|
+| Native runtime approvals | Sets the autonomy level to **Full** (`apply_user_approval`) | **Daemon-wide for native sessions** — one shared autonomy state backs every native session | In-memory: until lowered again (autonomy control or restart, which returns to the configured level) |
+| External agents (Codex / Claude Code) | Auto-approves that backend's subsequent approval requests (`approve_all_session`) | **That one external session only** — deliberately never touches native autonomy | The external session's lifetime |
+| Live audio | Does not exist. Every live-audio spawn requires its own explicit human approval; with no approver surface the spawn is denied outright | Per spawn | One consent per spawn |
+| Questions (`ask_user` and kin) | Nothing. Questions are not permissions: no level or approve-all grant answers one, and an `Answer` aimed at a command approval fails closed (denied) | — | — |
+| Display requests (`user_session` rail) | Nothing. The rail lives outside the approval id space; approve/approve-all can never mint a display grant there. (Approving a **DisplayControl-category runtime action** is different: the first such approval grants agent-visible user-display access session-wide — that approval *is* the opt-in) | Rail: per request | Grant durations are the rail's own (this session / 15 min / until revoked) |
+
+The asymmetry between the first two rows is intentional: a native
+approve-all is the operator saying "run autonomously" to *their daemon*,
+while a button on one supervised Codex/Claude session must not escalate
+every other surface of the daemon.

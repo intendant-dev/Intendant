@@ -32,6 +32,16 @@ sent the intent) learns the result by observing the *broadcast* event the
 control plane emits afterward (`AutonomyChanged`, `ExternalAgentChanged`,
 `CodexConfigChanged`, …).
 
+Stated honestly, the invariant covers the **intent path**: no frontend
+mutates shared state from a `ControlMsg` handler. It is not a literal
+single-writer over every piece of shared state — three documented paths
+write from their own tasks: approval side effects (`apply_user_approval`
+applies approve-all escalation and the first display-control grant to the
+shared autonomy state, identically from every approval surface), the MCP
+autonomy/display tools, and platform display activation. Those are
+deliberate carve-outs with one owner each; new shared-state writers
+belong in the control plane.
+
 ```
   Web ─┐  emit ControlMsg          ┌──────────────┐  write    ┌──────────────┐
   MCP ─┼───────────────▶ EventBus ─┤ Control Plane │──────────▶│ shared state │

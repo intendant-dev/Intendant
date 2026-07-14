@@ -262,7 +262,7 @@ input for `peer_execute_cu_actions` (`peer-operator` / `peer-root`).
 | `peer_delegate_task` | Delegate a task executed by the peer's own agent; returns `task_id`. | `peer_id`, `instructions`, `context?` |
 | `peer_list_displays` | List a peer's displays (ids, names, resolutions) over its `/mcp`. | `peer_id` |
 | `peer_take_screenshot` | Screenshot a peer display; returns an MCP image content block. | `peer_id`, `display_target?` |
-| `peer_execute_cu_actions` | Run CU actions on a peer display; returns per-action status + annotated post-action screenshot. | `peer_id`, `actions`, `display_target?`, `coordinate_space?` |
+| `peer_execute_cu_actions` | Run CU actions on a peer display; returns per-action status + the peer's post-action observation (clean screenshot by default). | `peer_id`, `actions`, `display_target?`, `coordinate_space?`, `observe?`, `annotate?` |
 
 ### Controller Orchestration
 
