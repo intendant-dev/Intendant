@@ -14,10 +14,8 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
 rand_core = "0.10"
-
-[dev-dependencies]
-# The companion-schema drift gate (domains::tests) parses
-# ../d0a-vector-cases.v1.json.
+# The §13.1 vector emitter; tests also parse ../d0a-vector-cases.v1.json
+# (the companion drift gate and the mint-time vocabulary checks).
 serde_json = "1"
 
 # Standalone: deliberately NOT a member of the intendant workspace —

@@ -59,14 +59,15 @@
       "type": "array", "minItems": 1,
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["item", "outcome", "disposition"],
+        "required": ["item"],
+        "dependentRequired": { "outcome": ["disposition"], "disposition": ["outcome"] },
         "properties": {
           "item": { "$ref": "#/$defs/itemname" },
           "outcome": { "type": "string" },
           "disposition": { "type": "string" }
         }
       },
-      "$comment": "FINAL per-item classification — arrival-invariant, one list for all deliveries"
+      "$comment": "FINAL per-item classification — arrival-invariant, one list for all deliveries: exactly one row per delivered item; a row WITHOUT the (outcome, disposition) pair asserts the item finally ADMITS (is in effect) — E10 pins the closed enums to failures, so admission carries no failure pair (same optional-classification design as journal-replay per_record)"
     },
     "state_probes": {
       "type": "array", "minItems": 1,
@@ -612,6 +613,7 @@
                         "type": "array", "minItems": 1,
                         "items": {
                           "type": "object", "additionalProperties": false, "required": ["rec"],
+                          "dependentRequired": { "outcome": ["disposition"], "disposition": ["outcome"] },
                           "properties": {
                             "rec": { "$ref": "#/$defs/itemname" },
                             "outcome": { "type": "string" },
