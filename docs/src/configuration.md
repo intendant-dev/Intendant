@@ -2,8 +2,11 @@
 
 Intendant is configured through three layers, in increasing specificity:
 
-1. **`intendant.toml`** in the project root — the durable, per-project config
-   (structure in `src/bin/caller/project.rs`).
+1. **`intendant.toml`** — in the project root for a rooted daemon, or under
+   the daemon state root (`~/.intendant/intendant.toml` by default) for a
+   projectless daemon such as the bundled app. The latter stores daemon-wide
+   defaults without making the state directory a session project or sandbox
+   root (structure in `src/bin/caller/project.rs`).
 2. **Environment variables** (often via `.env`) — keys, provider/model
    overrides, and a few runtime toggles.
 3. **CLI flags** — per-invocation overrides (see
@@ -50,7 +53,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
 
 ### Model and behavior tuning
 
@@ -128,9 +131,12 @@ sessions spawned in-process via the `spawn_sub_agent` tool (see
 
 ## `intendant.toml`
 
-Create `intendant.toml` in your project root (the git top-level). Every section
-is optional; an absent section uses its defaults. The structure and defaults
-below are taken directly from `src/bin/caller/project.rs`.
+Create `intendant.toml` in your project root (the git top-level). A daemon
+started without a project marker reads and writes the same schema at
+`<INTENDANT_HOME>/intendant.toml`; the dashboard's Settings page uses that
+daemon-wide file while `/api/project-root` remains null. Every section is
+optional; an absent section uses its defaults. The structure and defaults below
+are taken directly from `src/bin/caller/project.rs`.
 
 ### `[memory]`
 
@@ -362,10 +368,10 @@ account/route link. The
 the client and overrides the file (the card reports when it does).
 
 **Projectless daemons** (the bundled macOS app's normal shape — no
-`.git`/`intendant.toml` at the launch directory) have no project file to
-persist into; for them the same `[connect]` table lives in the
-daemon-scoped `connect.toml` under the state root (`~/.intendant/`), and
-the toggle and daemon boot both use it. Rooted daemons are unaffected.
+`.git`/`intendant.toml` at the launch directory) keep general defaults in the
+daemon-scoped `intendant.toml`, but Connect's credential-bearing table remains
+in its dedicated owner-only `connect.toml` beside it. The toggle and daemon boot
+both use that dedicated file. Rooted daemons are unaffected.
 
 Hosted Connect uses the same daemon-side settings:
 

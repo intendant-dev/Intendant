@@ -820,6 +820,24 @@ mod tests {
     }
 
     #[test]
+    fn global_codex_and_claude_model_defaults_are_wired_in_settings() {
+        for id in [
+            "set-codex-model-select",
+            "set-codex-model-custom",
+            "set-codex-reasoning-effort",
+            "set-claude-model-select",
+            "set-claude-model-custom",
+            "set-claude-permission-mode",
+        ] {
+            assert!(APP_HTML.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(APP_HTML.contains("codex_model: selectedCodexModel"));
+        assert!(APP_HTML.contains("claude_model: selectedClaudeModel"));
+        assert!(APP_HTML.contains("function populateSettingsCodexModel"));
+        assert!(APP_HTML.contains("function populateSettingsClaudeModel"));
+    }
+
+    #[test]
     fn embedded_codex_picker_fallback_matches_daemon_catalog() {
         fn marker_json(start: &str, end: &str) -> serde_json::Value {
             let json = APP_HTML

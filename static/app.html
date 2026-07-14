@@ -3,7 +3,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<!-- viewport-fit=cover: layout extends under notches/home indicator so the
+     env(safe-area-inset-*) vars in ui2-chrome.css get real values (they are
+     0 otherwise and the chrome collides with hardware on phones). No
+     user-scalable=no: pinch-zoom is an accessibility escape hatch — iOS
+     focus-zoom is prevented by 16px input font, double-tap zoom by
+     per-element touch-action:manipulation. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Intendant</title>
 <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -12258,11 +12264,34 @@ html.ui-v2 :focus:not(:focus-visible) { outline: none; }
    that never overlaps the Station canvases — the fixed rail and the
    oversight bar sit outside #app's content box, never over the canvas. */
 
-html.ui-v2 { --ui2-nav-w: 244px; --ui2-ovs-h: 48px; }
+html.ui-v2 {
+  --ui2-nav-w: 244px;
+  --ui2-ovs-h: 48px;
+  /* Device cutout / home-indicator insets. viewport-fit=cover makes these
+     nonzero on notched phones (0 everywhere else); they are composed into
+     every fixed-chrome coordinate below so no control sits under hardware. */
+  --ui2-sa-t: env(safe-area-inset-top, 0px);
+  --ui2-sa-r: env(safe-area-inset-right, 0px);
+  --ui2-sa-b: env(safe-area-inset-bottom, 0px);
+  --ui2-sa-l: env(safe-area-inset-left, 0px);
+  /* Left edge of the content area: rail width + left cutout. */
+  --ui2-nav-edge: calc(var(--ui2-nav-w) + var(--ui2-sa-l));
+  /* Composer geometry. --ui2-composer-h is kept at the bar's REAL rendered
+     height by ui2WireComposerMech (the bar wraps and grows: focus expand,
+     attachments row, the 500-600px wrap band) — the old 92px/64px constants
+     under-reserved whenever it did, letting the bar cover the Files save
+     row and the Live control banner. The fallback approximates the at-rest
+     bar for the pre-boot paint. --ui2-kb-inset lifts the bar above the iOS
+     soft keyboard while composing (0 otherwise). */
+  --ui2-composer-off: 16px;
+  --ui2-composer-h: 62px;
+  --ui2-kb-inset: 0px;
+}
 
 html.ui-v2 #app {
-  padding-left: var(--ui2-nav-w);
-  padding-top: var(--ui2-ovs-h);
+  padding-left: var(--ui2-nav-edge);
+  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  padding-right: var(--ui2-sa-r);
 }
 html.ui-v2 .tab-bar { display: none; }
 
@@ -12270,7 +12299,9 @@ html.ui-v2 .tab-bar { display: none; }
 html.ui-v2 #ui2-nav {
   position: fixed;
   inset: 0 auto 0 0;
-  width: var(--ui2-nav-w);
+  width: var(--ui2-nav-edge);
+  padding-left: var(--ui2-sa-l);
+  padding-bottom: var(--ui2-sa-b);
   z-index: 40;
   display: flex;
   flex-direction: column;
@@ -12380,11 +12411,11 @@ html.ui-v2 .ui2-identity-sub { font-size: 10.5px; color: var(--text-3); }
 /* ── oversight bar ── */
 html.ui-v2 #ui2-oversight {
   position: fixed;
-  top: 0; left: var(--ui2-nav-w); right: 0;
-  height: var(--ui2-ovs-h);
+  top: 0; left: var(--ui2-nav-edge); right: 0;
+  height: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
   z-index: 39;
   display: flex; align-items: center; gap: 12px;
-  padding: 0 18px;
+  padding: var(--ui2-sa-t) calc(18px + var(--ui2-sa-r)) 0 18px;
   background: var(--glass);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
@@ -12668,14 +12699,19 @@ html.ui-v2 .ui2-theme-btn:hover { background: var(--surface-2); color: var(--tex
    the bottom — the design's composer. Same element, same ids, all v1
    listeners intact; phase + stop inside it are hidden because the
    oversight bar already mirrors them. Solid surface, no backdrop-filter:
-   fixed chrome overlaps the Station canvases on the Station tab. */
-html.ui-v2 #app { padding-bottom: 92px; }
+   fixed chrome overlaps the Station canvases on the Station tab.
+   The #app bottom reservation tracks the bar's measured height (see the
+   --ui2-composer-h note at the vars block): panes must never draw under
+   the dock, whatever the dock's current size. */
+html.ui-v2 #app {
+  padding-bottom: calc(var(--ui2-composer-h) + var(--ui2-composer-off) + var(--ui2-sa-b) + 14px);
+}
 html.ui-v2 .global-task-bar {
   position: fixed;
-  left: var(--ui2-nav-w);
-  right: 0;
-  bottom: 16px;
-  width: min(920px, calc(100vw - var(--ui2-nav-w) - 36px));
+  left: var(--ui2-nav-edge);
+  right: var(--ui2-sa-r);
+  bottom: calc(var(--ui2-composer-off) + var(--ui2-sa-b) + var(--ui2-kb-inset));
+  width: min(920px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 36px));
   margin-inline: auto;
   z-index: 70;
   padding: 9px 11px;
@@ -12691,6 +12727,66 @@ html.ui-v2 .global-task-bar:focus-within {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22), var(--shadow-card);
 }
+
+/* ── composer states: expanded ⇄ pill ─────────────────────────────────
+   ui2WireComposerState stamps data-composer-state on <html>: "expanded"
+   is the full dock; "pill" collapses the same fixed element into a small
+   centered lozenge so immersive surfaces (the per-tab defaults: Live,
+   Station, Terminal, Files) keep the bottom of the viewport. The
+   reservation invariant is untouched — --ui2-composer-h simply measures
+   the pill. The child hide is !important on purpose: chip/attachment
+   children carry inline display toggles and focus-within reveals, and
+   the pill state must override every one of them. */
+html.ui-v2 .ui2-composer-pill { display: none; }
+html.ui-v2 .ui2-composer-collapse {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex-shrink: 0; padding: 0;
+  border: 0; border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-3); cursor: pointer;
+}
+html.ui-v2 .ui2-composer-collapse:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .ui2-composer-collapse svg { transform: rotate(90deg); } /* chev points down */
+html.ui-v2[data-composer-state="pill"] .global-task-bar {
+  width: auto;
+  min-width: 0;
+  max-width: min(340px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 24px));
+  padding: 8px 16px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  justify-content: center;
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar > *:not(.ui2-composer-pill) { display: none !important; }
+html.ui-v2[data-composer-state="pill"] .ui2-composer-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 700; color: var(--text-2);
+  white-space: nowrap;
+  pointer-events: none; /* the whole lozenge is the click target */
+}
+html.ui-v2 .ui2-composer-pill-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-3);
+}
+html.ui-v2 .ui2-composer-pill[data-phase="running"] .ui2-composer-pill-dot,
+html.ui-v2 .ui2-composer-pill[data-phase="thinking"] .ui2-composer-pill-dot {
+  background: var(--iris);
+  animation: ui2-pulse 1.3s infinite;
+}
+html.ui-v2 .ui2-composer-pill[data-phase="waiting"] .ui2-composer-pill-dot { background: var(--amber); }
+html.ui-v2 .ui2-composer-pill[data-phase="done"] .ui2-composer-pill-dot { background: var(--green); }
+html.ui-v2 .ui2-composer-pill-draft {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--amber);
+  display: none;
+}
+html.ui-v2 .ui2-composer-pill.has-draft .ui2-composer-pill-draft { display: inline-block; }
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .ui2-composer-pill-dot { animation: none !important; }
+}
+
 /* phase + stop live in the oversight bar under v2 */
 html.ui-v2 .global-task-bar .phase-banner { display: none; }
 html.ui-v2 .global-task-bar .stop-btn { display: none; }
@@ -12811,27 +12907,39 @@ html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
    ~40% of the viewport; focusing it (or targeting a session) expands the
    full control set. :focus-within covers typing, target chip, attach and
    Direct once expanded. */
-@media (max-width: 500px) {
+@media (max-width: 600px) {
+  /* The dock hugs the edge tighter on phones; the #app reservation keeps
+     following the measured bar height (the old fixed 64px was smaller
+     than the bar itself — the root of the covered-controls bug). The
+     breakpoint is 600, not 500: v1's ≤600 wrap rules force the input
+     onto its own row with Send alone under it — the order/flex resets
+     below re-join them into one compact resting row across the whole
+     band, with the secondary controls appearing on focus. */
+  html.ui-v2 { --ui2-composer-off: 8px; }
   html.ui-v2 .global-task-bar {
-    bottom: 8px;
-    width: calc(100vw - var(--ui2-nav-w) - 16px);
+    width: calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 16px);
     padding: 6px 8px;
     flex-wrap: wrap;
   }
-  html.ui-v2 #app { padding-bottom: 64px; }
+  html.ui-v2 .global-task-bar .global-task-input {
+    order: 0;
+    flex: 1 1 auto;
+    width: auto;
+    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
+    max-height: 2.4em;
+  }
+  html.ui-v2 .global-task-bar .global-send-btn { order: 0; flex: 0 0 auto; }
   html.ui-v2 .global-task-bar .task-new-session-btn,
   html.ui-v2 .global-task-bar .global-attach-btn,
-  html.ui-v2 .global-task-bar .global-direct-toggle {
+  html.ui-v2 .global-task-bar .global-direct-toggle,
+  html.ui-v2 .global-task-bar .ui2-composer-collapse {
     display: none;
   }
   html.ui-v2 .global-task-bar:focus-within .task-new-session-btn,
   html.ui-v2 .global-task-bar:focus-within .global-attach-btn,
-  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle {
+  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle,
+  html.ui-v2 .global-task-bar:focus-within .ui2-composer-collapse {
     display: inline-flex;
-  }
-  html.ui-v2 .global-task-bar .global-task-input {
-    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
-    max-height: 2.4em;
   }
   html.ui-v2 .global-task-bar:focus-within .global-task-input {
     max-height: 6em;
@@ -12871,6 +12979,15 @@ html.ui-v2 .ui2-fuel-chip {
   border: 1px solid rgba(var(--green-rgb), .28);
   white-space: nowrap;
 }
+
+/* ── touch behavior ──
+   The viewport meta no longer carries user-scalable=no (pinch-zoom is an
+   accessibility escape hatch and the recovery gesture when a layout goes
+   wrong on a phone). Double-tap-to-zoom on controls is suppressed
+   per-element instead; manipulation still allows pan and pinch. */
+html.ui-v2 :is(button, select, input, textarea, label, .ui2-nav-item, .tab-btn) {
+  touch-action: manipulation;
+}
 /* ── static/app/ui2-voice.css ── */
 /* ── ui-v2 voice: mic button + in-call panel (user-approved design) ────
    All scoped html.ui-v2. The v1 floating overlay stays in the DOM
@@ -12905,8 +13022,8 @@ html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--r
 
 html.ui-v2 #ui2-voice-panel {
   position: fixed;
-  top: calc(var(--ui2-ovs-h) + 8px);
-  right: 18px;                     /* shares the oversight bar's content edge */
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + 8px);
+  right: calc(18px + var(--ui2-sa-r)); /* shares the oversight bar's content edge */
   width: min(320px, calc(100vw - 36px));
   z-index: 90;                     /* above content + composer (70), below ⌘K (100) */
   background: var(--surface);
@@ -22627,6 +22744,445 @@ html.ui-v2 .ui2-appearance-note {
 /* Inline code in section subtitles rides the design mono (chrome-audit
    cross-surface sweep). */
 html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
+/* ── static/app/ui2-composer-peek.css ── */
+/* ── composer conversation peek ─────────────────────────────────────────
+   The container floats ABOVE the dock card: the bar is position:fixed, so
+   this absolute child anchors to the card and never contributes to the
+   bar's measured height — the #app bottom reservation follows
+   --ui2-composer-h (the bar box alone), and the peek overlays content
+   like a transient sheet instead of reflowing it. It rides the keyboard
+   lift for free (the bar's bottom carries --ui2-kb-inset).
+   Solid surface, no backdrop-filter: fixed chrome can overlap the Station
+   canvases (same rule as the dock card). */
+html.ui-v2 .ui2-composer-peek {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  max-height: min(42vh, 380px);
+  max-height: min(42dvh, 380px);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+/* the display:flex above outweighs the UA [hidden] rule — restate it */
+html.ui-v2 .ui2-composer-peek[hidden] { display: none; }
+@keyframes ui2-peek-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+html.ui-v2 .ui2-composer-peek:not([hidden]) {
+  animation: ui2-peek-in var(--t-slow) ease;
+}
+
+/* — header: target identity, live phase, jump-to-Activity, close — */
+html.ui-v2 .ui2-peek-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 8px 9px 7px 13px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-header:hover { background: var(--hover-wash); }
+html.ui-v2 .ui2-peek-target {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 220px;
+  font-size: 11px;
+  font-weight: 650;
+}
+html.ui-v2 .ui2-peek-phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-peek-phase-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="thinking"],
+html.ui-v2 .ui2-peek-phase-dot[data-cat="running"] {
+  background: var(--iris);
+  animation: ui2-pulse 1.3s infinite;
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="waiting"] {
+  background: var(--amber);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="done"] { background: var(--green); }
+html.ui-v2 .ui2-peek-phase-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-peek-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-open:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .ui2-peek-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans);
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-close:hover { color: var(--text); background: var(--surface-2); }
+
+/* — transcript tail — */
+html.ui-v2 .ui2-peek-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* scroll pinning is managed manually, like the other log scrollers */
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  padding: 6px 12px 9px;
+}
+html.ui-v2 .ui2-peek-empty {
+  padding: 20px 12px 22px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* — compact entry density —
+   Clones keep the Activity timeline grammar (ui2-activity.css styles
+   .log-entry globally); the peek drops the ts gutter and the host/session
+   badges (identity lives in the peek header) and tightens type. Track
+   list mirrors the base 7-column template with the hidden columns zeroed
+   so the explicit grid-column placements keep landing. */
+html.ui-v2 .ui2-composer-peek .log-entry {
+  grid-template-columns: 0 16px 0 0 max-content 0 minmax(0, 1fr);
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+/* 12.5px × 1.5 line box ≈ 19px; the 6px dot centers at (19−6)/2 ≈ 6px */
+html.ui-v2 .ui2-composer-peek .log-entry .log-icon { margin-top: 6px; }
+html.ui-v2 .ui2-composer-peek .log-entry .log-ts,
+html.ui-v2 .ui2-composer-peek .log-entry .log-host,
+html.ui-v2 .ui2-composer-peek .log-entry .log-session,
+html.ui-v2 .ui2-composer-peek .log-entry .log-anchor-btn,
+html.ui-v2 .ui2-composer-peek .log-entry .log-copy-entry,
+html.ui-v2 .ui2-composer-peek .log-entry .log-edit-message,
+html.ui-v2 .ui2-composer-peek .log-entry .collapse-toggle {
+  display: none;
+}
+html.ui-v2 .ui2-composer-peek .log-entry pre {
+  font-size: 11.5px;
+  padding: 8px 10px;
+}
+
+/* long payloads clamp; the fade appears only on entries that really clip
+   (JS tags .ui2-peek-clamped — CSS cannot see overflow). The blanket
+   content:none also retires v1's side fade on collapsible entries, whose
+   1.5em clamp the max-height below supersedes inside the peek. */
+html.ui-v2 .ui2-composer-peek .log-entry .log-content {
+  position: relative;
+  max-height: 8.5em;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-composer-peek .log-entry:not(.ui2-peek-clamped) .log-content::after { content: none; }
+html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  width: auto;
+  height: 1.8em;
+  background: linear-gradient(to bottom, transparent, var(--surface));
+  pointer-events: none;
+}
+html.ui-v2 .ui2-composer-peek .diff-log-entry .diff-log-body {
+  max-height: 8.5em;
+  overflow: hidden;
+}
+
+/* — phones: keep the header one quiet row — */
+@media (max-width: 500px) {
+  html.ui-v2 .ui2-peek-open .ui2-peek-open-label { display: none; }
+  html.ui-v2 .ui2-peek-open { padding: 4px 8px; }
+  html.ui-v2 .ui2-peek-header { padding: 7px 8px 6px 11px; }
+}
+/* ── static/app/ui2-target-switch.css ── */
+/* ── composer target hot-swap ───────────────────────────────────────────
+   Popover anchors to the dock card (absolute child of the fixed bar) and
+   opens UPWARD; position:absolute in every state so it never adds to the
+   bar's measured height — the #app reservation follows --ui2-composer-h,
+   the bar box alone (see the peek skeleton note — same rule). */
+
+/* trigger: revealed by ui2-target-switch.js (inline display cleared) */
+html.ui-v2 .task-target-switch-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans); /* buttons don't inherit */
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast),
+    border-color var(--t-fast), transform var(--t-fast);
+}
+html.ui-v2 .task-target-switch-btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+html.ui-v2 .task-target-switch-btn:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 1px;
+}
+/* open: iris tint + the caret flips toward the popover above (the button
+   box is a symmetric square, so rotating the whole control is safe) */
+html.ui-v2 .task-target-switch-btn[aria-expanded="true"] {
+  color: var(--iris-2);
+  border-color: rgba(var(--iris-rgb), .4);
+  background: rgba(var(--iris-rgb), .09);
+  transform: rotate(180deg);
+}
+
+html.ui-v2 .ui2-target-switch {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 10px;
+  min-width: 260px;
+  width: max-content;
+  max-width: min(420px, calc(100vw - 24px));
+  z-index: 3; /* above the peek, its z:auto anchor-mate on the same card */
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  animation: ui2-tsw-in var(--t-med) ease-out;
+}
+html.ui-v2 .ui2-target-switch[hidden] { display: none; }
+@keyframes ui2-tsw-in {
+  from { opacity: 0; transform: translateY(5px); }
+}
+
+html.ui-v2 .ui2-tsw-eyebrow {
+  padding: 7px 12px 4px;
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+  user-select: none;
+}
+
+html.ui-v2 .ui2-tsw-filter {
+  margin: 2px 6px 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--bg-1);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  outline: none;
+}
+html.ui-v2 .ui2-tsw-filter::placeholder { color: var(--text-3); }
+html.ui-v2 .ui2-tsw-filter:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .18);
+}
+
+html.ui-v2 .ui2-tsw-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 2px;
+  overflow-y: auto;
+  max-height: min(50vh, 420px);
+  max-height: min(50dvh, 420px);
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+html.ui-v2 .ui2-tsw-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans); /* buttons don't inherit */
+  font-size: 12.5px;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+}
+html.ui-v2 .ui2-tsw-row:hover {
+  background: var(--hover-wash);
+  color: var(--text);
+}
+html.ui-v2 .ui2-tsw-row:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: -2px;
+}
+html.ui-v2 .ui2-tsw-row[aria-selected="true"] {
+  color: var(--text);
+  background: rgba(var(--iris-rgb), .08);
+}
+html.ui-v2 .ui2-tsw-row[aria-selected="true"]::after {
+  content: "✓";
+  margin-left: 4px;
+  color: var(--iris-2);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+html.ui-v2 .ui2-tsw-row-main {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+}
+html.ui-v2 .ui2-tsw-row-label { font-weight: 650; }
+html.ui-v2 .ui2-tsw-row-sub {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 450;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-tsw-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+html.ui-v2 .ui2-tsw-badge {
+  flex-shrink: 0;
+  max-width: 96px;
+  padding: 2px 7px;
+  border: 1px solid var(--session-badge-border, rgba(var(--iris-rgb), .35));
+  border-radius: 5px;
+  background: var(--session-badge-bg, rgba(var(--iris-rgb), .08));
+  color: var(--session-badge-fg, var(--iris-2));
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* light theme: applySessionBadgeStyle mints dark-theme pastels — re-derive
+   toward ink while keeping each session's hue (same formula as the chip's
+   light rule in ui2-activity.css, which doesn't cover this class) */
+html.ui-v2[data-theme="light"] .ui2-tsw-badge {
+  color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
+  border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
+}
+
+html.ui-v2 .ui2-tsw-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+  opacity: .55;
+}
+html.ui-v2 .ui2-tsw-dot.active {
+  background: var(--green);
+  opacity: 1;
+  animation: ui2-tsw-pulse 2s ease-in-out infinite;
+}
+html.ui-v2 .ui2-tsw-dot.waiting {
+  background: var(--amber);
+  opacity: 1;
+}
+@keyframes ui2-tsw-pulse {
+  50% { opacity: .45; }
+}
+
+html.ui-v2 .ui2-tsw-empty {
+  padding: 14px 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+html.ui-v2 .ui2-tsw-foot {
+  margin-top: 4px;
+  padding: 4px 2px 0;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-tsw-foot .ui2-tsw-row { color: var(--text-3); }
+html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
+
+/* touch targets (brief: rows ≥44px at ≤820px); 16px input font keeps
+   iOS Safari from zooming the page on focus */
+@media (max-width: 820px) {
+  html.ui-v2 .ui2-tsw-row { min-height: 44px; }
+  html.ui-v2 .ui2-tsw-filter {
+    min-height: 40px;
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .ui2-target-switch { animation: none; }
+  html.ui-v2 .ui2-tsw-dot.active { animation: none; }
+  html.ui-v2 .task-target-switch-btn { transition: none; }
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -22712,6 +23268,11 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
 
   <!-- Global Task Bar — always visible across tabs -->
   <div class="global-task-bar">
+    <!-- Conversation peek: the prompt-target session's tail, floated above
+         the dock card (absolute → anchors to the bar, never adds to its
+         measured height / the #app reservation). Filled by
+         ui2-composer-peek.js; inert while hidden. -->
+    <div id="ui2-composer-peek" class="ui2-composer-peek" hidden></div>
     <div class="phase-banner phase-idle" id="phase-banner">
       <span class="spinner" id="phase-spinner"></span>
       <span class="phase-text" id="phase-text">Idle</span>
@@ -22719,6 +23280,12 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
     <button id="task-target-chip" class="task-target-chip" type="button" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
+    <!-- Target hot-swap: in-place session switcher. Button revealed and
+         both wired by ui2-target-switch.js (display:none keeps them inert
+         if that fragment ever regresses to a stub); the popover anchors to
+         the dock card like the peek. -->
+    <button id="task-target-switch-btn" class="task-target-switch-btn" type="button" title="Choose prompt target" aria-haspopup="listbox" aria-expanded="false" style="display:none">&#x25BE;</button>
+    <div id="ui2-target-switch" class="ui2-target-switch" hidden role="listbox" aria-label="Prompt target sessions"></div>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -24773,7 +25340,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
         <div class="subtab-pane" id="settings-pane-agent">
           <div class="settings-pane-body">
             <p class="settings-note">
-              Settings are saved to <code>intendant.toml</code> and take effect on the next task.
+              Settings are saved to the current project's <code>intendant.toml</code>, or to the daemon-wide <code>~/.intendant/intendant.toml</code> when no project is attached. Agent defaults take effect on the next task.
             </p>
 
             <section class="ui-card" aria-labelledby="settings-external-agent-heading">
@@ -24787,6 +25354,49 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
                   <option value="">None (internal agent)</option>
                   <option value="codex">Codex (OpenAI)</option>
                   <option value="claude-code">Claude Code (Anthropic)</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-model-select">Codex model</label>
+                <select id="set-codex-model-select">
+                  <option value="">Codex account default</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-codex-model-custom-row">
+                <label for="set-codex-model-custom">Custom Codex id</label>
+                <input id="set-codex-model-custom" type="text" placeholder="e.g. staged-model-id" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-reasoning-effort">Codex reasoning</label>
+                <select id="set-codex-reasoning-effort">
+                  <option value="">Model default</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-model-select">Claude model</label>
+                <select id="set-claude-model-select">
+                  <option value="">Claude account default</option>
+                  <option value="fable">fable — latest Fable</option>
+                  <option value="opus">opus — latest Opus</option>
+                  <option value="sonnet">sonnet — latest Sonnet</option>
+                  <option value="haiku">haiku — latest Haiku</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-claude-model-custom-row">
+                <label for="set-claude-model-custom">Custom Claude id</label>
+                <input id="set-claude-model-custom" type="text" placeholder="e.g. claude-haiku-4-5-20251001" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-permission-mode">Claude permissions</label>
+                <select id="set-claude-permission-mode">
+                  <option value="default">default</option>
+                  <option value="acceptEdits">acceptEdits</option>
+                  <option value="plan">plan</option>
+                  <option value="auto">auto</option>
+                  <option value="dontAsk">dontAsk</option>
+                  <option value="bypassPermissions">bypassPermissions</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -26660,6 +27270,174 @@ function ui2FuelChipSync() {
     + (best.kind ? ` (${best.kind})` : '') + '. Display only.';
 }
 
+function ui2WireComposerMech() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const root = document.documentElement.style;
+
+  // Reservation: keep --ui2-composer-h at the bar's real border-box height.
+  // The bar wraps and grows (focus expand, the attachments row, the v1
+  // 500-600px wrap band), and the old constant reservation is exactly what
+  // let it cover the Files save row and the Live control banner on phones.
+  const measure = () => {
+    const h = Math.ceil(bar.getBoundingClientRect().height);
+    if (h > 0) root.setProperty('--ui2-composer-h', h + 'px');
+  };
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(measure).observe(bar);
+  } else {
+    bar.addEventListener('focusin', () => requestAnimationFrame(measure));
+    bar.addEventListener('focusout', () => requestAnimationFrame(measure));
+    window.addEventListener('resize', measure);
+  }
+  measure();
+
+  // Soft-keyboard lift: iOS keeps position:fixed anchored to the layout
+  // viewport, so the opened keyboard covers the bar mid-composition. Track
+  // the visual viewport and lift by the overlap — but only while focus is
+  // inside the bar: lifting for other inputs (the Files editor, a settings
+  // field) would cover the very field being edited. Android resizes the
+  // layout viewport under the keyboard instead, so the overlap computes to
+  // ~0 there and this stays inert.
+  const vv = window.visualViewport;
+  if (vv) {
+    let raf = 0;
+    const apply = () => {
+      raf = 0;
+      const composing = bar.contains(document.activeElement);
+      const overlap = window.innerHeight - vv.height - vv.offsetTop;
+      const inset = composing ? Math.max(0, Math.round(overlap)) : 0;
+      root.setProperty('--ui2-kb-inset', inset + 'px');
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(apply); };
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+    bar.addEventListener('focusin', schedule);
+    // The keyboard retracts after focus leaves; measuring in the same frame
+    // reads the pre-retraction viewport.
+    bar.addEventListener('focusout', () => setTimeout(schedule, 80));
+  }
+}
+
+const UI2_COMPOSER_PILL_DEFAULT_TABS = new Set(['displays', 'station', 'terminal', 'files']);
+
+function ui2WireComposerState() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const rootEl = document.documentElement;
+  const input = document.getElementById('activity-task-input');
+
+  const pill = document.createElement('span');
+  pill.className = 'ui2-composer-pill';
+  const dot = document.createElement('span');
+  dot.className = 'ui2-composer-pill-dot';
+  const pillLabel = document.createElement('span');
+  pillLabel.textContent = 'Ask Intendant';
+  const draftDot = document.createElement('span');
+  draftDot.className = 'ui2-composer-pill-draft';
+  draftDot.title = 'Unsent draft';
+  pill.append(dot, pillLabel, draftDot);
+  bar.appendChild(pill);
+
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'ui2-composer-collapse';
+  collapse.title = 'Collapse composer (Esc)';
+  collapse.setAttribute('aria-label', 'Collapse composer');
+  collapse.innerHTML = ui2Icon('chev', 14);
+  bar.insertBefore(collapse, document.getElementById('phase-banner'));
+
+  const activeTabId = () => {
+    const pane = document.querySelector('.tab-pane.active');
+    return pane ? pane.id.replace(/^tab-/, '') : 'activity';
+  };
+  const stateKey = (tab) => 'intendant.ui2.composerState.' + tab;
+  const stateFor = (tab) => {
+    try {
+      const o = localStorage.getItem(stateKey(tab));
+      if (o === 'pill' || o === 'expanded') return o;
+    } catch (_) { /* private mode: defaults only */ }
+    return UI2_COMPOSER_PILL_DEFAULT_TABS.has(tab) ? 'pill' : 'expanded';
+  };
+  const syncDraft = () => {
+    pill.classList.toggle('has-draft', !!(input && input.value.trim()));
+  };
+
+  let current = '';
+  const setState = (next, remember = false) => {
+    if (next !== 'pill' && next !== 'expanded') return;
+    if (remember) {
+      try { localStorage.setItem(stateKey(activeTabId()), next); } catch (_) { /* private mode */ }
+    }
+    if (current === next) return;
+    current = next;
+    rootEl.dataset.composerState = next;
+    if (next === 'pill') {
+      // Children go display:none — never leave focus on a hidden control
+      // (it would also pin the keyboard lift).
+      if (bar.contains(document.activeElement)) document.activeElement.blur();
+      bar.setAttribute('role', 'button');
+      bar.setAttribute('tabindex', '0');
+      bar.setAttribute('aria-label', 'Expand composer');
+      syncDraft();
+    } else {
+      bar.removeAttribute('role');
+      bar.removeAttribute('tabindex');
+      bar.removeAttribute('aria-label');
+    }
+    window.dispatchEvent(new CustomEvent('ui2:composer-state', { detail: { state: next } }));
+  };
+
+  const expandAndFocus = (viaTouch) => {
+    setState('expanded', true);
+    // Touch keeps the keyboard down until the user taps the input.
+    if (!viaTouch && input) input.focus();
+  };
+
+  // Programmatic seam for palette/shortcut callers: expand before focusing
+  // (a pilled dock's children are display:none and cannot receive focus).
+  window.ui2ComposerExpand = () => setState('expanded');
+
+  bar.addEventListener('click', (e) => {
+    if (current !== 'pill') return;
+    expandAndFocus(e.pointerType === 'touch');
+  });
+  collapse.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setState('pill', true);
+  });
+  bar.addEventListener('keydown', (e) => {
+    if (current === 'pill' && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      expandAndFocus(false);
+      return;
+    }
+    // Bubble phase: the peek's capture-phase Esc (close-peek) stops
+    // propagation while the peek is open, so this fires only with no peek
+    // up. Esc is get-out-of-my-way, not a preference — no remember.
+    if (e.key === 'Escape' && current === 'expanded') setState('pill');
+  });
+  if (input) input.addEventListener('input', syncDraft);
+
+  ui2Mirror('phase-banner', (banner) => {
+    pill.dataset.phase = ui2PhaseCategory(banner.className);
+  });
+
+  const applyForTab = (tab) => setState(stateFor(String(tab || '')));
+  if (typeof switchTab === 'function') {
+    // One shared module scope: rebinding the declaration retargets every
+    // caller (nav, palette, router deep links), so the per-tab state rides
+    // every navigation path.
+    const origSwitchTab = switchTab;
+    switchTab = function (tabId) {
+      const r = origSwitchTab.apply(this, arguments);
+      if (r !== false) applyForTab(tabId);
+      return r;
+    };
+  }
+  applyForTab(activeTabId());
+}
+
 ui2BuildNav();
 {
   // Single-boot: a module script executes at readyState 'interactive', so
@@ -26670,6 +27448,8 @@ ui2BuildNav();
   const wire = () => {
     ui2WireMirrors();
     ui2WirePalette();
+    ui2WireComposerMech();
+    ui2WireComposerState();
     // Fuel chip: transport-status flips repaint it via the existing
     // #sb-dashboard-transport mirror lane; the interval keeps the lease
     // countdown honest between flips.
@@ -27266,7 +28046,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '812372c71a467900';
+const INTENDANT_APP_BUILD = 'f2650a8859193147';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -42632,14 +43412,13 @@ let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionCodexLaunchDefaultsLoaded = false;
-// Projectless daemons cannot serve /api/settings until the user chooses a
-// project, so New Session needs an embedded offline catalog. A daemon-side
-// parity test pins this JSON fallback to project::CODEX_MODEL_CATALOG; a
-// successful settings fetch replaces it with the daemon-owned payload.
+// Keep an embedded offline catalog for a settings fetch that has not landed
+// yet (or an older/unreachable daemon). A daemon-side parity test pins this
+// JSON fallback to project::CODEX_MODEL_CATALOG; a successful settings fetch
+// replaces it with the signed-in Codex account's cached catalog.
 const NEW_SESSION_CODEX_MODEL_FALLBACK = Object.freeze(
 /* codex-model-catalog:start */
 [
-  {"id":"gpt-5.6","display_name":"GPT-5.6 (Sol alias)","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max"]},
@@ -83684,6 +84463,106 @@ function renderStatsForActiveHost(options = {}) {
 // ── Settings ──
 // settingsLoaded lives with the minimal JS state block (deep-link TDZ).
 
+function settingsCodexModelValue() {
+  const select = document.getElementById('set-codex-model-select');
+  if (!select) return '';
+  if (select.value === '__custom__') {
+    return document.getElementById('set-codex-model-custom')?.value.trim() || '';
+  }
+  return select.value || '';
+}
+
+function settingsCodexCatalogEntry() {
+  const model = settingsCodexModelValue();
+  if (!model) return null;
+  return newSessionCodexModelCatalog
+    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
+    .sort((a, b) => b.id.length - a.id.length)[0] || null;
+}
+
+function updateSettingsCodexCustomModelRow() {
+  const custom = document.getElementById('set-codex-model-select')?.value === '__custom__';
+  document.getElementById('set-codex-model-custom-row')?.classList.toggle('hidden', !custom);
+}
+
+function populateSettingsCodexReasoningEfforts(configuredEffort = null) {
+  const select = document.getElementById('set-codex-reasoning-effort');
+  if (!select) return;
+  const previous = configuredEffort === null ? (select.value || '') : String(configuredEffort || '').trim();
+  const model = settingsCodexCatalogEntry();
+  const efforts = model?.reasoning_efforts?.length
+    ? model.reasoning_efforts
+    : newSessionCodexReasoningEfforts;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = model?.default_reasoning_effort
+    ? `Model default (${model.default_reasoning_effort})`
+    : 'Model / Codex default';
+  select.appendChild(inherit);
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = efforts.includes(previous) ? previous : '';
+}
+
+function populateSettingsCodexModel(configuredModel, configuredEffort) {
+  const select = document.getElementById('set-codex-model-select');
+  const customInput = document.getElementById('set-codex-model-custom');
+  if (!select) return;
+  const model = String(configuredModel || '').trim();
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = 'Codex account default';
+  select.appendChild(inherit);
+  for (const entry of newSessionCodexModelCatalog) {
+    const option = document.createElement('option');
+    option.value = entry.id;
+    option.textContent = `${entry.display_name} — ${entry.id}`;
+    select.appendChild(option);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  const isCatalogModel = newSessionCodexModelCatalog.some(entry => entry.id === model);
+  select.value = !model ? '' : (isCatalogModel ? model : '__custom__');
+  if (customInput) customInput.value = model && !isCatalogModel ? model : '';
+  updateSettingsCodexCustomModelRow();
+  populateSettingsCodexReasoningEfforts(configuredEffort);
+}
+
+function settingsClaudeModelValue() {
+  const select = document.getElementById('set-claude-model-select');
+  if (!select) return '';
+  if (select.value === '__custom__') {
+    return document.getElementById('set-claude-model-custom')?.value.trim() || '';
+  }
+  return select.value || '';
+}
+
+function updateSettingsClaudeCustomModelRow() {
+  const custom = document.getElementById('set-claude-model-select')?.value === '__custom__';
+  document.getElementById('set-claude-model-custom-row')?.classList.toggle('hidden', !custom);
+}
+
+function populateSettingsClaudeModel(configuredModel) {
+  const select = document.getElementById('set-claude-model-select');
+  const customInput = document.getElementById('set-claude-model-custom');
+  if (!select) return;
+  const model = String(configuredModel || '').trim();
+  const aliases = ['fable', 'opus', 'sonnet', 'haiku'];
+  select.value = !model ? '' : (aliases.includes(model) ? model : '__custom__');
+  if (customInput) customInput.value = model && !aliases.includes(model) ? model : '';
+  updateSettingsClaudeCustomModelRow();
+}
+
 async function loadSettings() {
   try {
     const d = await fetchDashboardSettings();
@@ -83714,11 +84593,29 @@ async function loadSettings() {
     document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
-    controlCodexConfig.command = d.codex_command || 'codex';
-    controlCodexConfig.service_tier = normalizeCodexServiceTier(d.codex_service_tier || '');
-    controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
-    controlCodexConfig.context_archive = d.codex_context_archive || 'summary';
+    controlCodexConfig = {
+      command: d.codex_command || 'codex',
+      managed_command: d.codex_managed_command || '',
+      sandbox: normalizeCodexSandbox(d.codex_sandbox || 'workspace-write'),
+      approval_policy: normalizeCodexApprovalPolicy(d.codex_approval_policy || 'on-request'),
+      model: d.codex_model || '',
+      reasoning_effort: d.codex_reasoning_effort || '',
+      service_tier: normalizeCodexServiceTier(d.codex_service_tier || ''),
+      web_search: !!d.codex_web_search,
+      network_access: !!d.codex_network_access,
+      writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
+      managed_context: d.codex_managed_context || 'vanilla',
+      context_archive: d.codex_context_archive || 'summary',
+    };
+    controlClaudeConfig = {
+      model: d.claude_model || '',
+      permission_mode: d.claude_permission_mode || 'default',
+      allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
+    };
     setNewSessionAgentDefaults(d);
+    populateSettingsCodexModel(d.codex_model, d.codex_reasoning_effort);
+    populateSettingsClaudeModel(d.claude_model);
+    document.getElementById('set-claude-permission-mode').value = controlClaudeConfig.permission_mode;
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync the Settings dropdown and status bar
     // worker identity here — on a fresh daemon boot there are no
@@ -83760,13 +84657,11 @@ async function loadSettings() {
 async function saveSettings() {
   const g = id => document.getElementById(id);
   const selectedCodexServiceTier = normalizeCodexServiceTier(g('set-codex-service-tier')?.value ?? controlCodexConfig.service_tier ?? '');
+  const selectedCodexModel = settingsCodexModelValue();
+  const selectedCodexReasoningEffort = g('set-codex-reasoning-effort')?.value || '';
+  const selectedClaudeModel = settingsClaudeModelValue();
+  const selectedClaudePermissionMode = g('set-claude-permission-mode')?.value || 'default';
   const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
-  controlCodexConfig.service_tier = selectedCodexServiceTier;
-  newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
-  newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
-  if (!newSessionCodexFastModeTouched) {
-    newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
-  }
   const payload = {
     cu_provider: g('set-cu-provider').value || null,
     cu_model: g('set-cu-model').value || null,
@@ -83794,8 +84689,10 @@ async function saveSettings() {
     claude_command: selectedClaudeCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
-    codex_model: controlCodexConfig.model || null,
-    codex_reasoning_effort: controlCodexConfig.reasoning_effort || null,
+    // Empty strings are explicit clears. `null`/omission means "leave this
+    // field untouched" to partial API clients on the daemon.
+    codex_model: selectedCodexModel,
+    codex_reasoning_effort: selectedCodexReasoningEffort,
     codex_service_tier: selectedCodexServiceTier,
     codex_web_search: !!controlCodexConfig.web_search,
     codex_network_access: !!controlCodexConfig.network_access,
@@ -83804,7 +84701,13 @@ async function saveSettings() {
       : [],
     codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
     codex_context_archive: controlCodexConfig.context_archive || 'summary',
+    claude_model: selectedClaudeModel,
+    claude_permission_mode: selectedClaudePermissionMode,
+    claude_allowed_tools: Array.isArray(controlClaudeConfig.allowed_tools)
+      ? controlClaudeConfig.allowed_tools
+      : [],
   };
+  let settingsSaved = false;
   try {
     // daemonApi (transport F3): POST twin — the fallback policy derives
     // no-replay from the verb, exactly the legacy
@@ -83815,6 +84718,7 @@ async function saveSettings() {
     const data = resp.body;
     const status = g('settings-status');
     if (data.ok) {
+      settingsSaved = true;
       status.textContent = 'Saved';
       status.style.color = 'var(--green)';
     } else {
@@ -83834,12 +84738,27 @@ async function saveSettings() {
     }
     showControlToast?.('error', 'Settings save failed: ' + (e?.message || 'network error'));
   }
+  if (!settingsSaved) return;
+  // Commit the browser-side mirrors only after persistence succeeds. A
+  // failed POST must not make New Session behave as though the defaults had
+  // been saved.
+  controlCodexConfig.model = selectedCodexModel;
+  controlCodexConfig.reasoning_effort = selectedCodexReasoningEffort;
+  controlCodexConfig.service_tier = selectedCodexServiceTier;
+  controlClaudeConfig.model = selectedClaudeModel;
+  controlClaudeConfig.permission_mode = selectedClaudePermissionMode;
+  newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
+  newSessionCodexGlobalModel = selectedCodexModel;
+  newSessionCodexGlobalReasoningEffort = selectedCodexReasoningEffort;
+  newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
+  if (!newSessionCodexFastModeTouched) {
+    newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
+  }
   // Also emit the control messages so the in-memory shared state
   // updates immediately (without waiting for the next daemon restart
   // to re-read the TOML). The POST above persists — and the gateway
-  // re-dispatches the codex fields server-side too — but keep this
-  // list complete so the dashboard never depends on that, and cover
-  // every codex field with a live control-plane setter.
+  // re-dispatches the external-agent fields server-side too — but keep
+  // this list complete so the dashboard never depends on that path.
   const agentVal = g('set-external-agent').value || null;
   dispatchControlMsg({ action: 'set_external_agent', agent: agentVal });
   dispatchControlMsg({
@@ -83849,6 +84768,16 @@ async function saveSettings() {
   dispatchControlMsg({
     action: 'set_codex_managed_command',
     command: (g('set-codex-managed-command').value || '').trim() || null,
+  });
+  dispatchControlMsg({ action: 'set_codex_sandbox', mode: controlCodexConfig.sandbox || 'workspace-write' });
+  dispatchControlMsg({ action: 'set_codex_approval_policy', policy: controlCodexConfig.approval_policy || 'on-request' });
+  dispatchControlMsg({ action: 'set_codex_model', model: selectedCodexModel || null });
+  dispatchControlMsg({ action: 'set_codex_reasoning_effort', effort: selectedCodexReasoningEffort || null });
+  dispatchControlMsg({ action: 'set_codex_web_search', enabled: !!controlCodexConfig.web_search });
+  dispatchControlMsg({ action: 'set_codex_network_access', enabled: !!controlCodexConfig.network_access });
+  dispatchControlMsg({
+    action: 'set_codex_writable_roots',
+    roots: Array.isArray(controlCodexConfig.writable_roots) ? controlCodexConfig.writable_roots : [],
   });
   dispatchControlMsg({
     action: 'set_codex_managed_context',
@@ -83862,10 +84791,24 @@ async function saveSettings() {
     action: 'set_codex_service_tier',
     service_tier: selectedCodexServiceTier || null,
   });
+  dispatchControlMsg({ action: 'set_claude_model', model: selectedClaudeModel || null });
+  dispatchControlMsg({ action: 'set_claude_permission_mode', mode: selectedClaudePermissionMode });
+  dispatchControlMsg({
+    action: 'set_claude_allowed_tools',
+    tools: Array.isArray(controlClaudeConfig.allowed_tools) ? controlClaudeConfig.allowed_tools : [],
+  });
 }
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
+document.getElementById('set-codex-model-select')?.addEventListener('change', () => {
+  updateSettingsCodexCustomModelRow();
+  populateSettingsCodexReasoningEfforts();
+});
+document.getElementById('set-codex-model-custom')?.addEventListener('input', () => {
+  populateSettingsCodexReasoningEfforts();
+});
+document.getElementById('set-claude-model-select')?.addEventListener('change', updateSettingsClaudeCustomModelRow);
 document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
 document.getElementById('connect-self-test-btn')?.addEventListener('click', () => {
   runConnectSelfTests().catch(err => {
@@ -85633,7 +86576,6 @@ function focusActivityForSessionEvent(options = {}) {
     showBadge('activity', '\u2022');
   }
 }
-
 /* ── static/app/ui2-settings.js ── */
 // ── ui-v2 Settings: 4-section layout + autonomy & approvals ────────────
 // Design-overhaul P2. Under the ui-v2 flag the Settings tab becomes the
@@ -86058,7 +87000,8 @@ function ui2SettingsBuild() {
     if (keys) panes.providers.appendChild(keys);
 
     // External agent → "Managed backend" with a segmented proxy over the
-    // existing select + an Advanced fold for binaries and tier.
+    // existing select, daemon-wide model defaults for both backends, and an
+    // Advanced fold for binaries and tier.
     const ext = cardOf('settings-external-agent-heading');
     if (ext) {
       panes.providers.appendChild(ext);
@@ -86075,7 +87018,7 @@ function ui2SettingsBuild() {
         'set-codex-command', 'set-codex-managed-command', 'set-claude-command', 'set-codex-service-tier',
       ]);
       const link = ui2SettingsEl('p', 'settings-note ui2-crosslink');
-      link.innerHTML = 'Live backend controls — sandbox, approval policy, model override, thread actions — stay in <a href="#activity/control">Activity → Control</a>.';
+      link.innerHTML = 'Advanced live controls — sandbox, approval policy, allowed tools, and thread actions — are in <a href="#activity/control">Activity → Control</a>.';
       ext.appendChild(link);
     }
 
@@ -101114,6 +102057,817 @@ function handleDisplayRequestResolved(d) {
     hidePanel('display-request-panel');
   }
 }
+/* ── static/app/ui2-composer-peek.js ── */
+// ── composer conversation peek ─────────────────────────────────────────
+// A transient sheet floating above the dock: the prompt-target session's
+// transcript tail, live, with tap-through to the full Activity view. The
+// peek is a read-only mirror — entries are clones of the target window's
+// log (the appendLogEntryToSessionWindow precedent: cloneNode + strip
+// ids), so it never mutates session state; interactive affordances that
+// need the live wiring (collapse, copy, retry) are hidden by the peek
+// stylesheet in favor of "Open in Activity".
+// Boot follows the ui2-chrome single-boot idiom; every entry point is a
+// no-op when the mount is missing so a stub build stays inert.
+{
+  const PEEK_TAIL_CAP = 12;
+  const PEEK_RENDER_THROTTLE_MS = 120;
+  // Chrome's phase categories that mean "the agent is answering" — the
+  // auto-open signal. `waiting` is excluded: approvals/questions already
+  // have their own attention surfaces.
+  const PEEK_WORKING_CATS = new Set(['thinking', 'running']);
+
+  let peekBarEl = null;
+  let peekRoot = null;
+  let peekList = null;
+  let peekBadge = null;
+  let peekPhaseDot = null;
+  let peekPhaseText = null;
+
+  let peekBoundSid = '';
+  let peekBoundLog = null;
+  let peekRendered = []; // [{ source, clone }] in list order
+  let peekFollow = true;
+  // Explicit close suppresses auto-open until the working streak ends or
+  // the target changes — otherwise the next phase mutation would fight
+  // the user's dismissal.
+  let peekDismissed = false;
+  let peekLastTarget = '';
+  let peekLastPhaseCat = null;
+  let peekFlushTimer = 0;
+  let peekPendingStructural = false;
+  const peekPendingDirty = new Set();
+
+  function peekIsOpen() {
+    return !!peekRoot && !peekRoot.hidden;
+  }
+
+  function peekComposerPill() {
+    return document.documentElement.dataset.composerState === 'pill';
+  }
+
+  function peekTargetSid() {
+    return typeof resolvePromptTargetSessionId === 'function'
+      ? (resolvePromptTargetSessionId() || '') : '';
+  }
+
+  function peekTargetWindow(sid) {
+    return (sid && typeof sessionWindows !== 'undefined')
+      ? (sessionWindows.get(sid) || null) : null;
+  }
+
+  function peekCloneEntry(source) {
+    const clone = source.cloneNode(true);
+    clone.removeAttribute('id');
+    clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+    return clone;
+  }
+
+  function peekTailSources() {
+    if (!peekBoundLog) return [];
+    const out = [];
+    for (let node = peekBoundLog.lastElementChild; node && out.length < PEEK_TAIL_CAP; node = node.previousElementSibling) {
+      if (node.classList.contains('session-window-empty')) continue;
+      out.push(node);
+    }
+    return out.reverse();
+  }
+
+  function peekEmptyText() {
+    if (!peekBoundLog) return 'No transcript yet — send a message below.';
+    const ph = peekBoundLog.querySelector('.session-window-empty');
+    if (ph && ph.classList.contains('session-window-empty-loading')) return 'Loading transcript…';
+    if (ph && ph.classList.contains('session-window-empty-error')) return 'Transcript failed to load — open Activity to retry.';
+    return 'No output yet';
+  }
+
+  // CSS cannot see overflow: entries whose body actually clips get the
+  // fade tag; short ones keep their last line un-washed.
+  function peekTagClamped(clone) {
+    const content = clone.querySelector('.log-content');
+    if (content && content.scrollHeight > content.clientHeight + 1) {
+      clone.classList.add('ui2-peek-clamped');
+    }
+  }
+
+  function peekRenderTail() {
+    if (!peekList || !peekIsOpen()) return;
+    const sources = peekTailSources();
+    if (sources.length === 0) {
+      peekRendered = [];
+      peekPendingDirty.clear();
+      const empty = document.createElement('div');
+      empty.className = 'ui2-peek-empty';
+      empty.textContent = peekEmptyText();
+      peekList.replaceChildren(empty);
+      return;
+    }
+    const prev = new Map(peekRendered.map(r => [r.source, r]));
+    const next = [];
+    const fresh = [];
+    for (const source of sources) {
+      const kept = prev.get(source);
+      if (kept && !peekPendingDirty.has(source)) {
+        next.push(kept);
+        continue;
+      }
+      const clone = peekCloneEntry(source);
+      next.push({ source, clone });
+      fresh.push(clone);
+    }
+    peekRendered = next;
+    // Surgical reconcile instead of replaceChildren: kept nodes never
+    // leave the DOM, so the aria-live list announces genuinely new
+    // entries instead of re-reading the whole tail on every append.
+    const keep = new Set(next.map(r => r.clone));
+    for (let child = peekList.firstElementChild; child;) {
+      const drop = child;
+      child = child.nextElementSibling;
+      if (!keep.has(drop)) drop.remove();
+    }
+    let cursor = peekList.firstElementChild;
+    for (const r of next) {
+      if (r.clone === cursor) cursor = cursor.nextElementSibling;
+      else peekList.insertBefore(r.clone, cursor);
+    }
+    for (const clone of fresh) peekTagClamped(clone);
+    peekPendingDirty.clear();
+    if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+  }
+
+  function peekFlush() {
+    peekFlushTimer = 0;
+    if (!peekIsOpen()) {
+      peekPendingStructural = false;
+      peekPendingDirty.clear();
+      return;
+    }
+    if (peekPendingStructural) {
+      peekPendingStructural = false;
+      peekRenderTail();
+      return;
+    }
+    if (peekPendingDirty.size === 0) return;
+    let touched = false;
+    for (const r of peekRendered) {
+      if (!peekPendingDirty.has(r.source)) continue;
+      const clone = peekCloneEntry(r.source);
+      r.clone.replaceWith(clone);
+      r.clone = clone;
+      peekTagClamped(clone);
+      touched = true;
+    }
+    peekPendingDirty.clear();
+    if (touched && peekFollow) peekList.scrollTop = peekList.scrollHeight;
+  }
+
+  function peekSchedule() {
+    if (peekFlushTimer || !peekIsOpen()) return;
+    peekFlushTimer = setTimeout(peekFlush, PEEK_RENDER_THROTTLE_MS);
+  }
+
+  // Command-output groups and edit/superseded markers mutate entries in
+  // place (no childList change on the log), so the observer watches the
+  // subtree and patches just the touched entries; only additions/removals
+  // on the log itself re-render the tail.
+  const peekLogObserver = new MutationObserver(records => {
+    for (const record of records) {
+      if (record.target === peekBoundLog) {
+        if (record.type === 'childList') peekPendingStructural = true;
+        continue;
+      }
+      let node = record.target;
+      while (node && node.parentNode !== peekBoundLog) node = node.parentNode;
+      if (node) peekPendingDirty.add(node);
+    }
+    if (peekPendingStructural || peekPendingDirty.size) peekSchedule();
+  });
+
+  function peekBind(sid) {
+    if (peekBadge) {
+      peekBadge.hidden = !sid;
+      if (typeof renderSessionIdentity === 'function') {
+        renderSessionIdentity(peekBadge, sid, { order: 'name-id', titlePrefix: 'Prompt target' });
+      }
+      if (typeof applySessionBadgeStyle === 'function') applySessionBadgeStyle(peekBadge, sid);
+    }
+    const win = peekTargetWindow(sid);
+    const log = win ? win.log : null;
+    if (sid === peekBoundSid && log === peekBoundLog) return;
+    peekLogObserver.disconnect();
+    peekBoundSid = sid;
+    peekBoundLog = log;
+    peekRendered = [];
+    peekPendingDirty.clear();
+    peekPendingStructural = false;
+    if (peekBoundLog) {
+      peekLogObserver.observe(peekBoundLog, {
+        childList: true, subtree: true, characterData: true, attributes: true,
+      });
+      if (typeof hydrateSessionWindowIfEmpty === 'function') {
+        Promise.resolve(hydrateSessionWindowIfEmpty(sid)).catch(() => {}).finally(() => {
+          if (peekBoundSid === sid) peekRenderTail();
+        });
+      }
+    }
+    peekRenderTail();
+  }
+
+  function peekOpen() {
+    if (!peekRoot || peekIsOpen() || peekComposerPill()) return;
+    const sid = peekTargetSid();
+    if (!sid) return;
+    peekFollow = true;
+    peekRoot.hidden = false;
+    peekBind(sid);
+    peekRenderTail();
+  }
+
+  function peekClose(dismissed) {
+    if (!peekRoot || peekRoot.hidden) return;
+    peekRoot.hidden = true;
+    if (dismissed) peekDismissed = true;
+    peekLogObserver.disconnect();
+    peekBoundSid = '';
+    peekBoundLog = null;
+    peekRendered = [];
+    peekPendingDirty.clear();
+    peekPendingStructural = false;
+    if (peekFlushTimer) {
+      clearTimeout(peekFlushTimer);
+      peekFlushTimer = 0;
+    }
+    if (peekList) peekList.replaceChildren();
+  }
+
+  function peekOpenInActivity() {
+    peekClose(false);
+    if (typeof routeTo === 'function') routeTo('activity', 'log');
+    if (typeof window.focusForegroundSessionWindow === 'function') {
+      window.focusForegroundSessionWindow();
+    }
+  }
+
+  function peekOnTargetChip() {
+    const sid = peekTargetSid();
+    if (sid !== peekLastTarget) {
+      peekLastTarget = sid;
+      peekDismissed = false;
+    }
+    if (!sid) {
+      peekClose(false);
+      return;
+    }
+    if (peekIsOpen()) {
+      peekBind(sid);
+      return;
+    }
+    // A target materializing mid-turn is the first-message case: the send
+    // happened before any session existed, so the phase edge fired with
+    // nothing to show — open now that there is a transcript to watch.
+    // Same replay guard as the phase edge: rebinds driven by bootstrap
+    // replay are history, not a turn in flight.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
+    if (PEEK_WORKING_CATS.has(peekLastPhaseCat) && !peekDismissed && !peekComposerPill()) {
+      peekOpen();
+    }
+  }
+
+  function peekOnPhase(banner) {
+    const cat = typeof ui2PhaseCategory === 'function'
+      ? ui2PhaseCategory(banner.className) : 'idle';
+    const label = document.getElementById('phase-text');
+    if (peekPhaseDot) peekPhaseDot.dataset.cat = cat;
+    if (peekPhaseText) {
+      peekPhaseText.textContent = ((label && label.textContent) || 'Idle').trim() || 'Idle';
+    }
+    const wasWorking = PEEK_WORKING_CATS.has(peekLastPhaseCat);
+    const isWorking = PEEK_WORKING_CATS.has(cat);
+    peekLastPhaseCat = cat;
+    if (!isWorking) {
+      if (wasWorking) peekDismissed = false;
+      return;
+    }
+    if (wasWorking || peekDismissed || peekIsOpen() || peekComposerPill()) return;
+    // Bootstrap replay re-drives historical phase edges through the
+    // mirror — auto-opening on those would pop the peek on every page
+    // load of a dashboard with any past task.
+    if (typeof processingLogReplay !== 'undefined' && processingLogReplay) return;
+    peekOpen();
+  }
+
+  function peekBuild(root) {
+    const icon = (name, size) => (typeof ui2Icon === 'function' ? ui2Icon(name, size) : '');
+    root.setAttribute('role', 'region');
+    root.setAttribute('aria-label', 'Conversation peek');
+
+    const header = document.createElement('div');
+    header.className = 'ui2-peek-header';
+    header.title = 'Open the full transcript in Activity';
+
+    peekBadge = document.createElement('span');
+    peekBadge.className = 'ui2-peek-target task-target-session-badge';
+    peekBadge.hidden = true;
+
+    const phase = document.createElement('span');
+    phase.className = 'ui2-peek-phase';
+    peekPhaseDot = document.createElement('span');
+    peekPhaseDot.className = 'ui2-peek-phase-dot';
+    peekPhaseDot.dataset.cat = 'idle';
+    peekPhaseText = document.createElement('span');
+    peekPhaseText.className = 'ui2-peek-phase-text';
+    peekPhaseText.textContent = 'Idle';
+    phase.appendChild(peekPhaseDot);
+    phase.appendChild(peekPhaseText);
+
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'ui2-peek-open';
+    openBtn.title = 'Open the full transcript in Activity';
+    openBtn.setAttribute('aria-label', 'Open in Activity');
+    openBtn.innerHTML = icon('external', 12) + '<span class="ui2-peek-open-label">Open in Activity</span>';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ui2-peek-close';
+    closeBtn.title = 'Close conversation peek';
+    closeBtn.setAttribute('aria-label', 'Close conversation peek');
+    closeBtn.innerHTML = icon('close', 14);
+
+    header.appendChild(peekBadge);
+    header.appendChild(phase);
+    header.appendChild(openBtn);
+    header.appendChild(closeBtn);
+
+    peekList = document.createElement('div');
+    peekList.className = 'ui2-peek-list';
+    peekList.setAttribute('role', 'log');
+    peekList.setAttribute('aria-live', 'polite');
+    peekList.setAttribute('aria-label', 'Recent transcript');
+
+    root.appendChild(header);
+    root.appendChild(peekList);
+
+    header.addEventListener('click', (e) => {
+      if (e.target.closest && e.target.closest('button')) return;
+      peekOpenInActivity();
+    });
+    openBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      peekOpenInActivity();
+    });
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      peekClose(true);
+      const input = document.getElementById('activity-task-input');
+      if (input) input.focus({ preventScroll: true });
+    });
+    peekList.addEventListener('scroll', () => {
+      peekFollow = peekList.scrollTop + peekList.clientHeight >= peekList.scrollHeight - 24;
+    });
+  }
+
+  // Boot autofocus (and any other programmatic focus before the user has
+  // touched the page) must not open the peek — a sheet popping over the
+  // content on every load of a dashboard with history is a surprise, not
+  // an affordance. Focus counts as intent only after a real gesture.
+  let peekSawUserGesture = false;
+
+  const peekWire = () => {
+    const root = document.getElementById('ui2-composer-peek');
+    const bar = root ? root.closest('.global-task-bar') : null;
+    if (!root || !bar) return;
+    peekRoot = root;
+    peekBarEl = bar;
+    peekBuild(root);
+
+    document.addEventListener('pointerdown', () => { peekSawUserGesture = true; }, { capture: true, passive: true });
+    document.addEventListener('keydown', () => { peekSawUserGesture = true; }, { capture: true });
+
+    bar.addEventListener('focusin', (e) => {
+      if (!peekSawUserGesture) return;
+      if (peekIsOpen() || peekComposerPill()) return;
+      // Focus moving WITHIN the dock (input → Send, the close button's
+      // refocus) is not an entry — reopening there would undo an Esc/×
+      // dismissal the user just made.
+      if (e.relatedTarget instanceof Node && bar.contains(e.relatedTarget)) return;
+      // Focus landing on the target-switch chrome is retargeting intent,
+      // not composition — opening the peek under that popover just stacks
+      // two overlays (and made Esc close the hidden one first).
+      const tsw = document.getElementById('ui2-target-switch');
+      if (e.target instanceof Node && (
+        (tsw && tsw.contains(e.target)) ||
+        (e.target.id === 'task-target-switch-btn')
+      )) return;
+      peekDismissed = false;
+      peekOpen();
+    });
+
+    // Window-level capture instead of bar-level: capture descends
+    // window → bar, so this preempts the composer state machine's
+    // Esc-to-pill regardless of listener registration order — one Esc
+    // closes the peek, the next one reaches the dock.
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || !peekIsOpen()) return;
+      // Onion ordering: the target-switch popover is the innermost open
+      // surface — its own Esc handling closes it; consuming here would
+      // close the peek hidden BEHIND the popover instead.
+      const tsw = document.getElementById('ui2-target-switch');
+      if (tsw && !tsw.hidden) return;
+      if (e.target instanceof Node && peekBarEl.contains(e.target)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        peekClose(true);
+        return;
+      }
+      peekClose(true);
+    }, true);
+
+    document.addEventListener('pointerdown', (e) => {
+      if (!peekIsOpen()) return;
+      if (e.target instanceof Node && peekBarEl.contains(e.target)) return;
+      peekClose(true);
+    }, true);
+
+    window.addEventListener('ui2:composer-state', (e) => {
+      if (((e && e.detail && e.detail.state) || '') === 'pill') peekClose(false);
+    });
+
+    if (typeof ui2Mirror === 'function') {
+      ui2Mirror('task-target-chip', peekOnTargetChip);
+      ui2Mirror('phase-banner', peekOnPhase);
+    }
+
+    // A cold target may grow its window only later (ensureSessionWindow
+    // on the first live event) — rebind when the grid gains it.
+    const grid = document.getElementById('session-window-grid');
+    if (grid) {
+      new MutationObserver(() => {
+        if (!peekIsOpen() || !peekBoundSid) return;
+        const win = peekTargetWindow(peekBoundSid);
+        if (win && win.log !== peekBoundLog) peekBind(peekBoundSid);
+      }).observe(grid, { childList: true });
+    }
+
+    window.__ui2Peek = {
+      isOpen: peekIsOpen,
+      open: peekOpen,
+      close: () => peekClose(true),
+      sessionId: () => peekBoundSid,
+    };
+  };
+  if (document.readyState === 'complete') peekWire();
+  else document.addEventListener('DOMContentLoaded', peekWire, { once: true });
+}
+/* ── static/app/ui2-target-switch.js ── */
+// ── composer target hot-swap ───────────────────────────────────────────
+// In-place prompt-target switcher for the dock: #task-target-switch-btn
+// toggles a listbox of exactly the sessions the resolver may target
+// (isPromptTargetSessionUsable), plus "Auto" (hand the pick back to the
+// resolver) and "New session…". Selecting retargets via focusSessionWindow
+// — the whole point is that it never leaves the current tab (no route
+// change, no scroll; the chip's own click stays the jump-to-Activity
+// affordance). IIFE: fragments share one script scope and nothing here is
+// consumed by other fragments.
+(() => {
+  const FILTER_AT = 6;   // more rows than this → show the type-to-filter input
+  const POLL_MS = 800;   // open-state refresh: sessions come and go
+
+  let btnEl = null;
+  let popEl = null;
+  let filterEl = null;
+  let rowsEl = null;
+  let isOpen = false;
+  let pollTimer = 0;
+  let filterQuery = '';
+  let lastSig = '';
+
+  const composerPill = () =>
+    document.documentElement.dataset.composerState === 'pill';
+
+  function usableSessionIds() {
+    const ids = [];
+    for (const sid of sessionWindows.keys()) {
+      if (isPromptTargetSessionUsable(sid)) ids.push(sid);
+    }
+    return ids;
+  }
+
+  function rowPhase(sid) {
+    if (hasPendingActiveSessionWindow(sid)) return 'active';
+    const win = sessionWindows.get(sid);
+    return sessionPhaseClass(win?.phase || 'idle') || 'done';
+  }
+
+  // Everything a rendered listing depends on; the open-state poll re-renders
+  // only when this changes (a vanished session, a phase flip, a rename, a
+  // target rebind elsewhere).
+  function currentSignature() {
+    const parts = [
+      resolvePromptTargetSessionId(),
+      explicitForegroundSessionId() ? 'E' : 'A',
+      filterQuery,
+    ];
+    for (const sid of usableSessionIds()) {
+      parts.push(sid, sessionIdentityParts(sid).name, rowPhase(sid));
+    }
+    return parts.join('\u0000');
+  }
+
+  const navRows = () => Array.from(popEl.querySelectorAll('.ui2-tsw-row'));
+
+  function makeRow(key, cls) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = cls ? `ui2-tsw-row ${cls}` : 'ui2-tsw-row';
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', 'false');
+    row.tabIndex = -1;
+    row.dataset.key = key;
+    return row;
+  }
+
+  function buildAutoRow(active) {
+    const row = makeRow('auto', 'ui2-tsw-auto');
+    const main = document.createElement('span');
+    main.className = 'ui2-tsw-row-main';
+    const label = document.createElement('span');
+    label.className = 'ui2-tsw-row-label';
+    label.textContent = 'Auto';
+    const sub = document.createElement('span');
+    sub.className = 'ui2-tsw-row-sub';
+    sub.textContent = 'picks the active session';
+    main.append(label, sub);
+    row.appendChild(main);
+    row.title = 'Let Intendant pick the prompt target';
+    row.setAttribute('aria-label', 'Auto: pick the prompt target for me');
+    if (active) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
+  function buildSessionRow(sid, target) {
+    const row = makeRow(`s:${sid}`);
+    const badge = document.createElement('span');
+    badge.className = 'ui2-tsw-badge';
+    renderSessionIdentity(badge, sid, { showName: false });
+    applySessionBadgeStyle(badge, sid);
+    const name = sessionIdentityParts(sid).name;
+    const nameEl = document.createElement('span');
+    nameEl.className = 'ui2-tsw-row-name';
+    nameEl.textContent = name;
+    const phase = rowPhase(sid);
+    const dot = document.createElement('span');
+    dot.className = `ui2-tsw-dot ${phase}`;
+    dot.setAttribute('aria-hidden', 'true');
+    row.append(badge, nameEl, dot);
+    row.title = name ? `${name} · ${sid}` : sid;
+    const phaseWord = phase === 'active' ? 'running' : phase === 'waiting' ? 'waiting' : 'idle';
+    row.setAttribute('aria-label', `${name || shortSessionId(sid)} · ${phaseWord}`);
+    if (sid === target) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
+  function buildEmpty(text) {
+    const el = document.createElement('div');
+    el.className = 'ui2-tsw-empty';
+    el.textContent = text;
+    return el;
+  }
+
+  function renderRows() {
+    const usable = usableSessionIds();
+    const target = resolvePromptTargetSessionId();
+    const autoActive = !explicitForegroundSessionId();
+    filterEl.hidden = !(usable.length > FILTER_AT || filterQuery.trim() !== '');
+
+    const active = document.activeElement;
+    const prevKey = popEl.contains(active) && active !== filterEl
+      ? active.dataset?.key || ''
+      : '';
+
+    let list = usable;
+    const q = filterQuery.trim();
+    if (q) {
+      list = usable
+        .map(sid => ({
+          sid,
+          score: Math.max(
+            ui2FuzzyScore(q, sessionIdentityParts(sid).name),
+            ui2FuzzyScore(q, sid),
+          ),
+        }))
+        .filter(x => x.score >= 0)
+        .sort((a, b) => b.score - a.score)
+        .map(x => x.sid);
+    }
+
+    const children = [];
+    if (usable.length) children.push(buildAutoRow(autoActive));
+    for (const sid of list) children.push(buildSessionRow(sid, target));
+    if (!usable.length) children.push(buildEmpty('No targetable sessions'));
+    else if (!list.length) children.push(buildEmpty('No matches'));
+    rowsEl.replaceChildren(...children);
+    lastSig = currentSignature();
+
+    // A refresh can remove the focused row — land on the survivor with the
+    // same key, else the first row, so the keyboard flow never dies.
+    if (prevKey) {
+      const again = navRows().find(r => r.dataset.key === prevKey);
+      (again || navRows()[0])?.focus();
+    }
+  }
+
+  function openPopover() {
+    if (isOpen || composerPill()) return;
+    filterQuery = '';
+    filterEl.value = '';
+    isOpen = true;
+    renderRows();
+    popEl.hidden = false;
+    btnEl.setAttribute('aria-expanded', 'true');
+    const first = popEl.querySelector('.ui2-tsw-row[aria-selected="true"]') || navRows()[0];
+    if (first) {
+      first.focus();
+      first.scrollIntoView({ block: 'nearest' });
+    }
+    document.addEventListener('pointerdown', onDocPointerDown, true);
+    pollTimer = setInterval(pollRefresh, POLL_MS);
+  }
+
+  function closePopover(opts = {}) {
+    if (!isOpen) return;
+    isOpen = false;
+    popEl.hidden = true;
+    btnEl.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', onDocPointerDown, true);
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = 0;
+    }
+    if (opts.refocus) btnEl.focus();
+  }
+
+  function pollRefresh() {
+    if (composerPill()) {
+      closePopover();
+      return;
+    }
+    if (currentSignature() !== lastSig) renderRows();
+  }
+
+  function onDocPointerDown(e) {
+    if (popEl.contains(e.target) || btnEl.contains(e.target)) return;
+    closePopover();
+  }
+
+  function activateRow(key) {
+    if (key === 'auto') {
+      // The explicit pick lives in two refs (foreground + current), possibly
+      // holding different ids — discard until the explicit lane is empty so
+      // the resolver takes over.
+      for (let i = 0; i < 4 && explicitForegroundSessionId(); i++) {
+        discardPromptTargetReference(explicitForegroundSessionId());
+      }
+      updateTaskTargetChip();
+      closePopover({ refocus: true });
+    } else if (key === 'new') {
+      // Close without refocus: openNewSessionFromPrompt focuses the
+      // new-session input on the next frame and must win.
+      openNewSessionFromPrompt();
+      closePopover();
+    } else if (key.startsWith('s:')) {
+      const sid = key.slice(2);
+      if (!isPromptTargetSessionUsable(sid)) {
+        renderRows();
+        return;
+      }
+      focusSessionWindow(sid);
+      closePopover({ refocus: true });
+    }
+  }
+
+  function onPopKeydown(e) {
+    const inFilter = e.target === filterEl;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closePopover({ refocus: true });
+      return;
+    }
+    if (e.key === 'Tab') {
+      // Close and hand focus back to the button so the default Tab
+      // continues from the composer instead of a removed row.
+      closePopover({ refocus: true });
+      return;
+    }
+    const rows = navRows();
+    if (!rows.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = rows.indexOf(document.activeElement);
+      if (inFilter) {
+        (e.key === 'ArrowDown' ? rows[0] : rows[rows.length - 1]).focus();
+      } else if (e.key === 'ArrowUp' && idx === 0 && !filterEl.hidden) {
+        filterEl.focus();
+      } else {
+        const next = e.key === 'ArrowDown'
+          ? Math.min(rows.length - 1, idx + 1)
+          : Math.max(0, idx - 1);
+        rows[next].focus();
+      }
+      document.activeElement?.scrollIntoView?.({ block: 'nearest' });
+      return;
+    }
+    if ((e.key === 'Home' || e.key === 'End') && !inFilter) {
+      e.preventDefault();
+      e.stopPropagation();
+      (e.key === 'Home' ? rows[0] : rows[rows.length - 1]).focus();
+      document.activeElement?.scrollIntoView?.({ block: 'nearest' });
+      return;
+    }
+    if (e.key === 'Enter' && inFilter) {
+      e.preventDefault();
+      e.stopPropagation();
+      const top = rows.find(r => (r.dataset.key || '').startsWith('s:'));
+      if (top) activateRow(top.dataset.key);
+      return;
+    }
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Contain printable keys: the document-level shortcut layer treats
+      // bare letters as approval verbs (y/s/a/n) when focus is not in an
+      // input, and popover rows are buttons. Redirect into the filter when
+      // it is shown — focusing during keydown lands this keystroke there.
+      e.stopPropagation();
+      if (!inFilter && !filterEl.hidden) filterEl.focus();
+    }
+  }
+
+  const wire = () => {
+    btnEl = document.getElementById('task-target-switch-btn');
+    popEl = document.getElementById('ui2-target-switch');
+    if (!btnEl || !popEl) return;
+
+    const eyebrow = document.createElement('div');
+    eyebrow.className = 'ui2-tsw-eyebrow';
+    eyebrow.textContent = 'Prompt target';
+    eyebrow.setAttribute('aria-hidden', 'true');
+
+    filterEl = document.createElement('input');
+    filterEl.type = 'text';
+    filterEl.className = 'ui2-tsw-filter';
+    filterEl.placeholder = 'Filter sessions…';
+    filterEl.setAttribute('aria-label', 'Filter sessions');
+    filterEl.autocomplete = 'off';
+    filterEl.spellcheck = false;
+    filterEl.hidden = true;
+
+    rowsEl = document.createElement('div');
+    rowsEl.className = 'ui2-tsw-rows';
+
+    const foot = document.createElement('div');
+    foot.className = 'ui2-tsw-foot';
+    const newRow = makeRow('new', 'ui2-tsw-new');
+    const newLabel = document.createElement('span');
+    newLabel.className = 'ui2-tsw-row-label';
+    newLabel.textContent = '+ New session…';
+    newRow.appendChild(newLabel);
+    newRow.title = 'Draft a new session from the composer';
+    foot.appendChild(newRow);
+
+    popEl.replaceChildren(eyebrow, filterEl, rowsEl, foot);
+
+    btnEl.style.display = '';
+    btnEl.setAttribute('aria-controls', 'ui2-target-switch');
+
+    btnEl.addEventListener('click', () => {
+      if (isOpen) closePopover({ refocus: true });
+      else openPopover();
+    });
+    btnEl.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        openPopover();
+      } else if (e.key === 'Escape' && isOpen) {
+        e.stopPropagation();
+        closePopover({ refocus: true });
+      }
+    });
+    popEl.addEventListener('keydown', onPopKeydown);
+    popEl.addEventListener('click', (e) => {
+      const row = e.target.closest?.('.ui2-tsw-row');
+      if (row && popEl.contains(row)) activateRow(row.dataset.key || '');
+    });
+    filterEl.addEventListener('input', () => {
+      filterQuery = filterEl.value;
+      renderRows();
+    });
+    window.addEventListener('ui2:composer-state', (e) => {
+      if ((e?.detail?.state || '') === 'pill') closePopover();
+    });
+  };
+  if (document.readyState === 'complete') wire();
+  else document.addEventListener('DOMContentLoaded', wire, { once: true });
+})();
 /* ── static/app/59-module-alive.js ── */
 // ── Module-death canary (sentinel) ──────────────────────────────────────
 // MUST stay the LAST .js fragment in manifest.txt (only 59-module-close.html

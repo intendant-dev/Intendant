@@ -421,7 +421,8 @@ function ui2SettingsBuild() {
     if (keys) panes.providers.appendChild(keys);
 
     // External agent → "Managed backend" with a segmented proxy over the
-    // existing select + an Advanced fold for binaries and tier.
+    // existing select, daemon-wide model defaults for both backends, and an
+    // Advanced fold for binaries and tier.
     const ext = cardOf('settings-external-agent-heading');
     if (ext) {
       panes.providers.appendChild(ext);
@@ -438,7 +439,7 @@ function ui2SettingsBuild() {
         'set-codex-command', 'set-codex-managed-command', 'set-claude-command', 'set-codex-service-tier',
       ]);
       const link = ui2SettingsEl('p', 'settings-note ui2-crosslink');
-      link.innerHTML = 'Live backend controls — sandbox, approval policy, model override, thread actions — stay in <a href="#activity/control">Activity → Control</a>.';
+      link.innerHTML = 'Advanced live controls — sandbox, approval policy, allowed tools, and thread actions — are in <a href="#activity/control">Activity → Control</a>.';
       ext.appendChild(link);
     }
 

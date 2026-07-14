@@ -3366,6 +3366,29 @@ async fn main() -> Result<(), CallerError> {
     if let Some(ref m) = flags.model {
         env::set_var("MODEL_NAME", m);
     }
+    // Idle web/dashboard startup defaults to the daemon path (the session
+    // supervisor owns all launches). Compute the execution shape before
+    // applying config-derived env so a projectless daemon can first load its
+    // durable machine-wide defaults.
+    let web_daemon_requested =
+        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags);
+    // Projectless: a daemon launched from a directory with no project marker
+    // must not adopt cwd as its sandbox/watcher/session root. It does still
+    // load daemon-wide defaults from `<state-root>/intendant.toml`; config
+    // scope and project scope deliberately remain separate.
+    let projectless_daemon = web_daemon_requested && !project_has_marker;
+    let daemon_project_root: Option<PathBuf> = (!projectless_daemon).then(|| project.root.clone());
+    if projectless_daemon {
+        let settings_root = project::daemon_settings_config_root();
+        project.config = Project::from_root(settings_root.clone())?.config;
+        eprintln!(
+            "Projectless daemon: {} has no project marker (.git or intendant.toml) — \
+             running without a default project; sessions choose their own project directory; \
+             daemon defaults load from {}/intendant.toml",
+            project.root.display(),
+            settings_root.display()
+        );
+    }
     // Synthetic display for headless test rigs (INTENDANT_MOCK_DISPLAY=
     // synthetic; fail-closed: honored only under PROVIDER=mock). Evaluated
     // here — after the .env load and the --provider override settle the
@@ -3382,29 +3405,6 @@ async fn main() -> Result<(), CallerError> {
         if let Some(max_out) = project.config.model.max_output_tokens {
             env::set_var("MAX_OUTPUT_TOKENS", max_out.to_string());
         }
-    }
-    // Idle web/dashboard startup defaults to the daemon path (the session
-    // supervisor owns all launches). Computed here — from flags only, which
-    // are not mutated below — because the daemon shape decides resume
-    // ownership, the sandbox write scope, and whether a markerless cwd
-    // becomes a project at all.
-    let web_daemon_requested =
-        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags);
-    // Projectless: a daemon launched from a directory with no project marker
-    // (.git / intendant.toml — `project::root_has_project_marker`) runs
-    // without a project instead of adopting cwd; an installed app or service
-    // otherwise inherits an accident of launch directory as its sandbox
-    // scope, watcher root, and default session project. CLI (headless/MCP)
-    // invocations keep cwd-as-project — correct for `intendant "task"`
-    // inside a repo.
-    let projectless_daemon = web_daemon_requested && !project_has_marker;
-    let daemon_project_root: Option<PathBuf> = (!projectless_daemon).then(|| project.root.clone());
-    if projectless_daemon {
-        eprintln!(
-            "Projectless daemon: {} has no project marker (.git or intendant.toml) — \
-             running without a default project; sessions choose their own project directory",
-            project.root.display()
-        );
     }
     // Create or resume session log.
     //

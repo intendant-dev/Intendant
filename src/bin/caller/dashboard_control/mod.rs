@@ -403,7 +403,9 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_file_transfer_signal"
         | "api_peer_dashboard_control_signal"
         | "api_coordinator_route" => runtime.peer_registry.is_some(),
-        "api_settings_save" => runtime.project_root.is_some(),
+        // Settings have their own durable root even when the daemon is
+        // projectless; method execution resolves it from RuntimeSettingsState.
+        "api_settings_save" => true,
         "api_access_connect_config" | "api_access_connect_unclaim" => {
             runtime.project_root.is_some()
         }
@@ -3522,7 +3524,7 @@ mod tests {
         assert_eq!(status["result"]["api_fs_delete_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
-        assert_eq!(status["result"]["api_settings_save_available"], false);
+        assert_eq!(status["result"]["api_settings_save_available"], true);
         assert_eq!(status["result"]["api_control_msg_available"], true);
         assert_eq!(status["result"]["api_session_control_msg_available"], true);
         assert_eq!(status["result"]["api_dashboard_action_msg_available"], true);

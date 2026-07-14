@@ -1002,14 +1002,13 @@ let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionCodexLaunchDefaultsLoaded = false;
-// Projectless daemons cannot serve /api/settings until the user chooses a
-// project, so New Session needs an embedded offline catalog. A daemon-side
-// parity test pins this JSON fallback to project::CODEX_MODEL_CATALOG; a
-// successful settings fetch replaces it with the daemon-owned payload.
+// Keep an embedded offline catalog for a settings fetch that has not landed
+// yet (or an older/unreachable daemon). A daemon-side parity test pins this
+// JSON fallback to project::CODEX_MODEL_CATALOG; a successful settings fetch
+// replaces it with the signed-in Codex account's cached catalog.
 const NEW_SESSION_CODEX_MODEL_FALLBACK = Object.freeze(
 /* codex-model-catalog:start */
 [
-  {"id":"gpt-5.6","display_name":"GPT-5.6 (Sol alias)","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
   {"id":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max"]},
