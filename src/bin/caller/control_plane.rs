@@ -60,10 +60,10 @@ pub struct ControlPlaneState {
     pub codex_config: SharedCodexConfig,
     pub claude_config: SharedClaudeConfig,
     pub bus: EventBus,
-    /// Project root for `intendant.toml` writes. When set, changes to
-    /// `external_agent` (from any frontend) also persist to the config
-    /// file so the setting survives daemon restarts. `None` in tests
-    /// or when no project context is available.
+    /// Config root for `intendant.toml` writes: the project root on a
+    /// rooted daemon, or the daemon state root when projectless. This is
+    /// persistence scope only and never grants project/sandbox access.
+    /// `None` is reserved for isolated tests or modes with no durable store.
     pub project_root: Option<PathBuf>,
 }
 

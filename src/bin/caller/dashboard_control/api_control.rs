@@ -1024,11 +1024,16 @@ pub(crate) async fn api_settings_save_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
+    let settings_root = {
+        let session = runtime.shared_session.read().await;
+        session.runtime_settings.settings_root.clone()
+    }
+    .or_else(|| runtime.project_root.clone());
     frame_api_response(
         id,
         crate::web_gateway::settings_post_api_response(
             &body_text,
-            runtime.project_root.as_deref(),
+            settings_root.as_deref(),
             &runtime.bus,
         ),
         "settings save",

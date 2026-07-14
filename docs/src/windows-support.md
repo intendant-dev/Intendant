@@ -119,7 +119,11 @@ check.
 
 **Optional / runtime / manual** (reported, but never fail `-Check`):
 
-- **wasm-pack** (optional) — for rebuilding the presence-web WASM bundle.
+- **wasm-pack** (optional) — for rebuilding the browser WASM crates
+  (`presence-web`, `station-web`) locally. Only the version pinned in
+  `.wasm-pack-version` will rebuild (`build.rs` skips any other), and
+  regenerating the *committed* `static/wasm-*` artifacts is a macOS-only
+  step — WASM output is not byte-deterministic across host triples.
 - **ffmpeg** — the voice audio bridge shells out to `ffmpeg`/`ffplay`.
 - **Media Foundation** — built into Windows client SKUs; on Windows Server the
   script enables the `Server-Media-Foundation` feature.

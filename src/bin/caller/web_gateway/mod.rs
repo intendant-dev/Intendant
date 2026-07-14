@@ -150,6 +150,15 @@ pub struct RuntimeSettingsState {
     pub external_agent:
         Option<Arc<tokio::sync::RwLock<Option<crate::external_agent::AgentBackend>>>>,
     pub presence_enabled: Option<bool>,
+    /// Durable config root for the Settings surface. This is the served
+    /// project root on rooted daemons and the daemon state root when
+    /// projectless; it is intentionally independent of
+    /// `project_root_for_changes` so settings never mint file/sandbox scope.
+    pub settings_root: Option<PathBuf>,
+    /// Codex home whose account-scoped model cache should drive pickers.
+    /// Resolved once at gateway startup so tests can inject/omit it without
+    /// settings helpers consulting the machine's live home.
+    pub codex_home: Option<PathBuf>,
 }
 
 /// Context for answering presence tool queries from browser-side live models.

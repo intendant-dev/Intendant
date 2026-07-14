@@ -500,17 +500,27 @@ directory is safe to delete; it rebuilds on the next scan.
   External Codex sessions can choose the binary path, a model, a compatible
   reasoning effort, sandbox and approval policies, `managed_context` mode
   (`vanilla` or `managed`), context replay mode, and Fast service tier for that
-  session. The model picker includes the current GPT-5.6 Sol/Terra/Luna family,
-  GPT-5.5, GPT-5.3-Codex-Spark, GPT-5.4, and GPT-5.4-Mini, with a Custom-id
-  escape for staged or account-specific models. Blank inherits the global/Codex
-  default; when a selected model cannot inherit the global effort, the picker
-  explicitly selects that model's advertised default instead. Model and effort
-  pins persist across attach/resume. The external-agent options sit in a fold
+  session. The model picker derives its normal choices and per-model reasoning
+  levels from the signed-in Codex account's `models_cache.json`; hidden entries
+  stay out, and API-key auth also filters subscription-only models exactly as
+  Codex does. A conservative offline catalog and a Custom-id escape cover
+  pre-fetch, staged, or private models. Blank inherits the global/Codex default;
+  when a selected model cannot inherit the global effort, the picker explicitly
+  selects that model's advertised default. Model and effort pins persist across
+  attach/resume. The external-agent options sit in a fold
   that opens when an external backend is selected. Claude Code sessions get per-launch
   dropdowns for the model (version-safe aliases — `fable`, `opus`, `sonnet`,
   `haiku` — that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
   (`low` … `max`).
+
+**Settings → Providers & models** exposes the daemon's global Codex and Claude
+defaults independently of whichever backend is currently selected. With an
+attached project, Save writes that project's `intendant.toml`; a projectless
+daemon writes `<state-root>/intendant.toml` (normally
+`~/.intendant/intendant.toml`) while `/api/project-root` remains `null`. These
+defaults seed new sessions, but an existing session's persisted launch config
+continues to control its next attach/resume.
 
 Internal sessions' window menus additionally expose **Delegate…** — spawn a
 supervised sub-agent (task, optional name, role, backend, worktree isolation)
