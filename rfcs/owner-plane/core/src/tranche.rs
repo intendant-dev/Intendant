@@ -20,7 +20,8 @@ use crate::domains::{h_tag, Tag};
 use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
-    ctrl_header, Cenrollnew, Cgenesis, Cgrant, Ckekrotate, Crevokedev, Crevokegrant, RevokeMode,
+    ctrl_header, Ccutoff, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate, Crevokedev,
+    Crevokegrant, RevokeMode,
 };
 use crate::shapes::envelope::{
     gen_start, seal_op, Actor, ActorKind, Header, OpSigner, Signedop, Tenant, Writer,
@@ -469,10 +470,17 @@ impl PlaneRig {
         }
     }
 
-    /// Seal the next control operation on the dense chain.
-    fn seal_ctrl(&mut self, op_type: &str, proof: Authproof, body: cbor::Value) -> Signedop {
+    /// Seal a control op at the next chain position with a named
+    /// request-id draw; advancing is the caller's choice.
+    fn seal_ctrl_at(
+        &mut self,
+        op_type: &str,
+        proof: Authproof,
+        body: cbor::Value,
+        req_draw: &str,
+    ) -> Signedop {
         let seq = self.ctrl_seq + 1;
-        let request_id = draw_id(&mut self.rng, &format!("ctrl{seq}.request_id"));
+        let request_id = draw_id(&mut self.rng, req_draw);
         let hlc = self.next_hlc();
         let header = ctrl_header(
             self.plane_id,
@@ -493,9 +501,30 @@ impl PlaneRig {
         );
         let op = seal_op(header, body, &OpSigner::Ed25519(&self.root_sk));
         assert!(op.verify(&self.root_pk), "control op must verify");
+        op
+    }
+
+    /// Seal the next control operation on the dense chain (advances).
+    fn seal_ctrl(&mut self, op_type: &str, proof: Authproof, body: cbor::Value) -> Signedop {
+        let seq = self.ctrl_seq + 1;
+        let op = self.seal_ctrl_at(op_type, proof, body, &format!("ctrl{seq}.request_id"));
         self.ctrl_seq = seq;
         self.ctrl_head = op.op_hash();
         op
+    }
+
+    /// Seal a control op the fixture expects the fold to REJECT: it
+    /// occupies the next position's coordinates but the chain does
+    /// not advance — a failed operation exerts no precedence (D-112),
+    /// so the accepted successor legally reuses the position.
+    pub fn seal_ctrl_candidate(
+        &mut self,
+        tag: &str,
+        op_type: &str,
+        proof: Authproof,
+        body: cbor::Value,
+    ) -> Signedop {
+        self.seal_ctrl_at(op_type, proof, body, &format!("{tag}.request_id"))
     }
 
     /// `c.enroll` (new-device shape) for `dev` with `grants`,
@@ -566,6 +595,56 @@ impl PlaneRig {
             ctrl_frontier: self.ctrl_head,
         };
         self.seal_ctrl(Ckekrotate::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.cutoff` as a pure staging operation (requesterless, empty
+    /// `cutoffs`, non-empty `closes` — D-136): the staged frontiers
+    /// are INERT until a consuming advance materializes them.
+    pub fn stage_closes(&mut self, closes: Vec<Frontierclose>) -> Signedop {
+        let body = Ccutoff {
+            cutoffs: vec![],
+            closes: Some(closes),
+            requester: None,
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Ccutoff::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.cap_epoch_bump` with closure cutoffs (advancing form).
+    pub fn epoch_bump(&mut self, new_epoch: u64, cutoffs: Vec<Frontierclose>) -> Signedop {
+        let body = Cepochbump {
+            zone_id: self.zone_id,
+            new_epoch,
+            cutoffs: Some(cutoffs),
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Cepochbump::OP_TYPE, proof, body.to_value())
+    }
+
+    /// A `c.cap_epoch_bump` candidate the fixture expects rejected
+    /// (see [`Self::seal_ctrl_candidate`]).
+    pub fn epoch_bump_candidate(
+        &mut self,
+        tag: &str,
+        new_epoch: u64,
+        cutoffs: Vec<Frontierclose>,
+    ) -> Signedop {
+        let body = Cepochbump {
+            zone_id: self.zone_id,
+            new_epoch,
+            cutoffs: Some(cutoffs),
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl_candidate(tag, Cepochbump::OP_TYPE, proof, body.to_value())
     }
 
     /// A generic tenant operation by `dev` under `grant` on the home
@@ -1264,12 +1343,103 @@ pub fn f11_reopen_basis_types() -> Vector {
     }
 }
 
+/// Tranche #6 — family 7 fold: the staged frontier is consumed by the
+/// authority-ending revocation and never resurrects under regrant
+/// (D-153/D-196). `s` stages dev2's frontier close (inert). `rg`
+/// revokes dev2's LAST op-authoring grant — the authority-ending
+/// frontier vacuously consumes the stage at its acceptance,
+/// materializing nothing. `g4` regrants dev2 (the lineage re-enters
+/// the coverage domain as NEW authority). `k1`, an epoch advance
+/// covering only dev1's lineage — counting on the dead stage for
+/// dev2 — REJECTS (`body-invariant`: strict-zone union coverage
+/// short); `k2` with fresh total coverage ADMITS at the same chain
+/// position (a failed operation exerts no precedence — D-112 — so
+/// no C2 fires).
+pub fn f7_staged_frontier_consumed() -> Vector {
+    let name = "staged-frontier-consumed-no-resurrection";
+    let mut rig = PlaneRig::new(name);
+
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let grant2_id = grant2.grant_id;
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+
+    let fc_dev2 = Frontierclose {
+        zone_id: rig.zone_id,
+        lineage: dev2.lineage,
+        heads: vec![],
+    };
+    let fc_dev1 = Frontierclose {
+        zone_id: rig.zone_id,
+        lineage: rig.dev1.lineage,
+        heads: vec![],
+    };
+
+    // s: the pure staging ceremony for dev2's lineage.
+    let s = rig.stage_closes(vec![fc_dev2.clone()]);
+
+    // rg: revoke dev2's last op-authoring grant — the authority-ending
+    // frontier; the stage is vacuously consumed here (D-196).
+    let rg = rig.revoke_grant_op(grant2_id, Some(fc_dev2.clone()));
+
+    // g4: regrant — new authority, fresh coverage obligations.
+    let grant4 = rig.simple_grant("grant4", &dev2, vec![Verb::Propose]);
+    let g4 = rig.grant_op(grant4);
+
+    // k1: coverage for dev1 only — the dead stage must NOT count.
+    let k1 = rig.epoch_bump_candidate("k1", 2, vec![fc_dev1.clone()]);
+    // k2: fresh total coverage at the same position — admits.
+    let k2 = rig.epoch_bump(2, vec![fc_dev1, fc_dev2]);
+
+    let c1 = &rig.genesis_op;
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items(&[
+            ("c1", c1),
+            ("c2", &c2),
+            ("s", &s),
+            ("rg", &rg),
+            ("g4", &g4),
+            ("k1", &k1),
+            ("k2", &k2),
+        ]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([["c1", "c2", "s", "rg", "g4", "k1", "k2"]]),
+    );
+
+    Vector {
+        family: 7,
+        name: name.into(),
+        case_kind: "fold".into(),
+        source: "7.1".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [
+                admits("c1"),
+                admits("c2"),
+                admits("s"),
+                admits("rg"),
+                admits("g4"),
+                { "item": "k1", "outcome": "body-invariant", "disposition": "reject-permanent" },
+                admits("k2"),
+            ],
+            "converge": true,
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
     vec![
         f7_delayed_reference_convergence(),
         f7_negation_residual(),
         f7_pending_revocation_window_grant(),
+        f7_staged_frontier_consumed(),
         f11_reopen_basis_types(),
         f13_txn_internal_order(),
     ]
