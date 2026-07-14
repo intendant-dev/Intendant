@@ -1,0 +1,14 @@
+/* ── composer conversation peek (skeleton contract) ─────────────────────
+   Filled by the peek track. The container floats ABOVE the dock card:
+   the bar is position:fixed, so this absolute child anchors to the card
+   and never contributes to the bar's measured height — the #app bottom
+   reservation follows --ui2-composer-h (the bar box alone), and the peek
+   overlays content like a transient sheet instead of reflowing it.
+   Everything visual beyond this anchoring belongs to the peek fragment. */
+html.ui-v2 .ui2-composer-peek {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 10px;
+}

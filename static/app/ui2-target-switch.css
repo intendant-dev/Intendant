@@ -1,0 +1,12 @@
+/* ── composer target hot-swap (skeleton contract) ───────────────────────
+   Filled by the target-switch track. Popover anchors to the dock card
+   (absolute child of the fixed bar) and opens UPWARD; it must not add to
+   the bar's measured height (see the peek skeleton note — same rule). */
+html.ui-v2 .ui2-target-switch {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 10px;
+  min-width: 260px;
+  max-width: min(420px, 100%);
+}

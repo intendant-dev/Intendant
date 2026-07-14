@@ -28,6 +28,8 @@ ui2-grid.css
 ui2-live.css
 ui2-usage.css
 ui2-settings.css
+ui2-composer-peek.css
+ui2-target-switch.css
 19-style-close.html
 
 20-shell.html
@@ -99,5 +101,11 @@ ui2-settings.js
 57-attention-notifications.js
 58-shortcuts-boot.js
 58-display-request.js
+# Composer satellites load LAST among features: they consume seams from
+# 31 (sessionWindows), 39 (prompt-target resolver), 41 (focus/append) and
+# ui2-chrome (dock state), and everything they do is boot-callback or
+# event-driven — nothing at top level touches earlier fragments' consts.
+ui2-composer-peek.js
+ui2-target-switch.js
 59-module-alive.js
 59-module-close.html

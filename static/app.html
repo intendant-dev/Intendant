@@ -22674,6 +22674,34 @@ html.ui-v2 .ui2-appearance-note {
 /* Inline code in section subtitles rides the design mono (chrome-audit
    cross-surface sweep). */
 html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
+/* ── static/app/ui2-composer-peek.css ── */
+/* ── composer conversation peek (skeleton contract) ─────────────────────
+   Filled by the peek track. The container floats ABOVE the dock card:
+   the bar is position:fixed, so this absolute child anchors to the card
+   and never contributes to the bar's measured height — the #app bottom
+   reservation follows --ui2-composer-h (the bar box alone), and the peek
+   overlays content like a transient sheet instead of reflowing it.
+   Everything visual beyond this anchoring belongs to the peek fragment. */
+html.ui-v2 .ui2-composer-peek {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 10px;
+}
+/* ── static/app/ui2-target-switch.css ── */
+/* ── composer target hot-swap (skeleton contract) ───────────────────────
+   Filled by the target-switch track. Popover anchors to the dock card
+   (absolute child of the fixed bar) and opens UPWARD; it must not add to
+   the bar's measured height (see the peek skeleton note — same rule). */
+html.ui-v2 .ui2-target-switch {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 10px;
+  min-width: 260px;
+  max-width: min(420px, 100%);
+}
 </style>
 <!-- ── static/app/20-shell.html ── -->
 </head>
@@ -22759,6 +22787,11 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
 
   <!-- Global Task Bar — always visible across tabs -->
   <div class="global-task-bar">
+    <!-- Conversation peek: the prompt-target session's tail, floated above
+         the dock card (absolute → anchors to the bar, never adds to its
+         measured height / the #app reservation). Filled by
+         ui2-composer-peek.js; inert while hidden. -->
+    <div id="ui2-composer-peek" class="ui2-composer-peek" hidden></div>
     <div class="phase-banner phase-idle" id="phase-banner">
       <span class="spinner" id="phase-spinner"></span>
       <span class="phase-text" id="phase-text">Idle</span>
@@ -22766,6 +22799,12 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
     <button id="task-target-chip" class="task-target-chip" type="button" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
+    <!-- Target hot-swap: in-place session switcher. Button revealed and
+         both wired by ui2-target-switch.js (display:none keeps them inert
+         if that fragment ever regresses to a stub); the popover anchors to
+         the dock card like the peek. -->
+    <button id="task-target-switch-btn" class="task-target-switch-btn" type="button" title="Choose prompt target" aria-haspopup="listbox" aria-expanded="false" style="display:none">&#x25BE;</button>
+    <div id="ui2-target-switch" class="ui2-target-switch" hidden role="listbox" aria-label="Prompt target sessions"></div>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -27362,7 +27401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '817badba45e13bb5';
+const INTENDANT_APP_BUILD = '9b5f86e4e3030e63';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -101267,6 +101306,22 @@ function handleDisplayRequestResolved(d) {
     hidePanel('display-request-panel');
   }
 }
+/* ── static/app/ui2-composer-peek.js ── */
+// ── composer conversation peek (seam stub — filled by the peek track) ──
+// Contract: render the prompt-target session's transcript tail into
+// #ui2-composer-peek (mounted as the dock's first child; skeleton
+// anchoring in ui2-composer-peek.css), live-following the same entries
+// the session window shows, with tap-through to the Activity window.
+// Boot follows the ui2-chrome single-boot idiom; every entry point is a
+// no-op when the mount is missing so a stub build stays inert.
+/* ── static/app/ui2-target-switch.js ── */
+// ── composer target hot-swap (seam stub — filled by the switch track) ──
+// Contract: reveal + wire #task-target-switch-btn (next to the target
+// chip) and fill #ui2-target-switch with the targetable-session listbox.
+// Selecting a session retargets the composer IN PLACE (focusSessionWindow
+// — it does not switch tabs); listing is gated exactly like the resolver
+// (isPromptTargetSessionUsable). Boot follows the ui2-chrome single-boot
+// idiom; every entry point is a no-op when the mounts are missing.
 /* ── static/app/59-module-alive.js ── */
 // ── Module-death canary (sentinel) ──────────────────────────────────────
 // MUST stay the LAST .js fragment in manifest.txt (only 59-module-close.html
