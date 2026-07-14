@@ -236,9 +236,7 @@ pub(crate) fn capture_failure_with_permission_hint(
 ) -> String {
     match preflight_granted {
         Some(false) => {
-            let binary_note = binary
-                .map(|b| format!(" ({b})"))
-                .unwrap_or_default();
+            let binary_note = binary.map(|b| format!(" ({b})")).unwrap_or_default();
             format!(
                 "{raw} — the Screen Recording (TCC) permission is missing for this \
                  process{binary_note}. Grant it in System Settings → Privacy & Security → \
@@ -345,7 +343,8 @@ async fn os_probes(
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (target, session_resolution);
-        let unsupported = || Probe::unknown("readiness probing is not implemented on this platform");
+        let unsupported =
+            || Probe::unknown("readiness probing is not implemented on this platform");
         OsProbes {
             capture: unsupported(),
             accessibility: unsupported(),
@@ -488,10 +487,7 @@ async fn linux_probes(target: DisplayTarget, session_resolution: Option<(u32, u3
     // X11 path (user session on X11, or any virtual/Xvfb display).
     let display_env = target.display_env_string();
     let socket = x11_socket_path(&display_env);
-    let socket_up = socket
-        .as_ref()
-        .map(|path| path.exists())
-        .unwrap_or(false);
+    let socket_up = socket.as_ref().map(|path| path.exists()).unwrap_or(false);
     let (capture, display, input) = if socket_up {
         let session_note = session_resolution
             .map(|(w, h)| format!("; live capture session ({w}x{h})"))
@@ -505,9 +501,9 @@ async fn linux_probes(target: DisplayTarget, session_resolution: Option<(u32, u3
         )
     } else {
         let fix = match target {
-            DisplayTarget::Virtual { id } => format!(
-                "start the virtual display first: `Xvfb :{id} -screen 0 1920x1080x24 &`"
-            ),
+            DisplayTarget::Virtual { id } => {
+                format!("start the virtual display first: `Xvfb :{id} -screen 0 1920x1080x24 &`")
+            }
             DisplayTarget::UserSession => format!(
                 "the daemon may lack the GUI session environment. {}",
                 crate::linux_display_env::diagnostic_summary()
@@ -576,16 +572,16 @@ async fn atspi_probe() -> Probe {
 async fn windows_probes(target: DisplayTarget, session_resolution: Option<(u32, u32)>) -> OsProbes {
     // UIA availability: COM apartment + client instantiation, probed on a
     // blocking thread (COM must not run on the async worker).
-    let accessibility =
-        match tokio::task::spawn_blocking(crate::windows_uia::probe_available).await {
-            Ok(Ok(())) => Probe::ready("UI Automation (UIA) client available"),
-            Ok(Err(e)) => Probe::blocked(
-                format!("UI Automation (UIA) client unavailable: {e}"),
-                "read_screen element trees need UIA (COM); check that the daemon runs in \
+    let accessibility = match tokio::task::spawn_blocking(crate::windows_uia::probe_available).await
+    {
+        Ok(Ok(())) => Probe::ready("UI Automation (UIA) client available"),
+        Ok(Err(e)) => Probe::blocked(
+            format!("UI Automation (UIA) client unavailable: {e}"),
+            "read_screen element trees need UIA (COM); check that the daemon runs in \
                  an interactive desktop session",
-            ),
-            Err(e) => Probe::unknown(format!("UIA probe task failed: {e} — treat as not ready")),
-        };
+        ),
+        Err(e) => Probe::unknown(format!("UIA probe task failed: {e} — treat as not ready")),
+    };
 
     if let DisplayTarget::Virtual { id } = target {
         let blocked = || {
@@ -642,7 +638,9 @@ fn x11_socket_path(display: &str) -> Option<std::path::PathBuf> {
     if digits.is_empty() {
         return None;
     }
-    Some(std::path::PathBuf::from(format!("/tmp/.X11-unix/X{digits}")))
+    Some(std::path::PathBuf::from(format!(
+        "/tmp/.X11-unix/X{digits}"
+    )))
 }
 
 #[cfg(test)]
@@ -670,11 +668,17 @@ mod tests {
 
         let denied = authority_probe(true, false, false);
         assert_eq!(denied.status, LayerStatus::Blocked);
-        assert!(denied.fix.as_deref().unwrap().contains("request_user_display"));
+        assert!(denied
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("request_user_display"));
 
         let virtual_target = authority_probe(false, false, false);
         assert_eq!(virtual_target.status, LayerStatus::Ready);
-        assert!(virtual_target.detail.contains("no user-display grant required"));
+        assert!(virtual_target
+            .detail
+            .contains("no user-display grant required"));
     }
 
     #[test]
@@ -699,11 +703,8 @@ mod tests {
         let mut os = ready_os_probes();
         os.capture = Probe::blocked("no TCC", "grant it");
         os.display = Probe::unknown("could not read display size");
-        let report = assemble_readiness(
-            "user_session".to_string(),
-            Probe::ready("authority ok"),
-            os,
-        );
+        let report =
+            assemble_readiness("user_session".to_string(), Probe::ready("authority ok"), os);
         assert!(!report.ready, "blocked/unknown layers must fail closed");
         assert!(report.summary.contains("NOT READY"));
         assert!(report.summary.contains(LAYER_CAPTURE));
@@ -713,8 +714,7 @@ mod tests {
         // Unknown-only reports are also not ready (fail closed).
         let mut os = ready_os_probes();
         os.accessibility = Probe::unknown("probe timed out");
-        let report =
-            assemble_readiness("user_session".to_string(), Probe::ready("ok"), os);
+        let report = assemble_readiness("user_session".to_string(), Probe::ready("ok"), os);
         assert!(!report.ready);
     }
 
@@ -722,11 +722,8 @@ mod tests {
     fn gap_json_lists_only_non_ready_layers() {
         let mut os = ready_os_probes();
         os.capture = Probe::blocked("no TCC", "grant it in System Settings");
-        let report = assemble_readiness(
-            "user_session".to_string(),
-            Probe::ready("authority ok"),
-            os,
-        );
+        let report =
+            assemble_readiness("user_session".to_string(), Probe::ready("authority ok"), os);
         let gap = report.gap_json();
         assert_eq!(gap["ready"], serde_json::json!(false));
         let rows = gap["not_ready_layers"].as_array().unwrap();

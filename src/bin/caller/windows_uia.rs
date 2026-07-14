@@ -72,8 +72,7 @@ fn control_type_role(control_type_id: i32) -> &'static str {
 /// here — the display cap is applied once, centrally, by
 /// `computer_use::cap_screen_elements_texts`.
 fn clean_text(text: Option<String>) -> Option<String> {
-    text.map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Assemble a [`UiElement`] from raw UIA-shaped fields.

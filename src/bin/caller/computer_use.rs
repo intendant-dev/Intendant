@@ -3195,7 +3195,10 @@ mod tests {
 
         // Two long values sharing the 80-char prefix stay distinguishable
         // through the hash.
-        let other = format!("data:image/png;base64,{}", "A".repeat(499).to_string() + "B");
+        let other = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(499).to_string() + "B"
+        );
         let other_capped = cap_ui_text(&other, 80);
         assert_ne!(capped, other_capped, "same-prefix values must differ");
     }

@@ -44,8 +44,7 @@ fn role_is_password_text(atspi_role_name: &str) -> bool {
 /// the display cap is applied once, centrally, by
 /// `computer_use::cap_screen_elements_texts`.
 fn clean_text(text: Option<String>) -> Option<String> {
-    text.map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Map an AT-SPI role name to the lowercase role vocabulary shared with the
