@@ -382,6 +382,7 @@ mod tests {
             "f07-delayed-reference-convergence-c1-i-c2.json",
             "f07-negation-residual-acceptance.json",
             "f07-pending-revocation-window-grant-completing-rotation.json",
+            "f07-staged-frontier-consumed-no-resurrection.json",
         ];
         for r in &reports {
             assert!(

@@ -18,9 +18,12 @@
 //! `c.revoke_device` in exclude mode (the D-180/D-186 one completion
 //! law over the D-173 decryptable-wrap domain, with the D-195
 //! reservation — a pending compound HOLDS its chain position, unlike
-//! a failed op which exerts no precedence, D-112), and
-//! `c.kek_rotate` (dense epochs, wrap-set validation, the D-81
-//! last-holder floor).
+//! a failed op which exerts no precedence, D-112), `c.kek_rotate`
+//! (dense epochs, wrap-set validation, the D-81 last-holder floor),
+//! and the staging machine: `c.cutoff`'s requesterless `closes` lane
+//! (D-136) plus `c.cap_epoch_bump` under the union-coverage rule —
+//! stages consume one-shot at the advance (D-153) and die vacuously
+//! at an authority-ending frontier (D-196).
 
 use std::collections::BTreeMap;
 
@@ -161,6 +164,16 @@ pub struct State {
     pending_compounds: BTreeMap<[u8; 32], [u8; 16]>,
     /// Completed (effect-applied) revocation_ids.
     revoked_ids: Vec<[u8; 16]>,
+    /// zone → current capability epoch (opens at 1, §9.4).
+    cap_epochs: BTreeMap<[u8; 16], u64>,
+    /// zone → `zone_policy.strictness == "strict"` (the union-coverage
+    /// rule binds under strict).
+    zone_strict: BTreeMap<[u8; 16], bool>,
+    /// UNCONSUMED staged frontier closures (`ccutoff.closes`, D-136)
+    /// — inert until a consuming advance materializes them; one-shot
+    /// (D-153), vacuously consumed by an authority-ending frontier
+    /// (D-196).
+    staged_closes: Vec<ZoneLineage>,
 }
 
 fn ok<T>(v: T) -> Result<T, Unimplemented> {
@@ -432,6 +445,39 @@ impl State {
         }
     }
 
+    /// D-151: the zone's LIVE lineages — those with an active
+    /// op-authoring grant naming the zone.
+    fn live_lineages(&self, zone: [u8; 16]) -> Vec<[u8; 16]> {
+        let mut out = Vec::new();
+        for g in self
+            .grants
+            .iter()
+            .filter(|g| !g.revoked && g.zone == Some(zone))
+        {
+            if !g.verbs.iter().any(|v| OP_AUTHORING.contains(&v.as_str())) {
+                continue;
+            }
+            if let Some(l) = g.lineage {
+                if !out.contains(&l) {
+                    out.push(l);
+                }
+            }
+        }
+        out
+    }
+
+    /// D-196: an authority-ending frontier VACUOUSLY CONSUMES the
+    /// unconsumed stages of the lineages it removed from the coverage
+    /// domain — one-shot-spent at the ending acceptance, so a later
+    /// regrant cannot resurrect them.
+    fn consume_dead_stages(&mut self, ended: &[ZoneLineage]) {
+        for &(z, l) in ended {
+            if !self.live_lineages(z).contains(&l) {
+                self.staged_closes.retain(|&(sz, sl)| !(sz == z && sl == l));
+            }
+        }
+    }
+
     /// `c.genesis` — control seq 1 only, genesis arm, D-68
     /// cross-field validity over the carried objects.
     fn admit_genesis(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
@@ -514,11 +560,20 @@ impl State {
             }
         }
 
-        // Accept: install the plane.
+        // Accept: install the plane. KEK epoch 1 AND capability
+        // epoch 1 open here (§7.1 row); the B.1 policy's strictness
+        // scopes the union-coverage rule.
         self.plane_id = Some(plane);
         self.root_pk = Some(root_pk);
         self.zones.push(zone_id.unwrap_or_default());
         self.kek_epochs.insert(zone_id.unwrap_or_default(), 1);
+        self.cap_epochs.insert(zone_id.unwrap_or_default(), 1);
+        let strict = body
+            .get("zone_policy")
+            .and_then(|p| p.get("strictness"))
+            .and_then(|s| s.as_text())
+            == Some("strict");
+        self.zone_strict.insert(zone_id.unwrap_or_default(), strict);
         for r in recipients {
             self.record_wrap(zone_id.unwrap_or_default(), 1, r);
         }
@@ -791,7 +846,12 @@ impl State {
 
         // Accept. (The boundary's quarantine consumers arrive with
         // later slices; state records the deactivation.)
+        let ended = match (self.grants[idx].zone, self.grants[idx].lineage) {
+            (Some(z), Some(l)) if op_authoring => vec![(z, l)],
+            _ => vec![],
+        };
         self.grants[idx].revoked = true;
+        self.consume_dead_stages(&ended);
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
         ok(Ok(()))
@@ -887,13 +947,21 @@ impl State {
         for c in self.certs.iter_mut().filter(|c| c.revocation_id == rid) {
             c.revoked = true;
         }
+        let mut ended: Vec<ZoneLineage> = Vec::new();
         for g in self
             .grants
             .iter_mut()
-            .filter(|g| targets.contains(&g.subject_device))
+            .filter(|g| !g.revoked && targets.contains(&g.subject_device))
         {
             g.revoked = true;
+            if let (Some(z), Some(l)) = (g.zone, g.lineage) {
+                if g.verbs.iter().any(|v| OP_AUTHORING.contains(&v.as_str())) {
+                    ended.push((z, l));
+                }
+            }
         }
+        // The compound's frontier is authority-ending too (D-196).
+        self.consume_dead_stages(&ended);
         self.revoked_ids.push(rid);
         self.pending_compounds.remove(&oh);
         Ok(())
@@ -989,6 +1057,134 @@ impl State {
         self.ctrl_head = oh;
         self.pending_compounds.insert(oh, rid);
         ok(self.try_complete_compound(oh, rid, &cutoffs))
+    }
+
+    /// `c.cutoff`, requesterless pure-staging form only (D-136): an
+    /// empty ratify set with non-empty `closes`, recorded INERT for a
+    /// later consuming advance. The ratify machine (requester
+    /// attestation, snapshot-wins, per-generation entries) is a later
+    /// slice.
+    fn admit_cutoff(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        if body.get("requester").is_some() {
+            return Err(Unimplemented("cutoff requester attestation".into()));
+        }
+        let Some(ratify) = body.get("cutoffs").and_then(|c| c.as_array()) else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        if !ratify.is_empty() {
+            return Err(Unimplemented("ratify cutoffs".into()));
+        }
+        // "an operation with neither entries nor closes nor requester
+        // is body-invariant".
+        let closes = match body.get("closes").and_then(|c| c.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+        };
+        let mut staged: Vec<ZoneLineage> = Vec::new();
+        for cn in closes {
+            let (Some(z), Some(l)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage")) else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            match cn.get("heads").and_then(|h| h.as_array()) {
+                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
+                Some(a) if !a.is_empty() => {
+                    return Err(Unimplemented("frontierclose heads".into()))
+                }
+                Some(_) => staged.push((z, l)),
+            }
+        }
+
+        // Accept: the stages exist from acceptance on (D-160), inert.
+        self.staged_closes.extend(staged);
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
+    }
+
+    /// `c.cap_epoch_bump` — §9.4 consecutiveness plus the
+    /// D-78/D-93/D-136/D-143/D-153 union-coverage rule under strict:
+    /// this operation's entries ∪ the zone's UNCONSUMED stages must
+    /// cover every live lineage; acceptance consumes every applicable
+    /// stage one-shot (a dead stage was already vacuously spent at its
+    /// authority-ending frontier and never counts, D-196).
+    fn admit_cap_epoch_bump(
+        &mut self,
+        op: &SignedOp,
+    ) -> Result<Result<(), Verdict>, Unimplemented> {
+        if let Err(v) = self.ctrl_admin_preamble(op) {
+            return ok(Err(v));
+        }
+        let body = &op.body;
+        let Some(zone) = b16_field(body, "zone_id") else {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        };
+        let Some(&cur) = self.cap_epochs.get(&zone) else {
+            // The zone's creation may arrive later (interpretation
+            // register #24 — unpinned).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if self.zone_strict.get(&zone) != Some(&true) {
+            return Err(Unimplemented("non-strict zone coverage".into()));
+        }
+        if body.get("new_epoch").and_then(|n| n.as_uint()) != Some(cur + 1) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        // Closure entries: each names THIS zone and a live lineage
+        // (D-151); only the empty-heads shape is minted so far.
+        let live = self.live_lineages(zone);
+        let mut entries: Vec<[u8; 16]> = Vec::new();
+        if let Some(cs) = body.get("cutoffs") {
+            let Some(cs) = cs.as_array() else {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+            };
+            for cn in cs {
+                let (Some(cz), Some(cl)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage"))
+                else {
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                };
+                if cz != zone || !live.contains(&cl) {
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                }
+                match cn.get("heads").and_then(|h| h.as_array()) {
+                    None => {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
+                    }
+                    Some(a) if !a.is_empty() => {
+                        return Err(Unimplemented("frontierclose heads".into()))
+                    }
+                    Some(_) => entries.push(cl),
+                }
+            }
+        }
+        // Union coverage: entries ∪ unconsumed stages for this zone.
+        let covered = |l: &[u8; 16]| {
+            entries.contains(l)
+                || self
+                    .staged_closes
+                    .iter()
+                    .any(|&(sz, sl)| sz == zone && sl == *l)
+        };
+        if live.iter().any(|l| !covered(l)) {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+
+        // Accept: advance the capability epoch; the consuming advance
+        // spends EVERY unconsumed stage for this zone (D-153 one-shot
+        // — a prior advance's materialized entries never satisfy
+        // later coverage). Budget-window state (D-79) has no consumer
+        // in the engine yet.
+        self.cap_epochs.insert(zone, cur + 1);
+        self.staged_closes.retain(|&(sz, _)| sz != zone);
+        self.ctrl_next_seq += 1;
+        self.ctrl_head = op.op_hash();
+        ok(Ok(()))
     }
 
     /// `c.kek_rotate` — §5.5's admission face: dense per-zone epochs
@@ -1204,6 +1400,8 @@ impl State {
             "c.grant" => self.admit_grant(op),
             "c.revoke_grant" => self.admit_revoke_grant(op),
             "c.revoke_device" => self.admit_revoke_device(op),
+            "c.cutoff" => self.admit_cutoff(op),
+            "c.cap_epoch_bump" => self.admit_cap_epoch_bump(op),
             "c.kek_rotate" => self.admit_kek_rotate(op),
             "m.claim" => self.admit_claim(op),
             other => Err(Unimplemented(format!("op_type {other}"))),
@@ -1380,5 +1578,27 @@ mod tests {
             Verdict::Pending("causal-missing", "pending-dependency")
         );
         assert_eq!(run2.final_verdicts, run.final_verdicts);
+    }
+
+    /// D-153/D-196: the staged close dies vacuously at the
+    /// authority-ending revocation, so after the regrant the dev1-only
+    /// bump lacks fresh coverage and rejects — and its corrected
+    /// successor legally reuses the position (D-112: a failed op
+    /// exerts no precedence).
+    #[test]
+    fn dead_stage_never_counts_and_rejected_candidate_frees_its_position() {
+        let (items, _) = load("f07-staged-frontier-consumed-no-resurrection.json");
+        let order: Vec<String> = ["c1", "c2", "s", "rg", "g4", "k1", "k2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let run = run_delivery(&items, &order).unwrap();
+        assert_eq!(
+            run.final_verdicts["k1"],
+            Verdict::Rejected("body-invariant", "reject-permanent")
+        );
+        for k in ["c1", "c2", "s", "rg", "g4", "k2"] {
+            assert_eq!(run.final_verdicts[k], Verdict::Admitted, "{k}");
+        }
     }
 }
