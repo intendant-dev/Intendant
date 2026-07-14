@@ -385,6 +385,25 @@ pub struct State {
     /// the §7.5 ceiling binds while hosted AND no recovery has been
     /// accepted (the lift is portable, D-42).
     provenance: Option<String>,
+    /// The ACCEPTED control chain's exact bytes as (seq, bytes) —
+    /// the D-138 total re-fold replays a surviving prefix from here.
+    /// (A pending compound RESERVES its position without entering
+    /// the log; completion pushes it when the re-evaluation accepts,
+    /// so entry order may lag seq order — replay sorts by seq.)
+    ctrl_log: Vec<(u64, Vec<u8>)>,
+    /// Derived verdicts for control ops re-classified by a C2 freeze
+    /// or a C3′ cut — overlaid like the tenant lane.
+    ctrl_overlay: BTreeMap<[u8; 32], Verdict>,
+    /// Hashes cut from the chain, by seq — a late redelivery of a
+    /// cut-branch op classifies from here.
+    cut_chain: BTreeMap<u64, Vec<[u8; 32]>>,
+    /// C2: the control plane is frozen (no further control ops on
+    /// either branch; only recovery resolves).
+    ctrl_frozen: bool,
+    /// The last accepted recovery's placement seq — a differing op
+    /// arriving AT that position is cut-branch material, never C2
+    /// (the §7.4 precedence exception).
+    recovery_placement: Option<u64>,
 }
 
 /// A held Signed `accept` receipt from aux — unvalidated until an
@@ -1348,7 +1367,13 @@ impl State {
     ) -> Result<BTreeMap<[u8; 32], Verdict>, Unimplemented> {
         let mut out = BTreeMap::new();
         for rec in &self.held_tenant {
-            let v = if !self.op_standing(rec) {
+            let v = if !self.grants.iter().any(|g| g.h_grant == rec.cited_grant) {
+                // The citing grant dissolved with a cut branch: the
+                // held bytes await their dependency again (the D-199
+                // lane; D-138 — everything a cut fact derived
+                // re-evaluates).
+                Verdict::Pending("ref-unresolved", "pending-dependency")
+            } else if !self.op_standing(rec) {
                 Verdict::Rejected("cutoff", "quarantine-reproposal")
             } else if let Some(imp) = &rec.import {
                 // The claimant fold: total portable order
@@ -2025,9 +2050,10 @@ impl State {
         if let Err(v) = Self::ctrl_header_pins(op) {
             return ok(Err(v));
         }
-        if let Err(v) = self.ctrl_chain(op) {
-            return ok(Err(v));
-        }
+        // NO ctrl_chain gate: placement is frozen to base.seq + 1
+        // and a valid recovery never triggers C2 against cut
+        // branches (the §7.4 precedence exception) — the base checks
+        // below are the whole position rule.
         let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
         let Proof::Recovery {
             repoch,
@@ -2072,12 +2098,31 @@ impl State {
         if h.writer_sequence != base_seq + 1 || h.previous_writer_hash != base_op {
             return ok(Err(bad()));
         }
-        // The chain gate above admitted this op at the CURRENT head —
-        // a base below it cuts control branches (the precedence
-        // exception), which no vector pins yet.
-        if base_seq + 1 != self.ctrl_next_seq.max(1) || base_op != self.ctrl_head {
-            return Err(Unimplemented("recovery branch cut below the head".into()));
-        }
+        // Base resolution: at the head = pure succession (nothing
+        // cuts); below it = the branch cut (D-138 total re-fold);
+        // beyond it or hash-mismatched = the base is not held.
+        let head_seq = self.ctrl_next_seq.max(1) - 1;
+        let cut_below_head = if base_seq == head_seq && base_op == self.ctrl_head {
+            false
+        } else if base_seq >= 1 && base_seq < head_seq {
+            let held = self
+                .ctrl_log
+                .iter()
+                .find(|(s, _)| *s == base_seq)
+                .and_then(|(_, b)| parse_op(b).ok())
+                .map(|o| o.op_hash());
+            if held != Some(base_op) {
+                return ok(Err(bad()));
+            }
+            true
+        } else {
+            // The named base position is not held yet (or its hash
+            // mismatches a shorter chain): await it.
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
         // repoch = current + 1 (proof arm and body agree).
         if body.get("repoch").and_then(|n| n.as_uint()) != Some(repoch) || repoch != self.repoch + 1
         {
@@ -2135,10 +2180,21 @@ impl State {
             }
         }
 
-        // Accept: install the successor epoch, rotate the recovery
-        // commitment, and fold the blanket. The total re-fold
-        // (D-138) is the derived lanes' job — with base at the head,
-        // no control state dissolves.
+        // Accept. A below-head base first cuts the branch above it:
+        // the control re-fold rebuilds every control-derived fact
+        // from the surviving prefix, and the cut ops classify
+        // (cutoff, quarantine-reproposal) — the D-140 recover
+        // boundary reading (a register/audit decision; the spec
+        // names no pair for a cut CONTROL op). Tenant re-derivation
+        // is the derived lanes' job either way.
+        if cut_below_head {
+            self.refold_control(
+                base_seq,
+                Verdict::Rejected("cutoff", "quarantine-reproposal"),
+            )?;
+        }
+        self.ctrl_frozen = false; // only recovery resolves C2
+        self.recovery_placement = Some(op.header.writer_sequence);
         self.admin_keys.insert(epoch, new_admin_pk);
         self.repoch = repoch;
         self.recovery_commitment = Some(new_commitment);
@@ -2427,6 +2483,116 @@ impl State {
             .collect()
     }
 
+    /// The D-138 total re-fold: rebuild every control-derived field
+    /// by replaying the surviving control prefix (`keep` entries)
+    /// into a fresh fold; tenant-side and aux state carry over; the
+    /// cut suffix joins `cut_chain` and the overlay under
+    /// `cut_verdict`. Incremental implementations MUST converge to
+    /// the fresh-fold result — this IS the fresh fold.
+    fn refold_control(
+        &mut self,
+        keep_through: u64,
+        cut_verdict: Verdict,
+    ) -> Result<(), Unimplemented> {
+        let mut fresh = State {
+            receipts: std::mem::take(&mut self.receipts),
+            leases: std::mem::take(&mut self.leases),
+            item_index: std::mem::take(&mut self.item_index),
+            tenant_chains: std::mem::take(&mut self.tenant_chains),
+            held_tenant: std::mem::take(&mut self.held_tenant),
+            erase_queue: std::mem::take(&mut self.erase_queue),
+            retrieval_excluded: std::mem::take(&mut self.retrieval_excluded),
+            ctrl_overlay: std::mem::take(&mut self.ctrl_overlay),
+            cut_chain: std::mem::take(&mut self.cut_chain),
+            // Tenant replay keys survive; control ones re-derive on
+            // replay (replay-key ownership is derived state, D-155).
+            request_seen: std::mem::take(&mut self.request_seen)
+                .into_iter()
+                .filter(|((_, lineage, _), _)| *lineage != CTRL_LINEAGE)
+                .collect(),
+            ..State::default()
+        };
+        let mut log = std::mem::take(&mut self.ctrl_log);
+        log.sort_by_key(|(seq, _)| *seq);
+        for (seq, bytes) in &log {
+            if *seq > keep_through {
+                if let Ok(op) = parse_op(bytes) {
+                    let hash = op.op_hash();
+                    fresh.cut_chain.entry(*seq).or_default().push(hash);
+                    fresh.ctrl_overlay.insert(hash, cut_verdict);
+                }
+                continue;
+            }
+            let op = parse_op(bytes)
+                .map_err(|_| Unimplemented("re-fold parse of an accepted op".into()))?;
+            match fresh.admit(&op)? {
+                Ok(()) => {
+                    fresh.request_seen.insert(
+                        (
+                            op.header.zone_id,
+                            op.header.writer_lineage,
+                            op.header.request_id,
+                        ),
+                        op.op_hash(),
+                    );
+                    fresh.ctrl_log.push((*seq, bytes.clone()));
+                }
+                Err(_) => {
+                    return Err(Unimplemented(
+                        "re-fold divergence: a surviving op no longer admits".into(),
+                    ))
+                }
+            }
+        }
+        *self = fresh;
+        Ok(())
+    }
+
+    /// C2 at position `seq`: BOTH branches freeze — the chain
+    /// re-folds to the pre-fork prefix, every op at or beyond the
+    /// contested position (either branch) classifies `(ctrl-fork,
+    /// freeze-control)`, and no further control op admits until a
+    /// recovery resolves.
+    fn freeze_at(&mut self, seq: u64) -> Result<(), Unimplemented> {
+        self.refold_control(seq - 1, Verdict::Rejected("ctrl-fork", "freeze-control"))?;
+        self.ctrl_frozen = true;
+        Ok(())
+    }
+
+    /// The pre-admission control gate (C2/C5, §7.4): a frozen plane
+    /// admits no control op but the resolving recovery; a differing
+    /// op at a HELD position is cut-branch material where a cut or
+    /// recovery covers it, and fork evidence otherwise.
+    fn ctrl_fork_gate(&mut self, op: &SignedOp) -> Result<Option<Verdict>, Unimplemented> {
+        if self.ctrl_frozen {
+            return Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")));
+        }
+        let seq = op.header.writer_sequence;
+        if seq >= self.ctrl_next_seq.max(1) {
+            return Ok(None);
+        }
+        if self.pending_compounds.contains_key(&op.op_hash()) {
+            // The op holds its OWN reserved position (a pending
+            // c.revoke_device compound, D-195) — re-evaluation, not
+            // a fork.
+            return Ok(None);
+        }
+        // Byte-identical replay was consumed by the replay registry;
+        // this op DIFFERS at a held position.
+        if self
+            .cut_chain
+            .get(&seq)
+            .is_some_and(|c| c.contains(&op.op_hash()))
+            || self.recovery_placement == Some(seq)
+        {
+            // A cut-branch op, or a challenger at the recovery's own
+            // position (the precedence exception: recovery wins).
+            return Ok(Some(Verdict::Rejected("cutoff", "quarantine-reproposal")));
+        }
+        self.freeze_at(seq)?;
+        Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")))
+    }
+
     /// The walkthrough probe registry (register #17: fixture-named
     /// canonical CBOR of the derived construct).
     pub fn probe(&self, name: &str) -> Option<Vec<u8>> {
@@ -2443,6 +2609,8 @@ impl State {
                 out.extend_from_slice(&self.ctrl_head);
                 Some(out)
             }
+            "ctrl.frozen" => Some(vec![if self.ctrl_frozen { 0xf5 } else { 0xf4 }]),
+            "repoch" => Some(crate::kat::encode(&crate::kat::Enc::U(self.repoch))),
             _ => None,
         }
     }
@@ -3500,6 +3668,10 @@ pub fn run_delivery_full(
             if let Some(v) = derived.get(h) {
                 verdicts.insert(n.clone(), *v);
             }
+            // Control ops re-classified by a freeze or a cut (§7.4).
+            if let Some(v) = state.ctrl_overlay.get(h) {
+                verdicts.insert(n.clone(), *v);
+            }
         }
         snapshots.push(verdicts.clone());
     }
@@ -3543,9 +3715,23 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
             Verdict::Rejected("request-fork", "reject-permanent")
         });
     }
+    // The control fork/freeze gate (C2/C5) — recovery carries its
+    // own placement rules (the §7.4 precedence exception).
+    if op.header.operation_type.starts_with("c.")
+        && op.header.operation_type != "c.recovery_succession"
+    {
+        if let Some(v) = state.ctrl_fork_gate(&op)? {
+            return Ok(v);
+        }
+    }
     state.admit(&op).map(|r| match r {
         Ok(()) => {
             state.request_seen.insert(replay_key, op.op_hash());
+            if op.header.operation_type.starts_with("c.") {
+                state
+                    .ctrl_log
+                    .push((op.header.writer_sequence, bytes.to_vec()));
+            }
             Verdict::Admitted
         }
         Err(v) => v,

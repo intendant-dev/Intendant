@@ -24,8 +24,13 @@
 //! control chain head hash.
 
 use crate::cbor::{self, Value};
+use crate::domains::{h_tag, Tag};
+use crate::shapes::control::{AdminKey, Crecovsucc};
 use crate::shapes::envelope::Signedop;
-use crate::shapes::{DeadlineFallback, Frontierclose, Strictness, TimeWitness, Verb, Zonepolicy};
+use crate::shapes::{
+    DeadlineFallback, Frontierclose, Sigalg, Strictness, TimeWitness, Verb, Zonepolicy,
+};
+use crate::suite;
 use crate::tranche::{items, PlaneRig};
 use crate::vector::{Expected, Vector};
 use serde_json::{json, Map as JsonMap, Value as Json};
@@ -186,12 +191,131 @@ pub fn f7_drill_acceptance() -> Vector {
     )
 }
 
+/// C2: two DIFFERENT control ops at one position freeze BOTH
+/// branches (§7.4 — "no further control ops on either branch");
+/// tenant writes citing UNCONTESTED authority continue. Both
+/// delivery orders converge on the freeze-both state — whichever op
+/// admitted first is re-classified when the fork is discovered.
+pub fn f7_c2_freeze_both() -> Vector {
+    let name = "f7-c2-freeze";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    // x2: a legal epoch bump occupying position 2 WITHOUT advancing
+    // the rig chain (coverage = dev1's lineage, the only live one at
+    // that point).
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    // e2: the enrollment holding the SAME position on the rig chain.
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    // i: a claim under the UNCONTESTED genesis authority — tenant
+    // writes continue under the last uncontested frontier.
+    let i = rig.claim(
+        &d1,
+        &g1,
+        "i",
+        "the harbor light holds through the fork",
+        1,
+        None,
+    );
+    let c1 = rig.genesis_op.clone();
+    let head = c1.op_hash();
+    ctrl_vector(
+        "walkthrough-c2-freeze-both",
+        "walkthrough",
+        "7.4",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("i", &i)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "i" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        Some(json!([
+            probe("ctrl.frozen", &Value::Bool(true)),
+            probe("ctrl.head", &Value::Bytes(head.to_vec())),
+        ])),
+    )
+}
+
+/// C3′ below the head: the recovery bases at the genesis, cutting
+/// the enrollment above it — the cut control op re-classifies
+/// `(cutoff, quarantine-reproposal)` (the D-140 recover-boundary
+/// reading; the spec names no pair for a cut CONTROL op — register/
+/// audit item), and the cut branch's tenant write re-pends on its
+/// dissolved citations (D-138/D-199). Empty `tenant_cutoffs` = the
+/// pure revivable omission blanket. The reversed order exercises the
+/// §7.4 precedence exception: the enrollment arriving AFTER the
+/// accepted recovery classifies as cut-branch material at the
+/// recovery's own position, never C2.
+pub fn f7_c3_branch_cut_below_head() -> Vector {
+    let name = "f7-c3-branch-cut";
+    let mut rig = PlaneRig::new(name);
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2.clone()], "wrap.dev2.eph");
+    let i2 = rig.claim(&d2, &g2, "i2", "the cut branch wrote this", 1, None);
+    let c1 = rig.genesis_op.clone();
+    let admin2_seed = rig.rng.draw32("admin2.sig_seed");
+    let (_a2_sk, a2_pk) = suite::ed25519::keypair(&admin2_seed);
+    let recovery2_seed = rig.rng.draw32("recovery2.sig_seed");
+    let (_r2_sk, r2_pk) = suite::ed25519::keypair(&recovery2_seed);
+    let r = rig.recovery_op_tagged(
+        "r",
+        Crecovsucc {
+            base_seq: 1,
+            base_op: c1.op_hash(),
+            epoch: 2,
+            repoch: 1,
+            new_admin: AdminKey {
+                alg: Sigalg::Ed25519,
+                pk: a2_pk.to_vec(),
+            },
+            new_recovery_commitment: h_tag(Tag::Drill, &r2_pk),
+            tenant_cutoffs: vec![],
+            adopted_renewals: None,
+            retired_keys: None,
+            adopted_rotations: vec![],
+        },
+    );
+    let r_hash = r.op_hash();
+    ctrl_vector(
+        "walkthrough-c3-branch-cut-below-head",
+        "walkthrough",
+        "7.4",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("i2", &i2), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
+            { "item": "i2", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
+            { "item": "r" },
+        ]),
+        Some(json!([
+            probe("repoch", &Value::Uint(1)),
+            probe("ctrl.frozen", &Value::Bool(false)),
+            probe("ctrl.head", &Value::Bytes(r_hash.to_vec())),
+        ])),
+    )
+}
+
 pub fn corpus_ctrl() -> Vec<Vector> {
     vec![
         f7_hosted_solo_boot(),
         f7_hosted_grant_verb_excluded(),
         f7_hosted_zone_policy_inadmissible(),
         f7_drill_acceptance(),
+        f7_c2_freeze_both(),
+        f7_c3_branch_cut_below_head(),
     ]
 }
 

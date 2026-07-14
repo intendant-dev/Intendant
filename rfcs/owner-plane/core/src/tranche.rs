@@ -1228,7 +1228,15 @@ impl PlaneRig {
 
     pub fn recovery_op(&mut self, body: Crecovsucc) -> Signedop {
         let seq = body.base_seq + 1;
-        let request_id = draw_id(&mut self.rng, &format!("ctrl{seq}.request_id"));
+        self.recovery_op_tagged(&format!("ctrl{seq}"), body)
+    }
+
+    /// [`Self::recovery_op`] with an explicit draw tag — a below-head
+    /// base reuses a position whose `ctrl{seq}` draw name is already
+    /// spent.
+    pub fn recovery_op_tagged(&mut self, tag: &str, body: Crecovsucc) -> Signedop {
+        let seq = body.base_seq + 1;
+        let request_id = draw_id(&mut self.rng, &format!("{tag}.request_id"));
         let hlc = self.next_hlc();
         let header = ctrl_header(
             self.plane_id,

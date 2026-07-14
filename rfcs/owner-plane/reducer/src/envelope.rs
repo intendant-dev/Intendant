@@ -416,9 +416,9 @@ mod tests {
         );
         // Every fold fixture folds its genesis (6 tranche + 12
         // fold-lane + 1 export-import + 7 status + 7 time/lease +
-        // 4 hosted/drill corpus); the two byte-level journal
+        // 6 control-fold corpus); the two byte-level journal
         // fixtures deliver Txn frames only.
-        assert_eq!(geneses, 37);
+        assert_eq!(geneses, 39);
     }
 
     /// Tampering any byte of the header breaks the signature; the

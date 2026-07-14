@@ -752,8 +752,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            123,
-            "the tranche plus the corpus through the hosted-ceiling/drill slice"
+            125,
+            "the tranche plus the corpus through the C2/C3-prime slice"
         );
         for r in &reports {
             assert!(
