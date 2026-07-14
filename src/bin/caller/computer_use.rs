@@ -860,6 +860,10 @@ pub async fn execute_actions(
     let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
+        // Whether input events were actually dispatched — the Live overlay
+        // renders what the agent DID, so a type whose read-back later
+        // downgrades the result still paints its keypress chip.
+        let mut dispatched_ok: Option<bool> = None;
         let result = match action {
             CuAction::Screenshot => {
                 match capture_screenshot_preferring_session(
@@ -909,13 +913,14 @@ pub async fn execute_actions(
                 if !matches!(action, CuAction::Wait { .. }) {
                     last_input_at = Some(std::time::Instant::now());
                 }
+                dispatched_ok = Some(result.success());
                 verify_action_effect(action, result, effective_backend, target).await
             }
         };
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
-        if result.success() {
+        if dispatched_ok.unwrap_or_else(|| result.success()) {
             if let Some(obs) = observer {
                 obs.observe(target, observe_ref, action);
             }
@@ -1057,7 +1062,10 @@ async fn verify_macos_type_readback(text: &str, dispatched: CuActionResult) -> C
         };
         let role = snapshot.role.unwrap_or_else(|| "element".to_string());
         if role == "securetextfield" {
-            return unverified(dispatched, "secure field values are not readable".to_string());
+            return unverified(
+                dispatched,
+                "secure field values are not readable".to_string(),
+            );
         }
         let Some(value) = snapshot.value else {
             return unverified(dispatched, format!("focused {role} has no readable value"));
@@ -1653,17 +1661,13 @@ mod macos_input {
         // touching it again.
         tokio::time::sleep(PASTE_CONSUME_DELAY).await;
         let note = match previous {
-            None => {
-                "clipboard: previous content could not be captured; \
+            None => "clipboard: previous content could not be captured; \
                  the pasted text remains on the clipboard"
-                    .to_string()
-            }
+                .to_string(),
             Some(prev) => {
                 let restorable = !prev.is_empty();
                 match (set_clipboard(prev).await, restorable) {
-                    (Ok(()), true) => {
-                        "clipboard: previous text restored after paste".to_string()
-                    }
+                    (Ok(()), true) => "clipboard: previous text restored after paste".to_string(),
                     // Clearing beats leaving the pasted text behind, but
                     // non-text content (e.g. an image) is already gone.
                     (Ok(()), false) => "clipboard: previous clipboard had no text \
@@ -2132,10 +2136,7 @@ mod macos_input {
             assert_eq!(typed_char_keycode('1'), Some((KeyCode::ANSI_1, false)));
             assert_eq!(typed_char_keycode('!'), Some((KeyCode::ANSI_1, true)));
             assert_eq!(typed_char_keycode('~'), Some((KeyCode::ANSI_GRAVE, true)));
-            assert_eq!(
-                typed_char_keycode('"'),
-                Some((KeyCode::ANSI_QUOTE, true))
-            );
+            assert_eq!(typed_char_keycode('"'), Some((KeyCode::ANSI_QUOTE, true)));
             assert_eq!(typed_char_keycode(' '), Some((KeyCode::SPACE, false)));
             assert_eq!(typed_char_keycode('\n'), Some((KeyCode::RETURN, false)));
             assert_eq!(typed_char_keycode('\r'), Some((KeyCode::RETURN, false)));
@@ -2607,10 +2608,7 @@ async fn execute_via_session(
                 results.push(if errors.is_empty() {
                     CuActionResult::injected()
                 } else {
-                    CuActionResult::failed(format!(
-                        "Click injection failed: {}",
-                        errors.join("; ")
-                    ))
+                    CuActionResult::failed(format!("Click injection failed: {}", errors.join("; ")))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2914,10 +2912,7 @@ async fn execute_via_session(
                 results.push(if errors.is_empty() {
                     CuActionResult::injected()
                 } else {
-                    CuActionResult::failed(format!(
-                        "Drag injection failed: {}",
-                        errors.join("; ")
-                    ))
+                    CuActionResult::failed(format!("Drag injection failed: {}", errors.join("; ")))
                 });
                 needs_auto_screenshot = true;
             }
@@ -4417,10 +4412,8 @@ mod tests {
         let type_action = CuAction::Type { text: "hi".into() };
 
         // All verified (e.g. screenshot-only batches) keeps the plain wording.
-        let summary = summarize_results_for_model(
-            &[CuAction::Screenshot],
-            &[CuActionResult::verified()],
-        );
+        let summary =
+            summarize_results_for_model(&[CuAction::Screenshot], &[CuActionResult::verified()]);
         assert_eq!(summary, "Actions executed successfully.");
 
         // Injected-only batches must not read as verified success, and
@@ -4429,11 +4422,19 @@ mod tests {
             &[click.clone(), type_action.clone()],
             &[
                 CuActionResult::injected(),
-                CuActionResult::injected_with("type dispatched; delivery unverified — no focused element"),
+                CuActionResult::injected_with(
+                    "type dispatched; delivery unverified — no focused element",
+                ),
             ],
         );
-        assert!(summary.starts_with("Actions dispatched (2 injected"), "{summary}");
-        assert!(summary.contains("effect not independently verified"), "{summary}");
+        assert!(
+            summary.starts_with("Actions dispatched (2 injected"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("effect not independently verified"),
+            "{summary}"
+        );
         assert!(
             summary.contains("type: type dispatched; delivery unverified"),
             "{summary}"

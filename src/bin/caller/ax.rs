@@ -25,11 +25,11 @@ use std::ffi::c_void;
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute, kAXErrorSuccess,
     kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute,
-    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute,
-    kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
-    AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementCreateSystemWide, AXUIElementGetTypeID, AXUIElementRef,
-    AXUIElementSetMessagingTimeout, AXValueGetTypeID, AXValueGetValue, AXValueRef,
+    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueGetTypeID,
+    AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFGetTypeID, CFType, TCFType};
@@ -161,9 +161,7 @@ pub fn focused_element_text() -> Result<FocusedElementText, String> {
     // preconditions; the wrapper takes ownership and releases on drop.
     let system = unsafe { AXUIElement::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
     // SAFETY: system is a valid AXUIElement for the duration of the call.
-    unsafe {
-        AXUIElementSetMessagingTimeout(system.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS)
-    };
+    unsafe { AXUIElementSetMessagingTimeout(system.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS) };
     let focused: AXUIElement = copy_attr(&system, kAXFocusedUIElementAttribute)
         .and_then(|cf| cf.downcast_into())
         .ok_or_else(|| "no focused UI element".to_string())?;

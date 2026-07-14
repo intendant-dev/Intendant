@@ -1406,8 +1406,7 @@ pub(crate) async fn run_cu_task(
                 .await;
 
                 let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-                let output =
-                    computer_use::summarize_results_for_model(&cu_call.actions, &results);
+                let output = computer_use::summarize_results_for_model(&cu_call.actions, &results);
 
                 if let Some(screenshot) = last_screenshot {
                     let images = vec![conversation::ImageData {
