@@ -10431,11 +10431,17 @@ body.display-fullscreen-open {
   pointer-events: none;
   z-index: 3;
 }
-.shared-view-focus-box::after {
-  content: attr(data-note);
+/* The note is a real child element (not an ::after) so the renderer can
+   measure it and clamp it into the stage — see renderSharedViewFocus:
+   below the box when it fits, flipped above when it doesn't, never past
+   the stage edges. `width: max-content` sizes the chip to its own text
+   (the abs-positioned shrink-to-fit base is the FOCUS BOX width, which
+   can be a sliver); JS caps max-width to the stage. */
+.shared-view-focus-note {
   position: absolute;
   left: 0;
   top: calc(100% + 6px);
+  width: max-content;
   max-width: min(360px, 70vw);
   padding: 4px 7px;
   border-radius: 4px;
@@ -10446,11 +10452,8 @@ body.display-fullscreen-open {
   line-height: 1.3;
   white-space: normal;
   overflow-wrap: anywhere;
-  display: none;
 }
-.shared-view-focus-box[data-note]:not([data-note=""])::after {
-  display: block;
-}
+.shared-view-focus-note[hidden] { display: none; }
 
 /* ── Activity Display Strip ── */
 .activity-display-strip {
@@ -19836,12 +19839,13 @@ html.ui-v2 .shared-view-focus-box {
     0 0 0 1px rgba(7, 8, 16, .72),
     0 0 12px rgba(var(--amber-rgb), .38);
 }
-html.ui-v2 .shared-view-focus-box::after {
+html.ui-v2 .shared-view-focus-note {
   border-radius: 8px;
   background: rgba(11, 13, 18, .92);
   border-color: rgba(228, 168, 91, .5);
   color: var(--cu-stage-text);
   font-family: var(--sans);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .38);
 }
 /* light theme: the stage stays a dark viewport, but its .5-black drop
    shadow is dark-tuned — soften toward the light elevation vocabulary. */
@@ -20840,7 +20844,7 @@ html.ui-v2 .ui2-live-activity {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  max-height: 190px;
+  max-height: 240px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -20849,10 +20853,19 @@ html.ui-v2 .ui2-live-activity-row {
   grid-template-columns: 7px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
+  /* Rows size to their wrapped content and the LIST scrolls. Never let
+     these flex items shrink: the explicit min-height replaces the
+     `min-height: auto` floor, so a shrinkable row gets squashed to 31px
+     when entries exceed the list budget and its wrapped text paints over
+     the neighboring rows (the 2026-07-13 feed-overlap bug). */
+  flex: 0 0 auto;
   min-height: 31px;
-  padding: 5px 2px;
+  padding: 5px 4px;
   border-bottom: 1px solid var(--line);
+  border-radius: 6px;
+  transition: background var(--t-fast);
 }
+html.ui-v2 .ui2-live-activity-row:hover { background: var(--hover-wash); }
 html.ui-v2 .ui2-live-activity-row:last-child { border-bottom: 0; }
 /* Feed dots: 8px + 3px semantic halo (concept grammar). Color map:
    sky = look/connect · iris = click/focus · violet = type · amber =
@@ -20944,6 +20957,30 @@ html.ui-v2 .cu-action-raw {
   font-family: var(--mono);
   font-size: 11px;
   word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Long raw payloads render collapsed (readable preview + char count) with
+   the full literal call one click away — the disclosure is a real button
+   so keyboards and screen readers get it for free. */
+html.ui-v2 .cu-action-raw-toggle {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: color var(--t-fast);
+}
+html.ui-v2 .cu-action-raw-toggle:hover { color: var(--text-2); }
+html.ui-v2 .cu-action-raw-toggle:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
 }
 @keyframes cu-row-in {
   from { opacity: 0; transform: translateX(6px); }
@@ -21020,7 +21057,41 @@ html.ui-v2 .cu-overlay-cursor {
 }
 html.ui-v2 .cu-overlay-cursor svg {
   display: block;
+  position: relative;
+  z-index: 1;
   filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .55));
+}
+/* Presence halo: a soft breathing ring centered on the pointer hotspot so
+   the agent cursor stays findable on busy content. It rides the cursor
+   element (inherits its ease + idle fade) and hides entirely while the
+   dashboard user holds input — their real cursor rules the stage, and a
+   glowing second cursor would read as a double pointer. */
+html.ui-v2 .cu-cursor-halo {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid rgba(var(--iris-rgb), .58);
+  background: radial-gradient(circle,
+    rgba(var(--iris-rgb), .16) 0%,
+    rgba(var(--iris-rgb), .07) 52%,
+    transparent 68%);
+  box-shadow:
+    0 0 16px rgba(var(--iris-rgb), .38),
+    inset 0 0 9px rgba(var(--iris-rgb), .2);
+  pointer-events: none;
+  transition: opacity var(--t-med);
+}
+html.ui-v2 .cu-overlay-cursor.cu-user-driving .cu-cursor-halo { opacity: 0; }
+@keyframes cu-halo-breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.12); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .cu-cursor-halo { animation: cu-halo-breathe 2.6s ease-in-out infinite; }
 }
 html.ui-v2 .cu-cursor-pill {
   position: absolute;
@@ -27194,7 +27265,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '63fa8e7a151c6b29';
+const INTENDANT_APP_BUILD = '0f03012ce91b10a0';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -65399,6 +65470,10 @@ function renderSharedViewFocus(slot, region, note) {
   if (!focus) {
     focus = document.createElement('div');
     focus.className = 'shared-view-focus-box';
+    const noteEl = document.createElement('div');
+    noteEl.className = 'shared-view-focus-note';
+    noteEl.hidden = true;
+    focus.appendChild(noteEl);
     slot.canvasEl.appendChild(focus);
   }
   const x = Math.max(0, Math.min(1, Number(region.x) || 0));
@@ -65410,23 +65485,66 @@ function renderSharedViewFocus(slot, region, note) {
   const videoRect = video ? video.getBoundingClientRect() : null;
   const videoWidth = video && Number(video.videoWidth);
   const videoHeight = video && Number(video.videoHeight);
+  // Box geometry in stage-local px (kept for the note clamp below even on
+  // the percentage fallback path).
+  let boxLeft; let boxTop; let boxW; let boxH;
   if (videoRect && videoRect.width > 0 && videoRect.height > 0 && canvasRect.width > 0 && canvasRect.height > 0 && videoWidth > 0 && videoHeight > 0) {
     const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
     const frameW = videoWidth * scale;
     const frameH = videoHeight * scale;
     const frameX = videoRect.left - canvasRect.left + ((videoRect.width - frameW) / 2);
     const frameY = videoRect.top - canvasRect.top + ((videoRect.height - frameH) / 2);
-    focus.style.left = (frameX + x * frameW).toFixed(1) + 'px';
-    focus.style.top = (frameY + y * frameH).toFixed(1) + 'px';
-    focus.style.width = (w * frameW).toFixed(1) + 'px';
-    focus.style.height = (h * frameH).toFixed(1) + 'px';
+    boxLeft = frameX + x * frameW;
+    boxTop = frameY + y * frameH;
+    boxW = w * frameW;
+    boxH = h * frameH;
+    focus.style.left = boxLeft.toFixed(1) + 'px';
+    focus.style.top = boxTop.toFixed(1) + 'px';
+    focus.style.width = boxW.toFixed(1) + 'px';
+    focus.style.height = boxH.toFixed(1) + 'px';
   } else {
+    boxLeft = x * canvasRect.width;
+    boxTop = y * canvasRect.height;
+    boxW = w * canvasRect.width;
+    boxH = h * canvasRect.height;
     focus.style.left = (x * 100).toFixed(3) + '%';
     focus.style.top = (y * 100).toFixed(3) + '%';
     focus.style.width = (w * 100).toFixed(3) + '%';
     focus.style.height = (h * 100).toFixed(3) + '%';
   }
-  focus.dataset.note = note || '';
+  positionSharedViewFocusNote(
+    focus, note, { left: boxLeft, top: boxTop, width: boxW, height: boxH },
+    canvasRect.width, canvasRect.height);
+}
+
+// Keep the focus note readable wherever the region lands: below the box
+// when that fits inside the stage, flipped above when it doesn't, and
+// always clamped into the stage box (the canvas clips at its edges, so an
+// unclamped chip near a corner renders as a cut-off sliver or nothing).
+const SHARED_FOCUS_NOTE_PAD = 8;   // stage-edge breathing room
+const SHARED_FOCUS_NOTE_GAP = 6;   // box ↔ chip spacing
+
+function positionSharedViewFocusNote(focus, note, box, canvasW, canvasH) {
+  const noteEl = focus.querySelector('.shared-view-focus-note');
+  if (!noteEl) return;
+  const text = String(note || '');
+  if (noteEl.textContent !== text) noteEl.textContent = text;
+  noteEl.hidden = text === '';
+  if (text === '' || !(canvasW > 0) || !(canvasH > 0)) return;
+  const pad = SHARED_FOCUS_NOTE_PAD;
+  const gap = SHARED_FOCUS_NOTE_GAP;
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  // Cap the chip's width to the stage before measuring it.
+  noteEl.style.maxWidth = Math.round(clamp(canvasW - 2 * pad, 60, 360)) + 'px';
+  const noteW = noteEl.offsetWidth;
+  const noteH = noteEl.offsetHeight;
+  const left = clamp(box.left, pad, canvasW - noteW - pad);
+  let top = box.top + box.height + gap;
+  if (top + noteH > canvasH - pad) top = box.top - gap - noteH; // flip above
+  top = clamp(top, pad, canvasH - noteH - pad);
+  // The chip is positioned relative to the focus box (its offset parent).
+  noteEl.style.left = (left - box.left).toFixed(1) + 'px';
+  noteEl.style.top = (top - box.top).toFixed(1) + 'px';
 }
 
 function updateSharedViewBanner() {
@@ -66435,6 +66553,51 @@ function applyDisplayStripState() {
     slotSnapshots.set(id, next);
   }
 
+  // Raw CU payloads can be huge — a type() of a percent-encoded data: URL
+  // runs to thousands of characters. Collapsed rows show a readable
+  // preview (URL-decoded when the text is percent-encoded) plus the total
+  // length; the full literal call is one click away.
+  const CU_RAW_COLLAPSE_MIN = 160;  // rows at or under this render inline
+  const CU_RAW_PREVIEW_CHARS = 96;  // collapsed preview length
+
+  function cuRawPreview(raw) {
+    let head = raw.slice(0, CU_RAW_PREVIEW_CHARS);
+    // Percent-encoded blobs read better decoded (`%20name%3D` → " name=").
+    // Only the preview decodes; expanding always shows the literal call.
+    if (/%[0-9A-Fa-f]{2}/.test(head)) {
+      try {
+        head = decodeURIComponent(head.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+      } catch (_) { /* not valid percent-encoding — keep the literal prefix */ }
+    }
+    // Keep the preview one tidy run: fold control chars and space runs.
+    head = head.replace(/[\u0000-\u001F\u007F]+/g, ' ').replace(/ {2,}/g, ' ');
+    return head + '… (' + raw.length + ' chars)';
+  }
+
+  function buildCuRawDetail(raw) {
+    const el = document.createElement('div');
+    el.className = 'cu-action-raw';
+    if (raw.length <= CU_RAW_COLLAPSE_MIN) {
+      el.textContent = raw;
+      return el;
+    }
+    const preview = cuRawPreview(raw);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'cu-action-raw-toggle';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.title = 'Show the full input';
+    toggle.textContent = preview;
+    toggle.addEventListener('click', () => {
+      const expand = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', expand ? 'true' : 'false');
+      toggle.textContent = expand ? raw : preview;
+      toggle.title = expand ? 'Show less' : 'Show the full input';
+    });
+    el.appendChild(toggle);
+    return el;
+  }
+
   function syncActivityList() {
     const entries = selectedDisplayId === null
       ? []
@@ -66501,10 +66664,7 @@ function applyDisplayStripState() {
         head.appendChild(time);
         main.appendChild(head);
         if (entry.raw) {
-          const raw = document.createElement('div');
-          raw.className = 'cu-action-raw';
-          raw.textContent = entry.raw;
-          main.appendChild(raw);
+          main.appendChild(buildCuRawDetail(entry.raw));
         }
         row.appendChild(dot);
         row.appendChild(main);
@@ -67090,8 +67250,14 @@ class CuOverlayEngine {
     this.rippleEl = layer('cu-overlay-ripple', 16);
     this.keysEl = layer('cu-overlay-keys', 18);
     this.cursorEl = layer('cu-overlay-cursor', 20);
-    // Concept-exact white arrow (24×26) + iris verb pill.
+    // Presence halo (under the arrow, centered on the hotspot) +
+    // concept-exact white arrow (24×26) + iris verb pill. The halo keeps
+    // the agent pointer findable on busy content; it rides this element's
+    // ease/idle-fade and is CSS-hidden while YOU hold input (the
+    // `cu-user-driving` class below) so it never reads as a second live
+    // cursor next to your real one.
     this.cursorEl.innerHTML =
+      '<span class="cu-cursor-halo"></span>' +
       '<svg width="24" height="26" viewBox="0 0 24 26">' +
       '<path d="M2 2 L2 20.5 L6.6 16.2 L9.9 23.4 L13 22 L9.7 15 L16 14.6 Z" ' +
       'fill="#ffffff" stroke="rgba(10,12,20,.55)" stroke-width="1.2" ' +
@@ -67218,6 +67384,9 @@ class CuOverlayEngine {
     // agent's), and fades out entirely after idle.
     const idle = now - this.lastActivityAt > CU_OVERLAY_IDLE_FADE_MS;
     const userDriving = this.slot.authorityState === 'you';
+    // classList.toggle with a force flag is a no-op when already in the
+    // desired state, so this is safe at animation-frame cadence.
+    this.cursorEl.classList.toggle('cu-user-driving', userDriving);
     const targetOpacity = !this.cursorShown || idle || !this.placed
       ? 0
       : (userDriving ? CU_OVERLAY_DIMMED_OPACITY : 1);
