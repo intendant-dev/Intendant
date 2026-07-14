@@ -10,17 +10,23 @@
 //! the set by construction (D-67).
 //!
 //! Lane conventions (fixture-defined; the reducer mirrors them):
-//! - `inputs.stream` = ONE tenant zone log (§6.2 framing, kind 0);
-//!   `cuts` = crash byte offsets — the durable prefix truncates to
-//!   the last complete frame (L1); `machine_state` = the §5.5 state
-//!   recovery re-enters at EVERY cut, derived from the CONFORMANT
-//!   durable prefix (frames before the first violation).
-//! - The manifest oracle: §5.5 state 6 re-derives tombstones from
-//!   the rotation's typed `erase_manifest`, which lives in the
-//!   CONTROL op — a tenant-log-only lane cannot carry it. The FULL
-//!   stream's tombstone set (rotation keyed by
-//!   `retired_epoch = new_epoch − 1`) is the same typed entries in
-//!   durable form and stands in for the control-side read.
+//! - `inputs.stream` = ONE tenant zone log (§6.2 framing, kind 0) on
+//!   the rig's plane/zone; `cuts` = crash byte offsets — the durable
+//!   prefix truncates to the last complete frame (L1);
+//!   `machine_state` = the §5.5 state recovery re-enters at EVERY
+//!   cut, derived from the CONFORMANT durable prefix (frames before
+//!   the first violation).
+//! - `inputs.rotation_ops` = the SIGNED `c.kek_rotate` operations the
+//!   control plane accepted (canonical triple bytes, hex) — the
+//!   §5.5 control context. Every durable Fence resolves its rotation
+//!   through `Fence.rotation_op = H_op` (the hash covers the whole
+//!   signed triple, signature included — the binding the lane
+//!   enforces; verifying the signature itself needs the control
+//!   fold's key material, which is fold territory). State-5 recovery
+//!   re-derives missing tombstones from the resolved op's typed
+//!   `erase_manifest` (retired_epoch = new_epoch − 1), and every
+//!   durable tombstone must MATCH its manifest entry — nothing about
+//!   erasure is read from unsigned stream content.
 //! - `fence_frontier`/`control_frontier`/`recipients_hash` are
 //!   opaque commitments here: mirror-checked (Fence ↔ RewrapDone,
 //!   D-97/D-106) and probe-recovered; deriving them is fold
@@ -39,17 +45,21 @@
 //!   = the last durable ItemRewrap's `wrap` map;
 //!   `survivorset.recomputed` = the verified rotation's canonical
 //!   survivorset; `tombstones.rederived`/`tombstones.durable` =
-//!   arrays of tombstone payload maps in `item_addr` order.
+//!   arrays of tombstone payload maps in `item_addr` order (the
+//!   rederived array is CONSTRUCTED from the signed manifest, never
+//!   copied from the stream).
 
 use crate::cbor::{self, Value};
 use crate::corpus_edge::{file_header, frame};
 use crate::keyschedule::{item_addr, seal_item, wrap_dek};
+use crate::shapes::envelope::Signedop;
 use crate::shapes::journal::{
     Fenceframe, Itemcommit, Itemrewrapframe, Itemwrap, Kekdestroyed, Rewrapdone, Survivorset,
     Tombstone, FRAME_FENCE, FRAME_ITEM_COMMIT, FRAME_ITEM_REWRAP, FRAME_KEK_DESTROYED,
     FRAME_REWRAP_DONE, FRAME_TOMBSTONE,
 };
-use crate::shapes::ToValue;
+use crate::shapes::{Bytes16, Bytes32, Erasemref, ToValue};
+use crate::tranche::PlaneRig;
 use crate::vector::{Expected, Vector};
 use serde_json::{json, Map as JsonMap};
 use sha2::{Digest, Sha256};
@@ -60,13 +70,11 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-const PLANE: [u8; 32] = [0x0d; 32];
-const ZONE: [u8; 16] = [0x0e; 16];
 const LINEAGE: [u8; 16] = [0x44; 16];
-const ERASE_OP: [u8; 32] = [0xf1; 32];
-const TARGET_OP: [u8; 32] = [0xf2; 32];
 
-/// Per-epoch KAT KEK (the storage machine never derives KEKs).
+/// Per-epoch KAT KEK (the storage machine never derives KEKs); the
+/// same bytes ride the rotation op's HPKE wrap, so the signed op and
+/// the log's DEK wraps agree on the epoch key.
 fn kek(epoch: u64) -> [u8; 32] {
     [0x60 + epoch as u8; 32]
 }
@@ -77,18 +85,36 @@ fn wrap_hash(wrap: &Itemwrap) -> [u8; 32] {
     Sha256::digest(&bytes).into()
 }
 
+/// The signed `c.kek_rotate` to `new_epoch`: one wrap of the KAT
+/// epoch KEK to dev1 (the D-81 last-holder floor) plus the manifest.
+fn rotation(rig: &mut PlaneRig, new_epoch: u64, manifest: Vec<Erasemref>) -> Signedop {
+    let (id, pk) = (rig.dev1.device_id, rig.dev1.kem_pk);
+    let w = rig.wrap_at(
+        id,
+        &pk,
+        new_epoch,
+        &kek(new_epoch),
+        &format!("wrap.dev1.e{new_epoch}"),
+    );
+    rig.kek_rotate_erasing(new_epoch, vec![w], manifest)
+}
+
 /// A tenant zone log under construction. Tracks each item's current
 /// wrap (the reducer rebuilds the same registry from the frames).
 struct Log {
+    plane: Bytes32,
+    zone: Bytes16,
     stream: Vec<u8>,
     seq: u64,
     wraps: BTreeMap<[u8; 32], Itemwrap>,
 }
 
 impl Log {
-    fn new() -> Self {
+    fn new(plane: Bytes32, zone: Bytes16) -> Self {
         Log {
-            stream: file_header(0, &PLANE, &ZONE),
+            plane,
+            zone,
+            stream: file_header(0, &plane, &zone),
             seq: 0,
             wraps: BTreeMap::new(),
         }
@@ -109,12 +135,12 @@ impl Log {
         let dek = [0x90 + i; 32];
         let nonce = [0xa0 + i; 12];
         let plaintext = format!("erase-crash item {i}");
-        let core = seal_item(&dek, nonce, &PLANE, &ZONE, plaintext.as_bytes());
+        let core = seal_item(&dek, nonce, &self.plane, &self.zone, plaintext.as_bytes());
         let addr = item_addr(&core);
         let wrap = Itemwrap {
             item_addr: addr,
             key_wrap_epoch: epoch,
-            wrapped_dek: wrap_dek(&kek(epoch), &PLANE, &ZONE, epoch, &addr, &dek),
+            wrapped_dek: wrap_dek(&kek(epoch), &self.plane, &self.zone, epoch, &addr, &dek),
         };
         self.seq += 1;
         let commit = Itemcommit {
@@ -129,11 +155,13 @@ impl Log {
         addr
     }
 
-    /// The rotation-`r` Fence to `new_epoch` (opaque commitments).
-    fn fence(&mut self, r: u8, new_epoch: u64) -> (Fenceframe, Range<usize>) {
+    /// The rotation-`r` Fence activating `new_epoch`, bound to its
+    /// signed rotation by `rotation_op = H_op` (the other three
+    /// commitments stay opaque — fold territory).
+    fn fence(&mut self, r: u8, new_epoch: u64, rotation_op: Bytes32) -> (Fenceframe, Range<usize>) {
         let f = Fenceframe {
             kek_epoch: new_epoch,
-            rotation_op: [0xb0 + r; 32],
+            rotation_op,
             fence_frontier: [0xc0 + r; 32],
             control_frontier: [0xd0 + r; 32],
             recipients_hash: [0xe0 + r; 32],
@@ -150,7 +178,7 @@ impl Log {
         let wrap = Itemwrap {
             item_addr: addr,
             key_wrap_epoch: epoch,
-            wrapped_dek: wrap_dek(&kek(epoch), &PLANE, &ZONE, epoch, &addr, &dek),
+            wrapped_dek: wrap_dek(&kek(epoch), &self.plane, &self.zone, epoch, &addr, &dek),
         };
         let range = self.push(FRAME_ITEM_REWRAP, &Itemrewrapframe { wrap }.to_value());
         self.wraps.insert(addr, wrap);
@@ -187,11 +215,12 @@ impl Log {
         )
     }
 
-    fn tombstone(&mut self, addr: [u8; 32], retired_epoch: u64) -> (Tombstone, Range<usize>) {
+    /// The state-6 tombstone realizing one signed manifest entry.
+    fn tombstone(&mut self, e: &Erasemref, retired_epoch: u64) -> (Tombstone, Range<usize>) {
         let t = Tombstone {
-            item_addr: addr,
-            erase_op: ERASE_OP,
-            target_op: TARGET_OP,
+            item_addr: e.item_addr,
+            erase_op: e.erase_op,
+            target_op: e.target_op,
             retired_epoch,
         };
         let range = self.push(FRAME_TOMBSTONE, &t.to_value());
@@ -205,6 +234,8 @@ fn probe(name: &str, value: &Value) -> serde_json::Value {
 
 fn ec_vector(
     name: &str,
+    rig: PlaneRig,
+    rotation_ops: &[&Signedop],
     stream: &[u8],
     cuts: Vec<usize>,
     machine_state: u64,
@@ -214,6 +245,15 @@ fn ec_vector(
     inputs.insert("stream".into(), json!(hex(stream)));
     inputs.insert("cuts".into(), json!(cuts));
     inputs.insert("machine_state".into(), json!(machine_state));
+    inputs.insert(
+        "rotation_ops".into(),
+        serde_json::Value::Array(
+            rotation_ops
+                .iter()
+                .map(|op| json!(hex(&op.encode())))
+                .collect(),
+        ),
+    );
     Vector {
         family: 13,
         name: name.into(),
@@ -225,39 +265,52 @@ fn ec_vector(
             "storage-linux".into(),
             "storage-windows".into(),
         ],
-        rng: None,
+        rng: Some(rig.rng.into_json()),
         inputs,
         expected: Expected::Result(result),
     }
 }
 
 /// The shared erase-rotation log (states 5 and 6 cut it at different
-/// points): a and b at epoch 1; the rotation to epoch 2 erases b.
-fn erase_log() -> (Log, usize, (Tombstone, Range<usize>)) {
-    let mut log = Log::new();
+/// points): a and b at epoch 1; the signed rotation to epoch 2
+/// erases b through its manifest.
+fn erase_log(rig: &mut PlaneRig) -> (Log, usize, Tombstone, Signedop) {
+    let mut log = Log::new(rig.plane_id, rig.zone_id);
     let a = log.commit(1, 1);
     let b = log.commit(2, 1);
-    let (f, _) = log.fence(1, 2);
+    let entry = Erasemref {
+        item_addr: b,
+        erase_op: rig.rng.draw32("erase.request.op"),
+        target_op: rig.rng.draw32("erase.target.op"),
+    };
+    let rot = rotation(rig, 2, vec![entry]);
+    let (f, _) = log.fence(1, 2, rot.op_hash());
     log.rewrap(1, a, 2);
     log.rewrap_done(&f, &[a]);
     let kd = log.kek_destroyed(1);
     let kd_end = kd.end;
-    let t = log.tombstone(b, 1);
-    (log, kd_end, t)
+    let (t, _) = log.tombstone(&entry, 1);
+    (log, kd_end, t, rot)
 }
 
 pub fn corpus_erase() -> Vec<Vector> {
     let mut out = Vec::new();
 
-    // State 1: the rotation is control-accepted; its Fence is torn by
-    // the crash — recovery finds no durable activation and re-enters
-    // at 1 (two cuts inside the Fence frame truncate identically).
+    // State 1: the rotation is control-accepted (its signed op rides
+    // rotation_ops); its Fence is torn by the crash — recovery finds
+    // no durable activation and re-enters at 1 (two cuts inside the
+    // Fence frame truncate identically).
     {
-        let mut log = Log::new();
+        let name = "erase-crash-state1-accepted-unfenced";
+        let mut rig = PlaneRig::new(name);
+        let rot = rotation(&mut rig, 2, vec![]);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         log.commit(1, 1);
-        let (_, fr) = log.fence(1, 2);
+        let (_, fr) = log.fence(1, 2, rot.op_hash());
         out.push(ec_vector(
-            "erase-crash-state1-accepted-unfenced",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![fr.start + 5, fr.end - 3],
             1,
@@ -270,12 +323,17 @@ pub fn corpus_erase() -> Vec<Vector> {
     // control_frontier, recipients_hash} recovers from the persisted
     // frame, and I3 already serves the NEW epoch.
     {
-        let mut log = Log::new();
+        let name = "erase-crash-state2-fence-intent-recovered";
+        let mut rig = PlaneRig::new(name);
+        let rot = rotation(&mut rig, 2, vec![]);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         let a = log.commit(1, 1);
-        let (f, fr) = log.fence(1, 2);
+        let (f, fr) = log.fence(1, 2, rot.op_hash());
         log.rewrap(1, a, 2);
         out.push(ec_vector(
-            "erase-crash-state2-fence-intent-recovered",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![fr.end],
             2,
@@ -289,15 +347,20 @@ pub fn corpus_erase() -> Vec<Vector> {
     // State 3: one of two survivor rewraps durable, the second torn —
     // recovery resumes the (idempotent, I2) rewrap pass.
     {
-        let mut log = Log::new();
+        let name = "erase-crash-state3-rewrap-progress";
+        let mut rig = PlaneRig::new(name);
+        let rot = rotation(&mut rig, 2, vec![]);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         let a = log.commit(1, 1);
         let b = log.commit(2, 1);
-        let (f, _) = log.fence(1, 2);
+        let (f, _) = log.fence(1, 2, rot.op_hash());
         let (wa, _) = log.rewrap(1, a, 2);
         let (_, rb) = log.rewrap(2, b, 2);
         log.rewrap_done(&f, &[a, b]);
         out.push(ec_vector(
-            "erase-crash-state3-rewrap-progress",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![rb.start + 7],
             3,
@@ -314,25 +377,32 @@ pub fn corpus_erase() -> Vec<Vector> {
     // irrelevant); item d commits post-Fence under the new epoch and
     // stays outside the set by construction (D-67).
     {
-        let mut log = Log::new();
+        let name = "erase-crash-state4-third-rotation-epoch1-survivor";
+        let mut rig = PlaneRig::new(name);
+        let r1 = rotation(&mut rig, 2, vec![]);
+        let r2 = rotation(&mut rig, 3, vec![]);
+        let r3 = rotation(&mut rig, 4, vec![]);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         let a = log.commit(1, 1);
-        let (f2, _) = log.fence(1, 2);
+        let (f2, _) = log.fence(1, 2, r1.op_hash());
         log.rewrap(1, a, 2);
         log.rewrap_done(&f2, &[a]);
         log.kek_destroyed(1);
         let b = log.commit(2, 2);
-        let (f3, _) = log.fence(2, 3);
+        let (f3, _) = log.fence(2, 3, r2.op_hash());
         log.rewrap(1, a, 3);
         log.rewrap(2, b, 3);
         log.rewrap_done(&f3, &[a, b]);
         log.kek_destroyed(2);
-        let (f4, _) = log.fence(3, 4);
+        let (f4, _) = log.fence(3, 4, r3.op_hash());
         log.commit(3, 4); // post-Fence commit: NEW epoch, not a survivor
         log.rewrap(1, a, 4);
         log.rewrap(2, b, 4);
         let (set, done) = log.rewrap_done(&f4, &[a, b]);
         out.push(ec_vector(
-            "erase-crash-state4-third-rotation-epoch1-survivor",
+            name,
+            rig,
+            &[&r1, &r2, &r3],
             &log.stream,
             vec![done.end],
             4,
@@ -344,12 +414,17 @@ pub fn corpus_erase() -> Vec<Vector> {
     }
 
     // State 5: crash between KekDestroyed and the tombstone —
-    // recovery re-derives the missing tombstone from the manifest
-    // (retired_epoch = new_epoch − 1) and re-enters at 5.
+    // recovery re-derives the missing tombstone from the SIGNED
+    // rotation's erase_manifest (retired_epoch = new_epoch − 1) and
+    // re-enters at 5.
     {
-        let (log, kd_end, (t, _)) = erase_log();
+        let name = "erase-crash-state5-tombstone-rederivation";
+        let mut rig = PlaneRig::new(name);
+        let (log, kd_end, t, rot) = erase_log(&mut rig);
         out.push(ec_vector(
-            "erase-crash-state5-tombstone-rederivation",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![kd_end],
             5,
@@ -360,12 +435,17 @@ pub fn corpus_erase() -> Vec<Vector> {
         ));
     }
 
-    // State 6: every tombstone durable — the rotation is complete.
+    // State 6: every manifest tombstone durable — the rotation is
+    // complete.
     {
-        let (log, _, (t, _)) = erase_log();
+        let name = "erase-crash-state6-complete";
+        let mut rig = PlaneRig::new(name);
+        let (log, _, t, rot) = erase_log(&mut rig);
         let len = log.stream.len();
         out.push(ec_vector(
-            "erase-crash-state6-complete",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![len],
             6,
@@ -382,15 +462,20 @@ pub fn corpus_erase() -> Vec<Vector> {
     // false completeness commitment is a log invariant violation and
     // the store quarantines. The conformant prefix ends at state 3.
     {
-        let mut log = Log::new();
+        let name = "erase-crash-survivor-omission-blocks-destruction";
+        let mut rig = PlaneRig::new(name);
+        let rot = rotation(&mut rig, 2, vec![]);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         let a = log.commit(1, 1);
-        log.commit(3, 1); // c — never rewrapped, never tombstoned
-        let (f, _) = log.fence(1, 2);
+        log.commit(3, 1); // c — never rewrapped, never manifested
+        let (f, _) = log.fence(1, 2, rot.op_hash());
         log.rewrap(1, a, 2);
         log.rewrap_done(&f, &[a]);
         let len = log.stream.len();
         out.push(ec_vector(
-            "erase-crash-survivor-omission-blocks-destruction",
+            name,
+            rig,
+            &[&rot],
             &log.stream,
             vec![len],
             3,
@@ -403,21 +488,32 @@ pub fn corpus_erase() -> Vec<Vector> {
     }
 
     // Rotation-queue serialization negative (D-89): rotation N's
-    // tombstone is still pending when rotation N+1's Fence lands —
-    // non-conformant; the conformant prefix records state 5.
+    // manifest tombstone is still pending when rotation N+1's Fence
+    // lands — non-conformant; the conformant prefix records state 5.
     {
-        let mut log = Log::new();
+        let name = "erase-crash-fence-before-tombstones-nonconformant";
+        let mut rig = PlaneRig::new(name);
+        let mut log = Log::new(rig.plane_id, rig.zone_id);
         let a = log.commit(1, 1);
         let b = log.commit(2, 1);
-        let (f, _) = log.fence(1, 2);
+        let entry = Erasemref {
+            item_addr: b,
+            erase_op: rig.rng.draw32("erase.request.op"),
+            target_op: rig.rng.draw32("erase.target.op"),
+        };
+        let r1 = rotation(&mut rig, 2, vec![entry]);
+        let r2 = rotation(&mut rig, 3, vec![]);
+        let (f, _) = log.fence(1, 2, r1.op_hash());
         log.rewrap(1, a, 2);
         log.rewrap_done(&f, &[a]);
         log.kek_destroyed(1);
-        log.fence(2, 3); // VIOLATION: b's tombstone is not durable yet
-        log.tombstone(b, 1);
+        log.fence(2, 3, r2.op_hash()); // VIOLATION: b's tombstone is not durable yet
+        log.tombstone(&entry, 1);
         let len = log.stream.len();
         out.push(ec_vector(
-            "erase-crash-fence-before-tombstones-nonconformant",
+            name,
+            rig,
+            &[&r1, &r2],
             &log.stream,
             vec![len],
             5,
@@ -476,6 +572,35 @@ mod tests {
             let len = stream_hex.len() / 2;
             for cut in v.inputs["cuts"].as_array().unwrap() {
                 assert!(cut.as_u64().unwrap() as usize <= len, "{}", v.name);
+            }
+        }
+    }
+
+    /// Input hygiene: every supplied rotation op's `H_op` appears as
+    /// a `rotation_op` inside the stream (each op is referenced by a
+    /// Fence — possibly a torn one). The converse binding — every
+    /// durable Fence RESOLVES a supplied op, epochs and zone match —
+    /// is the reducer's enforced check, exercised by all 8 vectors.
+    #[test]
+    fn supplied_rotations_are_referenced() {
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        for v in corpus_erase() {
+            let stream = unhex(v.inputs["stream"].as_str().unwrap());
+            let ops = v.inputs["rotation_ops"].as_array().unwrap();
+            assert!(!ops.is_empty(), "{}: no rotation ops", v.name);
+            for h in ops {
+                let raw = unhex(h.as_str().unwrap());
+                let hash = crate::domains::h_tag(crate::domains::Tag::Op, &raw);
+                assert!(
+                    stream.windows(32).any(|w| w == hash),
+                    "{}: a supplied rotation op is referenced by no Fence",
+                    v.name
+                );
             }
         }
     }

@@ -373,6 +373,18 @@ mod tests {
                     }
                 }
             }
+            // The erase lane's signed control context (D6): every
+            // supplied rotation op rides the same differential.
+            if let Some(a) = v["inputs"]["rotation_ops"].as_array() {
+                for (i, hx) in a.iter().enumerate() {
+                    let s = hx.as_str().unwrap();
+                    let bytes: Vec<u8> = (0..s.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                        .collect();
+                    out.push((fname.clone(), format!("rotation_ops[{i}]"), bytes));
+                }
+            }
         }
         out
     }

@@ -40,8 +40,8 @@ use crate::shapes::memory::{
     merkle_root, Bundleleaf, Bundlerec, Mclaim, Merasereq, Mexportrel, Mimport,
 };
 use crate::shapes::{
-    Bytes16, Bytes32, Class, Devclass, Factref, Frontierclose, Head, Hlc, Issuerid, Kekwrap, Kind,
-    Lineagedef, Opfactref, Polref, Sigalg, Spaceclass, Spacedef, ToValue, Verb,
+    Bytes16, Bytes32, Class, Devclass, Erasemref, Factref, Frontierclose, Head, Hlc, Issuerid,
+    Kekwrap, Kind, Lineagedef, Opfactref, Polref, Sigalg, Spaceclass, Spacedef, ToValue, Verb,
 };
 use crate::suite::{self, hpke_wrap};
 use crate::vector::{hex, Expected, RecordingRng, Vector};
@@ -690,11 +690,23 @@ impl PlaneRig {
     /// `c.kek_rotate` to `new_epoch` with the given wraps and an
     /// empty erase manifest.
     pub fn kek_rotate(&mut self, new_epoch: u64, wraps: Vec<Kekwrap>) -> Signedop {
+        self.kek_rotate_erasing(new_epoch, wraps, vec![])
+    }
+
+    /// `c.kek_rotate` carrying a typed `erase_manifest` (§5.4, D-66).
+    /// The family-13 erase lane binds tombstones to these signed
+    /// entries through `Fence.rotation_op = H_op`.
+    pub fn kek_rotate_erasing(
+        &mut self,
+        new_epoch: u64,
+        wraps: Vec<Kekwrap>,
+        erase_manifest: Vec<Erasemref>,
+    ) -> Signedop {
         let body = Ckekrotate {
             zone_id: self.zone_id,
             new_epoch,
             wraps,
-            erase_manifest: vec![],
+            erase_manifest,
         };
         let proof = Authproof::Admin {
             epoch: 1,

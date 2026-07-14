@@ -916,11 +916,15 @@
           "then": {
             "properties": {
               "inputs": {
-                "type": "object", "additionalProperties": false, "required": ["stream", "cuts", "machine_state"],
+                "type": "object", "additionalProperties": false, "required": ["stream", "cuts", "machine_state", "rotation_ops"],
                 "properties": {
                   "stream": { "$ref": "#/$defs/hexnz" },
                   "cuts": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 } },
-                  "machine_state": { "type": "integer", "minimum": 1, "maximum": 6 }
+                  "machine_state": { "type": "integer", "minimum": 1, "maximum": 6 },
+                  "rotation_ops": {
+                    "$comment": "Amendment #4 (D6): the signed c.kek_rotate operations the control plane accepted, as canonical triple bytes. Every durable Fence must resolve its rotation through Fence.rotation_op = H_op over one of these entries (the hash covers the signature bytes); state-5 tombstone re-derivation and durable-tombstone content validation bind to the resolved op's typed erase_manifest — never to unsigned stream content.",
+                    "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/hexnz" }
+                  }
                 }
               },
               "expected": {
