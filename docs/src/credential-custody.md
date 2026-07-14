@@ -2,12 +2,13 @@
 
 > Status: **the vault backends, lease RPCs, and client-egress machinery are
 > implemented; the default product does not yet expose a Connect account-vault
-> client or bridge that backend to a trusted direct/native daemon session.**
+> client or bridge that backend to a trusted local/direct-mTLS daemon session.**
 > Hosted Connect is fixed at `role:none` and deliberately does not serve the
 > daemon dashboard, its vault client, or `vault-kernel.js`. Connect can store
 > opaque account-vault envelopes through its API, but the shipped directory UI
 > cannot create or unseal them. A direct daemon-origin vault can use an
-> authorized direct channel. A future trusted native/direct bridge is required
+> authorized local/direct-mTLS channel. A future independently trusted client
+> bridge is required
 > to move or spend Connect-account vault entries. The four sign-off decisions
 > were resolved as recommended:
 > offline-lease default **24h**; full-credential OAuth leases **built but
@@ -111,7 +112,7 @@ nothing syncs implicitly between them. The daemon publish RPC and dashboard
 transfer code exist, but the default Connect directory supplies neither the
 source-vault client nor a channel to that RPC; therefore there is currently no
 shipped Connect-account-vault → direct-daemon-vault transfer path. A
-trusted native/direct bridge must be built before that action can be
+independently trusted client bridge must be built before that action can be
 advertised as working. A direct dashboard can create and use its own
 daemon-store vault today; moving an account vault into it is manual and
 out of band.
@@ -133,8 +134,9 @@ surviving unlocker recovers `K`, and enrolling a new device is adding an
 envelope (one small re-wrap), not re-encrypting anything. This dissolves
 the "lost passkey = lost vault" objection that parked the vault idea.
 
-**Sync.** The encrypted vault blob syncs through the rendezvous blind
-and size-capped, and every blob is **authenticated end-to-end**: the
+**Account-store protocol (backend shipped; hosted client unshipped).** The
+encrypted account-vault blob can be stored through the rendezvous blind and
+size-capped, and every blob is **authenticated end-to-end**: the
 revision number is bound into the body ciphertext (AES-GCM AAD), and the
 whole blob — version, revision, envelope set, body — carries an
 HMAC-SHA-256 under a key HKDF-derived from the vault master key
@@ -150,8 +152,10 @@ it can never produce a master-key MAC, so the MAC is what shipped.)
 trick) plus each device's local high-water mark. The trust-ledger entry
 is the usual one: a malicious store can withhold or serve a stale
 revision — detectably, once any device has seen a newer one — and
-nothing else. Local copies in origin storage keep the vault usable when
-the rendezvous is down.
+nothing else. The shipped daemon-origin vault client keeps an origin-local
+cache of its separate daemon-store vault. There is no shipped Connect vault
+client whose account-vault copy remains usable offline when the rendezvous is
+down.
 
 **Where it unseals.** Only in a browser worker, only in memory, and only behind
 an unlock gesture. The shipped direct daemon-origin dashboard can unseal its
@@ -239,7 +243,7 @@ In the lease path, a daemon **borrows** credentials instead of configuring
 them durably. This is optional: `.env` remains supported, and full-credential
 OAuth leases temporarily materialize private auth files as documented below.
 
-When an **authorized trusted direct/native browser session** opens over an
+When an **authorized trusted loopback/direct-mTLS browser session** opens over an
 E2E-verified dashboard channel (the binding the browser verifies and the
 loopback or mTLS principal the daemon authenticates), its daemon-store vault
 can unseal the needed entries and grant the daemon a
@@ -377,7 +381,7 @@ sends prompt payloads to the browser over the tunnel, the browser calls
 the provider, and streams results back; the credential never leaves the
 browser. The mode advertises itself per-session so the UI can show which
 path is live. It is not reachable from the Connect account vault today;
-a trusted native/direct bridge is still required.
+an independently trusted client bridge is still required.
 
 As shipped: a session holding `credentials.manage` registers as the
 relay per kind (`api_credential_egress_register`); the daemon ships each
@@ -437,19 +441,23 @@ flow, while ownership deliberately requires a trusted anchor:
    enters it in Connect to add discovery and route metadata to the account.
    Linking creates no IAM principal or grant and grants no access.
 3. **Anchor**: establish root through `intendant access setup` from the
-   machine's console/SSH session, a direct mTLS root connection, or the native
-   app's mTLS bridge. The former `--owner <client-key-fingerprint>` shortcut is
+   machine's console/SSH session or a direct mTLS root connection. The packaged
+   macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized
+   release has been published for this alpha; an `-unsigned-dev` artifact is
+   not an anchor. The former
+   `--owner <client-key-fingerprint>` shortcut is
    retired; alpha root establishment does not treat a bare browser-key
    fingerprint as authentication.
 4. **Authorize on a trusted surface**: install an owner-approved browser mTLS
-   certificate from the daemon enrollment flow or use the signed native app.
+   certificate from the daemon enrollment flow. A future verified signed and
+   notarized native release could provide the packaged local bridge.
    Browser identity keys remain record/signature vocabulary and are not an
    alpha login. Hosted Connect remains discovery-only: its compiled ceiling is immutably
    `role:none`, with no opt-in or role-raising control.
 5. **Fuel**: create or unlock the separate daemon-store vault from that trusted
    direct dashboard, or use existing local credential configuration. The
    Connect account vault cannot be handed across to this session in the default
-   build; a trusted native/direct bridge is still unimplemented.
+   build; an independently trusted client bridge is still unimplemented.
 
 Claiming and custody are intentionally independent: the claim makes a machine
 findable and the trusted anchor creates authority. Vault storage alone does not
@@ -483,7 +491,7 @@ create the missing cross-origin delivery bridge.
 6. ✅ Hosted installers leave route linking authority-free by default;
    legacy `--owner <browser-key>` bootstrap is retired/rejected rather than
    shipping an incomplete certless key-auth protocol.
-7. ⏳ Trusted native/direct bridge for transferring or spending a
+7. ⏳ Independently trusted client bridge for transferring or spending a
    Connect-account vault in a daemon-origin session.
 
 ## V1 decisions

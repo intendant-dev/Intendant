@@ -66,9 +66,11 @@ Practical rules:
   desktop browsers, but not by every embedding. In particular, the macOS
   `WKWebView` wrapper uses the custom `intendant://` scheme because
   `http://localhost` there does not expose media devices.
-- `http://<host-ip>` is not a secure context. Use default native mTLS,
-  `--tls` with a trusted certificate for public/authority-free bytes, or the
-  native app's mTLS bridge. A generic Caddy/nginx HTTPS reverse proxy supplies
+- `http://<host-ip>` is not a secure context. Use default native mTLS or
+  `--tls` with a trusted certificate for public/authority-free bytes. The
+  packaged macOS app's local bridge also supplies a secure context for local
+  development, but no Developer ID-signed/notarized release exists for this
+  alpha, so its current artifact is not a distribution anchor. A generic Caddy/nginx HTTPS reverse proxy supplies
   encryption and a secure context, not client authentication. If it forwards
   to daemon loopback, the proxy is itself a root trust boundary and must enforce
   approved client identity while protecting its upstream from other callers.
@@ -357,8 +359,9 @@ launchers, and the user's own screen (see
   respected.
 - **Input authority** — the toolbar and rail project the same server truth:
   you, another viewer, available, or connecting. Hiding an interactive or
-  pending display releases it before input listeners are removed. Editable
-  annotation/callout work blocks navigation instead of being discarded.
+  pending display first flushes held keys and mouse buttons, then releases it
+  before input listeners are removed. Editable annotation/callout work blocks
+  navigation instead of being discarded.
 - **Display activity** — reports real connection, authority, visibility,
   streaming, recording, annotation, callout, and shared-view transitions,
   plus the daemon's per-action `cu_action` lane: every executed CU action
@@ -667,8 +670,9 @@ Unified administration for how dashboards and daemons reach each other:
   `#access/public` resolve to Advanced, `#access/invitations` to Peers, and
   `#access/targets` to Daemons.
 
-Access uses one vocabulary across trusted daemon-served loopback/mTLS
-dashboards, the signed native app, and peer federation. Hosted Connect
+Access uses one vocabulary across trusted daemon-served loopback/direct-mTLS
+dashboards and peer federation. The packaged macOS app contains a local mTLS
+bridge, but no signed/notarized distribution exists for this alpha. Hosted Connect
 contributes directory metadata only; it is not an Access or control surface:
 
 - A **target** is a daemon the trusted dashboard can operate. A Connect-linked
@@ -826,16 +830,20 @@ browser-installed mTLS certificate cannot be steered cross-site. Reach the
 Access page by an origin the fleet advertises (the target rows already link
 that way) for cross-daemon administration to work.
 
-The same posture now applies daemon-wide: authority-bearing API responses carry
-no `Access-Control-Allow-Origin` by default (same-origin only), and every
-`/api/*` request bearing a foreign Origin is refused. `/config` is not public:
+The same posture now applies daemon-wide: authority-bearing responses carry no
+`Access-Control-Allow-Origin` by default (same-origin only), and every request
+for a non-authority-free route bearing a foreign Origin is refused before IAM
+or transport-authority resolution. Cross-/same-site Fetch Metadata closes the
+top-level-navigation and subresource cases where browsers omit `Origin`.
+`/config` is not public:
 it requires `presence.read`, echoes only the daemon's own or a fleet-allowlisted
 Origin, and returns `Cache-Control: no-store` because ICE configuration can
-contain TURN credentials. Only authority-free bytes such as the agent card,
-`/connect/bootstrap`, `/connect/status`, and the public peer-access doorbell
-remain public. Authority-bearing
+contain TURN credentials. Only authority-free shell/static bytes, the agent
+card, `/connect/bootstrap`, `/connect/status`, and the public signed-document
+doorbells remain public; those requests always use an anonymous `role:none`
+context even on loopback or when a client certificate is present. Authority-bearing
 direct signaling under `/connect/dashboard/*` and the legacy `/ws` event lane
-accept browser requests only from the daemon's own origin or the signed app
+accept browser requests only from the daemon's own origin or the local packaged-app
 scheme, before mTLS/local transport facts become a grant. For cleartext
 browser traffic, "own origin" additionally requires `localhost` or a literal
 loopback address; merely matching attacker-controlled Origin and Host values
@@ -1065,7 +1073,7 @@ The handshake is bound to the daemon identity:
 
 The tunnel can be the **primary event lane** — dashboard events and intents flow
 through it instead of the legacy `/ws` — for an authenticated daemon-origin
-dashboard, a loopback packaged macOS app, and the **capability fallback**.
+dashboard, a locally built loopback packaged macOS app, and the **capability fallback**.
 There is no remote signed-native authentication bridge in this release.
 WebKit browsers
 (Safari) share that WebSocket limitation — against an mTLS daemon the `/ws`
@@ -1437,7 +1445,8 @@ trusted local/direct dashboard-control validators.
 
 The surviving engineering result is narrower: daemon-signed WebRTC bindings and
 the dashboard transport abstraction remain useful on authenticated daemon-origin
-or signed-native paths. Hosted Connect is an account, route, presence, push, and
+paths and local packaged-app development builds. No signed/notarized packaged
+release exists for this alpha. Hosted Connect is an account, route, presence, push, and
 metadata directory. It serves no daemon SPA or privileged dashboard assets;
 `/app` and `/app.html` redirect to `/connect`; browser
 offer/ICE/close calls are refused before mutation; and current daemons drop
@@ -1466,7 +1475,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /vault-kernel.js` | The vault crypto kernel worker; the SPA hash-verifies it against its assembled-in pin before instantiating (see [credential custody](./credential-custody.md#the-crypto-kernel)) |
 | `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
-| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling; browser upgrades require the daemon's own origin or the signed-app scheme before transport authority is resolved |
+| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling; browser upgrades require the daemon's independently trusted origin or the local app scheme before transport authority is resolved; fleet SNI is refused |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
 | `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
 | `POST /api/session/{id}/agent-output` | Fetch persisted agent output by id for a historical/session-scoped transcript (POST-shaped read: the ids ride the body) |
@@ -1485,7 +1494,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
 | `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,merge}` | Agent worktree inventory and lifecycle (merge = session-linked worktree finish card) |
-| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Daemon-origin WebRTC control bootstrap: certless only on loopback, remote callers require mTLS; unrelated to hosted Connect browser APIs |
+| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Daemon-origin WebRTC control bootstrap: certless only on loopback, remote callers require direct mTLS; fleet SNI and hosted Connect browser APIs cannot open it |
 
 ### Declared API routes
 
@@ -1500,6 +1509,15 @@ paste the printed block between the markers. Authorization names the
 `PeerOperation` the IAM gate evaluates; `public` routes carry their authority
 in the payload itself (signature/shape), and the federation surface derives
 its operation per method/path from `federation_http_operation`.
+
+`fleet allowlist` in the generated CORS column describes which already-trusted
+dashboard origins may call a daemon's **independently verified direct-mTLS
+URL**. It does not authorize the rendezvous-controlled fleet WebPKI URL. The
+listener classifies fleet SNI first and rejects all non-public HTTP/MCP,
+signaling, and WebSocket traffic before route CORS, browser mTLS, or IAM is
+resolved. The fleet certificate endpoint itself can therefore be requested
+only from a trusted direct surface; the resulting name is discovery/public
+shell only.
 
 <!-- gateway-route-table:begin (generated; do not edit by hand) -->
 | Method | Path | Authorization | CORS | Body | Description |
@@ -1623,7 +1641,8 @@ principal, role, or session. A locally trusted org signature authorizes only
 processing of the bounded document for its named cryptographic subject (or
 application of signed revocation facts); that subject must authenticate later
 through a real ingress. Peer subjects use peer mTLS. Human browser-key subjects
-remain record-only in this alpha because no live ingress authenticates them.
+remain record-only in this alpha: peer offers can verify them for attribution,
+but no live ingress admits them as its controlling IAM principal.
 
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal

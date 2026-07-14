@@ -38,12 +38,14 @@ What happens next is the whole story in four steps:
    appears under *Your computers*. Linking is discovery metadata only: it
    creates no IAM principal or grant and grants no daemon access.
 2. **Establish a trusted owner.** On the machine's console or SSH session, run
-   `intendant access setup`; alternatively use a direct mTLS connection or the
-   native app's mTLS bridge. The default build cannot mint or exercise root
+   `intendant access setup`; alternatively use a direct mTLS connection. The
+   packaged macOS app contains a local mTLS bridge, but no Developer
+   ID-signed/notarized release has been published for this alpha, so its current
+   `-unsigned-dev` artifact is not an anchor. The default build cannot mint or exercise root
    through hosted-origin code. The former `--owner <browser-key>` shortcut is
    retired in this alpha; a bare fingerprint is not remote authentication.
 3. **Authorize on that trusted surface.** Install/use the daemon's browser mTLS
-   client certificate, stay on loopback, or use the native app's mTLS bridge.
+   client certificate or stay on loopback.
    Browser identity-key records are not an active login mechanism in this
    alpha. The hosted Connect tab remains discovery-only; there is no opt-in
    that turns it into a control client.
@@ -194,8 +196,9 @@ artifact host used by the drift gate.
 binary, codesigns it (a persistent self-signed identity, ad-hoc fallback), and
 installs to `/Applications/Intendant.app`. The same script carries the
 [release signing seam](#macos-releases-signing-and-notarization): with
-`INTENDANT_SIGN_IDENTITY` (and optionally the notary variables) set, it
-produces the Developer ID-signed, notarized bundle that tagged releases ship.
+`INTENDANT_SIGN_IDENTITY` and the notary variables set, it can produce a
+Developer ID-signed, notarized bundle. Those credentials are not provisioned
+for the current release setup, and no such artifact has been published.
 
 The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 `intendant://` URL scheme. This is deliberate: `WKWebView` does not treat
@@ -241,11 +244,14 @@ INSTALL_APP=0 ./scripts/bundle-macos.sh   # build the bundle without installing
 
 ### macOS releases: signing and notarization
 
-Tagged releases ship a prebuilt, signed macOS app. Pushing a `v*` tag runs
+The repository contains a tag-triggered release workflow, but the current
+setup has no Developer ID/notarization credentials and no signed/notarized app
+release has been published. Pushing a `v*` tag runs
 `.github/workflows/release.yml` on the self-hosted macOS runner: it
-release-builds the binaries, runs `scripts/bundle-macos.sh` with the signing
-seam active, and publishes a GitHub Release carrying
-`Intendant-<version>-macos-<arch>.zip` plus a `.sha256` checksum file.
+release-builds the binaries, runs `scripts/bundle-macos.sh`, and publishes a
+GitHub Release carrying `Intendant-<version>-macos-<arch>.zip` plus a `.sha256`
+checksum file. Without the complete signing configuration, the artifact is
+explicitly suffixed `-unsigned-dev` and is not a distribution trust anchor.
 
 **Installing a release:** download the zip and checksum from
 [GitHub releases](https://github.com/intendant-dev/Intendant/releases),
@@ -256,10 +262,11 @@ The app checks GitHub for a newer release at launch (silently, release builds
 only) and via **Intendant → Check for Updates…**; updating is always manual —
 the prompt only opens the release page in your browser.
 
-**What the signature means.** Release bundles are signed with a
-`Developer ID Application` certificate under the hardened runtime with a
-secure timestamp, notarized by Apple, and stapled — Gatekeeper opens them
-without warnings, and a tampered bundle fails validation. Signing is
+**What a future signed release would mean.** With all signing and notarization
+secrets provisioned, a release bundle is signed with a `Developer ID
+Application` certificate under the hardened runtime with a secure timestamp,
+notarized by Apple, and stapled — Gatekeeper opens it without warnings, and a
+tampered bundle fails validation. Signing is
 inside-out: bundled non-system dylibs (`Contents/Frameworks`, e.g. libvpx),
 then the embedded `intendant-bin` / `intendant-runtime`, then the bundle.
 All executables carry the minimal entitlements in
@@ -313,10 +320,13 @@ Two ways to give a daemon credentials, by trust posture:
 
 - **Keys on disk (`.env`)** — this section. Right for a machine you fully
   trust: your laptop, a workstation you sit at.
-- **No keys on disk** — a linked daemon remains unfueled until an authorized
-  session lends time-boxed leases from your browser-side vault, or relays provider calls through the
-  browser entirely; see [Credential Custody](./credential-custody.md). Right
-  for rented, shared, or disposable boxes.
+- **No keys on disk** — a daemon remains unfueled until an authorized trusted
+  loopback/direct-mTLS session lends time-boxed leases from that daemon's
+  separate daemon-store vault, or relays supported provider calls through the
+  trusted browser. A Connect account link or account-vault blob cannot fuel a
+  daemon in this build because no delivery bridge ships; see
+  [Credential Custody](./credential-custody.md). Right for rented, shared, or
+  disposable boxes.
 
 On startup the controller loads environment variables from `.env`, searching in
 this order (later files do not override variables already set):
@@ -537,14 +547,16 @@ is passed.
 
 For mutual-TLS with client certificates (so only enrolled devices can connect),
 the `intendant access` subcommand creates a per-user access certificate authority,
-server cert, client identity, and strict enrollment page for installing those
-certs on browsers and mobile devices:
+server cert, client identity, and local-IAM owner grant. macOS/Linux setup can
+then start a strict enrollment page for other browsers and mobile devices;
+Windows setup instead prints exact PowerShell commands for importing the same
+material into that user's local certificate stores:
 
 ```bash
-intendant access setup            # generate CA/server/client certs + start enrollment
+intendant access setup            # generate and seed CA/server/client material
 intendant access recert           # regenerate the server cert after access addresses change
 intendant access list             # show current setup state
-intendant access serve-certs      # run strict HTTPS client-cert enrollment
+intendant access serve-certs      # macOS/Linux: strict HTTPS client enrollment
 intendant access remove           # remove the per-user access cert store
 ```
 
@@ -552,8 +564,9 @@ Useful flags: `--port <N>` (native dashboard HTTPS port to advertise, default
 8765),
 `--cert-port <N>` (HTTPS enrollment server, default 9999), repeatable
 `--ip <IP>`, repeatable `--host <DNS>`, `--name <label>`, `--force`, and
-`--no-serve-certs`. Removed LAN/proxy flags are rejected; certificate setup no
-longer configures an upstream proxy.
+`--no-serve-certs`. `--cert-port` and `--no-serve-certs` are accepted but unused
+on Windows, where setup never starts a distribution server. Removed LAN/proxy
+flags are rejected; certificate setup no longer configures an upstream proxy.
 
 `--name` is the daemon display label used by the Agent Card and dashboard
 targets. If omitted, setup now uses the system hostname when available and falls
@@ -561,7 +574,17 @@ back to the primary IP only as a last resort. Existing IP-based labels continue
 to work, but the dashboard prefers a human label or hostname over a stale IP
 when both are present.
 
-Client certificate enrollment is deliberately strict. The temporary enrollment
+On Windows, `setup` finishes after generation and prints copy/paste-ready
+`Import-Certificate` / `Import-PfxCertificate` commands targeting
+`Cert:\CurrentUser\Root` and `Cert:\CurrentUser\My`. The commands read the
+generated PKCS#12 password directly into a PowerShell `SecureString`; they do
+not echo it into shell history. Close and reopen Edge or Chrome afterwards.
+`serve-certs` returns an explicit unsupported/manual-import error on Windows.
+`remove` deletes the generated access directory, but certificates manually
+imported into Windows certificate stores remain until removed with
+`certmgr.msc`.
+
+Remote client certificate enrollment is deliberately strict. The temporary enrollment
 server is HTTPS, using the same access server certificate as the dashboard. Before
 the CLI reveals the one-time enrollment secret, the operator must copy the
 server certificate SHA-256 fingerprint observed in the browser certificate UI
@@ -575,14 +598,20 @@ the local `server.crt` can the browser redeem the secret and download enrollment
 artifacts. Apple clients get a single `intendant.mobileconfig` profile; other
 clients can download `ca.crt` plus `client.p12` (or the same identity as
 `client.pfx`). This avoids the unsafe pattern where a MITM page can serve
-active content or steal a secret from an unauthenticated download page.
+active content or steal a secret from an unauthenticated download page. A fleet
+DNS/WebPKI certificate is deliberately not an enrollment shortcut: the server
+always presents the direct access certificate and always requires the
+browser-observed fingerprint. Hosted DNS or origin control must never authorize
+release of the shared owner/root client bundle.
 
 The enrollment page uses the browser's User-Agent only to prioritize the
 instructions and download buttons for that device. The authorization decision is
 always the strict terminal-paired session cookie.
 
-Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the macOS
-app wrapper for dashboard features that require a secure browser context:
+Use this HTTPS/mTLS path or native `--tls` with a trusted certificate for
+dashboard features that require a secure browser context. A locally built
+macOS app wrapper also supplies a secure context for development, but is not a
+distribution anchor:
 Station WebGPU, microphone/camera, browser screen capture, and stricter
 clipboard APIs. Plain `http://<host-ip>:8765` is available only when launched
 with `--no-tls`; it is intended for local/programmatic debugging, is guarded on

@@ -17,10 +17,13 @@ Peer federation is **not** the same security domain as a browser dashboard login
 Connect passkeys authenticate the hosted account and route UI only; they never
 authenticate to a daemon. Human/client daemon authentication uses browser mTLS
 or trusted local presence in this alpha. Browser identity keys sign fleet
-records and can be stored as IAM/org subject metadata, but no live alpha ingress
-authenticates one; recording or approving such a key does not create a session.
+records and can be stored as IAM/org subject metadata. Peer offers can verify
+one for attribution, but no live alpha ingress admits it as the controlling IAM
+principal; recording or approving such a key does not create a session.
 Hosted provenance is immutable `role:none` in the default build; all human
-control remains direct/local, daemon-served, or signed-native. Peer federation authenticates a daemon route to another daemon
+control remains local or independently reached direct mTLS. The packaged
+macOS app contains a local bridge, but no signed/notarized release exists for
+this alpha. Peer federation authenticates a daemon route to another daemon
 and should use peer-scoped mTLS identities plus peer profiles. Future
 coworker/team access belongs in user-scoped IAM unless the federation trust
 model is deliberately expanded.
@@ -626,11 +629,11 @@ compatibility path. Subcommands:
 
 | Command | Action |
 |---|---|
-| `intendant access setup` | Generate CA + server/client certs and start the strict HTTPS enrollment server |
+| `intendant access setup` | Generate CA + server/client certs and seed the local owner grant; start enrollment on macOS/Linux or print local import commands on Windows |
 | `intendant access recert` | Re-issue certs |
 | `intendant access remove` | Remove the per-user access cert store |
 | `intendant access list` | List issued client certs |
-| `intendant access serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
+| `intendant access serve-certs` | macOS/Linux only: run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
 intendant access setup --name nicks-mac --port 8765
@@ -641,10 +644,11 @@ addresses belong in SANs and advertised URLs, not in the label. When setup is
 run without `--name`, Intendant uses the system hostname when available and uses
 the primary IP only as a last resort.
 
-The interactive `intendant access` setup/enrollment flow is currently validated on
-Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
-Windows daemon can still use native HTTPS/mTLS and
-`read_server_cert_fingerprint` to publish a pinned fingerprint. See
+`setup`, `recert`, `list`, and `remove` are cross-platform. Windows setup uses
+the same pure-Rust generation and local-IAM seeding, then prints exact
+PowerShell commands to import `ca.crt` into `Cert:\CurrentUser\Root` and
+`client.p12` into `Cert:\CurrentUser\My`; it never starts `serve-certs`.
+Remote interactive enrollment remains macOS/Linux-only. See
 [Windows Support](./windows-support.md).
 
 Enrollment is not a plain unauthenticated download. The temporary
@@ -661,20 +665,19 @@ configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
 
-When the daemon holds a live **fleet certificate**
+Even when the daemon holds a live **fleet certificate**
 ([Self-Hosted Rendezvous → Fleet DNS](./self-hosted-rendezvous.md#fleet-dns-real-certificates-for-daemons)),
-`serve-certs` also serves it for the fleet name on the enrollment port and
-leads with that URL instead: the page then loads warning-free under WebPKI,
-and the fingerprint transcription is skipped — the operator just presses
-Enter to reveal the secret once the page is open. That path bootstraps
-device trust through [first-contact rung two](./trust-tiers.md#first-contact-three-rungs)
-(active-only betrayal, CT-logged, tripwire-watched) rather than rung one;
-the classic fingerprint ceremony against the IP URL remains available from
-the same prompt for trustless assurance. There is deliberately no
-short-code/PAKE variant: until the device trusts the daemon's certificate,
-a code typed into the *page* goes to whoever served the page — under an
-active MITM, the attacker — so the trustless leg keeps reading from browser
-chrome into the trusted terminal.
+`serve-certs` deliberately serves only the direct access certificate and never
+accepts an Enter/presence-only confirmation. The shared owner/root client bundle
+is released only after the browser-observed fingerprint matches the local
+certificate. A fleet name is valuable for warning-free discovery/public shell
+bytes, but it is not a dashboard-control or root-bootstrap origin: the daemon
+rejects protected fleet-SNI traffic before considering browser mTLS. Hosted
+DNS/origin control could otherwise proxy the ceremony, steal the bundle, or
+drive a previously enrolled certificate. There is likewise no short-code/PAKE variant:
+until the device trusts the daemon's certificate, a code typed into the *page*
+goes to whoever served the page — under an active MITM, the attacker — so the
+ceremony keeps reading from browser chrome into the trusted terminal.
 
 Native access TLS also solves browser secure-context requirements for access clients
 once the CA/client identity are installed. That matters for Station's WebGPU
@@ -880,7 +883,7 @@ dashboard or daemon-to-daemon UX.
 
 - [Display Pipeline](./display-pipeline.md) — the local capture/encode/WebRTC
   pipeline that federated displays plug into, and the `[webrtc]` config
-- [Windows Support](./windows-support.md) — why `intendant access` is gated off
-  Windows and what to use instead
+- [Windows Support](./windows-support.md) — local access setup/import support
+  and the remaining remote-enrollment limitation
 - [`docs/design-federated-input-authority.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-federated-input-authority.md)
   — the full federated input-authority protocol

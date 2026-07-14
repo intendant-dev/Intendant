@@ -714,17 +714,16 @@ somebody asked a question; policy can't answer it.
 Frontends answer with `{"action": "answer_question", "id", "answers":
 {question → chosen label(s) or free text}}` (multi-select answers join with
 ", "). The adapter replies `allow` + `updatedInput.answers`, exactly what the
-CLI's own interactive picker returns, so the tool result reads "Your questions
-have been answered: …". The web dashboard renders a dedicated question panel
-(option buttons + free-text input + Skip); the TUI gets a `Question` mode
-(number keys pick, typing gives a custom answer, Esc dismisses); presence
-narrates the question text with its option labels. Dismissals (deny/skip) send
-a plain `deny` — never `interrupt` — so the model continues gracefully without
-an answer, and the bare approval verbs (`approve`/`approve_all` from clients
-that only speak approvals) let the question through with a "proceed on your
-best judgment" note instead of fabricating a choice. Headless runs without any
-frontend answer the same way instead of blocking forever, mirroring the CLI's
-own away-from-keyboard fallback.
+external CLI's own interactive picker returns, so the tool result reads "Your
+questions have been answered: …". The web dashboard renders a dedicated
+question panel (option buttons + free-text input + Skip), and presence narrates
+the question text with its option labels. Dismissals (deny/skip) send a plain
+`deny` — never `interrupt` — so the model continues gracefully without an
+answer, and the bare approval verbs (`approve`/`approve_all` from clients that
+only speak approvals) let the question through with a "proceed on your best
+judgment" note instead of fabricating a choice. Headless runs without any
+frontend answer the same way instead of blocking forever, mirroring the
+external CLI's own away-from-keyboard fallback.
 
 ## Configuration
 

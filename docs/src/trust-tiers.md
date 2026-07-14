@@ -22,31 +22,38 @@ Every real deployment decision sits on two independent axes:
   is honest. Hosted Connect is convenient and zero-install for discovery,
   but is no longer on the control ladder at all: the default binary fixes it
   at `role:none` because the hosted origin can change what it serves at any
-  time. Control starts with code whose provenance you accept: the signed
-  native app using its mTLS bridge, or a dashboard served by a daemon you own
-  over loopback/mTLS (the
-  [anchor rule](./trust-architecture.md#anchor-daemons)).
+  time. Control starts with code whose provenance you accept: a dashboard
+  served by a daemon you own over loopback or an independently
+  fingerprint-verified direct-mTLS route (the
+  [anchor rule](./trust-architecture.md#anchor-daemons)). The packaged macOS
+  app contains a local mTLS bridge, but no Developer ID-signed/notarized
+  release has been published for this alpha; an `-unsigned-dev` bundle is not
+  a distribution anchor.
 
 The doctrine is one sentence: **match the client's provenance to the payload
 of the daemon it is driving — per daemon, not per person.**
 
 Stated per tier, and resolving what looks like a paradox:
 
-- A *disposable* daemon still wants a trusted client, usually its
-  daemon-served fleet-certificate URL with mTLS or the native app's mTLS bridge. Custody then
-  bounds what compromise of the disposable box costs. Linking it in hosted
-  Connect makes the route easy to find; it does not make the hosted page a
-  control client.
-- Driving an *integrated* daemon demands provenance and authentication: the
-  native app's mTLS bridge, loopback, or an owner-served mTLS origin. This is
+- A *disposable* remote daemon still wants a trusted client, usually an
+  independently reached direct-mTLS origin. Custody then bounds what
+  compromise of the disposable box costs. Linking it in hosted Connect or
+  publishing a WebPKI fleet name makes the route easy to find; neither
+  service-controlled name is a control origin.
+- Driving an *integrated* daemon demands provenance and authentication:
+  loopback or an independently reached owner-served direct-mTLS origin. A
+  future Developer ID-signed/notarized packaged macOS release may add its
+  local bridge for the bundled daemon. This is
   where "just open intendant.dev" stops being
   an acceptable answer, however encrypted the transport and however honest
   the service intends to be.
 
-Trust machinery scales with payload, not with paranoia. A user who "doesn't
-trust Intendant" and keeps every daemon disposable is served perfectly well
-by the most convenient path; a user who trusts it with everything needs the
-inconvenient-once path for exactly one machine.
+Trust machinery scales with payload, not with paranoia. A user who keeps every
+daemon disposable can lean heavily on hosted discovery and short-lived
+credential custody, but control still starts with direct enrollment. A user
+who trusts one integrated machine with everything adds stricter client and
+credential discipline on that machine; neither tier turns a service-controlled
+origin into an authority surface.
 
 One footgun completes the model: **a daemon's tier is set by the most
 sensitive thing that ever touches it**, not by the label its owner had in
@@ -81,10 +88,12 @@ therefore made of three disciplines, not of infrastructure:
    default build exposes no knob that raises them.
 3. **Separate credentials, not separate networks.** Browser identity keys are
    fleet-signing/attribution records in this alpha, not daemon login
-   credentials. Authority belongs on trusted loopback, direct-mTLS, or
-   native-mTLS surfaces; hosted Connect has no control ingress. Keep
-   integrated-daemon root material in a dedicated direct profile/device or
-   the native app; use the hosted profile only for account and route metadata.
+   credentials. Authority belongs on trusted loopback or direct-mTLS
+   surfaces; the packaged macOS app code contains a local bridge to its bundled
+   daemon, not a remote-client transport, but the current unsigned artifact is
+   not an anchor. Hosted Connect and fleet-name SNI have no control ingress.
+   Keep integrated-daemon root material in a dedicated direct profile/device;
+   use hosted and fleet-name profiles only for account and route metadata.
 
 Two accounts — two actual fleets — buy exactly one additional property:
 the rendezvous cannot see that both worlds belong to the same person.
@@ -97,7 +106,9 @@ The [credential custody](./credential-custody.md) mechanisms — sealed stores,
 time-boxed leases, and client egress — are most valuable on boxes you do not
 trust. The current boundary matters: Connect account-vault blobs cannot be
 delivered to a daemon because no trusted bridge ships. Use a daemon-store vault
-from a loopback/mTLS/native-mTLS client, or local credential configuration:
+from a loopback/direct-mTLS client, or local credential configuration. A
+future signed/notarized packaged app release may use its local bridge for its
+bundled macOS daemon:
 
 - **Disposable tier**: prefer memory-only API-key leases from an authorized
   daemon-store vault. A deliberately keyless box outside an active
@@ -113,43 +124,46 @@ from a loopback/mTLS/native-mTLS client, or local credential configuration:
 
 ## The client ladder
 
-- **Disposable tier**: a daemon-served fleet-certificate/direct mTLS origin or
-  the native app's mTLS bridge. Hosted Connect remains the zero-install directory.
-- **Integrated tier**: the native app's mTLS bridge, loopback, or a direct/owner-served mTLS
-  origin. Store-signed releases are the out-of-band code anchor a bare
-  browser tab cannot have — the same reason messengers with real E2E
-  guarantees treat their web clients as the weak tier. The app is not the
-  non-technical user's consolation prize; it is *everyone's* correct client
-  for the machines that matter.
+- **Disposable tier**: loopback or an independently reached direct-mTLS
+  origin. Hosted Connect and the fleet WebPKI name remain discovery routes.
+- **Integrated tier**: the same shipped anchors, with stricter device and
+  credential discipline. A Developer ID-signed/notarized native release could
+  become an out-of-band code anchor a bare browser tab cannot have, but no such
+  release is available in this alpha; the current `-unsigned-dev` artifact is
+  development-only.
 
-Getting a pleasant direct origin today: the fleet strip offers **↗
-direct** wherever a daemon's own URL is known, and the daemon-store vault
-([Credential Custody](./credential-custody.md#the-vault)) makes that tab
-self-sufficient. For the warning-free padlock, **fleet certificates** do
-it in one click: a rendezvous serving a delegated DNS subzone
+Getting a direct control origin today: use a typed/pinned address, an
+owner-controlled hostname, mDNS or a tailnet route, then complete the direct
+mTLS enrollment ceremony. The fleet strip may remember that independently
+verified URL, and the daemon-store vault
+([Credential Custody](./credential-custody.md#the-vault)) makes the trusted
+tab self-sufficient.
+
+**Fleet certificates are different.** A rendezvous serving a delegated DNS subzone
 ([Self-Hosted Rendezvous → Fleet DNS](./self-hosted-rendezvous.md#fleet-dns-real-certificates-for-daemons))
-gives each daemon a real name, and the Connect card's *Get a real
-certificate* button publishes the daemon's addresses (LAN included — no
+gives each daemon a real name, and the Connect card's *Enable HTTPS
+discovery* button publishes the daemon's addresses (LAN included — no
 port forwarding needed) and mints a Let's Encrypt certificate via DNS-01,
-renewed automatically, private keys never leaving the machine. Without
-fleet DNS, the manual routes remain: a hostname you own with a DNS-01
-cert, `tailscale cert` on a tailnet, or the browser's one-time exception
-plus the enrollment ceremony.
-The public server certificate proves the origin and supplies a warning-free
-secure context; it does not authenticate the browser. Remote protected routes
-still require the enrolled mTLS client certificate. Certless root exists only
-on loopback, and `--allow-public-plaintext` grants no authority.
+renewed automatically, private keys never leaving the machine. That gives a
+warning-free public shell/discovery endpoint, not a control endpoint. The
+rendezvous controls the name and can serve code at the same origin, so the
+daemon rejects every protected HTTP/MCP route, direct signaling request, and
+WebSocket on fleet SNI before it considers browser mTLS or IAM. CT monitoring
+is useful evidence of unexpected issuance, not authority. Certless root exists
+only on verified loopback; `--allow-public-plaintext` and fleet WebPKI grant no
+authority.
 
 A worked example, one fleet:
 
 | Daemon | Tier | Control origins | Custody | Peer grants |
 |---|---|---|---|---|
-| `home` (desktop) | integrated | native-app mTLS / loopback or direct mTLS | local keystore or daemon-store vault | holds grants **on** `vps-1`, `vps-2` |
-| `vps-1`, `vps-2` (rented) | disposable | fleet-certificate + client mTLS, or native-app mTLS | prefer memory-only leases; full OAuth may materialize files | none; controlled **by** `home` |
+| `home` (Mac desktop) | integrated | loopback or fingerprint-verified direct mTLS | local keystore or daemon-store vault | holds grants **on** `vps-1`, `vps-2` |
+| `vps-1`, `vps-2` (rented) | disposable | fingerprint-verified direct mTLS; fleet name for discovery only | prefer memory-only leases; full OAuth may materialize files | none; controlled **by** `home` |
 
-The owner links all three routes to one account and sees them in one dashboard.
-Linking changes no IAM. Control stays daemon-served/direct/native; grants on
-the disposable boxes are still scoped independently from grants on `home`.
+The owner links all three routes to one account and sees them in the directory.
+Linking changes no IAM. Remote control uses the separately verified direct
+routes; grants on the disposable boxes are still scoped independently from
+grants on `home`.
 
 ## First contact: three rungs
 
@@ -171,18 +185,17 @@ Three rungs, ordered by what betrayal costs the attacker:
    serving, so there is nothing whose betrayal you would need evidence of.
    This is the only rung that deserves the word *anchor*, and it is bought
    with the one deliberately inconvenient ceremony.
-2. **Trust with mandatory evidence — the fleet name.**
+2. **Warning-free discovery with evidence — the fleet name.**
    `https://d-<hash>.fleet.intendant.dev:8765` is daemon-served code on a
    rendezvous-named route: the zone operator — or anything else that can
    answer DNS for the name and convince a CA — could point your daemon's
-   name at a box of its choosing. What this rung guarantees is not that
-   the swap cannot happen but that it **cannot happen quietly**: serving
-   code at the `https` origin requires a certificate for the name, the
-   attack must be live at the moment you connect (nothing is exposed
-   passively or retroactively), and every issued certificate lands in
-   public Certificate Transparency logs — where the daemon's own CT
-   tripwire watches for serials it never requested and raises **CT
-   ALERT** on the Connect card. Betrayal is possible, targeted, and loud.
+   name at a box of its choosing and serve same-origin JavaScript. CT can
+   leave evidence of a newly issued certificate, but that is detection after
+   the trust decision, not an anchor. The default daemon therefore treats
+   fleet SNI like the hosted tab for authority: public shell and discovery
+   bytes only, with protected HTTP/MCP, signaling, and WebSocket traffic
+   refused before mTLS or IAM resolution. The CT tripwire remains a useful
+   diagnostic for the route directory.
 3. **Directory only — the hosted tab.** The rendezvous origin serves
    the code itself, so betrayal is a silently different bundle to one
    visitor, once, with no artifact anywhere. No evidence machinery can
@@ -191,29 +204,32 @@ Three rungs, ordered by what betrayal costs the attacker:
    Connect can still lie about or exfiltrate its own account, route, presence,
    and unlocked vault UI state, and its installers remain a real trust boundary.
 
-The product states the rung wherever an owner makes a trust decision:
-device-enrollment approvals carry a daemon-computed route chip (*via
-direct origin* / *via fleet name* / *via hosted route*). Marking an origin in
-`hosted_origins` now means refusing it with `role:none`; it is not a way to
-create a lower-authority hosted control tier.
-Device enrollment (`intendant access serve-certs`) rides the same ladder:
-with a live fleet certificate it leads with the warning-free fleet URL and
-skips the fingerprint transcription (a rung-two bootstrap), while the
-fingerprint ceremony against a direct address remains the rung-one path —
-shortened to an 80-bit prefix, since pre-grinding a certificate that
-shares 20 hex characters is out of reach.
+The product states route provenance wherever it displays historical/staged
+enrollment metadata (*via direct origin* / *via fleet name* / *via hosted
+route*). Fleet and hosted origins are refusals, not lower-authority control
+tiers. Marking an origin in `hosted_origins` also means refusing it with
+`role:none`; it is not a ceiling-raising mechanism.
+Device enrollment (`intendant access serve-certs`) is intentionally stricter
+than ordinary navigation: it always uses the direct-address access certificate
+and requires the browser-observed fingerprint, shortened to an 80-bit prefix
+since pre-grinding a certificate that shares 20 hex characters is out of reach.
+A warning-free fleet URL is not accepted as root bootstrap evidence and cannot
+use a previously enrolled client certificate for control; hosted DNS or origin
+control must never be enough to release or exercise the shared owner/root
+client bundle.
 
 One consequence is easy to miss: for any *browser* client, first contact
 re-asks itself on every page load — the tab re-fetches its code each
 visit, so a rung's guarantee is only as durable as its serving origin.
-Enrolled identity keys do not change this: browser storage is
-origin-scoped, so a key enrolled at a fleet name is wieldable by whatever
-code that name serves. Rungs one and two therefore fully converge only
-when the client stops being re-served. That top of the ladder is now
-built: the native app ships through a signing/notarization release
-pipeline (dormant until the operator's signing credentials are
-provisioned — tags build clearly-labeled unsigned dev artifacts until
-then), and every serving origin is answerable to **code transparency** —
+Enrolled identity keys or mTLS certificates do not change this: browser
+credentials are presented to the origin, so whatever code that name serves can
+try to wield them. The daemon-side fleet-SNI refusal is the controlling
+boundary. A native app could instead collapse code trust to install-and-update
+moments, and the repository contains a signing/notarization pipeline, but its
+credentials are not provisioned and no Developer ID-signed/notarized release
+has been published for this alpha. Tags without those credentials produce
+clearly labelled `-unsigned-dev` artifacts. Separately, serving origins are
+answerable to **code transparency** —
 the artifacts an origin serves are committed to the rendezvous's public
 append-only log, and `intendant hosted-verify` re-downloads them exactly
 as a browser would and checks them against the log from a machine the
@@ -226,18 +242,19 @@ stated non-goal:
 
 - **The time axis (TOFU).** Everything above grades *first* contact;
   later visits inherit pinned material (enrolled keys, remembered
-  certificates) but re-inherit the code channel every load. The app
-  collapses code trust to install-and-update moments; every browser
-  client still re-runs its rung per visit — that is the browser's
-  condition, not a defect the ladder can fix.
+  certificates) but re-inherit the code channel every load. A future signed
+  app release could collapse code trust to install-and-update moments; every
+  browser client still re-runs its route risk per visit. Fleet-name control is
+  refused rather than betting authority on TOFU.
 - **The update channel.** A signed app trusts its updater. For the
   *serving* channel the evidence leg is shipped: served-artifact
   manifests live in the rendezvous's public transparency log, verified
   out of band by `hosted-verify` and advisorily by every daemon's
-  bundle tripwire. The *release* channel now carries the same tie: app
-  builds ship as GitHub releases (public source, public workflow runs,
-  and — once signing is provisioned — Developer ID + notarization),
-  the release pipeline commits every artifact's hash to the same log
+  bundle tripwire. The *release* channel has code for the same tie, but no
+  signed/notarized release exists yet: when a release workflow is run it can
+  publish artifacts (public source and workflow runs; Developer ID +
+  notarization only after credentials are provisioned), and the pipeline
+  commits every artifact's hash to the same log
   (`release_manifest` entries), `hosted-verify --releases` checks the
   log against GitHub out of band, and the app's update check surfaces
   logged / not-logged as a fail-open advisory.
@@ -245,8 +262,8 @@ stated non-goal:
   also means humans cannot eyeball them; a phished lookalike with its own
   valid certificate raises no CT alarm on *your* name, because it is not
   your name. Two mitigations now, one navigational and one nominal:
-  reach fleet names from the fleet strip, bookmarks, or the app — never
-  by retyping — and give machines **petnames**: the owner's name for a
+  reach fleet names from the fleet strip or bookmarks — never by retyping —
+  and give machines **petnames**: the owner's name for a
   daemon, signed into the fleet record (payload v5) and keyed to the
   record's identity, shown first everywhere with the self-reported label
   demoted to a muted secondary. A lookalike arrives *nameless* — no
@@ -256,17 +273,16 @@ stated non-goal:
   honest; an extension with page access reads all tiers alike. Outside
   Intendant's reach — stated so the ladder is not mistaken for covering
   it.
-- **Hosted-passkey coupling.** Unsealing the vault with a passkey inside
-  a hosted tab is rung-three code wielding rung-one credentials. Two
-  shipped mechanisms reduce accidental exposure: the write-only CLI deposit
-  lane moves secret *entry* off the web UI, and the crypto worker narrows the
-  code that normally handles key material. Neither detrusts the hosted origin:
-  Connect controls the page that selects and hash-checks the worker, can prompt
-  for a PRF evaluation, and can exfiltrate the output, decrypted state, or
-  plaintext it renders. Trusted-only entry policy is client-side mistake
-  prevention, not protection from malicious served code. The stronger current
-  boundary is that Connect has no daemon-control channel or vault-delivery
-  bridge at all.
+- **Account-vault status and hosted-passkey coupling.** Connect's account-vault
+  API stores opaque blobs, but the default hosted directory ships no vault
+  client or crypto worker that creates, unseals, or spends vault envelopes. A
+  future hosted client that unsealed them with a passkey PRF would still be
+  rung-three code wielding rung-one credentials: Connect would control the page
+  and worker selection, could prompt for a PRF evaluation, and could exfiltrate
+  the output, decrypted state, or plaintext it rendered. Passkey sealing narrows
+  ambient and at-rest exposure; it does not detrust the hosted origin. The
+  stronger current boundary is that Connect has no daemon-control channel or
+  vault-delivery bridge at all.
 
 ## Product hooks
 
@@ -294,25 +310,25 @@ the owner's memory. All four are **shipped**:
    hosted-ceiling UI/API is retired; missing, empty, or hand-edited values
    cannot enable hosted control.
 3. **Per-entry vault unseal policy.** Vault entries accept
-   `unseal_policy: "trusted"` (add form + per-entry toggle): trusted-only
-   entries refuse reveal in the normal hosted UI. Connect cannot invoke lease
-   fueling, egress relay, or the voice mirror because no control/delivery bridge
-   ships; trusted daemon-origin sessions retain those mechanisms. The custody trail stamps every
-   lease/relay ceremony with the session's origin class
-   (`hosted`/`direct`/`local`/`peer`). Honest limits, stated in the UI
-   too: this is client-side self-enforcement — protection against
-   mistakes and casual exfiltration, not against a malicious bundle.
-   With the **local vault** shipped (the daemon-store backend in
-   [Credential Custody](./credential-custody.md#the-vault)), trusted-only
-   entries do real work: sealed against hosted tabs, fully usable from a
-   direct dashboard backed by the daemon's own store.
-4. **First-contact route, surfaced and watched.** Enrollment approvals
+   `unseal_policy: "trusted"` (add form + per-entry toggle). The shipped vault
+   UI is daemon-origin and backed by the daemon store; trusted-only entries work
+   normally from that direct dashboard. Connect's account-vault endpoints store
+   opaque blobs, but the default hosted directory has no vault UI and cannot
+   invoke lease fueling, egress relay, or the voice mirror because no
+   control/delivery bridge ships. The custody trail stamps every lease/relay
+   ceremony with the session's origin class
+   (`hosted`/`direct`/`local`/`peer`). Any future hosted vault client would need
+   to honor the trusted-only policy, but that would remain client-side mistake
+   prevention, not protection from a malicious served bundle. See the **local
+   vault** in [Credential Custody](./credential-custody.md#the-vault).
+4. **First-contact route, surfaced and watched.** Historical/staged enrollment approvals
    carry a route chip computed daemon-side (`iam::origin_route_class`:
    hosted / fleet / direct / unknown — route provenance for approval
    decisions, distinct from `session_origin_class`, the custody-trail
    code-provenance class), with honest per-rung copy and an
-   integrated-tier warning on any network route. The **CT tripwire**
-   backs rung two's evidence claim: `fleet_cert` records the serial of
+   integrated-tier warning on any network route. Fleet and hosted classes do
+   not admit control. The **CT tripwire** is a route diagnostic: `fleet_cert`
+   records the serial of
    every certificate it obtains (before install, so a crash cannot make
    an own certificate look foreign), polls crt.sh for the daemon's fleet
    name on each renewal tick, and flips the Connect card to **CT ALERT**
@@ -329,8 +345,11 @@ direct browser↔target datachannel. Hosted Connect has no control tunnel. The a
 weight is the **principal**: whose authority the *target* daemon
 enforces and audits. Every fleet surface sits in one of two lanes:
 
-- **The user lane** — the target binds *you*: a loopback/direct-mTLS tab or the
-  native app's mTLS bridge. The local session or mTLS certificate is the
+- **The user lane** — the target binds *you*: a loopback/direct-mTLS tab. A
+  future Developer ID-signed/notarized packaged app release could add its
+  bridge for the locally bundled macOS daemon; the current unsigned bundle
+  cannot.
+  The local session or mTLS certificate is the
   shipped alpha principal; a browser identity key is record-only and the
   Connect account is route metadata, not an authenticator. Your role applies
   and the audit names you.

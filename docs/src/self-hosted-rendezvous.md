@@ -11,7 +11,8 @@ IAM principal or grant. The default
 daemon stamps this route as hosted and applies immutable `role:none`, so
 Connect-served code cannot open a daemon-control session. Org grant documents
 are verified by the target daemon against its own trusted keys, and authority
-on trusted direct/native routes still comes from the target daemon's local IAM.
+on trusted local or independently reached direct-mTLS routes still comes from
+the target daemon's local IAM.
 
 That is a precise boundary, not an absolute "zero-authority" claim. Connect
 is trusted for availability, its account and route metadata, push delivery,
@@ -75,17 +76,20 @@ connect.example.com {
 
 ## Fleet DNS: real certificates for daemons
 
-The convenient-direct-path option ([Trust Tiers](./trust-tiers.md)):
+The warning-free discovery option ([Trust Tiers](./trust-tiers.md)):
 delegate one subzone to the service and every registered daemon gets a
 real name — `d-<hash>.<zone>`, an opaque sha256-derived label (these
 names land in public CT logs) — plus a one-click Let's Encrypt
 certificate from its Access card. The daemon publishes its own
 addresses (LAN addresses are the point: public name + real certificate
-+ private address gives a warning-free padlock on your own network with
++ private address gives a warning-free public shell on your own network with
 no port forwarding), answers the ACME DNS-01 challenge through the
 service with daemon-signed requests, and keeps its private keys local.
 The service's DNS authority covers exactly the delegated subzone and nothing
-else — the same least-authority posture applied to DNS.
+else. That still makes it an authority over code at every name in the subzone,
+so the daemon classifies fleet SNI before IAM and serves only public
+shell/discovery bytes there. Protected HTTP/MCP routes, direct signaling, and
+WebSockets require an independently reached direct-mTLS or loopback origin.
 
 Setup, one time:
 
@@ -99,20 +103,21 @@ Setup, one time:
    ns-fleet.example.com --dns-listen 0.0.0.0:53`.
 
 The register response then carries each daemon's `fleet_dns` name; the
-daemon's Connect card shows it with a **Get a real certificate** button.
+daemon's Connect card shows it with an **Enable HTTPS discovery** button.
 Address records persist in the state file and follow the daemon-record
 lifecycle (they survive link/release; the stale-unlinked sweep drops
 them). ACME TXT challenges are in-memory and self-expire. Posture:
 authoritative-only, `Refused` outside the zone, no AXFR, RFC 8482
 minimal `ANY`, 60 s TTLs. Daemons validating against Let's Encrypt
 *staging* set `INTENDANT_ACME_DIRECTORY` to the staging directory URL.
-Honest caveats: a single NS is a SPOF for fleet *names* (enrolled
-browsers keep working via remembered routes; renewals retry), Let's
+Honest caveats: a single NS is a SPOF for fleet *names* (independently
+remembered direct routes keep working; renewals retry), Let's
 Encrypt rate-limits new certificates per registered domain (~50/week —
 request a limit raise before any large fleet), and a hostile zone
-operator could mint certificates for fleet names — key verification
-protects enrolled browsers, and CT logs make mis-issuance public
-evidence.
+operator could redirect fleet names and mint certificates for them. CT logs
+make issuance public evidence, but that evidence does not protect an enrolled
+browser credential from same-origin code. The discovery-only SNI gate is the
+authority boundary.
 
 ## Pointing daemons at it
 
@@ -193,12 +198,14 @@ It creates no principal or grant; it only associates discovery and routing
 metadata with the account. A hosted Connect account assertion never
 authenticates to the daemon. The default build fixes hosted provenance at
 `role:none`; a separately enrolled browser key, stored grant, hand-edited
-ceiling, or disclosure cannot enable hosted control. Use a trusted local,
-daemon-served direct/mTLS, or signed-native surface for daemon access.
+ceiling, or disclosure cannot enable hosted control. Use a trusted local or
+independently reached daemon-served direct/mTLS surface for daemon access. The
+packaged macOS app is not an alternative distribution anchor in this alpha:
+no Developer ID-signed/notarized release has been published.
 
 Root bootstrap is deliberately outside this flow. Use `intendant access
-setup` from the machine's console/SSH session, a direct mTLS root session, or
-the native app's mTLS bridge. The former `--owner <browser-key>` shortcut is
+setup` from the machine's console/SSH session or a direct mTLS root session.
+The former `--owner <browser-key>` shortcut is
 retired in this alpha because a fingerprint alone is not a complete certless
 remote authentication protocol. Never treat a Connect claim code as a password,
 owner secret, or proof of root authority.
@@ -497,7 +504,9 @@ reclamation is logged.
 A daemon with Connect enabled advertises its rendezvous in its agent card
 (`/.well-known/agent-card.json` → `rendezvous_base`, `connect_daemon_id`),
 and the dashboard records it in the signed fleet records
-(`connect_signaling_base`, fleet-record payload v2). Links that open a
-daemon through a rendezvous carry the base as the `connect_base` URL
-parameter, so browsers follow the daemon's own rendezvous instead of
-assuming the default instance.
+(`connect_signaling_base`, fleet-record payload v2). Those fields are retained
+as route/protocol compatibility metadata; the default hosted directory does
+not turn them into `/app?connect=1` daemon-control links. A claimed Connect
+route can show discovery and presence only. An independently recorded direct
+daemon URL opens the daemon's own HTTPS/mTLS origin, where the daemon—not the
+rendezvous—serves the dashboard and authenticates the client.

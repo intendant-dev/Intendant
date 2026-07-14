@@ -356,8 +356,8 @@ current service also returns `403` for browser offer/ICE/close before mutation.
 No file editing is required for the common case: the dashboard's
 **Access → Intendant Connect** card toggles `enabled` (persisting it
 here), shows registration/link state, reveals the single-use twelve-word
-  locally minted claim code to manage-grade sessions, and can release the account/route
-link. The
+locally minted claim code to trusted manage-grade sessions, and can release the
+account/route link. The
 `INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable still force-enables
 the client and overrides the file (the card reports when it does).
 
@@ -605,14 +605,16 @@ Use `[server.tls]` for a secure context on loopback or for public/bootstrap
 content, not as a remote authentication bypass. Use default mTLS or
 `[server.mtls]` for a remote dashboard with daemon authority.
 
-Use default mTLS, `[server.tls]`, `--tls`, or the native app's mTLS bridge when
-a remote browser needs secure-context-gated features: Station WebGPU,
+Use default mTLS, `[server.tls]`, or `--tls` when a remote browser needs
+secure-context-gated features: Station WebGPU,
 microphone/camera, browser screen capture, or stricter clipboard APIs. An HTTPS
 reverse proxy can provide a secure context for public bytes, but ordinary TLS
 termination does **not** authenticate a controller. A proxy that forwards to
 daemon loopback becomes a root trust boundary: remote control is safe only when
 the proxy enforces an approved client identity and its upstream is protected
-from other local callers. Plain `http://<host-ip>` is not enough for those APIs, and
+from other local callers. A local development build of the packaged macOS app
+also supplies a secure context for its bundled daemon, but the current unsigned
+artifact is not a distribution anchor. Plain `http://<host-ip>` is not enough for those APIs, and
 `--no-tls` on a wildcard listener refuses startup when the host has a public
 interface unless `--allow-public-plaintext` is passed. The macOS
 app wrapper starts its bundled backend with native mTLS by default and fails
@@ -678,10 +680,10 @@ or Connect user access by themselves. Peer profiles use names such as
 
 In the Access UI and `/api/access/overview`, a `[[peer]]` entry appears as a
 peer-daemon principal with a peer-profile grant to a daemon target. Browser mTLS
-and browser-key dashboard access are user/client grants instead; a Connect
-passkey authenticates only the hosted account and route UI. The same page shows
-both kinds of access, but the config entry only persists the peer route and its
-daemon-to-daemon credentials. Peer profiles are not human IAM:
+access is a user/client grant instead; browser-key rows are record-only in this
+alpha, and a Connect passkey authenticates only the hosted account and route UI.
+The same page shows both kinds of records, but the config entry only persists the
+peer route and its daemon-to-daemon credentials. Peer profiles are not human IAM:
 `peer-root` maps to peer inspection/management and access inspection, while
 human/account access management remains owner/root user-client authority.
 
@@ -709,10 +711,12 @@ The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
 sessions, peer daemon profiles, and active scoped user/client grants pass
 through the IAM operation evaluator. Shipped alpha browser authentication is
-loopback/local presence or a browser/native mTLS certificate fingerprint.
+loopback/local presence or a browser mTLS certificate presented over an
+independently verified direct daemon route.
 `client_key` WebCrypto records remain in the schema for fleet signatures,
 attribution, migration, and future identity work, but direct `/ws`, direct
-dashboard-control offers, and the native bridge do not authenticate them. A
+dashboard-control offers, and the reserved future native-bridge code do not
+authenticate them. A
 combined `human_user` principal may carry those records plus optional
 account/provider and organization metadata. `connect_account` records are
 also inert compatibility/audit metadata and never authenticate.
@@ -729,16 +733,16 @@ drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`
 or dashboard-control `api_access_iam_update_grant`.
 
 The user-client grant upsert request accepts `kind = "client_key"`,
-`"browser_certificate"`, `"connect_account"`, or `"human_user"`. `human_user`
-is the local IAM shape for a real person. In the alpha only its mTLS binding is
-an active browser authenticator; a browser-key binding is record-only.
-`connect_account` is retained in the IAM vocabulary
-for compatibility and future identity work, but a Connect account assertion
-does not authenticate a hosted control session. `client_key`
-grants take `client_key_fingerprint` (base64url, case-sensitive), an optional
-`client_key` public key for audit, and an optional `client_key_origin`
-recorded by the trusted session that creates the grant. The optional
-`account_provider`, `verified_provider`, `handle`, `organization_id`, and
+`"browser_certificate"`, `"human_user"`, `"agent_session"`, or
+`"local_process"`. `human_user` is the local IAM shape for a real person. In the
+alpha only its mTLS binding is an active browser authenticator; a browser-key
+binding is record-only. `connect_account` remains readable in the IAM vocabulary
+for compatibility and audit, but grant upsert rejects it without mutating IAM
+state: Connect account links are metadata only and cannot receive a role.
+`client_key` grant records take `client_key_fingerprint` (base64url, case-sensitive),
+an optional `client_key` public key for audit, and an optional
+`client_key_origin` recorded by the trusted session that creates the grant. The
+optional `account_provider`, `verified_provider`, `handle`, `organization_id`, and
 `organization_name` fields are local metadata today; the hosted Connect
 service does not yet verify OAuth providers or organization membership.
 

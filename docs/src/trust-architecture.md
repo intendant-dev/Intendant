@@ -15,9 +15,11 @@ by people and organizations, where an owner can grant other people and other
 daemons scoped IAM access to their machines, infrastructure, and resources —
 with pleasant abstractions (passkeys, single-use route linking, and route
 discovery) on top. The discovery client stays a plain web browser. Daemon
-control requires local presence, the signed native app, or a browser enrolled
-for direct mTLS by a trusted owner; root remains on one of those trusted
-surfaces.
+control requires local presence or a browser enrolled for independently
+reached direct mTLS by a trusted owner; root remains on one of those trusted
+surfaces. The packaged macOS app contains a local mTLS bridge, but no Developer
+ID-signed/notarized release has been published for this alpha. An
+`-unsigned-dev` app artifact is not a distribution trust anchor.
 
 ## The residual trust problem is code provenance
 
@@ -32,7 +34,7 @@ could betray if compromised:
 4. **Metadata** — fleet lists, labels, claim records.
 5. **Application code** — the HTML/JS the browser runs.
 
-Items 2–4 can be bounded cryptographically: direct/native dashboard tunnels
+Items 2–4 can be bounded cryptographically: trusted daemon-origin dashboard tunnels
 verify a daemon-signed binding (daemon public key + session grant + client
 nonce), push payloads are encrypted to the browser subscription, and metadata
 can be client-signed and client-encrypted. Fleet-record signatures are
@@ -62,14 +64,18 @@ origin can change what it serves at any time, per user, silently:
 
 So within "pure browser, no extension" there is exactly one class of origin
 that can serve root-administration code without adding new trust: **an origin
-whose compromise is already game over for you**. Your own daemon runs your
-agent with real authority — it is already inside your trusted computing base.
-Code served by a daemon you own adds zero marginal trust.
+whose compromise is already game over for you and whose route is independently
+authenticated**. Your own daemon runs your agent with real authority — it is
+already inside your trusted computing base. Code served over its loopback or
+fingerprint-verified direct-mTLS route adds zero marginal trust. A WebPKI fleet
+name does not: the rendezvous controls that DNS namespace and can serve code at
+the same browser origin.
 
 That observation fixes the design:
 
 > **The rule:** root-capable code is served by the resource owner, runs from
-> a trusted local console, or ships as a signed native client; authority is
+> a trusted local console, or ships as a native client whose release signature
+> the user verifies (none has been published for this alpha); authority is
 > only ever minted by the target daemon's local IAM. A hosted claim carries
 > discovery/route metadata and creates no principal or grant. In the default
 > binary, hosted provenance is always capped at the zero-permission
@@ -84,9 +90,10 @@ user controls — the **anchor**:
 - The ceremony is the existing certificate enrollment
   (`intendant access serve-certs`, p12/mobileconfig) or an on-LAN bootstrap.
   It happens once per browser, not once per daemon.
-- The anchor — or *any* daemon of the user's fleet; the serving role is
-  deliberately fungible — serves the dashboard and the Access admin surface.
-  Root administration executes in an origin backed by hardware the user owns.
+- The anchor — or *any* daemon of the user's fleet reached over an independently
+  verified route; the serving role is deliberately fungible — serves the
+  dashboard and the Access admin surface. Root administration executes in an
+  origin backed by hardware and route identity the user controls.
 - The app generates a **client identity key** in the browser (WebCrypto
   P-256, non-extractable private key, stored in IndexedDB) for fleet-record
   signatures, attribution, and future identity work. In this alpha it is not
@@ -94,9 +101,10 @@ user controls — the **anchor**:
   the active browser authentication boundary.
 - Reaching any other daemon (yours, or an organization's) from a trusted
   client means: the rendezvous can supply route metadata, while the
-  daemon-served or signed-native client binds the channel to the target
-  daemon's key and authenticates through loopback or mTLS. Browser-key
-  fingerprints can be stored in local IAM, but no alpha direct/native ingress
+  daemon-served client binds the independently reached channel to the target
+  daemon's key and authenticates through loopback or mTLS. A future verified
+  packaged native release could do the same for its bundled local daemon. Browser-key
+  fingerprints can be stored in local IAM, but no alpha human ingress
   consumes a browser-key signature as authentication. Connect-served code has
   no control ingress at all.
 - Passkeys authenticate the Connect account and derive keys for the encrypted
@@ -135,9 +143,9 @@ rows explicitly marked future remain design constraints:
 | Future/separate TURN relay | Denial of service; traffic analysis | Not a Connect control path in the default build; any future use must preserve authenticated, end-to-end encrypted daemon channels |
 | Fleet metadata store | Denial of service; false labels/routes or a substituted self-signed record on a new device | Private fields are encrypted; the current browser detects same-key alteration; records carry no daemon authority. An owner/device signer trust set is not shipped yet. |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
-| Fleet DNS zone + WebPKI (fleet-name route) | Targeted endpoint swap: your daemon's fleet name answered with another box, a fresh certificate minted for it, attacker code served at the enrolled origin | Betrayal must be active (a live wrong answer at connect time; nothing leaks passively or retroactively) and mints public evidence — certificates land in CT logs and the daemon's CT tripwire alarms on serials it never requested. First-load code is *not* bounded, which is why this is [first-contact rung two](./trust-tiers.md#first-contact-three-rungs), not an anchor |
+| Fleet DNS zone + WebPKI (fleet-name route) | Targeted endpoint swap: your daemon's fleet name answered with another box, a fresh certificate minted for it, attacker code served at that origin | The route is discovery-only. The daemon classifies accepted fleet SNI before IAM and rejects every protected HTTP/MCP route, direct signaling request, and WebSocket even when the browser presents an enrolled root certificate. Public shell/discovery bytes run as anonymous `role:none`. CT alerts are diagnostic evidence, not an authority control. |
 | Hosted Connect origin (directory lane) | False or missing account/route/presence metadata; misleading UI; exfiltration of anything entered or unlocked on that page; malicious installers | Claims and account assertions grant nothing, and daemon-stamped hosted provenance is compiled to immutable `role:none`, so the default daemon exposes no control capability to this code. Served artifacts are transparency-logged (evidence, not prevention); installers remain a real software-supply-chain trust boundary. |
-| Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Authority-bearing APIs, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
+| Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Every non-public HTTP route, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority; cross-/same-site Fetch Metadata closes navigation and subresource requests that omit `Origin`. Explicit authority-free shell/assets/discovery/signed-document doorbells run as anonymous `role:none`. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
 
 Trust scales with the blast radius of the relationship: a global service that
 could betray *everyone at once* is allowed to hold approximately nothing; the
@@ -186,7 +194,7 @@ control.
 > peer-subject documents, and
 > issuer-key delegation are live. Peer-subject documents are usable now;
 > human client-key documents can materialize but cannot authenticate an alpha
-> session because direct/native ingress does not consume browser-key proofs.
+> session because shipped human ingress does not consume browser-key proofs.
 > Revocation-list gossip over peer links remains. This section is the spec the code follows; the earlier "two
 > lanes" section is the product narrative it serves.
 
@@ -240,8 +248,9 @@ would make the org-grant path only as trustworthy as the rendezvous's
 account assertion — a compromised hosted service could claim to be a
 granted member and collect the org's authority on every daemon that trusts
 it. Peer certificates authenticate cryptographically end-to-end. Browser
-client keys remain staged subject vocabulary until a trusted direct/native
-authenticator is implemented; current human access uses explicit mTLS.
+client keys remain staged subject vocabulary until a trusted browser-key
+authenticator is implemented; current human access uses loopback or explicit
+mTLS.
 Account subjects can be added later as an explicit, documented weakening
 if a real need appears.
 
@@ -277,7 +286,7 @@ as inactive (temporary grants for humans drop out of this immediately).
 
 Presentation paths: an explicit `POST /api/access/org-grants` in the public
 doorbell class (rate-limited and size-capped), and an `org_grant` ride-along field on a daemon-origin
-dashboard-control offer so an org member's *first trusted direct/native*
+dashboard-control offer so an org member's *first trusted direct-mTLS*
 connection to an org daemon can materialize the grant and proceed in one round
 trip. Materialization runs *before* grant resolution, so the freshly written
 grant resolves for the offer that carried it. Connect does not relay or present
@@ -292,15 +301,16 @@ not become a dashboard/control session. The daemon parses the bounded document,
 verifies its org signature and local trust/cap, and can materialize a grant only
 for the cryptographic subject named inside it. A peer subject must later
 authenticate with its peer mTLS key. A human browser-key subject is record-only
-in this alpha because no ingress authenticates that key. The same distinction
-applies to public renewal and ORL read/apply: they verify or return signed
-documents, never authenticate the courier.
+in this alpha: peer offers can verify that key for attribution, but no ingress
+admits it as the authority-bearing IAM principal. The same distinction applies
+to public renewal and ORL read/apply: they verify or return signed documents,
+never authenticate the courier.
 
 Browser-side storage (`intendant_org_grants_v1`, keyed by org handle) is a
 record format, not a login or automatic alpha presentation promise. The default
 Connect directory may display records already present in that origin, but it
 does not present them to daemons. The retired browser-key offer code contains a
-presentation field, yet no shipped direct/native ingress authenticates that
+presentation field, yet no shipped human ingress authenticates that
 key. Usable human access therefore requires an explicit trusted mTLS binding;
 peer-subject documents remain usable through peer mTLS.
 
@@ -409,10 +419,11 @@ is not logged in by this call and cannot exercise the renewed subject's grant.
 4. ⚠️ Human client-key presentation machinery is staged: browsers can store and
    present a document from trusted daemon-origin code, and daemons can verify
    and materialize it idempotently without resurrecting local revocations, but
-   no alpha ingress authenticates the document's browser key. It therefore
-   creates record state, not a usable human login. The hosted rendezvous path is
-   disabled and cannot exercise a stored document. Peer subjects are usable
-   through peer mTLS. E2E: `scripts/validate-org-grants.cjs`.
+   no alpha ingress admits the document's browser key as its controlling IAM
+   principal. It therefore creates record state, not a usable human login. The
+   hosted rendezvous path is disabled and cannot exercise a stored document.
+   Peer subjects are usable through peer mTLS. E2E:
+   `scripts/validate-org-grants.cjs`.
 5. ✅ Revocation list + renewal: root-signed cumulative ORL maintained on
    the org daemon (`orl.json`, served publicly), carried to consumers via
    the public apply doorbell, enforced monotonically and persisted so
@@ -518,17 +529,19 @@ The pieces that implement the model, mapped to the codebase:
   over the daemon permission catalog defined in `access/iam.rs`. Implemented;
   the source of all authority. Connect account records remain compatibility
   and audit vocabulary, not an authenticating binding.
-- **End-to-end tunnel binding**: trusted direct/native dashboard-control offers are answered with a
+- **End-to-end tunnel binding**: trusted direct dashboard-control offers are answered with a
   daemon-signed binding over (daemon public key, session grant, client
   nonce); the browser verifies before trusting the channel. Implemented for
-  daemon-origin control. The retired Connect signaling format used the same
+  daemon-origin control. Fleet-SNI and hosted Connect signaling are rejected
+  before a grant can be constructed. The retired Connect signaling format used the same
   binding, but the current service rejects those calls and current daemons
   refuse legacy events before opening a channel.
 - **Client identity keys (staged, not alpha authentication)**: browser-held
   WebCrypto P-256 keys sign fleet records and may appear as peer-relay
   attribution. Verification and IAM record vocabulary for key-signed offers
   exist from the retired hosted design, but local `/ws`, direct
-  `/connect/dashboard/offer`, and the native bridge do not consume that proof.
+  `/connect/dashboard/offer`, and the reserved future native-bridge code do not
+  consume that proof.
   A stored key grant therefore grants no usable alpha ingress; active browser
   control authenticates with loopback presence or mTLS.
 - **Hosted authentication and immutable refusal**: a Connect account assertion
@@ -561,7 +574,7 @@ The pieces that implement the model, mapped to the codebase:
   locally to establish the generated owner mTLS credential.
 - **Device enrollment (staged UI/state)**: the daemon has a bounded pending
   enrollment queue and ordinary key-grant upsert machinery, but the alpha
-  direct/native transports do not present browser-key authentication, so this
+  shipped local/direct-mTLS transports do not present browser-key authentication, so this
   is not a usable sign-in path. Connect events are dropped before key parsing
   and never create an enrollment request. Remote alpha enrollment uses mTLS
   certificate setup instead; a claim never substitutes for trusted approval.
@@ -578,7 +591,8 @@ The pieces that implement the model, mapped to the codebase:
   fields only.
 - **Grant fanout**: the anchor-served Access page applies one grant across
   many daemons — an "Apply to" step in the grant flow calls each selected
-  fleet daemon's IAM API directly (browser mTLS, cross-origin), with
+  daemon's independently verified direct-mTLS IAM API (browser mTLS,
+  cross-origin), with
   per-daemon results; every target authorizes independently and no central
   grant store exists. Cross-origin access to the six fleet Access APIs is
   gated by a per-daemon origin allowlist (itself, the macOS app scheme, its
@@ -590,6 +604,7 @@ The pieces that implement the model, mapped to the codebase:
   refused. `/config` is not public bootstrap: it requires `presence.read`,
   accepts only the daemon's own or a fleet-allowlisted Origin, and is
   `Cache-Control: no-store` because its ICE material may contain credentials.
+  Fleet-name SNI is rejected even when CORS would otherwise allow the caller.
   Only authority-free bytes such as the agent card, `/connect/bootstrap`,
   `/connect/status`, and the peer doorbell remain public. Authority-
   bearing `/connect/dashboard/*` signaling and `/ws` apply the same own/app-
@@ -641,8 +656,8 @@ The pattern is proven elsewhere; we are assembling, not inventing:
 - **Matrix** — the client trusts *its* homeserver; federation carries
   verifiable events between sovereign servers. Our anchor daemon is the
   homeserver role.
-- **Certificate Transparency** — the eventual answer for directory
-  equivocation, once the namespace is worth attacking.
+- **Certificate Transparency** — public evidence of certificate issuance and
+  a useful route diagnostic, not a substitute for an authority anchor.
 - **SPKI/SDSI and petnames** — authority bound to keys; human names are
   local, contextual labels.
 
@@ -651,16 +666,21 @@ The pattern is proven elsewhere; we are assembling, not inventing:
 The alpha keeps loopback and direct mTLS first-class while separating shipped
 authentication from staged identity vocabulary:
 
-1. **Trusted anchors are shipped** — local presence, direct mTLS, and the
-   signed native app's mTLS bridge are the daemon-control entry points.
+1. **Trusted anchors are shipped** — local presence and direct mTLS are the
+   remote-capable daemon-control entry points. The packaged macOS app has a
+   loopback mTLS bridge in source, but no Developer ID-signed/notarized release
+   has been published for this alpha. The release pipeline labels builds
+   `-unsigned-dev` until signing credentials are provisioned; those artifacts
+   are not distribution anchors.
 2. **Hosted refusal and migration are shipped** — hosted provenance is fixed
    at `role:none`; Connect signaling is refused at both ends; IAM schema v2
    revokes grants created by the retired Connect bootstrap and `--owner`
    browser-key bootstrap.
 3. **Client identity keys are metadata-only in this alpha** — they sign fleet
-   records and remain useful subject vocabulary, but no live alpha ingress
-   authenticates a browser with one. Device enrollment UI/state is therefore
-   staged, not a replacement for mTLS.
+   records and remain useful subject vocabulary. Peer offers can verify one for
+   attribution, but no live alpha ingress admits it as the controlling IAM
+   principal. Device enrollment UI/state is therefore staged, not a replacement
+   for mTLS.
 4. **Local grant fanout, signed and encrypted fleet sync, org-signed grant and
    revocation documents, self-hostable Connect, and transparency-log records
    are implemented** — every daemon still makes its own trust and
