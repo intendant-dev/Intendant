@@ -20,18 +20,23 @@ use crate::domains::{h_tag, Tag};
 use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
-    ctrl_header, Cenrollnew, Cgenesis, Cgrant, Ckekrotate, Crevokedev, RevokeMode,
+    ctrl_header, Cenrollnew, Cgenesis, Cgrant, Ckekrotate, Crevokedev, Crevokegrant, RevokeMode,
 };
 use crate::shapes::envelope::{
     gen_start, seal_op, Actor, ActorKind, Header, OpSigner, Signedop, Tenant, Writer,
 };
 use crate::shapes::identity::{
-    Authproof, Budget, Cert, Genesis, Grant, GrantTenant, Provenance, SpacesSel, ZoneSel,
+    Authproof, Budget, Cert, Endpoint, Genesis, Grant, GrantTenant, Provenance, SpacesSel, ZoneSel,
 };
-use crate::shapes::memory::Mclaim;
+use crate::shapes::journal::AbortReason;
+use crate::shapes::journal::{
+    sign_receipt, Itemcommit, Itemwrap, MissingRec, Pendingxfer, Receiptstmt, Signedstmt, Txn,
+    Txnrec, Xferabort, Xferdone, Xferreopen,
+};
+use crate::shapes::memory::{Mclaim, Mexportrel};
 use crate::shapes::{
-    Bytes16, Bytes32, Class, Devclass, Frontierclose, Hlc, Kekwrap, Kind, Lineagedef, Polref,
-    Sigalg, Spaceclass, Spacedef, ToValue, Verb,
+    Bytes16, Bytes32, Class, Devclass, Factref, Frontierclose, Hlc, Issuerid, Kekwrap, Kind,
+    Lineagedef, Opfactref, Polref, Sigalg, Spaceclass, Spacedef, ToValue, Verb,
 };
 use crate::suite::{self, hpke_wrap};
 use crate::vector::{hex, Expected, RecordingRng, Vector};
@@ -133,6 +138,7 @@ fn draw_id(rng: &mut RecordingRng, name: &str) -> Bytes16 {
 }
 
 /// One enrolled device's key material and certificate.
+#[derive(Clone)]
 pub struct Device {
     pub device_id: Bytes16,
     pub lineage: Bytes16,
@@ -562,32 +568,19 @@ impl PlaneRig {
         self.seal_ctrl(Ckekrotate::OP_TYPE, proof, body.to_value())
     }
 
-    /// A tenant `m.claim` (plain propose) by `dev` under `grant`, at
-    /// `(gen 1, writer_sequence)` of the device's lineage.
-    pub fn claim(
+    /// A generic tenant operation by `dev` under `grant` on the home
+    /// space, at `(gen 1, writer_sequence)` of the device's lineage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tenant_op(
         &mut self,
         dev: &Device,
         grant: &Grant,
         tag: &str,
-        statement: &str,
+        op_type: &str,
+        body: cbor::Value,
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
-        let body = Mclaim {
-            kind: Kind::Observation,
-            statement: statement.into(),
-            sensitivity: Class::Private,
-            observed_at_ms: Some(self.hlc_ms),
-            valid_from_ms: None,
-            valid_until_ms: None,
-            expires_at_ms: None,
-            session: None,
-            project: None,
-            model: None,
-            evidence: vec![],
-            supersedes: None,
-            labels: None,
-        };
         let request_id = draw_id(&mut self.rng, &format!("{tag}.request_id"));
         let hlc = self.next_hlc();
         let header = Header {
@@ -614,14 +607,164 @@ impl PlaneRig {
                 .unwrap_or_else(|| gen_start(&dev.lineage, 1)),
             causal_references: vec![],
             created_hlc: hlc,
-            operation_type: Mclaim::OP_TYPE.into(),
+            operation_type: op_type.into(),
             operation_version: 1,
             body_hash: [0; 32], // set by seal_op
         };
-        let op = seal_op(header, body.to_value(), &OpSigner::Ed25519(&dev.sig_sk));
+        let op = seal_op(header, body, &OpSigner::Ed25519(&dev.sig_sk));
         assert!(op.verify(&dev.sig_pk), "tenant op must verify");
         op
     }
+
+    /// A tenant `m.claim` (plain propose).
+    pub fn claim(
+        &mut self,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        statement: &str,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
+        let body = Mclaim {
+            kind: Kind::Observation,
+            statement: statement.into(),
+            sensitivity: Class::Private,
+            observed_at_ms: Some(self.hlc_ms),
+            valid_from_ms: None,
+            valid_until_ms: None,
+            expires_at_ms: None,
+            session: None,
+            project: None,
+            model: None,
+            evidence: vec![],
+            supersedes: None,
+            labels: None,
+        };
+        self.tenant_op(
+            dev,
+            grant,
+            tag,
+            Mclaim::OP_TYPE,
+            body.to_value(),
+            writer_sequence,
+            previous_writer_hash,
+        )
+    }
+
+    /// `c.revoke_grant` (admin arm) — cutoff REQUIRED when the grant
+    /// is op-authoring (D-78/D-143).
+    pub fn revoke_grant_op(
+        &mut self,
+        grant_id: Bytes16,
+        cutoff: Option<Frontierclose>,
+    ) -> Signedop {
+        let body = Crevokegrant { grant_id, cutoff };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Crevokegrant::OP_TYPE, proof, body.to_value())
+    }
+
+    /// A tenant `m.export.release` by `dev` to a plane destination —
+    /// a genuine signed triple (the journal fixtures seal it into the
+    /// release ItemCommit, so `release_op = H_op(triple)` is real; its
+    /// own fold admission is outside the journal machine's scope).
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_op_signed(
+        &mut self,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        export_id: Bytes16,
+        sources: Vec<Bytes32>,
+        content_digest: Bytes32,
+        dest_zone: Bytes16,
+        dest_space: Bytes16,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
+        let body = Mexportrel {
+            export_id,
+            sources,
+            content_digest,
+            to: Endpoint::Plane {
+                plane_id: self.plane_id,
+                zone_id: dest_zone,
+                space_id: dest_space,
+            },
+            class_floor: Class::Private,
+            data_frontier: self.rng.draw32(&format!("{tag}.data_frontier")),
+            control_frontier: self.ctrl_head,
+            as_of_ms: self.hlc_ms,
+            expiry_deadline_ms: self.hlc_ms + 86_400_000,
+        };
+        self.tenant_op(
+            dev,
+            grant,
+            tag,
+            Mexportrel::OP_TYPE,
+            body.to_value(),
+            writer_sequence,
+            previous_writer_hash,
+        )
+    }
+
+    /// Seal `triple` as an item at `(dev.lineage, 1, seq)` in the
+    /// genesis zone: drawn DEK + nonce, §5.3 wrap under the epoch-1
+    /// KEK — a byte-honest ItemCommit.
+    pub fn seal_commit(&mut self, dev: &Device, triple: &[u8], tag: &str, seq: u64) -> Itemcommit {
+        let dek = self.rng.draw32(&format!("{tag}.dek"));
+        let nonce = self.rng.draw12(&format!("{tag}.nonce"));
+        let core = keyschedule::seal_item(&dek, nonce, &self.plane_id, &self.zone_id, triple);
+        let addr = keyschedule::item_addr(&core);
+        let wrapped =
+            keyschedule::wrap_dek(&self.kek_e1, &self.plane_id, &self.zone_id, 1, &addr, &dek);
+        Itemcommit {
+            core,
+            wrap: Itemwrap {
+                item_addr: addr,
+                key_wrap_epoch: 1,
+                wrapped_dek: wrapped,
+            },
+            lineage: dev.lineage,
+            gen: 1,
+            seq,
+        }
+    }
+
+    /// A signed storage receipt from `dev` (issuer_seq 1) — a real
+    /// `Signedstmt` whose `stmt_id` fixtures can cite.
+    pub fn storage_receipt(&mut self, dev: &Device, subject: Bytes32) -> Signedstmt {
+        let stmt = Receiptstmt::Storage {
+            issuer: Issuerid::Device {
+                cert: h_cert(&dev.cert),
+            },
+            plane_id: self.plane_id,
+            zone_id: self.zone_id,
+            subject,
+            size: 512,
+            seen_ms: self.hlc_ms,
+            issuer_seq: 1,
+            prev_stmt: [0; 32],
+        };
+        sign_receipt(&stmt, &OpSigner::Ed25519(&dev.sig_sk))
+    }
+}
+
+/// Canonical bytes of any shape — journal frames enter the items map
+/// this way.
+fn enc(v: &impl ToValue) -> Vec<u8> {
+    cbor::encode(&v.to_value()).expect("shape encodes")
+}
+
+fn items_raw(entries: &[(&str, &[u8])]) -> Json {
+    let mut m = JsonMap::new();
+    for (name, b) in entries {
+        m.insert((*name).into(), json!(hex(b)));
+    }
+    Json::Object(m)
 }
 
 fn items(entries: &[(&str, &Signedop)]) -> Json {
@@ -823,12 +966,312 @@ pub fn f7_pending_revocation_window_grant() -> Vector {
     }
 }
 
+/// The shared journal preamble both journal fixtures mint: a real
+/// release triple sealed into its ItemCommit, committed in ONE Txn
+/// with the PendingXfer (§6.2 — the source-zone commit shape), plus
+/// the revocation op the abort bases cite (held via `aux`).
+struct JournalPreamble {
+    rig: PlaneRig,
+    export_id: Bytes16,
+    release_op: Bytes32,
+    srcs: Vec<Bytes32>,
+    t1: Txn,
+    revoke_op: Signedop,
+    grant3_op: Signedop,
+}
+
+fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+
+    // The op the abort bases cite: a real revocation of a real import
+    // grant (issued to a second device, then revoked — the
+    // revoked-grant `no-grant` cause of the missing imports).
+    let dev2 = rig.mint_device("dev2");
+    let g3 = rig.simple_grant("grant3", &dev2, vec![Verb::Import]);
+    let g3_id = g3.grant_id;
+    let grant3_op = rig.grant_op(g3);
+    let revoke_op = rig.revoke_grant_op(
+        g3_id,
+        // import is op-authoring: the revocation carries the target
+        // lineage's (empty-heads) authorship cutoff (D-143).
+        Some(Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }),
+    );
+
+    // The release: real signed triple, sealed byte-honestly into the
+    // journal's opening Txn. Source ids are opaque to the journal
+    // machine (drawn; never dereferenced by replay).
+    let export_id = draw_id(&mut rig.rng, "rel.export_id");
+    let srcs: Vec<Bytes32> = (1..=source_count)
+        .map(|i| rig.rng.draw32(&format!("src{i}.op_hash")))
+        .collect();
+    let content_digest = rig.rng.draw32("rel.content_digest");
+    let dest_zone = draw_id(&mut rig.rng, "dest.zone_id");
+    let dest_space = draw_id(&mut rig.rng, "dest.space_id");
+    let grant = rig.genesis_grant.clone();
+    let rel = rig.release_op_signed(
+        &d1,
+        &grant,
+        "rel",
+        export_id,
+        srcs.clone(),
+        content_digest,
+        dest_zone,
+        dest_space,
+        1,
+        None,
+    );
+    let release_op = rel.op_hash();
+    let commit = rig.seal_commit(&d1, &rel.encode(), "rel.item", 1);
+    let t1 = Txn {
+        records: vec![
+            Txnrec::ItemCommit(commit),
+            Txnrec::PendingXfer(Pendingxfer {
+                export_id,
+                release_op,
+                dest_zone,
+                content_digest,
+                record_count: source_count as u64,
+            }),
+        ],
+    };
+
+    JournalPreamble {
+        rig,
+        export_id,
+        release_op,
+        srcs,
+        t1,
+        revoke_op,
+        grant3_op,
+    }
+}
+
+/// Tranche #4 — family 13 journal-replay: Abort/Reopen inside one
+/// Txn, then competing terminals inside one Txn (D-200). Journal
+/// order is `(frame ordinal, record index)`: t2's abort terminals
+/// interval 0 and its reopen — validating SEQUENTIALLY against
+/// transaction-local state — opens interval 1 (frame order alone
+/// could never order the pair). t3 then carries a Done AND an Abort
+/// for interval 1: the second terminal in one interval is a journal
+/// invariant violation, `(log-corrupt, storage-quarantine)`, and the
+/// commit is all-or-nothing — the Done is DISCARDED with it, so
+/// interval 1 stays open (the intervals result proves the discard).
+pub fn f13_txn_internal_order() -> Vector {
+    let name = "txn-internal-order-and-competing-terminals";
+    let mut p = journal_preamble(name, 2);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let (r1, r2) = (p.srcs[0], p.srcs[1]);
+
+    // The reopen's invalidation: a real signed statement, HELD via
+    // aux (the journal machine checks holding and basis-match; cause
+    // sufficiency is fold territory).
+    let d1 = p.rig.dev1.clone();
+    let fork_stmt = p.rig.storage_receipt(&d1, rop);
+    let s_id = fork_stmt.stmt_id();
+
+    let t2 = Txn {
+        records: vec![
+            Txnrec::XferAbort(Xferabort {
+                export_id: eid,
+                release_op: rop,
+                reason: AbortReason::RejectPermanent,
+                incarnation: 0,
+                missing: vec![
+                    MissingRec {
+                        rec: r1,
+                        basis: Some(x),
+                    },
+                    MissingRec {
+                        rec: r2,
+                        basis: Some(x),
+                    },
+                ],
+            }),
+            Txnrec::XferReopen(Xferreopen {
+                export_id: eid,
+                release_op: rop,
+                incarnation: 0,
+                basis: x,
+                invalidation: Factref::Stmt(s_id),
+            }),
+        ],
+    };
+    let t3 = Txn {
+        records: vec![
+            Txnrec::XferDone(Xferdone {
+                export_id: eid,
+                release_op: rop,
+                incarnation: 1,
+                completed: vec![r1, r2],
+            }),
+            Txnrec::XferAbort(Xferabort {
+                export_id: eid,
+                release_op: rop,
+                reason: AbortReason::RejectPermanent,
+                incarnation: 1,
+                missing: vec![MissingRec {
+                    rec: r2,
+                    basis: Some(x),
+                }],
+            }),
+        ],
+    };
+
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
+    );
+    inputs.insert("deliveries".into(), json!([["t1", "t2", "t3"]]));
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    aux.insert("fork.stmt".into(), json!(hex(&enc(&fork_stmt))));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 13,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec![
+            "browser".into(),
+            "storage-macos".into(),
+            "storage-linux".into(),
+            "storage-windows".into(),
+        ],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+                { "incarnation": 1, "terminal": "open" },
+            ],
+            "per_record": [
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
+/// Tranche #3 — family 11 journal-replay: the D-193/D-200 basis
+/// typing. t3 is a well-formed reopen whose op-kind basis is held
+/// but whose stmt-kind INVALIDATION cites an unheld statement — it
+/// verifies as a shape and PENDS `ref-unresolved` (verifiable-when-
+/// held, D-163/D-185), reserving the interval. t4 carries a
+/// stmt-kind BASIS — structurally outside `opfactref`, so it fails
+/// at parse: `(log-corrupt, storage-quarantine)`; a parse-invalid
+/// record classifies immediately (it is not a valid transition, so
+/// the reservation queue never sees it).
+pub fn f11_reopen_basis_types() -> Vector {
+    let name = "reopen-basis-op-kind-and-unheld-invalidation";
+    let mut p = journal_preamble(name, 1);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let r1 = p.srcs[0];
+    let unheld_stmt = p.rig.rng.draw32("unheld.stmt_id");
+
+    let t2 = Txn {
+        records: vec![Txnrec::XferAbort(Xferabort {
+            export_id: eid,
+            release_op: rop,
+            reason: AbortReason::RejectPermanent,
+            incarnation: 0,
+            missing: vec![MissingRec {
+                rec: r1,
+                basis: Some(x),
+            }],
+        })],
+    };
+    let t3 = Txn {
+        records: vec![Txnrec::XferReopen(Xferreopen {
+            export_id: eid,
+            release_op: rop,
+            incarnation: 0,
+            basis: x,
+            invalidation: Factref::Stmt(unheld_stmt),
+        })],
+    };
+    // t4: the D-193/D-200 negative — hand-built below the typed
+    // layer, which cannot express a stmt-kind basis.
+    let t4_bytes = {
+        use crate::shapes::{bytes, text, u};
+        let bad_reopen = cbor::map(vec![
+            ("export_id", bytes(&eid)),
+            ("release_op", bytes(&rop)),
+            ("incarnation", u(0)),
+            (
+                "basis",
+                cbor::map(vec![("kind", text("stmt")), ("ref", bytes(&x.0))]),
+            ),
+            (
+                "invalidation",
+                Factref::Op(p.revoke_op.op_hash()).to_value(),
+            ),
+        ]);
+        cbor::encode(&cbor::map(vec![(
+            "records",
+            cbor::Value::Array(vec![bad_reopen]),
+        )]))
+        .expect("bad txn encodes")
+    };
+
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[
+            ("t1", &enc(&p.t1)),
+            ("t2", &enc(&t2)),
+            ("t3", &enc(&t3)),
+            ("t4", &t4_bytes),
+        ]),
+    );
+    inputs.insert("deliveries".into(), json!([["t1", "t2", "t3", "t4"]]));
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+            ],
+            "per_record": [
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
+                { "rec": "t4", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
 /// Every tranche fixture, in annex order (grows as builders land).
 pub fn tranche() -> Vec<Vector> {
     vec![
         f7_delayed_reference_convergence(),
         f7_negation_residual(),
         f7_pending_revocation_window_grant(),
+        f11_reopen_basis_types(),
+        f13_txn_internal_order(),
     ]
 }
 
