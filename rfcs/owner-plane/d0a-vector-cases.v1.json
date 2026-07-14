@@ -652,9 +652,9 @@
                   }
                 },
                 "required": ["result"]
-              },
-              "$comment": "the construct-and-rederive contract (D-127/D-156): fixtures start from sources + keys; the harness independently re-derives the root, paths, and release_op"
-            }
+              }
+            },
+            "$comment": "the construct-and-rederive contract (D-127/D-156): fixtures start from sources + keys; the harness independently re-derives the root, paths, and release_op"
           } },
         { "if": { "properties": { "case_kind": { "const": "merkle-proof" } }, "required": ["case_kind"] },
           "then": {
@@ -993,9 +993,9 @@
                   }
                 },
                 "required": ["result"]
-              },
-              "$comment": "family 14: the umbrella RFC App C #2 offline confirmation — the run's result is recorded in spec §15 when performed"
-            }
+              }
+            },
+            "$comment": "family 14: the umbrella RFC App C #2 offline confirmation — the run's result is recorded in spec §15 when performed"
           } }
       ]
     }

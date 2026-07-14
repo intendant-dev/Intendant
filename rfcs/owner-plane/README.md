@@ -16,6 +16,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
 | `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
+| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, fold logic; `cargo run --bin harness` reports per-vector status). The tranche stays red here until the reducer's engine reproduces it |
 
 ## Provenance note
 

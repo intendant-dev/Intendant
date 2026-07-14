@@ -1,0 +1,19 @@
+[package]
+name = "owner-plane-reducer"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A independent reducer + differential harness. Shares NO code with owner-plane-core (the fixture-minting reference): own strict CBOR reader, own domain framing, own fold logic — the point of the differential exercise. Third-party primitives (sha2, ed25519-dalek, serde_json) are shared dependencies, not shared code."
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+serde_json = "1"
+# The harness validates every vector against the §13.1 container
+# schema AND the companion with a real JSON Schema engine (Draft
+# 2020-12) — hand-rolled validation is the reference core's lane.
+jsonschema = { version = "0.26", default-features = false }
+
+# Standalone: NOT a member of the intendant workspace — lives and
+# versions with the spec, like core/.
+[workspace]
