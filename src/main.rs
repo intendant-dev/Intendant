@@ -4,6 +4,7 @@ use crate::models::AgentInput;
 use std::io::{self, Read, Write};
 
 mod agent;
+mod build_info;
 mod error;
 mod models;
 mod utils;
@@ -87,6 +88,17 @@ fn write_line(stdout: &mut io::StdoutLock, line: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
+    // Version/provenance probe — MUST run before anything touches stdin
+    // (the runtime otherwise blocks reading its one-shot JSON input) and
+    // before the Windows sandbox re-exec consumes the argv.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--version") | Some("-V")
+    ) {
+        println!("{}", build_info::version_line("intendant-runtime"));
+        return Ok(());
+    }
+
     // Initialize logging
     env_logger::init();
 

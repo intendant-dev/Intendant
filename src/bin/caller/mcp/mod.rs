@@ -523,6 +523,13 @@ impl IntendantServer {
                     self.hide_shared_view_for_session(params, session_id).await,
                 ))
             }
+            "clear_shared_view_focus" => {
+                let Parameters(params) = parse_params::<ClearSharedViewFocusParams>(args)?;
+                Ok(text_tool_result(
+                    self.clear_shared_view_focus_for_session(params, session_id)
+                        .await,
+                ))
+            }
             "focus_shared_view" => {
                 let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
                 Ok(text_tool_result(
@@ -1056,6 +1063,13 @@ impl IntendantServer {
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
             let usage = s.usage_snapshot_for(Some(&session_id));
+            // Running-binary provenance (EV-02): the daemon's own embedded
+            // version line, so `intendant ctl status` can pin the exact
+            // revision serving this answer.
+            obj.insert(
+                "daemon_version".to_string(),
+                serde_json::Value::String(crate::build_info::version_line("intendant")),
+            );
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),

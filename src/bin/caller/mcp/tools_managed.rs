@@ -1431,6 +1431,7 @@ mod tests {
             assert!(vanilla_names.contains(&"get_status"));
             assert!(vanilla_names.contains(&"show_shared_view"));
             assert!(vanilla_names.contains(&"focus_shared_view"));
+            assert!(vanilla_names.contains(&"clear_shared_view_focus"));
             assert!(vanilla_names.contains(&"request_shared_view_input"));
             assert!(vanilla_names.contains(&"capture_shared_view_frame"));
             assert!(vanilla_names.contains(&"hide_shared_view"));

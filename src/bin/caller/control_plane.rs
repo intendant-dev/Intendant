@@ -77,6 +77,12 @@ pub struct ControlPlaneState {
 pub fn spawn(state: ControlPlaneState) -> tokio::task::JoinHandle<()> {
     let mut intent_rx = state.bus.subscribe_intents();
     tokio::spawn(async move {
+        // Shared-view focus-annotation lifecycle (CU-05): fold the ordered
+        // shared-view stream so a display revoke or the owning session's
+        // end auto-clears an annotation that outlived its content. The
+        // emitted `focus_clear` re-enters this loop and folds to a no-op.
+        let mut shared_view_annotations =
+            crate::shared_view_lifecycle::SharedViewAnnotations::new();
         while let Some(event) = intent_rx.recv().await {
             match event {
                 AppEvent::ControlCommand(msg) => {
@@ -92,9 +98,19 @@ pub fn spawn(state: ControlPlaneState) -> tokio::task::JoinHandle<()> {
                         &session_id,
                         &state.bus,
                     );
+                    if let Some(clear) = shared_view_annotations.on_session_ended(&session_id) {
+                        state.bus.send(clear);
+                    }
                 }
-                AppEvent::UserDisplayRevoked { .. } => {
+                AppEvent::UserDisplayRevoked { display_id, .. } => {
                     crate::display_requests::registry().note_revoked();
+                    if let Some(clear) = shared_view_annotations.on_user_display_revoked(display_id)
+                    {
+                        state.bus.send(clear);
+                    }
+                }
+                AppEvent::SharedView { .. } => {
+                    shared_view_annotations.observe(&event);
                 }
                 // Other intent-lane events (identity/relationship
                 // bookkeeping) belong to the session supervisor.
@@ -1231,6 +1247,97 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    /// End-to-end wiring of the CU-05 focus-annotation lifecycle through
+    /// the REAL control-plane loop: `SharedView` events ride the intent
+    /// lane into the tracker, and the session-end / display-revoke arms
+    /// broadcast the `focus_clear`. (The transition matrix itself is
+    /// unit-tested in `shared_view_lifecycle`.) Session ids are unique to
+    /// this test because the loop also feeds the process-global
+    /// display-request registry.
+    #[tokio::test]
+    async fn control_plane_loop_clears_focus_annotations_on_lifecycle_events() {
+        let bus = EventBus::new();
+        let (state, _autonomy) = display_request_test_state(&bus);
+        let _loop_task = spawn(state);
+        let mut rx = bus.subscribe();
+
+        async fn await_focus_clear(
+            rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        ) -> (Option<String>, Option<u32>, Option<String>) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::SharedView {
+                            action,
+                            session_id,
+                            display_id,
+                            reason,
+                            ..
+                        }) if action == "focus_clear" => {
+                            return (session_id, display_id, reason);
+                        }
+                        Ok(_) => {}
+                        Err(err) => panic!("bus closed while waiting for focus_clear: {err}"),
+                    }
+                }
+            })
+            .await
+            .expect("focus_clear must be broadcast")
+        }
+
+        // A session draws an annotation on an agent-owned display; the
+        // session's end must clear it.
+        bus.send(AppEvent::SharedView {
+            session_id: Some("cp-svl-owner".to_string()),
+            action: "focus".to_string(),
+            display_target: Some("display_7".to_string()),
+            display_id: Some(7),
+            reason: None,
+            region: Some(crate::types::SharedViewRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            note: Some("watch this".to_string()),
+        });
+        bus.send(AppEvent::SessionEnded {
+            session_id: "cp-svl-owner".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        let (session_id, display_id, reason) = await_focus_clear(&mut rx).await;
+        assert_eq!(session_id.as_deref(), Some("cp-svl-owner"));
+        assert_eq!(display_id, Some(7));
+        assert_eq!(reason.as_deref(), Some("owning session ended"));
+
+        // Re-arm on the user display; revoking the grant must clear it.
+        // (The emitted clear above re-entered the loop and folded to a
+        // no-op — a stale record would mis-attribute this second clear.)
+        bus.send(AppEvent::SharedView {
+            session_id: Some("cp-svl-owner-2".to_string()),
+            action: "focus".to_string(),
+            display_target: Some("user_session".to_string()),
+            display_id: Some(0),
+            reason: None,
+            region: Some(crate::types::SharedViewRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.3,
+                height: 0.3,
+            }),
+            note: None,
+        });
+        bus.send(AppEvent::UserDisplayRevoked {
+            display_id: 0,
+            note: None,
+        });
+        let (session_id, display_id, reason) = await_focus_clear(&mut rx).await;
+        assert_eq!(session_id.as_deref(), Some("cp-svl-owner-2"));
+        assert_eq!(display_id, Some(0));
+        assert_eq!(reason.as_deref(), Some("display access revoked"));
     }
 
     #[tokio::test]

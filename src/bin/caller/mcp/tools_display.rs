@@ -744,6 +744,36 @@ impl IntendantServer {
         self.hide_shared_view_for_session(params, None).await
     }
 
+    pub(crate) async fn clear_shared_view_focus_for_session(
+        &self,
+        params: ClearSharedViewFocusParams,
+        session_id: Option<&str>,
+    ) -> String {
+        // Like hide, this is a cleanup verb: no display resolution and no
+        // activation gate — it only retracts presentation state, so it must
+        // stay callable after the underlying display/grant is gone.
+        self.emit_shared_view(
+            session_id,
+            "focus_clear",
+            None,
+            None,
+            params.reason,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Clear the shared display view's focus annotation (highlight region + note) while keeping the shared view itself open. Idempotent — safe to call when nothing is highlighted. Use it as soon as the annotated content is gone (tab closed, page navigated away) instead of leaving stale guidance on screen; hide_shared_view also clears it when the whole collaboration moment ends."
+    )]
+    pub(crate) async fn clear_shared_view_focus(
+        &self,
+        Parameters(params): Parameters<ClearSharedViewFocusParams>,
+    ) -> String {
+        self.clear_shared_view_focus_for_session(params, None).await
+    }
+
     pub(crate) async fn focus_shared_view_for_session(
         &self,
         params: FocusSharedViewParams,
