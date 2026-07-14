@@ -15,5 +15,6 @@
 pub mod cbor;
 pub mod domains;
 pub mod envelope;
+pub mod fold;
 pub mod harness;
 pub mod outcomes;

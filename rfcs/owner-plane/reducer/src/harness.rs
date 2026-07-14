@@ -30,7 +30,9 @@ use crate::outcomes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemStatus {
-    Unimplemented,
+    /// The engine met an operation type or lane outside its coverage
+    /// — the honest red state; the reason names the frontier.
+    Unimplemented(String),
     Pass,
     Fail(String),
 }
@@ -169,9 +171,134 @@ fn check_decode(vector: &Json) -> Result<(), String> {
 }
 
 /// The semantic dispatch — grows with the reducer's engine.
+///
+/// `fold` vectors run the three-run standard: EVERY listed delivery
+/// order PLUS a fresh fold of the union (sorted item names — the
+/// engine's fixpoint re-evaluation makes arrival order immaterial,
+/// which is exactly what the standard asserts), identical final
+/// state required, then per_item and trace comparison.
 fn run_semantics(vector: &Json) -> SemStatus {
-    let _ = vector;
-    SemStatus::Unimplemented
+    let kind = vector["case_kind"].as_str().unwrap_or_default();
+    if kind != "fold" {
+        return SemStatus::Unimplemented(format!("case_kind {kind}"));
+    }
+    match run_fold_vector(vector) {
+        Ok(status) => status,
+        Err(e) => SemStatus::Fail(e),
+    }
+}
+
+fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?
+        .iter()
+        .map(|d| {
+            d.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or("delivery not an array")
+        })
+        .collect::<Result<_, _>>()?;
+
+    // The three-run standard.
+    let mut runs = Vec::new();
+    for order in &deliveries {
+        match crate::fold::run_delivery(&items, order) {
+            Ok(run) => runs.push(run),
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+        }
+    }
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let fresh = match crate::fold::run_delivery(&items, &fresh_order) {
+        Ok(run) => run,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    for (i, run) in runs.iter().enumerate() {
+        if run.final_verdicts != fresh.final_verdicts {
+            return Ok(SemStatus::Fail(format!(
+                "delivery {i} final state diverges from the fresh fold"
+            )));
+        }
+    }
+
+    // per_item: exactly one row per delivered item; absent pair =
+    // finally admits.
+    let expected_rows = vector["expected"]["result"]["per_item"]
+        .as_array()
+        .ok_or("per_item missing")?;
+    let final_v = &fresh.final_verdicts;
+    if expected_rows.len() != final_v.len() {
+        return Ok(SemStatus::Fail(format!(
+            "per_item rows {} != delivered items {}",
+            expected_rows.len(),
+            final_v.len()
+        )));
+    }
+    for row in expected_rows {
+        let name = row["item"].as_str().ok_or("row.item")?;
+        let Some(verdict) = final_v.get(name) else {
+            return Ok(SemStatus::Fail(format!(
+                "per_item names unknown item {name}"
+            )));
+        };
+        let want = match (row.get("outcome"), row.get("disposition")) {
+            (Some(o), Some(d)) => Some((
+                o.as_str().ok_or("row.outcome")?,
+                d.as_str().ok_or("row.disposition")?,
+            )),
+            _ => None,
+        };
+        let got = verdict.pair();
+        if got != want {
+            return Ok(SemStatus::Fail(format!(
+                "{name}: expected {want:?}, reducer derived {got:?}"
+            )));
+        }
+    }
+
+    // trace: in delivery #d, immediately after `after` folds, `item`
+    // holds (outcome, disposition).
+    if let Some(trace) = vector["expected"]["result"]["trace"].as_array() {
+        for t in trace {
+            let d = t["delivery"].as_u64().ok_or("trace.delivery")? as usize;
+            let after = t["after"].as_str().ok_or("trace.after")?;
+            let item = t["item"].as_str().ok_or("trace.item")?;
+            let want = (
+                t["outcome"].as_str().ok_or("trace.outcome")?,
+                t["disposition"].as_str().ok_or("trace.disposition")?,
+            );
+            let run = runs.get(d).ok_or("trace delivery index")?;
+            let pos = deliveries[d]
+                .iter()
+                .position(|n| n == after)
+                .ok_or("trace.after not in delivery")?;
+            let snap = run.snapshots.get(pos).ok_or("trace snapshot")?;
+            let got = snap.get(item).and_then(|v| v.pair());
+            if got != Some(want) {
+                return Ok(SemStatus::Fail(format!(
+                    "trace d{d} after {after}: {item} expected {want:?}, got {got:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(SemStatus::Pass)
 }
 
 /// Run the full harness over a vectors directory.
@@ -249,6 +376,12 @@ mod tests {
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(reports.len(), 8, "the opening tranche is eight vectors");
+        // The burn-down: fixtures flip to Pass as engine coverage
+        // grows; a Fail anywhere is a differential finding.
+        let expect_pass = [
+            "f07-delayed-reference-convergence-c1-i-c2.json",
+            "f07-negation-residual-acceptance.json",
+        ];
         for r in &reports {
             assert!(
                 r.structural_ok(),
@@ -259,7 +392,16 @@ mod tests {
                 r.pairs_ok,
                 r.decode_ok
             );
-            assert_eq!(r.semantics, SemStatus::Unimplemented, "{}", r.file);
+            if expect_pass.contains(&r.file.as_str()) {
+                assert_eq!(r.semantics, SemStatus::Pass, "{}", r.file);
+            } else {
+                assert!(
+                    matches!(r.semantics, SemStatus::Unimplemented(_)),
+                    "{}: {:?}",
+                    r.file,
+                    r.semantics
+                );
+            }
         }
     }
 

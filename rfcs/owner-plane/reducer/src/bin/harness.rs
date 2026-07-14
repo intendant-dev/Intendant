@@ -16,8 +16,8 @@ fn main() {
     for r in &reports {
         let s = |x: &Result<(), String>| if x.is_ok() { "ok" } else { "FAIL" };
         let sem = match &r.semantics {
-            SemStatus::Unimplemented => "unimplemented".to_string(),
-            SemStatus::Pass => "pass".to_string(),
+            SemStatus::Unimplemented(why) => format!("unimplemented ({why})"),
+            SemStatus::Pass => "PASS".to_string(),
             SemStatus::Fail(e) => format!("FAIL: {e}"),
         };
         println!(
