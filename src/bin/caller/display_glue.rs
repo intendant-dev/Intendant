@@ -1491,11 +1491,13 @@ pub(crate) async fn handle_shared_view_calls(
         // The user's own screen is an explicit opt-in path: require the
         // existing display grant instead of flipping it from a tool call.
         // Only display-exposing verbs gate — focus/input/hide operate on
-        // whatever view is already shown.
+        // whatever view is already shown. The cleanup verbs (hide,
+        // focus_clear) never auto-resolve a display: they retract
+        // presentation state wherever it is.
         let user_display_granted = autonomy.read().await.user_display_granted;
         let resolved =
             mcp::resolve_concrete_shared_view_target(display_target, None).or_else(|| {
-                if action == "hide" {
+                if matches!(action, "hide" | "focus_clear") {
                     None
                 } else {
                     Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
@@ -1624,13 +1626,20 @@ pub(crate) async fn handle_shared_view_calls(
                      dashboard control — continue only after they take over or respond."
                 )
             }
+            "focus_clear" => {
+                // Cleanup verb like hide: no display gate — it only retracts
+                // presentation state and must work after the annotated
+                // content (or the display grant) is already gone.
+                bus.send(emit("focus_clear", None));
+                "Focus highlight cleared; the shared view stays open.".to_string()
+            }
             "hide" => {
                 bus.send(emit("hide", None));
                 "Shared view dismissed.".to_string()
             }
             other => format!(
-                "Error: unknown shared_view action '{other}' — use show, focus, capture, \
-                 input, or hide."
+                "Error: unknown shared_view action '{other}' — use show, focus, focus_clear, \
+                 capture, input, or hide."
             ),
         };
         slog(session_log, |l| {
@@ -2114,6 +2123,12 @@ mod tests {
             ),
             ("c4".to_string(), serde_json::json!({"action": "bogus"})),
             ("c5".to_string(), serde_json::json!({"action": "input"})),
+            // focus_clear is an ungated cleanup verb (CU-05): no region, no
+            // display resolution, callable without any grant.
+            (
+                "c6".to_string(),
+                serde_json::json!({"action": "focus_clear"}),
+            ),
         ];
         handle_shared_view_calls(
             &calls,
@@ -2133,7 +2148,7 @@ mod tests {
             .iter()
             .filter(|m| m.role == "tool")
             .collect();
-        assert_eq!(results.len(), 5, "one result per call");
+        assert_eq!(results.len(), 6, "one result per call");
         assert!(
             results[0].content.contains("dismissed"),
             "{}",
@@ -2158,6 +2173,11 @@ mod tests {
             results[4].content.contains("Input authority requested"),
             "{}",
             results[4].content
+        );
+        assert!(
+            results[5].content.contains("Focus highlight cleared"),
+            "{}",
+            results[5].content
         );
 
         // The valid hide and advisory input request emit SharedView events;
@@ -2185,6 +2205,22 @@ mod tests {
                 assert_eq!(display_id, Some(99));
             }
             other => panic!("expected SharedView input_request event, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action,
+                session_id,
+                display_target,
+                display_id,
+                ..
+            }) => {
+                assert_eq!(action, "focus_clear");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                // Cleanup verbs never auto-resolve a display target.
+                assert_eq!(display_target, None);
+                assert_eq!(display_id, None);
+            }
+            other => panic!("expected SharedView focus_clear event, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no further events expected");
     }
