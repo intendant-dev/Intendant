@@ -91,7 +91,7 @@ impl SharedViewAnnotations {
         let matches_display = self
             .current
             .as_ref()
-            .is_some_and(|a| a.display_id.map_or(true, |id| id == display_id));
+            .is_some_and(|a| a.display_id.is_none_or(|id| id == display_id));
         if !matches_display {
             return None;
         }
