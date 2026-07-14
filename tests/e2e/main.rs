@@ -2064,6 +2064,35 @@ async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
             && !text.contains("--- screen elements ---"),
         "observe=none must attach nothing:\n{text}"
     );
+
+    // settle: the synthetic test card free-runs (its counter strip changes
+    // every frame), so it has no quiescence semantics — settle must degrade
+    // to the fixed minimal wait AND SAY SO, deterministically, on every
+    // platform (session present → "synthetic display has no damage signal";
+    // session still absent on the subprocess backends → "no live capture
+    // session" — both are the honest fixed-wait label).
+    let output = ctl(
+        &daemon,
+        &[
+            "cu",
+            "actions",
+            "--actions",
+            r#"[{"type":"wait","ms":1}]"#,
+            "--target",
+            "user_session",
+            "--observe",
+            "none",
+            "--settle",
+            "1000",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        text.contains("settle: fixed 300ms wait ("),
+        "settle on the synthetic rig must report the honest fixed wait:\n{text}"
+    );
 }
 
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon

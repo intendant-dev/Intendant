@@ -225,7 +225,9 @@ pub async fn take_screenshot(
 /// through verbatim in the peer's own `CuAction` vocabulary; the
 /// reply text carries per-action status plus the observation the peer
 /// chose (a post-action screenshot rides `images` by default; `observe`
-/// forwards the peer's ax/auto/none policies, which older peers ignore).
+/// and `settle` forward the peer's observation/quiescence policies,
+/// which older peers ignore).
+#[allow(clippy::too_many_arguments)] // verbatim passthrough of the remote tool's optional params
 pub async fn execute_cu_actions(
     registry: Option<&PeerRegistry>,
     peer_id: &str,
@@ -234,6 +236,7 @@ pub async fn execute_cu_actions(
     coordinate_space: Option<String>,
     observe: Option<String>,
     annotate: Option<bool>,
+    settle: Option<serde_json::Value>,
 ) -> PeerToolOutput {
     let handle = match peer_handle(registry, peer_id) {
         Ok(handle) => handle,
@@ -252,6 +255,9 @@ pub async fn execute_cu_actions(
     }
     if let Some(annotate) = annotate {
         arguments.insert("annotate".into(), annotate.into());
+    }
+    if let Some(settle) = settle {
+        arguments.insert("settle".into(), settle);
     }
     peer_tool_output(
         mcp_http::call_peer_mcp_tool(

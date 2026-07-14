@@ -327,8 +327,43 @@ disk-substitution consumer was retired with the Gemini CLI backend), which
 wants exactly what the model would have seen — including, on macOS, the
 logical-size (not raw-Retina) image that CU coordinates map to. Each batch
 logs a `[cu]` measurement line (observation kind/reason, capture+encode ms,
-AX walk ms, observation bytes) to the daemon log, and the native loop logs
-the same line into the session log.
+AX walk ms, observation bytes, settle outcome) to the daemon log, and the
+native loop logs the same line into the session log.
+
+### Settle: bounded UI quiescence (`settle`)
+
+The 300 ms freshness floor guarantees a *recent* frame, not a *finished* UI —
+after a click that starts a page load, the model historically padded batches
+with guessed `wait` actions. `settle` replaces the guess with a bounded
+quiescence wait (`cu_observation`): after the last input action, watch the
+display and return once no content change has been observed for a ~300 ms
+quiet window, capped at 2 s (`settle: true`) or a caller-supplied cap
+(`settle: <ms>`, clamped to 5 s; `0`/`false` = off).
+
+- **Anchoring:** the wait is anchored at the last input action. It runs
+  before the batch's first capture that follows an input (`[click,
+  screenshot]` settles between the two), or before the trailing observation
+  — the AX walk and the auto-screenshot both read the settled UI. A batch
+  with no input actions settles from call start ("capture once quiet").
+- **Damage signal:** platform-native dirty rects when frames carry them
+  (ScreenCaptureKit); otherwise a per-frame content fingerprint — the X11
+  backend polls at the capture rate and re-delivers unchanged frames, so
+  frame *arrival* is deliberately not treated as change.
+- **Honest reporting:** the result carries `settle: settled after Nms (no
+  display change for 300ms)` or `still_loading after Nms (display still
+  changing at the cap)`. Paths without a usable damage signal — no live
+  capture session, a capture stream that ends mid-wait, or the synthetic
+  test-card backend (whose counter strip free-runs, which also keeps the
+  e2e suite deterministic) — degrade to a fixed minimal wait and say so
+  (`fixed 300ms wait (...)`).
+- **No double-wait:** a damage-verified settle subsumes the capture
+  freshness wait — the stream was watched past the input, so the following
+  capture serves the current frame immediately.
+
+`settle` composes with every `observe` mode (with `none` it simply bounds
+the batch's return for callers chaining batches), and is exposed on the MCP
+tool, `ctl cu actions --settle MS`, and the peer twins (older peers ignore
+it).
 
 ### Three separate concepts: private view, agent share, presence streaming
 
