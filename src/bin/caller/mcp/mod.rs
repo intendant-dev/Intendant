@@ -564,6 +564,12 @@ impl IntendantServer {
                     .await
                     .map_err(|e| e.to_string())
             }
+            "display_readiness" => {
+                let params = parse_params::<DisplayReadinessParams>(args)?;
+                self.display_readiness_as_caller(params, caller)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
                 self.execute_cu_actions_with_output(
@@ -815,6 +821,29 @@ async fn active_display_session_resolution(
     let registry = state.read().await.session_registry.clone()?;
     let session = registry.read().await.get(display_id)?;
     Some(session.resolution())
+}
+
+/// Attach the user-session OS readiness gap to a user-display result when
+/// any OS layer is not ready (CU-02): Intendant authority (`already_granted`
+/// / an approved click) is only one layer — TCC permissions, portal
+/// sessions, and display presence can still block actual CU, and the
+/// operator must see that in the same answer. No-op when everything is
+/// ready. Probes live state; never cached.
+async fn attach_os_readiness_gap(
+    result: &mut serde_json::Value,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) {
+    let readiness = crate::cu_readiness::probe_user_session_os_readiness(session_registry).await;
+    if readiness.ready {
+        return;
+    }
+    result["os_readiness"] = readiness.gap_json();
+    result["readiness_note"] = serde_json::json!(
+        "the display grant is Intendant authority only — OS layers listed in \
+         os_readiness are still blocking; fix them (see each layer's fix) or CU \
+         calls will fail. Check again with display_readiness \
+         (or `intendant ctl display status`)."
+    );
 }
 
 async fn clear_wayland_user_session_activation_pending_after_capture(

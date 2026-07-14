@@ -14,8 +14,6 @@
 
 use crate::computer_use::{ScreenElements, UiElement};
 
-/// Cap for label/value text carried per element.
-const TEXT_CAP: usize = 80;
 /// How many "other visible windows" summaries to include.
 #[cfg(windows)]
 const OTHER_WINDOWS_CAP: usize = 8;
@@ -70,18 +68,12 @@ fn control_type_role(control_type_id: i32) -> &'static str {
     }
 }
 
-fn truncate(text: &str, cap: usize) -> String {
-    if text.chars().count() <= cap {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(cap).collect();
-    format!("{cut}...")
-}
-
+/// Trim/normalize a raw UIA property string. Deliberately no truncation
+/// here — the display cap is applied once, centrally, by
+/// `computer_use::cap_screen_elements_texts`.
 fn clean_text(text: Option<String>) -> Option<String> {
     text.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(|s| truncate(&s, TEXT_CAP))
 }
 
 /// Assemble a [`UiElement`] from raw UIA-shaped fields.
@@ -148,6 +140,25 @@ mod imp {
             // SAFETY: Paired with the successful CoInitializeEx in init().
             unsafe { CoUninitialize() };
         }
+    }
+
+    /// Probe UIA availability without touching any window: COM apartment
+    /// init plus client instantiation, both dropped immediately. Used by
+    /// the CU readiness report; blocking, so callers use `spawn_blocking`.
+    pub fn probe_available() -> Result<(), String> {
+        let _com = ComApartment::init()?;
+        // SAFETY: CoCreateInstance is called after COM initialization on this
+        // thread; CUIAutomation is the documented in-proc/local UIA client
+        // class, and windows-rs owns/releases the returned interface.
+        let _automation: IUIAutomation = unsafe {
+            CoCreateInstance(
+                &CUIAutomation,
+                None,
+                CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+            )
+        }
+        .map_err(|e| format!("create UIAutomation client: {e}"))?;
+        Ok(())
     }
 
     pub fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElements, String> {
@@ -428,6 +439,21 @@ pub fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElemen
              use take_screenshot instead"
                 .to_string(),
         )
+    }
+}
+
+/// Whether the UIA client can be instantiated at all (COM + CUIAutomation).
+/// Blocking — callers wrap it in `spawn_blocking`. Used by the CU
+/// readiness report's accessibility layer.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn probe_available() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        imp::probe_available()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("UI Automation is only available on Windows".to_string())
     }
 }
 

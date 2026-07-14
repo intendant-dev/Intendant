@@ -18,8 +18,14 @@
 
 use crate::computer_use::UiElement;
 
-/// Cap for label/value text carried per element.
-const TEXT_CAP: usize = 80;
+/// Transport bound on one Text-interface fetch, in characters. This is a
+/// D-Bus efficiency cap, not the display cap: the display cap (with its
+/// truncation marker) is applied once, centrally, by
+/// `computer_use::cap_screen_elements_texts`, and `read_screen`'s
+/// `full_values` opt-out serves what was fetched. Values longer than this
+/// bound therefore report a total of at most this many chars on Linux.
+#[cfg(target_os = "linux")]
+const TEXT_FETCH_CAP: usize = 4096;
 
 fn normalized_role_key(atspi_role_name: &str) -> String {
     atspi_role_name
@@ -34,18 +40,12 @@ fn role_is_password_text(atspi_role_name: &str) -> bool {
     normalized_role_key(atspi_role_name) == "passwordtext"
 }
 
-fn truncate(text: &str, cap: usize) -> String {
-    if text.chars().count() <= cap {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(cap).collect();
-    format!("{cut}...")
-}
-
+/// Trim/normalize a raw AT-SPI text. Deliberately no truncation here —
+/// the display cap is applied once, centrally, by
+/// `computer_use::cap_screen_elements_texts`.
 fn clean_text(text: Option<String>) -> Option<String> {
     text.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(|s| truncate(&s, TEXT_CAP))
 }
 
 /// Map an AT-SPI role name to the lowercase role vocabulary shared with the
@@ -175,7 +175,7 @@ pub async fn read_frontmost(
 
 #[cfg(target_os = "linux")]
 mod walk {
-    use super::{make_element, role_is_password_text, UiElement, TEXT_CAP};
+    use super::{make_element, role_is_password_text, UiElement, TEXT_FETCH_CAP};
     use crate::computer_use::ScreenElements;
     use atspi::connection::AccessibilityConnection;
     use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
@@ -470,7 +470,7 @@ mod walk {
         if character_count <= 0 {
             return None;
         }
-        text.get_text(0, character_count.min(TEXT_CAP as i32 + 1))
+        text.get_text(0, character_count.min(TEXT_FETCH_CAP as i32))
             .await
             .ok()
             .map(|s| s.trim().to_string())
