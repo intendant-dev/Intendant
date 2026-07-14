@@ -321,7 +321,10 @@ pub fn f11_export_import_rederive() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "cz", "cs", "c2", "gf", "i1", "i2", "rel", "m1", "m2"]]),
+        json!([
+            ["c1", "cz", "cs", "c2", "gf", "i1", "i2", "rel", "m1", "m2"],
+            ["m2", "m1", "rel", "i2", "i1", "gf", "c2", "cs", "cz", "c1"]
+        ]),
     );
     Vector {
         family: 11,

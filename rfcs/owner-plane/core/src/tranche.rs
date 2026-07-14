@@ -1425,7 +1425,7 @@ pub fn f7_negation_residual() -> Vector {
     let c1 = &rig.genesis_op;
     let mut inputs = JsonMap::new();
     inputs.insert("items".into(), items(&[("c1", c1), ("c2", &c2)]));
-    inputs.insert("deliveries".into(), json!([["c1", "c2"]]));
+    inputs.insert("deliveries".into(), json!([["c1", "c2"], ["c2", "c1"]]));
 
     Vector {
         family: 7,
@@ -1704,7 +1704,10 @@ pub fn f13_txn_internal_order() -> Vector {
         "items".into(),
         items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
     );
-    inputs.insert("deliveries".into(), json!([["t1", "t2", "t3"]]));
+    inputs.insert(
+        "deliveries".into(),
+        json!([["t1", "t2", "t3"], ["t3", "t2", "t1"]]),
+    );
     let mut aux = JsonMap::new();
     aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
     aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
@@ -1811,7 +1814,10 @@ pub fn f11_reopen_basis_types() -> Vector {
             ("t4", &t4_bytes),
         ]),
     );
-    inputs.insert("deliveries".into(), json!([["t1", "t2", "t3", "t4"]]));
+    inputs.insert(
+        "deliveries".into(),
+        json!([["t1", "t2", "t3", "t4"], ["t4", "t3", "t2", "t1"]]),
+    );
     let mut aux = JsonMap::new();
     aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
     aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
@@ -1904,7 +1910,10 @@ pub fn f7_staged_frontier_consumed() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "c2", "s", "rg", "g4", "k1", "k2"]]),
+        json!([
+            ["c1", "c2", "s", "rg", "g4", "k1", "k2"],
+            ["c2", "c1", "s", "rg", "g4", "k1", "k2"]
+        ]),
     );
 
     Vector {
@@ -2064,7 +2073,10 @@ pub fn f11_erase_deferral() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "c2", "gf", "i1", "t.i1", "rel", "t.rel", "e"]]),
+        json!([
+            ["c1", "c2", "gf", "i1", "t.i1", "rel", "t.rel", "e"],
+            ["e", "t.rel", "rel", "t.i1", "i1", "gf", "c2", "c1"]
+        ]),
     );
 
     let probe = |ids: &[Bytes32]| -> String {
@@ -2378,7 +2390,10 @@ pub fn f11_collision_loser_reentry() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "cz", "cs", "c2", "gf", "i1", "rel", "m1", "rg", "c3", "m2", "r"]]),
+        json!([
+            ["c1", "cz", "cs", "c2", "gf", "i1", "rel", "m1", "rg", "c3", "m2", "r"],
+            ["r", "m2", "c3", "rg", "m1", "rel", "i1", "gf", "c2", "cs", "cz", "c1"]
+        ]),
     );
 
     Vector {

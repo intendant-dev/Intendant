@@ -46,6 +46,12 @@ pub struct VectorReport {
     pub companion_ok: Result<(), String>,
     pub pairs_ok: Result<(), String>,
     pub decode_ok: Result<(), String>,
+    /// The arrival-order rule: a convergence-bearing multi-item
+    /// vector must list at least TWO byte-distinct delivery orders —
+    /// otherwise its converge assertion degenerates to re-running
+    /// one order (the fresh fold uses sorted names, which a single
+    /// listed delivery may equal).
+    pub convergence_ok: Result<(), String>,
     pub semantics: SemStatus,
 }
 
@@ -55,6 +61,7 @@ impl VectorReport {
             && self.companion_ok.is_ok()
             && self.pairs_ok.is_ok()
             && self.decode_ok.is_ok()
+            && self.convergence_ok.is_ok()
     }
 }
 
@@ -125,6 +132,47 @@ fn check_pairs(expected: &Json) -> Result<(), String> {
     } else {
         Err(bad.join("; "))
     }
+}
+
+/// Case kinds whose semantics run the delivery-order converge
+/// standard.
+const CONVERGENCE_KINDS: &[&str] = &[
+    "fold",
+    "walkthrough",
+    "journal-replay",
+    "status-derive",
+    "export-import",
+    "audit-partition",
+];
+
+/// A convergence-bearing vector with more than one item must carry
+/// at least two byte-distinct delivery orders.
+fn check_convergence_orders(vector: &Json) -> Result<(), String> {
+    let kind = vector["case_kind"].as_str().unwrap_or_default();
+    if !CONVERGENCE_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    let n_items = vector["inputs"]["items"]
+        .as_object()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if n_items < 2 {
+        return Ok(());
+    }
+    let deliveries = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?;
+    let mut distinct: Vec<String> = deliveries.iter().map(|d| d.to_string()).collect();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return Err(format!(
+            "{n_items} items but only {} distinct delivery order(s) — the converge \
+             assertion needs at least two",
+            distinct.len()
+        ));
+    }
+    Ok(())
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
@@ -754,6 +802,16 @@ fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
     Ok(SemStatus::Pass)
 }
 
+/// The gate predicate: a committed corpus is green only when EVERY
+/// vector passes all structural layers AND semantics — a FAIL or an
+/// Unimplemented committed vector is a red gate (the CLI exits
+/// nonzero on it).
+pub fn all_green(reports: &[VectorReport]) -> bool {
+    reports
+        .iter()
+        .all(|r| r.structural_ok() && r.semantics == SemStatus::Pass)
+}
+
 /// Run the full harness over a vectors directory.
 pub fn run_all(vectors_dir: &Path) -> Result<Vec<VectorReport>, String> {
     let spec = std::fs::read_to_string(plane_root().join("owner-plane-d0a-spec.md"))
@@ -790,6 +848,7 @@ pub fn run_all(vectors_dir: &Path) -> Result<Vec<VectorReport>, String> {
             companion_ok: validate(&companion, &v),
             pairs_ok: check_pairs(&v["expected"]),
             decode_ok: check_decode(&v),
+            convergence_ok: check_convergence_orders(&v),
             semantics: run_semantics(&v),
         });
     }
@@ -847,6 +906,62 @@ mod tests {
             );
             assert_eq!(r.semantics, SemStatus::Pass, "{}", r.file);
         }
+    }
+
+    /// The CLI gate goes red on semantic failure: a committed vector
+    /// whose semantics FAIL (here: a fold vector whose per_item
+    /// contradicts the reducer) makes `all_green` false — the exit
+    /// path the bin maps to nonzero. Unimplemented is red too.
+    #[test]
+    fn semantic_red_fails_the_gate() {
+        // A structurally green report set with one semantic FAIL.
+        let mk = |sem: SemStatus| VectorReport {
+            file: "x.json".into(),
+            family: 7,
+            case_kind: "fold".into(),
+            container_ok: Ok(()),
+            companion_ok: Ok(()),
+            pairs_ok: Ok(()),
+            decode_ok: Ok(()),
+            convergence_ok: Ok(()),
+            semantics: sem,
+        };
+        assert!(all_green(&[mk(SemStatus::Pass)]));
+        assert!(!all_green(&[
+            mk(SemStatus::Pass),
+            mk(SemStatus::Fail("x".into()))
+        ]));
+        assert!(!all_green(&[mk(SemStatus::Unimplemented("y".into()))]));
+
+        // End-to-end: a real vectors dir whose single vector LIES
+        // about its per_item — run_all must report a semantic FAIL,
+        // never Pass.
+        let dir = std::env::temp_dir().join(format!("d0a-red-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = std::fs::read_to_string(
+            plane_root().join("vectors/f07-delayed-reference-convergence-c1-i-c2.json"),
+        )
+        .unwrap();
+        let mut v: Json = serde_json::from_str(&good).unwrap();
+        // Flip one admitted item to a claimed failure the reducer
+        // will not derive.
+        let rows = v["expected"]["result"]["per_item"].as_array_mut().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|r| r.get("outcome").is_none())
+            .expect("an admitted row");
+        row["outcome"] = Json::String("no-grant".into());
+        row["disposition"] = Json::String("reject-permanent".into());
+        std::fs::write(
+            dir.join("f07-lying.json"),
+            serde_json::to_string(&v).unwrap(),
+        )
+        .unwrap();
+        let reports = run_all(&dir).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0].semantics, SemStatus::Fail(_)));
+        assert!(!all_green(&reports));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Negative controls: the harness actually rejects bad inputs.

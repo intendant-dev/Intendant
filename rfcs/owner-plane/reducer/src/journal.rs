@@ -91,7 +91,6 @@ impl JournalState {
         }
         // Transaction-local state: all-or-nothing.
         let mut local = self.clone();
-        let mut pend: Option<Verdict> = None;
         for rec in records {
             let keys = rec.map_keys().unwrap_or_default();
             let step = if keys.contains(&"core") {
@@ -110,21 +109,15 @@ impl JournalState {
             match step {
                 Ok(()) => {}
                 Err(v @ Verdict::Pending(..)) => {
-                    if records.len() > 1 {
-                        // A pending record inside a multi-record
-                        // commit — ordering vs the discard rule is
-                        // unpinned.
-                        return Err(Unimplemented("pending record in a multi-record txn".into()));
-                    }
-                    pend = Some(v);
+                    // Sequential validation (D-200) halts at the
+                    // first unresolved record: the WHOLE frame pends
+                    // — all-or-nothing extends to pendency, nothing
+                    // commits, and the reservation holds the frame
+                    // until the cited fact lands (D-185).
+                    return Ok(v);
                 }
                 Err(_) => return Ok(corrupt),
             }
-        }
-        if let Some(v) = pend {
-            // The reservation: nothing commits; the frame re-evaluates
-            // when the cited fact lands.
-            return Ok(v);
         }
         *self = local;
         Ok(Verdict::Admitted)
@@ -246,7 +239,9 @@ impl JournalState {
             return Err(bad);
         };
         let Some(j) = journals.get_mut(&release_op) else {
-            return Err(bad);
+            // The journal's opener has not arrived: a missing
+            // dependency reserves, never corrupts (D-185).
+            return Err(Verdict::Pending("ref-unresolved", "pending-dependency"));
         };
         if j.export_id != export_id {
             return Err(bad);
@@ -273,7 +268,12 @@ impl JournalState {
         {
             return bad;
         }
-        if inc + 1 != j.intervals.len() as u64 || j.intervals[inc as usize].is_some() {
+        if inc + 1 > j.intervals.len() as u64 {
+            // The cited incarnation has not opened yet (its reopen
+            // is in flight): reserve.
+            return Err(Verdict::Pending("ref-unresolved", "pending-dependency"));
+        }
+        if inc + 1 < j.intervals.len() as u64 || j.intervals[inc as usize].is_some() {
             return bad;
         }
         j.intervals[inc as usize] = Some(Terminal::Done);
@@ -338,7 +338,13 @@ impl JournalState {
             Ok(v) => v,
             Err(v) => return Ok(Err(v)),
         };
-        if inc + 1 != j.intervals.len() as u64 || j.intervals[inc as usize].is_some() {
+        if inc + 1 > j.intervals.len() as u64 {
+            return Ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        }
+        if inc + 1 < j.intervals.len() as u64 || j.intervals[inc as usize].is_some() {
             return bad;
         }
         j.intervals[inc as usize] = Some(Terminal::Abort { bases });
@@ -379,26 +385,8 @@ impl JournalState {
             },
             None => return bad,
         };
-        // Transition legality against the (transaction-local) state.
-        {
-            let (j, inc) = match Self::open_interval(&mut self.journals, rec) {
-                Ok(v) => v,
-                Err(v) => return Ok(Err(v)),
-            };
-            if inc + 1 != j.intervals.len() as u64 {
-                return bad;
-            }
-            // Basis-match: the invalidated recorded cause.
-            match &j.intervals[inc as usize] {
-                Some(Terminal::Abort { bases }) => {
-                    if !bases.contains(&basis) {
-                        return bad;
-                    }
-                }
-                Some(Terminal::Done) | None => return bad,
-            }
-        }
-        // Holding checks (verifiable-when-held → pend).
+        // Holding checks FIRST (D-185: citation resolution precedes
+        // transition legality — an unheld citation pends, reserving).
         if !self.op_held(&basis, fold) {
             return Ok(Err(Verdict::Pending(
                 "ref-unresolved",
@@ -415,10 +403,37 @@ impl JournalState {
                 "pending-dependency",
             )));
         }
-        let (j, _) = match Self::open_interval(&mut self.journals, rec) {
+        // Transition legality against the (transaction-local) state.
+        let (j, inc) = match Self::open_interval(&mut self.journals, rec) {
             Ok(v) => v,
             Err(v) => return Ok(Err(v)),
         };
+        if inc + 1 > j.intervals.len() as u64 {
+            return Ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        }
+        if inc + 1 < j.intervals.len() as u64 {
+            return bad;
+        }
+        // Basis-match: the invalidated recorded cause. An interval
+        // still awaiting its terminal reserves; reopen-after-Done
+        // and a basis outside the recorded causes are held-invalid.
+        match &j.intervals[inc as usize] {
+            Some(Terminal::Abort { bases }) => {
+                if !bases.contains(&basis) {
+                    return bad;
+                }
+            }
+            Some(Terminal::Done) => return bad,
+            None => {
+                return Ok(Err(Verdict::Pending(
+                    "ref-unresolved",
+                    "pending-dependency",
+                )))
+            }
+        }
         j.intervals.push(None);
         Ok(Ok(()))
     }

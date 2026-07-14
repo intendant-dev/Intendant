@@ -64,7 +64,14 @@ fn status_vector(
 ) -> Vector {
     let mut inputs = JsonMap::new();
     inputs.insert("items".into(), items(item_list));
-    inputs.insert("deliveries".into(), json!([delivery]));
+    let reversed: Vec<Json> = delivery
+        .as_array()
+        .expect("delivery is an array")
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    inputs.insert("deliveries".into(), json!([delivery, reversed]));
     inputs.insert("as_of_ms".into(), json!(AS_OF));
     let mut result = JsonMap::new();
     result.insert("derived".into(), derived);
@@ -449,7 +456,10 @@ pub fn f11_policy_hash_mismatch() -> Vector {
         "items".into(),
         items(&[("c1", &c1), ("c2", &c2), ("i", &i), ("j", &j)]),
     );
-    inputs.insert("deliveries".into(), json!([["c1", "c2", "i", "j"]]));
+    inputs.insert(
+        "deliveries".into(),
+        json!([["c1", "c2", "i", "j"], ["j", "i", "c2", "c1"]]),
+    );
     Vector {
         family: 11,
         name: name.into(),

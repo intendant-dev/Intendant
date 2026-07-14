@@ -71,7 +71,7 @@ pub fn f7_issuance_to_revoked_device() -> Vector {
         "7.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("r", &r), ("g", &g)],
-        json!([["c1", "c2", "r", "g"]]),
+        json!([["c1", "c2", "r", "g"], ["c1", "c2", "g", "r"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -102,7 +102,7 @@ pub fn f7_second_live_compound() -> Vector {
         "7.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("r1", &r1), ("r2", &r2)],
-        json!([["c1", "c2", "r1", "r2"]]),
+        json!([["c1", "c2", "r1", "r2"], ["c1", "c2", "r2", "r1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -130,7 +130,7 @@ pub fn f7_control_sig_tamper() -> Vector {
         "4.5",
         rig,
         &[("c1", &c1), ("c2", &c2)],
-        json!([["c1", "c2"]]),
+        json!([["c1", "c2"], ["c2", "c1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -157,7 +157,7 @@ pub fn f7_control_body_tamper() -> Vector {
         "4.5",
         rig,
         &[("c1", &c1), ("c2", &c2)],
-        json!([["c1", "c2"]]),
+        json!([["c1", "c2"], ["c2", "c1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -193,7 +193,7 @@ pub fn f7_wrong_proof_arm() -> Vector {
         "7.1",
         rig,
         &[("c1", &c1), ("g", &g)],
-        json!([["c1", "g"]]),
+        json!([["c1", "g"], ["g", "c1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -231,7 +231,7 @@ pub fn f7_request_fork() -> Vector {
         "11.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("g1", &g1), ("g2", &g2)],
-        json!([["c1", "c2", "g1", "g2"]]),
+        json!([["c1", "c2", "g1", "g2"], ["c2", "c1", "g1", "g2"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -259,7 +259,7 @@ pub fn f7_duplicate_idempotent() -> Vector {
         "11.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("c2dup", &c2)],
-        json!([["c1", "c2", "c2dup"]]),
+        json!([["c1", "c2", "c2dup"], ["c2", "c1", "c2dup"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -320,7 +320,7 @@ pub fn f11_actor_id_mint() -> Vector {
         "10.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("i", &i)],
-        json!([["c1", "c2", "i"]]),
+        json!([["c1", "c2", "i"], ["i", "c2", "c1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -353,7 +353,7 @@ pub fn f10_grant_epoch_lower_bound() -> Vector {
         "4.3",
         rig,
         &[("c1", &c1), ("c2", &c2), ("i", &i)],
-        json!([["c1", "c2", "i"]]),
+        json!([["c1", "c2", "i"], ["i", "c2", "c1"]]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -463,7 +463,7 @@ pub fn f10_tenant_fork() -> Vector {
         "9.3",
         rig,
         &[("c1", &c1), ("c2", &c2), ("i1", &i1), ("i2", &i2)],
-        json!([["c1", "c2", "i1", "i2"]]),
+        json!([["c1", "c2", "i1", "i2"], ["c2", "c1", "i1", "i2"]]),
         json!({
             "per_item": [
                 admits("c1"),
