@@ -182,12 +182,101 @@ fn run_semantics(vector: &Json) -> SemStatus {
     let run = match kind {
         "fold" => run_fold_vector(vector),
         "journal-replay" => run_journal_vector(vector),
+        "export-import" => run_export_import(vector),
         _ => crate::kat::run(vector),
     };
     match run {
         Ok(status) => status,
         Err(e) => SemStatus::Fail(e),
     }
+}
+
+/// The export-import lane (D-127/D-156 construct-and-rederive): a
+/// fold vector whose result additionally carries `content_digest`
+/// and `release_op` — the harness re-derives BOTH from the held
+/// facts (source claims → ranked leaves → root; the release item's
+/// own bytes → H_op) and compares.
+fn run_export_import(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+    let status = run_fold_vector(vector)?;
+    if status != SemStatus::Pass {
+        return Ok(status);
+    }
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let fresh_order: Vec<String> = items.keys().cloned().collect();
+    let (_, state) = match crate::fold::run_delivery_with_state(&items, &fresh_order) {
+        Ok(v) => v,
+        Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+    };
+    let releases = state.held_releases();
+    let [(release_op, export_id, digest, sources)] = releases.as_slice() else {
+        return Ok(SemStatus::Unimplemented(
+            "export-import expects exactly one held release".into(),
+        ));
+    };
+    // Re-derive the root from the LIVE sources: ranks are the sorted
+    // source order (the signed set is already canonical).
+    let mut leaves = Vec::new();
+    for (rank, op) in sources.iter().enumerate() {
+        let Some((kind, statement, sens)) = state.claim_content(op) else {
+            return Ok(SemStatus::Fail(format!(
+                "source {rank} is not a held claim"
+            )));
+        };
+        let floor = match sens {
+            0 => "public",
+            1 => "internal",
+            2 => "private",
+            3 => "sensitive",
+            _ => return Ok(SemStatus::Fail("source sensitivity out of range".into())),
+        };
+        leaves.push(crate::domains::brec_leaf(
+            export_id,
+            rank as u64,
+            op,
+            &kind,
+            &statement,
+            floor,
+        ));
+    }
+    let Some(root) = crate::domains::merkle_root(&leaves) else {
+        return Ok(SemStatus::Fail("empty source set".into()));
+    };
+    if root != *digest {
+        return Ok(SemStatus::Fail(
+            "re-derived root differs from the held content_digest".into(),
+        ));
+    }
+    let want_digest = unhex(
+        vector["expected"]["result"]["content_digest"]
+            .as_str()
+            .ok_or("result.content_digest")?,
+    )?;
+    let want_release = unhex(
+        vector["expected"]["result"]["release_op"]
+            .as_str()
+            .ok_or("result.release_op")?,
+    )?;
+    if root.to_vec() != want_digest {
+        return Ok(SemStatus::Fail(
+            "re-derived root differs from the expected content_digest".into(),
+        ));
+    }
+    if release_op.to_vec() != want_release {
+        return Ok(SemStatus::Fail(
+            "held release_op differs from the expected".into(),
+        ));
+    }
+    Ok(SemStatus::Pass)
 }
 
 /// The journal-replay lane: every listed delivery plus the fresh
@@ -522,8 +611,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            64,
-            "8 tranche + 44 KAT + 12 fold-lane corpus vectors"
+            71,
+            "8 tranche + 44 KAT + 12 fold-lane + 7 recovery/export corpus vectors"
         );
         for r in &reports {
             assert!(

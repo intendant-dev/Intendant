@@ -166,6 +166,9 @@ pub fn run(vector: &Json) -> Result<SemStatus, String> {
         "crypto-negative" => crypto_negative(vector),
         "frontier-fold" => frontier_fold(vector),
         "frontier-negative" => frontier_negative(vector),
+        "phrase-derive" => phrase_derive(vector),
+        "commitment-derive" => commitment_derive(vector),
+        "merkle-proof" => merkle_proof_kat(vector),
         other => Ok(SemStatus::Unimplemented(format!("case_kind {other}"))),
     }
 }
@@ -1037,4 +1040,110 @@ fn frontier_negative(vector: &Json) -> Result<SemStatus, String> {
         Ok(_) => Ok(SemStatus::Fail("negative folded successfully".into())),
         Err(got) => pass_if_pair(got, vector),
     }
+}
+
+// --------------------------------------------------------- family 8
+
+/// §2.4 exact: `seed = PBKDF2-HMAC-SHA512(mnemonic, "mnemonic",
+/// 2048, 64)`, then the HKDF stage, then the Ed25519 keypair. The
+/// reducer derives from the PHRASE (the entropy→mnemonic leg is the
+/// core's — fixture convention); the corpus phrases are ASCII, so
+/// NFKD normalization is the identity.
+fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
+    use hkdf::Hkdf;
+    use sha2::{Sha256, Sha512};
+    let Some(phrase) = vector["inputs"]["phrase"].as_str() else {
+        return Ok(SemStatus::Unimplemented(
+            "entropy-only phrase-derive (the mnemonic leg is core-side)".into(),
+        ));
+    };
+    let mut seed = [0u8; 64];
+    pbkdf2::pbkdf2_hmac::<Sha512>(phrase.as_bytes(), b"mnemonic", 2048, &mut seed);
+    let hk = Hkdf::<Sha256>::new(Some(b"intendant/recovery/v1"), &seed);
+    let mut ed_seed = [0u8; 32];
+    hk.expand(b"ed25519-seed", &mut ed_seed)
+        .expect("32 B within bounds");
+    let pk = ed25519_dalek::SigningKey::from_bytes(&ed_seed)
+        .verifying_key()
+        .to_bytes();
+
+    let keys = vector["expected"]["result"]["keys"]
+        .as_object()
+        .ok_or("result.keys")?;
+    for (name, want_hex) in keys {
+        let want = unhex(want_hex.as_str().ok_or("key not a string")?)?;
+        let got: &[u8] = match name.as_str() {
+            "seed" => &seed,
+            "ed25519_seed" => &ed_seed,
+            "recovery_pk" => &pk,
+            other => return Ok(SemStatus::Unimplemented(format!("key name {other}"))),
+        };
+        if got != want.as_slice() {
+            return Ok(SemStatus::Fail(format!("{name} differs")));
+        }
+    }
+    Ok(SemStatus::Pass)
+}
+
+/// `commitment = H_drill(recovery_pk)`.
+fn commitment_derive(vector: &Json) -> Result<SemStatus, String> {
+    let pk = in_hex(vector, "recovery_pk")?;
+    let want = unhex(
+        vector["expected"]["bytes"]
+            .as_str()
+            .ok_or("expected.bytes")?,
+    )?;
+    if domains::h("drill", &pk).to_vec() == want {
+        Ok(SemStatus::Pass)
+    } else {
+        Ok(SemStatus::Fail("commitment differs".into()))
+    }
+}
+
+// ------------------------------------------- family 11 merkle-proof
+
+/// The KAT lane carries no record_count (the admission lane reads it
+/// from the signed release), so validity quantifies over widths
+/// 1..=128: SOME width reproduces the root under exact consumption.
+fn merkle_proof_kat(vector: &Json) -> Result<SemStatus, String> {
+    let leaf_bytes = in_hex(vector, "bundleleaf")?;
+    let root: [u8; 32] = in_hex(vector, "root")?
+        .try_into()
+        .map_err(|_| "root is 32 bytes")?;
+    let idx = vector["inputs"]["rec_index"].as_u64().ok_or("rec_index")?;
+    let mut proof: Vec<[u8; 32]> = Vec::new();
+    for pn in vector["inputs"]["proof"].as_array().ok_or("proof")? {
+        proof.push(
+            unhex(pn.as_str().ok_or("proof entry")?)?
+                .try_into()
+                .map_err(|_| "sibling is 32 bytes")?,
+        );
+    }
+    // D-162: the leaf is SELF-DESCRIBING — its internal `rec_index`
+    // must equal the declared one (the wrong-index case dies here,
+    // width-independent: leaf 2 of a 3-record bundle is structurally
+    // identical to leaf 1 of a 2-record one, so only the binding
+    // distinguishes them).
+    let leaf_node = decode(&leaf_bytes).map_err(|e| format!("bundleleaf decode: {e:?}"))?;
+    let internal_idx = leaf_node
+        .get("rec_index")
+        .and_then(|n| n.as_uint())
+        .ok_or("bundleleaf.rec_index")?;
+    let leaf = domains::h("brec", &leaf_bytes);
+    let valid = internal_idx == idx
+        && (1..=128u64)
+            .any(|w| idx < w && domains::merkle_fold(leaf, idx, w, &proof) == Some(root));
+
+    if let Some(want) = vector["expected"]["result"]["valid"].as_bool() {
+        return if valid == want {
+            Ok(SemStatus::Pass)
+        } else {
+            Ok(SemStatus::Fail(format!("valid={valid}, expected {want}")))
+        };
+    }
+    // The negative arm: an unverifiable proof is `body-invariant`.
+    if valid {
+        return Ok(SemStatus::Fail("negative proof verified".into()));
+    }
+    pass_if_pair(("body-invariant", "reject-permanent"), vector)
 }

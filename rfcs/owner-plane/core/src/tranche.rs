@@ -58,7 +58,7 @@ pub const GENESIS_BUDGET: Budget = Budget {
     max_bytes: 268_435_456,
 };
 
-const T0_MS: u64 = 1_752_400_000_000;
+pub(crate) const T0_MS: u64 = 1_752_400_000_000;
 const HLC_STEP_MS: u64 = 60_000;
 
 /// The tranche RNG convention (documented, deterministic): a

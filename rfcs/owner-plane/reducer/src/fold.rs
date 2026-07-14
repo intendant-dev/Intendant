@@ -228,6 +228,9 @@ type ChainHead = (u64, [u8; 32]);
 type ZoneLineage = ([u8; 16], [u8; 16]);
 /// An O5 replay-registry key: (zone, lineage, request_id).
 type ReplayKey = ([u8; 16], [u8; 16], [u8; 16]);
+/// A held release's re-derivation facts:
+/// (op_hash, export_id, content_digest, sources).
+type ReleaseView = ([u8; 32], [u8; 16], [u8; 32], Vec<[u8; 32]>);
 
 /// Derived plane state — grown only by ACCEPTED operations.
 #[derive(Debug, Clone, Default)]
@@ -2393,6 +2396,27 @@ impl State {
         (&self.erase_queue, &self.retrieval_excluded)
     }
 
+    /// Every held release: (op_hash, export_id, content_digest,
+    /// sources) — the export-import lane re-derives against these.
+    pub(crate) fn held_releases(&self) -> Vec<ReleaseView> {
+        self.held_tenant
+            .iter()
+            .filter_map(|r| {
+                r.release
+                    .as_ref()
+                    .map(|f| (r.op_hash, f.export_id, f.content_digest, f.sources.clone()))
+            })
+            .collect()
+    }
+
+    /// A held claim's (kind, statement, sensitivity rank).
+    pub(crate) fn claim_content(&self, h: &[u8; 32]) -> Option<(String, String, u8)> {
+        self.held_tenant
+            .iter()
+            .find(|r| r.op_hash == *h)
+            .and_then(|r| r.claim.clone())
+    }
+
     /// Dispatch one operation.
     fn admit(&mut self, op: &SignedOp) -> Result<Result<(), Verdict>, Unimplemented> {
         match op.header.operation_type {
@@ -2429,6 +2453,15 @@ pub fn run_delivery(
     items: &BTreeMap<String, Vec<u8>>,
     order: &[String],
 ) -> Result<Run, Unimplemented> {
+    run_delivery_with_state(items, order).map(|(run, _)| run)
+}
+
+/// [`run_delivery`] returning the final [`State`] too — the
+/// export-import lane re-derives against held facts.
+pub fn run_delivery_with_state(
+    items: &BTreeMap<String, Vec<u8>>,
+    order: &[String],
+) -> Result<(Run, State), Unimplemented> {
     let mut state = State::default();
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     let mut snapshots = Vec::new();
@@ -2483,10 +2516,13 @@ pub fn run_delivery(
         }
         snapshots.push(verdicts.clone());
     }
-    Ok(Run {
-        final_verdicts: verdicts,
-        snapshots,
-    })
+    Ok((
+        Run {
+            final_verdicts: verdicts,
+            snapshots,
+        },
+        state,
+    ))
 }
 
 pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimplemented> {

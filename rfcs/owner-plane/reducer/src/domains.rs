@@ -171,6 +171,30 @@ pub fn merkle_fold(
     sibs.next().is_none().then_some(cur)
 }
 
+/// The §11.8 root over a full leaf level: `H_bnode(left ‖ right)`
+/// parents, the trailing odd node promoting unchanged.
+pub fn merkle_root(leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            if pair.len() == 2 {
+                let mut cat = [0u8; 64];
+                cat[..32].copy_from_slice(&pair[0]);
+                cat[32..].copy_from_slice(&pair[1]);
+                next.push(h("bnode", &cat));
+            } else {
+                next.push(pair[0]);
+            }
+        }
+        level = next;
+    }
+    Some(level[0])
+}
+
 fn uint_bytes(n: u64) -> Vec<u8> {
     header(0, n as usize)
 }

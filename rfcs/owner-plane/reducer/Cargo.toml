@@ -18,6 +18,7 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
+pbkdf2 = "0.12"
 
 # Standalone: NOT a member of the intendant workspace — lives and
 # versions with the spec, like core/.
