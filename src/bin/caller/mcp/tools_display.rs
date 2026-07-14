@@ -322,15 +322,22 @@ impl IntendantServer {
 
         // Already holding what was asked for? Short-circuit without a
         // popup: view_and_control is the guard itself; a view request is
-        // satisfied by the guard too (control implies view).
-        let autonomy = self.state.read().await.autonomy.clone();
+        // satisfied by the guard too (control implies view). The grant is
+        // Intendant authority only — OS layers (TCC, portal, display) can
+        // still block actual CU, so the answer carries the live OS
+        // readiness gap instead of implying capability (CU-02).
+        let (autonomy, session_registry) = {
+            let state = self.state.read().await;
+            (state.autonomy.clone(), state.session_registry.clone())
+        };
         if autonomy.read().await.user_display_granted {
-            return serde_json::json!({
+            let mut result = serde_json::json!({
                 "status": "already_granted",
                 "access": DisplayRequestAccess::ViewAndControl.as_str(),
                 "note": "the user display grant is already held; use take_screenshot / execute_cu_actions with display_target \"user_session\"",
-            })
-            .to_string();
+            });
+            attach_os_readiness_gap(&mut result, &session_registry).await;
+            return result.to_string();
         }
 
         let outcome = display_requests::registry().raise(
@@ -424,6 +431,9 @@ impl IntendantServer {
                                  execute_cu_actions may target user_session until the grant \
                                  ends. De-escalate with revoke_user_display when done.",
                         });
+                        // The click minted Intendant authority; OS layers can
+                        // still block actual CU (CU-02).
+                        attach_os_readiness_gap(&mut result, &session_registry).await;
                     }
                     DisplayRequestOutcome::Denied => {
                         result["retry_after_secs"] =
@@ -1039,7 +1049,8 @@ impl IntendantServer {
                 ));
             }
         }
-        match crate::computer_use::read_screen_elements(target).await {
+        let full_values = params.full_values.unwrap_or(false);
+        match crate::computer_use::read_screen_elements(target, full_values).await {
             Ok(snapshot) => {
                 let body = if params.format.as_deref() == Some("json") {
                     serde_json::to_string_pretty(&snapshot)
@@ -1051,6 +1062,45 @@ impl IntendantServer {
             }
             Err(e) => Ok(text_tool_error(format!("read_screen error: {e}"))),
         }
+    }
+
+    #[tool(
+        description = "Report per-layer Computer Use readiness for a display target: Intendant display authority, OS screen-capture permission (macOS Screen Recording / Wayland portal / X11 socket), accessibility permission (macOS Accessibility / AT-SPI / UIA), target display availability, and input backend availability. A held display grant does NOT imply OS permissions — this names each missing layer with a fix. Probes live state on every call (never cached); unknown layers count as not ready."
+    )]
+    pub(crate) async fn display_readiness(
+        &self,
+        Parameters(params): Parameters<DisplayReadinessParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.display_readiness_as_caller(Parameters(params), ToolCallerTrust::OwnerSurface)
+            .await
+    }
+
+    pub(crate) async fn display_readiness_as_caller(
+        &self,
+        Parameters(params): Parameters<DisplayReadinessParams>,
+        caller: ToolCallerTrust,
+    ) -> Result<CallToolResult, McpError> {
+        let (session_registry, autonomy) = {
+            let state = self.state.read().await;
+            (state.session_registry.clone(), state.autonomy.clone())
+        };
+        let target = match params.display_target.as_deref() {
+            Some(spec) => resolve_display_target(spec),
+            None => crate::computer_use::default_display_target(&session_registry).await,
+        };
+        let user_display_granted = autonomy.read().await.user_display_granted;
+        let readiness = crate::cu_readiness::probe_readiness(
+            target,
+            caller.allows_user_session(user_display_granted),
+            user_display_granted,
+            &session_registry,
+        )
+        .await;
+        Ok(text_tool_result(
+            serde_json::to_string_pretty(&readiness)
+                .unwrap_or_else(|e| format!("serialize error: {e}")),
+        ))
     }
 
     #[tool(

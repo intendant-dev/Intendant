@@ -371,6 +371,74 @@ pub struct ScreenElements {
 pub const ELEMENT_TREE_MAX_DEPTH: usize = 12;
 /// Node-count cap for element-tree walks (keeps the observation a few KB).
 pub const ELEMENT_TREE_MAX_NODES: usize = 400;
+/// Display cap for element labels/values and window titles: one long
+/// `data:`/URL value must not dominate the whole observation. Applied once,
+/// centrally, by [`cap_screen_elements_texts`]; `read_screen`'s
+/// `full_values` opt-out skips it for explicit detail requests.
+pub const UI_TEXT_CAP: usize = 80;
+
+/// FNV-1a 64-bit over the text's UTF-8 bytes: a tiny, dependency-free,
+/// stable content fingerprint for the truncation marker (identity aid,
+/// not a security hash).
+fn fnv1a_64(text: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Length-cap one UI text with a stable marker: the first `cap` chars, an
+/// ellipsis, then the total char count and a short content hash so (a) the
+/// reader knows exactly how much was cut and (b) two long values that share
+/// a prefix remain distinguishable. Identical input always produces the
+/// identical marker. Texts within the cap pass through unchanged.
+pub(crate) fn cap_ui_text(text: &str, cap: usize) -> String {
+    let total = text.chars().count();
+    if total <= cap {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(cap).collect();
+    // Fold the 64-bit FNV to 32 bits for a compact 8-hex marker.
+    let hash = fnv1a_64(text);
+    let folded = (hash >> 32) as u32 ^ hash as u32;
+    format!("{prefix}… [{total} chars total, #{folded:08x}]")
+}
+
+/// Apply [`cap_ui_text`] once across a snapshot: window title, every
+/// element label/value, and the other-window summaries. This is the single
+/// cross-platform cap point — the macOS AX, Linux AT-SPI, and Windows UIA
+/// readers deliberately do not cap display text themselves.
+pub(crate) fn cap_screen_elements_texts(snapshot: &mut ScreenElements) {
+    fn cap_opt(value: &mut Option<String>) {
+        if let Some(text) = value {
+            let capped = cap_ui_text(text, UI_TEXT_CAP);
+            if capped.len() != text.len() {
+                *value = Some(capped);
+            }
+        }
+    }
+    fn cap_element(element: &mut UiElement) {
+        cap_opt(&mut element.label);
+        cap_opt(&mut element.value);
+        for child in &mut element.children {
+            cap_element(child);
+        }
+    }
+    cap_opt(&mut snapshot.window_title);
+    if let Some(root) = &mut snapshot.root {
+        cap_element(root);
+    }
+    for window in &mut snapshot.other_windows {
+        let capped = cap_ui_text(window, UI_TEXT_CAP);
+        if capped.len() != window.len() {
+            *window = capped;
+        }
+    }
+}
 
 /// Read the element tree of the frontmost application on the user's display.
 ///
@@ -380,7 +448,25 @@ pub const ELEMENT_TREE_MAX_NODES: usize = 400;
 /// deterministically (click the center of a reported frame). Pixels remain
 /// the fallback for visual verification and for apps with poor accessibility
 /// support.
-pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElements, String> {
+///
+/// `full_values: false` (the default) applies the central
+/// [`cap_screen_elements_texts`] pass so one long URL/`data:` value cannot
+/// dominate the observation; `true` returns values/titles uncapped for
+/// explicit detail requests (Linux AT-SPI still bounds each text fetch at
+/// its transport cap).
+pub async fn read_screen_elements(
+    target: DisplayTarget,
+    full_values: bool,
+) -> Result<ScreenElements, String> {
+    let mut snapshot = read_screen_elements_raw(target).await?;
+    if !full_values {
+        cap_screen_elements_texts(&mut snapshot);
+    }
+    Ok(snapshot)
+}
+
+/// Platform dispatch for [`read_screen_elements`], before the display cap.
+async fn read_screen_elements_raw(target: DisplayTarget) -> Result<ScreenElements, String> {
     #[cfg(target_os = "macos")]
     {
         if !target.is_user_session() {
@@ -2267,10 +2353,13 @@ async fn take_screenshot(
                 .await
                 .map_err(|e| format!("screencapture exec error: {}", e))?;
             if !output.status.success() {
-                return Err(format!(
+                // A bare "could not create image from display" is usually the
+                // Screen Recording (TCC) denial — name it when the preflight
+                // confirms the permission is missing (CU-04).
+                return Err(crate::cu_readiness::enrich_capture_failure(format!(
                     "screencapture failed: {}",
                     String::from_utf8_lossy(&output.stderr)
-                ));
+                )));
             }
             tokio::fs::read(&path)
                 .await
@@ -3097,10 +3186,11 @@ async fn capture_zoom_screenshot(
                     .await
                     .map_err(|e| format!("screencapture exec error: {e}"))?;
                 if !output.status.success() {
-                    return Err(format!(
+                    // Same TCC-denial naming as take_screenshot (CU-04).
+                    return Err(crate::cu_readiness::enrich_capture_failure(format!(
                         "zoom capture failed: {}",
                         String::from_utf8_lossy(&output.stderr)
-                    ));
+                    )));
                 }
                 let bytes = tokio::fs::read(&path)
                     .await
@@ -3522,6 +3612,96 @@ mod tests {
         assert!(root.get("children").is_none());
         assert!(root.get("focused").is_none());
         assert_eq!(root.get("enabled"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn cap_ui_text_passes_short_text_and_marks_long_text() {
+        // Within the cap (incl. exactly at it): unchanged.
+        assert_eq!(cap_ui_text("Save", 80), "Save");
+        let exactly = "x".repeat(80);
+        assert_eq!(cap_ui_text(&exactly, 80), exactly);
+
+        // Beyond the cap: prefix + ellipsis + total length + content hash.
+        let long = format!("data:image/png;base64,{}", "A".repeat(500));
+        let capped = cap_ui_text(&long, 80);
+        let prefix: String = long.chars().take(80).collect();
+        assert!(capped.starts_with(&prefix), "prefix preserved: {capped}");
+        assert!(capped.contains("… ["), "marker present: {capped}");
+        assert!(
+            capped.contains(&format!("{} chars total", long.chars().count())),
+            "total length named: {capped}"
+        );
+        assert!(capped.contains('#'), "content hash present: {capped}");
+
+        // Stable: identical input, identical marker.
+        assert_eq!(cap_ui_text(&long, 80), capped);
+
+        // Two long values sharing the 80-char prefix stay distinguishable
+        // through the hash.
+        let other = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(499).to_string() + "B"
+        );
+        let other_capped = cap_ui_text(&other, 80);
+        assert_ne!(capped, other_capped, "same-prefix values must differ");
+    }
+
+    #[test]
+    fn cap_ui_text_counts_chars_not_bytes() {
+        // Multibyte text: the cap must cut on char boundaries.
+        let long = "é".repeat(100);
+        let capped = cap_ui_text(&long, 80);
+        assert!(capped.starts_with(&"é".repeat(80)));
+        assert!(capped.contains("100 chars total"), "marker: {capped}");
+    }
+
+    #[test]
+    fn cap_screen_elements_texts_caps_titles_values_and_other_windows() {
+        let long_url = format!("data:text/html;base64,{}", "Q".repeat(400));
+        let mut field = leaf("textfield", Some(long_url.as_str()), (0, 0, 10, 10));
+        field.value = Some(long_url.clone());
+        let window = UiElement {
+            role: "window".to_string(),
+            label: None,
+            value: None,
+            frame: (0, 0, 100, 100),
+            focused: false,
+            enabled: true,
+            children: vec![field],
+        };
+        let mut snapshot = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: Some(long_url.clone()),
+            root: Some(window),
+            other_windows: vec![format!("Safari — \"{long_url}\"")],
+            truncated: None,
+        };
+        cap_screen_elements_texts(&mut snapshot);
+
+        let title = snapshot.window_title.as_deref().unwrap();
+        assert!(title.contains("chars total"), "title capped: {title}");
+        assert!(
+            title.chars().count() < long_url.chars().count(),
+            "title shortened"
+        );
+        let child = &snapshot.root.as_ref().unwrap().children[0];
+        assert!(child.label.as_deref().unwrap().contains("chars total"));
+        assert!(child.value.as_deref().unwrap().contains("chars total"));
+        assert!(snapshot.other_windows[0].contains("chars total"));
+
+        // Short texts stay untouched.
+        let mut short = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: Some("GitHub".to_string()),
+            root: None,
+            other_windows: vec!["Finder".to_string()],
+            truncated: None,
+        };
+        cap_screen_elements_texts(&mut short);
+        assert_eq!(short.window_title.as_deref(), Some("GitHub"));
+        assert_eq!(short.other_windows[0], "Finder");
     }
 
     #[test]
@@ -4127,7 +4307,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_screen_elements_rejects_virtual_target_on_linux() {
-        let err = read_screen_elements(DisplayTarget::Virtual { id: 99 })
+        let err = read_screen_elements(DisplayTarget::Virtual { id: 99 }, false)
             .await
             .unwrap_err();
         assert!(err.contains("user_session"), "{err}");

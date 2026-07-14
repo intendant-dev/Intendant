@@ -52,8 +52,6 @@ impl_TCFType!(AXUIElement, AXUIElementRef, AXUIElementGetTypeID);
 declare_TCFType!(AXValue, AXValueRef);
 impl_TCFType!(AXValue, AXValueRef, AXValueGetTypeID);
 
-/// Cap for label/value text carried per element.
-const TEXT_CAP: usize = 80;
 /// How many "other visible windows" summaries to include.
 const OTHER_WINDOWS_CAP: usize = 8;
 /// Per-attribute IPC timeout so one unresponsive app cannot hang the read.
@@ -239,11 +237,13 @@ fn walk(
     let role = attr_string(element, kAXRoleAttribute)
         .map(|r| normalize_role(&r))
         .unwrap_or_else(|| "unknown".to_string());
+    // Labels/values are carried in full here; the display cap is applied
+    // once, centrally, by computer_use::cap_screen_elements_texts (so the
+    // read_screen `full_values` opt-out can serve the uncapped text).
     let label = attr_string(element, kAXTitleAttribute)
         .filter(|s| !s.is_empty())
-        .or_else(|| attr_string(element, kAXDescriptionAttribute).filter(|s| !s.is_empty()))
-        .map(|s| truncate(&s, TEXT_CAP));
-    let value = attr_value_string(element).map(|s| truncate(&s, TEXT_CAP));
+        .or_else(|| attr_string(element, kAXDescriptionAttribute).filter(|s| !s.is_empty()));
+    let value = attr_value_string(element);
     let focused = attr_bool(element, kAXFocusedAttribute).unwrap_or(false);
     let enabled = attr_bool(element, kAXEnabledAttribute).unwrap_or(true);
     let frame = element_frame(element).unwrap_or((0, 0, 0, 0));
@@ -276,14 +276,6 @@ fn walk(
 /// `AXButton` → `button`; unknown shapes are lowercased as-is.
 fn normalize_role(role: &str) -> String {
     role.strip_prefix("AX").unwrap_or(role).to_ascii_lowercase()
-}
-
-fn truncate(text: &str, cap: usize) -> String {
-    if text.chars().count() <= cap {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(cap).collect();
-    format!("{cut}…")
 }
 
 /// Copy one AX attribute, taking ownership of the returned object.
