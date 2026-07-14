@@ -74,8 +74,13 @@ The runtime/controller split is a deliberate security boundary:
   but **never executes user-requested shell commands directly** — it pipes them
   to the runtime subprocess.
 - **intendant-connect** is the hosted rendezvous/account metadata service. It is
-  outside the runtime/controller command-execution boundary and holds no daemon
-  API keys or runtime authority.
+  outside the runtime/controller command-execution boundary, holds no daemon
+  API keys, cannot mint daemon-local IAM, and exposes no hosted daemon-control
+  session in the default build. It is still trusted for account, route, fleet,
+  and availability metadata plus the browser code and installers it serves.
+  Malicious served code can lie about or exfiltrate Connect-visible account,
+  route, or unlocked vault/fleet state, while a malicious installer can
+  compromise what it installs; neither is a path to a hosted control session.
 
 A compromised model conversation therefore cannot reach API keys, and the
 runtime process cannot exfiltrate data through a model API. See

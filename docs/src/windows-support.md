@@ -34,18 +34,22 @@ The fastest path is the served installer — the Windows counterpart of the
 `curl | sh` one-liner, from an elevated PowerShell on a fresh box:
 
 ```powershell
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
 
 # Keep it running unattended (Task Scheduler entry — at boot when elevated,
-# at logon otherwise — supervised by the built-in restart loop; the claim
-# phrase lands in the service log the installer prints):
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key> -Service
+# at logon otherwise — supervised by the built-in restart loop; the one-time
+# claim code lands in the service log the installer prints):
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Service
 ```
 
 It clones the repo, runs the dependency setup below (elevated shells only),
 builds, and launches; every rendezvous — hosted or self-run — serves its own
 version-matched copy at `/install.ps1`. `intendant service
 install|uninstall|status` manages the scheduled task directly once built.
+The claim code links discovery metadata only and grants no daemon access.
+Establish control from a trusted local, daemon-served direct/mTLS, or
+signed-native surface. Hosted Connect remains discovery-only at immutable
+`role:none` in the default build.
 
 Working from an existing checkout instead, run the setup script from an
 elevated (Administrator) PowerShell in the repo root:
@@ -275,8 +279,10 @@ than a panic or silent no-op.
   mTLS are pure Rust and cross-platform, but the interactive access enrollment
   command has only been validated on Unix hosts so far. To expose the dashboard
   to other devices from a Windows host, use native HTTPS/WSS with explicit
-  `--tls-cert` / `--tls-key` plus `--mtls-ca`, run enrollment from a Unix peer, or
-  front the dashboard with your own reverse proxy. See
+  `--tls-cert` / `--tls-key` plus `--mtls-ca`, or run enrollment from a Unix
+  peer. A generic HTTPS reverse proxy is not an authentication substitute: if
+  it terminates into daemon loopback it becomes a root trust boundary and must
+  enforce approved client identity plus a protected upstream. See
   [Peer Federation](./peer-federation.md#dashboard-access-and-tls) for the full
   dashboard TLS/mTLS and federation auth story.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so

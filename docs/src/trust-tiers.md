@@ -19,11 +19,12 @@ Every real deployment decision sits on two independent axes:
   that reads your mail, holds your files, drives your accounts; worst case
   is your life.
 - **Client provenance** — how sure you are that the code driving a daemon
-  is honest. At one end, the hosted dashboard tab: convenient, zero-install,
-  and explicitly a [degraded-trust tier](./trust-architecture.md#organizations-two-lanes),
-  because the hosted origin can change what it serves at any time. At the
-  other, code whose provenance you control: the signed native app, or a
-  dashboard served by a daemon you own (the
+  is honest. Hosted Connect is convenient and zero-install for discovery,
+  but is no longer on the control ladder at all: the default binary fixes it
+  at `role:none` because the hosted origin can change what it serves at any
+  time. Control starts with code whose provenance you accept: the signed
+  native app using its mTLS bridge, or a dashboard served by a daemon you own
+  over loopback/mTLS (the
   [anchor rule](./trust-architecture.md#anchor-daemons)).
 
 The doctrine is one sentence: **match the client's provenance to the payload
@@ -31,15 +32,14 @@ of the daemon it is driving — per daemon, not per person.**
 
 Stated per tier, and resolving what looks like a paradox:
 
-- Driving a *disposable* daemon from a hosted tab is not a compromise you
-  tolerate — it is the design working. The custody machinery (vault,
-  time-boxed leases, zero-authority rendezvous, claims-grant-nothing) exists
-  precisely so that the worst a poisoned hosted page can harvest from this
-  tier is bounded, revocable, and logged. The hosted path is *most*
-  compelling exactly where trust in the infrastructure is lowest, because
-  the payload puts a hard ceiling on the loss.
-- Driving an *integrated* daemon demands provenance: the native app or an
-  owner-served origin. This is where "just open intendant.dev" stops being
+- A *disposable* daemon still wants a trusted client, usually its
+  daemon-served fleet-certificate URL with mTLS or the native app's mTLS bridge. Custody then
+  bounds what compromise of the disposable box costs. Linking it in hosted
+  Connect makes the route easy to find; it does not make the hosted page a
+  control client.
+- Driving an *integrated* daemon demands provenance and authentication: the
+  native app's mTLS bridge, loopback, or an owner-served mTLS origin. This is
+  where "just open intendant.dev" stops being
   an acceptable answer, however encrypted the transport and however honest
   the service intends to be.
 
@@ -74,22 +74,17 @@ therefore made of three disciplines, not of infrastructure:
    ever holds a grant on an integrated daemon. An upward grant is the only
    way tiers actually bridge, which makes it the alarm condition — the one
    thing a fleet owner should never do casually.
-2. **Origin ceilings, hardened per daemon.** The default
-   [role ceilings](./trust-architecture.md#mechanisms) already cap
-   hosted-provenance sessions at `role:operator` everywhere
-   (`role_ceilings` in `iam.json`). That is a floor of protection sized for
-   the disposable tier. Integrated daemons should harden it further —
-   ceiling hosted provenance at an observer role, or refuse hosted-origin
-   control outright — so that "this box cannot be driven from a hosted tab"
-   is enforced where all authority already lives, not remembered by the
-   owner.
-3. **Separate keys, not separate networks.** The one genuinely cross-tier
-   single point is the browser identity key: one browser profile enrolled
-   as root on every daemon means one stolen profile owns both worlds. Keep
-   the enrollment that holds root on integrated daemons in a dedicated
-   browser profile or device (or in the native app's own storage); let the
-   everyday profile carry the disposable tier. This costs one extra
-   enrollment ceremony, once.
+2. **Hosted provenance is an immutable refusal.** The
+   [role ceilings](./trust-architecture.md#mechanisms) normalize hosted
+   sessions to `role:none` (`role_ceilings` remains compatibility state in
+   `iam.json`). Missing, empty, or hand-edited values fail closed, and the
+   default build exposes no knob that raises them.
+3. **Separate credentials, not separate networks.** Browser identity keys are
+   fleet-signing/attribution records in this alpha, not daemon login
+   credentials. Authority belongs on trusted loopback, direct-mTLS, or
+   native-mTLS surfaces; hosted Connect has no control ingress. Keep
+   integrated-daemon root material in a dedicated direct profile/device or
+   the native app; use the hosted profile only for account and route metadata.
 
 Two accounts — two actual fleets — buy exactly one additional property:
 the rendezvous cannot see that both worlds belong to the same person.
@@ -98,12 +93,16 @@ opt-in paranoia rather than the recommended shape.
 
 ## Custody inverts across tiers
 
-The [credential custody](./credential-custody.md) discipline — vault blob on
-the account, nothing durable on disk, browsers minting time-boxed leases —
-was built *for* boxes you do not trust. Apply it there and only there:
+The [credential custody](./credential-custody.md) mechanisms — sealed stores,
+time-boxed leases, and client egress — are most valuable on boxes you do not
+trust. The current boundary matters: Connect account-vault blobs cannot be
+delivered to a daemon because no trusted bridge ships. Use a daemon-store vault
+from a loopback/mTLS/native-mTLS client, or local credential configuration:
 
-- **Disposable tier**: leases only. The box's disk holds no durable secret;
-  destroying the box revokes nothing because there was nothing to revoke.
+- **Disposable tier**: prefer memory-only API-key leases from an authorized
+  daemon-store vault. A deliberately keyless box outside an active
+  full-credential OAuth lease can avoid durable provider secrets; `.env` and
+  full-credential OAuth mode do write durable/private material.
 - **Integrated tier**: the box is already inside your trusted computing
   base — it runs the agent that reads the mail. It may simply hold its own
   credentials (OS keystore, local config), because routing them through the
@@ -114,9 +113,9 @@ was built *for* boxes you do not trust. Apply it there and only there:
 
 ## The client ladder
 
-- **Disposable tier**: any hosted tab, anywhere. This is the zero-install
-  promise, delivered honestly.
-- **Integrated tier**: the signed native app, or a direct/owner-served
+- **Disposable tier**: a daemon-served fleet-certificate/direct mTLS origin or
+  the native app's mTLS bridge. Hosted Connect remains the zero-install directory.
+- **Integrated tier**: the native app's mTLS bridge, loopback, or a direct/owner-served mTLS
   origin. Store-signed releases are the out-of-band code anchor a bare
   browser tab cannot have — the same reason messengers with real E2E
   guarantees treat their web clients as the weak tier. The app is not the
@@ -136,17 +135,21 @@ renewed automatically, private keys never leaving the machine. Without
 fleet DNS, the manual routes remain: a hostname you own with a DNS-01
 cert, `tailscale cert` on a tailnet, or the browser's one-time exception
 plus the enrollment ceremony.
+The public server certificate proves the origin and supplies a warning-free
+secure context; it does not authenticate the browser. Remote protected routes
+still require the enrolled mTLS client certificate. Certless root exists only
+on loopback, and `--allow-public-plaintext` grants no authority.
 
 A worked example, one fleet:
 
 | Daemon | Tier | Control origins | Custody | Peer grants |
 |---|---|---|---|---|
-| `home` (desktop) | integrated | native app / direct only (hosted ceiling: none) | local keystore; vault entries app-only | holds grants **on** `vps-1`, `vps-2` |
-| `vps-1`, `vps-2` (rented) | disposable | any hosted tab | vault leases only | none; controlled **by** `home` |
+| `home` (desktop) | integrated | native-app mTLS / loopback or direct mTLS | local keystore or daemon-store vault | holds grants **on** `vps-1`, `vps-2` |
+| `vps-1`, `vps-2` (rented) | disposable | fleet-certificate + client mTLS, or native-app mTLS | prefer memory-only leases; full OAuth may materialize files | none; controlled **by** `home` |
 
-The owner claims all three into one account, sees them in one dashboard,
-and the tier boundary is carried entirely by ceilings, grant direction, and
-which client they open for which box.
+The owner links all three routes to one account and sees them in one dashboard.
+Linking changes no IAM. Control stays daemon-served/direct/native; grants on
+the disposable boxes are still scoped independently from grants on `home`.
 
 ## First contact: three rungs
 
@@ -180,20 +183,19 @@ Three rungs, ordered by what betrayal costs the attacker:
    public Certificate Transparency logs — where the daemon's own CT
    tripwire watches for serials it never requested and raises **CT
    ALERT** on the Connect card. Betrayal is possible, targeted, and loud.
-3. **Trusted but bounded — the hosted tab.** The rendezvous origin serves
+3. **Directory only — the hosted tab.** The rendezvous origin serves
    the code itself, so betrayal is a silently different bundle to one
    visitor, once, with no artifact anywhere. No evidence machinery can
-   apply; what bounds the damage is authority, not detection — role
-   ceilings cap hosted-provenance sessions, trusted-only vault entries
-   refuse hosted unseal, and custody keeps durable secrets off the tier
-   that would leak them.
+   apply. The default product therefore gives it no daemon authority at all:
+   claims grant nothing and hosted provenance is immutably `role:none`.
+   Connect can still lie about or exfiltrate its own account, route, presence,
+   and unlocked vault UI state, and its installers remain a real trust boundary.
 
 The product states the rung wherever an owner makes a trust decision:
 device-enrollment approvals carry a daemon-computed route chip (*via
-direct origin* / *via fleet name* / *via hosted route*), and owners who
-want rung-two sessions capped like rung-three ones add the daemon's fleet
-origin to `hosted_origins` (the ceiling test matches exact origins, so it
-is the daemon's own fleet URL that goes in the list, not the bare zone).
+direct origin* / *via fleet name* / *via hosted route*). Marking an origin in
+`hosted_origins` now means refusing it with `role:none`; it is not a way to
+create a lower-authority hosted control tier.
 Device enrollment (`intendant access serve-certs`) rides the same ladder:
 with a live fleet certificate it leads with the warning-free fleet URL and
 skips the fingerprint transcription (a rung-two bootstrap), while the
@@ -256,16 +258,15 @@ stated non-goal:
   it.
 - **Hosted-passkey coupling.** Unsealing the vault with a passkey inside
   a hosted tab is rung-three code wielding rung-one credentials. Two
-  shipped mechanisms narrow it: the write-only CLI deposit lane moves
-  secret *entry* off the web UI entirely, and the pinned crypto kernel
-  confines the master key, KEKs, and MAC key to one small hash-pinned
-  worker — page code can no longer exfiltrate key material or decrypt
-  future blobs offline. What remains, stated plainly: while a vault is
-  unlocked, the page necessarily sees entry plaintext to render it, so a
-  malicious hosted bundle can still read what it shows you — bounded by
-  the unseal policy (trusted-only entries refuse hosted tabs), the
-  ceilings, and the transparency log's after-the-fact evidence, not by
-  the kernel.
+  shipped mechanisms reduce accidental exposure: the write-only CLI deposit
+  lane moves secret *entry* off the web UI, and the crypto worker narrows the
+  code that normally handles key material. Neither detrusts the hosted origin:
+  Connect controls the page that selects and hash-checks the worker, can prompt
+  for a PRF evaluation, and can exfiltrate the output, decrypted state, or
+  plaintext it renders. Trusted-only entry policy is client-side mistake
+  prevention, not protection from malicious served code. The stronger current
+  boundary is that Connect has no daemon-control channel or vault-delivery
+  bridge at all.
 
 ## Product hooks
 
@@ -278,8 +279,9 @@ the owner's memory. All four are **shipped**:
    top of Access → Overview. The guard is advisory and local-tier-driven:
    on an integrated machine, the peer pairing-approval card warns that
    approving grants a peer authority *here* (the upward-grant alarm), and
-   hosted-route device enrollments get an integrated-tier warning chip
-   beside the existing hosted-route one. When a verified doorbell caller
+   direct enrollment records whose key originated at a hosted origin get an
+   integrated-tier warning chip. Connect itself never queues an enrollment.
+   When a verified doorbell caller
    states its own tier ([Where fleet metadata
    rides](#where-fleet-metadata-rides)), the alarm sharpens: a disposable
    machine asking for authority on an integrated one is named as exactly
@@ -287,19 +289,15 @@ the owner's memory. All four are **shipped**:
    visibility ships via the signed fleet record — each fleet card carries
    its daemon's tier chip, offline daemons included (the carrier
    reasoning is [Where fleet metadata rides](#where-fleet-metadata-rides)).
-2. **Per-daemon hosted-ceiling knob.** The same card carries "Hosted tabs
-   may: Operate / View only / Nothing" — one control writing both
-   hosted-provenance `role_ceilings` bindings
-   (`POST /api/access/hosted-ceiling`), with `role:none` (a
-   zero-permission, ceiling-only builtin) as the honest refuse-entirely
-   position. Choosing Integrated while hosted tabs can still operate
-   surfaces a one-click "Cap to View only" nudge. Raising ceilings,
-   per-binding divergence, and disabling remain deliberate `iam.json`
-   edits.
+2. **Immutable hosted refusal.** Both hosted-provenance compatibility entries
+   are forced to the zero-permission `role:none` on every IAM load. The former
+   hosted-ceiling UI/API is retired; missing, empty, or hand-edited values
+   cannot enable hosted control.
 3. **Per-entry vault unseal policy.** Vault entries accept
    `unseal_policy: "trusted"` (add form + per-entry toggle): trusted-only
-   entries refuse reveal, lease fueling, egress relay, and the voice
-   mirror from hosted tabs, and the custody trail stamps every
+   entries refuse reveal in the normal hosted UI. Connect cannot invoke lease
+   fueling, egress relay, or the voice mirror because no control/delivery bridge
+   ships; trusted daemon-origin sessions retain those mechanisms. The custody trail stamps every
    lease/relay ceremony with the session's origin class
    (`hosted`/`direct`/`local`/`peer`). Honest limits, stated in the UI
    too: this is client-side self-enforcement — protection against
@@ -327,15 +325,15 @@ the owner's memory. All four are **shipped**:
 "Browser→daemon vs peer-to-peer" conflates two axes. The *transport* —
 who carries the bytes — genuinely mixes: a peer-routed terminal is
 signaled through the daemon you're logged into but its data plane is a
-direct browser↔target datachannel, while a hosted tab's tunnel is
-rendezvous-signaled yet equally direct. The axis that carries trust
+direct browser↔target datachannel. Hosted Connect has no control tunnel. The axis that carries trust
 weight is the **principal**: whose authority the *target* daemon
 enforces and audits. Every fleet surface sits in one of two lanes:
 
-- **The user lane** — the target binds *you*: a direct tab, the hosted
-  tunnel to a claimed daemon, the native app. Your identity key (or
-  certificate, or account) is the principal; your role and the
-  provenance ceilings apply; the audit names you.
+- **The user lane** — the target binds *you*: a loopback/direct-mTLS tab or the
+  native app's mTLS bridge. The local session or mTLS certificate is the
+  shipped alpha principal; a browser identity key is record-only and the
+  Connect account is route metadata, not an authenticator. Your role applies
+  and the audit names you.
 - **The delegation lane** — the target binds *a daemon*: the peer-routed
   panes (terminal, files, folded sessions, displays) are admitted under
   the intermediary's peer grant (`DashboardControlGrant::Peer` — its
@@ -350,8 +348,8 @@ that know you. The delegation lane is for **orchestration and downward
 reach** — an integrated anchor conducting its disposables, or seeing a
 box that has granted your daemon (not you) access. The
 grants-flow-down discipline is what keeps the delegation lane safe: a
-hosted tab on your anchor can spend the anchor's peer grants, which is
-acceptable *because* those grants only reach down the tier gradient.
+loopback/mTLS-authenticated session on your anchor can spend its peer grants
+only down the tier gradient. A hosted Connect tab cannot spend them.
 
 Lane rules, stated once:
 

@@ -14,12 +14,16 @@ path, and dashboard TLS/mTLS setup. For the local display pipeline
 those federated displays plug into, see [Display Pipeline](./display-pipeline.md).
 
 Peer federation is **not** the same security domain as a browser dashboard login.
-Hosted Connect passkeys and browser mTLS client certificates authenticate a
-human/client route to one daemon and are root dashboard access for the owner
-today. Peer federation authenticates a daemon route to another daemon and should
-use peer-scoped mTLS identities plus peer profiles. Future coworker/team access
-belongs in user-scoped IAM unless the federation trust model is deliberately
-expanded.
+Connect passkeys authenticate the hosted account and route UI only; they never
+authenticate to a daemon. Human/client daemon authentication uses browser mTLS
+or trusted local presence in this alpha. Browser identity keys sign fleet
+records and can be stored as IAM/org subject metadata, but no live alpha ingress
+authenticates one; recording or approving such a key does not create a session.
+Hosted provenance is immutable `role:none` in the default build; all human
+control remains direct/local, daemon-served, or signed-native. Peer federation authenticates a daemon route to another daemon
+and should use peer-scoped mTLS identities plus peer profiles. Future
+coworker/team access belongs in user-scoped IAM unless the federation trust
+model is deliberately expanded.
 
 The dashboard now describes both domains with the same access vocabulary:
 principal, target, grant, policy, and transport. In that model a peer daemon is

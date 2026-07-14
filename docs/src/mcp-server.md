@@ -93,7 +93,7 @@ the owner's own client config, always counts as an owner surface. See
    sessions with no binding at all do.
 3. **Browser pages** may only call `/mcp` from this daemon's own origin (or
    the macOS app scheme) and then bind like any dashboard HTTP request
-   (mTLS certificate principal or trusted-transport root). Foreign origins
+   (an enrolled mTLS certificate principal or trusted-local root). Foreign origins
    get 403 — same posture as the rest of `/api/*`.
 4. **Tokenless loopback** processes bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are

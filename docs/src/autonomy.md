@@ -43,7 +43,7 @@ A pending request does not depend on someone happening to look at a
 dashboard: an open-but-hidden tab badges its title/favicon with the pending
 count and can raise a browser notification
 ([Web Dashboard](./web-dashboard.md)), and when *no* dashboard has been
-connected since the request appeared, a claimed daemon nudges the Connect
+connected since the request appeared, a linked daemon nudges the Connect
 rendezvous after a grace period so opted-in browsers get a Web Push that
 names only the request kind and the daemon/session labels — never the
 command or question itself (`attention_nudge.rs`;

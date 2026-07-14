@@ -164,10 +164,13 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 | `setup-windows.ps1` | Windows toolchain + build for `x86_64-pc-windows-msvc`, plus managed Chrome for Testing provisioning (see [Windows Support](./windows-support.md)) |
 | `bundle-macos.sh` | Build and codesign the macOS `.app` (WKWebView wrapper over the `intendant://` scheme) and install to `/Applications` |
 | `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers/orchestrators around the native `intendant access` cert enrollment flow |
-| `intendant-ctl.sh` | Convenience wrapper over the control socket (`status`, `approve`, `follow`, `start`, …) |
 
 `intendant setup browsers` can also be run directly to install or repair the
 managed browser cache used by CDP browser workspaces.
+
+There is no `scripts/intendant-ctl.sh` wrapper. The supported command-line
+client is the binary itself: `intendant ctl --help` discovers the HTTP MCP
+control surface, and each command group has focused help.
 
 > **When you add a new `-sys` crate dependency, update both
 > `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh` in the
@@ -182,13 +185,15 @@ checks marked *required* below gate it. The required-check workflows run
 **unfiltered on `pull_request` and `merge_group`** on purpose: GitHub only
 adds a PR to the queue once the PR's own required checks pass, so a
 `paths:`-skipped required check blocks queue entry (and a skipped group check
-wedges the entry at "Expected"). Their push-to-main triggers keep paths
-filters — those runs warm the main-branch caches, they don't gate.
+wedges the entry at "Expected"). Cheap integrity/docs workflows retain
+paths-filtered push triggers; the heavy cross-platform workflow has no push
+trigger because the merge group just validated the same tree.
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on a
 **self-hosted fleet** (`dell-206` / `intendant-linux`, `macbook-vm` /
-`intendant-macos`, `samsung-win` / `intendant-windows`) whose persistent
-incremental `target/` dirs make warm gate runs a few minutes. **Fork PRs
+`intendant-macos`, `samsung-win` / `intendant-windows`). Its incremental build
+state lives in external, per-listener `CARGO_TARGET_DIR` caches keyed by the
+Rust version; checkout cleanup wipes any in-workspace `target/`. **Fork PRs
 route to GitHub-hosted runners** via a dynamic `runs-on` (the matrix `os`
 key doubles as the hosted label): external code never executes on the
 fleet, while its required checks still genuinely run — a skipped required
@@ -202,17 +207,20 @@ registered per-repo, and the default `GITHUB_TOKEN` is read-only.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `windows.yml` | every PR + merge group; push to `main` (Rust/Cargo paths, check-only warm) | **Required.** Cross-platform `cargo test` (the `intendant` bins plus the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) and the headless mock-provider e2e on Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`) to catch platform-specific build breaks and Unix-only test assumptions. Full suites run in exactly two places — the merge group (all three platforms, the actual gate) and the Linux `pull_request` leg (the pre-queue runtime signal); everything else (non-Linux PR legs, every push-to-main warm run) is `cargo check` only. The Windows and Linux legs build with `CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link against ~12s of test execution, so debuginfo was the cost, not the tests |
-| `smokes.yml` | every PR + merge group (no push trigger — the group run just validated the identical tree) | **Required.** The keyless smokes (`session-vitals`, `native-goal`, `peer-sessions`) driving real binaries with the scripted mock provider on Linux (debug profile with debuginfo off, sharing the runner's warm tree with the test job — the drivers are platform-agnostic protocol probes; a second platform duplicated coverage and doubled flake surface, and release added only build time) |
+| `windows.yml` | every PR + merge group; no push trigger | **Required.** Cross-platform test/check matrix for Windows (`x86_64-pc-windows-msvc`), macOS (`aarch64-apple-darwin`), and Linux (`x86_64-unknown-linux-gnu`). A merge group runs the unit suite plus the 20 headless mock-provider e2e cases on all three platforms; a PR runs that full battery on Linux and `cargo check` on the other two. The Linux leg then reuses its checkout and build tree for the keyless `session-vitals`, `native-goal`, and `peer-sessions` smokes plus the headless dashboard-boot probe. All legs build with `CARGO_PROFILE_DEV_DEBUG=0` |
 | `app-html.yml` | every PR + merge group; push to `main` (fragment/assembler paths) | **Required.** Reruns the assembler and fails when the committed `static/app.html` doesn't match the fragments |
 | `agents-md-sync.yml` | every PR + merge group; push touching `CLAUDE.md`/`AGENTS.md`; manual dispatch | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
+| `wasm-drift.yml` | every PR + merge group; in-job relevance skip | **Required.** On the canonical macOS host, rebuilds both browser WASM crates with the pinned Rust/wasm-pack versions and byte-compares the committed artifacts |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |
 | `docs.yml` | docs changes on `main` | Build and deploy this mdBook to GitHub Pages |
 
-The `tests/skills/` scenarios that make real API calls or need a display (the
-live claude-code-e2e battery, browser/Station probes, the peer smoke's
-`--browser` leg) are **not** in CI — they run on operator hardware as the
-post-landing battery.
+`tests/e2e/main.rs` currently contains 20 hermetic `#[tokio::test]` cases. They
+spawn the real binaries against the scripted mock provider, use the synthetic
+1280×720 display rather than native capture, need no API key or network, and
+run in CI on all three supported operating systems. The `tests/skills/`
+scenarios that make real API calls or need a native display (the live
+claude-code-e2e battery, browser/Station probes, voice/audio scenarios) stay
+outside CI and run on operator hardware.
 Run `cargo test --bins` and `cargo clippy` locally before committing. The TLS
 stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is why the
 Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
@@ -277,16 +285,18 @@ external scripts and tools. It is opt-in.
   `schedule_controller_restart` with `restart_after="now"` and no executable
   restart action).
 
-### Example
+### Examples
 
 ```bash
+# Raw, opt-in Unix control-socket protocol:
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 
-# Or the helper script:
-./scripts/intendant-ctl.sh status
-./scripts/intendant-ctl.sh approve
-./scripts/intendant-ctl.sh follow "fix that other bug too"
-./scripts/intendant-ctl.sh start "new task description"
+# Supported CLI (HTTP MCP, default port 8765; add --port PORT when needed):
+intendant ctl status
+intendant ctl approval pending
+intendant ctl approval approve 123
+intendant ctl input respond "answer to the pending question"
+intendant ctl task start --task "new task description"
 ```
 
 ## Web gateway

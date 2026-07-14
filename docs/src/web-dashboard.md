@@ -67,8 +67,12 @@ Practical rules:
   `WKWebView` wrapper uses the custom `intendant://` scheme because
   `http://localhost` there does not expose media devices.
 - `http://<host-ip>` is not a secure context. Use default native mTLS,
-  `--tls` with a trusted certificate, the macOS app wrapper, or another trusted
-  HTTPS reverse proxy. The macOS app wrapper starts its bundled backend with
+  `--tls` with a trusted certificate for public/authority-free bytes, or the
+  native app's mTLS bridge. A generic Caddy/nginx HTTPS reverse proxy supplies
+  encryption and a secure context, not client authentication. If it forwards
+  to daemon loopback, the proxy is itself a root trust boundary and must enforce
+  approved client identity while protecting its upstream from other callers.
+  The macOS app wrapper starts its bundled backend with
   mTLS by default and fails closed with setup guidance when access certs are
   missing.
 - Clicking through a self-signed certificate warning is not a reliable substitute
@@ -411,7 +415,7 @@ per-display WebRTC session.
   agent sessions use, registers a capture session, and every connected
   dashboard gets a streaming tile (`create_virtual_display`, gated as
   `display.input`, on both the `/ws` and dashboard-control transports). This
-  is how a freshly claimed headless box — no display server, no API key —
+  is how a newly authorized headless box — no display server, no API key —
   gets a working display; agents can then target it for computer use. The
   created display is daemon-owned: it never touches the "Your display"
   opt-in, and it is destroyed (Xvfb killed) when any dashboard closes its
@@ -554,9 +558,11 @@ the active compacted session is not mistaken for the target of the mutation.
 Edit, browse, download, and upload files on the local daemon or a configured
 peer target. The tab is split into two sub-tabs: **Editor** (the default) and
 **Transfers** (the download/transfer-history/upload tooling). The target
-summary uses the same access abstraction as Terminal: local/mTLS, hosted
-transports, and peer dashboard-control routes are shown as targets with their
-available capabilities rather than as transport internals.
+summary uses the same access abstraction as Terminal: local/mTLS and peer
+dashboard-control routes are shown as targets with their available
+capabilities rather than as transport internals. Hosted Connect directory
+records are not Files or Terminal targets: they carry no control URL or
+authority and appear only as non-operable discovery/remembered metadata.
 
 The daemon-side durable state behind this surface — staged uploads
 (`uploads/<session-id>/` blob + sidecar) and transfer job metadata
@@ -631,7 +637,9 @@ Unified administration for how dashboards and daemons reach each other:
   three-step explainer of the access model.
 - **Daemons** lists targets, not raw transports: each row shows a clean display
   name (never a bare IP or key when a better name exists), a route chip, your
-  role badge there, capability chips, and Stats/Files/Shell/Display actions.
+  role badge there, capability chips, and Stats/Files/Shell/Display actions for
+  local, mTLS, or peer-operable targets. Connect-only directory records never
+  become Files/Terminal targets and expose no such actions.
   The pane also hosts the per-peer messaging/task/approval quick controls and
   capability routing, both in collapsed poweruser folds.
 - **People & Devices** owns the user/client domain. It shows your identity on
@@ -644,8 +652,8 @@ Unified administration for how dashboards and daemons reach each other:
   Link-daemons wizard (Request Peer Access, Join Invite, Grant Peer Invite,
   Manual Add), inbound peer access requests, approved/revoked inbound peer
   identities, and every peer-profile grant in both directions.
-- **Diagnostics** owns dashboard route health, including hosted Connect,
-  local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
+- **Diagnostics** owns route health, including hosted Connect directory/link
+  status, local/mTLS, trusted local WebRTC control, event delivery, byte streams, uploads, and
   self-tests. The oversight bar's access dot links here, and its prefix names
   the actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is
   never ambiguous.
@@ -659,22 +667,34 @@ Unified administration for how dashboards and daemons reach each other:
   `#access/public` resolve to Advanced, `#access/invitations` to Peers, and
   `#access/targets` to Daemons.
 
-Access uses one vocabulary across the hosted dashboard, direct/self-hosted mTLS,
-and peer federation:
+Access uses one vocabulary across trusted daemon-served loopback/mTLS
+dashboards, the signed native app, and peer federation. Hosted Connect
+contributes directory metadata only; it is not an Access or control surface:
 
-- A **target** is a daemon the dashboard can operate.
-- A **principal** is the actor being trusted: the current browser session, a
-  browser certificate, a hosted Connect account, a future organization group, or
-  a peer daemon.
-- A **grant** connects one principal to one target with a role and status. The
-  current browser has a root user/client grant to the local daemon. A peer route
-  has a daemon peer-profile grant. An approved inbound peer identity appears as
+- A **target** is a daemon the trusted dashboard can operate. A Connect-linked
+  directory record is navigation metadata, not a target, until it carries a
+  separately trusted direct route.
+- A **principal** is the actor being trusted: the current local session, an
+  mTLS browser certificate, or a peer daemon. Browser identity-key records and
+  future organization groups also exist in the model, but keys are not an
+  active alpha login credential. `connect_account` remains in the IAM vocabulary for compatibility,
+  but a hosted account assertion is route metadata and does not authenticate to
+  the daemon.
+- A **grant** connects one principal to one target with a role and status. A
+  loopback browser or a verified owner-mTLS browser is root-compatible with the
+  local daemon. A hosted-origin key may exist in IAM and may be assigned a
+  scoped grant for use after trusted re-enrollment, but presentation through
+  Connect cannot exercise that grant or open a control session. A peer route
+  has a daemon peer-profile grant. An
+  approved inbound peer identity appears as
   a peer-daemon principal with a peer-profile grant to this daemon; revoked
   identities remain visible as revoked grants for audit clarity. Local IAM
-  grants loaded from `iam.json` are enforced when active and bound to browser
-  mTLS certificate fingerprints, hosted Connect account metadata, or a
-  `human_user` record that can carry both bindings plus account/provider and
-  organization metadata. Draft and revoked records remain visible for review.
+  grants loaded from `iam.json` are enforced when active and bound to an
+  authentication mechanism the transport actually supplies. In this alpha
+  that browser mechanism is mTLS, not a browser identity key. A `human_user`
+  record can carry account/provider and organization metadata, but Connect
+  account metadata alone is not an authenticating binding. Draft and revoked
+  records remain visible for review.
 - A **policy** defines the shape of authority behind a grant. `root` and
   `peer-profile` are enforced today, but they live in different domains:
   `root` is user/client authority and `peer-profile` is daemon-to-daemon
@@ -698,9 +718,9 @@ and peer federation:
   peer profiles are mapped conservatively: `peer-root` can inspect access and
   inspect/manage/use peer topology, but `access.manage` remains reserved for
   trusted root user/client sessions.
-- A **transport** is only how the route is carried: browser mTLS, hosted
-  Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
-  product UI should not make Connect a separate access system.
+- A **transport** is only how an authorized route is carried: browser mTLS,
+  loopback HTTP, trusted daemon-origin WebRTC control, or daemon-to-daemon peer
+  mTLS. Hosted Connect is a directory/link surface, not an access transport.
 
 The browser may also maintain a local fleet registry for navigation: daemon ids,
 labels, remembered URLs, and the route/auth summary last seen from a daemon. This
@@ -709,34 +729,42 @@ target is no longer configured on the current daemon, Access shows it as a
 browser-local record with operation buttons disabled. The daemon still owns IAM
 enforcement for every request.
 
-When the dashboard is loaded from the hosted Connect/Access origin in
-`?connect=1` mode, that browser-local fleet registry is also synced to the
-signed-in account through `GET /api/fleet/targets`,
+The hosted `/connect` directory maintains account-scoped fleet navigation
+metadata through `GET /api/fleet/targets`,
 `POST /api/fleet/targets/sync`, and
 `POST /api/fleet/targets/{target_id}/forget`. The hosted service stores only
 navigation metadata: target ids, labels, route labels, URLs, capability hints,
 and last-seen timestamps. It does not store browser mTLS private keys, daemon
 IAM grants, peer secrets, dashboard session grants, or passkey private material.
-Claimed Connect daemons are merged into the same target list as live
+Linked Connect daemons are merged into that directory list as live
 `connect_daemon` records and override stale remembered labels. Records the
 browser pushes are signed with its identity key and re-verified after every
 round trip; target rows and the fleet strip badge each synced record as
 verified (this browser), signed (another device), unverified, or a hosted
-claim — so the metadata store can remember the fleet but cannot invent or
-alter it unnoticed. Direct mTLS
+claim. The signer key is carried inside the record and is not yet anchored to
+an owner/device trust set. The current browser detects same-key alteration,
+but a malicious store can substitute a fresh, internally valid self-signed
+record on another device. Connect-served code can also wield the hosted
+origin's browser key while loaded. These signatures are metadata
+integrity/attribution hints, not daemon authentication. The former hosted
+`/app?connect=1&daemon_id=...` dashboard route is retired and always redirects
+to `/connect`; linked targets expose no dashboard URL or Open action. Direct mTLS
 dashboards on daemon origins remain local-first; cross-origin sync to
 `intendant.dev` is a separate explicit-consent design problem, not something the
 current cookie model does silently.
 
 The important security-domain split is:
 
-- **User/client daemon access** means a human-operated dashboard can control a
-  daemon. Hosted Connect passkey access and browser mTLS client certificates are
-  both in this domain. Unbound browser mTLS owner sessions remain
-  root-compatible; hosted Connect sessions require a daemon-local IAM binding
-  for the routed account. Active local IAM bindings can scope a browser
-  certificate, Connect account, or combined human mTLS user through this same
-  domain. Future coworker/team access belongs here, not in peer federation.
+- **User/client daemon access** means a human-operated trusted dashboard can
+  control a daemon. Browser/native mTLS certificates are the shipped remote
+  credential; browser identity keys are record-only in this alpha. Unbound browser mTLS owner sessions remain
+  root-compatible only when the browser is loopback or presents the verified
+  owner client certificate. Hosted Connect passkeys authenticate only the
+  directory account; Connect browser signaling is disabled at the service and
+  legacy Connect control events are dropped by the daemon. A local grant does
+  not turn that page into a control session. Future
+  coworker/team access belongs on trusted user/client surfaces, not in peer
+  federation.
 - **Peer access** means one daemon can call capabilities on another daemon. That
   uses daemon-to-daemon mTLS identities and peer profiles such as `peer-operator`
   or `peer-root`. Peer access does not imply that the human's browser can open
@@ -750,7 +778,7 @@ dashboard-control `api_access_overview` method return schema version 1 with
 architecture notes. Root dashboard sessions and peer daemon sessions now pass
 through the shared IAM operation evaluator, while preserving the existing root
 and peer-profile semantics. The overview still exposes one product model over
-the current transport/auth paths rather than replacing mTLS, Connect account
+the current transport/auth paths rather than replacing mTLS, browser-key
 checks, or peer profiles.
 
 The local IAM foundation lives beside the native access cert store as
@@ -759,16 +787,22 @@ dashboard-control `api_access_iam_state`. Its schema contains `principals`,
 `roles`, `grants`, and `audit_events`. The daemon exposes this state for
 inspection, merges managed principals/grants into the unified overview, and
 enforces active scoped user/client grants when a request can be bound to a
-stable local principal. Today those stable bindings are browser mTLS client
-certificate fingerprints, hosted Connect account metadata, and `human_user`
-records that can combine both while carrying optional account provider,
-verified-provider, handle, and organization metadata. Existing owner browser
-mTLS requests remain root-compatible when no active local binding exists so
-direct/self-hosted access stays first-class. Hosted Connect requests do **not**
-get that root fallback: the daemon only answers a Connect dashboard offer when
-the Connect account matches a daemon-local IAM principal/grant. Active grants
-are evaluated by role, while draft or revoked records deny instead of silently
-becoming root again. The `iam.enforcement` object reports
+stable local principal. Today the shipped browser binding is a browser/native
+mTLS client-certificate fingerprint. Browser identity-key records are staged
+but not consumed by direct `/ws` or dashboard-control offers; `human_user` records can
+carry optional account provider, verified-provider, handle, and organization
+metadata without making that metadata an authenticator. Requests remain
+root-compatible without a stored binding only when they are loopback or present
+the verified owner mTLS certificate. Certless remote `--tls` supplies HTTPS and
+a secure context, not daemon authority; remote protected HTTP, WebSocket, and
+dashboard-control routes require mTLS. `--allow-public-plaintext` never opts a
+remote caller into ambient root. Hosted Connect has no root fallback or control
+request path: the service returns `403` for browser offer/ICE/close before
+mutation, and the daemon drops those events from old/self-hosted services before
+inspecting a browser key or grant. There is no hosted-ceiling raise in the
+default build. Active grants are evaluated by role on trusted routes, while draft
+or revoked records deny instead of silently becoming root again. The
+`iam.enforcement` object reports
 `root_session_grants: true`, `peer_profile_grants: true`,
 `user_client_grants: true`, and
 `principal_binding: root_peer_and_local_user_client`. Root sessions can create
@@ -792,34 +826,44 @@ browser-installed mTLS certificate cannot be steered cross-site. Reach the
 Access page by an origin the fleet advertises (the target rows already link
 that way) for cross-daemon administration to work.
 
-The same posture now applies daemon-wide: API responses carry no
-`Access-Control-Allow-Origin` by default (same-origin only), every `/api/*`
-request bearing a foreign Origin is refused, and only the deliberate
-public-bootstrap surfaces stay wildcard-readable — `/config`, the agent
-card, local Connect signaling (`/connect/status`, `/connect/dashboard/*`,
-whose real authentication is the daemon-signed binding plus IAM), and the
-public peer-access doorbell. The macOS app is unaffected: its custom-scheme
-pages are proxied natively, and the `intendant://` scheme is treated as the
-daemon's own origin.
+The same posture now applies daemon-wide: authority-bearing API responses carry
+no `Access-Control-Allow-Origin` by default (same-origin only), and every
+`/api/*` request bearing a foreign Origin is refused. `/config` is not public:
+it requires `presence.read`, echoes only the daemon's own or a fleet-allowlisted
+Origin, and returns `Cache-Control: no-store` because ICE configuration can
+contain TURN credentials. Only authority-free bytes such as the agent card,
+`/connect/bootstrap`, `/connect/status`, and the public peer-access doorbell
+remain public. Authority-bearing
+direct signaling under `/connect/dashboard/*` and the legacy `/ws` event lane
+accept browser requests only from the daemon's own origin or the signed app
+scheme, before mTLS/local transport facts become a grant. For cleartext
+browser traffic, "own origin" additionally requires `localhost` or a literal
+loopback address; merely matching attacker-controlled Origin and Host values
+is not enough, which closes the DNS-rebinding route into local root authority.
+Non-loopback browser access uses HTTPS/mTLS. Native and daemon clients that do
+not send a browser Origin remain transport-authenticated as before. The macOS
+app is unaffected: its custom-scheme pages are proxied natively, and the
+`intendant://` scheme is treated as the daemon's own origin.
 
-Device enrollment closes the loop for browsers that hold an identity key but
-no grant yet: when a *verified* client key is refused, the daemon queues a
-pending enrollment (in-memory, capped, TTL'd — the queue grants nothing by
-itself). `GET /api/access/enrollment-requests` /
+Device enrollment has implemented queue/state/UI plumbing, but it is staged in
+this alpha: direct `/ws` and dashboard-control offers do not present a browser
+identity-key proof, so ordinary alpha traffic cannot create a usable key-login
+enrollment. `GET /api/access/enrollment-requests` /
 `api_access_enrollment_requests` list the queue (`access.inspect`), and
 `POST /api/access/enrollment-requests/decide` / `api_access_enrollment_decide`
 (`access.manage`) approve with a role or deny. Approval reuses the normal
 user-client grant upsert with the queued key's public key and route origin
-attached, so role ceilings and audit apply as usual. People & Devices shows
-the queue as **Pending devices**, and the Overview raises an attention banner
-while any request waits.
+attached, so role ceilings and audit apply as usual for fixtures/future
+transports. People & Devices shows any queued records, but remote alpha
+enrollment uses mTLS certificates.
 
 The same IAM evaluator now protects the direct dashboard HTTP routes that expose
 Access, target discovery, settings, filesystem reads/writes, sessions,
 worktrees, displays, diagnostics, and managed-context data. Static bootstrap
-assets, `/config`, `/.well-known/agent-card.json`, local Connect signaling, and
-the WebSocket bootstrap stay outside this generic HTTP gate because they either
-do not mutate daemon state or have their own transport/authentication binding.
+assets, `/config`, `/.well-known/agent-card.json`, local Connect status, direct
+dashboard signaling, and the WebSocket bootstrap stay outside this generic HTTP
+IAM gate because they either do not mutate daemon state or have their own
+same/app-origin plus transport/authentication binding.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
@@ -844,8 +888,8 @@ input-authority wire follows). The Access **Overview** renders this as the
 **Open dashboards** card — "N tabs connected · this tab · holds voice /
 display input" — refreshed on pane entry and every 15 s while the pane is
 visible; peer-daemon control connections are counted separately from tabs.
-Hosted Connect offers relayed through the rendezvous don't carry the tab id
-yet (the relay envelope drops unknown fields), so those sessions list untagged.
+Hosted Connect cannot create an entry: the service refuses browser signaling
+and the daemon drops legacy Connect control events before the registry.
 
 ### Debug
 
@@ -1001,13 +1045,12 @@ control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
 ### WebRTC Dashboard Control Tunnel
 
 Intendant also has an experimental daemon-scoped WebRTC DataChannel transport
-for dashboard control traffic. It is not a replacement for dashboard
-authentication yet: today the browser still bootstraps from the normal dashboard
-origin, then uses the daemon's local `/connect/dashboard/*` signaling endpoints
-to establish the DataChannel. The existing WebSocket signaling path remains as
-a compatibility fallback for older dashboard bundles. The point is to prove the
-future "public HTTPS bootstrap + direct local daemon data path" shape without
-weakening the current mTLS default.
+for trusted dashboard control traffic. It is not authentication: the browser
+bootstraps from the daemon's normal dashboard origin, then uses that daemon's
+local `/connect/dashboard/*` signaling endpoints. Loopback callers may use the
+local-root posture; remote callers must present mTLS. Certless `--tls` provides
+only a secure context, and `--allow-public-plaintext` grants no authority. The
+existing WebSocket lane remains as a compatibility fallback.
 
 The handshake is bound to the daemon identity:
 
@@ -1016,14 +1059,15 @@ The handshake is bound to the daemon identity:
 - the daemon answers with SDP plus a signed binding over the offer hash, answer
   hash, session id, timestamp, and daemon Ed25519 public key;
 - the browser verifies that binding with WebCrypto before using the channel.
-- in Connect-rendezvous mode, the browser also requires the answer to carry the
-  daemon public key registered for the selected daemon id and rejects the tunnel
-  if that advertised key differs from the key inside the signed binding.
+- the retired Connect-rendezvous prototype additionally compared the directory's
+  daemon key; that path is unreachable in the default product and remains only
+  in negative mixed-version tests.
 
-The tunnel is the **primary event lane** — dashboard events and intents flow
-through it instead of the legacy `/ws` — in three postures: hosted Connect
-dashboards, the packaged macOS app (a WKWebView WebSocket can never present the
-mTLS client certificate), and the **capability fallback**. WebKit browsers
+The tunnel can be the **primary event lane** — dashboard events and intents flow
+through it instead of the legacy `/ws` — for an authenticated daemon-origin
+dashboard, a loopback packaged macOS app, and the **capability fallback**.
+There is no remote signed-native authentication bridge in this release.
+WebKit browsers
 (Safari) share that WebSocket limitation — against an mTLS daemon the `/ws`
 hangs in CONNECTING forever while fetch/XHR keeps working — so a plain browser
 tab whose `/ws` has not opened within a few seconds of an attempt promotes the
@@ -1109,16 +1153,17 @@ The daemon also exposes a narrow, experimental Connect-style bootstrap surface
 for testing the public-origin signaling shape without changing the normal
 dashboard:
 
-| Endpoint | mTLS? | Purpose |
-|----------|-------|---------|
-| `GET /connect/bootstrap` | not required | Minimal HTML bootstrap page for WebRTC dashboard-control transport testing |
-| `GET /connect/status` | not required | JSON health/capability probe for the bootstrap surface |
-| `POST /connect/dashboard/offer` | not required | Browser SDP offer -> daemon SDP answer plus signed binding |
-| `POST /connect/dashboard/ice` | not required | Browser trickle ICE candidate for a control session |
-| `POST /connect/dashboard/close` | not required | Close a control session |
+| Endpoint | Authentication | Purpose |
+|----------|----------------|---------|
+| `GET /connect/bootstrap` | Public, authority-free bytes | Minimal HTML bootstrap page for WebRTC dashboard-control transport testing; receiving it grants nothing |
+| `GET /connect/status` | Public, authority-free bytes | JSON health/capability probe for the bootstrap surface; contains no credential or grant |
+| `POST /connect/dashboard/offer` | loopback local root or remote mTLS | Browser SDP offer -> daemon SDP answer plus signed binding |
+| `POST /connect/dashboard/ice` | loopback local root or remote mTLS | Browser trickle ICE candidate for a control session |
+| `POST /connect/dashboard/close` | loopback local root or remote mTLS | Close a control session |
 
-Those paths are deliberately allowlisted one by one. They do **not** make `/`,
-`/config`, `/ws`, `/api/*`, assets, recordings, or the full dashboard available
+Those paths are deliberately allowlisted one by one; allowlisting is routing,
+not authority. They do **not** make `/`,
+`/config`, `/ws`, `/api/*`, recordings, or the full dashboard's protected data
 without the normal dashboard authentication. The bootstrap page exposes
 `window.intendantConnectDashboard` for tests and diagnostics; it verifies the
 same daemon-signed binding as the full dashboard control experiment, then uses
@@ -1126,7 +1171,10 @@ the DataChannel RPC protocol directly. Its small browser-side transport supports
 plain JSON requests, chunked JSON responses, bounded `byte_stream_*` downloads,
 and `upload_*` frames, so the local bootstrap check can cover both read-style
 artifacts and media/editor writes without making the full dashboard certless.
-These local endpoints are useful for same-origin dashboard experiments and
+The bootstrap HTML/status bytes may be fetched remotely without a certificate,
+but certless **signaling and control** remain loopback-only. A custom `Origin`,
+public plaintext opt-in, or self-signed HTTPS connection from a remote address
+does not synthesize local root; remote protected paths require mTLS. These endpoints are useful for same-origin dashboard experiments and
 diagnostics; by themselves they do not solve browser trust for a public page
 talking to a daemon HTTPS certificate the browser has not already accepted.
 
@@ -1155,104 +1203,35 @@ That harness enables `window.intendantDashboardControl` in the real SPA and
 asserts that the verified DataChannel reports `signalingMode: "local-http"`.
 
 This slice is a local low-level harness for the dashboard-control tunnel. It
-does not implement account signup, passkeys, daemon claiming, or a durable
+does not implement account signup, passkeys, daemon linking, or a durable
 daemon registry. Its job is to keep the same-origin tunnel protocol easy to
-exercise while the hosted Connect service owns the account and daemon-claim UX.
-The validator seeds a temporary daemon-local IAM grant for its fixed test
-Connect account so the tunnel still exercises the same no-implicit-root rule as
-hosted Connect.
+exercise while the hosted Connect service owns the account and route-link UX.
+It is not a claim-authority path; hosted acceptance tests assert persistent
+`role:none` refusal instead of authorizing this local transport through Connect.
 
-### Local Rendezvous Emulator Slice
+### Retired Local Rendezvous Control Emulator
 
-The next experimental slice moves signaling off the daemon-served page. A daemon
-can opt into an outbound rendezvous client with `[connect]` or the
-`INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable. In that mode:
+> **Rejected protocol history; no success path remains.** An earlier emulator
+> served the daemon SPA from a public rendezvous origin and brokered a direct
+> WebRTC control channel. That experiment established transport feasibility but
+> failed the code-provenance boundary: the hosted service could replace the JS
+> that exercised authority. Its success-path contract and dashboard inventory
+> have been removed from the current documentation so they cannot be mistaken
+> for product behavior.
 
-1. The daemon registers a daemon id and daemon identity public key with a
-   rendezvous endpoint.
-2. The daemon long-polls the rendezvous endpoint for dashboard-control offers,
-   ICE candidates, and close requests.
-3. A browser loads a separate public-origin emulator page instead of a daemon
-   page.
-4. The emulator brokers SDP/ICE only; the browser and daemon still establish a
-   direct WebRTC DataChannel when ICE succeeds.
-5. The browser verifies the same daemon-signed binding before issuing RPC over
-   the channel.
-
-Run the end-to-end validator with:
-
-```bash
-node scripts/validate-connect-rendezvous.cjs
-```
-
-That script uses Playwright when it is installed (`PLAYWRIGHT_NODE_PATH` may
-point at a temporary `node_modules`), otherwise it falls back to launching
-Chrome/Chromium through the DevTools Protocol. The fallback honors
-`INTENDANT_BROWSER_WORKSPACE_EXECUTABLE`, `INTENDANT_BROWSER_EXECUTABLE`,
-`CHROME_PATH`, and `CHROME_BIN`.
-
-The validator starts a local rendezvous HTTP origin, launches a fresh daemon
-child with Connect env vars, verifies that
-`https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
-`401`, verifies that daemon rendezvous endpoints reject missing bearer auth, and
-then performs these browser passes:
-
-1. It loads the minimal public bootstrap page from the rendezvous origin and
-   drives `status`, `config`, `api_sessions`, id-filtered `api_sessions`,
-   streamed `api_sessions_stream` hydration, a chunked large
-   `api_sessions_stream` event, a chunked large `api_sessions` response,
-   active-session command-output lookup, active-session timeline
-   lookup/validation, bounded byte streams, uploads, media/editor writes, and
-   application error RPCs over the verified DataChannel.
-2. It serves the real `static/app.html` bundle from the same public origin at
-   `/app?connect=1&daemon_id=...`, proves that it uses rendezvous signaling
-   (`signalingMode: "connect-rendezvous"`), and checks that first-load dashboard
-   data such as config, Agent Card identity, sessions, bootstrap frames, event
-   subscription, and visible transport status all arrive through
-   `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
-   It also asserts that the SPA's signed daemon binding key matches the daemon
-   public key registered with the rendezvous service for the selected daemon id.
-   It injects a synthetic `api_control_msg` failure in the connected SPA and
-   verifies that the generic settings-style write path does not replay the same
-   mutation over the legacy WebSocket.
-   This real-SPA pass also fails if the public-origin dashboard attempts daemon
-   REST/media/WebSocket fallback paths such as `/config`,
-   `/.well-known/agent-card.json`, `/api/...`, `/recordings`,
-   `/connect/dashboard/...`, or `/ws`.
-3. It opens the same real dashboard with an unregistered daemon id and asserts
-   that the UI reports a Connect failure while still avoiding those public-origin
-   REST/media/WebSocket fallbacks. This page must also stop daemon-dependent
-   startup hydrators such as settings, project-root, and recording refreshes so
-   the initial rendezvous failure does not cascade into unrelated errors.
-4. It opens the real dashboard with the same registered daemon id while the
-   emulator deliberately tampers with the advertised registry key for that offer.
-   The SPA must reject the tunnel before it stores a verified binding, report a
-   failed Connect transport, and still avoid daemon REST/media/WebSocket
-   fallbacks.
-5. It opens the real dashboard with the same registered daemon id while the
-   emulator deliberately tampers with the browser-visible session grant. The
-   daemon signs the grant hash it received in the offer event, so the SPA must
-   reject the answer before it stores a verified binding or grant hash.
-6. It opens the real dashboard while the emulator deliberately tampers with the
-   browser challenge nonce forwarded to the daemon. The daemon signs the nonce it
-   received, so the SPA must reject the answer before it stores a verified
-   binding or expiry.
-
-This is still a protocol emulator rather than the consumer Connect service. It
-has no account signup, passkey ceremony, daemon claim, revocation, audit log, or
-hosted public HTTPS. Its fixed test account metadata must match the temporary
-daemon-local IAM grant seeded by the validator. The emulator's per-offer session
-value is only an opaque binding token used to prove that rendezvous state can be
-carried through signaling and bound into the daemon-signed WebRTC session
-statement; it is not dashboard authority.
+`scripts/validate-connect-rendezvous.cjs` now exists only as an adversarial
+mixed-version refusal check. It sends a legacy hosted offer and requires the
+daemon to reject it before registry, IAM, enrollment, or DataChannel mutation.
+Trusted daemon-origin tests cover successful dashboard-control transport.
 
 ### Hosted Connect Production Alpha
 
 The hosted-service slice is implemented as a separate binary,
 `intendant-connect`. It serves a public web origin, handles passkey-only account
-registration/login, lets a signed-in user claim a daemon with a short-lived
-12-word phrase, and brokers dashboard WebRTC signaling without asking the
-browser to trust the daemon's private HTTPS certificate.
+registration/login, lets a signed-in user link a daemon route with a single-use
+12-word claim code, and stores directory/fleet metadata. Browser dashboard
+signaling is compiled off: authenticated offer/ICE/close calls return `403`
+before service state mutation.
 
 In production, run it behind ordinary public TLS for a public origin such as
 `https://connect.intendant.dev`:
@@ -1263,9 +1242,14 @@ INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
     --listen 127.0.0.1:9876 \
     --origin https://connect.intendant.dev \
     --rp-id intendant.dev \
-    --static-root static \
     --data-file <state-file>
 ```
+
+The retired `--static-root PATH` flag (and
+`INTENDANT_CONNECT_STATIC_ROOT`) is accepted and ignored for deployment
+compatibility. It cannot mount a filesystem tree or re-enable the daemon SPA,
+WASM, or vault kernel on the hosted origin. Connect serves only explicit
+compile-time embedded pages/assets.
 
 The `--rp-id intendant.dev` value means passkeys are scoped to the owned
 Intendant parent domain while the actual UI can live on `connect.intendant.dev`.
@@ -1276,8 +1260,10 @@ also allow `http://localhost:<port>` as a secure context for local development,
 so the same binary can be E2E-tested without public TLS.
 
 The hosted service also serves `/access` as the account/fleet entry point.
-`/connect` remains a compatibility alias for the same passkey, claim, daemon
-list, open-dashboard, label, revoke, and audit workflows.
+`/connect` is the canonical passkey, route-link, daemon-list, label, release,
+and audit surface. It exposes no Open-dashboard action or daemon control URL.
+The historical `/app` route always redirects to `/connect`, including crafted
+`?connect=1&daemon_id=...` queries.
 
 The daemon side still uses the normal `[connect]` outbound rendezvous client:
 
@@ -1291,75 +1277,83 @@ auth_token = "same daemon token configured on intendant-connect"
 
 The hosted MVP flow is:
 
-1. The daemon registers its `daemon_id` and persistent daemon identity public
-   key through `/api/daemon/register`.
-2. If the daemon is unclaimed, Connect returns a short-lived claim phrase and
-   URL. The phrase is a standard 12-word BIP39 English mnemonic generated from
-   128 bits of entropy, stored only as a hash at rest, and regenerated if it
-   collides with another active unclaimed daemon.
-3. The user opens Connect, signs in or registers with a passkey, and submits the
-   claim phrase.
+1. The daemon locally generates a short-lived 12-word BIP39 claim code, then
+   registers its `daemon_id`, persistent identity public key, code hash, fresh
+   timestamp, and identity signature through `/api/daemon/register`. Connect
+   never receives or returns the plaintext code or URL.
+2. A successful, single-use registration proof rotates a short-lived
+   daemon-session credential. The daemon must present it on `/api/daemon/next`,
+   `answer`, `error`, `dry`, and `claim-proof`, including when deployment-wide
+   open registration skips the shared bearer.
+3. The user opens the daemon-printed `/connect#claim_code=...` URL or enters the
+   code, then signs in or registers with a passkey. The browser scrubs the
+   fragment, normalizes and hashes the code locally, and submits only the
+   digest. Query-string and plaintext claim bodies are rejected. The page
+   states that the code is single-use and is not a
+   password, recovery phrase, API key, private key, or passkey secret.
 4. Connect sends a `claim_challenge` event to the daemon. The daemon signs that
    challenge with its daemon identity key, and Connect verifies the signature
-   before assigning ownership.
-5. The user chooses the daemon in Connect and opens the dashboard. Connect
-   issues a short-lived opaque routing/session grant, forwards the browser SDP offer
-   to the daemon, and waits for the daemon answer.
-6. The daemon signs the same WebRTC binding used by the local/rendezvous paths,
-   including the offer hash, answer hash, browser nonce, expiry, daemon public
-   key, and hash of the Connect-issued routing grant.
-7. Connect validates that the answer came from the registered daemon key and
-   that the signed grant hash matches before returning the answer to the
-   browser. The browser independently verifies the daemon-signed binding before
-   sending dashboard RPC over the DataChannel.
+   before recording the account/route link. This changes no daemon IAM state
+   and grants no access.
+5. Control is established separately through a loopback local console or a
+   daemon-served mTLS dashboard. A remote signed-native authentication bridge
+   is future work. A Connect account
+   assertion never authenticates to the daemon, and daemon-stamped hosted
+   provenance is always `role:none` in the default build.
+6. Selecting the daemon in Connect shows directory metadata only. The service
+   rejects browser offer/ICE/close calls with `403` before queue, rate-limit, or
+   active-session mutation; a current daemon also drops those event kinds from
+   an old/self-hosted service before registry, IAM, or enrollment mutation. A
+   browser-key grant does not override either refusal.
 
-The state file durably stores users, passkeys, daemon ownership, hashed claim
-phrases, account-scoped fleet navigation metadata, and a capped audit log. Plain
-claim phrases, WebAuthn challenge state, browser offers, and routing grants
-are memory-only. The service exposes a minimal account/fleet UI today: passkey
-registration/login, claim-phrase entry, daemon list, daemon labels, open
-dashboard, revoke ownership, fleet target listing/forget, and audit events.
+The state file durably stores users, passkeys, daemon account/route links,
+hashed claim codes, account-scoped fleet navigation metadata, and a capped
+audit log. Plain claim codes are never in the service; WebAuthn challenge
+state and rotating daemon-session credentials are memory-only. The service
+does not accept browser offers. It exposes a minimal account/fleet UI today: passkey
+registration/login, claim-code entry, daemon list, daemon labels, route
+metadata, release link, fleet target listing/forget, and audit events.
 The visible account identity is the globally unique account name/handle; the
 internal WebAuthn display-name field is derived from that handle and is not a
 separate user-facing profile field in the MVP UI.
 
-Hosted Connect does not yet have Google/GitHub verification, organizations, or
-team IAM. The local daemon IAM schema already has portable account/provider,
-verified-provider, handle, and organization fields so a future hosted identity
-layer can issue grants without changing the daemon-side access vocabulary, but
-today those fields are operator-entered local metadata unless the current
-transport already supplies them.
+Hosted Connect does not provide daemon control or team IAM. The local daemon
+IAM schema already has portable account/provider, verified-provider, handle,
+and organization fields, but hosted account metadata remains non-authenticating
+directory data.
 
-Inside the hosted dashboard, Settings -> Debug includes a **Connect Health**
-panel. It summarizes the active dashboard-control transport, daemon binding,
-ICE route, event stream, byte-stream support, terminal-frame support, and other
-advertised tunnel capabilities. Its self-test button runs the same safe
-browser-side probes used by the hosted E2E harness: no legacy HTTP/WebSocket
-fallback for Connect-only mutations, Shell input ordering, terminal-output
-dedupe behavior, display-control routing, and tunneled presence callbacks. It is
-not a file-transfer integrity test; the Files tab owns the user-facing ranged
-download flow, and the hosted validator still uses a known fixture path for
-byte-accurate transfer checks.
+There is no hosted dashboard or Settings/Debug control panel in the default
+service. Connect shows directory/link health. Lower-level transport self-tests
+run on trusted loopback/mTLS harnesses; hosted validators stop before dashboard
+RPC and expect zero control sessions.
 
 Production-alpha hardening now includes:
 
 - cookie-backed user mutations require same-origin requests and a per-session
   CSRF header;
-- auth, claim, daemon, and browser signaling hot paths have simple in-memory
+- auth, claim, and daemon hot paths have simple in-memory
   rate limits keyed by reverse-proxy client headers;
-- `/healthz` is a cheap liveness probe and `/readyz` verifies that the static
-  dashboard bundle and state directory are usable;
+- `/healthz` is a cheap liveness probe and `/readyz` verifies that the state
+  directory is usable; the Connect pages/assets are embedded in the binary, so
+  readiness does not depend on a static dashboard root;
 - security-relevant service events are emitted as structured JSON on stderr in
   addition to the persisted user audit log;
-- revoking a daemon removes ownership, blocks future grants, and enqueues close
-  events for active dashboard-control sessions known to the service.
+- releasing a daemon link removes it from the account and clears legacy
+  service-side active-session bookkeeping. Current daemons ignore any legacy
+  hosted close event.
+
+For mixed-version alpha upgrades, restarting only Connect does not terminate a
+legacy P2P DataChannel that was already established. Upgrade and restart each
+daemon, close old Connect tabs, and let IAM schema v2 revoke legacy
+`connect-bootstrap` grants. New mixed-version attempts are blocked twice: at
+the current service and at the current daemon.
 
 The reverse proxy in front of `intendant-connect` must terminate public TLS for
 `connect.intendant.dev`, forward `Host`, set `X-Forwarded-For`/`X-Real-IP`, and
 strip any inbound copies of those client-IP headers before setting them. Keep
 the service bound to `127.0.0.1`, keep `INTENDANT_CONNECT_TOKEN` in a secret
 store, and back up the configured state file; that file is the current
-account/passkey/device ownership database.
+account/passkey/route-link database, not a daemon authority store.
 
 The production-alpha operator path is captured in scripts, but live target
 details are not stored in the public repository. Provide them through a private
@@ -1395,18 +1389,22 @@ state snapshots and require an explicit plaintext flag for diagnostics.
 
 Current alpha limits:
 
-- one owner per daemon; no shared roles, teams, recovery, or account email flow;
-- one bearer token protects daemon service endpoints;
-- rate limits, sessions, pending offers, plain claim phrases, and active-session
-  tracking are single-process in-memory state;
+- one linked account per daemon; the link is route metadata, not ownership;
+  no teams, recovery, or account email flow;
+- an optional shared deployment bearer gates registration (and always guards
+  admin APIs); fresh daemon-key proofs and rotating short-lived daemon-session
+  credentials protect the per-daemon mailbox endpoints even in open mode;
+- rate limits, web sessions, and daemon-session credentials are single-process
+  in-memory state; browser offers are rejected before pending/active session
+  mutation, and plaintext route codes never enter the service;
 - no high-availability storage or database migrations; the state file is a
   single-node alpha persistence layer;
-- no application-layer dashboard RPC relay; the default path is browser to
-  daemon WebRTC, with TURN/WebRTC relay remaining a transport-level option;
-- Files transfer history and resumed download offsets are browser-local state
-  (`localStorage` plus IndexedDB parts), not server-side durable state shared
-  across browsers; uploads are current-session staged attachments rather than
-  arbitrary daemon filesystem writes;
+- no hosted daemon-control path or application-layer dashboard RPC relay in the
+  default build; successful WebRTC/dashboard transport is exercised only from
+  trusted local/direct clients;
+- Connect exposes no Files or Terminal target. File-transfer history, resumed
+  offsets, and staged uploads belong to authenticated daemon dashboards, not
+  the hosted directory;
 - peer daemon-to-daemon mTLS remains separate from Connect account login.
 
 Run the hosted MVP E2E locally with:
@@ -1418,586 +1416,37 @@ node scripts/validate-connect-hosted-mvp.cjs
 
 That validator starts `intendant-connect`, launches a daemon with outbound
 Connect enabled, uses a browser virtual authenticator for passkey registration,
-claims the daemon, labels it, opens the real SPA in `connect=1` mode, verifies
-the daemon-signed binding and Connect grant hash, exercises the Shell tab
-over tunneled terminal frames, and runs the SPA's no-legacy-transport probes
-for control actions, media/editor upload, visual-freshness diagnostics, display
-signaling, display input authority, peer mutation fallback, presence
-media, presence server callbacks, the Files tab's ranged download/resume flow,
-the lower-level generic filesystem download probe, and staged upload raw range
-reads. It then revokes the daemon while the tunnel is still open, waits for the
-tunnel to close, and checks the audit events.
+links the daemon route, labels it, verifies that authenticated browser
+offer/ICE/close calls return `403` without enqueueing, creates a local operator
+grant as an adversarial regression fixture, and verifies the service still
+creates zero control sessions. A daemon regression feeds the same events as if
+from an old/self-hosted service and checks that control, IAM, and enrollment
+state stay unchanged. The validator then releases the route and verifies the
+audit events. Successful
+Shell, Files, media, display, and byte-stream transport remain covered by the
+trusted local/direct dashboard-control validators.
 
-### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
+### Rejected Hosted-Dashboard Design
 
-> **Superseded in part.** The tunnel/bootstrap mechanics below shipped, but
-> the trust conclusions were revised after production experience: a hosted
-> origin must never serve privileged code or hold account authority. The
-> adopted model — anchor daemons serve privileged code, the hosted service is
-> demoted to zero-authority introductions/relay/backup/directory, and
-> low-provenance sessions are role-capped — is specified in
-> [Trust Architecture](./trust-architecture.md).
+> **Historical decision only; there is no hosted dashboard contract here.**
+> The public-origin WebRTC prototype was rejected because encrypted transport
+> did not make replaceable hosted JavaScript a trusted authority client.
+> Its detailed success-path, session-grant, relay, RPC, media, and rollout
+> specifications were removed: they were not a roadmap and no longer describe
+> callable code.
 
-The current dashboard access model is certificate-first: a remote browser
-reaches the daemon over HTTPS/WSS, usually with mTLS. That keeps the
-implementation simple and gives the browser a secure context, but it also means
-private host names, changing VM addresses, and locally generated server
-certificates leak into the user experience.
+The surviving engineering result is narrower: daemon-signed WebRTC bindings and
+the dashboard transport abstraction remain useful on authenticated daemon-origin
+or signed-native paths. Hosted Connect is an account, route, presence, push, and
+metadata directory. It serves no daemon SPA or privileged dashboard assets;
+`/app` and `/app.html` redirect to `/connect`; browser
+offer/ICE/close calls are refused before mutation; and current daemons drop
+legacy hosted-control events. No browser-key grant or persisted ceiling edit can
+reactivate the design.
 
-The product problem is specifically **browser server trust**. Passkeys can prove
-that the user approved a login, but they do not make
-`https://192.168.x.y:8765` or `https://daemon.local:8765` a browser-trusted
-origin. Public Web PKI also cannot directly cover VM-local names, `.local`
-names, or changing private IP addresses. Pointing public DNS at private IPs is
-fragile because DNS rebinding defenses, cache lifetimes, and per-network address
-choices all become visible to users.
-
-A plausible future direction is a **public-trusted bootstrap with a direct data
-path**:
-
-1. The browser loads an Intendant-owned public HTTPS origin with an ordinary
-   publicly trusted certificate.
-2. That origin handles account, passkey, device, and daemon-claim UX.
-3. The daemon maintains an outbound signaling connection to Intendant Connect.
-4. The browser and daemon establish a daemon-scoped WebRTC DataChannel directly
-   where possible.
-5. TURN/WebRTC relay remains available when a direct path cannot form.
-6. Dashboard RPC, the main event stream, and display signaling move over that
-   encrypted browser-to-daemon DataChannel.
-
-This avoids asking the browser to trust private LAN HTTPS names: public TLS
-secures the bootstrap page, while WebRTC supplies a private encrypted transport
-to the daemon. It also fits Intendant's existing shape better than trying to make
-public Web PKI cover VM-local or LAN-only daemon addresses. The codebase already
-has browser-offer WebRTC, data channels, ICE-TCP multiplexing, relay fallback
-for display/federation paths, and now an opt-in daemon-scoped dashboard control
-tunnel with a browser-side `DashboardTransport` boundary.
-
-#### Trust Model
-
-WebRTC encryption is not the same thing as daemon identity. The DataChannel is
-encrypted with DTLS, but the browser learns the DTLS fingerprint through
-signaling. Therefore the signaling path must be authenticated and bound to the
-daemon the user intended to reach.
-
-The high-assurance trust model is:
-
-- **Trusted dashboard code** is loaded from a daemon-served mTLS origin, or from
-  another locally pinned/installed bundle. The hosted `intendant.dev` origin is
-  not the root admin trust anchor in this mode.
-- **Intendant Connect** is a public rendezvous/mailbox and optional WebRTC relay
-  helper. It can help route signaling and store convenience fleet metadata, but
-  it is not sufficient authority to open a dashboard.
-- **The daemon** has a persistent daemon identity key, separate from both the
-  ephemeral WebRTC DTLS certificate and peer mTLS client certificates.
-- **The browser** accepts a dashboard tunnel only when it receives a fresh
-  daemon-signed session statement bound to the claimed daemon identity, the
-  current user/device/account metadata, the Connect-issued routing grant, the
-  WebRTC session material, an expiry, and a nonce.
-- **The daemon** accepts Connect dashboard control only when the routed Connect
-  account matches a daemon-local IAM principal/grant, then applies that local
-  role before exposing control-plane APIs over the DataChannel.
-
-The current experimental tunnel implements the daemon-signed binding locally: the
-browser sends a fresh challenge nonce with its SDP offer, and the daemon signs
-the SDP offer hash, SDP answer hash, WebRTC control session id, creation time,
-expiry time, daemon Ed25519 public key, that browser challenge nonce, and, when
-rendezvous signaling supplies one, a Connect session-grant hash. The browser
-verifies the signature with WebCrypto, rejects expired bindings, checks that the
-signed nonce matches its own challenge, and checks that the visible grant hashes
-to the signed grant hash before using the channel. A public bootstrap service
-should keep that daemon identity binding and add account/device grants around it.
-
-The local Connect-rendezvous emulator now also models the registry side of that
-identity check: the daemon registers its public key for a daemon id, the browser
-offer answer carries that registered key, and the public-origin dashboard accepts
-the DataChannel only when the signed binding key matches the registered key. It
-also models grant binding with an opaque per-offer value and nonce binding with a
-browser-generated challenge: the browser accepts the answer only when that
-visible grant hashes to the daemon-signed grant hash and the signed nonce matches
-the nonce it put in the offer. This does not make Connect an authorization
-authority; the daemon still requires local IAM for Connect account access.
-
-This makes the security boundary explicit: hosted Connect is in the trusted
-computing base only when the user chooses to load root-capable dashboard
-JavaScript from the hosted origin. The high-assurance path keeps trusted admin
-code local/daemon-served and uses `intendant.dev` only for rendezvous, relay, and
-optional metadata sync. A compromised Connect service can then delay, drop, or
-misroute signaling, but it cannot by itself mint daemon-local dashboard
-authority.
-
-#### Claim and Login Flow
-
-A concrete flow should look like this:
-
-1. The daemon generates or loads a persistent daemon identity key.
-2. The daemon opens an outbound TLS connection to Intendant Connect and publishes
-   a short-lived high-entropy claim phrase or QR URL.
-3. The user opens the public Intendant Connect URL and signs in with a passkey.
-4. The user claims the daemon by entering the phrase or scanning the QR code.
-5. Connect records the daemon identity public key, owner account, device label,
-   and any local policy metadata the daemon chooses to expose.
-6. On later visits, the browser signs in with a passkey and selects the daemon.
-7. A root/admin user opens the daemon-served Access page over direct mTLS and
-   creates a daemon-local IAM grant for the Connect account if hosted
-   rendezvous should be allowed.
-8. Connect issues a short-lived routing/session grant and brokers WebRTC
-   signaling between browser and daemon.
-9. The daemon checks that the routed Connect account matches local IAM, signs
-   the WebRTC session binding with its daemon identity key, and only then
-   accepts dashboard RPC over the DataChannel.
-
-Passkey step-up can then protect high-impact actions such as approving a peer
-access request, changing autonomy policy, exposing display control, or minting
-long-lived credentials.
-
-#### Direct Path and Relay Fallback
-
-There are two different fallback concepts, and they should not be conflated:
-
-- **TURN/WebRTC relay fallback** keeps the browser-to-daemon DataChannel
-  encrypted end-to-end at the WebRTC layer. The relay forwards packets but does
-  not see dashboard RPC plaintext.
-- **Application RPC relay fallback** would terminate or proxy dashboard messages
-  at Intendant Connect unless an additional application-layer encryption scheme
-  is added. That is a materially different trust posture and should be an
-  explicit product mode, not the default fallback implied by "relay."
-
-The preferred consumer path is direct WebRTC first, TURN/WebRTC relay second,
-and no plaintext dashboard RPC through the public service by default. If an
-operator deliberately enables an application relay for locked-down networks, the
-UI should label it as "proxied through Intendant Connect" rather than "direct."
-
-#### Dashboard Transport Contract
-
-This is not a drop-in replacement for mTLS today. The dashboard mostly still
-assumes ordinary HTTP endpoints plus a main WebSocket, while existing display
-WebRTC sessions remain display-scoped. The current `DashboardTransport` boundary
-is the first browser-side split: when the opt-in DataChannel is connected,
-selected JSON reads and conservative mutations can use WebRTC and fall back to
-HTTP where safe.
-
-A production version still needs two explicit transport implementations:
-
-- `HttpDashboardTransport`: current HTTPS/WSS REST plus main WebSocket.
-- `WebRtcDashboardTransport`: request/response RPC, streaming events, and
-  cancellation over a reliable ordered DataChannel.
-
-The DataChannel protocol should stay explicitly framed rather than ad hoc JSON
-messages. The first useful envelope set is:
-
-| Frame | Direction | Purpose |
-|-------|-----------|---------|
-| `hello` / `hello_ack` | both | Version negotiation, daemon identity, session id, role, feature flags |
-| `request` | browser -> daemon | HTTP-like method/body call with a request id |
-| `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
-| `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
-| `stream_start` / `stream_event` / `stream_end` | daemon -> browser | Ordered event stream for a long-lived request id |
-| `byte_stream_start` / `byte_stream_chunk` / `byte_stream_end` | daemon -> browser | Bounded raw-byte artifact transfer for a request id |
-| `upload_start` / `upload_chunk` / `upload_end` | browser -> daemon | Bounded raw-byte upload transfer for a request id |
-| `terminal_open` / `terminal_input` / `terminal_resize` / `terminal_close` | browser -> daemon | Standalone Shell PTY control for one terminal id |
-| `terminal_output` / `terminal_exited` / `terminal_opened` / `terminal_error` | daemon -> browser | Standalone Shell PTY data and lifecycle frames |
-| `event` | daemon -> browser | Control-plane event stream entry |
-| `cancel` | browser -> daemon | Cancel an in-flight request or stream |
-| `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
-| `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
-
-Oversized DataChannel `response` and `stream_event` frames are split at the
-transport layer. The daemon sends a `response_start` header, base64-encoded
-`response_chunk` frames containing the original JSON frame bytes, and a
-`response_end` marker. The browser reassembles and parses the original frame
-before handing it to existing request or stream code, so API semantics stay
-unchanged. Current browser clients advertise `response_credit`, `byte_streams`,
-`upload_frames`, and `terminal_frames` in `hello`; when
-`response_credit` is negotiated, the daemon sends an initial chunk window and
-then waits for browser `credit` frames before releasing more chunks. Stream
-chunks carry a `chunk_id` so a large event inside a longer stream can be
-credited and cancelled without ending the whole request id. Older clients that
-do not advertise the feature still receive the legacy eager chunk burst.
-
-Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
-frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
-result and reuses the same credit-window queue. Individual byte streams remain
-bounded, but browser helpers can build resumable user-facing downloads by
-issuing repeated ranged requests and resuming from the last completed offset.
-
-Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
-`upload_end`. The daemon writes chunks into a tempfile and commits through the
-same upload store as `POST /api/session/current/uploads`, including the
-`UploadReady` broadcast. The Files tab uses this same primitive for browser
-file uploads, so uploaded files become current-session staged attachments. This
-is still a one-shot, ordered transfer with no resume token, destination
-filesystem path, or cross-refresh queue. Resume tokens, explicit destination
-policy, and application-level restart semantics are still required before
-treating uploads as broad resumable file transfer.
-
-Dashboard media/editor writes intentionally stay outside the generic
-`api_dashboard_action_msg` and `api_control_msg` allowlists. They use the
-dedicated media protocol instead: annotation attach/save/send commits use
-media-specific upload methods, and clip creation uses an operation id with
-ordered frame uploads plus commit/cancel. Older daemons that do not advertise the
-media protocol still receive the legacy `annotation_*` and `clip_*` WebSocket
-messages before any tunneled write is attempted.
-
-The **Terminal** tab's Shell uses `terminal_*` frames when the
-verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
-the same PTY registry used by the WebSocket path, so scrollback and reconnect
-behavior stay consistent.
-
-The first streamed API on this substrate is `api_sessions_stream`, which shares
-one server-side line source with `/api/sessions/stream` (transport-unification
-S10: the neutral core's `ApiResponse::Stream`) — both lanes carry the identical
-NDJSON event sequence (`start`, partial `session`, `phase`, final `replace`,
-`done`); HTTP writes the lines verbatim, the tunnel wraps each in a
-`stream_event` frame. When the verified DataChannel is connected, local
-dashboard session hydration uses that stream and falls back to the HTTP stream
-on safe errors. Peer session lists still use direct peer HTTP.
-The local daemon identity is available as `api_agent_card`, returning the same
-Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
-remains the unauthenticated discovery surface.
-When the verified channel opens, the browser also applies `config` and
-`api_agent_card` results to the same runtime-config and self-identity state
-normally hydrated by `/config` and `/.well-known/agent-card.json`.
-`api_cached_bootstrap_events` returns the daemon's current non-personalized
-dashboard event cache (`usage`/`usage_update`, `live_usage_update`, `status`,
-`autonomy_changed`, `external_agent_changed`, and `user_display_granted` when
-present) as parsed JSON events. This cached-event RPC is intentionally narrower
-than the WebSocket open sequence, but the tunnel exposes the personalized
-bootstrap pieces as separate identity-aware APIs below. `api_dashboard_bootstrap`
-composes those pieces so a public-origin dashboard can hydrate without the
-primary daemon WebSocket.
-`api_browser_workspace_snapshot` returns the existing
-`browser_workspace_snapshot` message shape with active browser workspaces and
-lease state; callers can feed it through the same browser workspace handler that
-currently receives the WebSocket bootstrap message.
-`api_state_snapshot` returns the existing `state_snapshot` message shape with
-the current `AgentStateSnapshot`, dashboard config, daemon session id when known,
-and a DataChannel-scoped `connection_id`. The connection id is the WebRTC
-control session id, not the legacy WebSocket connection id.
-`api_display_bootstrap` returns a DataChannel-safe display bootstrap envelope
-whose `frames` array contains `display_ready` events for every active display
-session known to the daemon. Those frames use the same event shape as the
-WebSocket bootstrap (`event`, `display_id`, `width`, `height`), so browser code
-can feed them through the existing display-slot path. When the daemon exposes a
-dashboard-control display authority bridge, the envelope also includes
-personalized `display_input_authority_state` frames for the same active display
-ids; otherwise `display_input_authority_state` is listed in `omitted`.
-`api_display_input_authority_snapshot` returns just those personalized authority
-frames, while `api_display_input_authority_request` and
-`api_display_input_authority_release` claim or release the display for the
-current dashboard-control session and return fresh state frames for immediate UI
-application. The browser then sends local keyboard/mouse events as
-fire-and-forget `display_input` frames over the same daemon-scoped DataChannel.
-If the tunnel or authority bridge is unavailable, the dashboard falls back to
-the older WebSocket plus per-display input-channel path.
-Local display WebRTC signaling uses `api_display_webrtc_signal` when the
-verified tunnel advertises it. The browser sends the same `display_id`, offer
-SDP, and ICE candidate shapes that the legacy `display_offer`/`display_ice`
-WebSocket frames used; the offer RPC returns a `display_answer`, while daemon
-ICE candidates arrive later as `display_ice` event payloads over the control
-DataChannel. Daemon-origin dashboards may still fall back to the WebSocket when
-the tunnel is unavailable. Public-origin Connect mode does not attempt a daemon
-WebSocket fallback for local display signaling, so missing tunnel support fails
-the display slot visibly.
-`api_session_log_replay` returns the existing capped `log_replay` message shape
-used by late WebSocket joiners. When no active session log exists it returns an
-empty replay with `available: false`.
-`api_external_session_activity_replay` returns an envelope whose `frames` array
-contains compact external attached-session activity replay frames for currently
-attached Codex/Claude Code sessions. It uses the same transcript payloads as
-WebSocket bootstrap. The combined bootstrap skips an attached external session
-when the active Intendant session log replay already names the same
-`external_session_id`, avoiding duplicate transcript hydration.
-`api_dashboard_bootstrap` composes the DataChannel-safe bootstrap pieces into an
-ordered `frames` array: state snapshot, cached dashboard events, browser
-workspace snapshot, active display `display_ready` frames, and capped session
-log replay, followed by active external attached-session activity replay frames.
-When the display authority bridge is available, it appends personalized
-`display_input_authority_state` frames as well so a refreshed public-origin
-dashboard can hydrate display control chips without the primary WebSocket.
-Lazy command-output expansion for finalized log command groups uses
-`api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
-metadata as the existing HTTP endpoint.
-The active-session timeline uses `api_session_current_history`,
-`api_session_current_rollback`, `api_session_current_redo`, and
-`api_session_current_prune`; the mutation calls use the same no-replay fallback
-rule as other writes.
-Active-session change list/detail reads use `api_session_current_changes`,
-preserving the existing path validation and `_httpStatus`/`_httpOk` metadata.
-Live and per-session recording stream lists use `api_recordings` and
-`api_session_recordings`. Scoped recording asset reads use `api_recording_asset`
-and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
-`seg_*.mp4`/`seg_*.ts` filenames with optional `offset`/`length` ranges. The
-recording player uses these byte streams for segment lists and MP4 MSE buffers
-when the verified tunnel is available. The non-MSE MP4 fallback also reads the
-segment over the tunnel and assigns a local blob URL to the video element.
-HLS/`.ts` playback also prefers the tunnel when available: the browser reads
-`playlist.m3u8` and validated `.ts` segments with the same recording asset RPC,
-rewrites the playlist to local blob URLs, and points the native video element at
-that object URL. If the browser rejects the blob playlist, it falls back to the
-daemon-served `m3u8` URL only on a daemon-origin dashboard page; public-origin
-Connect mode does not attempt same-origin HTTP fallback for self-daemon media.
-Archived session frame images use `api_session_frame_asset` for validated `.jpg`
-and `.png` filenames under a resolved session's `frames/` directory. The session
-detail gallery renders returned bytes through browser blob URLs when the verified
-tunnel advertises byte streams, falling back to the existing HTTP image URL when
-the tunnel is unavailable or a tunneled image read fails.
-The Settings debug session-report download uses `api_session_report`, returning
-the same text-artifact zip as `/api/session/{id}/report` through bounded
-`byte_stream_*` frames. This remains intentionally scoped to the diagnostic
-report; generic daemon file downloads use the Files tab and `api_fs_read`.
-The task attachment upload path uses `api_session_current_upload` over
-`upload_*` frames when the verified tunnel advertises `upload_frames`; it falls
-back to `POST /api/session/current/uploads` only when the tunnel feature is not
-available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
-duplicate attachments after an ambiguous partial transfer.
-Dashboard annotation media uses the same ordered `upload_*` frame substrate but
-commits to media-specific methods instead of the task attachment store:
-`api_media_annotation_attach` registers a pending annotation frame, and
-`api_media_annotation_submit` registers a saved annotation and optionally queues
-it for the live presence context. Clip creation is stateful: the browser first
-opens a `clip_id` operation with `api_media_clip_start`, uploads each JPEG frame
-with `api_media_clip_frame` in strict `frame_index` order, then commits with
-`api_media_clip_end` or discards with `api_media_clip_cancel`. The dashboard
-chooses the transport once per media operation. If the media protocol is not
-advertised before the first write, daemon-origin dashboards use the legacy
-WebSocket media messages. Public-origin Connect mode has no daemon WebSocket
-fallback, so annotation and clip writes fail visibly when the verified media
-tunnel is not available. After a tunneled media write is attempted, failures are
-surfaced and are not replayed over the WebSocket.
-Browser-side live voice keeps its provider WebSocket in the browser, but the
-daemon coordination side uses the Connect control tunnel. The WASM presence
-bridge can install a custom sender so its normal server messages route over the
-verified DataChannel instead of `/ws`: `presence_frame` carries
-`presence_connect`, `presence_disconnect`, `make_active`, `voice_log`,
-`presence_checkpoint`, `voice_diagnostic`, `live_usage_update`, `tool_request`,
-and `async_query`. Server responses such as `presence_welcome`,
-`force_disconnect_voice`, `active_granted`, `tool_response`, and
-`async_query_result` are delivered back to the same WASM callback router that
-the WebSocket path uses. HQ browser video/archive frames use
-`api_presence_video_frame` over the ordered `upload_*` substrate. Public-origin
-Connect pages therefore do not depend on the daemon-origin WebSocket for active
-voice handoff, voice event logging, live voice tool/query dispatch, or frame
-archival. Server-side transcription audio remains intentionally untunneled for
-now; Connect mode drops that optional audio stream rather than replaying it over
-the legacy bridge.
-Current-upload list reads use `api_session_current_uploads`, returning the same
-staged-upload descriptor array as `GET /api/session/current/uploads`. The Files
-tab shows this as its staged-upload list and can remove entries with
-`api_session_current_upload_delete`.
-Current-upload raw reads use `api_session_current_upload_raw` over
-`byte_stream_*` frames. The request names an uploaded attachment id and may
-include `offset`/`length`; the response carries `range_start`, `range_end`,
-`total_size`, and `resumable: true` metadata with the returned bytes. The Files
-tab uses repeated ranged reads to download staged uploads back to the browser.
-This is a bounded current-session attachment primitive, not yet a general
-daemon-filesystem upload/download adapter.
-Worktree cached inventory reads, explicit scans, guarded removals, and the
-session finish card's merge use `api_worktrees`, `api_worktrees_scan`,
-`api_worktrees_remove`, and `api_worktrees_merge`; the writes use the same
-no-replay fallback rule as other writes.
-The filesystem picker's path checks, directory listings, and mkdir operation use
-`api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
-fallback rule as other writes.
-Bounded filesystem file reads use `api_fs_read` when the verified tunnel
-advertises byte streams. The request uses the same absolute-path or `~/` path
-rules as the picker, rejects directories, accepts optional `offset`/`length`,
-and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
-and `resumable: true` metadata. The Files tab exposes this as the download side
-of its transfer center: users can type a path or browse with the filesystem
-picker, queue downloads, pause/cancel/retry, and resume from completed ranges
-inside the current browser session. Public-origin Connect mode does not fall
-back to daemon HTTP for this path. The queue/history and partially completed
-ranges are browser-local state, not daemon-side transfer records.
-
-Daemon-origin dashboards reached directly over native mTLS use the same Files
-transfer center but read arbitrary files through `GET /api/fs/read?path=...`
-with ordinary HTTP `Range` requests. The endpoint follows the same path rules,
-rejects directories, advertises `Accept-Ranges: bytes`, returns `206 Partial
-Content` plus `Content-Range` for ranged reads, and returns `416 Range Not
-Satisfiable` with `Content-Range: bytes */total` for invalid ranges. This keeps
-direct mTLS downloads resumable without routing them through the Connect
-DataChannel. Connect dashboards intentionally keep using `api_fs_read` over the
-verified tunnel and never fall back to daemon-origin HTTP.
-Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
-large raw request payloads out of ordinary session-detail hydration while still
-allowing the Context pane to fetch a single archived snapshot on demand.
-Staged upload deletion uses `api_session_current_upload_delete` so removing a
-pending attachment can travel over the verified control channel. Browser image
-chips now prefer `api_session_current_upload_raw` and render the returned bytes
-through a local blob URL, falling back to the legacy raw HTTP URL only when the
-tunnel is unavailable or preview loading fails.
-OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
-the existing `/session` behavior and error envelope while avoiding a direct
-dashboard HTTPS POST when the verified control channel is available.
-Dashboard-originated managed-context MCP actions use `api_mcp_tool_call`, which
-wraps a single `tools/call` against the daemon's existing MCP server. These
-calls use the same no-replay fallback rule as other writes because tools such
-as `rewind_context`, `fission_control`, and `fission_spawn` mutate live session
-state.
-Confirmed session-data deletion uses `api_session_delete` with the same
-no-replay fallback rule as other writes; the dashboard still requires the
-existing confirmation modal before issuing the RPC.
-Peer-display WebRTC signaling uses `api_peer_webrtc_signal`, carrying the same
-`display_id`, `session_id`, and `signal` body as `POST /api/peers/{id}/webrtc`
-plus the target `peer_id`. Answers and remote ICE still arrive asynchronously
-through the normal peer-event path; the RPC only confirms that the signal was
-accepted for forwarding. Failed tunneled signaling requests are not replayed
-over HTTP after a verified tunnel attempt.
-Dashboard session-control actions use `api_session_control_msg`. This includes
-create/start/resume/stop/restart session, targeted follow-up, mid-turn steer,
-cancel queued steer/follow-up, edit user message, interrupt, approvals,
-session rename, and per-session launch-config persistence. The browser only
-falls back to the WebSocket before it has attempted the RPC; once a verified
-DataChannel write is sent, an error is surfaced to the operator instead of
-replaying a potentially duplicated action.
-Small dashboard action controls use `api_dashboard_action_msg`. This covers
-Codex attached-thread actions, local display authority toggles, the
-diagnostics visual-marker toggle, recording and debug screen controls, and
-browser workspace create/acquire/close/release. The browser applies the same
-no-replay fallback rule: use the WebSocket only before a verified DataChannel
-request is attempted, then surface RPC failures instead of duplicating a
-potentially state-changing action. For `set_diagnostics_visual_marker`, the
-daemon applies the request directly to the active display registry when
-available, or records the desired state as a pending per-display default for
-the next display session.
-
-The remaining migration work is mostly byte-stream and file-transfer heavy:
-native media fallback URLs, broader bidirectional file transfer, durable
-cross-refresh resume tokens, and any remaining non-allowlisted control
-mutations should move only after resumable stream/file-transfer semantics and
-per-action no-replay rules are settled.
-
-The oversight bar exposes the selected control transport. Direct
-dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
-shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
-TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
-verification fails. The tooltip carries the detailed state that is also exposed
-through `window.intendantDashboardControl.status()`. In public-origin Connect
-mode, the legacy `ws` indicator is relabeled to `events`; it turns green only
-after the verified DataChannel has hydrated dashboard bootstrap events, since no
-same-origin daemon WebSocket is expected in that mode.
-
-Peer access-request APIs now use the same transport boundary. The dashboard's
-pairing/request panes call `api_peer_pairing_requests`,
-`api_peer_pairing_request_decision`, invite/join/request-access/poll, identity
-list, and identity revoke over the DataChannel when it is connected. Mutating
-pairing operations deliberately fail rather than silently falling back after a
-WebRTC RPC error, so an operator does not approve or mint credentials over an
-unexpected transport.
-Pairing authorization follows the access/peer split: request and identity lists
-require `access.inspect`, invite/approve/revoke require `access.manage`, and
-join/request-access/poll remain peer-topology operations gated by `peer.manage`.
-Acting through an already-connected peer is gated by `peer.use` instead —
-using a peer relationship is not administering it. That covers the signaling
-relays that open tunnels (`api_peer_webrtc_signal`,
-`api_peer_file_transfer_signal`, `api_peer_dashboard_control_signal`, and
-their `POST /api/peers/{id}/…-webrtc` HTTP twins), the quick controls
-(`api_peer_message`, `api_peer_task`, `api_peer_approval`, and their
-`POST /api/peers/{id}/message|task|approval` HTTP twins), and coordinator
-task routing (`api_coordinator_route` and its `POST /api/coordinator/route`
-HTTP twin, which picks the capability-matched peer for you): each delegates
-this daemon's peer identity, and the receiving peer authorizes the action
-against its own grants for this daemon.
-General peer and coordinator controls are covered by the same rule. Peer add,
-remove, eligibility discovery, per-peer message/task/approval, peer-display
-signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
-`api_peer_eligible`, `api_peer_message`, `api_peer_task`, `api_peer_approval`,
-`api_peer_webrtc_signal`, and `api_coordinator_route` over the verified tunnel.
-They preserve the existing HTTP endpoint metadata (`_httpStatus`/`_httpOk`) so
-the dashboard can render the same success and error states on either transport,
-but state-changing calls do not replay over HTTP once a verified DataChannel
-request has been attempted.
-
-#### Relationship to Existing Auth Modes
-
-This design should not remove local/offline mTLS. It gives the product two clear
-dashboard access modes:
-
-- **Consumer cloud-assisted mode:** public Intendant Connect origin for
-  account/rendezvous UX, with dashboard access still gated by daemon-local IAM.
-- **Local/offline/power-user mode:** direct daemon HTTPS/WSS with browser mTLS
-  enrollment, as implemented today.
-
-Peer daemon-to-daemon trust remains separate. Humans may use passkeys to approve
-a peer access request, but the resulting daemon-to-daemon connection should
-still use Intendant-issued peer-scoped mTLS certificates unless the federation
-trust model is deliberately redesigned. In user-facing copy, that should appear
-as "grant access to this daemon" and "revoke access," not as manual certificate
-management.
-
-In other words, Connect and browser mTLS authenticate a **user/client route to a
-daemon**. Peer mTLS authenticates a **daemon route to another daemon**. The
-dashboard can present both as targets, but target selection is only a product
-abstraction; it does not collapse the two security domains.
-
-#### Status and Remaining Rollout
-
-The current implementation has crossed from protocol sketch into hosted MVP:
-
-1. Direct mTLS dashboard access remains the default local/offline path.
-2. The daemon has a persistent daemon identity key and can expose a
-   dashboard-control WebRTC DataChannel.
-3. The real SPA has a `connect=1` public-origin mode and a
-   `DashboardTransport` boundary for tunneled reads, streams, bounded byte
-   transfer, uploads, terminal frames, selected control messages, peer
-   pairing actions, local display signaling, and media/editor writes.
-4. The daemon has a disabled-by-default outbound Connect polling client.
-5. `intendant-connect` provides the hosted production alpha: passkey-only
-   account sessions, daemon registration, claim-phrase route ownership proof,
-   rendezvous signaling, labels, revoke, active tunnel close, rate limits, CSRF
-   protection, readiness checks, and audit.
-6. The daemon refuses Connect dashboard-control offers unless the routed Connect account
-   matches daemon-local IAM; Connect account ownership is no longer an implicit
-   root grant.
-7. The browser and hosted service both verify that the daemon-signed WebRTC
-   binding matches the registered daemon identity and Connect-issued routing
-   grant.
-8. Focused validators cover the local bootstrap, local rendezvous emulator, and
-   hosted Connect MVP paths.
-9. `connect.intendant.dev` has a repeatable production-alpha deploy path plus
-   encrypted state backup/restore scripts.
-
-The remaining rollout work is production operations, breadth, and making the
-local trusted Access app pleasant enough that hosted Connect can stay a
-rendezvous/convenience layer:
-
-1. Add durable/database-backed rate limits, structured metrics, and database
-   migrations.
-2. Add account recovery, richer multi-device management, teams/roles, and optional
-   passkey step-up for sensitive actions.
-3. Add daemon identity rotation/recovery semantics for VM clones, disk restore,
-   and deliberate transfer of ownership.
-4. Continue migrating remaining dashboard APIs only when the tunnel has the
-   required streaming, byte-range, resumable transfer, or media semantics.
-5. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
-   throughout.
-
-Non-goals for this path:
-
-- no loopback or same-host bypass of dashboard authentication;
-- no native host app requirement for the general web dashboard;
-- no passkeys as daemon-to-daemon federation credentials;
-- no silent downgrade from verified direct WebRTC to opaque relay;
-- no attempt to obtain public certificates for private VM IPs or `.local`
-  names.
-
-Remaining design questions before production rollout:
-
-- Do we want an additional app-integrity story such as signed static assets,
-  pinned PWA bundles, or browser extension packaging for users who want trusted
-  local dashboard code without a native app?
-- How are daemon identity keys backed up, rotated, revoked, and recovered after
-  VM cloning or disk restore?
-- What local policy does the daemon enforce when Connect says a signed-in user
-  wants access?
-- Do browser WebRTC privacy policies, enterprise restrictions, or future Private
-  Network Access rules constrain direct DataChannels from a public origin to
-  LAN/VM candidates?
-- What is the visible product distinction between "direct," "TURN-relayed," and
-  "application-proxied" dashboard transport?
-- What audit log should exist for passkey logins, daemon claims, step-up
-  approvals, and peer certificate issuance?
+Any future hosted-control product would require a separate binary/product and a
+new trust design. The current boundaries and migration are specified in
+[Trust Architecture](./trust-architecture.md).
 
 ## HTTP endpoints
 
@@ -2011,13 +1460,13 @@ family (sub-routes elided where the family is uniform):
 | `GET /` | The dashboard SPA |
 | `GET /config` | Live-model configuration JSON (provider, model, sample rates, git SHA) |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
-| `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
+| `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime (own/app origin; `CredentialsManage` IAM permission) |
 | `GET /wasm-web/*`, `GET /wasm-station/*` | Compiled WASM + JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for mic capture |
 | `GET /vault-kernel.js` | The vault crypto kernel worker; the SPA hash-verifies it against its assembled-in pin before instantiating (see [credential custody](./credential-custody.md#the-crypto-kernel)) |
 | `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
-| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling |
+| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling; browser upgrades require the daemon's own origin or the signed-app scheme before transport authority is resolved |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
 | `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
 | `POST /api/session/{id}/agent-output` | Fetch persisted agent output by id for a historical/session-scoped transcript (POST-shaped read: the ids ride the body) |
@@ -2036,11 +1485,11 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
 | `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,merge}` | Agent worktree inventory and lifecycle (merge = session-linked worktree finish card) |
-| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Intendant Connect tunnel: bootstrap metadata and dashboard-control WebRTC signaling |
+| `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Daemon-origin WebRTC control bootstrap: certless only on loopback, remote callers require mTLS; unrelated to hosted Connect browser APIs |
 
 ### Declared API routes
 
-Every `/api/*` and `/mcp` route is declared exactly once in
+Every `/api/*`, `/session`, and `/mcp` route is declared exactly once in
 `gateway_routes::ROUTES` (`src/bin/caller/gateway_routes.rs`); dispatch, the
 pre-dispatch IAM classification, and the OPTIONS preflight (CORS posture +
 allowed-method union) all derive from those declarations, and the table below
@@ -2069,6 +1518,7 @@ its operation per method/path from `federation_http_operation`.
 | DELETE | `/api/transfers/{id}` | FilesystemWrite | own origin | none | Delete a transfer job (cancels partials; removes managed artifacts) |
 | POST | `/api/transfers/{id}/delete` | FilesystemWrite | own origin | none | Delete a transfer job (WKWebView POST fallback) |
 | GET | `/api/transfers/{id}/download` | FilesystemRead | own origin | none | Read download-job bytes (`?offset=&length=` or `Range` → 206; resume metadata echoed as X-Transfer-* headers, X-Content-Sha256 on full reads) |
+| POST | `/session` | CredentialsManage | own origin | none | Mint an ephemeral Gemini Live / OpenAI Realtime token from a daemon-held provider credential |
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
@@ -2077,7 +1527,7 @@ its operation per method/path from `federation_http_operation`.
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
 | POST | `/api/session/current/uploads` | SessionManage | own origin | streaming | Upload a file attachment (raw streamed body; name/destination in query) |
 | GET | `/api/session/current/uploads` | SessionManage | own origin | none | List uploads for the current session |
-| GET | `/api/session/current/uploads/{id}/raw` | SessionManage | own origin | none | Fetch one upload's raw bytes (inline Content-Disposition) |
+| GET | `/api/session/current/uploads/{id}/raw` | SessionManage | own origin | none | Fetch one upload's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/session/current/uploads[/…]` | SessionManage | own origin | none | Unknown upload subpaths (handler-owned JSON 404) |
 | DELETE | `/api/session/current/uploads/{upload_id}` | SessionManage | own origin | none | Delete one upload (file + sidecar) |
 | DELETE | `/api/session/{id}` | SessionManage | own origin | none | Delete a session's data |
@@ -2134,12 +1584,11 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Pending enrollment requests |
 | GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
 | GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
-| GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (claim state, binding provenance; no claim phrase) |
-| GET | `/api/access/connect/claim-code` | AccessManage | fleet allowlist | none | Reveal the current twelve-word claim phrase (unclaimed daemons only) |
+| GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (discovery-link state and provenance; no claim code) |
+| GET | `/api/access/connect/claim-code` | AccessManage | fleet allowlist | none | Reveal the current one-time twelve-word claim code (unlinked daemons only) |
 | POST | `/api/access/connect/config` | AccessManage | fleet allowlist | bounded | Enable/disable the Connect client (persists to intendant.toml, applies live) |
-| POST | `/api/access/connect/unclaim` | AccessManage | fleet allowlist | bounded | Release this daemon's claim binding at the rendezvous (daemon-signed) |
+| POST | `/api/access/connect/unclaim` | AccessManage | fleet allowlist | bounded | Unlink this daemon's discovery record from its Connect account (daemon-signed) |
 | POST | `/api/access/tier` | AccessManage | fleet allowlist | bounded | Set this daemon's trust tier label (integrated/disposable; null clears) |
-| POST | `/api/access/hosted-ceiling` | AccessManage | fleet allowlist | bounded | Set the hosted-control ceiling role for hosted-provenance sessions |
 | POST | `/api/access/fleet-cert/request` | AccessManage | fleet allowlist | bounded | Request a fleet certificate (publish addresses, run the ACME DNS-01 order; async start) |
 | GET | `/api/dashboard/targets` | AccessInspect | own origin | none | Dashboard target list (this daemon + connected peers) |
 | GET | `/api/dashboard/tabs` | AccessInspect | own origin | none | Live dashboard connections (open tabs) with voice/input-authority holders |
@@ -2167,6 +1616,14 @@ its operation per method/path from `federation_http_operation`.
 | GET | `/mcp` | MCP token | own origin | none | MCP SSE stream (405: stateless server) |
 | DELETE | `/mcp` | MCP token | own origin | none | MCP session delete (405: stateless server) |
 <!-- gateway-route-table:end -->
+
+The four signed-organization rows marked `public` are courier/verification
+doors, not daemon-authentication or control doors. The HTTP caller receives no
+principal, role, or session. A locally trusted org signature authorizes only
+processing of the bounded document for its named cryptographic subject (or
+application of signed revocation facts); that subject must authenticate later
+through a real ingress. Peer subjects use peer mTLS. Human browser-key subjects
+remain record-only in this alpha because no live ingress authenticates them.
 
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal

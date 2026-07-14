@@ -1,8 +1,10 @@
 # Trust Architecture
 
-> Status: adopted design, incremental rollout. This chapter records *why* the
-> access system is shaped the way it is, what each piece of infrastructure is
-> allowed to do, and the order in which the remaining pieces land. The
+> Status: alpha trust boundary implemented for trusted anchors, immutable
+> hosted refusal and migration, signed/encrypted fleet metadata, org documents,
+> and transparency records. Browser-key authentication and peer-link ORL gossip
+> remain staged/future. This chapter records *why* the access system is shaped
+> the way it is and what each piece of infrastructure is allowed to do. The
 > operational reference for the UI lives in [Web Dashboard → Access](./web-dashboard.md#access);
 > the daemon-to-daemon layer is in [Peer Federation](./peer-federation.md);
 > the fleet-level operating model built on these mechanisms — which client
@@ -11,9 +13,11 @@
 Intendant's goal is a **network of agentic networks**: daemons (agents) owned
 by people and organizations, where an owner can grant other people and other
 daemons scoped IAM access to their machines, infrastructure, and resources —
-with pleasant abstractions (passkeys, one-phrase claiming, rendezvous, relays)
-on top. The product constraint that makes this hard: the client stays a plain
-web browser. No native app, no browser extension.
+with pleasant abstractions (passkeys, single-use route linking, and route
+discovery) on top. The discovery client stays a plain web browser. Daemon
+control requires local presence, the signed native app, or a browser enrolled
+for direct mTLS by a trusted owner; root remains on one of those trusted
+surfaces.
 
 ## The residual trust problem is code provenance
 
@@ -21,17 +25,26 @@ Break a hosted convenience service (`connect.intendant.dev`) into what it
 could betray if compromised:
 
 1. **Authentication** — it is the WebAuthn relying party for accounts.
-2. **Introductions** — rendezvous/signaling between browsers and daemons.
-3. **Relay** — TURN for NATed paths.
+2. **Introductions** — route discovery and daemon-presence metadata.
+3. **Delivery** — optional encrypted Web Push notifications. TURN may be a
+   separate future transport component, but hosted Connect does not relay
+   daemon control in the default build.
 4. **Metadata** — fleet lists, labels, claim records.
 5. **Application code** — the HTML/JS the browser runs.
 
-Items 2–4 are already cheap to detrust: dashboard tunnels verify a
-daemon-signed binding (daemon public key + session grant + client nonce), so a
-malicious rendezvous can deny service but cannot impersonate a daemon; TURN
-only ever sees ciphertext; metadata can be client-signed and client-encrypted.
-Item 1 *feels* fundamental but collapses into item 5: trusted code can hold
-keys locally and do identity without a server vouching for anything.
+Items 2–4 can be bounded cryptographically: direct/native dashboard tunnels
+verify a daemon-signed binding (daemon public key + session grant + client
+nonce), push payloads are encrypted to the browser subscription, and metadata
+can be client-signed and client-encrypted. Fleet-record signatures are
+self-contained rather than anchored to an owner/device trust set, so they
+detect same-key alteration but do not stop a store from substituting a fresh
+self-signed record on another device. None of that metadata grants daemon
+authority. These mechanisms do not detrust item
+5: Connect controls the page that asks for passkey assertions and PRF output,
+so malicious code at that endpoint could read or misuse account, fleet, or
+decrypted vault state made available to it. Item 1 is account authentication
+and route metadata only; a Connect account assertion does not authenticate to
+a daemon, and the default service exposes no browser-control signaling.
 
 Item 5 is the one the web platform will not let us escape. The browser binds
 code identity to *origin*, origin trust to TLS+DNS, and the server behind an
@@ -48,18 +61,20 @@ origin can change what it serves at any time, per user, silently:
   about the code the RP serves after login.
 
 So within "pure browser, no extension" there is exactly one class of origin
-that can serve privileged code without adding new trust: **an origin whose
-compromise is already game over for you**. Your own daemon runs your agent
-with real authority — it is already inside your trusted computing base.
+that can serve root-administration code without adding new trust: **an origin
+whose compromise is already game over for you**. Your own daemon runs your
+agent with real authority — it is already inside your trusted computing base.
 Code served by a daemon you own adds zero marginal trust.
 
 That observation fixes the design:
 
-> **The rule:** privileged code is served by the resource owner or by
-> yourself; authority is only ever minted by the target daemon's local IAM;
-> global services carry introductions, ciphertext, and signatures — nothing
-> else. A hosted service never wears two hats: it is not an authority, and it
-> is not a code origin for privileged surfaces.
+> **The rule:** root-capable code is served by the resource owner, runs from
+> a trusted local console, or ships as a signed native client; authority is
+> only ever minted by the target daemon's local IAM. A hosted claim carries
+> discovery/route metadata and creates no principal or grant. In the default
+> binary, hosted provenance is always capped at the zero-permission
+> `role:none`; no local grant, persisted edit, or API call can turn hosted code
+> into a daemon-control client.
 
 ## Anchor daemons
 
@@ -71,55 +86,58 @@ user controls — the **anchor**:
   It happens once per browser, not once per daemon.
 - The anchor — or *any* daemon of the user's fleet; the serving role is
   deliberately fungible — serves the dashboard and the Access admin surface.
-  All privileged logic executes in an origin backed by hardware the user
-  owns.
+  Root administration executes in an origin backed by hardware the user owns.
 - The app generates a **client identity key** in the browser (WebCrypto
-  P-256, non-extractable private key, stored in IndexedDB). This key — not
-  the mTLS certificate — is the durable identity. Browser storage is
-  origin-scoped, which is load-bearing: a key created under the anchor's
-  origin *cannot be wielded by code served from any other origin*. Hosted
-  code cannot sign with your anchor key, by construction.
-- Reaching any other daemon (yours, or an organization's) means: a rendezvous
-  introduces the two ends; the channel binds to the target daemon's key
-  (verified end-to-end, as today); and the client authenticates by signing
-  the offer with its identity key. The target daemon resolves the key
-  fingerprint against its local IAM and enforces the granted role. Nobody in
-  the middle holds authority.
-- Passkeys are reframed as **local key protection**, not server-side
-  authentication: the WebAuthn PRF extension derives a wrapping key so a
-  Face ID / Touch ID gesture unlocks the local identity key. No server is in
-  the authentication loop at all.
+  P-256, non-extractable private key, stored in IndexedDB) for fleet-record
+  signatures, attribution, and future identity work. In this alpha it is not
+  a daemon login credential: local presence or an mTLS client certificate is
+  the active browser authentication boundary.
+- Reaching any other daemon (yours, or an organization's) from a trusted
+  client means: the rendezvous can supply route metadata, while the
+  daemon-served or signed-native client binds the channel to the target
+  daemon's key and authenticates through loopback or mTLS. Browser-key
+  fingerprints can be stored in local IAM, but no alpha direct/native ingress
+  consumes a browser-key signature as authentication. Connect-served code has
+  no control ingress at all.
+- Passkeys authenticate the Connect account and derive keys for the encrypted
+  fleet/vault envelopes. They do not make Connect-served code trustworthy and
+  do not turn a claim into daemon authentication. The durable browser identity
+  key is enrolled separately by an already-trusted daemon root.
 
 A companion chapter, [Credential Custody](./credential-custody.md),
 applies the same discipline to the *other* secret class — the model
-provider credentials a daemon spends. Credential custody has shipped; the
-custody chapter is the source for the current vault, lease, relay, and
-caveat details.
+provider credentials a daemon spends. Vault, lease, and relay components have
+shipped, but a Connect-origin account vault has no trusted delivery bridge to a
+daemon in this build; the custody chapter is the source for the exact boundary.
 
-The hosted service keeps exactly four jobs, all zero-authority:
-introductions (signaling for endpoints that authenticate each other
-end-to-end), blind relay, encrypted/signed fleet-metadata backup, and a name
-directory. The rendezvous component is self-hostable ([how](./self-hosted-rendezvous.md)),
+The hosted service keeps route discovery and presence, optional encrypted push
+delivery, encrypted/signed fleet-metadata backup, account/route linking, a name
+directory, and the browser/installer distribution surface. It has no daemon
+control relay in the default build. None of those is a daemon authority mint, but they are
+not "zero trust": Connect controls availability, account and route metadata,
+and the code it serves. The rendezvous component is self-hostable ([how](./self-hosted-rendezvous.md)),
 and a daemon's agent card states *which* rendezvous it uses
 (`rendezvous_base`) — `connect.intendant.dev` is the default instance of an
 open component, not a chokepoint.
 
 ## The trust ledger
 
-What each component can do to you if it turns malicious, once the design is
-fully rolled out:
+What each component can do to you if it turns malicious in the current alpha;
+rows explicitly marked future remain design constraints:
 
 | Component | Worst case if malicious | Why it is bounded |
 |---|---|---|
 | Your anchor daemon | Full compromise | It already runs your agent; nothing new is delegated to it |
 | Another daemon of yours | That machine's authority | Each daemon is its own authority island |
 | Org portal daemon (guest lane) | The guest's org-scoped session | Blast radius = the org's own resources; self-defeating |
-| Rendezvous / signaling | Denial of service; first-introduction name games | Channels bind to daemon keys; claim phrases bind keys out of band; daemons co-sign claim bindings (v2 proofs) and flag asserted owners they never acknowledged; first-owner bootstrap phrases are daemon-minted (the service holds only a hash, so it cannot enroll a key of its own) |
-| TURN relay | Denial of service; traffic analysis | Sees only ciphertext |
-| Fleet metadata store | Denial of service | Records are client-signed (and encrypted where private); clients verify |
+| Connect route directory | Denial of service; route/account misbinding; first-introduction name games | Daemons co-sign route links and flag asserted links they never acknowledged; claims create no daemon IAM state; this build exposes no hosted control signaling |
+| Optional Web Push delivery | Denial of service; delivery timing analysis | Payloads are encrypted to each browser subscription; notifications carry no daemon authority |
+| Future/separate TURN relay | Denial of service; traffic analysis | Not a Connect control path in the default build; any future use must preserve authenticated, end-to-end encrypted daemon channels |
+| Fleet metadata store | Denial of service; false labels/routes or a substituted self-signed record on a new device | Private fields are encrypted; the current browser detects same-key alteration; records carry no daemon authority. An owner/device signer trust set is not shipped yet. |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
-| Fleet DNS zone + WebPKI (fleet-name route) | Targeted endpoint swap: your daemon's fleet name answered with another box, a fresh certificate minted for it, attacker code served at the enrolled origin | Betrayal must be active (a live wrong answer at connect time; nothing leaks passively or retroactively) and mints public evidence — certificates land in CT logs, the daemon's CT tripwire alarms on serials it never requested — and owners can cap fleet-name sessions under the hosted ceiling; first-load code is *not* bounded, which is why this is [first-contact rung two](./trust-tiers.md#first-contact-three-rungs), not an anchor |
-| Hosted dashboard origin (degraded lane) | The session's granted authority | Sessions are principal-marked and role-capped below root by daemon policy; what the origin serves is committed to its transparency log (`artifact_manifest` entries) and re-checked out of band by `intendant hosted-verify` and every connected daemon's tripwire, so sustained or later-denied bundle swaps leave public evidence. Vault key material is additionally confined to the pinned crypto kernel — one small manifest-covered file, not the whole bundle (see [credential custody](./credential-custody.md#the-crypto-kernel)) |
+| Fleet DNS zone + WebPKI (fleet-name route) | Targeted endpoint swap: your daemon's fleet name answered with another box, a fresh certificate minted for it, attacker code served at the enrolled origin | Betrayal must be active (a live wrong answer at connect time; nothing leaks passively or retroactively) and mints public evidence — certificates land in CT logs and the daemon's CT tripwire alarms on serials it never requested. First-load code is *not* bounded, which is why this is [first-contact rung two](./trust-tiers.md#first-contact-three-rungs), not an anchor |
+| Hosted Connect origin (directory lane) | False or missing account/route/presence metadata; misleading UI; exfiltration of anything entered or unlocked on that page; malicious installers | Claims and account assertions grant nothing, and daemon-stamped hosted provenance is compiled to immutable `role:none`, so the default daemon exposes no control capability to this code. Served artifacts are transparency-logged (evidence, not prevention); installers remain a real software-supply-chain trust boundary. |
+| Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Authority-bearing APIs, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
 
 Trust scales with the blast radius of the relationship: a global service that
 could betray *everyone at once* is allowed to hold approximately nothing; the
@@ -135,12 +153,13 @@ personal daemon does.
 
 **Lane A — members bring their own agent.** The consistent version of the
 network: Alice has her own daemon (laptop, VPS, anything), her browser trusts
-only it, and the org binds *Alice's identity* — her client key, or her
-daemon's peer identity — into IAM grants on its machines with scoped roles.
+only it, and the org binds *Alice's identity* — an mTLS identity for shipped
+alpha human access, or her daemon's peer identity — into IAM grants on its machines with scoped roles.
 Alice touching org infra never requires Alice to trust org-served code, and
 the org never has to trust Alice's infrastructure. The existing split between
 the user/client domain and the peer domain is preserved on purpose: an org
-can grant Alice-the-human (browser sessions via her key) or alice's-daemon
+can grant Alice-the-human (the client-key document shape is staged until a
+trusted direct authenticator consumes it) or Alice's daemon
 (agent-to-agent peer profile with filesystem scoping), and those are
 different, separately auditable trust decisions.
 
@@ -151,21 +170,24 @@ daemons does not apply). The portal could betray its guest — but only with
 authority over the org's own resources, which is a categorically smaller and
 self-defeating threat compared to a global origin. For the true cold start —
 fresh machine, no prior trust, nothing at stake — no browser-only design
-escapes trusting *some* server for the first load. We refuse to pretend
-otherwise: the hosted dashboard survives as an explicitly labeled
-**degraded-trust tier** whose sessions are principal-marked and capped below
-root by daemon-side policy (see role ceilings below), useful for emergencies
-and first contact, honest about what it is.
+escapes trusting *some* server for the first load. We refuse to turn that
+observation into ambient authority: the global hosted origin is a directory
+lane only. It can link and locate a route, but it cannot create a daemon-control
+session in the default product. An organization can offer browser control
+from its own resource-owner portal; global Connect cannot be opted into
+control.
 
-## Phase 6 design: organization grants in detail
+## Organization grants: implementation and remaining work
 
-> Status: **implemented** (v1: steps 1-6 of the rollout below). Grant
-> expiry, org root keys, signed grant documents, per-daemon trust with a
+> Status: **core implementation shipped**. Grant expiry, org root keys, signed
+> grant documents, per-daemon trust with a
 > local cap, materialization, the presentation/issue/trust/revoke
-> endpoints, the offer ride-along (documents attached to dashboard-control
-> offers), signed revocation lists + renewal, peer-subject documents, and
-> issuer-key delegation are live. Revocation-list gossip over peer links
-> remains. This section is the spec the code follows; the earlier "two
+> endpoints, direct document presentation/materialization, signed revocation lists + renewal,
+> peer-subject documents, and
+> issuer-key delegation are live. Peer-subject documents are usable now;
+> human client-key documents can materialize but cannot authenticate an alpha
+> session because direct/native ingress does not consume browser-key proofs.
+> Revocation-list gossip over peer links remains. This section is the spec the code follows; the earlier "two
 > lanes" section is the product narrative it serves.
 
 ### Objects
@@ -203,10 +225,11 @@ to any daemon that trusts the org key:
 
 The signing payload is newline-joined fields (the protocol style already
 used by claim proofs and client-key offers), not canonical JSON. The
-document is *authorization*, not authentication: only the bound subject can
-use it, because sessions still authenticate the subject itself — a stolen
-document is useless to anyone else, and third-party replay just
-re-materializes the same grant. `chain` is omitted or empty when the root
+document is *authorization*, not authentication: it is useful only when an
+active transport separately authenticates the bound subject. Peer certificate
+subjects have that ingress today. Browser client-key subjects do not in this
+alpha, so materializing one creates record state but no usable login path.
+`chain` is omitted or empty when the root
 signed the document and present with one issuer certificate when a
 delegated issuer signed.
 
@@ -216,9 +239,9 @@ for the peer lane. Connect-account subjects are deliberately absent: they
 would make the org-grant path only as trustworthy as the rendezvous's
 account assertion — a compromised hosted service could claim to be a
 granted member and collect the org's authority on every daemon that trusts
-it. Client keys and peer certificates authenticate cryptographically
-end-to-end. A member without a daemon still joins fine: any page mints a
-key, the org grants that key, and hosted-origin keys remain ceiling-capped.
+it. Peer certificates authenticate cryptographically end-to-end. Browser
+client keys remain staged subject vocabulary until a trusted direct/native
+authenticator is implemented; current human access uses explicit mTLS.
 Account subjects can be added later as an explicit, documented weakening
 if a real need appears.
 
@@ -253,36 +276,41 @@ Prerequisite schema work, valuable on its own: `IamGrant` gains
 as inactive (temporary grants for humans drop out of this immediately).
 
 Presentation paths: an explicit `POST /api/access/org-grants` in the public
-doorbell class (rate-limited, size-capped — the document itself is the
-authorization), and an `org_grant` ride-along field on dashboard-control
-offers so an org member's *first* connection to an org daemon materializes
-the grant and proceeds in one round trip. The ride-along works the same on
-both offer doors — the hosted rendezvous (`connect_rendezvous.rs`, with
-`intendant-connect` relaying the field verbatim like the client-key
-fields) and the daemon's own `/connect/dashboard/offer` — and runs
-*before* grant resolution, so the freshly written grant resolves for the
-very offer that carried it. Presentation failure is non-fatal: if another
-identity resolves, the session proceeds (the error is logged and, on the
-local path, surfaced in the answer); only when nothing resolves does the
-org error ride back inside the refusal.
+doorbell class (rate-limited and size-capped), and an `org_grant` ride-along field on a daemon-origin
+dashboard-control offer so an org member's *first trusted direct/native*
+connection to an org daemon can materialize the grant and proceed in one round
+trip. Materialization runs *before* grant resolution, so the freshly written
+grant resolves for the offer that carried it. Connect does not relay or present
+this field in the default build: the service rejects hosted control calls and
+the daemon drops legacy Connect offers before parsing any ride-along. A failed
+direct presentation is non-fatal when another identity resolves; otherwise its
+error is surfaced in the local answer.
 
-Browser side, the join fold stores a pasted document in
-`localStorage` (`intendant_org_grants_v1`, keyed by org handle) even when
-the presenting daemon refuses it — the daemon may simply not trust the org
-yet. Offers then attach the freshest stored document that is unexpired,
-bound to *this* browser's identity key, and targeted at the daemon (when
-its id is known client-side). Since the identity key is origin-scoped,
-a stored document only ever helps the browser it was issued to.
+"Public" here describes an **authority-free courier door**, not public daemon
+authentication. The caller identity receives no role and the HTTP request does
+not become a dashboard/control session. The daemon parses the bounded document,
+verifies its org signature and local trust/cap, and can materialize a grant only
+for the cryptographic subject named inside it. A peer subject must later
+authenticate with its peer mTLS key. A human browser-key subject is record-only
+in this alpha because no ingress authenticates that key. The same distinction
+applies to public renewal and ORL read/apply: they verify or return signed
+documents, never authenticate the courier.
 
-Because offers re-present automatically on every connect, materialization
-is idempotent-quiet and local-wins: an unchanged presentation neither
-rewrites `iam.json` nor grows the audit log, and a document whose
-materialized grant (or subject principal) was *locally revoked* is
-refused rather than resurrected — otherwise a member's browser would undo
-the owner's revocation on its next reconnect. The org's escape hatch is a
-fresh document (new `grant_id`); the owner's is re-enabling the grant from
-a root session. This same property is what lets the step-5 revocation
-list revoke by `grant_id` durably.
+Browser-side storage (`intendant_org_grants_v1`, keyed by org handle) is a
+record format, not a login or automatic alpha presentation promise. The default
+Connect directory may display records already present in that origin, but it
+does not present them to daemons. The retired browser-key offer code contains a
+presentation field, yet no shipped direct/native ingress authenticates that
+key. Usable human access therefore requires an explicit trusted mTLS binding;
+peer-subject documents remain usable through peer mTLS.
+
+Materialization itself is idempotent-quiet and local-wins: an unchanged
+presentation neither rewrites `iam.json` nor grows the audit log, and a
+document whose materialized grant (or subject principal) was *locally revoked*
+is refused rather than resurrected. The org's escape hatch is a fresh document
+(new `grant_id`); the owner's is re-enabling the grant from a root session. This
+same property is what lets the step-5 revocation list revoke by `grant_id`
+durably.
 
 ### Revocation
 
@@ -328,12 +356,16 @@ data; an empty seq-0 list is signed lazily on first read).
 address for "the org daemon" — there is no membership server to ask — so
 the list travels the same way grant documents do: anyone may push it to
 `POST /api/access/orgs/revocations/apply` (doorbell class:
-unauthenticated, rate-limited, size-capped — the signature is the
-authority, and replaying an old list is refused by `seq`). Two couriers
+unauthenticated, rate-limited, size-capped — the caller gets no authority;
+the locally pinned org signature authorizes only application of the signed
+revocation facts, and replaying an old list is refused by `seq`). Two couriers
 exist today: the org admin's browser publishes the list to the
-rendezvous **bulletin board** (blind storage — signature-checked and
-rollback-proof, so the board can only withhold), and every member's
-browser fetches it from there and hands it to each daemon it visits.
+rendezvous **bulletin board** (blind storage — signature-checked, with
+monotonic writes). The board cannot forge a newer list and a daemon refuses a
+sequence below its local high-water mark, but the board can withhold the latest
+list or serve an older signed list to a fresh daemon that has no sequence
+history. Every member's browser fetches the board's copy and hands it to each
+daemon it visits.
 Peer-link gossip can come later; with browsers as couriers, revocations
 already reach any daemon a member still talks to.
 
@@ -360,9 +392,10 @@ daemon refuses renewal for anything its own ORL lists (by grant_id or
 subject) — expiry then retires the member within the document's remaining
 lifetime. Only the daemon holding the org root key can renew, and renewal
 grants nothing a fresh issue would not; it exists so membership can be
-kept short-lived without the issuer in the loop.
+kept short-lived without the issuer in the loop. The unauthenticated courier
+is not logged in by this call and cannot exercise the renewed subject's grant.
 
-### Rollout
+### Organization-grant implementation status
 
 1. ✅ Grant expiry in the IAM schema, evaluator, and UI.
 2. ✅ Org identity + `intendant org init` + `trusted_orgs` + Access →
@@ -370,13 +403,16 @@ kept short-lived without the issuer in the loop.
 3. ✅ Document format, verification against trusted org keys,
    materialization into local IAM, and paste-to-join UI. The public
    presentation endpoint is `POST /api/access/org-grants` (doorbell class:
-   unauthenticated, rate-limited, 16 KiB cap — the document is the
-   authorization); trust/revoke/issue require `access.manage`.
-4. ✅ Offer ride-along (one-round-trip first contact): browsers store
-   pasted documents and attach them to dashboard-control offers on both
-   the hosted-rendezvous and local paths; daemons materialize before
-   grant resolution, idempotent-quiet, without resurrecting local
-   revocations. E2E: `scripts/validate-org-grants.cjs`.
+   unauthenticated, rate-limited, 16 KiB cap — the signed document authorizes
+   only subject-bound verification/materialization, never the courier's
+   session); trust/revoke/issue require `access.manage`.
+4. ⚠️ Human client-key presentation machinery is staged: browsers can store and
+   present a document from trusted daemon-origin code, and daemons can verify
+   and materialize it idempotently without resurrecting local revocations, but
+   no alpha ingress authenticates the document's browser key. It therefore
+   creates record state, not a usable human login. The hosted rendezvous path is
+   disabled and cannot exercise a stored document. Peer subjects are usable
+   through peer mTLS. E2E: `scripts/validate-org-grants.cjs`.
 5. ✅ Revocation list + renewal: root-signed cumulative ORL maintained on
    the org daemon (`orl.json`, served publicly), carried to consumers via
    the public apply doorbell, enforced monotonically and persisted so
@@ -393,7 +429,7 @@ kept short-lived without the issuer in the loop.
    issuers wholesale via recorded `issued_via`). Renewal stays root-only
    for now. E2E: `scripts/validate-org-grants.cjs` scenarios 4–5.
 
-### Step 6 design: peer subjects and issuer keys (built)
+### Peer subjects and issuer-key delegation
 
 **Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
 materializes into the peer identity store
@@ -457,10 +493,9 @@ issuer cannot mint issuers.
 
 Revoking an issuer revokes everything it signed going forward: the ORL
 gains a `revoked_issuer_keys` list, which adds a line to the ORL signing
-payload. Nothing consuming v1 lists has shipped outside this branch, so
-the payload change lands as a plain extension of the v1 protocol before
-first release; were that no longer true it would ship as an explicit
-`v: 2` with dual-version acceptance. Materialized grants are swept by
+payload. The v1 payload was extended before external compatibility was
+promised. Any future incompatible change must use an explicit `v: 2` with
+dual-version acceptance. Materialized grants are swept by
 matching the `chain` recorded at materialization time — which means the
 materialization audit/grant record starts persisting the issuer key it
 accepted.
@@ -478,44 +513,64 @@ verification value; documents stay self-contained.
 The pieces that implement the model, mapped to the codebase:
 
 - **Daemon-local IAM** (`~/.intendant/access-certs/iam.json`): principals
-  (browser certificate, client key, Connect account, human user, peer
-  daemon), grants (principal → role on this daemon), roles over the daemon
-  permission catalog defined in `access/iam.rs`. Implemented; the source
-  of all authority.
-- **End-to-end tunnel binding**: dashboard-control offers are answered with a
+  (browser certificate, client key, metadata-only Connect account records,
+  human user, peer daemon), grants (principal → role on this daemon), roles
+  over the daemon permission catalog defined in `access/iam.rs`. Implemented;
+  the source of all authority. Connect account records remain compatibility
+  and audit vocabulary, not an authenticating binding.
+- **End-to-end tunnel binding**: trusted direct/native dashboard-control offers are answered with a
   daemon-signed binding over (daemon public key, session grant, client
-  nonce); the browser verifies before trusting the channel. Implemented —
-  this is what demotes the rendezvous to an introducer.
-- **Client identity keys**: browser-held WebCrypto P-256 keys; offers carry
-  `client_key` + a signature over (daemon id, client nonce, SDP digest,
-  timestamp); daemons verify (ring, fixed-form ECDSA) and resolve the key
-  fingerprint to a local principal. The recorded key metadata includes the
-  origin it was enrolled from, so policy can distinguish anchor-origin keys
-  from hosted-origin keys. Grants to a key are created from an
-  already-trusted session — an anchor-served root session — which is what
-  makes the recorded origin meaningful.
-- **Role ceilings**: daemon policy caps the *effective* permissions of
-  low-provenance sessions regardless of the grant — by default,
-  Connect-account principals and client keys enrolled from a hosted origin
-  cannot exceed `role:operator` (no `access.manage`, no `settings.manage`,
-  no `runtime.control`). Ceilings are enforced as a permission intersection
-  at decision time and surfaced in the Access UI. Hardening is one knob —
-  the hosted-control cap on the Trust tier card (Access → Overview) moves
-  both hosted bindings to operator / observer / `role:none` (refuse
-  entirely), per [Trust Tiers](./trust-tiers.md); raising a ceiling or
-  clearing them stays an explicit `iam.json` edit for owners who accept
-  hosted-root risk.
-- **Device enrollment**: when a browser's *verified* key is refused, the
-  daemon queues a pending enrollment (in-memory, capped, TTL'd — the queue
-  grants nothing by itself); the owner approves it with a role, or denies it,
-  from Access → People & Devices in an already-trusted session. Approval goes
-  through the ordinary grant upsert with the key's route origin recorded, so
-  ceilings and audit apply unchanged. The certificate ceremony happens once
-  per *user*, not once per browser or per daemon.
+  nonce); the browser verifies before trusting the channel. Implemented for
+  daemon-origin control. The retired Connect signaling format used the same
+  binding, but the current service rejects those calls and current daemons
+  refuse legacy events before opening a channel.
+- **Client identity keys (staged, not alpha authentication)**: browser-held
+  WebCrypto P-256 keys sign fleet records and may appear as peer-relay
+  attribution. Verification and IAM record vocabulary for key-signed offers
+  exist from the retired hosted design, but local `/ws`, direct
+  `/connect/dashboard/offer`, and the native bridge do not consume that proof.
+  A stored key grant therefore grants no usable alpha ingress; active browser
+  control authenticates with loopback presence or mTLS.
+- **Hosted authentication and immutable refusal**: a Connect account assertion
+  is route metadata and never authenticates to the daemon. Daemon-stamped
+  route provenance prevents a directly enrolled key from shedding hosted
+  policy merely because its stored origin looks trusted. Both compatibility
+  ceiling entries are normalized to `role:none` on every load; missing, empty,
+  or hand-edited values also resolve to `role:none`. The default service returns
+  `403` for authenticated browser offer/ICE/close calls before mutation, and
+  the daemon drops those event kinds before touching control, IAM, or
+  enrollment state. There is no ceiling-raising endpoint or disclosure
+  checkbox: no browser-key grant can authorize a Connect-served control
+  session. Any future hosted-control
+  offering would have to be a deliberately separate binary/product and is not
+  part of this release.
+  Upgrading only Connect cannot tear down a legacy P2P session that is already
+  established; complete the migration by restarting upgraded daemons, closing
+  old Connect tabs, and allowing IAM schema v2 to revoke legacy
+  `connect-bootstrap` grants.
+- **Legacy hosted-root and `--owner` migration**: IAM schema v2 identifies
+  principals whose client-key authentication origin is the retired
+  `connect-bootstrap` sentinel, revokes every active grant on them, and records
+  `revoke_legacy_connect_bootstrap`. It separately revokes active browser-key
+  grants whose recorded reason came from the retired CLI `--owner` bootstrap
+  and records `revoke_legacy_owner_browser_key_bootstrap`. Both hosted ceilings
+  return to `role:none`; direct/mTLS root grants survive. Existing Connect
+  account/route links are metadata outside IAM and remain linked. Remove
+  `--owner` from old service commands (the parser now rejects it), restart the
+  upgraded daemon, close old Connect tabs, and run `intendant access setup`
+  locally to establish the generated owner mTLS credential.
+- **Device enrollment (staged UI/state)**: the daemon has a bounded pending
+  enrollment queue and ordinary key-grant upsert machinery, but the alpha
+  direct/native transports do not present browser-key authentication, so this
+  is not a usable sign-in path. Connect events are dropped before key parsing
+  and never create an enrollment request. Remote alpha enrollment uses mTLS
+  certificate setup instead; a claim never substitutes for trusted approval.
 - **Encrypted fleet sync**: the private fields of a synced fleet record
   (daemon URLs) are sealed with an AES-GCM key derived from the account
-  passkey via the WebAuthn PRF extension — a secret the browser evaluates
-  locally and the rendezvous never sees. Passkeys sync across the user's
+  passkey via the WebAuthn PRF extension — bytes the browser evaluates
+  locally and does not send in the protocol. Connect still controls that
+  browser's JavaScript and can prompt for verification and exfiltrate the PRF
+  output or decrypted state while the page has it. Passkeys sync across the user's
   devices, so each device derives the same key; the hosted store holds
   ciphertext (`enc_fields`, signed as stored — fleet-record payload v3),
   and a device without the key still verifies the record and simply shows
@@ -530,18 +585,30 @@ The pieces that implement the model, mapped to the codebase:
   outbound peer routes, its approved inbound identities) that both drives
   the CORS echo and refuses state-changing requests from any other page —
   closing the hole where a cert-installed browser could be steered by an
-  arbitrary website. This posture is daemon-wide: no API response is
-  wildcard-readable, foreign-origin `/api/*` requests are refused, and only
-  the deliberate public-bootstrap surfaces (`/config`, the agent card,
-  local Connect signaling, the peer doorbell) remain open to any page.
+  arbitrary website. This posture is daemon-wide: no authority-bearing API
+  response is wildcard-readable and foreign-origin `/api/*` requests are
+  refused. `/config` is not public bootstrap: it requires `presence.read`,
+  accepts only the daemon's own or a fleet-allowlisted Origin, and is
+  `Cache-Control: no-store` because its ICE material may contain credentials.
+  Only authority-free bytes such as the agent card, `/connect/bootstrap`,
+  `/connect/status`, and the peer doorbell remain public. Authority-
+  bearing `/connect/dashboard/*` signaling and `/ws` apply the same own/app-
+  origin gate before resolving local or mTLS authority; cleartext own-origin
+  access is loopback-only to resist DNS rebinding.
 - **Signed fleet sync**: fleet records that round-trip the hosted metadata
   store are signed by the pushing browser's identity key (over host id,
   label, and route URLs) and verified on read; the Access UI badges each
   synced record as verified-by-this-browser, signed-by-another-device,
-  unverified, or hosted-claim. The store carries the signatures verbatim
-  and cannot silently inject or relabel a daemon in your fleet view.
-  Cross-device encryption of private fields (via passkey-PRF-derived keys)
-  remains the follow-on step.
+  unverified, or hosted-claim. The signing public key travels inside the
+  record and there is no owner/device trust set yet. The current browser can
+  therefore detect alteration under its own key, but a malicious store can
+  replace a record with a newly generated, internally valid self-signed one on
+  another device. Connect-served code can also wield that origin's browser key
+  while loaded. These signatures are integrity/attribution hints, not daemon
+  authentication and not protection from a malicious hosted page or store.
+  Private route fields are also encrypted across devices with the
+  passkey-PRF-derived key described above; that protects stored ciphertext,
+  not plaintext exposed to the currently running hosted page.
 - **MCP principal binding**: `/mcp` requests (supervised backends, `intendant
   ctl`, the dashboard's tool RPC) enter the same evaluator as every other
   surface. Supervised agents authenticate with a session-scoped token derived
@@ -557,9 +624,10 @@ The pieces that implement the model, mapped to the codebase:
   revoked) denies rather than restoring default trust. See
   [MCP Server](./mcp-server.md#mcp-authorization).
 - **Org root keys**: membership and role assertions signed by the org key;
-  daemons verify signatures rather than trusting a directory. The global
-  directory maps handle → org root key and is cross-checkable; a
-  transparency log can be layered on when scale warrants it.
+  each daemon explicitly pins the org root it trusts and verifies signatures
+  locally. Handles are labels, not a global authority directory. Connect's
+  append-only transparency log can make published metadata auditable, but it
+  cannot add or replace an org root in daemon-local trust.
 
 ## Prior art
 
@@ -578,25 +646,25 @@ The pattern is proven elsewhere; we are assembling, not inventing:
 - **SPKI/SDSI and petnames** — authority bound to keys; human names are
   local, contextual labels.
 
-## Rollout sequence
+## Alpha implementation status
 
-Each step is independently shippable and none breaks the poweruser mTLS path,
-which remains first-class throughout:
+The alpha keeps loopback and direct mTLS first-class while separating shipped
+authentication from staged identity vocabulary:
 
-1. **Client identity keys + key-signed offers** — establishes key-bound
-   sessions on both the local and rendezvous signaling paths; removes the
-   account-authority residue from Connect entirely (accounts become spam
-   control and petname sync).
-2. **Role ceilings for low-provenance routes** — closes the hosted-root hole
-   by policy instead of by warning.
-3. **Device enrollment via existing session** — kills the per-browser
-   certificate dance without touching the trust model.
-4. **Grant fanout from the anchor Access page** — one grant, N daemons, all
-   authority local.
-5. **Signed + encrypted fleet sync** — detrusts the metadata store.
-6. **Org root keys + signed membership** — organizations as key-rooted
-   namespaces.
-7. **Self-hostable rendezvous as a first-class deployable** — the default
-   instance stops being special.
-8. **Directory transparency** — when the namespace is big enough to deserve
-   it.
+1. **Trusted anchors are shipped** — local presence, direct mTLS, and the
+   signed native app's mTLS bridge are the daemon-control entry points.
+2. **Hosted refusal and migration are shipped** — hosted provenance is fixed
+   at `role:none`; Connect signaling is refused at both ends; IAM schema v2
+   revokes grants created by the retired Connect bootstrap and `--owner`
+   browser-key bootstrap.
+3. **Client identity keys are metadata-only in this alpha** — they sign fleet
+   records and remain useful subject vocabulary, but no live alpha ingress
+   authenticates a browser with one. Device enrollment UI/state is therefore
+   staged, not a replacement for mTLS.
+4. **Local grant fanout, signed and encrypted fleet sync, org-signed grant and
+   revocation documents, self-hostable Connect, and transparency-log records
+   are implemented** — every daemon still makes its own trust and
+   authorization decision.
+5. **Future work requires a new trust design** — any browser-key login or
+   hosted-control product must define a trusted authenticator and ship outside
+   the default hosted build; it cannot reactivate the retired Connect path.

@@ -7,57 +7,81 @@ reference.
 ## Fresh box in one command
 
 Standing up a **new machine** end to end (clone, dependencies, build, launch,
-claimable from your browser) is one served command — see
+and a Connect discovery link) is one served command — see
 [Credential Custody](./credential-custody.md#the-bootstrap-this-unlocks) for
 the trust story behind it:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://intendant.dev/install.sh | sh -s -- --owner <your-key>
+curl -fsSL https://intendant.dev/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
 ```
 
 Add `--service` / `-Service` on an unattended box: `intendant service install`
 registers the daemon with the platform's native supervisor (systemd where
 present, launchd on macOS, Task Scheduler on Windows, cron `@reboot` plus a
 built-in restart supervisor on systemd-less Linux — no init system is a
-dependency) and prints where the claim phrase lands. `intendant service
+dependency) and prints where the one-time claim code lands. `intendant service
 uninstall|status` manage it afterwards.
 
-What happens next is the whole story in three steps:
+What happens next is the whole story in four steps:
 
-1. **Claim.** The daemon prints a twelve-word claim phrase in its log (and
-   re-prints a fresh claim link every minute while unclaimed). Paste it at
+1. **Link.** The daemon prints a single-use twelve-word claim code in its log.
+   Enter it at
    your rendezvous — [intendant.dev/connect](https://intendant.dev/connect)
-   for the hosted service (invite-only during the pre-alpha), or your
-   [self-hosted rendezvous](./self-hosted-rendezvous.md) — and the box
-   appears under *Your computers*.
-2. **Fuel.** Open it: the dashboard greets you with *"This daemon has no fuel
-   yet"* and a **Fuel from your vault** button. Grant a time-boxed credential
-   lease (or relay provider calls through your browser) — the machine's disk
-   never holds a key. [Credential Custody](./credential-custody.md) is the
+   for the hosted service (invite-only during the alpha), or your
+   [self-hosted rendezvous](./self-hosted-rendezvous.md) — and the route
+   appears under *Your computers*. Linking is discovery metadata only: it
+   creates no IAM principal or grant and grants no daemon access.
+2. **Establish a trusted owner.** On the machine's console or SSH session, run
+   `intendant access setup`; alternatively use a direct mTLS connection or the
+   native app's mTLS bridge. The default build cannot mint or exercise root
+   through hosted-origin code. The former `--owner <browser-key>` shortcut is
+   retired in this alpha; a bare fingerprint is not remote authentication.
+3. **Authorize on that trusted surface.** Install/use the daemon's browser mTLS
+   client certificate, stay on loopback, or use the native app's mTLS bridge.
+   Browser identity-key records are not an active login mechanism in this
+   alpha. The hosted Connect tab remains discovery-only; there is no opt-in
+   that turns it into a control client.
+4. **Fuel and work.** Open the trusted dashboard: it greets you with *"This daemon
+   has no fuel yet"* and a **Fuel from your vault** button. Grant a time-boxed
+   API-key lease (or relay provider calls through your browser). API-key leases
+   are memory-only, but this is not a blanket disk guarantee: `.env` is still
+   supported and a full-credential OAuth lease temporarily materializes a
+   private auth home under `~/.intendant/leased-auth` until cleanup.
+   [Credential Custody](./credential-custody.md) is the
    full story.
-3. **Work.** Send the first task from the composer, watch it in Activity, and
-   dial autonomy and approvals to taste.
+   Then send the first task from the composer, watch it in Activity, and dial
+   autonomy and approvals to taste.
+
+> **Upgrading an earlier alpha installed with `--owner`:** remove the retired
+> flag from the service command, upgrade and restart the daemon, close any old
+> Connect dashboard tabs, then run `intendant access setup` locally and install
+> the generated mTLS client credential. CLI parsing now rejects `--owner` with
+> this migration direction. IAM schema v2 revokes both `connect-bootstrap`
+> grants and legacy browser-key grants whose reason records a `--owner`
+> bootstrap; it does not silently preserve browser-key root.
 
 The rest of this chapter is the from-checkout path the installer automates —
-including the classic alternative to step 2: putting an API key in `.env` on
+including the classic alternative to fueling from the vault: putting an API key in `.env` on
 a machine you fully trust.
 
 ## Prerequisites
 
 Intendant is a Rust workspace. At minimum you need:
 
-- **Rust** toolchain (stable) — `rustup` recommended
-- **wasm-pack** — `cargo install wasm-pack` (the dashboard's browser code is a
-  WASM crate; the build auto-rebuilds it, see [WASM](#wasm-builds-automatically))
+- **Rust 1.96.1** — pinned by `rust-toolchain.toml`; `rustup` selects and
+  installs it automatically
+- **wasm-pack 0.14.0** — pinned by `.wasm-pack-version`; install it with
+  `cargo install wasm-pack --version 0.14.0 --locked` (the build
+  auto-rebuilds stale browser WASM, see [WASM](#wasm-builds-automatically))
 - **ffmpeg** — display recording and software H.264 encoding
 - Provider **credentials** — an API key in `.env` for at least one of OpenAI,
-  Anthropic, or Gemini, *or* nothing on disk at all: a claimed daemon can run
+  Anthropic, or Gemini, *or* nothing on disk at all: an authorized daemon can run
   keyless on [vault leases](./credential-custody.md)
 
 Platform-specific runtime dependencies (display capture, input injection, audio
@@ -111,7 +135,7 @@ Managed browser setup accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; run
 `intendant setup browsers --help` for exact usage.
 
-A release build produces two binaries:
+A release build produces three binaries:
 
 - `target/release/intendant-runtime` — the sandboxed command executor. Reads
   JSON commands on stdin, runs them, writes JSON results to stdout. Never holds
@@ -119,6 +143,8 @@ A release build produces two binaries:
 - `target/release/intendant` — the controller. Manages the LLM conversation,
   calls model APIs, dispatches tool calls to the runtime subprocess, and hosts
   every frontend (web dashboard, MCP, control socket).
+- `target/release/intendant-connect` — the self-hostable account, discovery,
+  and route-metadata rendezvous. It has no daemon authority.
 
 The two-binary split is the security boundary; see [Architecture](./architecture.md).
 
@@ -128,31 +154,35 @@ The two-binary split is the security boundary; see [Architecture](./architecture
 cargo install --path .
 ```
 
-Both binaries land in `~/.cargo/bin/`. The `intendant` binary embeds the default
+All three binaries land in `~/.cargo/bin/`. The `intendant` binary embeds the default
 system prompts and the web assets (HTML, JS, compiled WASM) at compile time, so
 it runs from any directory without the source tree.
 
 ### WASM builds automatically
 
-The dashboard's browser-side state machine and voice clients live in the
-`crates/presence-web` (and shared `crates/presence-core`) WASM crate. **A normal
-`cargo build` rebuilds the WASM for you**: `build.rs` compares the timestamps of
-`crates/presence-web/src` and `crates/presence-core/src` against the compiled
-`static/wasm-web/presence_web_bg.wasm`, and when the sources are newer it runs
-`wasm-pack` into a separate target dir and re-embeds the result.
+There are two browser WASM crates: `crates/presence-web` (fed by shared
+`crates/presence-core`) produces `static/wasm-web/`, and
+`crates/station-web` produces `static/wasm-station/`. **A normal `cargo build`
+rebuilds stale WASM for you**: `build.rs` compares each crate's source
+timestamps with its compiled `.wasm`, invokes `wasm-pack` in a separate target
+directory when needed, then re-embeds the resulting artifacts.
 
-This requires `wasm-pack` to be installed. If it is missing, `cargo build`
-prints a `cargo:warning` and skips the WASM step (the previously-compiled
-artifact in `static/wasm-web/` is used as-is).
+Artifact generation is version-gated. Only the `wasm-pack` version in
+`.wasm-pack-version` — currently **0.14.0** — may rebuild the committed output.
+If `wasm-pack` is absent or a different version is installed, `cargo build`
+warns and keeps the committed artifacts rather than creating byte churn.
 
-The manual two-step is now only a **fallback** (e.g. if the auto-detect ever
-misfires):
+The canonical manual fallback rebuilds **both** crates with the same flags as
+`build.rs`:
 
 ```bash
-cd crates/presence-web && \
-  wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+bash scripts/build-wasm.sh
 cargo build --release -p intendant   # re-embed
 ```
+
+Regenerate and commit WASM artifacts on macOS only. The emitted bytes are not
+deterministic across host triples; the aarch64 macOS build is the canonical
+artifact host used by the drift gate.
 
 > The earlier guidance that "`cargo build` alone does NOT rebuild WASM" is no
 > longer true — `build.rs` handles it.
@@ -283,8 +313,8 @@ Two ways to give a daemon credentials, by trust posture:
 
 - **Keys on disk (`.env`)** — this section. Right for a machine you fully
   trust: your laptop, a workstation you sit at.
-- **No keys on disk** — a claimed daemon runs unfueled and borrows time-boxed
-  leases from your browser-side vault, or relays provider calls through the
+- **No keys on disk** — a linked daemon remains unfueled until an authorized
+  session lends time-boxed leases from your browser-side vault, or relays provider calls through the
   browser entirely; see [Credential Custody](./credential-custody.md). Right
   for rented, shared, or disposable boxes.
 
@@ -438,10 +468,9 @@ value is missing.
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; run headless |
 | `--bind` | `<addr>` | IP address for the web dashboard listener. Use `127.0.0.1` for local/plaintext automation |
-| `--owner` | `<fingerprint>` | Pin root authority to a browser client key at startup for the install bootstrap; authority is minted locally and no secrets go on the wire |
 | `--no-tls` | — | Serve the dashboard over plain HTTP. Explicit local/debug escape; wildcard bind refuses startup when a public interface exists |
-| `--allow-public-plaintext` | — | Override the `--no-tls` public-interface guard for intentional public plaintext exposure |
-| `--tls` | — | Serve HTTPS/WSS without requiring browser client certificates; uses installed access certs when present, otherwise falls back to an auto self-signed cert |
+| `--allow-public-plaintext` | — | Override the `--no-tls` public-interface startup guard; does not grant remote callers local/root authority |
+| `--tls` | — | Serve HTTPS/WSS and provide a secure context; certless local-root is loopback-only and remote protected routes still require mTLS |
 | `--tls-cert` | `<path>` | PEM cert (chain) overriding the default cert selection; implies `--tls` (pair with `--tls-key`) |
 | `--tls-key` | `<path>` | PEM private key matching `--tls-cert`; implies `--tls` |
 | `--mtls` | — | Require browser/client certificates signed by the Intendant access CA. This is the default dashboard transport |
@@ -593,11 +622,15 @@ cargo test --bins         # unit tests (fast, no API keys)
 cargo test -- --list      # list all test names
 ```
 
-Unit tests are inline `#[cfg(test)]` modules in both binaries. Integration
-tests under `tests/e2e/` spawn a real binary and make real API calls (they cost
-tokens and are non-deterministic) — they are **not** part of CI. See
-[Architecture](./architecture.md) for the tiered e2e suite and
-[Session Logging](./session-logging.md) for the test-coverage summary.
+Unit tests are inline `#[cfg(test)]` modules across the binaries and library
+crates. The 20 `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
+binaries against the deterministic scripted mock provider (`PROVIDER=mock` +
+`INTENDANT_MOCK_SCRIPT`). They need no API key or network, use the synthetic
+1280×720 display backend rather than native capture, and run in CI on macOS,
+Linux, and Windows; run them locally with `cargo test --test e2e`. Real-LLM or
+headed-display scenarios live under `tests/skills/` and are deliberately
+outside CI. See [Session Logging](./session-logging.md) for the logging/search
+coverage exercised through that real-binary suite.
 
 ## Runtime (standalone)
 
