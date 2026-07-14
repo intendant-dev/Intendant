@@ -33,5 +33,6 @@ pub mod rng;
 pub mod scenario;
 pub mod shapes;
 pub mod suite;
+pub mod surfaces;
 pub mod tranche;
 pub mod vector;

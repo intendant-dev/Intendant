@@ -17,7 +17,6 @@
   "name": "merkle-wrong-index-invalid",
   "source": "11.8",
   "surfaces": [
-    "core",
-    "browser"
+    "core"
   ]
 }

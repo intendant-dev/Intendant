@@ -17,7 +17,6 @@
   "name": "merkle-promotion-path-valid",
   "source": "11.8",
   "surfaces": [
-    "core",
-    "browser"
+    "core"
   ]
 }

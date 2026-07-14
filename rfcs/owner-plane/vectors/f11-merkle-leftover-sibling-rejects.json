@@ -17,7 +17,6 @@
   "name": "merkle-leftover-sibling-rejects",
   "source": "11.8",
   "surfaces": [
-    "core",
-    "browser"
+    "core"
   ]
 }

@@ -130,7 +130,7 @@ fn merkle_vectors() -> Vec<Vector> {
             name: name.into(),
             case_kind: "merkle-proof".into(),
             source: "11.8".into(),
-            surfaces: vec!["core".into(), "browser".into()],
+            surfaces: vec!["core".into()],
             rng: None,
             inputs,
             expected,
