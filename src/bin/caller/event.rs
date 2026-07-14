@@ -2104,7 +2104,11 @@ impl EventBus {
 /// (control plane, task dispatcher, session supervisor) fold into the same
 /// ordered stream — alias/relationship mapping that routes FUTURE intents,
 /// and the end-of-session / display-revoke hygiene the control plane owns.
-/// Everything here is rare; nothing high-frequency may join this list.
+/// `SharedView` rides along for the same hygiene: the control plane's
+/// focus-annotation tracker (`shared_view_lifecycle`) must fold the
+/// human-scale shared-view verbs in emission order to know what a later
+/// revoke or session end has to clear. Everything here is rare; nothing
+/// high-frequency may join this list.
 pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
     matches!(
         event,
@@ -2113,6 +2117,7 @@ pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
             | AppEvent::SessionRelationship { .. }
             | AppEvent::SessionEnded { .. }
             | AppEvent::UserDisplayRevoked { .. }
+            | AppEvent::SharedView { .. }
     )
 }
 

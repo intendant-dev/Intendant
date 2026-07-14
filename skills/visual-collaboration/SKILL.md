@@ -11,6 +11,7 @@ Use this skill when work benefits from the user having live visibility into an *
 
 - `show_shared_view`: opens the shared display surface and marks the relevant display as the shared view, requesting display-stream activation so the dashboard shows it live.
 - `focus_shared_view`: highlights a normalized region `{x, y, width, height}` on the shared display. Coordinates are fractions from 0.0 to 1.0.
+- `clear_shared_view_focus`: removes the focus highlight and its note while keeping the shared view open. Idempotent — safe when nothing is highlighted.
 - `capture_shared_view_frame`: captures the current display as an MCP image and foregrounds the same dashboard view.
 - `request_shared_view_input`: asks the user to take input authority. Input authority is always granted by the user clicking the dashboard control — the tool only asks; it never grants.
 - `hide_shared_view`: dismisses the banner and focus overlay when collaboration is done.
@@ -24,6 +25,8 @@ Proactively open the shared view when the human should visually stay in the loop
 3. **Auth and judgment handoffs** — when the user must type a password, approve a login, or choose from an account picker, show the display and `request_shared_view_input`; wait for the user to take control from the dashboard.
 
 Use `focus_shared_view` whenever you reference a specific UI area, keep notes short and concrete, and `hide_shared_view` when the shared visual moment is over.
+
+A focus annotation is content-bound guidance: the moment the thing it points at is gone (tab closed, page navigated, dialog dismissed), replace it with a new focus or remove it with `clear_shared_view_focus` — stale guidance on a live view is worse than none. Annotations also auto-clear when the shared view hides, when the display's user grant is revoked, and when the session that drew them ends; the explicit clear is for every earlier moment the content changes under the highlight.
 
 ## Display Targets
 

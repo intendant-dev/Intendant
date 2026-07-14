@@ -754,6 +754,36 @@ impl IntendantServer {
         self.hide_shared_view_for_session(params, None).await
     }
 
+    pub(crate) async fn clear_shared_view_focus_for_session(
+        &self,
+        params: ClearSharedViewFocusParams,
+        session_id: Option<&str>,
+    ) -> String {
+        // Like hide, this is a cleanup verb: no display resolution and no
+        // activation gate — it only retracts presentation state, so it must
+        // stay callable after the underlying display/grant is gone.
+        self.emit_shared_view(
+            session_id,
+            "focus_clear",
+            None,
+            None,
+            params.reason,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Clear the shared display view's focus annotation (highlight region + note) while keeping the shared view itself open. Idempotent — safe to call when nothing is highlighted. Use it as soon as the annotated content is gone (tab closed, page navigated away) instead of leaving stale guidance on screen; hide_shared_view also clears it when the whole collaboration moment ends."
+    )]
+    pub(crate) async fn clear_shared_view_focus(
+        &self,
+        Parameters(params): Parameters<ClearSharedViewFocusParams>,
+    ) -> String {
+        self.clear_shared_view_focus_for_session(params, None).await
+    }
+
     pub(crate) async fn focus_shared_view_for_session(
         &self,
         params: FocusSharedViewParams,
@@ -1074,7 +1104,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the screenshot), failed — plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     pub(crate) async fn execute_cu_actions(
         &self,
@@ -1173,10 +1203,19 @@ impl IntendantServer {
         if let Some(hint) = activation_request.hint() {
             summaries.push(hint.to_string());
         }
+        // Status vocabulary: `ok` = effect verified, `injected` = events
+        // dispatched to the OS but effect unverified (the honest ceiling for
+        // most input injection), `failed` = dispatch failed or verification
+        // contradicted the intent. The detail carries the evidence
+        // (read-back excerpts, clipboard restore notes) or the error.
         for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
             let status = cu_result_status(result);
             let action_desc = format_cu_action_brief(action);
-            let detail = result.error.as_deref().unwrap_or("");
+            let detail = result
+                .error
+                .as_deref()
+                .or(result.detail.as_deref())
+                .unwrap_or("");
             if detail.is_empty() {
                 summaries.push(format!("action[{}] {}: {}", i, action_desc, status));
             } else {
@@ -1191,10 +1230,11 @@ impl IntendantServer {
         // clean MCP success just because a screenshot came along. Every
         // action failing marks the whole call is_error; partial failures get
         // a loud leading line (a "failed" buried mid-list gets skimmed over).
+        // `injected` counts as dispatched, not failed.
         let failed = actions
             .iter()
             .zip(results.iter())
-            .filter(|(_, r)| cu_result_status(r) != "ok")
+            .filter(|(_, r)| !r.success())
             .count();
         let all_failed = failed == actions.len();
         if failed > 0 && !all_failed {

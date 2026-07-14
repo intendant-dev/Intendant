@@ -625,6 +625,13 @@ pub struct HideSharedViewParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearSharedViewFocusParams {
+    /// Optional reason for clearing the focus annotation.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FocusSharedViewParams {
     /// Display target to focus, such as "user_session" or "display_99".
     #[serde(default)]

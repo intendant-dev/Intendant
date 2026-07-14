@@ -427,7 +427,7 @@ impl DisplayBackend for WaylandBackend {
         Ok(())
     }
 
-    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    async fn paste_text(&self, text: &str) -> Result<super::PasteOutcome, CallerError> {
         // Paste gesture emulation, matching the Windows backend: (1) make
         // exactly `text` the session's current paste payload, (2) press
         // ctrl+v in the already-approved RemoteDesktop session. The payload
@@ -505,7 +505,17 @@ impl DisplayBackend for WaylandBackend {
             ));
         }
 
-        Ok(())
+        // Portal selections are pull-based and the portal offers no way to
+        // read (and thus restore) the previous owner's content — this
+        // session simply stays the selection owner. Report that honestly
+        // instead of pretending the clipboard is untouched.
+        Ok(super::PasteOutcome {
+            clipboard_note: Some(
+                "clipboard: previous content not restored (the Wayland portal clipboard \
+                 is pull-based); the pasted text remains the active selection"
+                    .to_string(),
+            ),
+        })
     }
 
     fn resolution(&self) -> (u32, u32) {

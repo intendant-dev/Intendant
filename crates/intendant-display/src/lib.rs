@@ -627,6 +627,16 @@ impl DisplayMetricsSnapshot {
 // Display backend trait
 // ---------------------------------------------------------------------------
 
+/// What a [`DisplayBackend::paste_text`] did to the clipboard beyond the
+/// paste itself.
+#[derive(Debug, Clone, Default)]
+pub struct PasteOutcome {
+    /// Honest note on the previous clipboard content: restored, cleared, or
+    /// left holding the pasted text (and why). `None` only when there is
+    /// nothing worth reporting.
+    pub clipboard_note: Option<String>,
+}
+
 /// Platform-specific display capture and input injection.
 ///
 /// # Capture lifecycle contract
@@ -721,7 +731,11 @@ pub trait DisplayBackend: Send + Sync + 'static {
     /// Paste literal text via the display's clipboard: set the clipboard,
     /// then press the platform paste chord. Backends without clipboard
     /// access keep this default error.
-    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    ///
+    /// The outcome reports what happened to the *previous* clipboard
+    /// content — restored, cleared, or left holding the pasted text — so
+    /// callers can surface residue honestly instead of guessing.
+    async fn paste_text(&self, text: &str) -> Result<PasteOutcome, CallerError> {
         let _ = text;
         Err(CallerError::Display(format!(
             "the {} display backend does not support clipboard paste — use a type action instead",
@@ -3220,8 +3234,10 @@ impl DisplaySession {
         self.backend.inject_text(text).await
     }
 
-    /// Paste text via the display backend's clipboard.
-    pub async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    /// Paste text via the display backend's clipboard. The outcome carries
+    /// the backend's honest note on what happened to the previous clipboard
+    /// content.
+    pub async fn paste_text(&self, text: &str) -> Result<PasteOutcome, CallerError> {
         self.backend.paste_text(text).await
     }
 

@@ -23,7 +23,7 @@ For non-display tasks (shell commands, file editing, code), continue using `exec
 
 ## Shared View (showing the user)
 
-Use the `shared_view` tool to give the user live dashboard visibility into an agent-owned display — your virtual display, a sandbox, or a VM. Open it proactively when the human should visually stay in the loop: demoing a finished result (`show` with a short `reason`), longer GUI/browser sessions the user may want to watch, or auth/judgment handoffs (`input` — the user grants input authority from the dashboard; the tool only asks). Use `focus` when referencing a specific screen region, and `hide` when the moment is over. Sharing the user's own screen (`user_session`) is an explicit opt-in that requires their display grant — default to your own displays.
+Use the `shared_view` tool to give the user live dashboard visibility into an agent-owned display — your virtual display, a sandbox, or a VM. Open it proactively when the human should visually stay in the loop: demoing a finished result (`show` with a short `reason`), longer GUI/browser sessions the user may want to watch, or auth/judgment handoffs (`input` — the user grants input authority from the dashboard; the tool only asks). Use `focus` when referencing a specific screen region, `focus_clear` the moment the highlighted content is gone (tab closed, page changed — stale guidance is worse than none; idempotent, keeps the view open), and `hide` when the moment is over. Sharing the user's own screen (`user_session`) is an explicit opt-in that requires their display grant — default to your own displays.
 
 ## Federated Peers
 
