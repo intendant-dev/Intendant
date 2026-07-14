@@ -898,17 +898,34 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
             ensure_help(&raw[1..], help_cu_actions)?;
             let args = parse_command_args(
                 &raw[1..],
-                &["--actions", "--target", "--coordinate-space", "--output"],
-                &[],
+                &[
+                    "--actions",
+                    "--target",
+                    "--observe",
+                    "--coordinate-space",
+                    "--output",
+                ],
+                &["--annotate"],
             )?;
             let actions = args
                 .one("--actions")
                 .ok_or_else(|| "cu actions requires --actions JSON".to_string())
                 .and_then(read_json_value)?;
             validate_cu_actions(&actions)?;
+            if let Some(observe) = args.one("--observe") {
+                if !matches!(observe, "pixels" | "ax" | "auto" | "none") {
+                    return Err(format!(
+                        "unknown --observe mode '{observe}' (expected pixels, ax, auto, or none)"
+                    ));
+                }
+            }
             let mut map = Map::new();
             map.insert("actions".to_string(), actions);
             insert_string(&mut map, "display_target", args.one("--target"));
+            insert_string(&mut map, "observe", args.one("--observe"));
+            if args.has("--annotate") {
+                map.insert("annotate".to_string(), Value::Bool(true));
+            }
             insert_string(&mut map, "coordinate_space", args.one("--coordinate-space"));
             let response =
                 call_tool(client, config, "execute_cu_actions", Value::Object(map)).await?;
@@ -2468,7 +2485,7 @@ const CU_ACTIONS_EXAMPLE: &str = r#"[{"type":"click","x":120,"y":260},{"type":"t
 fn help_cu() {
     println!(
         "Usage:\n\
-  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+  intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
   intendant ctl cu elements [--target TARGET] [--format text|json] [--full-values]\n\
 \n\
@@ -2486,9 +2503,17 @@ If CU calls fail, `intendant ctl display status` reports per-layer readiness\n\
 
 fn help_cu_actions() {
     println!(
-        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--observe pixels|ax|auto|none] [--annotate] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
 \n\
 {CU_ACTION_SHAPES}\n\
+\n\
+Observation (--observe): what rides the result after the batch.\n\
+  pixels  post-action screenshot (default)\n\
+  ax      frontmost UI element tree as text (user_session targets only)\n\
+  auto    element tree when usable, screenshot fallback\n\
+  none    per-action results only\n\
+The result names the observation it carries and why. --annotate draws click\n\
+markers on captured screenshots (off by default: clean pixels).\n\
 \n\
 Example:\n\
   intendant ctl cu actions --actions '{CU_ACTIONS_EXAMPLE}' --output after.png"

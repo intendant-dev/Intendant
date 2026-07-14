@@ -965,7 +965,7 @@ impl IntendantServer {
         // Sessionless surface: the dashboard shows the capture flash but
         // attributes it to no session.
         let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
-        let results = execute_actions(
+        let outcome = execute_actions(
             &[CuAction::Screenshot],
             target,
             backend,
@@ -975,10 +975,11 @@ impl IntendantServer {
             None,
             caller.allows_user_session(user_display_granted),
             Some(&cu_observer),
+            crate::computer_use::CuExecOptions::default(),
         )
         .await;
 
-        if let Some(result) = results.first() {
+        if let Some(result) = outcome.results.first() {
             if let Some(ref screenshot) = result.screenshot {
                 clear_wayland_user_session_activation_pending_after_capture(
                     &self.state,
@@ -1104,7 +1105,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the screenshot), failed — plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     pub(crate) async fn execute_cu_actions(
         &self,
@@ -1185,7 +1186,11 @@ impl IntendantServer {
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
         // Sessionless surface: overlays/feed render, attributed to no session.
         let cu_observer = crate::computer_use::CuActionObserver::new(self.bus.clone(), None);
-        let results = execute_actions(
+        let options = crate::computer_use::CuExecOptions {
+            observe: params.observe.unwrap_or_default(),
+            annotate: params.annotate.unwrap_or(false),
+        };
+        let outcome = execute_actions(
             &actions,
             target,
             backend,
@@ -1195,8 +1200,10 @@ impl IntendantServer {
             denorm_ref,
             caller.allows_user_session(user_display_granted),
             Some(&cu_observer),
+            options,
         )
         .await;
+        let results = &outcome.results;
 
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
@@ -1244,10 +1251,17 @@ impl IntendantServer {
             );
         }
 
-        // Attach the last screenshot inline, annotated with click markers.
-        // Also save the annotated version to disk so substitute_screenshot_from_disk
-        // picks it up for the Activity tab.
-        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+        // Name the observation the result carries and why — a fallback
+        // (`ax sparse → pixels`) must never be silent.
+        summaries.push(format!("observation: {}", outcome.observation.describe()));
+
+        // Attach the trailing observation. Pixels: the executor already
+        // finalized the artifact (markers only when annotate=true; disk ==
+        // model payload) — no decode/re-encode/rewrite here. AX: the element
+        // tree rides inline as text; for compact (managed-context) callers
+        // that is the whole win — an actual observation instead of a
+        // stripped image.
+        let last_screenshot = outcome.last_screenshot();
         if let Some(ss) = last_screenshot {
             clear_wayland_user_session_activation_pending_after_capture(
                 &self.state,
@@ -1255,18 +1269,15 @@ impl IntendantServer {
                 backend,
             )
             .await;
-            let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
-            // Save annotated screenshot to disk (overwrite the raw one)
-            if let Ok(bytes) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &annotated)
-            {
-                let _ = std::fs::write(&ss.path, &bytes);
-            }
             summaries.push("post-action screenshot captured".to_string());
             if compact_output {
                 let payload = serde_json::json!({
                     "status": if all_failed { "all actions failed" } else { "actions executed" },
                     "actions": summaries,
+                    "observation": {
+                        "kind": outcome.observation.kind.label(),
+                        "reason": outcome.observation.reason,
+                    },
                     "screenshot_path": ss.path,
                     "width": ss.width,
                     "height": ss.height,
@@ -1278,9 +1289,38 @@ impl IntendantServer {
                 });
             }
             return Ok(if all_failed {
-                image_tool_error(summaries.join("\n"), annotated)
+                image_tool_error(summaries.join("\n"), ss.base64_png.clone())
             } else {
-                image_tool_result(summaries.join("\n"), annotated)
+                image_tool_result(summaries.join("\n"), ss.base64_png.clone())
+            });
+        }
+
+        if let Some(ax_text) = &outcome.observation.ax_text {
+            if compact_output {
+                let payload = serde_json::json!({
+                    "status": if all_failed { "all actions failed" } else { "actions executed" },
+                    "actions": summaries,
+                    "observation": {
+                        "kind": outcome.observation.kind.label(),
+                        "reason": outcome.observation.reason,
+                    },
+                    "elements": ax_text,
+                });
+                return Ok(if all_failed {
+                    text_tool_error(payload.to_string())
+                } else {
+                    text_tool_result(payload.to_string())
+                });
+            }
+            let body = format!(
+                "{}\n--- screen elements ---\n{}",
+                summaries.join("\n"),
+                ax_text
+            );
+            return Ok(if all_failed {
+                text_tool_error(body)
+            } else {
+                text_tool_result(body)
             });
         }
 
