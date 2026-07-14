@@ -10,11 +10,34 @@
    that never overlaps the Station canvases — the fixed rail and the
    oversight bar sit outside #app's content box, never over the canvas. */
 
-html.ui-v2 { --ui2-nav-w: 244px; --ui2-ovs-h: 48px; }
+html.ui-v2 {
+  --ui2-nav-w: 244px;
+  --ui2-ovs-h: 48px;
+  /* Device cutout / home-indicator insets. viewport-fit=cover makes these
+     nonzero on notched phones (0 everywhere else); they are composed into
+     every fixed-chrome coordinate below so no control sits under hardware. */
+  --ui2-sa-t: env(safe-area-inset-top, 0px);
+  --ui2-sa-r: env(safe-area-inset-right, 0px);
+  --ui2-sa-b: env(safe-area-inset-bottom, 0px);
+  --ui2-sa-l: env(safe-area-inset-left, 0px);
+  /* Left edge of the content area: rail width + left cutout. */
+  --ui2-nav-edge: calc(var(--ui2-nav-w) + var(--ui2-sa-l));
+  /* Composer geometry. --ui2-composer-h is kept at the bar's REAL rendered
+     height by ui2WireComposerMech (the bar wraps and grows: focus expand,
+     attachments row, the 500-600px wrap band) — the old 92px/64px constants
+     under-reserved whenever it did, letting the bar cover the Files save
+     row and the Live control banner. The fallback approximates the at-rest
+     bar for the pre-boot paint. --ui2-kb-inset lifts the bar above the iOS
+     soft keyboard while composing (0 otherwise). */
+  --ui2-composer-off: 16px;
+  --ui2-composer-h: 62px;
+  --ui2-kb-inset: 0px;
+}
 
 html.ui-v2 #app {
-  padding-left: var(--ui2-nav-w);
-  padding-top: var(--ui2-ovs-h);
+  padding-left: var(--ui2-nav-edge);
+  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  padding-right: var(--ui2-sa-r);
 }
 html.ui-v2 .tab-bar { display: none; }
 
@@ -22,7 +45,9 @@ html.ui-v2 .tab-bar { display: none; }
 html.ui-v2 #ui2-nav {
   position: fixed;
   inset: 0 auto 0 0;
-  width: var(--ui2-nav-w);
+  width: var(--ui2-nav-edge);
+  padding-left: var(--ui2-sa-l);
+  padding-bottom: var(--ui2-sa-b);
   z-index: 40;
   display: flex;
   flex-direction: column;
@@ -132,11 +157,11 @@ html.ui-v2 .ui2-identity-sub { font-size: 10.5px; color: var(--text-3); }
 /* ── oversight bar ── */
 html.ui-v2 #ui2-oversight {
   position: fixed;
-  top: 0; left: var(--ui2-nav-w); right: 0;
-  height: var(--ui2-ovs-h);
+  top: 0; left: var(--ui2-nav-edge); right: 0;
+  height: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
   z-index: 39;
   display: flex; align-items: center; gap: 12px;
-  padding: 0 18px;
+  padding: var(--ui2-sa-t) calc(18px + var(--ui2-sa-r)) 0 18px;
   background: var(--glass);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
@@ -420,14 +445,19 @@ html.ui-v2 .ui2-theme-btn:hover { background: var(--surface-2); color: var(--tex
    the bottom — the design's composer. Same element, same ids, all v1
    listeners intact; phase + stop inside it are hidden because the
    oversight bar already mirrors them. Solid surface, no backdrop-filter:
-   fixed chrome overlaps the Station canvases on the Station tab. */
-html.ui-v2 #app { padding-bottom: 92px; }
+   fixed chrome overlaps the Station canvases on the Station tab.
+   The #app bottom reservation tracks the bar's measured height (see the
+   --ui2-composer-h note at the vars block): panes must never draw under
+   the dock, whatever the dock's current size. */
+html.ui-v2 #app {
+  padding-bottom: calc(var(--ui2-composer-h) + var(--ui2-composer-off) + var(--ui2-sa-b) + 14px);
+}
 html.ui-v2 .global-task-bar {
   position: fixed;
-  left: var(--ui2-nav-w);
-  right: 0;
-  bottom: 16px;
-  width: min(920px, calc(100vw - var(--ui2-nav-w) - 36px));
+  left: var(--ui2-nav-edge);
+  right: var(--ui2-sa-r);
+  bottom: calc(var(--ui2-composer-off) + var(--ui2-sa-b) + var(--ui2-kb-inset));
+  width: min(920px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 36px));
   margin-inline: auto;
   z-index: 70;
   padding: 9px 11px;
@@ -564,13 +594,15 @@ html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
    full control set. :focus-within covers typing, target chip, attach and
    Direct once expanded. */
 @media (max-width: 500px) {
+  /* The dock hugs the edge tighter on phones; the #app reservation keeps
+     following the measured bar height (the old fixed 64px was smaller
+     than the bar itself — the root of the covered-controls bug). */
+  html.ui-v2 { --ui2-composer-off: 8px; }
   html.ui-v2 .global-task-bar {
-    bottom: 8px;
-    width: calc(100vw - var(--ui2-nav-w) - 16px);
+    width: calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 16px);
     padding: 6px 8px;
     flex-wrap: wrap;
   }
-  html.ui-v2 #app { padding-bottom: 64px; }
   html.ui-v2 .global-task-bar .task-new-session-btn,
   html.ui-v2 .global-task-bar .global-attach-btn,
   html.ui-v2 .global-task-bar .global-direct-toggle {
@@ -622,4 +654,13 @@ html.ui-v2 .ui2-fuel-chip {
   color: var(--green);
   border: 1px solid rgba(var(--green-rgb), .28);
   white-space: nowrap;
+}
+
+/* ── touch behavior ──
+   The viewport meta no longer carries user-scalable=no (pinch-zoom is an
+   accessibility escape hatch and the recovery gesture when a layout goes
+   wrong on a phone). Double-tap-to-zoom on controls is suppressed
+   per-element instead; manipulation still allows pan and pinch. */
+html.ui-v2 :is(button, select, input, textarea, label, .ui2-nav-item, .tab-btn) {
+  touch-action: manipulation;
 }

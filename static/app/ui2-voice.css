@@ -31,8 +31,8 @@ html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--r
 
 html.ui-v2 #ui2-voice-panel {
   position: fixed;
-  top: calc(var(--ui2-ovs-h) + 8px);
-  right: 18px;                     /* shares the oversight bar's content edge */
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + 8px);
+  right: calc(18px + var(--ui2-sa-r)); /* shares the oversight bar's content edge */
   width: min(320px, calc(100vw - 36px));
   z-index: 90;                     /* above content + composer (70), below ⌘K (100) */
   background: var(--surface);
