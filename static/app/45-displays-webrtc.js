@@ -1928,6 +1928,30 @@ function hideSharedView() {
   }
 }
 
+// CU-05 (docs/cu-e2e-findings-2026-07-13.md): retract the focus overlay +
+// note WITHOUT dismissing the shared view. Fired by the explicit
+// clear_shared_view_focus verb and by the daemon's lifecycle auto-clears
+// (display revoked, owning session ended). Idempotent: with nothing shown
+// (or after hide) it is a no-op.
+function clearSharedViewFocusAnnotation(evt) {
+  if (!sharedViewState.visible) return;
+  sharedViewState.region = null;
+  sharedViewState.note = '';
+  // Demote a "Focus" banner back to plain viewing; other action labels
+  // (input_request's Take-input affordance, capture) are not the
+  // annotation's and stay.
+  if (sharedViewState.action === 'focus') sharedViewState.action = 'show';
+  // A lifecycle clear names its cause ("display access revoked", "owning
+  // session ended") — surface it as the banner detail.
+  const reason = String((evt && evt.reason) || '').trim();
+  if (reason) sharedViewState.reason = reason;
+  for (const slot of displaySlots.values()) {
+    const focus = slot.canvasEl && slot.canvasEl.querySelector('.shared-view-focus-box');
+    if (focus) focus.remove();
+  }
+  updateSharedViewBanner();
+}
+
 function takeSharedViewInput() {
   if (sharedViewState.displayId === null) return;
   const slot = displaySlots.get(sharedViewState.displayId);
@@ -1957,6 +1981,10 @@ function handleSharedViewEvent(evt) {
   const action = rawAction === 'input' ? 'input_request' : rawAction;
   if (action === 'hide') {
     hideSharedView();
+    return;
+  }
+  if (action === 'focus_clear') {
+    clearSharedViewFocusAnnotation(evt);
     return;
   }
   sharedViewState.visible = true;

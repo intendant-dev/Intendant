@@ -118,6 +118,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "notify_user"
                     | "show_shared_view"
                     | "focus_shared_view"
+                    | "clear_shared_view_focus"
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
@@ -162,6 +163,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "read_frame"
                     | "show_shared_view"
                     | "focus_shared_view"
+                    | "clear_shared_view_focus"
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
@@ -259,7 +261,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "capture_shared_view_frame"
         | "show_shared_view"
         | "hide_shared_view"
-        | "focus_shared_view" => PeerOperation::DisplayView,
+        | "focus_shared_view"
+        | "clear_shared_view_focus" => PeerOperation::DisplayView,
         // Controlling displays and injecting input — including granting the
         // agent access to the user's real session.
         "take_display"
@@ -417,6 +420,14 @@ pub(crate) fn append_manual_http_tool_definitions(
             "focus_shared_view",
             "Highlight a normalized region in the active dashboard shared display view.",
             FocusSharedViewParams
+        ),
+    );
+    push(
+        "clear_shared_view_focus",
+        manual_http_tool_definition!(
+            "clear_shared_view_focus",
+            "Clear the shared display view's focus annotation (highlight + note) while keeping the view open. Idempotent.",
+            ClearSharedViewFocusParams
         ),
     );
     push(
@@ -865,6 +876,14 @@ mod tests {
         );
         assert_eq!(
             mcp_tool_operation("show_shared_view"),
+            PeerOperation::DisplayView
+        );
+        // The focus-clear verb is a presentation retraction on the same
+        // shared-view surface as hide_shared_view; pinned so it never falls
+        // to the RuntimeControl default and strands a session-scoped agent
+        // with a stale annotation it cannot clear (CU-05).
+        assert_eq!(
+            mcp_tool_operation("clear_shared_view_focus"),
             PeerOperation::DisplayView
         );
         // The user-session reach: granting the agent the user's display and

@@ -523,6 +523,13 @@ impl IntendantServer {
                     self.hide_shared_view_for_session(params, session_id).await,
                 ))
             }
+            "clear_shared_view_focus" => {
+                let Parameters(params) = parse_params::<ClearSharedViewFocusParams>(args)?;
+                Ok(text_tool_result(
+                    self.clear_shared_view_focus_for_session(params, session_id)
+                        .await,
+                ))
+            }
             "focus_shared_view" => {
                 let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
                 Ok(text_tool_result(

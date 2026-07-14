@@ -951,6 +951,23 @@ async fn run_shared(
         }
         "focus" => {
             ensure_help(&raw[1..], help_shared_focus)?;
+            if raw.get(1).map(String::as_str) == Some("clear") {
+                // `shared focus clear`: idempotent annotation retraction —
+                // no target/region; the daemon clears whatever is shown.
+                ensure_help(&raw[2..], help_shared_focus)?;
+                let args = parse_command_args(&raw[2..], &["--reason"], &[])?;
+                let mut map = Map::new();
+                insert_string(&mut map, "reason", args.one("--reason"));
+                let response = call_tool(
+                    client,
+                    config,
+                    "clear_shared_view_focus",
+                    Value::Object(map),
+                )
+                .await?;
+                print_tool_response(response, config, None)?;
+                return Ok(());
+            }
             let args = parse_command_args(
                 &raw[1..],
                 &["--target", "--display-id", "--region", "--note"],
@@ -2451,16 +2468,23 @@ fn help_shared() {
         "Usage:\n\
   intendant ctl shared show [--target TARGET|--display-id ID] [--reason TEXT] [--focus x,y,w,h]\n\
   intendant ctl shared focus --region x,y,w,h [--target TARGET|--display-id ID] [--note TEXT]\n\
+  intendant ctl shared focus clear [--reason TEXT]\n\
   intendant ctl shared input [--target TARGET|--display-id ID] [--reason TEXT]\n\
   intendant ctl shared capture [--target TARGET|--display-id ID] [--output out.png]\n\
   intendant ctl shared hide [--reason TEXT]\n\
 \n\
-Regions are normalized fractions from 0.0 to 1.0."
+Regions are normalized fractions from 0.0 to 1.0.\n\
+`focus clear` removes the highlight + note but keeps the view open (idempotent);\n\
+annotations also auto-clear on hide, display revocation, and session end."
     );
 }
 
 fn help_shared_focus() {
-    println!("Usage: intendant ctl shared focus --region x,y,width,height [--note TEXT]");
+    println!(
+        "Usage:\n\
+  intendant ctl shared focus --region x,y,width,height [--note TEXT]\n\
+  intendant ctl shared focus clear [--reason TEXT]"
+    );
 }
 
 fn help_approval() {

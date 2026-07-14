@@ -372,13 +372,13 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 13. shared_view (caller-handled, not sent to runtime)
     tools.push(ToolDefinition {
         name: "shared_view".to_string(),
-        description: "Control the dashboard shared display view: give the user live visibility into an agent-owned display — a sandbox, VM, dedicated agent machine, or virtual display — to demo a result or let them follow GUI/browser work as it happens. Actions: show opens the shared view and requests display-stream activation, focus highlights a region, capture attaches the current frame, input asks the user to take input authority (granted only by the user clicking the dashboard control — never by the agent), hide dismisses the view when the moment is over. Sharing the user's own screen (user_session) is an explicit opt-in path for collaboration the user asked for, not a default and not unattended control of their machine.".to_string(),
+        description: "Control the dashboard shared display view: give the user live visibility into an agent-owned display — a sandbox, VM, dedicated agent machine, or virtual display — to demo a result or let them follow GUI/browser work as it happens. Actions: show opens the shared view and requests display-stream activation, focus highlights a region, focus_clear removes a highlight whose content is gone (idempotent; the view stays open), capture attaches the current frame, input asks the user to take input authority (granted only by the user clicking the dashboard control — never by the agent), hide dismisses the view when the moment is over. Clear or replace a focus highlight as soon as what it annotates changes — stale guidance is worse than none. Sharing the user's own screen (user_session) is an explicit opt-in path for collaboration the user asked for, not a default and not unattended control of their machine.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["show", "focus", "capture", "input", "hide"],
+                    "enum": ["show", "focus", "focus_clear", "capture", "input", "hide"],
                     "description": "Shared-view verb to perform."
                 },
                 "display_target": {

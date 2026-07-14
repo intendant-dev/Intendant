@@ -70,6 +70,7 @@ mod session_names;
 mod session_supervisor;
 mod session_vitals;
 mod setup;
+mod shared_view_lifecycle;
 mod usage_rail;
 pub(crate) use intendant_core::skills;
 mod sub_agent;
