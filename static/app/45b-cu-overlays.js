@@ -79,6 +79,20 @@ function cuRawArgs(raw) {
   return m ? m[1] : '';
 }
 
+// Percent-encoded typed text reads better decoded in the friendly line
+// (`%20name%3D` → " name="). Presentation only — the feed row's mono
+// detail keeps the literal call (full text behind its disclosure), so
+// nothing daemon-reported is lost or invented.
+function cuDecodedPreview(text, max) {
+  let t = text;
+  if (/%[0-9A-Fa-f]{2}/.test(t)) {
+    try {
+      t = decodeURIComponent(t.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+    } catch (_) { /* not valid percent-encoding — keep the literal text */ }
+  }
+  return t.length > max ? t.slice(0, max) + '…' : t;
+}
+
 // Friendly first line for the feed. Generic on purpose: the wire carries
 // coordinates and raw calls, not element semantics, so the sentence never
 // pretends to know WHAT was clicked.
@@ -104,8 +118,7 @@ function cuFriendlyFor(d) {
     case 'type': {
       const text = cuRawQuotedText(d.raw);
       if (!text) return 'Typed text';
-      const preview = text.length > 32 ? text.slice(0, 32) + '…' : text;
-      return `Typed “${preview}”`;
+      return `Typed “${cuDecodedPreview(text, 32)}”`;
     }
     case 'paste': return 'Pasted text';
     case 'key': {
