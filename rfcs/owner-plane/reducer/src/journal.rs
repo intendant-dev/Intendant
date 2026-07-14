@@ -534,6 +534,9 @@ pub fn run_journal(
         }
         let derived = fold.derived_tenant_verdicts()?;
         for (n, h) in &hashes {
+            if verdicts.get(n) == Some(&Verdict::Rejected("duplicate", "duplicate-idempotent")) {
+                continue;
+            }
             if let Some(v) = derived.get(h) {
                 verdicts.insert(n.clone(), *v);
             }

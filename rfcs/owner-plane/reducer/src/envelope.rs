@@ -387,24 +387,37 @@ mod tests {
     fn tranche_ops_parse_and_genesis_verifies() {
         let mut ops = 0;
         let mut geneses = 0;
+        let mut bad_body = Vec::new();
         for (file, name, bytes) in tranche_items() {
-            let node = decode(&bytes).unwrap_or_else(|e| panic!("{file}/{name}: {e:?}"));
+            let Ok(node) = decode(&bytes) else {
+                // The family-1 canonical-reject corpus deliberately
+                // carries undecodable bytes — those ride inputs.bytes,
+                // not items/aux, so anything here MUST decode.
+                panic!("{file}/{name}: items/aux entry fails strict decode");
+            };
             if node.get("header").is_none() {
                 continue; // journal Txns, signed statements
             }
             let op = parse_op(&bytes).unwrap_or_else(|e| panic!("{file}/{name}: {e:?}"));
-            assert!(op.body_hash_ok(), "{file}/{name}: body_hash");
+            if !op.body_hash_ok() {
+                bad_body.push(format!("{file}/{name}"));
+            }
             ops += 1;
-            if op.header.operation_type == "c.genesis" {
-                op.verify_genesis()
-                    .unwrap_or_else(|e| panic!("{file}/{name}: {e}"));
+            if op.header.operation_type == "c.genesis" && op.verify_genesis().is_ok() {
                 geneses += 1;
             }
         }
         assert!(ops >= 30, "expected a substantial op population, got {ops}");
-        // Six fixtures fold their genesis; the two byte-level journal
-        // fixtures (f11-reopen, f13-txn) deliver Txn frames only.
-        assert_eq!(geneses, 6);
+        // Exactly ONE deliberate body tamper exists in the corpus.
+        assert_eq!(
+            bad_body,
+            vec!["f07-control-body-tamper.json/c2".to_string()],
+            "unexpected body-hash failures"
+        );
+        // Every fold fixture folds its genesis (6 tranche + 12
+        // fold-lane corpus); the two byte-level journal fixtures
+        // deliver Txn frames only.
+        assert_eq!(geneses, 18);
     }
 
     /// Tampering any byte of the header breaks the signature; the

@@ -226,6 +226,8 @@ type ChainKey = ([u8; 16], [u8; 16], u64);
 type ChainHead = (u64, [u8; 32]);
 /// A frontierclose's (zone, lineage) coordinates.
 type ZoneLineage = ([u8; 16], [u8; 16]);
+/// An O5 replay-registry key: (zone, lineage, request_id).
+type ReplayKey = ([u8; 16], [u8; 16], [u8; 16]);
 
 /// Derived plane state — grown only by ACCEPTED operations.
 #[derive(Debug, Clone, Default)]
@@ -281,6 +283,12 @@ pub struct State {
     repoch: u64,
     /// The current recovery commitment (`H_drill(recovery_pk)`).
     recovery_commitment: Option<[u8; 32]>,
+    /// O5 replay registry, scoped to the writer (§11.1): (zone,
+    /// lineage, request_id) → accepted op hash. Byte-identical
+    /// redelivery = `duplicate` (idempotent); differing bytes under a
+    /// consumed request_id = `request-fork`. Only ACCEPTANCE consumes
+    /// (a failed op exerts no precedence, D-112).
+    request_seen: BTreeMap<ReplayKey, [u8; 32]>,
     /// §5.4 erase queue: accepted `m.erase_request` targets (claim op
     /// hashes, acceptance order) — persisted until manifested.
     erase_queue: Vec<[u8; 32]>,
@@ -1937,10 +1945,29 @@ impl State {
             return ok(Err(Verdict::Rejected("fork", "freeze-writer")));
         }
 
-        // Epochs: capability_epoch 1 is open at genesis/zone-create;
-        // grant slack lower bound.
-        if h.capability_epoch != 1 || h.authored_kek_epoch != 1 {
-            return Err(Unimplemented("non-initial epochs".into()));
+        // Epochs (D-78 portable currency): a signed epoch the chain
+        // has not opened pends `epoch-unopened`; the reserved value 0
+        // is read-only-wildcard territory — a write op using it is
+        // `body-invariant`; grant slack is a signed-vs-signed lower
+        // bound (`capability-epoch`, revivable).
+        if h.capability_epoch == 0 || h.authored_kek_epoch == 0 {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+        }
+        let (Some(&zone_cap), Some(&zone_kek)) = (
+            self.cap_epochs.get(&h.zone_id),
+            self.kek_epochs.get(&h.zone_id),
+        ) else {
+            // The zone's creation may arrive later (register #24).
+            return ok(Err(Verdict::Pending(
+                "ref-unresolved",
+                "pending-dependency",
+            )));
+        };
+        if h.capability_epoch > zone_cap || h.authored_kek_epoch > zone_kek {
+            return ok(Err(Verdict::Pending(
+                "epoch-unopened",
+                "pending-dependency",
+            )));
         }
         if grant.capability_epoch > h.capability_epoch {
             return ok(Err(Verdict::Rejected(
@@ -2445,6 +2472,11 @@ pub fn run_delivery(
         // re-derivation) and overlay.
         let derived = state.derived_tenant_verdicts()?;
         for (n, h) in &hashes {
+            // A duplicate delivery is an edge fact about THAT
+            // delivery — never overlaid by the shared op's fold state.
+            if verdicts.get(n) == Some(&Verdict::Rejected("duplicate", "duplicate-idempotent")) {
+                continue;
+            }
             if let Some(v) = derived.get(h) {
                 verdicts.insert(n.clone(), *v);
             }
@@ -2476,8 +2508,23 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
             return Ok(Verdict::Rejected("malformed", "reject-permanent"));
         }
     };
+    let replay_key = (
+        op.header.zone_id,
+        op.header.writer_lineage,
+        op.header.request_id,
+    );
+    if let Some(&seen) = state.request_seen.get(&replay_key) {
+        return Ok(if seen == op.op_hash() {
+            Verdict::Rejected("duplicate", "duplicate-idempotent")
+        } else {
+            Verdict::Rejected("request-fork", "reject-permanent")
+        });
+    }
     state.admit(&op).map(|r| match r {
-        Ok(()) => Verdict::Admitted,
+        Ok(()) => {
+            state.request_seen.insert(replay_key, op.op_hash());
+            Verdict::Admitted
+        }
         Err(v) => v,
     })
 }

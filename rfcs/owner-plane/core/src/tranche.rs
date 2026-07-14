@@ -64,7 +64,7 @@ const HLC_STEP_MS: u64 = 60_000;
 /// The tranche RNG convention (documented, deterministic): a
 /// fixture's ChaCha20 key = SHA-256("d0a/tranche/" ‖ name), nonce =
 /// SHA-256("d0a/tranche/" ‖ name ‖ "/nonce")[0..12].
-fn rng_for(name: &str) -> RecordingRng {
+pub(crate) fn rng_for(name: &str) -> RecordingRng {
     use sha2::{Digest, Sha256};
     let key: [u8; 32] = Sha256::digest(format!("d0a/tranche/{name}")).into();
     let n: [u8; 32] = Sha256::digest(format!("d0a/tranche/{name}/nonce")).into();
@@ -132,7 +132,7 @@ pub fn negate_p256(pk: &[u8; 65], sk: &[u8; 32]) -> ([u8; 65], [u8; 32]) {
 
 /// Draw a 16-byte real ID (N1: the first 8 bytes must not be all
 /// zero — astronomically improbable from the stream; asserted).
-fn draw_id(rng: &mut RecordingRng, name: &str) -> Bytes16 {
+pub(crate) fn draw_id(rng: &mut RecordingRng, name: &str) -> Bytes16 {
     let id = rng.draw16(name);
     assert!(
         id[..8].iter().any(|b| *b != 0),
@@ -204,6 +204,23 @@ fn mint_device_inner(
 /// arithmetic (dense seq; `previous_writer_hash` = gen_start at seq 1,
 /// else the predecessor's op hash) and the O7 conventions correct by
 /// construction.
+/// Header overrides for [`PlaneRig::tenant_op_over`].
+pub struct TenantOverrides {
+    pub actor_id: Option<String>,
+    pub capability_epoch: u64,
+    pub authored_kek_epoch: u64,
+}
+
+impl Default for TenantOverrides {
+    fn default() -> Self {
+        TenantOverrides {
+            actor_id: None,
+            capability_epoch: 1,
+            authored_kek_epoch: 1,
+        }
+    }
+}
+
 pub struct PlaneRig {
     pub rng: RecordingRng,
     hlc_ms: u64,
@@ -750,6 +767,38 @@ impl PlaneRig {
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
+        self.tenant_op_over(
+            zone_id,
+            space_id,
+            actor_kind,
+            dev,
+            grant,
+            tag,
+            op_type,
+            body,
+            writer_sequence,
+            previous_writer_hash,
+            TenantOverrides::default(),
+        )
+    }
+
+    /// [`Self::tenant_op_in`] with header overrides — the negative
+    /// and epoch-currency corpus vectors mint through this seam.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tenant_op_over(
+        &mut self,
+        zone_id: Bytes16,
+        space_id: Bytes16,
+        actor_kind: ActorKind,
+        dev: &Device,
+        grant: &Grant,
+        tag: &str,
+        op_type: &str,
+        body: cbor::Value,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+        over: TenantOverrides,
+    ) -> Signedop {
         let request_id = draw_id(&mut self.rng, &format!("{tag}.request_id"));
         let hlc = self.next_hlc();
         let header = Header {
@@ -757,8 +806,8 @@ impl PlaneRig {
             plane_id: self.plane_id,
             zone_id,
             space_id,
-            authored_kek_epoch: 1,
-            capability_epoch: 1,
+            authored_kek_epoch: over.authored_kek_epoch,
+            capability_epoch: over.capability_epoch,
             signer_alg: Sigalg::Ed25519,
             signer_key_id: suite::key_id("ed25519", &dev.sig_pk),
             writer: Writer {
@@ -767,7 +816,7 @@ impl PlaneRig {
             },
             actor: Actor {
                 kind: actor_kind,
-                id: hex(&dev.device_id),
+                id: over.actor_id.unwrap_or_else(|| hex(&dev.device_id)),
                 attested_by: None,
             },
             authorization_proof: Authproof::Dev {
@@ -786,6 +835,42 @@ impl PlaneRig {
         };
         let op = seal_op(header, body, &OpSigner::Ed25519(&dev.sig_sk));
         assert!(op.verify(&dev.sig_pk), "tenant op must verify");
+        op
+    }
+
+    /// Seal a control op at the NEXT position under a caller-chosen
+    /// `request_id` (the O5 replay negatives reuse a consumed one) —
+    /// advances the chain like `seal_ctrl`.
+    pub fn seal_ctrl_with_request(
+        &mut self,
+        op_type: &str,
+        proof: Authproof,
+        body: cbor::Value,
+        request_id: Bytes16,
+    ) -> Signedop {
+        let seq = self.ctrl_seq + 1;
+        let hlc = self.next_hlc();
+        let header = ctrl_header(
+            self.plane_id,
+            CTRL_ZONE,
+            CTRL_SPACE,
+            Sigalg::Ed25519,
+            suite::key_id("ed25519", &self.root_pk),
+            Writer {
+                lineage: CTRL_LINEAGE,
+                gen: 1,
+            },
+            proof,
+            request_id,
+            seq,
+            Some(self.ctrl_head),
+            hlc,
+            op_type,
+        );
+        let op = seal_op(header, body, &OpSigner::Ed25519(&self.root_sk));
+        assert!(op.verify(&self.root_pk), "control op must verify");
+        self.ctrl_seq = seq;
+        self.ctrl_head = op.op_hash();
         op
     }
 
@@ -1004,7 +1089,7 @@ fn enc(v: &impl ToValue) -> Vec<u8> {
     cbor::encode(&v.to_value()).expect("shape encodes")
 }
 
-fn items_raw(entries: &[(&str, &[u8])]) -> Json {
+pub(crate) fn items_raw(entries: &[(&str, &[u8])]) -> Json {
     let mut m = JsonMap::new();
     for (name, b) in entries {
         m.insert((*name).into(), json!(hex(b)));
@@ -1012,7 +1097,7 @@ fn items_raw(entries: &[(&str, &[u8])]) -> Json {
     Json::Object(m)
 }
 
-fn items(entries: &[(&str, &Signedop)]) -> Json {
+pub(crate) fn items(entries: &[(&str, &Signedop)]) -> Json {
     let mut m = JsonMap::new();
     for (name, op) in entries {
         m.insert((*name).into(), json!(hex(&op.encode())));
@@ -1020,7 +1105,7 @@ fn items(entries: &[(&str, &Signedop)]) -> Json {
     Json::Object(m)
 }
 
-fn admits(item: &str) -> Json {
+pub(crate) fn admits(item: &str) -> Json {
     json!({ "item": item })
 }
 

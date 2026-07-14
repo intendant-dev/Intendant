@@ -16,6 +16,7 @@
 
 pub mod cbor;
 pub mod corpus;
+pub mod corpus_fold;
 pub mod domains;
 pub mod keyschedule;
 pub mod outcomes;

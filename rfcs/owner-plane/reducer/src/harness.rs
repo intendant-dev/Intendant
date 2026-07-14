@@ -522,8 +522,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            52,
-            "8 tranche + 44 corpus (families 1-6) vectors"
+            64,
+            "8 tranche + 44 KAT + 12 fold-lane corpus vectors"
         );
         for r in &reports {
             assert!(
