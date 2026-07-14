@@ -4,7 +4,7 @@
 //! before it is written; the `tranche::tests` drift gate then pins
 //! the committed bytes to the builders.
 
-use owner_plane_core::{corpus, corpus_fold, corpus_recovery, tranche, vector};
+use owner_plane_core::{corpus, corpus_edge, corpus_fold, corpus_recovery, tranche, vector};
 
 fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -20,6 +20,7 @@ fn main() {
     all.extend(corpus::corpus());
     all.extend(corpus_fold::corpus_fold());
     all.extend(corpus_recovery::corpus_recovery());
+    all.extend(corpus_edge::corpus_edge());
     for v in all {
         vector::check(&v.to_json(), &companion)
             .unwrap_or_else(|e| panic!("{} fails mint-time check: {e}", v.name));

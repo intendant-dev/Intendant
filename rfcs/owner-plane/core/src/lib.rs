@@ -16,6 +16,7 @@
 
 pub mod cbor;
 pub mod corpus;
+pub mod corpus_edge;
 pub mod corpus_fold;
 pub mod corpus_recovery;
 pub mod domains;

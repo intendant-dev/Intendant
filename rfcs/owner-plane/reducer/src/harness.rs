@@ -183,6 +183,11 @@ fn run_semantics(vector: &Json) -> SemStatus {
         "fold" => run_fold_vector(vector),
         "journal-replay" => run_journal_vector(vector),
         "export-import" => run_export_import(vector),
+        "edge-admission" => crate::edge::edge_admission(vector),
+        "frame-roundtrip" => crate::edge::frame_roundtrip(vector),
+        "corruption-negative" => crate::edge::corruption_negative(vector),
+        "crash-replay" => crate::edge::crash_replay(vector),
+        "lock-matrix" => crate::edge::lock_matrix(vector),
         _ => crate::kat::run(vector),
     };
     match run {
@@ -611,8 +616,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            71,
-            "8 tranche + 44 KAT + 12 fold-lane + 7 recovery/export corpus vectors"
+            93,
+            "the tranche plus the corpus through families 12/13's edge+framing lanes"
         );
         for r in &reports {
             assert!(
