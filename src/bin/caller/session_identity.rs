@@ -39,6 +39,10 @@ pub(crate) struct PersistedExternalIdentity {
 /// Everything one pass over a `session.jsonl` yields about identity.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityScan {
+    /// Every parseable structured identity fact, in log order. Callers that
+    /// scan multiple candidate directories must match these exact facts
+    /// rather than applying the single-directory fallback policy below.
+    pub identities: Vec<PersistedExternalIdentity>,
     /// Latest parseable event whose wrapper id matches the requested
     /// session under [`wrapper_matches`]. Later events supersede earlier
     /// ones — identity upgrades (placeholder → native id) append, never
@@ -102,8 +106,9 @@ pub(crate) fn scan_session_log(
                     scan.latest_matching = Some(identity.clone());
                 }
                 if scan.first.is_none() {
-                    scan.first = Some(identity);
+                    scan.first = Some(identity.clone());
                 }
+                scan.identities.push(identity);
             }
             continue;
         }

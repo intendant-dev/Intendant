@@ -242,9 +242,12 @@ its version (`CFBundleShortVersionString`) from the tag; dev builds get a
 never be confused. Versions are visible in **Intendant → About Intendant**.
 
 **Provisioning the release secrets** (repo → Settings → Secrets and
-variables → Actions). Without them the workflow still runs and publishes an
-unsigned dev artifact; each group is all-or-nothing and a partial group fails
-the run.
+variables → Actions). Official tag builds fail closed without them: a `v*`
+tag must be signed, notarized, and committed to the transparency log, or the
+run goes red before anything is published. A `workflow_dispatch` dry-run
+without secrets still exercises the pipeline end to end and keeps an
+unsigned dev artifact on the workflow run. Each secret group is
+all-or-nothing and a partial group fails the run.
 
 Signing identity — `MACOS_SIGN_P12_B64`, `MACOS_SIGN_P12_PASSWORD`:
 

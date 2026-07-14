@@ -351,7 +351,7 @@
         <div class="subtab-pane" id="settings-pane-agent">
           <div class="settings-pane-body">
             <p class="settings-note">
-              Settings are saved to <code>intendant.toml</code> and take effect on the next task.
+              Settings are saved to the current project's <code>intendant.toml</code>, or to the daemon-wide <code>~/.intendant/intendant.toml</code> when no project is attached. Agent defaults take effect on the next task.
             </p>
 
             <section class="ui-card" aria-labelledby="settings-external-agent-heading">
@@ -365,6 +365,49 @@
                   <option value="">None (internal agent)</option>
                   <option value="codex">Codex (OpenAI)</option>
                   <option value="claude-code">Claude Code (Anthropic)</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-model-select">Codex model</label>
+                <select id="set-codex-model-select">
+                  <option value="">Codex account default</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-codex-model-custom-row">
+                <label for="set-codex-model-custom">Custom Codex id</label>
+                <input id="set-codex-model-custom" type="text" placeholder="e.g. staged-model-id" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-reasoning-effort">Codex reasoning</label>
+                <select id="set-codex-reasoning-effort">
+                  <option value="">Model default</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-model-select">Claude model</label>
+                <select id="set-claude-model-select">
+                  <option value="">Claude account default</option>
+                  <option value="fable">fable — latest Fable</option>
+                  <option value="opus">opus — latest Opus</option>
+                  <option value="sonnet">sonnet — latest Sonnet</option>
+                  <option value="haiku">haiku — latest Haiku</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-claude-model-custom-row">
+                <label for="set-claude-model-custom">Custom Claude id</label>
+                <input id="set-claude-model-custom" type="text" placeholder="e.g. claude-haiku-4-5-20251001" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-permission-mode">Claude permissions</label>
+                <select id="set-claude-permission-mode">
+                  <option value="default">default</option>
+                  <option value="acceptEdits">acceptEdits</option>
+                  <option value="plan">plan</option>
+                  <option value="auto">auto</option>
+                  <option value="dontAsk">dontAsk</option>
+                  <option value="bypassPermissions">bypassPermissions</option>
                 </select>
               </div>
               <div class="settings-row">
