@@ -588,6 +588,7 @@ class PeerDisplayConnection {
       this.interactive = false;
       this._boundHandlers = {};
       if (this._heldKeys) this._heldKeys.clear();
+      if (this._heldButtons) this._heldButtons.clear();
       this._enterInteractive();
     }
   }
@@ -1384,8 +1385,12 @@ class PeerDisplayConnection {
     // falls back to channels; no such lane exists to a peer).
     const sendControl = (msg) => {
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        this.controlChannel.send(JSON.stringify(msg));
+        try {
+          this.controlChannel.send(JSON.stringify(msg));
+          return true;
+        } catch (_) {}
       }
+      return false;
     };
     const sendPointer = (msg) => {
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
@@ -1438,6 +1443,7 @@ class PeerDisplayConnection {
       this._flushHeldKeys = null;
     }
     if (this._heldKeys) this._heldKeys.clear();
+    if (this._heldButtons) this._heldButtons.clear();
     const target = this._interactiveTarget;
     if (target) {
       for (const [evt, handler] of Object.entries(this._boundHandlers)) {
@@ -3081,4 +3087,3 @@ async function initDaemons() {
     }
   });
 }
-

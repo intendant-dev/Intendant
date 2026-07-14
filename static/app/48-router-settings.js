@@ -129,7 +129,7 @@ function parseRoute() {
 
 function daemonDashboardHref(hash = '#activity') {
   if (DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
-    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${hash || ''}`;
+    return '/connect';
   }
   return `/${hash || ''}`;
 }

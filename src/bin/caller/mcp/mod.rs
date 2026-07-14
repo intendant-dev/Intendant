@@ -1670,7 +1670,7 @@ pub enum ToolCallerTrust {
 
 impl ToolCallerTrust {
     pub fn from_principal(principal: &crate::access::iam::AccessPrincipal) -> Self {
-        if principal.is_owner_surface() {
+        if principal.is_owner_surface() || principal.is_enrolled_root_mtls_user_client() {
             ToolCallerTrust::OwnerSurface
         } else {
             ToolCallerTrust::Scoped
@@ -2151,9 +2151,65 @@ pub(crate) mod tests {
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
-    // Crate-wide (not module-local): tests in other modules mutate the same
-    // process environment, so a per-module lock would still race them.
-    pub(crate) use crate::test_support::TEST_ENV_LOCK;
+    #[test]
+    fn tool_caller_trust_admits_enrolled_root_mtls_but_not_root_compatible_callers() {
+        let mut root_mtls =
+            crate::access::iam::AccessPrincipal::mcp_token_holder("webrtc-datachannel");
+        root_mtls.id = "principal:human:alice".to_string();
+        root_mtls.kind = "human_user".to_string();
+        root_mtls.grant_id = Some("grant:alice:root".to_string());
+        root_mtls.authn_kind = Some("browser_mtls_cert".to_string());
+        root_mtls.authn_binding = Some("AA:BB:CC".to_string());
+        assert_eq!(
+            ToolCallerTrust::from_principal(&root_mtls),
+            ToolCallerTrust::OwnerSurface
+        );
+
+        let mut non_root_mtls = root_mtls.clone();
+        non_root_mtls.role_id = "role:operator".to_string();
+        assert_eq!(
+            ToolCallerTrust::from_principal(&non_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        let mut hosted_root_mtls = root_mtls.clone();
+        hosted_root_mtls.hosted_connect = true;
+        assert_eq!(
+            ToolCallerTrust::from_principal(&hosted_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        let mut unenrolled_root_mtls = root_mtls;
+        unenrolled_root_mtls.grant_id = None;
+        assert_eq!(
+            ToolCallerTrust::from_principal(&unenrolled_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        assert_eq!(
+            ToolCallerTrust::from_principal(
+                &crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                    "agent-1", "http", true,
+                ),
+            ),
+            ToolCallerTrust::Scoped
+        );
+        assert_eq!(
+            ToolCallerTrust::from_principal(
+                &crate::access::iam::AccessPrincipal::mcp_token_holder("http"),
+            ),
+            ToolCallerTrust::Scoped
+        );
+        assert_eq!(
+            ToolCallerTrust::from_principal(&crate::access::iam::AccessPrincipal::peer_daemon(
+                "fp",
+                "peer",
+                "peer-root",
+                "mtls",
+            )),
+            ToolCallerTrust::Scoped
+        );
+    }
 
     #[test]
     fn format_cu_action_brief_truncates_multibyte_text_on_char_boundary() {

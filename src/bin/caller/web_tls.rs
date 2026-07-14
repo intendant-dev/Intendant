@@ -160,8 +160,20 @@ pub enum ClientAuth {
 /// The returned acceptor wraps an `Arc<ServerConfig>` configured with the
 /// `ring` provider and ALPN advertising `http/1.1` (the gateway speaks
 /// HTTP/1.1 + WebSocket only — no HTTP/2).
+#[cfg(test)]
 pub fn build_acceptor(source: &TlsCertSource) -> Result<TlsAcceptor, String> {
     build_acceptor_with_client_auth(source, &ClientAuth::None)
+}
+
+/// Build an acceptor that serves only `source`, bypassing the process-global
+/// fleet-SNI resolver. Root/client-certificate enrollment uses this stricter
+/// form so a hosted fleet name can never replace the directly fingerprinted
+/// access certificate during the bootstrap ceremony.
+#[cfg(any(not(target_os = "windows"), test))]
+pub fn build_single_cert_acceptor(source: &TlsCertSource) -> Result<TlsAcceptor, String> {
+    let (cert_chain, key) = load_cert_source(source)?;
+    let config = server_config_from(cert_chain, key, &ClientAuth::None, false)?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Build a [`TlsAcceptor`] with an explicit client-certificate policy.
@@ -169,6 +181,20 @@ pub fn build_acceptor_with_client_auth(
     source: &TlsCertSource,
     client_auth: &ClientAuth,
 ) -> Result<TlsAcceptor, String> {
+    let (cert_chain, key) = load_cert_source(source)?;
+    let config = server_config_from(cert_chain, key, client_auth, true)?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_cert_source(
+    source: &TlsCertSource,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
     let (cert_chain, key) = match source {
         TlsCertSource::SelfSigned { bind_ip, hostname } => {
             generate_self_signed(*bind_ip, hostname.as_deref())?
@@ -178,9 +204,7 @@ pub fn build_acceptor_with_client_auth(
             key_path,
         } => load_pem_cert_and_key(cert_path, key_path)?,
     };
-
-    let config = server_config_from(cert_chain, key, client_auth)?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok((cert_chain, key))
 }
 
 /// Assemble a [`rustls::ServerConfig`] from a parsed cert chain + key.
@@ -192,6 +216,7 @@ fn server_config_from(
     cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
     client_auth: &ClientAuth,
+    allow_fleet_sni: bool,
 ) -> Result<ServerConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ServerConfig::builder_with_provider(provider)
@@ -225,16 +250,26 @@ fn server_config_from(
             builder.with_client_cert_verifier(verifier)
         }
     };
-    // A resolver instead of `with_single_cert`: the base cert (installed
-    // access certs or the startup self-signed) answers by default, and a
-    // fleet certificate (fleet_cert.rs) can be installed LIVE for its
-    // SNI name — first issuance and every renewal apply without a daemon
-    // restart.
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-        .map_err(|e| format!("rustls server key unusable: {e}"))?;
-    let base = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
-    fleet_sni_resolver().set_base(base);
-    let mut config = builder.with_cert_resolver(fleet_sni_resolver());
+    let mut config = if allow_fleet_sni {
+        // A resolver instead of `with_single_cert`: the base cert (installed
+        // access certs or the startup self-signed) answers by default, and a
+        // fleet certificate (fleet_cert.rs) can be installed LIVE for its
+        // SNI name — first issuance and every renewal apply without a daemon
+        // restart.
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|e| format!("rustls server key unusable: {e}"))?;
+        let base = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
+        fleet_sni_resolver().set_base(base);
+        builder.with_cert_resolver(fleet_sni_resolver())
+    } else {
+        // Enrollment must present exactly the access certificate whose
+        // fingerprint the operator compares out of band. A WebPKI/fleet SNI
+        // override here would let hosted DNS select a different certificate
+        // and turn a terminal Enter press into root-client-bundle release.
+        builder
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| format!("rustls server certificate setup failed: {e}"))?
+    };
     // The dashboard speaks HTTP/1.1 and upgrades to WebSocket; advertise
     // only http/1.1 so a browser never negotiates h2 (which the gateway's
     // hand-rolled HTTP/1 handler doesn't implement). KEEP THIS PINNED:
@@ -254,6 +289,11 @@ fn server_config_from(
 pub struct FleetSniResolver {
     base: std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
     fleet: std::sync::RwLock<Option<(String, Arc<rustls::sign::CertifiedKey>)>>,
+    // Never forget a name during this process. Accepted connections keep
+    // their SNI for HTTP/1 keep-alive, and a hot fleet-name replacement must
+    // not reclassify an already-open old-name connection as a pinned/direct
+    // authority-bearing origin.
+    fleet_names: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl FleetSniResolver {
@@ -262,7 +302,23 @@ impl FleetSniResolver {
     }
 
     fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
+        self.register_fleet_name(&name);
         *self.fleet.write().expect("tls resolver poisoned") = Some((name, key));
+    }
+
+    fn register_fleet_name(&self, name: &str) {
+        self.fleet_names
+            .write()
+            .expect("tls resolver poisoned")
+            .insert(name.trim().trim_end_matches('.').to_ascii_lowercase());
+    }
+
+    fn is_fleet_name(&self, name: &str) -> bool {
+        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.fleet_names
+            .read()
+            .expect("tls resolver poisoned")
+            .contains(&normalized)
     }
 }
 
@@ -288,6 +344,24 @@ fn fleet_sni_resolver() -> Arc<FleetSniResolver> {
     RESOLVER
         .get_or_init(|| Arc::new(FleetSniResolver::default()))
         .clone()
+}
+
+/// Whether an accepted TLS connection named a public fleet/WebPKI origin.
+///
+/// This is certificate-selection provenance, not a trust decision derived
+/// from the mutable HTTP `Host` header. Gateway edges use it to keep the
+/// convenient fleet-name endpoint discovery-only: service-controlled DNS can
+/// serve same-origin JavaScript and therefore cannot be a root anchor even
+/// when the browser also holds a daemon-issued client certificate.
+pub fn is_fleet_server_name(name: Option<&str>) -> bool {
+    name.is_some_and(|name| fleet_sni_resolver().is_fleet_name(name))
+}
+
+/// Remember a rendezvous-assigned fleet route before certificate issuance.
+/// Classification follows service-controlled name provenance, not whichever
+/// certificate happens to be active at the moment.
+pub fn register_fleet_server_name(name: &str) {
+    fleet_sni_resolver().register_fleet_name(name);
 }
 
 /// Install (or replace) the fleet certificate served for `name` —
@@ -517,6 +591,39 @@ mod tests {
             "acceptor build failed: {:?}",
             acceptor.err()
         );
+    }
+
+    #[test]
+    fn single_cert_acceptor_bypasses_process_global_fleet_resolver() {
+        let src = TlsCertSource::SelfSigned {
+            bind_ip: Some("127.0.0.1".parse().unwrap()),
+            hostname: None,
+        };
+        let single = build_single_cert_acceptor(&src).unwrap();
+        let global: Arc<dyn rustls::server::ResolvesServerCert> = fleet_sni_resolver();
+        assert!(
+            !Arc::ptr_eq(&single.config().cert_resolver, &global),
+            "strict enrollment must not consult the fleet SNI resolver"
+        );
+
+        let dashboard = build_acceptor(&src).unwrap();
+        assert!(
+            Arc::ptr_eq(&dashboard.config().cert_resolver, &global),
+            "normal dashboard TLS should retain live fleet-SNI support"
+        );
+    }
+
+    #[test]
+    fn fleet_origin_classification_remembers_replaced_names() {
+        let first_name = "old-fleet-origin.test";
+        let second_name = "new-fleet-origin.test";
+        register_fleet_server_name(first_name);
+        register_fleet_server_name(second_name);
+
+        assert!(is_fleet_server_name(Some(first_name)));
+        assert!(is_fleet_server_name(Some(second_name)));
+        assert!(is_fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")));
+        assert!(!is_fleet_server_name(Some("direct-daemon.test")));
     }
 
     #[test]

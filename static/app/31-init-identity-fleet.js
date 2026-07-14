@@ -220,7 +220,7 @@ let _sessionDeepSearch = {
   truncatedFiles: 0,
   results: new Map(),
 };
-// Quick-search message lane (feature flag: ?message_search=on): state of
+// Quick-search message lane (default on; ?message_search=off escape): state of
 // the last /api/sessions/message-search request, unioned into the Recent
 // list under the metadata lane. Declared up here with the other sessions
 // module state (deep-link TDZ, above); the lane's code lives in
@@ -426,8 +426,9 @@ async function refreshUnfueledEmptyState() {
       return true;
     }
     // The status frame carries an aggregate `fueled` flag readable by
-    // every binding; per-provider api_key_status needs settings.manage,
-    // which the default hosted (operator) binding does not hold.
+    // every authorized binding; per-provider api_key_status needs
+    // settings.manage. Hosted Connect has no daemon-control binding in the
+    // default build.
     const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
     if (typeof statusFueled === 'boolean') {
       if (!statusFueled) await refreshExternalAgentAvailability();
@@ -725,13 +726,14 @@ let activeStatsHost = '';
 const DAEMONS_KEY = 'intendant_daemons';
 const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
 const ACCESS_FLEET_KEY = 'intendant_access_fleet_v1';
-const dashboardUrlParams = new URLSearchParams(window.location.search);
 const DASHBOARD_ACCESS_PAGE_MODE = /^\/access\/?$/i.test(window.location.pathname || '');
-const DASHBOARD_CONNECT_MODE = dashboardUrlParams.get('connect') === '1';
-const DASHBOARD_CONNECT_DAEMON_ID = String(dashboardUrlParams.get('daemon_id') || '').trim();
-const DASHBOARD_CONNECT_SIGNALING_BASE = String(
-  dashboardUrlParams.get('connect_base') || ''
-).trim().replace(/\/+$/, '');
+// The hosted-origin dashboard experiment is retired. Keep the vocabulary for
+// the remaining trusted daemon-origin transport code, but make URL parameters unable
+// to activate it in the default daemon bundle. Connect serves a separate,
+// discovery-only page and never this SPA.
+const DASHBOARD_CONNECT_MODE = false;
+const DASHBOARD_CONNECT_DAEMON_ID = '';
+const DASHBOARD_CONNECT_SIGNALING_BASE = '';
 if (DASHBOARD_ACCESS_PAGE_MODE) {
   document.body?.classList.add('access-page');
   document.title = 'Intendant Access';
@@ -1056,21 +1058,22 @@ async function clientIdentityReset() {
 
 /* ── Signed fleet records (trust architecture phase 5) ──
    Fleet entries that round-trip through the hosted metadata store are
-   signed with this browser's identity key and verified on read, so the
-   store can remember the fleet but cannot invent or alter it unnoticed.
-   Provenance is display metadata only — authority always stays with the
-   target daemon. */
+   signed with this browser's identity key and verified on read. That detects
+   alteration under the current key, but the key travels inside the record:
+   without an owner/device trust set, a malicious store can substitute a new
+   internally valid self-signed record on another device. Provenance is
+   display metadata only — authority always stays with the target daemon. */
 
 function accessFleetRecordPayload(record, signedAt, version = 2) {
   // v3 (encrypted records): the URL fields travel ONLY inside enc_fields,
   // so the signed lines pin them to empty — decrypting into the in-memory
   // record never invalidates the signature.
   // v4 folds the enc line in unconditionally (may be empty) and appends
-  // the daemon's owner-set trust tier, so a store cannot relabel an
-  // integrated box as disposable without breaking the signature.
+  // the daemon's owner-set trust tier, so alteration under the same signer
+  // cannot relabel an integrated box without breaking the signature.
   // v5 appends the owner's PETNAME for the daemon — the name the owner
-  // chose, bound to this record's identity, so a lookalike daemon can
-  // never wear a familiar name the store or a phisher picked.
+  // chose, bound under that record's signer. It does not make the self-carried
+  // signer an owner-trusted identity on a different browser.
   const enc = version >= 3 ? String(record.enc_fields || '') : '';
   const blank = version >= 3 && enc;
   const lines = [
@@ -1277,4 +1280,3 @@ async function accessFleetRefreshProvenance() {
   }
   if (changed) renderAccessAdminSummaries();
 }
-

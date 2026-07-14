@@ -9,9 +9,9 @@
 //! used; where it is weak (Task Scheduler, cron) the entry point is
 //! `intendant service run`, a small built-in supervisor that restarts
 //! the daemon with backoff and appends its output to a log file — which
-//! is also where the claim phrase lands on those backends.
+//! is also where the one-time claim code lands on those backends.
 //!
-//! `install` always says where to watch for the claim phrase; that line
+//! `install` always says where to watch for the claim code; that line
 //! is the contract the install scripts and the landing advisor lean on.
 
 use std::io::Write;
@@ -30,7 +30,7 @@ const BACKOFF_CAP_SECS: u64 = 60;
 const BACKOFF_RESET_UPTIME_SECS: u64 = 300;
 
 /// The environment a service definition must carry over: the rendezvous
-/// wiring is how a booted daemon finds its way back to being claimable.
+/// wiring is how a booted daemon finds its way back to being linkable.
 const CARRIED_ENV_KEYS: [&str; 3] = [
     "INTENDANT_CONNECT_RENDEZVOUS_URL",
     "INTENDANT_CONNECT_DAEMON_ID",
@@ -415,6 +415,21 @@ fn supervisor_run_args(
     args
 }
 
+/// Parse daemon arguments through the exact startup parser before a service
+/// definition can persist them and before the portable supervisor can spawn
+/// them. Reusing the parser matters here: a raw scan cannot distinguish an
+/// option value named `--owner` from the retired flag, or a `--` consumed as
+/// another option's value from the real task delimiter.
+fn validate_daemon_args(daemon_args: &[String]) -> Result<(), String> {
+    match super::parse_cli_flags_outcome(daemon_args.to_vec()) {
+        Ok(super::CliParseOutcome::Flags(_)) => Ok(()),
+        Ok(super::CliParseOutcome::Help) => {
+            Err("service daemon arguments cannot include --help".to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /* ── install ── */
 
 fn cli_install(rest: &[String]) -> Result<(), String> {
@@ -434,6 +449,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
     if daemon_args.is_empty() {
         daemon_args = vec!["--no-tui".to_string()];
     }
+    validate_daemon_args(&daemon_args)?;
 
     let backend = detect_backend()?;
     let exe = current_exe()?.display().to_string();
@@ -484,7 +500,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 unit_path.display()
             );
             println!(
-                "claim phrase / logs: journalctl {}-u intendant -f",
+                "claim code / logs: journalctl {}-u intendant -f",
                 if system { "" } else { "--user " }
             );
         }
@@ -513,7 +529,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 );
             }
             println!("installed LaunchAgent {}", plist_path.display());
-            println!("claim phrase / logs: tail -f {log_str}");
+            println!("claim code / logs: tail -f {log_str}");
         }
         Backend::WindowsTask { boot } => {
             let user_id = windows_user_id();
@@ -543,7 +559,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                     "starts at logon — rerun elevated for at-boot start"
                 }
             );
-            println!("claim phrase / logs: Get-Content -Wait {log_str}");
+            println!("claim code / logs: Get-Content -Wait {log_str}");
         }
         Backend::CronReboot => {
             let run_args = supervisor_run_args(&log_str, &envs, &daemon_args);
@@ -566,7 +582,7 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
                 spawn_supervisor_detached(&exe, &run_args)?;
                 println!("supervisor started");
             }
-            println!("claim phrase / logs: tail -f {log_str}");
+            println!("claim code / logs: tail -f {log_str}");
         }
     }
     if now {
@@ -581,10 +597,10 @@ fn cli_install(rest: &[String]) -> Result<(), String> {
 /// its first 3s backoff), short enough not to stall the installer.
 const FIRST_BOOT_PROBE_DELAY_MS: u64 = 2500;
 
-/// `install --now` used to report success — and print where the claim
-/// phrase lands — while the daemon it had just started was crash-looping
+/// `install --now` used to report success — and print where the one-time
+/// claim code lands — while the daemon it had just started was crash-looping
 /// on a first-boot misconfiguration; the user then tails a log that never
-/// shows a claim phrase. After starting, wait briefly and fail loudly on
+/// shows a claim code. After starting, wait briefly and fail loudly on
 /// positive evidence of death: a failed/auto-restarting unit, a pid-less
 /// LaunchAgent, or supervisor restart lines from this run. Absence of
 /// evidence (a slow start) stays green — this must never flake a healthy
@@ -1030,6 +1046,10 @@ fn cli_run(rest: &[String]) -> i32 {
     if daemon_args.is_empty() {
         daemon_args = vec!["--no-tui".to_string()];
     }
+    if let Err(error) = validate_daemon_args(&daemon_args) {
+        eprintln!("error: {error}");
+        return 2;
+    }
     let exe = match current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -1208,7 +1228,7 @@ mod tests {
     fn systemd_unit_quotes_and_targets_correctly() {
         let unit = systemd_unit(
             "/opt/intendant/target/release/intendant",
-            &args(&["--no-tui", "--owner", "fp with space", "50%$x"]),
+            &args(&["--no-tui", "--model", "model with space", "50%$x"]),
             &[(
                 "INTENDANT_CONNECT_TOKEN".to_string(),
                 "tok\"quote".to_string(),
@@ -1217,7 +1237,7 @@ mod tests {
             true,
         );
         assert!(unit.contains(
-            r#"ExecStart="/opt/intendant/target/release/intendant" "--no-tui" "--owner" "fp with space" "50%%$$x""#
+            r#"ExecStart="/opt/intendant/target/release/intendant" "--no-tui" "--model" "model with space" "50%%$$x""#
         ));
         assert!(unit.contains(r#"Environment="INTENDANT_CONNECT_TOKEN=tok\"quote""#));
         assert!(unit.contains("Restart=on-failure"));
@@ -1230,7 +1250,7 @@ mod tests {
     fn launchd_plist_escapes_and_keeps_alive() {
         let plist = launchd_plist(
             "/Users/ada/intendant/target/release/intendant",
-            &args(&["--no-tui", "--owner", "a<b&c"]),
+            &args(&["--no-tui", "--task-file", "a<b&c"]),
             &[(
                 "INTENDANT_CONNECT_DAEMON_ID".to_string(),
                 "box<1>".to_string(),
@@ -1253,7 +1273,7 @@ mod tests {
         let run_args = supervisor_run_args(
             r"C:\Users\ada\.intendant\logs\service.log",
             &[("INTENDANT_CONNECT_TOKEN".to_string(), "t&t".to_string())],
-            &args(&["--no-tui", "--owner", "fp with space"]),
+            &args(&["--no-tui", "--model", "model with space"]),
         );
         let boot = schtasks_xml(r"C:\intendant\intendant.exe", &run_args, r"BOX\ada", true);
         assert!(boot.contains("<BootTrigger>"));
@@ -1264,7 +1284,7 @@ mod tests {
         // & is XML-escaped inside the Arguments element.
         assert!(boot.contains("service run --log"));
         assert!(boot.contains("--env INTENDANT_CONNECT_TOKEN=t&amp;t"));
-        assert!(boot.contains("&quot;fp with space&quot;"));
+        assert!(boot.contains("&quot;model with space&quot;"));
         let logon = schtasks_xml(r"C:\intendant\intendant.exe", &run_args, r"BOX\ada", false);
         assert!(logon.contains("<LogonTrigger>"));
         assert!(logon.contains("<LogonType>InteractiveToken</LogonType>"));
@@ -1275,12 +1295,53 @@ mod tests {
         let run_args = supervisor_run_args(
             "/home/a b/.intendant/logs/service.log",
             &[],
-            &args(&["--no-tui", "--owner", "o'brien"]),
+            &args(&["--no-tui", "--task-file", "o'brien"]),
         );
         let line = cron_line("/home/a b/intendant", &run_args);
         assert!(line.starts_with("@reboot '/home/a b/intendant' 'service' 'run'"));
         assert!(line.contains(r"'o'\''brien'"));
         assert!(line.ends_with(CRON_MARKER));
+    }
+
+    #[test]
+    fn service_boundaries_reject_retired_owner_before_side_effects() {
+        for owner in ["--owner", "--owner=browser-fingerprint"] {
+            let install_error = cli_install(&args(&["--", owner, "browser-fingerprint"]))
+                .expect_err("service install must not persist a retired owner argument");
+            assert!(
+                install_error.contains("--owner is retired"),
+                "{install_error}"
+            );
+            assert!(
+                install_error.contains("intendant access setup"),
+                "{install_error}"
+            );
+
+            // Rejection happens before current_exe resolution, detachment,
+            // pidfile/log writes, or the supervisor's non-returning loop.
+            assert_eq!(
+                cli_run(&args(&[
+                    "--log",
+                    "/path-that-must-not-be-touched/service.log",
+                    "--",
+                    owner,
+                    "browser-fingerprint",
+                ])),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn retired_owner_check_respects_daemon_end_of_options() {
+        validate_daemon_args(&args(&["--no-tui", "--", "--owner", "story text"]))
+            .expect("--owner after the daemon delimiter is task text");
+        validate_daemon_args(&args(&["--model", "--owner"]))
+            .expect("a value named --owner is not the retired flag");
+
+        let error = validate_daemon_args(&args(&["--task-file", "--", "--owner", "fp"]))
+            .expect_err("a consumed -- value must not hide a later retired flag");
+        assert!(error.contains("--owner is retired"), "{error}");
     }
 
     #[test]

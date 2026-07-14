@@ -17,7 +17,7 @@
 // Contract: `viewer` arguments are DisplaySlot / PeerDisplayConnection /
 // PeerFileTransferConnection instances; helpers touch only fields the
 // callers already share (`pc`, `_answerApplied`, `_pendingCandidates`,
-// `_heldKeys`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
+// `_heldKeys`, `_heldButtons`, `_lastPointer`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
 // `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`, plus
 // the liveness-guard state this file owns: `_pauseGuard`,
 // `_resumeVideoPending`, `_freezeWatch`, `_freezeWatchGen`).
@@ -241,19 +241,34 @@ function displayViewerNormalizePointerEvent(surface, e) {
   };
 }
 
-// Item 3: synthetic-keyup flusher for every currently-held key (not just
-// the 8 modifiers — a latched non-modifier auto-repeats remotely forever).
+// Item 3: synthetic-release flusher for every currently-held key and mouse
+// button (a latched non-modifier auto-repeats remotely forever; a lost mu can
+// leave a drag held across the desktop).
 // Returned closure is stored on `owner._flushHeldKeys` so exit paths that
 // run outside the enter closure (server demotion, release, pane rebuild)
 // can release held keys BEFORE the listeners are removed / authority is
 // gone. Reads `owner._heldKeys` at flush time, like both originals did.
 function displayViewerMakeHeldKeyFlusher(owner, sendControl) {
   return () => {
-    if (!owner._heldKeys) return;
-    for (const code of owner._heldKeys) {
-      sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+    // Snapshot before sending and remove each edge only after the transport
+    // accepted its release. A full-but-still-open RTC channel can reject one
+    // send without closing; retaining that edge lets blur/retry paths try
+    // again. One failed release still must not block attempts for the rest.
+    const keys = Array.from(owner._heldKeys || []);
+    const buttons = Array.from(owner._heldButtons || []);
+    for (const code of keys) {
+      try {
+        if (sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false })) {
+          owner._heldKeys?.delete(code);
+        }
+      } catch (_) {}
     }
-    owner._heldKeys.clear();
+    const { x = 0.5, y = 0.5 } = owner._lastPointer || {};
+    for (const b of buttons) {
+      try {
+        if (sendControl({ t: 'mu', x, y, b })) owner._heldButtons?.delete(b);
+      } catch (_) {}
+    }
   };
 }
 
@@ -281,17 +296,20 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
       return;
     }
     e.preventDefault();
-    owner._heldKeys.add(e.code);
-    sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    if (sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey })) {
+      owner._heldKeys.add(e.code);
+    }
   };
   handlers.keyup = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner)) {
       e.preventDefault();
+      owner._flushHeldKeys?.();
       return;
     }
     e.preventDefault();
-    owner._heldKeys.delete(e.code);
-    sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    if (sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey })) {
+      owner._heldKeys.delete(e.code);
+    }
   };
   handlers.pointerdown = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
@@ -302,17 +320,25 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
     target.focus();
     target.setPointerCapture(e.pointerId);
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
-    sendControl({ t: 'md', x, y, b: e.button });
+    owner._lastPointer = { x, y };
+    if (!owner._heldButtons) owner._heldButtons = new Set();
+    if (sendControl({ t: 'md', x, y, b: e.button })) {
+      owner._heldButtons.add(e.button);
+    }
   };
   handlers.pointerup = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
       e.preventDefault();
+      owner._flushHeldKeys?.();
       return;
     }
     e.preventDefault();
     target.releasePointerCapture(e.pointerId);
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
-    sendControl({ t: 'mu', x, y, b: e.button });
+    owner._lastPointer = { x, y };
+    if (sendControl({ t: 'mu', x, y, b: e.button })) {
+      owner._heldButtons?.delete(e.button);
+    }
   };
   handlers.pointermove = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
@@ -320,7 +346,13 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
       return;
     }
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    owner._lastPointer = { x, y };
     sendPointer({ t: 'mm', x, y, buttons: e.buttons });
+  };
+  handlers.pointercancel = (e) => {
+    e.preventDefault();
+    owner._flushHeldKeys?.();
+    try { target.releasePointerCapture(e.pointerId); } catch (_) {}
   };
   handlers.wheel = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner)) {
@@ -343,9 +375,9 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
     sendPointer({ t: 'sc', x, y, dx, dy });
   };
   handlers.contextmenu = (e) => e.preventDefault();
-  // Release ALL held keys when the surface loses focus (e.g. Alt+Tab
-  // away). Without this, the remote side thinks they are still held
-  // because no keyup event ever fires for them.
+  // Release ALL held keys/buttons when the surface loses focus (e.g.
+  // Alt+Tab away) or a pointer gesture is cancelled. Without this, the
+  // remote side thinks they are still held because no up event ever fires.
   handlers.blur = () => {
     owner._flushHeldKeys?.();
   };

@@ -26,10 +26,10 @@ pub(crate) const SESSION_NOTE_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// under the `POST /mcp` body cap — pinned by a test below.
 pub(crate) const SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Raster image MIME types a note may attach. SVG is deliberately
-/// excluded: the `/raw` route serves blobs inline with their stored MIME,
-/// and an inline SVG document executes scripts on the daemon origin when
-/// opened via the thumbnail's click-through link. Raster types cannot.
+/// Raster image MIME types a note may attach. SVG remains deliberately
+/// excluded as defense in depth for preview consumers. The `/raw` route
+/// forces attachment disposition and disables MIME sniffing, so even a
+/// stored active document cannot execute in the daemon origin.
 const SESSION_NOTE_ALLOWED_MIME: [&str; 5] = [
     "image/png",
     "image/jpeg",

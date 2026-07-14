@@ -1,7 +1,8 @@
 // Intendant Connect service worker: shows pushed notifications and opens
-// the dashboard on click. Payloads arrive end-to-end encrypted to this
-// browser's subscription; by the time they reach here the browser has
-// already decrypted them.
+// the discovery directory (or another explicitly supplied Connect URL) on
+// click. It never opens a daemon dashboard or control session. Payloads arrive
+// end-to-end encrypted to this browser's subscription; by the time they reach
+// here the browser has already decrypted them.
 self.addEventListener('push', event => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch {}

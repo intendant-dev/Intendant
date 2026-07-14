@@ -1191,11 +1191,15 @@ class DisplaySlot {
     // (close races, full SCTP buffers).
     const sendControl = (msg) => {
       try {
-        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+        if (sendDisplayInputForSlot(this.displayId, msg)) return true;
       } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
+        try {
+          this.controlChannel.send(JSON.stringify(msg));
+          return true;
+        } catch (_) {}
       }
+      return false;
     };
     const sendPointer = (msg) => {
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {

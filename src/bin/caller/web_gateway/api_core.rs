@@ -243,7 +243,7 @@ impl ApiResponse {
 /// constructor when its families delegate (S2+). Filesystem scope and
 /// custody attribution stay with the per-lane gates until the unified
 /// `authorize_filesystem` stage.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestAuthority {
     pub(crate) principal: crate::access::iam::AccessPrincipal,
     pub(crate) iam_state: Option<crate::access::iam::LocalIamState>,

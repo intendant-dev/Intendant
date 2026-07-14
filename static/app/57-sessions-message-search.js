@@ -1,4 +1,4 @@
-// ── Quick-search message lane (feature flag: ?message_search=on) ─────────
+// ── Quick-search message lane (default on; ?message_search=off escape) ──
 // Unions full-text message hits from the rolling message index
 // (`/api/sessions/message-search`, tunnel twin `api_sessions_message_search`)
 // into the Recent list's quick search, UNDER the existing metadata lane:
@@ -9,14 +9,13 @@
 // superseded/truncated/subagent badges); hits whose sessions are missing
 // from the loaded metadata corpus render as compact stub cards.
 //
-// Flag OFF = inert: scheduleSessionMessageSearch() returns before touching
-// anything, the toolbar toggle and status line stay hidden, and the render
-// pipeline sees `active:false` everywhere — behavior is identical to a
-// build without this fragment. Flag precedent: Station's world panes
-// (`?station_panes=on`, crates/station-web/src/util.rs); once C1's route
-// row lands, the daemon-side `api_sessions_message_search_available`
-// status boolean (derived from the tunnel method table) is what the
-// availability precheck below consults — no hand-mirrored capability flag.
+// The lane is enabled by default after its 2026-07-12 soak.
+// `?message_search=off` (or `=0`) is the inert escape hatch:
+// scheduleSessionMessageSearch() returns before touching anything, the
+// toolbar toggle and status line stay hidden, and the render pipeline sees
+// `active:false` everywhere. The daemon-side
+// `api_sessions_message_search_available` status boolean (derived from the
+// tunnel method table) gates availability — no hand-mirrored capability flag.
 //
 // Transport: `daemonApi.request('api_sessions_message_search', …)` rides
 // tunnel-first with the direct-HTTP GET fallback — the descriptor row

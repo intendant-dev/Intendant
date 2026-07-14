@@ -1,6 +1,6 @@
 //! Declarative route table for the web gateway.
 //!
-//! One declaration per HTTP API route (`/api/*` and `/mcp`). Four things
+//! One declaration per HTTP API route (`/api/*`, `/session`, and `/mcp`). Four things
 //! that used to be hand-synchronized across distant regions of
 //! `web_gateway.rs` all derive from this table, so they cannot drift:
 //!
@@ -213,6 +213,7 @@ pub(crate) enum RouteHandlerId {
     /// both shapes capture the same `{id}`).
     TransferJobDelete,
     TransferDownloadRead,
+    SessionToken,
     SessionCurrentChanges,
     CurrentHistory,
     CurrentRollback,
@@ -276,9 +277,7 @@ pub(crate) enum RouteHandlerId {
     AccessConnectClaimCode,
     AccessConnectConfig,
     AccessConnectUnclaim,
-    /// Trust-tier settings pair (docs/src/trust-tiers.md): the daemon
-    /// tier label and the hosted-control ceiling knob. One handler, two
-    /// paths, switched on `req_path`.
+    /// Daemon trust-tier label (docs/src/trust-tiers.md).
     AccessTierSettings,
     /// Fleet certificate request (async-start; progress rides the
     /// connect status payload).
@@ -722,6 +721,17 @@ pub(crate) static ROUTES: &[Route] = &[
          resume metadata echoed as X-Transfer-* headers, X-Content-Sha256 on full reads)",
     )
     .with_tunnel(tunnel_method("api_transfer_download_read")),
+    // The legacy spelling predates the /api namespace, but this endpoint
+    // spends a daemon-held provider credential. Keep its IAM and own-origin
+    // posture in the same route table as the rest of the dashboard API.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/session"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::SessionToken,
+        "Mint an ephemeral Gemini Live / OpenAI Realtime token from a daemon-held provider credential",
+    ),
     // ── Current-session routes (exact/subtree rows precede the generic
     //    session sub-router rows below).
     op_route(
@@ -818,7 +828,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::SessionManage,
         BodyPolicy::None,
         RouteHandlerId::CurrentUploadsGet,
-        "Fetch one upload's raw bytes (inline Content-Disposition)",
+        "Fetch one upload's raw bytes (attachment; MIME sniffing disabled)",
     )
     .with_tunnel(tunnel_method("api_session_current_upload_raw")),
     op_route(
@@ -1406,7 +1416,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::AccessEnrollmentDecide,
-        "Approve or deny a pending enrollment request",
+        "Staged decision API; the default product has no queue writer",
     )
     .with_tunnel(tunnel_method("api_access_enrollment_decide")),
     fleet_route(
@@ -1415,7 +1425,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessInspect,
         BodyPolicy::None,
         RouteHandlerId::AccessEnrollmentRequests,
-        "Pending enrollment requests",
+        "Staged enrollment capability and normally empty queue",
     )
     .with_tunnel(tunnel_method("api_access_enrollment_requests")),
     fleet_route(
@@ -1437,8 +1447,8 @@ pub(crate) static ROUTES: &[Route] = &[
     )
     .with_tunnel(tunnel_method("api_access_overview")),
     // ── Connect rendezvous administration. Status is inspect-grade but
-    //    never carries the claim phrase; the phrase reveal is its own
-    //    manage-gated route so the one secret-bearing response has the
+    //    never carries the one-time claim code; revealing the code is its own
+    //    manage-gated route so the sensitive one-time-code response has the
     //    strictest gate.
     fleet_route(
         RouteMethod::Get,
@@ -1446,7 +1456,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessInspect,
         BodyPolicy::None,
         RouteHandlerId::AccessConnectStatus,
-        "Connect rendezvous status (claim state, binding provenance; no claim phrase)",
+        "Connect rendezvous status (discovery-link state and provenance; no claim code)",
     )
     .with_tunnel(tunnel_method("api_access_connect_status")),
     fleet_route(
@@ -1455,7 +1465,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::None,
         RouteHandlerId::AccessConnectClaimCode,
-        "Reveal the current twelve-word claim phrase (unclaimed daemons only)",
+        "Reveal the current one-time twelve-word claim code (unlinked daemons only)",
     )
     .with_tunnel(tunnel_method("api_access_connect_claim_code")),
     fleet_route(
@@ -1473,7 +1483,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::AccessConnectUnclaim,
-        "Release this daemon's claim binding at the rendezvous (daemon-signed)",
+        "Unlink this daemon's discovery record from its Connect account (daemon-signed)",
     )
     .with_tunnel(tunnel_method("api_access_connect_unclaim")),
     fleet_route(
@@ -1485,15 +1495,6 @@ pub(crate) static ROUTES: &[Route] = &[
         "Set this daemon's trust tier label (integrated/disposable; null clears)",
     )
     .with_tunnel(tunnel_method("api_access_set_tier")),
-    fleet_route(
-        RouteMethod::Post,
-        PathPattern::Exact("/api/access/hosted-ceiling"),
-        PeerOperation::AccessManage,
-        BodyPolicy::Default,
-        RouteHandlerId::AccessTierSettings,
-        "Set the hosted-control ceiling role for hosted-provenance sessions",
-    )
-    .with_tunnel(tunnel_method("api_access_set_hosted_ceiling")),
     fleet_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/fleet-cert/request"),
@@ -2221,7 +2222,6 @@ mod tests {
             RouteHandlerId::AccessIamGrants,
             RouteHandlerId::AccessOrgApplyRenew,
             RouteHandlerId::AccessOrgManage,
-            RouteHandlerId::AccessTierSettings,
             RouteHandlerId::PeersSubRouter,
             RouteHandlerId::McpStream,
         ];

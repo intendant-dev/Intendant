@@ -102,13 +102,13 @@ pub(crate) fn now_unix_ms() -> u64 {
 pub(crate) struct DashboardTabsRegistry {
     inner: Arc<Mutex<HashMap<String, DashboardTabConnection>>>,
     active_presence: Arc<Mutex<Option<ActivePresence>>>,
-    display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    display_input_authority: Arc<DisplayInputAuthority>,
 }
 
 impl DashboardTabsRegistry {
     pub(crate) fn new(
         active_presence: Arc<Mutex<Option<ActivePresence>>>,
-        display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        display_input_authority: Arc<DisplayInputAuthority>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -227,7 +227,7 @@ mod tests {
     fn empty_registry() -> DashboardTabsRegistry {
         DashboardTabsRegistry::new(
             Arc::new(Mutex::new(None)),
-            Arc::new(StdRwLock::new(HashMap::new())),
+            Arc::new(DisplayInputAuthority::default()),
         )
     }
 
@@ -303,8 +303,7 @@ mod tests {
     #[test]
     fn snapshot_joins_voice_and_input_authority_by_internal_id() {
         let active = Arc::new(Mutex::new(None));
-        let authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> =
-            Arc::new(StdRwLock::new(HashMap::new()));
+        let authority = Arc::new(DisplayInputAuthority::default());
         let reg = DashboardTabsRegistry::new(active.clone(), authority.clone());
         reg.register("ws-1", conn(DashboardTabLane::LegacyWs, "a", 1));
         reg.register("sess-1", conn(DashboardTabLane::ControlTunnel, "b", 2));

@@ -229,7 +229,8 @@ fn default_true() -> bool {
 /// blob committed into the session's upload store — never inline bytes:
 /// the WebSocket broadcast and the session log both stay small, and the
 /// browser fetches the pixels lazily from `url` (the upload store's
-/// existing `/raw` route, which serves the stored MIME inline).
+/// existing `/raw` route, which preserves the stored MIME but forces an
+/// attachment disposition and disables MIME sniffing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNoteAttachment {
     /// Upload-store descriptor id the blob was committed under.
@@ -389,9 +390,10 @@ pub enum OutboundEvent {
         width: u32,
         height: u32,
         /// `false` marks a private user view ("View this machine"):
-        /// dashboards render the tile with a "private view" chip; peer
-        /// upcasters skip it. Absent on wires older than the split —
-        /// those daemons never hid displays, so default `true`.
+        /// authority-checked owner/root dashboards render the tile with a
+        /// "private view" chip; scoped dashboards and peer upcasters skip it.
+        /// Absent on wires older than the split — those daemons never hid
+        /// displays, so default `true`.
         #[serde(default = "default_true")]
         agent_visible: bool,
     },
@@ -441,8 +443,8 @@ pub enum OutboundEvent {
         /// 0 = primary, matching the historical single-display meaning.
         #[serde(default)]
         display_id: u32,
-        /// `false` = private user view (dashboard-only); `true` = shared
-        /// with the agent for computer use. Absent-means-true keeps old
+        /// `false` = private user view (owner/root-dashboard-only); `true` =
+        /// shared with the agent for computer use. Absent-means-true keeps old
         /// wire lines meaning what they always meant.
         #[serde(default = "default_true")]
         agent_visible: bool,

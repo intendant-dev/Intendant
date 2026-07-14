@@ -75,10 +75,11 @@ and `grant_user_display` require `display.input`, `start_task` requires
 `task.run`, unclassified tools require `runtime.control`). `tools/list` is
 filtered to what the principal may actually call. The display tools carry a
 second, separate gate: a `user_session` target needs the standing
-user-display grant unless the bound principal is an owner surface (the
-trusted dashboard / enrolled root user client or bare local loopback —
-`AccessPrincipal::is_owner_surface`); the stdio transport, being wired up by
-the owner's own client config, always counts as an owner surface. See
+user-display grant unless the bound principal is an owner/root caller (the
+trusted dashboard, an independently enrolled direct-mTLS `role:root` user
+client, or bare local loopback — derived by `ToolCallerTrust` without
+widening `AccessPrincipal::is_owner_surface`); the stdio transport, being
+wired up by the owner's own client config, always counts as an owner surface. See
 [Computer Use](./computer-use-and-audio.md#display-targets). Binding order:
 
 1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
@@ -93,7 +94,7 @@ the owner's own client config, always counts as an owner surface. See
    sessions with no binding at all do.
 3. **Browser pages** may only call `/mcp` from this daemon's own origin (or
    the macOS app scheme) and then bind like any dashboard HTTP request
-   (mTLS certificate principal or trusted-transport root). Foreign origins
+   (an enrolled mTLS certificate principal or trusted-local root). Foreign origins
    get 403 — same posture as the rest of `/api/*`.
 4. **Tokenless loopback** processes bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are

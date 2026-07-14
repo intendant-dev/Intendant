@@ -427,7 +427,7 @@ pub(crate) fn attention_push_payload(
         "display_request" => (
             format!("{daemon_label}: agent asks to view your screen"),
             format!(
-                "Session \u{201c}{session_label}\u{201d} is asking for display access. Open the dashboard to allow or deny."
+                "Session \u{201c}{session_label}\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
             ),
         ),
         _ => (
@@ -438,10 +438,9 @@ pub(crate) fn attention_push_payload(
     json!({
         "title": title,
         "body": body,
-        "url": format!(
-            "/app?connect=1&daemon_id={}",
-            form_urlencoded::byte_serialize(daemon_id.as_bytes()).collect::<String>()
-        ),
+        // Connect cannot open the daemon at role:none. Land on the route
+        // directory, whose cards explain which trusted client to use.
+        "url": "/connect",
         // One stacked notification per daemon: later nudges replace
         // earlier ones instead of piling up.
         "tag": format!("attention-{daemon_id}"),
@@ -674,7 +673,7 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
             continue;
         }
         let mut dead = Vec::new();
-        for (daemon_id, label, owner, online, offline_for) in transitions {
+        for (_daemon_id, label, owner, online, offline_for) in transitions {
             let payload = json!({
                 "title": if online { format!("{label} is back online") } else { format!("{label} went offline") },
                 "body": if online {
@@ -682,7 +681,7 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
                 } else {
                     "It stopped polling the rendezvous. The machine may be off, asleep, or disconnected.".to_string()
                 },
-                "url": format!("/app?connect=1&daemon_id={daemon_id}"),
+                "url": "/connect",
             });
             for subscription in subscriptions
                 .iter()
@@ -899,7 +898,7 @@ mod tests {
             payload["body"],
             "Session \u{201c}deploy review\u{201d} is waiting for your approval."
         );
-        assert_eq!(payload["url"], "/app?connect=1&daemon_id=daemon-1");
+        assert_eq!(payload["url"], "/connect");
         assert_eq!(payload["tag"], "attention-daemon-1");
 
         let question = attention_push_payload("question", "workshop", "s-1", "daemon-1");
@@ -936,7 +935,7 @@ mod tests {
         assert_eq!(display["title"], "workshop: agent asks to view your screen");
         assert_eq!(
             display["body"],
-            "Session \u{201c}s-1\u{201d} is asking for display access. Open the dashboard to allow or deny."
+            "Session \u{201c}s-1\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
         );
     }
 

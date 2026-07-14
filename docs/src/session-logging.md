@@ -594,10 +594,11 @@ A malformed `locate` parameter is a 400 like any bad parameter; every
 well-formed locator degrades typed, so the dashboard can open the detail view
 unanchored and say why. Sidecar reads never escape the session directory.
 
-### Dashboard integration (`?message_search=on`)
+### Dashboard integration (default on; `?message_search=off` escape)
 
-The dashboard side ships behind a URL flag (`?message_search=on` or `=1` —
-the Station world-panes precedent), inert when off. Two surfaces
+The dashboard message lane is enabled by default. `?message_search=off` (or
+`=0`) disables it as an operational escape hatch; daemon-derived method
+availability still makes older daemons degrade cleanly. Two surfaces
 (`static/app/57-sessions-message-search.js`, `ui2-chrome.js`): the Recent
 list's quick search gains a full-text message lane *under* the immediate
 metadata lane — ≥ 2 characters, ~225 ms debounce, in-flight aborts and
@@ -652,13 +653,14 @@ message-lane wire contract against the real binary
 (`supervised_session_writes_task_ask_human_and_steer_message_rows`,
 `headless_rollback_writes_a_conversation_rewound_cut` in `tests/e2e/`).
 
-Integration tests in `tests/e2e/` spawn the real binary and exercise the full
-stack (see [Architecture](./architecture.md)):
-
-- **Tier 1 (JSON mode)** — full-stack exec, approve/deny via stdin, multi-round
-  follow-up. No display.
-- **Tier 2 (control socket)** — status/usage queries, autonomy change, approve
-  via the Unix control socket. Needs Xvfb.
-- **Tier 3 (web/voice/WebRTC)** — WebSocket `state_snapshot`,
-  `tool_request`/`tool_response`, ANSI terminal frames, WebRTC signaling, and the
-  `/debug` endpoint. Voice tests need Firefox, PulseAudio, and espeak-ng.
+The integration cases in `tests/e2e/main.rs` spawn the real binaries against
+the deterministic mock provider and synthetic display; they are keyless,
+headless, network-independent, and run in CI on all three supported platforms.
+They cover direct execution and runtime file writes; daemon session/project and
+worktree creation; HTTP transfers and NDJSON session streaming; WebSocket
+display-request and computer-use event rails; blocking questions and persisted
+notifications through `intendant ctl`; federated peer tasks plus mTLS-scoped
+display input; supervised approvals and ask-human flows; parked steering; and
+both supervised and headless conversation rollback/message-lane cuts. Real-LLM,
+native-display, browser/Station, voice, and audio scenarios remain separate
+`tests/skills/` smokes rather than fictional extra e2e tiers.

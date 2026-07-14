@@ -438,8 +438,8 @@ function dashboardSetControlLastError(message = '', kind = '') {
 // a button that can only fail on macOS/Windows hosts. Two sources, because
 // each covers a transport the other can't: the displays payload reaches
 // direct dashboards over HTTP, and the dashboard-control status capability
-// reaches Connect dashboards once the channel is up (the HTTP probe is
-// impossible there, so dashboardUpdateTransportStatus re-applies the gate
+  // reaches authenticated dashboard-control tunnels once the channel is up
+  // (the HTTP probe is impossible there, so dashboardUpdateTransportStatus re-applies the gate
 // whenever transport state changes). Declared HERE, before that function's
 // first eval-time call — a later-fragment `let` would be a TDZ trap that
 // kills the whole module.
@@ -2639,4 +2639,3 @@ window.intendantDashboardControl = {
     return dashboardTransport.peerDashboardControlSignal(peerId, params, options);
   },
 };
-

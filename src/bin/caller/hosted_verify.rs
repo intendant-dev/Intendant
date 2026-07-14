@@ -1,6 +1,6 @@
-//! Out-of-band verifier for hosted-dashboard code transparency
+//! Out-of-band verifier for Connect code/installer transparency
 //! (docs/src/self-hosted-rendezvous.md, "Code transparency for the served
-//! dashboard"; the evidence leg of first-contact rung three in
+//! Connect bundle"; the evidence leg of first-contact rung three in
 //! docs/src/trust-tiers.md). The rendezvous commits what it serves to its
 //! append-only transparency log (`artifact_manifest` entries); this module
 //! fetches the LIVE artifacts over HTTPS exactly as a browser would,
@@ -777,7 +777,7 @@ const DEFAULT_RELEASE_REPO: &str = "intendant-dev/Intendant";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// `--download` re-fetches whole release artifacts, which are allowed to
-/// be far bigger than dashboard bundles.
+/// be far bigger than Connect page/installer bundles.
 const RELEASE_DOWNLOAD_BYTE_CAP: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1246,7 +1246,7 @@ pub(crate) async fn check_once() {
                 };
             });
             eprintln!(
-                "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving dashboard code that does \
+                "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
                  not match its public transparency log ({summary}): {:?} — treat hosted tabs \
                  against this rendezvous as compromised until the operator explains; direct \
                  and fleet-name dashboards are unaffected",

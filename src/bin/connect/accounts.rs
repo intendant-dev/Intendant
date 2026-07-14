@@ -483,11 +483,11 @@ pub(crate) fn require_bearer_token(state: &AppState, headers: &HeaderMap) -> Api
 }
 
 /// Gate for the daemon registration/polling endpoints. With
-/// `--open-registration` these are anonymous by design: registration is
-/// rate-limited, unclaimed records expire, and authorization moves to
-/// claim time (a signed-in — on the hosted instance, invited — account).
-/// Without it, the operator token (when configured) is required, which
-/// suits self-hosters who want a closed fleet.
+/// `--open-registration` the shared service bearer is omitted, but
+/// registration still requires a daemon-identity proof and later
+/// poll/answer calls require the rotating daemon-session credential returned
+/// by registration. Without it, the operator token (when configured) is an
+/// additional gate, which suits self-hosters who want a closed fleet.
 pub(crate) fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if state.config.open_daemon_registration {
         return Ok(());
