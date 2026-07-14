@@ -287,8 +287,7 @@ pub fn spawn_web_gateway(
     // can.  The map is small, write-rare (grant/release/WS-close only),
     // read-frequent on the hot input path; std::sync::RwLock is the
     // correct lock here.
-    let display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> =
-        Arc::new(StdRwLock::new(HashMap::new()));
+    let display_input_authority = Arc::new(DisplayInputAuthority::default());
 
     // Tab presence (Access pane): live connections on both event lanes,
     // with voice/input ownership joined from the two handles above at
@@ -299,10 +298,8 @@ pub fn spawn_web_gateway(
 
     // Phase 5a.1 authority transition channel.  Each per-connection
     // outbound task subscribes; emit sites are the Request/Release
-    // ControlMsg handlers, the WS-close cleanup, and the DisplayReady
-    // listener that fires `holder: None` for freshly
-    // created display sessions so already-connected browsers move
-    // from `unknown` to `unclaimed`.
+    // ControlMsg handlers, transport cleanup, and the synchronous display
+    // registry lifecycle observer installed before the accept loop starts.
     let (authority_change_tx, _authority_change_rx0) =
         broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
 
@@ -311,14 +308,79 @@ pub fn spawn_web_gateway(
     {
         let mut authority_change_rx = authority_change_tx.subscribe();
         let dashboard_authority_change_tx = dashboard_authority_change_tx.clone();
+        let authority_shared_session = shared_session.clone();
+        let observer_authority = Arc::clone(&display_input_authority);
         tokio::spawn(async move {
+            let mut last_holders: HashMap<u32, DisplayInputHolder> = HashMap::new();
             loop {
                 match authority_change_rx.recv().await {
                     Ok(change) => {
+                        // Mutation and broadcast are intentionally separated so
+                        // no channel send happens under the hot holder lock.
+                        // A concurrent newer mutation can therefore broadcast
+                        // first; never regress derived state to its stale event.
+                        if !change.is_current(&observer_authority) {
+                            continue;
+                        }
+                        let identity_changed =
+                            match (last_holders.get(&change.display_id), change.holder.as_ref()) {
+                                (Some(previous), Some(current)) => !previous.same_identity(current),
+                                (None, None) => false,
+                                _ => true,
+                            };
+                        match change.holder.as_ref() {
+                            Some(holder) => {
+                                last_holders.insert(change.display_id, holder.clone());
+                            }
+                            None => {
+                                last_holders.remove(&change.display_id);
+                            }
+                        }
+                        // Every holder transition advances the display input
+                        // epoch and clears its backlog, even when no native
+                        // edge is held yet. Otherwise a queued A event could
+                        // survive a fast A -> B -> A sequence and become true
+                        // under A's identity-only guard again.
+                        if identity_changed {
+                            let session_registry = authority_shared_session
+                                .read()
+                                .await
+                                .session_registry
+                                .clone();
+                            if let Some(session_registry) = session_registry {
+                                if let Some(session) =
+                                    session_registry.read().await.get_any(change.display_id)
+                                {
+                                    session.reset_browser_input("display input authority changed");
+                                }
+                            }
+                        }
                         let _ = dashboard_authority_change_tx.send(change.display_id);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        last_holders.clear();
+                        let session_registry = authority_shared_session
+                            .read()
+                            .await
+                            .session_registry
+                            .clone();
+                        if let Some(session_registry) = session_registry {
+                            let sessions = {
+                                let registry = session_registry.read().await;
+                                registry
+                                    .all_display_ids()
+                                    .into_iter()
+                                    .filter_map(|display_id| registry.get_any(display_id))
+                                    .collect::<Vec<_>>()
+                            };
+                            for session in sessions {
+                                session.reset_browser_input(
+                                    "display input authority updates were lost",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -332,6 +394,7 @@ pub fn spawn_web_gateway(
         let release_authority = Arc::clone(&display_input_authority);
         let release_change_tx = authority_change_tx.clone();
         let input_authority = Arc::clone(&display_input_authority);
+        let input_revision_authority = Arc::clone(&display_input_authority);
         let cleanup_authority = Arc::clone(&display_input_authority);
         let cleanup_change_tx = authority_change_tx.clone();
         let subscribe_tx = dashboard_authority_change_tx.clone();
@@ -379,6 +442,7 @@ pub fn spawn_web_gateway(
             move |session_id, display_id| {
                 dashboard_control_input_authorized(session_id, display_id, &input_authority)
             },
+            move |display_id| input_revision_authority.revision(display_id),
             move |session_id| {
                 apply_dashboard_control_close_input_authority(
                     session_id,
@@ -577,13 +641,14 @@ pub fn spawn_web_gateway(
     // on Lagged clears the affected sections so the next bootstrap omits
     // stale lines instead of replaying ghosts (see
     // `BootstrapCacheMaintainer::clear_on_gap` for the per-section
-    // ground-truth story). It also owns the "unclaimed" authority nudge
-    // the old display_ready sniffer task fired.
+    // ground-truth story). Authority is tied synchronously to the session
+    // registry; this maintainer only clears it as fail-closed gap recovery.
     spawn_bootstrap_cache_maintainer(
         &bus,
         BootstrapCacheMaintainer {
             caches: bootstrap_caches.clone(),
             display_ready_cache: display_ready_cache.clone(),
+            display_input_authority: Arc::clone(&display_input_authority),
             authority_change_tx: authority_change_tx.clone(),
         },
     );
@@ -681,8 +746,34 @@ pub fn spawn_web_gateway(
     // behind `embedded_static_asset`), so its cache lives here.
     let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
+    let lifecycle_shared_session = shared_session.clone();
+    let lifecycle_authority = Arc::clone(&display_input_authority);
+    let lifecycle_authority_change_tx = authority_change_tx.clone();
 
     tokio::spawn(async move {
+        // Install the authority invalidator before accepting any browser.
+        // SessionRegistry invokes it synchronously under its write guard and
+        // before insert/remove publication, closing the display-ID reuse race
+        // that an asynchronous DisplayReady/CaptureLost subscriber cannot.
+        if let Some(session_registry) = lifecycle_shared_session
+            .read()
+            .await
+            .session_registry
+            .clone()
+        {
+            session_registry
+                .write()
+                .await
+                .set_lifecycle_observer(Some(Arc::new(move |display_id| {
+                    let (_, revision) = lifecycle_authority.clear_display(display_id);
+                    let _ = lifecycle_authority_change_tx.send(DisplayInputAuthorityChange {
+                        display_id,
+                        holder: None,
+                        revision,
+                    });
+                })));
+        }
+
         let mut listener = listener;
         let bind_addr = listener.local_addr().ok();
         let port = bind_addr.map(|a| a.port()).unwrap_or(0);
@@ -996,6 +1087,7 @@ pub fn spawn_web_gateway(
 
                 let buf_owned: Vec<u8>;
                 let mut stream: DemuxStream;
+                let tls_fleet_origin: bool;
                 let tls_client_cert_present: bool;
                 let tls_client_cert_fingerprint: Option<String>;
                 if is_tls {
@@ -1015,6 +1107,13 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
+                    // Capture certificate-selection provenance at the TLS
+                    // boundary. The public fleet/WebPKI name is a discovery
+                    // endpoint, never an authority anchor; HTTP Host alone is
+                    // mutable and cannot establish the stronger direct-mTLS
+                    // ceremony.
+                    tls_fleet_origin =
+                        crate::web_tls::is_fleet_server_name(tls_stream.get_ref().1.server_name());
                     let peer_certs = tls_stream
                         .get_ref()
                         .1
@@ -1052,6 +1151,7 @@ pub fn spawn_web_gateway(
                     // replay prefix — a zero-overhead pass-through that
                     // reads the request straight from the socket.
                     buf_owned = buf[..peeked].to_vec();
+                    tls_fleet_origin = false;
                     tls_client_cert_present = false;
                     tls_client_cert_fingerprint = None;
                     stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
@@ -1187,6 +1287,7 @@ pub fn spawn_web_gateway(
                         peer_addr,
                         source_hint.clone(),
                         is_tls,
+                        tls_fleet_origin,
                         tls_client_cert_present,
                         tls_client_cert_fingerprint.clone(),
                         peer_connection_identity,
@@ -1224,6 +1325,16 @@ pub fn spawn_web_gateway(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
+                    if tls_fleet_origin || request_names_known_fleet_origin(&header_text) {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
                     // Browsers attach their page Origin to WebSocket
                     // handshakes, but WebSocket's same-origin protection is
                     // entirely server-enforced. Reject foreign pages before
@@ -1231,8 +1342,10 @@ pub fn spawn_web_gateway(
                     // otherwise a hosted page can make the browser present an
                     // already-enrolled mTLS certificate and inherit that
                     // direct principal's daemon-local IAM grant. Native
-                    // and daemon clients may omit Origin; the signed native
-                    // app's custom scheme remains an explicit trusted origin.
+                    // and daemon clients may omit Origin. The local wrapper's
+                    // custom scheme is an origin allowance, not authentication
+                    // or a shipped signed-native remote anchor; transport IAM
+                    // checks below still apply.
                     if let Some(origin) = extract_origin_header(&header_text)
                         .filter(|origin| !is_own_or_app_origin(origin, is_tls, &header_text))
                     {
@@ -1374,6 +1487,12 @@ pub fn spawn_web_gateway(
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
+
+                    // Subscribe before reading the authority bootstrap. Any
+                    // transition racing the snapshot is then either represented
+                    // by the snapshot or retained for the outbound task. Waiting
+                    // until after log replay left a long missed-update window.
+                    let authority_change_rx = authority_change_tx.subscribe();
 
                     // Ordering barrier for the outbound task: live broadcast
                     // events stay gated until every bootstrap frame queued on
@@ -1771,13 +1890,6 @@ pub fn spawn_web_gateway(
                     // "somebody is watching" signal that suppresses pushes.
                     crate::attention_nudge::dashboard_connected();
 
-                    // Phase 5a.1 outbound personalization plumbing: the authority
-                    // change channel carries the holder's server-internal
-                    // connection_id; ws_outbound_task converts each incoming change
-                    // into a personalized `display_input_authority_state` wire
-                    // message.
-                    let authority_change_rx = authority_change_tx.subscribe();
-
                     // Outbound: broadcast + direct responses → WebSocket
                     let outbound = tokio::spawn(ws_outbound_task(
                         outbound_rx,
@@ -1816,11 +1928,12 @@ fn bootstrap_wire_line(event: &crate::event::AppEvent) -> Option<String> {
 /// State fed by [`spawn_bootstrap_cache_maintainer`]: the shared bootstrap
 /// caches every new `/ws` connection (and the tunnel's
 /// `api_dashboard_bootstrap`) replays, the per-display `display_ready`
-/// fallback cache, and the authority-change channel for the
-/// "fresh display ⇒ unclaimed chip" nudge.
+/// fallback cache, plus authority state used only for fail-closed recovery
+/// when the typed event stream itself has a gap.
 pub(crate) struct BootstrapCacheMaintainer {
     pub(crate) caches: crate::dashboard_control::DashboardBootstrapCaches,
     pub(crate) display_ready_cache: Arc<Mutex<HashMap<u32, String>>>,
+    pub(crate) display_input_authority: Arc<DisplayInputAuthority>,
     pub(crate) authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
 }
 
@@ -1873,13 +1986,6 @@ impl BootstrapCacheMaintainer {
                         guard.insert(*display_id, line);
                     }
                 }
-                // Fresh display session: flip already-connected browsers'
-                // authority chips from `unknown` to `unclaimed` without
-                // waiting for the first Request/Release.
-                let _ = self.authority_change_tx.send(DisplayInputAuthorityChange {
-                    display_id: *display_id,
-                    holder: None,
-                });
             }
             // Evict display_ready on revoke / capture loss; a revoke also
             // clears the cached grant so a refreshed browser after a revoke
@@ -1990,6 +2096,13 @@ impl BootstrapCacheMaintainer {
     ///   the daemon-side approval registry still holds the real pending set
     ///   and live `approval_required` re-emissions repopulate the panel.
     pub(crate) fn clear_on_gap(&self) {
+        for (display_id, revision) in self.display_input_authority.clear_all() {
+            let _ = self.authority_change_tx.send(DisplayInputAuthorityChange {
+                display_id,
+                holder: None,
+                revision,
+            });
+        }
         if let Ok(mut guard) = self.display_ready_cache.lock() {
             guard.clear();
         }
@@ -2052,6 +2165,7 @@ mod bootstrap_cache_tests {
             BootstrapCacheMaintainer {
                 caches: crate::dashboard_control::DashboardBootstrapCaches::default(),
                 display_ready_cache: Arc::new(Mutex::new(HashMap::new())),
+                display_input_authority: Arc::new(DisplayInputAuthority::default()),
                 authority_change_tx,
             },
             authority_rx,
@@ -2070,7 +2184,7 @@ mod bootstrap_cache_tests {
 
     #[test]
     fn typed_events_fill_the_caches_with_wire_lines() {
-        let (m, mut authority_rx) = maintainer();
+        let (m, _authority_rx) = maintainer();
         let display_cache = m.display_ready_cache.clone();
 
         m.apply(&status_event("s-1", "running"));
@@ -2097,7 +2211,8 @@ mod bootstrap_cache_tests {
             .unwrap()
             .contains("\"autonomy_changed\""));
 
-        // display_ready caches per display AND nudges the authority chip.
+        // display_ready caches per display. The synchronous session-registry
+        // lifecycle observer owns authority invalidation and UI notification.
         m.apply(&AppEvent::DisplayReady {
             display_id: 3,
             width: 1280,
@@ -2105,9 +2220,6 @@ mod bootstrap_cache_tests {
             agent_visible: true,
         });
         assert!(display_cache.lock().unwrap().contains_key(&3));
-        let nudge = authority_rx.try_recv().expect("unclaimed nudge fired");
-        assert_eq!(nudge.display_id, 3);
-        assert!(nudge.holder.is_none());
 
         // Grant cached; revoke clears it AND evicts the display entry.
         m.apply(&AppEvent::UserDisplayGranted {
@@ -2188,8 +2300,16 @@ mod bootstrap_cache_tests {
     /// gap omits possibly-stale lines instead of replaying ghosts.
     #[test]
     fn clear_on_gap_empties_every_cache_section() {
-        let (m, _rx) = maintainer();
+        let (m, mut authority_rx) = maintainer();
         let display_cache = m.display_ready_cache.clone();
+        let revision = m.display_input_authority.revision(1);
+        m.display_input_authority.write().unwrap().insert(
+            1,
+            DisplayInputHolder::LocalWs {
+                connection_id: "stale-holder".to_string(),
+                direct_tx: mpsc::unbounded_channel().0,
+            },
+        );
         m.apply(&status_event("s-1", "running"));
         m.apply(&AppEvent::DisplayReady {
             display_id: 1,
@@ -2218,6 +2338,11 @@ mod bootstrap_cache_tests {
             .unwrap()
             .is_empty());
         assert!(display_cache.lock().unwrap().is_empty());
+        assert!(m.display_input_authority.read().unwrap().is_empty());
+        assert_eq!(revision.load(Ordering::SeqCst), 1);
+        let cleared = authority_rx.try_recv().expect("gap publishes unclaimed");
+        assert_eq!(cleared.display_id, 1);
+        assert!(cleared.holder.is_none());
     }
 
     /// End to end: intents flooding past the broadcast ring can lag the

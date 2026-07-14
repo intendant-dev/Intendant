@@ -72,8 +72,9 @@ pub(crate) const CODEMIRROR_BUNDLE_CSS: &str =
 
 // Vendored xterm.js (MIT). Previously loaded from jsdelivr with SRI
 // pins — the one external fetch in the dashboard; embedding it keeps
-// the terminal working offline/LAN and on hosted Connect. The vendored
-// bytes hash-match the exact SRI digests the CDN loader pinned.
+// the daemon-served terminal working offline and over trusted LAN/mTLS
+// dashboard routes. These bytes hash-match the exact SRI digests the CDN
+// loader pinned.
 pub(crate) const XTERM_JS: &str = include_str!("../../../../static/xterm.min.js");
 
 // D-2 tile-test harness (parked seed): fetched by the dashboard only
@@ -89,7 +90,7 @@ pub(crate) const XTERM_CSS: &str = include_str!("../../../../static/xterm.css");
 // Self-hosted variable fonts (SIL OFL 1.1; license texts ship in
 // static/fonts/). Referenced by the @font-face rules in
 // static/app/09-styles-fonts.css — the dashboard must stay fully
-// self-contained for offline/LAN and hosted-Connect use.
+// self-contained for offline and trusted LAN/mTLS use.
 pub(crate) const FONT_HANKEN_LATIN: &[u8] =
     include_bytes!("../../../../static/fonts/hanken-grotesk-latin.woff2");
 
@@ -1123,6 +1124,14 @@ mod tests {
             app_html_override_from(Some(" /tmp/app.html ".into())),
             Some(std::path::PathBuf::from("/tmp/app.html"))
         );
+    }
+
+    #[test]
+    fn dashboard_flushes_keys_and_mouse_buttons_on_input_teardown() {
+        assert!(APP_HTML.contains("owner._heldButtons.add(e.button)"));
+        assert!(APP_HTML.contains("sendControl({ t: 'mu', x, y, b })"));
+        assert!(APP_HTML.contains("handlers.pointercancel = (e) =>"));
+        assert!(APP_HTML.contains("owner._flushHeldKeys?.();"));
     }
 
     #[test]

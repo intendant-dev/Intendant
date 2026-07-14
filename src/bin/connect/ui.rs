@@ -300,7 +300,7 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
     <p class="lede">The short version: this service handles accounts, routes, availability, hosted code, installers, and optional encrypted push delivery. A daemon grant can only be minted by that daemon's local IAM.</p>
 
     <h2>What this service actually does</h2>
-    <p>Connect <em>serves</em> this discovery client and its installers, <em>publishes</em> daemon routes and presence, <em>stores</em> client-signed fleet records, and <em>remembers</em> which routes an account linked. A link creates no daemon principal or grant. This hosted build is discovery-only and cannot open a daemon control session; use a trusted local, signed-native, or direct-mTLS surface for access.</p>
+    <p>Connect <em>serves</em> this discovery client and its installers, <em>publishes</em> daemon routes and presence, <em>stores</em> client-signed fleet records, and <em>remembers</em> which routes an account linked. A link creates no daemon principal or grant. This hosted build and its fleet WebPKI names are discovery-only and cannot open a daemon control session; use a trusted local or independently verified direct-mTLS surface for access. No signed/notarized native release exists for this alpha.</p>
 
     <h2>"But I sign in with a passkey&hellip;"</h2>
     <p>A fair question: doesn&rsquo;t signing in give the server something it could use?</p>
@@ -310,7 +310,7 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
     <ol>
       <li><strong>It could lie in introductions.</strong><span>It can alter account and routing metadata, substitute the daemon key at first introduction, or deny a route. A daemon signature checked by this page proves consistency with the key Connect linked; it is not an independent key pin, because this service supplies both the first key record and the browser code doing the check. Account assertions never authenticate to a daemon, and this hosted build has an immutable <code>role:none</code> ceiling: it cannot open a control session even if local state is edited to grant its browser key.</span></li>
       <li><strong>It could deny service.</strong><span>Connect controls availability for its account, route, presence, and push services. Denial does not add daemon authority, but it can hide or delay those updates.</span></li>
-      <li><strong>It could serve malicious code or installers.</strong><span>Hosted code can misuse Connect account state and any decrypted vault or fleet data made available after a user gesture; a replaced installer can compromise what it installs. There is no hosted daemon-control session in the default product. Use a trusted local, direct-mTLS, or signed-native root surface; self-host or verify artifacts out of band if you do not trust this deployment.</span></li>
+      <li><strong>It could serve malicious code or installers.</strong><span>Hosted code can misuse Connect account state and any decrypted vault or fleet data made available after a user gesture; a replaced installer can compromise what it installs. There is no hosted or fleet-name daemon-control session in the default product. Use a trusted local or independently verified direct-mTLS root surface; self-host or verify artifacts out of band if you do not trust this deployment. The current native artifact is unsigned development-only.</span></li>
     </ol>
 
     <div class="card good">
@@ -324,7 +324,7 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
     <p class="dim">Every name binding this service hands out &mdash; which daemon key Connect recorded for a linked computer, handle creations, revocation lists, verified badges &mdash; is committed to an append-only transparency log. Your browser pins the signed tree head and re-verifies on every visit that history only ever grew. This makes later rewriting detectable; it does not independently validate the first key or the browser code served by this origin. Handles can carry <em>verified identity</em> badges (a DNS record or GitHub gist you control); verification is decoration, never authority. Dormant handles with no computers and no sign-ins are eventually freed &mdash; squatted names don&rsquo;t keep.</p>
 
     <h2>Organizations</h2>
-    <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em> &mdash; also root-signed and rollback-protected, so the worst a malicious board can do is withhold it, never forge it.</p>
+    <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em>, also root-signed. A computer that has recorded a sequence high-water mark rejects rollback below it; a fresh computer can still be shown an older signed list. A malicious board can withhold or serve stale data, but cannot forge a newer valid list.</p>
 
     <h2>Verify all of this</h2>
     <p class="dim">The component is open and self-hostable: <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">run your own rendezvous</a>, read the <a href="https://intendant-dev.github.io/Intendant/trust-architecture.html" target="_blank" rel="noopener">full trust architecture</a>, or audit the <a href="https://github.com/intendant-dev/Intendant" target="_blank" rel="noopener">source</a>.</p>
@@ -348,8 +348,8 @@ pub(crate) const REPO_URL: &str = "https://github.com/intendant-dev/Intendant";
 /// command is server-rendered into the terminal (via the
 /// `__ADVISOR_DEFAULT_CMD__` placeholder) so the page works without JS
 /// and the one-command story is visible before any click. Every question
-/// is about the agent's machine — the client side needs no install and
-/// therefore no questions.
+/// is about the agent's machine. A browser needs no separate app install,
+/// but daemon control still requires trusted certificate/profile enrollment.
 pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
         <style>
           .advisor { border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
@@ -418,11 +418,11 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
             document.getElementById('advcmd').textContent = cmd;
             var plan = [];
             if (pick.box === 'laptop') {
-              plan.push('<b>Local credentials work as-is.</b> A .env key remains supported. The daemon-store vault is available from a trusted direct or native client. Connect implements blind account-vault storage, but this directory serves no vault client or delivery bridge.');
+              plan.push('<b>Local credentials work as-is.</b> A .env key remains supported. The daemon-store vault is available from a trusted local or independently verified direct-mTLS client. Connect implements blind account-vault storage, but this directory serves no vault client or delivery bridge.');
             } else {
               var watched = pick.solo === 'no';
               if (pick.fuel !== 'sub') {
-                plan.push('<b>API keys:</b> configure .env on the box, or open the daemon through a trusted direct/native client and grant a memory-only lease from its daemon-store vault. This hosted Connect tab cannot fuel the daemon or relay its calls.');
+                plan.push('<b>API keys:</b> configure .env on the box, or open the daemon through a trusted local/direct-mTLS client and grant a memory-only lease from its daemon-store vault. This hosted Connect tab cannot fuel the daemon or relay its calls.');
               }
               if (pick.fuel !== 'api') {
                 plan.push('<b>Subscriptions:</b> establish auth through the signed client or another trusted direct surface. Access-token leases are short-lived; full-credential OAuth mode temporarily materializes a private auth home on the daemon for the lease window.');
@@ -699,8 +699,9 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
         loop, supervises Codex and Claude Code as managed backends, and is
         portable across OpenAI, Anthropic, and Gemini. The agent's machine
         can run macOS, Linux, or Windows. Route discovery needs only this
-        browser tab; control uses local presence, the signed native app, or
-        a browser enrolled for direct mTLS by a trusted daemon owner.
+        browser tab; control uses local presence or a browser enrolled for
+        independently verified direct mTLS by a trusted daemon owner. No
+        signed/notarized native release exists for this alpha.
       </p>
       <div class="cta">
         <a class="btn" href="/connect">Open Connect</a>
@@ -712,8 +713,9 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <h2>Stand up a daemon in about ninety seconds</h2>
       <p class="sectionlede">
         Four answers about the machine the agent will live on, and the exact
-        command appears. That machine is the only one that installs anything
-        — you can be reading this from your phone.
+        command appears. You can discover it from your phone without a separate
+        app; controlling the daemon still requires trusted certificate or
+        profile enrollment.
       </p>
       <div class="igrid">
         {advisor}
@@ -724,14 +726,14 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
             <div class="step"><b><span class="n">2</span>Link</b>
               Enter its twelve-word one-time claim code to add the route to your account. This grants no access.</div>
             <div class="step"><b><span class="n">3</span>Establish owner</b>
-              Use the machine's local console, the signed native app, or direct mTLS to establish root outside hosted-origin JavaScript.</div>
+              Use the machine's local console or independently verified direct mTLS to establish root outside hosted-origin JavaScript. No signed/notarized native release exists for this alpha.</div>
             <div class="step"><b><span class="n">4</span>Fuel</b>
               Configure credentials from a trusted daemon surface. Connect implements blind account-vault storage but serves no vault client or daemon-delivery bridge in this build.</div>
           </div>
           <p class="installnote">
             New here? <a href="/connect">Sign in</a> to link the route for
             discovery. The link does not create a daemon principal or grant;
-            establish access from a trusted local, signed-native, or direct-mTLS
+            establish access from a trusted local or independently verified direct-mTLS
             surface. This hosted build remains discovery-only.
           </p>
         </div>
@@ -779,8 +781,8 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           <h3>Every agent, one canvas</h3>
           <p>Station renders the whole machine live — sessions, approvals,
           context budgets, changes, and worktrees orbiting one WebGPU canvas.
-          The same state is a keystroke away in the terminal TUI and the CLI,
-          and a glance away from your phone.</p>
+          The same daemon is operable from the CLI and MCP, and a glance away
+          from your phone in an enrolled browser.</p>
         </div>
         <div class="pic">
           <div class="shot">
@@ -801,7 +803,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           This directory does not serve the vault client or crypto worker and
           has no daemon-control channel, so it cannot create or unseal account
           entries, grant a lease, or relay a provider call. Use a
-          trusted direct or signed-native client for those mechanisms, or use
+          trusted direct client for those mechanisms, or use
           the daemon's local credential configuration.</p>
           <div class="fuelmap">
             <div class="fuelrow"><span class="fueltag">trusted client</span>
@@ -826,7 +828,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           <p>Start the daemon anywhere and it prints a one-time claim code.
           Enter it here to link the route to your account for discovery. The
           link changes no daemon IAM and grants no machine access; ownership
-          starts only from a trusted local, direct-mTLS, or signed-native surface.</p>
+          starts only from a trusted local or independently verified direct-mTLS surface.</p>
         </div>
         <div class="pic">
           <div class="shot">
@@ -843,8 +845,8 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           <h3>Zero-install discovery; trusted enrollment for control</h3>
           <p>Link and discover a daemon from this browser tab without client
           software. To approve a diff, watch the live desktop, or run mission
-          control, use local loopback access, the signed native app, or first
-          enroll that browser for direct mTLS from a trusted owner surface.
+          control, use local loopback access or first enroll that browser for
+          independently verified direct mTLS from a trusted owner surface.
           After enrollment the dashboard remains browser-based and carries
           only the authority that daemon granted to the authenticated
           principal. Installing a client certificate or profile is a real
@@ -879,11 +881,12 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           leases temporarily materialize private auth files.</p>
         </div>
         <div class="card">
-          <h3>Every interface, any device</h3>
-          <p>Web dashboard, terminal TUI, CLI, MCP, live voice, and phone
-          calls — every capability reachable from each of them. The web
-          client runs in any browser, phone included, with nothing to
-          install client-side.</p>
+          <h3>Multiple trusted interfaces</h3>
+          <p>Use the web dashboard for visual control, CLI or MCP for
+          automation, and live voice or phone for conversation. A remote
+          browser enrolled for direct mTLS by a trusted owner runs the web
+          client there, phone included, without a separate app install; that
+          remote browser still needs certificate or profile enrollment.</p>
         </div>
         <div class="card">
           <h3>A fleet, not a box</h3>
@@ -1174,7 +1177,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
       <div class="hero">
         <img class="hero-mark" src="/logo.svg" alt="">
         <h2 class="hero-title">Your computers, anywhere.</h2>
-        <p class="hero-sub">Sign in with a passkey to find machines linked to your account. Linking is discovery only: daemon control still requires loopback, direct mTLS, or the native app's mTLS bridge and a grant approved through a trusted root surface.</p>
+        <p class="hero-sub">Sign in with a passkey to find machines linked to your account. Linking is discovery only: daemon control still requires loopback or independently verified direct mTLS and a grant approved through a trusted root surface. No signed/notarized native release exists for this alpha.</p>
       </div>
       <div class="auth-card">
         <div>
@@ -1257,7 +1260,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
             <span id="session-passkeys" class="pill"></span>
             <span id="enc-pill" class="pill"></span>
           </div>
-          <div class="sub">This user id identifies Connect account, route, and audit metadata. It never authenticates to a daemon. Browser identity keys are metadata-only in this alpha; use loopback, direct mTLS, or the native app's mTLS bridge for control.</div>
+          <div class="sub">This user id identifies Connect account, route, and audit metadata. It never authenticates to a daemon. Browser identity keys are metadata-only in this alpha; use loopback or independently verified direct mTLS for control.</div>
           <div class="user-id-row">
             <code id="session-user-id"></code>
             <button id="copy-user-id" class="ghost" type="button">Copy</button>
@@ -1523,7 +1526,7 @@ async function claimDaemon() {{
       if (status.result?.status === 'approved') {{
         setStatus(
           'claim-status',
-          `Linked ${{status.result.daemon_id}} to this account for discovery. No machine access was granted. Establish owner access directly on the machine, through the signed native app, or through a trusted direct daemon connection.`,
+          `Linked ${{status.result.daemon_id}} to this account for discovery. No machine access was granted. Establish owner access directly on the machine or through an independently verified direct-mTLS daemon connection.`,
           'ok'
         );
         $('claim-code').value = '';
@@ -1927,7 +1930,7 @@ function renderDaemons() {{
         </div>
       </div>
       <div class="computer-actions">
-        <span class="route-only">Discovery only &mdash; open this daemon from a trusted local, signed-native, or direct-mTLS client.</span>
+        <span class="route-only">Discovery only &mdash; open this daemon from a trusted local or independently verified direct-mTLS client.</span>
         <button class="secondary" data-rename="${{escapeAttr(daemonId)}}">Rename</button>
       </div>
       ${{presenceSparkline(daemon)}}
@@ -1979,7 +1982,7 @@ function renderFleetTargets() {{
     const label = (!rawLabel || rawLabel === id) ? (shortId(id) || 'Place') : rawLabel;
     const locked = target.fleet_locked === true;
     const route = locked
-      ? 'End-to-end encrypted — opens on a device signed in with your passkey'
+      ? 'End-to-end encrypted — passkey sign-in reveals this saved route; opening the daemon still requires trusted mTLS'
       : String(target.route_label || target.route || target.url || 'Remembered route');
     const online = target.online || target.connected;
     // A live claim link is directory metadata and must never grow a control
@@ -2451,6 +2454,11 @@ mod tests {
         // enrollment or native/local anchor instead of inheriting that claim.
         assert!(html.contains("Zero-install discovery; trusted enrollment for control"));
         assert!(html.contains("Installing a client certificate or profile is a real"));
+        assert!(html.contains("controlling the daemon still requires trusted certificate or"));
+        assert!(html.contains("Multiple trusted interfaces"));
+        assert!(html.contains("without a separate app install"));
+        assert!(html.contains("remote browser still needs certificate or profile enrollment"));
+        assert!(!html.contains("terminal TUI"));
         // "How do I use it" is the page's first answer: the install
         // questionnaire sits directly under the hero, before the shot tour.
         let install_at = html.find(r#"<section class="install-section""#).unwrap();
@@ -2474,8 +2482,9 @@ mod tests {
         assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
         // The deployment advisor LEADS the install section — no fold to
-        // find, four questions all about the agent's machine (the client
-        // side installs nothing, so it gets no questions), and
+        // find, four questions all about the agent's machine (the browser
+        // needs no separate app install, while trusted enrollment is handled
+        // on the daemon/client access path), and
         // runtime-origin commands so self-hosted rendezvous advertise their
         // own installers there too — the sh one-liner AND the PowerShell
         // one (Windows is first-class).
@@ -2534,6 +2543,8 @@ mod tests {
         assert!(!html.contains("data-open="));
         assert!(html.contains("target.claimed_daemon === true ? ''"));
         assert!(html.contains("Open direct route"));
+        assert!(html.contains("passkey sign-in reveals this saved route"));
+        assert!(html.contains("opening the daemon still requires trusted mTLS"));
         assert!(!html.contains("/app?connect=1"));
         assert!(!html.contains("sessions verify this end to end"));
         for forbidden in [

@@ -30,7 +30,7 @@ const ACCESS_TIER_META = {
   'disposable': {
     label: 'Disposable',
     glyph: '♻',
-    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted tabs are fine here.',
+    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted Connect can discover it, but control still requires a trusted anchor.',
   },
 };
 
@@ -60,10 +60,10 @@ function accessIamRoleById(roleId) {
   return roles.find(role => accessModelLabel(role.id) === id) || null;
 }
 
-/* Role ceiling that applies to a session authenticated by `authnKind`
-   (optionally with the binding's recorded enrollment origin). Mirrors the
-   daemon's role_ceiling_for_session so the UI can explain what a session
-   will actually be able to do. */
+/* Compatibility display for persisted role-ceiling metadata. In the default
+   binary both legacy hosted binding kinds are compiled to role:none and every
+   load normalizes the stored values back to role:none. No alpha ingress uses a
+   browser key as its controlling principal. */
 function accessRoleCeilingFor(authnKind, authnOrigin = '') {
   const iam = accessIamModel(accessOverviewModel());
   const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
@@ -376,7 +376,7 @@ function renderAccessAttention() {
           detail: lastError,
           steps: [
             'Hosted Connect is discovery-only in the default build; this refusal is expected.',
-            'Open the daemon from a trusted local console, its direct-mTLS address, or the signed native app.',
+            'Open the daemon from a trusted local console or its independently verified direct-mTLS address.',
             'Use the Connect account link only to find the daemon and inspect route presence.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -389,7 +389,7 @@ function renderAccessAttention() {
           detail: lastError,
           steps: [
             'The default Connect product is discovery-only; it does not establish dashboard transport.',
-            'Open a trusted daemon-origin mTLS dashboard or the signed native app.',
+            'Open a trusted daemon-origin dashboard over loopback or independently verified direct mTLS.',
             'Do not add a browser-key grant or change a ceiling: neither can enable this path.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -403,7 +403,7 @@ function renderAccessAttention() {
           steps: [
             'Current Connect services reject browser offers before mutation, and current daemons drop legacy offers.',
             'Use Connect only to inspect the daemon’s discovery and presence metadata.',
-            'Use a trusted local, direct-mTLS, or signed-native client for control.',
+            'Use a trusted local console or independently verified direct-mTLS client for control.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
         });
@@ -533,14 +533,14 @@ function renderAccessIdentityHero() {
     youLines.push(accessHeroLine('Can do', 'Not authorized yet — the account link grants nothing and this daemon has no effective grant for this browser key.'));
   }
   if (me.ceiling) {
-    youLines.push(accessHeroLine('Ceiling', `Sessions on this route are capped at ${me.ceiling.replace(/^role:/, '')} by daemon policy.`, {
-      title: 'role_ceilings in iam.json bounds what low-provenance routes can do, regardless of the granted role.',
+    youLines.push(accessHeroLine('Hosted ceiling', `This legacy binding is fixed at ${me.ceiling.replace(/^role:/, '')}; it cannot authenticate an alpha control session.`, {
+      title: 'Compatibility metadata in iam.json is normalized to role:none. The compiled evaluator refuses hosted control regardless of stored grants or hand edits.',
     }));
   }
   if (me.clientKeyFingerprint) {
     youLines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
       mono: true,
-      title: 'This origin’s identity key is only an identity record in this alpha. Direct daemon access still requires loopback, the native app’s mTLS bridge, or a direct mTLS client certificate.',
+      title: 'This origin’s identity key is only an identity record in this alpha. Direct daemon access still requires loopback or an independently verified direct-mTLS client certificate; no signed-native remote anchor ships.',
     }));
   }
   if (me.fingerprint) youLines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
@@ -915,7 +915,7 @@ function renderAccessPeopleCurrent() {
   if (me.clientKeyFingerprint) {
     lines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
       mono: true,
-      title: 'Held in this browser’s origin storage as an identity record. This alpha does not consume it for direct or native authentication; use loopback, the native app’s mTLS bridge, or a direct mTLS certificate.',
+      title: 'Held in this browser’s origin storage as an identity record. This alpha does not consume it for direct authentication; use loopback or an independently verified direct-mTLS certificate. No signed-native remote anchor ships.',
     }));
   }
   if (me.fingerprint) {
@@ -1049,7 +1049,7 @@ function renderAccessTierCard() {
 
   const hint = document.createElement('div');
   hint.className = 'acc-principal-kind';
-  hint.textContent = 'Use a trusted local console, direct mTLS, or the signed native app for daemon control. A persisted IAM edit cannot raise this hosted boundary in the default build.';
+  hint.textContent = 'Use a trusted local console or independently verified direct mTLS for daemon control. A persisted IAM edit cannot raise this hosted boundary in the default build; this release has no signed-native remote anchor.';
   card.appendChild(hint);
 
   mount.appendChild(card);
@@ -1150,7 +1150,7 @@ function renderAccessConnectCard() {
   // Connect build does not serve this daemon dashboard.
   if (status.hosted_bundle_state === 'alert') {
     headRow.appendChild(accessRouteChip('danger', 'HOSTED CODE ALERT',
-      `This daemon fetched Connect account/directory code, assets, or installers that do not match the rendezvous's public transparency log: ${(status.hosted_bundle_mismatches || []).join(' | ')}. Until the operator explains, treat that deployment's pages and downloads as compromised — reach this daemon directly or by its fleet name instead. Re-check out of band with: intendant hosted-verify.`));
+      `This daemon fetched Connect account/directory code, assets, or installers that do not match the rendezvous's public transparency log: ${(status.hosted_bundle_mismatches || []).join(' | ')}. Until the operator explains, treat that deployment's pages and downloads as compromised — use an independently verified loopback/direct-mTLS route instead. Re-check out of band with: intendant hosted-verify.`));
   } else if (status.hosted_bundle_state === 'ok') {
     headRow.appendChild(accessRouteChip('webrtc', 'hosted code ✓',
       'What this rendezvous serves matches its public transparency log'
@@ -1175,11 +1175,10 @@ function renderAccessConnectCard() {
     card.appendChild(err);
   }
 
-  // Fleet certificate (docs/src/trust-tiers.md, the convenient direct
-  // path): when the rendezvous serves a fleet DNS zone, this daemon owns
-  // a real name — one click publishes its addresses and mints a
-  // Let's Encrypt certificate, so the direct dashboard gets a warning-free
-  // padlock (LAN address + public name included).
+  // Fleet certificate (docs/src/trust-tiers.md, warning-free discovery):
+  // when the rendezvous serves a fleet DNS zone, this daemon owns a real
+  // name. The endpoint serves public shell/discovery bytes only; protected
+  // HTTP/MCP, signaling, and WebSocket traffic is refused on fleet SNI.
   const fleetCert = status.fleet_cert || {};
   if (fleetCert.name) {
     const row = document.createElement('div');
@@ -1199,13 +1198,13 @@ function renderAccessConnectCard() {
       const ct = document.createElement('span');
       ct.className = 'acc-chip route-danger';
       ct.textContent = 'CT ALERT';
-      ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name — treat the fleet route as compromised and reach this daemon directly or through the app.`;
+      ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name. Treat its directory metadata as compromised and use an independently verified loopback/direct-mTLS route for control.`;
       row.appendChild(ct);
     }
     if (fleetCert.state === 'valid') {
       chip.className = 'acc-chip route-webrtc';
       chip.textContent = validUntil ? `certificate ✓ until ${validUntil}` : 'certificate ✓';
-      chip.title = 'A browser-trusted Let’s Encrypt certificate is serving for this name — open the direct dashboard at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Renewals are automatic.'
+      chip.title = 'A browser-trusted Let’s Encrypt certificate serves the public shell and discovery endpoint at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. It is not a control origin: protected API, MCP, signaling, and WebSocket access is refused even with browser mTLS. Renewals are automatic.'
         + (fleetCert.ct_state === 'ok' && fleetCert.ct_checked_unix_ms
           ? ` CT tripwire: all publicly logged certificates for this name are this daemon's own (checked ${new Date(Number(fleetCert.ct_checked_unix_ms)).toLocaleString()}).`
           : '');
@@ -1224,8 +1223,8 @@ function renderAccessConnectCard() {
       const request = document.createElement('button');
       request.type = 'button';
       request.className = 'acc-btn primary';
-      request.textContent = 'Get a real certificate';
-      request.title = 'Publishes this daemon’s routable addresses under its fleet name and mints a Let’s Encrypt certificate (DNS-01 through the rendezvous — the private key never leaves this machine). The name lands in public CT logs; it is an opaque hash for that reason.';
+      request.textContent = 'Enable HTTPS discovery';
+      request.title = 'Publishes this daemon’s routable addresses under its fleet name and mints a Let’s Encrypt certificate (DNS-01 through the rendezvous — the private key never leaves this machine). This is a warning-free discovery/public-shell endpoint, not control authority. The name lands in public CT logs; it is an opaque hash for that reason.';
       request.disabled = !canRequest;
       request.addEventListener('click', () => accessFleetCertRequest());
       row.appendChild(request);
@@ -1399,13 +1398,13 @@ function renderAccessEnrollmentRequests() {
     if (originClass === 'hosted') {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the rendezvous serves that page's code. The default binary refuses all daemon control through this route, regardless of stored grants.`));
     } else if (originClass === 'fleet') {
-      headRow.appendChild(accessRouteChip('remembered', 'via fleet name', `The offer arrived through ${request.origin} — this daemon serves that page's code, but the rendezvous names the route (it could hijack DNS and mint a certificate; such an attack is active-only and lands in public CT logs, which this daemon monitors). Rung two of first contact: stronger than hosted, weaker than a typed address. No ceiling applies by default; add this exact origin to hosted_origins in iam.json to cap it.`));
+      headRow.appendChild(accessRouteChip('remembered', 'via fleet name', `The record arrived through ${request.origin}, whose DNS namespace is controlled by the rendezvous. CT may expose unexpected certificate issuance, but it is not an anchor. Protected requests on fleet SNI are refused before mTLS or IAM, so this record cannot create a control session; use an independently verified direct-mTLS route.`));
     } else if (request.origin) {
       headRow.appendChild(accessRouteChip('local', 'via direct origin', `The offer arrived through ${request.origin} — a daemon-served origin the rendezvous neither serves nor names.`));
     }
     if (request.origin && accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
       headRow.appendChild(accessRouteChip('danger', 'integrated tier',
-        'This is an integrated-tier machine and the key arrived over the network. Hosted Connect remains discovery-only; authorize control only from a trusted direct or signed-native surface (docs: trust-tiers).'));
+        'This is an integrated-tier machine and the key arrived over the network. Hosted Connect remains discovery-only; authorize control only from a trusted local console or independently verified direct-mTLS surface (docs: trust-tiers).'));
     }
     if (request.account_hint) {
       headRow.appendChild(request.account_attested
@@ -1533,7 +1532,7 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     const chip = document.createElement('span');
     chip.className = 'acc-chip route-connect';
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
-    chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
+    chip.title = `Compatibility metadata marks this principal's ${capped.binding.replace(/_/g, ' ')} binding as ${capped.ceiling}. The default binary admits no hosted/browser-key control session, regardless of this grant.`;
     row.appendChild(chip);
   }
   const fsScope = grant.fs_scope;

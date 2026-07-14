@@ -344,6 +344,11 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
         }
     }
 
+    // Invalidate every interactive display guard minted by this control
+    // session before any other teardown can yield. The display transport is
+    // separate WebRTC and may reap a beat later; it must not retain input or
+    // clipboard authority during that window.
+    shutdown.cancel();
     for (_, token) in pending_requests {
         token.cancel();
     }
@@ -436,7 +441,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
-    display_input_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    display_input_tx: &DisplayInputForwarder,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1

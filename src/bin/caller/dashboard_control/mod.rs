@@ -1,9 +1,11 @@
 //! Daemon-scoped WebRTC control tunnel for dashboard RPC experiments.
 //!
 //! The dashboard still uses HTTP plus the main WebSocket by default. This
-//! module provides the first substrate for a future public-origin dashboard:
-//! WebSocket signaling creates a direct browser-to-daemon WebRTC data channel,
-//! then the channel carries small JSON RPC frames.
+//! module provides a lower-latency path for clients already admitted through a
+//! trusted local, independently verified direct-mTLS, or authenticated peer
+//! transport: daemon/peer signaling creates a direct WebRTC data channel, then
+//! the channel carries small JSON RPC frames. Hosted Connect has no signaling
+//! or control path into this module.
 
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
@@ -32,7 +34,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -444,9 +446,8 @@ pub struct DashboardControlRegistry {
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum DashboardControlGrant {
-    #[default]
     TrustedLocal,
     UserClient {
         principal: crate::access::iam::AccessPrincipal,
@@ -516,7 +517,7 @@ pub struct PeerAttribution {
 }
 
 impl DashboardControlGrant {
-    fn current_user_client_state(&self) -> Result<crate::access::iam::LocalIamState, String> {
+    fn current_user_client_state(&self) -> Result<Arc<crate::access::iam::LocalIamState>, String> {
         let Self::UserClient {
             iam_state,
             iam_cert_dir,
@@ -526,9 +527,9 @@ impl DashboardControlGrant {
             return Err("dashboard grant is not a local IAM user/client".to_string());
         };
         match iam_cert_dir {
-            Some(cert_dir) => crate::access::iam::load_state_cached(cert_dir)
+            Some(cert_dir) => crate::access::iam::load_state_cached_arc(cert_dir)
                 .map_err(|error| format!("reload local IAM state: {error}")),
-            None => Ok(iam_state.clone()),
+            None => Ok(Arc::new(iam_state.clone())),
         }
     }
 
@@ -606,8 +607,8 @@ impl DashboardControlGrant {
                 (Some(opening), Some(cert_dir)) => {
                     let now_unix = crate::access::client_key::now_unix_ms() / 1000;
                     matches!(
-                        crate::peer::access_policy::lookup_identity(cert_dir, fingerprint),
-                        Ok(Some(current)) if current == *opening && current.is_active(now_unix)
+                        crate::peer::access_policy::lookup_identity_cached_arc(cert_dir, fingerprint),
+                        Ok(Some(current)) if current.as_ref() == opening && current.is_active(now_unix)
                     )
                 }
                 _ => false,
@@ -927,6 +928,7 @@ type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send
 type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
 type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
+type AuthorityInputRevisionFn = dyn Fn(u32) -> Arc<AtomicU64> + Send + Sync;
 
 #[derive(Clone)]
 pub struct DashboardDisplayAuthorityBridge {
@@ -935,17 +937,20 @@ pub struct DashboardDisplayAuthorityBridge {
     request: Arc<AuthorityEventsFn>,
     release: Arc<AuthorityEventsFn>,
     input_authorized: Arc<AuthorityInputAuthorizedFn>,
+    input_revision: Arc<AuthorityInputRevisionFn>,
     cleanup: Arc<dyn Fn(&str) + Send + Sync>,
     subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
 }
 
 impl DashboardDisplayAuthorityBridge {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: impl Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync + 'static,
         state_frame: impl Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync + 'static,
         request: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
         release: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
         input_authorized: impl Fn(&str, u32) -> bool + Send + Sync + 'static,
+        input_revision: impl Fn(u32) -> Arc<AtomicU64> + Send + Sync + 'static,
         cleanup: impl Fn(&str) + Send + Sync + 'static,
         subscribe: impl Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync + 'static,
     ) -> Self {
@@ -955,6 +960,7 @@ impl DashboardDisplayAuthorityBridge {
             request: Arc::new(request),
             release: Arc::new(release),
             input_authorized: Arc::new(input_authorized),
+            input_revision: Arc::new(input_revision),
             cleanup: Arc::new(cleanup),
             subscribe: Arc::new(subscribe),
         }
@@ -978,6 +984,10 @@ impl DashboardDisplayAuthorityBridge {
 
     fn input_authorized(&self, session_id: &str, display_id: u32) -> bool {
         (self.input_authorized)(session_id, display_id)
+    }
+
+    fn input_revision(&self, display_id: u32) -> Arc<AtomicU64> {
+        (self.input_revision)(display_id)
     }
 
     fn cleanup(&self, session_id: &str) {
@@ -1055,22 +1065,6 @@ impl DashboardControlRegistry {
     /// has registered the session).
     pub(crate) fn note_tab_id(&self, session_id: &str, tab_id: &str) {
         self.tabs.note_tab_id(session_id, tab_id);
-    }
-
-    #[allow(dead_code)]
-    pub async fn answer_offer(
-        &self,
-        offer_sdp: String,
-        session_grant: Option<String>,
-        client_nonce: Option<String>,
-    ) -> Result<DashboardControlAnswer, String> {
-        self.answer_offer_with_grant(
-            offer_sdp,
-            session_grant,
-            client_nonce,
-            DashboardControlGrant::TrustedLocal,
-        )
-        .await
     }
 
     pub async fn answer_offer_with_grant(
@@ -1226,6 +1220,10 @@ impl DashboardControlRegistry {
                 .remove(session_id)
                 .expect("dashboard-control peer existed under the same lock")
         };
+        // Kill the live transport guard before any cleanup callback can yield.
+        // Once an explicit close is accepted, no buffered control frame may
+        // retain the opening grant while presence/authority teardown runs.
+        peer.close().await;
         self.tabs.unregister(session_id);
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
@@ -1233,20 +1231,20 @@ impl DashboardControlRegistry {
         if let Some(bridge) = &self.presence {
             bridge.cleanup(session_id.to_string()).await;
         }
-        peer.close().await;
         DashboardControlSessionMutation::Applied
     }
 
     pub async fn close(&self, session_id: &str) {
+        let peer = self.peers.lock().await.remove(session_id);
+        if let Some(peer) = peer {
+            peer.close().await;
+        }
         self.tabs.unregister(session_id);
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
         }
         if let Some(bridge) = &self.presence {
             bridge.cleanup(session_id.to_string()).await;
-        }
-        if let Some(peer) = self.peers.lock().await.remove(session_id) {
-            peer.close().await;
         }
     }
 
@@ -1483,6 +1481,7 @@ impl DashboardControlPeer {
             session_grant.as_deref(),
             client_nonce.as_deref(),
         );
+        let shutdown = CancellationToken::new();
         let runtime = ControlRuntime {
             session_id,
             daemon_public_key: identity.public_key_b64u(),
@@ -1510,11 +1509,11 @@ impl DashboardControlPeer {
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
             grant,
+            shutdown: shutdown.clone(),
             tabs,
             state_root: crate::platform::intendant_home(),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
-        let shutdown = CancellationToken::new();
         tokio::spawn(control_driver(
             rtc,
             sockets,
@@ -1587,17 +1586,21 @@ pub(crate) struct ControlRuntime {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
-    /// The ICE-TCP tuple this control session itself advertised (the
-    /// rendezvous-observed public address on the gateway port for hosted
-    /// Connect sessions; `None` for locally-signaled sessions, whose
-    /// browsers signal displays over the gateway WS instead). Display
-    /// offers arriving on the control channel advertise the same tuple —
-    /// the browser reached us through it, so display traffic can too.
+    /// The ICE-TCP tuple supplied by an authenticated peer signaling path.
+    /// Trusted local and independently verified direct-mTLS sessions use
+    /// `None` and signal displays over the gateway WebSocket instead. Display
+    /// offers arriving on a peer control channel advertise the same tuple —
+    /// that peer reached us through it, so display traffic can too.
     tcp_advertised: Option<SocketAddr>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
     grant: DashboardControlGrant,
+    /// Lifetime of the authenticated control transport. Interactive display
+    /// channels created through it retain this token so queued input and
+    /// clipboard access die with the session even if the separate display
+    /// WebRTC transport has not reaped yet.
+    shutdown: CancellationToken,
     /// The live tabs-presence registry (shared with the `/ws` lane) —
     /// serves the `api_dashboard_tabs` twin.
     tabs: crate::web_gateway::DashboardTabsRegistry,
@@ -3000,9 +3003,10 @@ mod tests {
             control_frames_tx: None,
             display_peer_id: 1,
             grant: DashboardControlGrant::TrustedLocal,
+            shutdown: CancellationToken::new(),
             tabs: crate::web_gateway::DashboardTabsRegistry::new(
                 Arc::new(std::sync::Mutex::new(None)),
-                Arc::new(std::sync::RwLock::new(HashMap::new())),
+                Arc::new(crate::web_gateway::DisplayInputAuthority::default()),
             ),
             // Per-instance scratch (never the machine's real ~/.intendant):
             // projectless adapters resolve the daemon-global store under
@@ -3070,7 +3074,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(
             text,
             runtime,

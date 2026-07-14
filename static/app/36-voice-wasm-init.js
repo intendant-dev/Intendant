@@ -1214,9 +1214,9 @@ async function main() {
   // Store app globally for reconnect/debug hooks.
   window.__presenceWeb = app;
 
-  // Fire-and-forget: the vault only needs the hosted origin (same-origin
-  // fetch + the login PRF secret), not the control transport — and it
-  // must never block or be blocked by dashboard bootstrap.
+  // Fire-and-forget: vault discovery must not block dashboard bootstrap.
+  // The shipped vault uses this trusted daemon/native origin and its secure
+  // control channel; Hosted Connect serves no vault client or delivery bridge.
   vaultInit();
 
   let connectBootstrapReady = !dashboardConnectModeEnabled();

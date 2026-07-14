@@ -24423,7 +24423,7 @@ html.ui-v2 #tab-settings .ui-section-sub code { font-family: var(--mono); }
           <div class="access-pane-body">
             <div class="acc-section-head">
               <div class="acc-section-title">People &amp; Devices</div>
-              <div class="acc-section-sub">Humans and their trusted local, mTLS-browser, or signed-native identities. Connect account fields are discovery metadata only in this alpha; daemon-to-daemon trust lives under Peers.</div>
+              <div class="acc-section-sub">Humans and their trusted local or independently enrolled direct-mTLS browser identities. Connect account fields are discovery metadata only in this alpha; no signed/notarized native release exists yet, and daemon-to-daemon trust lives under Peers.</div>
             </div>
             <div id="access-people-current" class="acc-hero-grid"></div>
             <div id="access-enrollment-requests"></div>
@@ -27195,7 +27195,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'df9e15bd1cbb0a08';
+const INTENDANT_APP_BUILD = 'ba4e5d80566948b3';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -27910,7 +27910,7 @@ const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
 const ACCESS_FLEET_KEY = 'intendant_access_fleet_v1';
 const DASHBOARD_ACCESS_PAGE_MODE = /^\/access\/?$/i.test(window.location.pathname || '');
 // The hosted-origin dashboard experiment is retired. Keep the vocabulary for
-// the remaining direct/native transport code, but make URL parameters unable
+// the remaining trusted daemon-origin transport code, but make URL parameters unable
 // to activate it in the default daemon bundle. Connect serves a separate,
 // discovery-only page and never this SPA.
 const DASHBOARD_CONNECT_MODE = false;
@@ -29209,9 +29209,11 @@ async function daemonApiHttpStream(method, params, opts, onEvent) {
 
 // ── Remote-http adapter (transport F4) ────────────────────────────────────
 // Cross-daemon fleet calls: the anchor page applies access changes to
-// OTHER daemons by direct cross-origin HTTP — the fleet-CORS rows, with
-// the browser's own identity to that origin (mTLS certificate) as the
-// authentication. This daemon's `authedFetch` bearer stays out of the
+// OTHER daemons at independently verified direct-mTLS URLs — the
+// fleet-CORS rows, with the browser's own identity to that origin (mTLS
+// certificate) as the authentication. A rendezvous-controlled fleet-SNI
+// URL is discovery-only and the daemon rejects this lane there. This
+// daemon's `authedFetch` bearer stays out of the
 // lane on purpose: nothing minted here carries authority there
 // (trust-architecture: authority is only ever minted by the target
 // daemon's local IAM). Naming the target names the transport — no tunnel
@@ -29500,7 +29502,7 @@ function daemonApiAvailability(method, target = null) {
   if (remoteOrigin) {
     // A REMOTE origin's reachability is unknowable without a request;
     // the honest answer is lane presence — the descriptor names the
-    // methods fleet daemons serve over direct HTTP.
+    // methods fleet daemons serve over independently verified direct HTTP.
     return DAEMON_API_HTTP_MAP[method]
       ? { ok: true, reason: 'http-only' }
       : { ok: false, reason: 'never' };
@@ -29665,7 +29667,10 @@ window.qa = Object.assign(window.qa || {}, {
 /* ── static/app/32-vault-custody.js ── */
 /* ── Credential vault (credential custody v1) ──
    The user's provider credentials, end-to-end encrypted client-side and
-   synced blind through the hosted rendezvous (/api/vault). A random
+   stored as an opaque blob on the daemon used by this trusted dashboard.
+   Connect retains an account-vault storage API for compatibility, but the
+   default hosted directory serves no vault client and has no bridge to a
+   daemon. A random
    256-bit master key encrypts the vault body; that key is stored only
    wrapped, one envelope per enrolled unlocker: each account passkey (via
    the vault's OWN WebAuthn PRF salt 'intendant-vault-v1', evaluated as
@@ -29722,16 +29727,14 @@ let vaultPublishChain = Promise.resolve(true);
 const vaultRevealedEntries = new Set();
 
 /* ── Vault storage backends ──
-   The blob has two possible homes, both blind to its contents:
-   - 'account': the Connect service stores one blob per account (hosted
-     tabs — the original path; follows the person across daemons).
-   - 'daemon': this daemon stores the blob itself (~/.intendant/
-     vault-blob.json via api_daemon_vault_fetch/publish) — the local
-     vault for direct dashboards, no Connect service in the loop.
-   The stores are independent (each keeps its own revision ratchet);
-   copying between them is an explicit user action, never implicit. */
+   The shipped dashboard uses the daemon store (~/.intendant/vault-blob.json
+   via api_daemon_vault_fetch/publish), with no Connect service in the loop.
+   The dormant 'account' branch is wire-compatibility scaffolding for a
+   future, separately trusted client; Connect does not serve this bundle.
+   The stores are independent (each keeps its own revision ratchet), and a
+   future copy between them must remain an explicit user action. */
 function vaultDaemonStoreReady() {
-  if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
+  if (DASHBOARD_CONNECT_MODE) return false; // retired hosted-dashboard mode
   // daemonApi availability (transport F6): the tunnel status boolean when
   // it has landed (false = this session's role is refused the custody
   // gate), the hello_ack features list before that (absent = the daemon
@@ -29745,25 +29748,25 @@ function vaultDaemonStoreReady() {
 function vaultDaemonStoreUnavailableText() {
   const reason = daemonApi.availability('api_daemon_vault_fetch').reason;
   if (reason === 'denied') {
-    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Hosted Connect dashboards use the account vault instead.";
+    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Reopen it through an authorized loopback/direct-mTLS session or grant that permission from a trusted root surface.";
   }
   if (reason === 'unsupported') {
-    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect dashboards use the account vault instead.';
+    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect is discovery-only and cannot supply a vault client.';
   }
   // 'transport-down': the store rides the secure control channel (a
   // tunnel-only method). Whether that channel is even coming decides the
   // honest copy — "retries automatically" was a lie on dashboards that
   // never open one.
   if (!dashboardControlTransportEnabled()) {
-    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics, or open this daemon through a hosted Connect dashboard to use the account vault instead.';
+    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics or use a trusted loopback/direct-mTLS dashboard.';
   }
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: true, connected: false };
   if (dashboardTransportStatusSummary(status).kind === 'err') {
-    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect dashboards use the account vault instead.';
+    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect cannot bridge an account vault to this daemon.';
   }
-  return 'No vault store reachable yet: the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
+  return 'No vault store reachable yet: the trusted control channel is still connecting (retries automatically).';
 }
 
 function vaultBackendKind() {
@@ -29986,7 +29989,7 @@ function vaultMarkMacSeen() {
   }
 }
 
-/* ── Local cache + hosted sync ── */
+/* ── Local cache + backing-store sync ── */
 
 function vaultReadLocal() {
   try {
@@ -30068,7 +30071,7 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   if (!blob || !revision) return;
   if (fromServer) {
     vaultState.rollbackWarning = vaultState.highWater > revision
-      ? `The hosted store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
+      ? `The backing store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
       : '';
   }
   if (revision < vaultState.revision) return;
@@ -30397,7 +30400,7 @@ async function vaultUnlockWithPhrase(input) {
 }
 
 async function vaultCreate(phrase) {
-  if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
+  if (!vaultAvailable()) throw new Error('the vault needs an authorized trusted dashboard session');
   const now = Date.now();
   // The page owns the metadata (ids, labels, timestamps); the kernel
   // generates the master key, wraps the envelopes, encrypts the empty
@@ -30538,12 +30541,11 @@ function vaultQueuePersist() {
 
 /* Per-entry unseal policy (docs/src/trust-tiers.md, hook 3). 'any' (or
    absent — every pre-policy entry) uses the entry everywhere the vault
-   opens; 'trusted' refuses use from hosted tabs. Client-side self-
-   enforcement: it defends against mistakes and casual exfiltration, not
-   against a malicious page — and since today the vault only opens
-   through a Connect service, a trusted-only entry stays sealed until
-   the direct/app vault path lands. It still syncs, and the policy
-   rides inside the encrypted body like every other entry field. */
+   opens; 'trusted' refuses use from a future hosted client. The shipped
+   vault UI is already daemon-origin and uses the daemon store. This remains
+   client-side self-enforcement: useful against mistakes, not malicious code
+   on whatever origin is allowed to unseal. The policy rides inside the
+   encrypted body like every other entry field. */
 function vaultEntryUnsealPolicy(entry) {
   return entry?.unseal_policy === 'trusted' ? 'trusted' : 'any';
 }
@@ -31808,7 +31810,7 @@ function vaultRenderAddForm(card) {
   const policySelect = document.createElement('select');
   for (const [value, label, title] of [
     ['any', 'Anywhere this vault opens', 'The default: usable from every dashboard that can open your vault.'],
-    ['trusted', 'Trusted origins only (direct / app)', 'Sealed against hosted tabs: no reveal, fueling, or relay from them. Client-side policy — a guard against mistakes, not a malicious page. Today the vault itself opens through Connect, so a trusted-only entry stays stored-but-sealed until the direct/app vault path lands.'],
+    ['trusted', 'Trusted origins only (direct / app)', 'Usable from this daemon-origin/native vault. Any future hosted vault client must keep it sealed: no reveal, fueling, or relay. Client-side policy guards against mistakes, not malicious served code.'],
   ]) {
     const option = document.createElement('option');
     option.value = value;
@@ -31858,8 +31860,8 @@ function vaultRenderAddForm(card) {
 }
 
 /* Fueling panel: this daemon's active leases + a fuel button per
-   fuelable vault entry. Renders wherever a vault store is reachable —
-   hosted tabs (account vault) and direct dashboards (local vault). */
+   fuelable vault entry. The shipped path is the trusted loopback/direct-mTLS
+   dashboard backed by this daemon's local vault. */
 function vaultRenderFueling(card) {
   if (!vaultAvailable()) return;
   const head = document.createElement('div');
@@ -33044,7 +33046,6 @@ function stationStatus(text) {
   }
   el.textContent = value;
 }
-
 /* ── static/app/33-station-core.js ── */
 // ── Station status metrics chip ──
 // Always-on `renderer · fps · displays` readout in #station-status-metrics.
@@ -41341,9 +41342,9 @@ async function main() {
   // Store app globally for reconnect/debug hooks.
   window.__presenceWeb = app;
 
-  // Fire-and-forget: the vault only needs the hosted origin (same-origin
-  // fetch + the login PRF secret), not the control transport — and it
-  // must never block or be blocked by dashboard bootstrap.
+  // Fire-and-forget: vault discovery must not block dashboard bootstrap.
+  // The shipped vault uses this trusted daemon/native origin and its secure
+  // control channel; Hosted Connect serves no vault client or delivery bridge.
   vaultInit();
 
   let connectBootstrapReady = !dashboardConnectModeEnabled();
@@ -57396,8 +57397,8 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to trusted local sessions or browser mTLS certificates. Browser identity-key and Connect account records do not authenticate alpha control traffic.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
       },
       role_ceilings: {
         connect_account: 'role:none',
@@ -57992,7 +57993,7 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
 const ACCESS_GRANT_KIND_CHOICES = [{
   value: 'client_key',
   title: 'A browser identity record (inactive)',
-  desc: 'A browser identity record for future direct authentication. In this alpha it is not an active sign-in credential: use loopback, the native app’s mTLS bridge, or a direct mTLS client certificate. Hosted Connect never exercises the grant.',
+  desc: 'A browser identity record for future direct authentication. In this alpha it is not an active sign-in credential: use loopback or an independently verified direct-mTLS client certificate. Hosted Connect never exercises the grant, and no signed-native remote anchor ships.',
 }, {
   value: 'browser_certificate',
   title: 'A browser certificate',
@@ -58010,7 +58011,8 @@ const ACCESS_ROLE_PICKER_ORDER = [
 
 /* Grant fanout: the daemons this page can apply a grant to, each with the
    channel it would use. 'self' uses the normal session; 'remote' is a
-   direct cross-origin call to a fleet daemon (mTLS in the browser, origin
+   direct cross-origin call to a fleet daemon's independently verified mTLS
+   URL (the browser certificate is admitted there and the caller origin is
    allowlisted daemon-side); 'connect-only' targets have no direct route
    from this page. Every write is still authorized by the target daemon. */
 function accessGrantFanoutTargets() {
@@ -58926,7 +58928,7 @@ const ACCESS_TIER_META = {
   'disposable': {
     label: 'Disposable',
     glyph: '♻',
-    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted tabs are fine here.',
+    short: 'Scratch box holding nothing durable. Worst case: rotate a key and destroy it. Hosted Connect can discover it, but control still requires a trusted anchor.',
   },
 };
 
@@ -58956,10 +58958,10 @@ function accessIamRoleById(roleId) {
   return roles.find(role => accessModelLabel(role.id) === id) || null;
 }
 
-/* Role ceiling that applies to a session authenticated by `authnKind`
-   (optionally with the binding's recorded enrollment origin). Mirrors the
-   daemon's role_ceiling_for_session so the UI can explain what a session
-   will actually be able to do. */
+/* Compatibility display for persisted role-ceiling metadata. In the default
+   binary both legacy hosted binding kinds are compiled to role:none and every
+   load normalizes the stored values back to role:none. No alpha ingress uses a
+   browser key as its controlling principal. */
 function accessRoleCeilingFor(authnKind, authnOrigin = '') {
   const iam = accessIamModel(accessOverviewModel());
   const ceilings = iam.role_ceilings && typeof iam.role_ceilings === 'object' ? iam.role_ceilings : {};
@@ -59272,7 +59274,7 @@ function renderAccessAttention() {
           detail: lastError,
           steps: [
             'Hosted Connect is discovery-only in the default build; this refusal is expected.',
-            'Open the daemon from a trusted local console, its direct-mTLS address, or the signed native app.',
+            'Open the daemon from a trusted local console or its independently verified direct-mTLS address.',
             'Use the Connect account link only to find the daemon and inspect route presence.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -59285,7 +59287,7 @@ function renderAccessAttention() {
           detail: lastError,
           steps: [
             'The default Connect product is discovery-only; it does not establish dashboard transport.',
-            'Open a trusted daemon-origin mTLS dashboard or the signed native app.',
+            'Open a trusted daemon-origin dashboard over loopback or independently verified direct mTLS.',
             'Do not add a browser-key grant or change a ceiling: neither can enable this path.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
@@ -59299,7 +59301,7 @@ function renderAccessAttention() {
           steps: [
             'Current Connect services reject browser offers before mutation, and current daemons drop legacy offers.',
             'Use Connect only to inspect the daemon’s discovery and presence metadata.',
-            'Use a trusted local, direct-mTLS, or signed-native client for control.',
+            'Use a trusted local console or independently verified direct-mTLS client for control.',
           ],
           action: { label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') },
         });
@@ -59429,14 +59431,14 @@ function renderAccessIdentityHero() {
     youLines.push(accessHeroLine('Can do', 'Not authorized yet — the account link grants nothing and this daemon has no effective grant for this browser key.'));
   }
   if (me.ceiling) {
-    youLines.push(accessHeroLine('Ceiling', `Sessions on this route are capped at ${me.ceiling.replace(/^role:/, '')} by daemon policy.`, {
-      title: 'role_ceilings in iam.json bounds what low-provenance routes can do, regardless of the granted role.',
+    youLines.push(accessHeroLine('Hosted ceiling', `This legacy binding is fixed at ${me.ceiling.replace(/^role:/, '')}; it cannot authenticate an alpha control session.`, {
+      title: 'Compatibility metadata in iam.json is normalized to role:none. The compiled evaluator refuses hosted control regardless of stored grants or hand edits.',
     }));
   }
   if (me.clientKeyFingerprint) {
     youLines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
       mono: true,
-      title: 'This origin’s identity key is only an identity record in this alpha. Direct daemon access still requires loopback, the native app’s mTLS bridge, or a direct mTLS client certificate.',
+      title: 'This origin’s identity key is only an identity record in this alpha. Direct daemon access still requires loopback or an independently verified direct-mTLS client certificate; no signed-native remote anchor ships.',
     }));
   }
   if (me.fingerprint) youLines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
@@ -59811,7 +59813,7 @@ function renderAccessPeopleCurrent() {
   if (me.clientKeyFingerprint) {
     lines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
       mono: true,
-      title: 'Held in this browser’s origin storage as an identity record. This alpha does not consume it for direct or native authentication; use loopback, the native app’s mTLS bridge, or a direct mTLS certificate.',
+      title: 'Held in this browser’s origin storage as an identity record. This alpha does not consume it for direct authentication; use loopback or an independently verified direct-mTLS certificate. No signed-native remote anchor ships.',
     }));
   }
   if (me.fingerprint) {
@@ -59945,7 +59947,7 @@ function renderAccessTierCard() {
 
   const hint = document.createElement('div');
   hint.className = 'acc-principal-kind';
-  hint.textContent = 'Use a trusted local console, direct mTLS, or the signed native app for daemon control. A persisted IAM edit cannot raise this hosted boundary in the default build.';
+  hint.textContent = 'Use a trusted local console or independently verified direct mTLS for daemon control. A persisted IAM edit cannot raise this hosted boundary in the default build; this release has no signed-native remote anchor.';
   card.appendChild(hint);
 
   mount.appendChild(card);
@@ -60046,7 +60048,7 @@ function renderAccessConnectCard() {
   // Connect build does not serve this daemon dashboard.
   if (status.hosted_bundle_state === 'alert') {
     headRow.appendChild(accessRouteChip('danger', 'HOSTED CODE ALERT',
-      `This daemon fetched Connect account/directory code, assets, or installers that do not match the rendezvous's public transparency log: ${(status.hosted_bundle_mismatches || []).join(' | ')}. Until the operator explains, treat that deployment's pages and downloads as compromised — reach this daemon directly or by its fleet name instead. Re-check out of band with: intendant hosted-verify.`));
+      `This daemon fetched Connect account/directory code, assets, or installers that do not match the rendezvous's public transparency log: ${(status.hosted_bundle_mismatches || []).join(' | ')}. Until the operator explains, treat that deployment's pages and downloads as compromised — use an independently verified loopback/direct-mTLS route instead. Re-check out of band with: intendant hosted-verify.`));
   } else if (status.hosted_bundle_state === 'ok') {
     headRow.appendChild(accessRouteChip('webrtc', 'hosted code ✓',
       'What this rendezvous serves matches its public transparency log'
@@ -60071,11 +60073,10 @@ function renderAccessConnectCard() {
     card.appendChild(err);
   }
 
-  // Fleet certificate (docs/src/trust-tiers.md, the convenient direct
-  // path): when the rendezvous serves a fleet DNS zone, this daemon owns
-  // a real name — one click publishes its addresses and mints a
-  // Let's Encrypt certificate, so the direct dashboard gets a warning-free
-  // padlock (LAN address + public name included).
+  // Fleet certificate (docs/src/trust-tiers.md, warning-free discovery):
+  // when the rendezvous serves a fleet DNS zone, this daemon owns a real
+  // name. The endpoint serves public shell/discovery bytes only; protected
+  // HTTP/MCP, signaling, and WebSocket traffic is refused on fleet SNI.
   const fleetCert = status.fleet_cert || {};
   if (fleetCert.name) {
     const row = document.createElement('div');
@@ -60095,13 +60096,13 @@ function renderAccessConnectCard() {
       const ct = document.createElement('span');
       ct.className = 'acc-chip route-danger';
       ct.textContent = 'CT ALERT';
-      ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name — treat the fleet route as compromised and reach this daemon directly or through the app.`;
+      ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name. Treat its directory metadata as compromised and use an independently verified loopback/direct-mTLS route for control.`;
       row.appendChild(ct);
     }
     if (fleetCert.state === 'valid') {
       chip.className = 'acc-chip route-webrtc';
       chip.textContent = validUntil ? `certificate ✓ until ${validUntil}` : 'certificate ✓';
-      chip.title = 'A browser-trusted Let’s Encrypt certificate is serving for this name — open the direct dashboard at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Renewals are automatic.'
+      chip.title = 'A browser-trusted Let’s Encrypt certificate serves the public shell and discovery endpoint at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. It is not a control origin: protected API, MCP, signaling, and WebSocket access is refused even with browser mTLS. Renewals are automatic.'
         + (fleetCert.ct_state === 'ok' && fleetCert.ct_checked_unix_ms
           ? ` CT tripwire: all publicly logged certificates for this name are this daemon's own (checked ${new Date(Number(fleetCert.ct_checked_unix_ms)).toLocaleString()}).`
           : '');
@@ -60120,8 +60121,8 @@ function renderAccessConnectCard() {
       const request = document.createElement('button');
       request.type = 'button';
       request.className = 'acc-btn primary';
-      request.textContent = 'Get a real certificate';
-      request.title = 'Publishes this daemon’s routable addresses under its fleet name and mints a Let’s Encrypt certificate (DNS-01 through the rendezvous — the private key never leaves this machine). The name lands in public CT logs; it is an opaque hash for that reason.';
+      request.textContent = 'Enable HTTPS discovery';
+      request.title = 'Publishes this daemon’s routable addresses under its fleet name and mints a Let’s Encrypt certificate (DNS-01 through the rendezvous — the private key never leaves this machine). This is a warning-free discovery/public-shell endpoint, not control authority. The name lands in public CT logs; it is an opaque hash for that reason.';
       request.disabled = !canRequest;
       request.addEventListener('click', () => accessFleetCertRequest());
       row.appendChild(request);
@@ -60295,13 +60296,13 @@ function renderAccessEnrollmentRequests() {
     if (originClass === 'hosted') {
       headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the rendezvous serves that page's code. The default binary refuses all daemon control through this route, regardless of stored grants.`));
     } else if (originClass === 'fleet') {
-      headRow.appendChild(accessRouteChip('remembered', 'via fleet name', `The offer arrived through ${request.origin} — this daemon serves that page's code, but the rendezvous names the route (it could hijack DNS and mint a certificate; such an attack is active-only and lands in public CT logs, which this daemon monitors). Rung two of first contact: stronger than hosted, weaker than a typed address. No ceiling applies by default; add this exact origin to hosted_origins in iam.json to cap it.`));
+      headRow.appendChild(accessRouteChip('remembered', 'via fleet name', `The record arrived through ${request.origin}, whose DNS namespace is controlled by the rendezvous. CT may expose unexpected certificate issuance, but it is not an anchor. Protected requests on fleet SNI are refused before mTLS or IAM, so this record cannot create a control session; use an independently verified direct-mTLS route.`));
     } else if (request.origin) {
       headRow.appendChild(accessRouteChip('local', 'via direct origin', `The offer arrived through ${request.origin} — a daemon-served origin the rendezvous neither serves nor names.`));
     }
     if (request.origin && accessModelLabel(accessIamModel(accessOverviewModel()).tier) === 'integrated') {
       headRow.appendChild(accessRouteChip('danger', 'integrated tier',
-        'This is an integrated-tier machine and the key arrived over the network. Hosted Connect remains discovery-only; authorize control only from a trusted direct or signed-native surface (docs: trust-tiers).'));
+        'This is an integrated-tier machine and the key arrived over the network. Hosted Connect remains discovery-only; authorize control only from a trusted local console or independently verified direct-mTLS surface (docs: trust-tiers).'));
     }
     if (request.account_hint) {
       headRow.appendChild(request.account_attested
@@ -60429,7 +60430,7 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     const chip = document.createElement('span');
     chip.className = 'acc-chip route-connect';
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
-    chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
+    chip.title = `Compatibility metadata marks this principal's ${capped.binding.replace(/_/g, ' ')} binding as ${capped.ceiling}. The default binary admits no hosted/browser-key control session, regardless of this grant.`;
     row.appendChild(chip);
   }
   const fsScope = grant.fs_scope;
@@ -62527,7 +62528,7 @@ document.addEventListener('keydown', (e) => {
 // Contract: `viewer` arguments are DisplaySlot / PeerDisplayConnection /
 // PeerFileTransferConnection instances; helpers touch only fields the
 // callers already share (`pc`, `_answerApplied`, `_pendingCandidates`,
-// `_heldKeys`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
+// `_heldKeys`, `_heldButtons`, `_lastPointer`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
 // `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`, plus
 // the liveness-guard state this file owns: `_pauseGuard`,
 // `_resumeVideoPending`, `_freezeWatch`, `_freezeWatchGen`).
@@ -62751,19 +62752,34 @@ function displayViewerNormalizePointerEvent(surface, e) {
   };
 }
 
-// Item 3: synthetic-keyup flusher for every currently-held key (not just
-// the 8 modifiers — a latched non-modifier auto-repeats remotely forever).
+// Item 3: synthetic-release flusher for every currently-held key and mouse
+// button (a latched non-modifier auto-repeats remotely forever; a lost mu can
+// leave a drag held across the desktop).
 // Returned closure is stored on `owner._flushHeldKeys` so exit paths that
 // run outside the enter closure (server demotion, release, pane rebuild)
 // can release held keys BEFORE the listeners are removed / authority is
 // gone. Reads `owner._heldKeys` at flush time, like both originals did.
 function displayViewerMakeHeldKeyFlusher(owner, sendControl) {
   return () => {
-    if (!owner._heldKeys) return;
-    for (const code of owner._heldKeys) {
-      sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false });
+    // Snapshot before sending and remove each edge only after the transport
+    // accepted its release. A full-but-still-open RTC channel can reject one
+    // send without closing; retaining that edge lets blur/retry paths try
+    // again. One failed release still must not block attempts for the rest.
+    const keys = Array.from(owner._heldKeys || []);
+    const buttons = Array.from(owner._heldButtons || []);
+    for (const code of keys) {
+      try {
+        if (sendControl({ t: 'ku', code, key: '', shift: false, ctrl: false, alt: false, meta: false })) {
+          owner._heldKeys?.delete(code);
+        }
+      } catch (_) {}
     }
-    owner._heldKeys.clear();
+    const { x = 0.5, y = 0.5 } = owner._lastPointer || {};
+    for (const b of buttons) {
+      try {
+        if (sendControl({ t: 'mu', x, y, b })) owner._heldButtons?.delete(b);
+      } catch (_) {}
+    }
   };
 }
 
@@ -62791,17 +62807,20 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
       return;
     }
     e.preventDefault();
-    owner._heldKeys.add(e.code);
-    sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    if (sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey })) {
+      owner._heldKeys.add(e.code);
+    }
   };
   handlers.keyup = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner)) {
       e.preventDefault();
+      owner._flushHeldKeys?.();
       return;
     }
     e.preventDefault();
-    owner._heldKeys.delete(e.code);
-    sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    if (sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey })) {
+      owner._heldKeys.delete(e.code);
+    }
   };
   handlers.pointerdown = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
@@ -62812,17 +62831,25 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
     target.focus();
     target.setPointerCapture(e.pointerId);
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
-    sendControl({ t: 'md', x, y, b: e.button });
+    owner._lastPointer = { x, y };
+    if (!owner._heldButtons) owner._heldButtons = new Set();
+    if (sendControl({ t: 'md', x, y, b: e.button })) {
+      owner._heldButtons.add(e.button);
+    }
   };
   handlers.pointerup = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
       e.preventDefault();
+      owner._flushHeldKeys?.();
       return;
     }
     e.preventDefault();
     target.releasePointerCapture(e.pointerId);
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
-    sendControl({ t: 'mu', x, y, b: e.button });
+    owner._lastPointer = { x, y };
+    if (sendControl({ t: 'mu', x, y, b: e.button })) {
+      owner._heldButtons?.delete(e.button);
+    }
   };
   handlers.pointermove = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner) || liveCalloutArmedFor(owner)) {
@@ -62830,7 +62857,13 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
       return;
     }
     const { x, y } = displayViewerNormalizePointerEvent(target, e);
+    owner._lastPointer = { x, y };
     sendPointer({ t: 'mm', x, y, buttons: e.buttons });
+  };
+  handlers.pointercancel = (e) => {
+    e.preventDefault();
+    owner._flushHeldKeys?.();
+    try { target.releasePointerCapture(e.pointerId); } catch (_) {}
   };
   handlers.wheel = (e) => {
     if (shouldSuppressDisplayInputForAnnotation(owner)) {
@@ -62853,9 +62886,9 @@ function displayViewerBuildInputHandlers({ owner, target, sendControl, sendPoint
     sendPointer({ t: 'sc', x, y, dx, dy });
   };
   handlers.contextmenu = (e) => e.preventDefault();
-  // Release ALL held keys when the surface loses focus (e.g. Alt+Tab
-  // away). Without this, the remote side thinks they are still held
-  // because no keyup event ever fires for them.
+  // Release ALL held keys/buttons when the surface loses focus (e.g.
+  // Alt+Tab away) or a pointer gesture is cancelled. Without this, the
+  // remote side thinks they are still held because no up event ever fires.
   handlers.blur = () => {
     owner._flushHeldKeys?.();
   };
@@ -64656,11 +64689,15 @@ class DisplaySlot {
     // (close races, full SCTP buffers).
     const sendControl = (msg) => {
       try {
-        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+        if (sendDisplayInputForSlot(this.displayId, msg)) return true;
       } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
+        try {
+          this.controlChannel.send(JSON.stringify(msg));
+          return true;
+        } catch (_) {}
       }
+      return false;
     };
     const sendPointer = (msg) => {
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
@@ -73591,8 +73628,8 @@ function dashboardSetControlLastError(message = '', kind = '') {
 // a button that can only fail on macOS/Windows hosts. Two sources, because
 // each covers a transport the other can't: the displays payload reaches
 // direct dashboards over HTTP, and the dashboard-control status capability
-// reaches Connect dashboards once the channel is up (the HTTP probe is
-// impossible there, so dashboardUpdateTransportStatus re-applies the gate
+  // reaches authenticated dashboard-control tunnels once the channel is up
+  // (the HTTP probe is impossible there, so dashboardUpdateTransportStatus re-applies the gate
 // whenever transport state changes). Declared HERE, before that function's
 // first eval-time call — a later-fragment `let` would be a TDZ trap that
 // kills the whole module.
@@ -75792,7 +75829,6 @@ window.intendantDashboardControl = {
     return dashboardTransport.peerDashboardControlSignal(peerId, params, options);
   },
 };
-
 /* ── static/app/50-control-transport.js ── */
 // Item F4: pointer moves ('mm') deliberately dropped by displayInput's
 // bufferedAmount watermark instead of queueing behind a congested shared
@@ -80767,6 +80803,7 @@ class PeerDisplayConnection {
       this.interactive = false;
       this._boundHandlers = {};
       if (this._heldKeys) this._heldKeys.clear();
+      if (this._heldButtons) this._heldButtons.clear();
       this._enterInteractive();
     }
   }
@@ -81563,8 +81600,12 @@ class PeerDisplayConnection {
     // falls back to channels; no such lane exists to a peer).
     const sendControl = (msg) => {
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        this.controlChannel.send(JSON.stringify(msg));
+        try {
+          this.controlChannel.send(JSON.stringify(msg));
+          return true;
+        } catch (_) {}
       }
+      return false;
     };
     const sendPointer = (msg) => {
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
@@ -81617,6 +81658,7 @@ class PeerDisplayConnection {
       this._flushHeldKeys = null;
     }
     if (this._heldKeys) this._heldKeys.clear();
+    if (this._heldButtons) this._heldButtons.clear();
     const target = this._interactiveTarget;
     if (target) {
       for (const [evt, handler] of Object.entries(this._boundHandlers)) {
@@ -83260,7 +83302,6 @@ async function initDaemons() {
     }
   });
 }
-
 /* ── static/app/53-stats-settings.js ── */
 // ── Activity host filter ──
 //

@@ -10,6 +10,32 @@ fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: 
     !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
 }
 
+/// Bind the display-holder predicate to the exact IAM/peer grant and WebSocket
+/// lifetime that admitted this browser. The display queue retains this guard
+/// and checks it again immediately before injection, so buffered input dies on
+/// grant mutation, peer revocation, or transport teardown even when the holder
+/// map has already returned to its permissive `unclaimed` state.
+fn bind_input_authorizer_to_ws_session(
+    holder_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+    grant: Arc<crate::dashboard_control::DashboardControlGrant>,
+    session_cancel: CancellationToken,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    // Display signaling itself requires only DisplayView. Freeze an explicit
+    // interactive floor into the WebRTC peer so a view-only principal cannot
+    // open `control`, `pointer`, or `clipboard` data channels and mutate the
+    // host. A later upgrade deliberately requires reconnecting; revocation or
+    // downgrade is caught by exact opening-grant revalidation below.
+    let interactive_at_open = grant
+        .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+        .allowed;
+    Arc::new(move || {
+        interactive_at_open
+            && !session_cancel.is_cancelled()
+            && grant.opening_authority_is_current()
+            && holder_authorized()
+    })
+}
+
 /// Cache-backed resync lines for a `/ws` connection that lagged the
 /// outbound broadcast: the same latest-state lines a fresh bootstrap
 /// replays, in the bootstrap block's relative order (usage, live usage,
@@ -82,7 +108,7 @@ pub(crate) async fn ws_outbound_task(
     >,
     mut authority_change_rx: broadcast::Receiver<DisplayInputAuthorityChange>,
     connection_id: String,
-    display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    display_input_authority: Arc<DisplayInputAuthority>,
     session_registry: Option<crate::display::SharedSessionRegistry>,
     bootstrap_caches: crate::dashboard_control::DashboardBootstrapCaches,
     mut bootstrap_flushed_rx: tokio::sync::oneshot::Receiver<()>,
@@ -207,6 +233,13 @@ pub(crate) async fn ws_outbound_task(
                 }
                 match msg {
                     Ok(change) => {
+                        // Holder mutations and broadcast sends are decoupled;
+                        // concurrent writers may enqueue an older event after a
+                        // newer one. Only the event for the live revision may
+                        // update this connection's personalized authority chip.
+                        if !change.is_current(&display_input_authority) {
+                            continue;
+                        }
                         // Personalize: never ship the holder's identity.
                         let state = match &change.holder {
                             Some(h) if h.matches_local_ws(&connection_id) => "you",
@@ -293,7 +326,7 @@ pub(crate) struct WsInboundCtx {
     pub(crate) live_model: String,
     pub(crate) transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
     pub(crate) active_presence: Arc<Mutex<Option<ActivePresence>>>,
-    pub(crate) display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    pub(crate) display_input_authority: Arc<DisplayInputAuthority>,
     pub(crate) authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     pub(crate) federated_authority_subscribers: FederatedAuthoritySubscribers,
     pub(crate) connection_id: String,
@@ -358,6 +391,10 @@ pub(crate) async fn ws_inbound_task(
         tcp_peer_registry,
         session_cancel,
     } = ctx;
+    // Input queue entries retain this shared grant handle. Keeping one Arc per
+    // WebSocket avoids cloning the full IAM snapshot/audit history for every
+    // pointer or keyboard event while preserving live revalidation.
+    let dashboard_control_grant_live = Arc::new(dashboard_control_grant_inbound.clone());
     // Track whether this connection has an active presence model,
     // so we can auto-send PresenceDisconnected if the WebSocket drops
     // without a clean presence_disconnect message (e.g. tab close
@@ -381,6 +418,18 @@ pub(crate) async fn ws_inbound_task(
     // connection — dedupes the warn log only; the denial
     // frame itself is sent for every rejected frame.
     let mut ws_denied_logged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // One composite guard per display, shared by WebRTC and raw `/ws` input.
+    // Pointer-rate frames clone this Arc instead of allocating two trait
+    // objects and capturing the grant/authority map for every event.
+    let mut local_display_input_authorizers: HashMap<u32, Arc<dyn Fn() -> bool + Send + Sync>> =
+        HashMap::new();
+    let mut local_display_input_sources: HashMap<
+        u32,
+        (
+            std::sync::Weak<crate::display::DisplaySession>,
+            Arc<crate::display::BrowserInputSource>,
+        ),
+    > = HashMap::new();
 
     // Per-connection audio transcription buffer.
     // PCM16 bytes are accumulated and drained every ~3s.
@@ -1344,10 +1393,20 @@ pub(crate) async fn ws_inbound_task(
                             // map, or connection IDs.  See
                             // [`build_local_ws_input_authorizer`] for the
                             // closure semantics + tests.
-                            let input_authorized = build_local_ws_input_authorizer(
-                                display_id,
-                                connection_id_inbound.clone(),
-                                Arc::clone(&display_input_authority_inbound),
+                            let input_authorized = Arc::clone(
+                                local_display_input_authorizers
+                                    .entry(display_id)
+                                    .or_insert_with(|| {
+                                        bind_input_authorizer_to_ws_session(
+                                            build_local_ws_input_authorizer(
+                                                display_id,
+                                                connection_id_inbound.clone(),
+                                                Arc::clone(&display_input_authority_inbound),
+                                            ),
+                                            Arc::clone(&dashboard_control_grant_live),
+                                            session_cancel.clone(),
+                                        )
+                                    }),
                             );
                             // F-1.3b2 transport plumbing: local DisplaySlot's
                             // browser doesn't create the
@@ -1368,7 +1427,10 @@ pub(crate) async fn ws_inbound_task(
                                     Some(Arc::clone(&tcp_peer_registry)),
                                     tcp_advertised_addr,
                                     ice_tx,
-                                    input_authorized,
+                                    crate::display::BrowserInputAuthorization::versioned(
+                                        input_authorized,
+                                        display_input_authority_inbound.revision(display_id),
+                                    ),
                                     authority_handler,
                                 )
                                 .await
@@ -1758,16 +1820,22 @@ pub(crate) async fn ws_inbound_task(
                         // every connection can input. See the
                         // `DisplayInputHolder` doc for the full
                         // contract.
-                        let allowed = {
-                            let authority = display_input_authority_inbound
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner());
-                            match authority.get(&display_id) {
-                                Some(entry) => entry.matches_local_ws(&connection_id_inbound),
-                                None => true,
-                            }
-                        };
-                        if !allowed {
+                        let input_authorized = Arc::clone(
+                            local_display_input_authorizers
+                                .entry(display_id)
+                                .or_insert_with(|| {
+                                    bind_input_authorizer_to_ws_session(
+                                        build_local_ws_input_authorizer(
+                                            display_id,
+                                            connection_id_inbound.clone(),
+                                            Arc::clone(&display_input_authority_inbound),
+                                        ),
+                                        Arc::clone(&dashboard_control_grant_live),
+                                        session_cancel.clone(),
+                                    )
+                                }),
+                        );
+                        if !input_authorized() {
                             // Silent drop — matches the "force_disconnect_voice"
                             // convention where demoted connections don't get
                             // per-message denial feedback; the browser already
@@ -1789,10 +1857,34 @@ pub(crate) async fn ws_inbound_task(
                                         None => None,
                                     };
                                 if let Some(session) = session {
-                                    // Fire-and-forget: injection failures
-                                    // are logged by the session's input
-                                    // pump.
-                                    session.enqueue_input(input_event);
+                                    let replace = local_display_input_sources
+                                        .get(&display_id)
+                                        .and_then(|(known, _)| known.upgrade())
+                                        .is_none_or(|known| !Arc::ptr_eq(&known, &session));
+                                    if replace {
+                                        local_display_input_sources.insert(
+                                            display_id,
+                                            (
+                                                Arc::downgrade(&session),
+                                                session.browser_input_source(
+                                                    crate::display::BrowserInputAuthorization::versioned(
+                                                        Arc::clone(&input_authorized),
+                                                        display_input_authority_inbound
+                                                            .revision(display_id),
+                                                    ),
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                    if let Some((_, source)) =
+                                        local_display_input_sources.get(&display_id)
+                                    {
+                                        // Fire-and-forget: the source binds
+                                        // buffered events to this WS lifetime;
+                                        // the pump rechecks that guard at the
+                                        // injection boundary.
+                                        source.enqueue(input_event);
+                                    }
                                 }
                             }
                         }
@@ -1864,11 +1956,11 @@ pub(crate) async fn ws_inbound_task(
                                 session_id,
                                 signal,
                             }) => {
-                                let federated_display_input_allowed =
-                                    peer_identity_allows_operation(
-                                        peer_identity_inbound.as_ref(),
-                                        crate::peer::access_policy::PeerOperation::DisplayInput,
-                                        "peer-webrtc-display",
+                                let federated_display_input_authorized =
+                                    bind_input_authorizer_to_ws_session(
+                                        Arc::new(|| true),
+                                        Arc::clone(&dashboard_control_grant_live),
+                                        session_cancel.clone(),
                                     );
                                 handle_federated_webrtc_signal(
                                     display_id,
@@ -1889,7 +1981,7 @@ pub(crate) async fn ws_inbound_task(
                                     Arc::clone(&display_input_authority_inbound),
                                     authority_change_tx_inbound.clone(),
                                     Arc::clone(&federated_authority_subscribers_inbound),
-                                    federated_display_input_allowed,
+                                    federated_display_input_authorized,
                                 )
                                 .await;
                             }
@@ -2087,6 +2179,9 @@ pub(crate) async fn ws_inbound_task(
             *slot = None;
         }
     }
+    // Invalidate this transport's buffered raw-input frames before authority
+    // returns to the permissive unclaimed state.
+    drop(local_display_input_sources);
     // Also release any display input authority this
     // connection held (phase 5).  Without this, a
     // dangling entry would block other browsers from
@@ -2165,7 +2260,10 @@ pub(crate) async fn ws_inbound_task(
 
 #[cfg(test)]
 mod signaling_ownership_tests {
-    use super::websocket_owns_dashboard_control_session;
+    use super::{bind_input_authorizer_to_ws_session, websocket_owns_dashboard_control_session};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn websocket_rejects_cross_connection_dashboard_control_session_ids() {
@@ -2179,5 +2277,71 @@ mod signaling_ownership_tests {
             "session-opened-elsewhere"
         ));
         assert!(!websocket_owns_dashboard_control_session(&owned, ""));
+    }
+
+    #[test]
+    fn buffered_input_guard_dies_with_holder_or_websocket() {
+        let holder = Arc::new(AtomicBool::new(true));
+        let holder_for_guard = Arc::clone(&holder);
+        let cancel = CancellationToken::new();
+        let guard = bind_input_authorizer_to_ws_session(
+            Arc::new(move || holder_for_guard.load(Ordering::SeqCst)),
+            Arc::new(crate::dashboard_control::DashboardControlGrant::TrustedLocal),
+            cancel.clone(),
+        );
+        assert!(guard());
+        holder.store(false, Ordering::SeqCst);
+        assert!(!guard());
+        holder.store(true, Ordering::SeqCst);
+        cancel.cancel();
+        assert!(!guard(), "transport teardown must invalidate queued input");
+    }
+
+    #[test]
+    fn display_view_grant_cannot_open_interactive_data_channels() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:OBSERVER".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&state, "AA:OBSERVER", "https")
+                .unwrap();
+        let grant = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+            iam_cert_dir: None,
+        };
+        assert!(
+            grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
+        );
+        assert!(
+            !grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        let guard = bind_input_authorizer_to_ws_session(
+            Arc::new(|| true),
+            Arc::new(grant),
+            CancellationToken::new(),
+        );
+        assert!(
+            !guard(),
+            "a view-only display offer must not admit input or clipboard mutation"
+        );
     }
 }

@@ -728,7 +728,7 @@ const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
 const ACCESS_FLEET_KEY = 'intendant_access_fleet_v1';
 const DASHBOARD_ACCESS_PAGE_MODE = /^\/access\/?$/i.test(window.location.pathname || '');
 // The hosted-origin dashboard experiment is retired. Keep the vocabulary for
-// the remaining direct/native transport code, but make URL parameters unable
+// the remaining trusted daemon-origin transport code, but make URL parameters unable
 // to activate it in the default daemon bundle. Connect serves a separate,
 // discovery-only page and never this SPA.
 const DASHBOARD_CONNECT_MODE = false;

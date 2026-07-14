@@ -1,10 +1,11 @@
 //! Embedded authoritative DNS for the delegated fleet subzone
 //! (docs/src/self-hosted-rendezvous.md; docs/src/trust-tiers.md).
 //!
-//! The convenient-direct-path design: the parent zone NS-delegates one
+//! The warning-free discovery design: the parent zone NS-delegates one
 //! subzone (e.g. `fleet.intendant.dev`) to this service, which answers
-//! for exactly that subzone and nothing else — the DNS twin of the
-//! separation from the daemon authority mint. Records served:
+//! for exactly that subzone and nothing else. Because the service controls
+//! this namespace, daemon gateways treat its SNI names as discovery/public
+//! shell only and refuse protected traffic before IAM. Records served:
 //!
 //! - apex `SOA` / `NS` (this server, via the parent-zone glue name);
 //! - `d-<daemon-id>.<zone>` `A`/`AAAA` — addresses a registered daemon

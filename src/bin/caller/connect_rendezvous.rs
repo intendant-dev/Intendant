@@ -5,7 +5,7 @@
 //! touching the control registry, IAM, or enrollment state — including events
 //! from an older or self-hosted service that still forwards signaling. A
 //! Connect account link is discovery metadata, never authentication. Direct
-//! mTLS, local-root access, or the signed native app is the trusted path for
+//! independently verified direct mTLS or local-root access is the trusted path for
 //! daemon control and grant management.
 
 use crate::daemon_identity::DaemonIdentity;
@@ -916,7 +916,7 @@ async fn handle_event(
     // Defense in depth for mixed-version and self-hosted deployments: the
     // current service never enqueues these events, but an older service can.
     // Refuse all three control verbs before consulting the registry. In
-    // particular, `close` must not be allowed to tear down a direct/native
+    // particular, `close` must not be allowed to tear down a local/direct-mTLS
     // session whose id a hosted relay guessed or replayed, and `ice` must not
     // mutate an existing peer's candidate state.
     if let Some(error) = hosted_control_event_refusal(&event) {
@@ -1151,7 +1151,7 @@ fn connect_account_not_authorized_message(
         (None, None) => "This client".to_string(),
     };
     let mut message = format!(
-        "{identity} is not authorized for daemon control through hosted Connect. The default build uses Connect for discovery and route metadata only; open this daemon through local access, direct mTLS, or the signed native app."
+        "{identity} is not authorized for daemon control through hosted Connect. The default build uses Connect for discovery and route metadata only; open this daemon through local access or independently verified direct mTLS. No signed/notarized native release exists for this alpha."
     );
     if let Some(key) = client_key {
         message.push_str(&format!(
@@ -1644,7 +1644,7 @@ mod tests {
         let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(16);
         let tabs = crate::web_gateway::DashboardTabsRegistry::new(
             Arc::new(std::sync::Mutex::new(None)),
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            Arc::new(crate::web_gateway::DisplayInputAuthority::default()),
         );
         let registry = Arc::new(DashboardControlRegistry::new(
             crate::web_gateway::WebGatewayConfig::default(),

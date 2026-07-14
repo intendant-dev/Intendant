@@ -837,6 +837,18 @@ pub(crate) fn extract_host_header(header_text: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Conservative fallback for fleet-origin provenance on HTTP keep-alive.
+/// The listener's accepted SNI is authoritative; this also treats a request
+/// whose Host names any fleet certificate installed during this process as
+/// fleet-origin. A forged Host can therefore only remove authority, never
+/// gain it.
+pub(crate) fn request_names_known_fleet_origin(header_text: &str) -> bool {
+    extract_host_header(header_text)
+        .and_then(|authority| url::Url::parse(&format!("https://{authority}")).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| crate::web_tls::is_fleet_server_name(Some(&host)))
+}
+
 /// Decide whether a cross-origin caller may use the fleet Access APIs.
 /// Allowed origins are: this daemon itself (same-origin requests also send
 /// an Origin header on POST), the macOS app bundle's custom scheme, this

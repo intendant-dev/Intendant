@@ -744,9 +744,11 @@ async function daemonApiHttpStream(method, params, opts, onEvent) {
 
 // ── Remote-http adapter (transport F4) ────────────────────────────────────
 // Cross-daemon fleet calls: the anchor page applies access changes to
-// OTHER daemons by direct cross-origin HTTP — the fleet-CORS rows, with
-// the browser's own identity to that origin (mTLS certificate) as the
-// authentication. This daemon's `authedFetch` bearer stays out of the
+// OTHER daemons at independently verified direct-mTLS URLs — the
+// fleet-CORS rows, with the browser's own identity to that origin (mTLS
+// certificate) as the authentication. A rendezvous-controlled fleet-SNI
+// URL is discovery-only and the daemon rejects this lane there. This
+// daemon's `authedFetch` bearer stays out of the
 // lane on purpose: nothing minted here carries authority there
 // (trust-architecture: authority is only ever minted by the target
 // daemon's local IAM). Naming the target names the transport — no tunnel
@@ -1035,7 +1037,7 @@ function daemonApiAvailability(method, target = null) {
   if (remoteOrigin) {
     // A REMOTE origin's reachability is unknowable without a request;
     // the honest answer is lane presence — the descriptor names the
-    // methods fleet daemons serve over direct HTTP.
+    // methods fleet daemons serve over independently verified direct HTTP.
     return DAEMON_API_HTTP_MAP[method]
       ? { ok: true, reason: 'http-only' }
       : { ok: false, reason: 'never' };

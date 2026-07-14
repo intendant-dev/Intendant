@@ -1,5 +1,5 @@
 //! Fleet certificates: a real, browser-trusted certificate for this
-//! daemon's fleet name (docs/src/trust-tiers.md; the convenient direct
+//! daemon's fleet name (docs/src/trust-tiers.md; the warning-free discovery
 //! path). The rendezvous serves a delegated DNS subzone and this daemon
 //! owns exactly one name under it — `d-<hash>.<zone>`, derived from its
 //! Connect daemon id. Flow, all daemon-side:
@@ -17,10 +17,12 @@
 //!    beside the access certs; a background loop renews it.
 //!
 //! Honest limits: certificate names appear in public CT logs (the label
-//! is an opaque hash for exactly that reason), and a hostile zone
-//! operator could mint certificates for fleet names — enrolled browsers
-//! stay safe via key verification, and CT makes mis-issuance public
-//! evidence.
+//! is an opaque hash for exactly that reason), and a hostile zone operator
+//! can redirect a fleet name and mint a certificate for it. CT makes that
+//! issuance public evidence, but evidence is not an authority anchor: the
+//! gateway serves only public shell/discovery bytes on fleet-SNI connections
+//! and rejects protected HTTP, MCP, signaling, and WebSocket access before it
+//! resolves browser mTLS or daemon IAM authority.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -57,8 +59,8 @@ pub struct FleetCertStatus {
     pub last_error: Option<String>,
     /// Addresses last published for the name (what the A/AAAA records say).
     pub addresses: Vec<String>,
-    /// Certificate Transparency tripwire (docs/src/trust-tiers.md, first
-    /// contact rung two): `unchecked` | `ok` | `alert`. An `alert` means
+    /// Certificate Transparency tripwire (docs/src/trust-tiers.md, fleet
+    /// discovery route): `unchecked` | `ok` | `alert`. An `alert` means
     /// the public CT logs hold a certificate for this daemon's name that
     /// this daemon never requested — the fleet-zone operator (or a CA)
     /// minted one, which is exactly the betrayal the rung's security
@@ -99,6 +101,13 @@ fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
 /// fleet_dns hint. Also loads any existing on-disk certificate state the
 /// first time the name is learned.
 pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) {
+    if let Some(name) = name.as_deref() {
+        // The rendezvous-assigned public name is never an authority anchor,
+        // regardless of whether its WebPKI certificate has been issued or
+        // installed yet. Register provenance before updating live state so
+        // gateway requests fail closed during name/certificate transitions.
+        crate::web_tls::register_fleet_server_name(name);
+    }
     let newly_named = {
         let mut status = registry().lock().expect("fleet cert status poisoned");
         let newly_named = name.is_some() && status.name != name;
@@ -348,13 +357,13 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
 }
 
 /* ── Certificate Transparency tripwire ──
-The fleet rung's security argument is "the zone operator can only betray
-loudly": a hijack needs a mis-issued certificate, and browsers only
-accept CT-logged certificates. This monitor turns that in-principle
-evidence into an actual alarm — the daemon records the serials of every
-certificate IT obtained and periodically asks the public CT indexes
-whether its name carries any it didn't. Advisory by nature (crt.sh is a
-best-effort public service); failures are reported, never alarmed. */
+A fleet-name hijack needs a certificate browsers accept, and public CAs log
+those certificates to CT. This monitor turns that evidence into an alarm —
+the daemon records the serials of every certificate IT obtained and
+periodically asks the public CT indexes whether its name carries any it
+didn't. It is diagnostic, not an authorization control: fleet-SNI traffic is
+discovery-only even when this check is healthy. Advisory by nature (crt.sh is
+a best-effort public service); failures are reported, never alarmed. */
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OwnCertRecord {

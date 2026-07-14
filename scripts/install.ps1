@@ -6,8 +6,9 @@
 .DESCRIPTION
     Stands up a daemon and optionally links its route to Connect. The
     one-time claim code grants no daemon access and changes no IAM. Establish
-    root separately through the machine's local console, the signed native
-    app, or direct mTLS; this hosted installer never accepts an owner key.
+    root separately through the machine's local console or direct mTLS. The
+    packaged macOS app only bridges its own bundled local daemon; this hosted
+    installer never accepts an owner key.
 
     One-liner (PowerShell):
       & ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
@@ -134,7 +135,7 @@ if ($Service) {
     Say "done. Start it with:"
     Say "  `"$daemonExe`" $($daemonArgs -join ' ')"
 } else {
-    Say "starting the daemon -- its one-time Connect code links discovery only and grants no access. Establish owner through local console, signed native app, or direct mTLS."
+    Say "starting the daemon -- its one-time Connect code links discovery only and grants no access. Establish owner through this machine's local console or direct mTLS."
     & $daemonExe @daemonArgs
     exit $LASTEXITCODE
 }

@@ -307,11 +307,7 @@ pub(crate) async fn api_display_webrtc_offer_response(
         });
     }
 
-    let input_authorized = dashboard_display_input_authorizer(
-        runtime.display_authority.clone(),
-        runtime.session_id.clone(),
-        display_id,
-    );
+    let input_authorized = dashboard_display_interactive_authorizer(runtime, display_id);
     let authority_handler = crate::display::webrtc::noop_authority_handler();
     match display_session
         .handle_offer(
@@ -321,7 +317,14 @@ pub(crate) async fn api_display_webrtc_offer_response(
             Some(Arc::clone(&runtime.tcp_peer_registry)),
             runtime.tcp_advertised,
             ice_tx,
-            input_authorized,
+            crate::display::BrowserInputAuthorization::versioned(
+                input_authorized,
+                runtime
+                    .display_authority
+                    .as_ref()
+                    .expect("display offer requires authority bridge")
+                    .input_revision(display_id),
+            ),
             authority_handler,
         )
         .await
@@ -392,14 +395,31 @@ pub(crate) async fn active_display_session(
     registry.get(display_id)
 }
 
-pub(crate) fn dashboard_display_input_authorizer(
-    display_authority: Option<DashboardDisplayAuthorityBridge>,
-    session_id: String,
+pub(crate) fn dashboard_display_interactive_authorizer(
+    runtime: &ControlRuntime,
     display_id: u32,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
-    Arc::new(move || match display_authority.as_ref() {
-        Some(bridge) => bridge.input_authorized(&session_id, display_id),
-        None => true,
+    // The signaling method itself has a DisplayView floor. Freeze the
+    // separate interactive decision into the peer so an observer cannot use
+    // `control`, `pointer`, or `clipboard` data channels as a side door. A
+    // later authority upgrade requires reconnecting; exact-grant checks make
+    // every downgrade/revocation fail closed immediately.
+    let interactive_at_open = runtime
+        .grant
+        .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+        .allowed;
+    let display_authority = runtime.display_authority.clone();
+    let session_id = runtime.session_id.clone();
+    let grant = runtime.grant.clone();
+    let shutdown = runtime.shutdown.clone();
+    Arc::new(move || {
+        interactive_at_open
+            && !shutdown.is_cancelled()
+            && grant.opening_authority_is_current()
+            && match display_authority.as_ref() {
+                Some(bridge) => bridge.input_authorized(&session_id, display_id),
+                None => true,
+            }
     })
 }
 
@@ -3180,6 +3200,36 @@ mod tests {
     use crate::dashboard_control::tests::runtime;
     use crate::*;
 
+    fn observer_display_grant() -> DashboardControlGrant {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:TUNNEL-OBSERVER".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:TUNNEL-OBSERVER",
+            "https",
+        )
+        .unwrap();
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+            iam_cert_dir: None,
+        }
+    }
+
     /// The SPA mirrors the action-message allowlist as
     /// `DASHBOARD_ACTION_MSG_RPC_ACTIONS` (static/app/31-init-identity-fleet.js)
     /// to pick the RPC lane before dispatching. That copy can't derive from
@@ -3705,6 +3755,37 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("display_input_authority_state")));
+    }
+
+    #[test]
+    fn display_signal_viewer_cannot_gain_interactive_data_channels() {
+        let mut rt = runtime();
+        rt.grant = observer_display_grant();
+        assert!(
+            rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
+        );
+        assert!(
+            !rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        let guard = dashboard_display_interactive_authorizer(&rt, 0);
+        assert!(
+            !guard(),
+            "DisplayView-only signaling must not authorize input or clipboard channels"
+        );
+    }
+
+    #[test]
+    fn interactive_display_guard_dies_with_control_session() {
+        let rt = runtime();
+        let guard = dashboard_display_interactive_authorizer(&rt, 0);
+        assert!(guard());
+        rt.shutdown.cancel();
+        assert!(!guard());
     }
 
     #[tokio::test]

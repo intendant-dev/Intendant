@@ -1962,7 +1962,7 @@ pub(crate) fn verify_ed25519_b64u(
 /// queue/pending mutation prevents an upgraded service from reaching it.
 fn reject_hosted_control_api<T>() -> ApiResult<T> {
     Err(ApiError::forbidden(
-        "hosted daemon control is unavailable in this build; use a trusted local, signed-native, or direct-mTLS client",
+        "hosted daemon control is unavailable in this build; use a trusted local or independently verified direct-mTLS client (no signed/notarized native release exists for this alpha)",
     ))
 }
 

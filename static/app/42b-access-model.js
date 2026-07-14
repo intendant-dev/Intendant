@@ -1714,8 +1714,8 @@ function accessOverviewModel() {
         peer_profile_grants: true,
         user_client_grants: true,
         principal_binding: 'root_peer_and_local_user_client',
-        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate'],
-        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to trusted local sessions or browser mTLS certificates. Browser identity-key and Connect account records do not authenticate alpha control traffic.',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'agent_session', 'local_process'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, approved daemon peers, browser/native mTLS identities, supervised agent sessions, MCP token holders, and trusted local-process grants. Browser-key records can verify peer attribution, but neither they nor Connect-account records become the controlling IAM principal for alpha control traffic.',
       },
       role_ceilings: {
         connect_account: 'role:none',
@@ -2310,7 +2310,7 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
 const ACCESS_GRANT_KIND_CHOICES = [{
   value: 'client_key',
   title: 'A browser identity record (inactive)',
-  desc: 'A browser identity record for future direct authentication. In this alpha it is not an active sign-in credential: use loopback, the native app’s mTLS bridge, or a direct mTLS client certificate. Hosted Connect never exercises the grant.',
+  desc: 'A browser identity record for future direct authentication. In this alpha it is not an active sign-in credential: use loopback or an independently verified direct-mTLS client certificate. Hosted Connect never exercises the grant, and no signed-native remote anchor ships.',
 }, {
   value: 'browser_certificate',
   title: 'A browser certificate',
@@ -2328,7 +2328,8 @@ const ACCESS_ROLE_PICKER_ORDER = [
 
 /* Grant fanout: the daemons this page can apply a grant to, each with the
    channel it would use. 'self' uses the normal session; 'remote' is a
-   direct cross-origin call to a fleet daemon (mTLS in the browser, origin
+   direct cross-origin call to a fleet daemon's independently verified mTLS
+   URL (the browser certificate is admitted there and the caller origin is
    allowlisted daemon-side); 'connect-only' targets have no direct route
    from this page. Every write is still authorized by the target daemon. */
 function accessGrantFanoutTargets() {

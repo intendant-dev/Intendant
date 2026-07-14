@@ -71,8 +71,11 @@ impl PeerFileTransferAuthorization {
             (Some(opening), Some(cert_dir)) => {
                 let now_unix = crate::access::client_key::now_unix_ms() / 1000;
                 matches!(
-                    crate::peer::access_policy::lookup_identity(cert_dir, &self.fingerprint),
-                    Ok(Some(current)) if current == *opening && current.is_active(now_unix)
+                    crate::peer::access_policy::lookup_identity_cached_arc(
+                        cert_dir,
+                        &self.fingerprint,
+                    ),
+                    Ok(Some(current)) if current.as_ref() == opening && current.is_active(now_unix)
                 )
             }
             _ => false,

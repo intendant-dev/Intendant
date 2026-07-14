@@ -1,9 +1,12 @@
 //! Local Access/IAM state.
 //!
 //! This is deliberately a local daemon-owned access model. The daemon can
-//! distinguish trusted owner/root dashboard sessions, daemon peer identities, and
-//! active user/client records bound to stable browser identity keys or mTLS.
-//! Connect account records are discovery/audit metadata and never authenticate.
+//! distinguish trusted owner/root dashboard sessions, approved daemon peers,
+//! browser/native mTLS identities, supervised agent sessions, and trusted local
+//! processes. Browser `client_key` records are enrollment/audit records only in
+//! this alpha: peer offers can verify them for attribution, but no request
+//! ingress admits them as the authority-bearing IAM principal. Connect account
+//! records are also discovery/audit metadata and never authenticate.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -332,14 +335,19 @@ pub struct AccessPrincipal {
     pub organization: Option<Value>,
     #[serde(default)]
     pub authn: Vec<Value>,
-    /// The authn binding kind that actually authenticated this session
-    /// (e.g. `client_key`, `connect_account`, `browser_mtls_cert`). Role
-    /// ceilings key off this, not the principal kind, because one principal
-    /// (a `human_user`) can carry several bindings of different provenance.
+    /// The authn binding kind that actually authenticated this session (for
+    /// example `browser_mtls_cert`, `agent_session`, or `loopback_mcp`). Legacy
+    /// `client_key` / `connect_account` values can remain in stored records.
+    /// Peer offers may verify a client key for attribution, but no alpha request
+    /// ingress admits either kind as its controlling IAM principal. Role ceilings
+    /// key off this, not the principal kind, because one principal (a
+    /// `human_user`) can carry several bindings of different provenance.
     #[serde(default)]
     pub authn_kind: Option<String>,
     /// Normalized value of the binding that authenticated this request
-    /// (certificate fingerprint, browser-key fingerprint, session id, …).
+    /// (certificate fingerprint, session id, local-process id, …). Legacy
+    /// browser-key fingerprints can remain in stored/session records, but are
+    /// not an alpha ingress proof.
     /// This is deliberately distinct from the principal id: one human
     /// principal may carry several certificates, and follow-up signaling
     /// must stay bound to the exact certificate that opened the session.
@@ -349,9 +357,10 @@ pub struct AccessPrincipal {
     /// binding carries one (client keys do).
     #[serde(default)]
     pub authn_origin: Option<String>,
-    /// Daemon-stamped route provenance. `true` only when this session
-    /// arrived through the hosted Connect offer lane; stored/client-sent
-    /// origin strings cannot clear it.
+    /// Legacy daemon-stamped route provenance. `true` identifies a session
+    /// attributed to the retired hosted Connect offer lane and makes the
+    /// evaluator fail closed; no alpha ingress creates such a session.
+    /// Stored/client-sent origin strings cannot clear it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hosted_connect: bool,
 }
@@ -451,6 +460,31 @@ impl AccessPrincipal {
             } else {
                 Some(fingerprint)
             },
+            authn_origin: None,
+            hosted_connect: false,
+        }
+    }
+
+    /// Authority-free HTTP bytes (the dashboard shell/static assets, public
+    /// discovery, and signed-document doorbells) do not need a controlling
+    /// principal. Keep those requests at `role:none` even on loopback and
+    /// even when a browser happens to present a client certificate, so merely
+    /// fetching public bytes cannot enter root/IAM resolution.
+    pub fn authority_free_http(transport: impl Into<String>) -> Self {
+        Self {
+            id: "principal:anonymous:http".to_string(),
+            kind: "anonymous".to_string(),
+            label: "Authority-free HTTP request".to_string(),
+            source: "public-http".to_string(),
+            role_id: "role:none".to_string(),
+            grant_id: None,
+            transport: transport.into(),
+            peer_profile: None,
+            account: None,
+            organization: None,
+            authn: Vec::new(),
+            authn_kind: None,
+            authn_binding: None,
             authn_origin: None,
             hosted_connect: false,
         }
@@ -678,7 +712,7 @@ impl LocalIamState {
             // and the retired CLI `--owner` path could pin root to a browser
             // identity key whose hosted provenance was unknowable. Revoke
             // both rather than silently downgrading them, and require trusted
-            // mTLS/native re-enrollment. Existing Connect account-route
+            // direct-mTLS re-enrollment. Existing Connect account-route
             // records live outside IAM and survive as metadata.
             for binding in HOSTED_CEILING_BINDINGS {
                 self.role_ceilings
@@ -737,7 +771,7 @@ impl LocalIamState {
                     action: "revoke_legacy_owner_browser_key_bootstrap".to_string(),
                     target_id: "owner-bootstrap".to_string(),
                     summary: format!(
-                        "Revoked {owner_bootstrap_revoked} retired --owner browser-key grant(s); mTLS/native re-enrollment required"
+                        "Revoked {owner_bootstrap_revoked} retired --owner browser-key grant(s); direct-mTLS re-enrollment required"
                     ),
                 });
             }
@@ -915,16 +949,16 @@ pub fn seed_generated_browser_mtls_owner_root(cert_dir: &Path) -> AccessResult<b
     })
 }
 
-/// Resolve the request-time migration for pre-marker direct-mTLS installs.
+/// Resolve the compatibility migration for pre-marker direct-mTLS installs.
 ///
-/// The caller must pass a fingerprint extracted from a certificate already
-/// verified by the local access CA. CA validity alone is deliberately
-/// insufficient: peer/scoped certificates share that CA. Only the exact
-/// locally generated `client.crt` fingerprint may receive the compatibility
-/// root grant, or an already-persisted browser-certificate binding may be
-/// honored. Unknown CA-valid certificates remain ungranted. A separate sticky
-/// marker records completion so losing `iam.json` can never make a later
-/// certificate root.
+/// This primitive is used only by trusted setup/startup paths. Request
+/// authentication is read-only and must never call it. The caller passes the
+/// fingerprint of the exact locally generated `client.crt`; CA validity alone
+/// is deliberately insufficient because peer/scoped certificates share that
+/// CA. An already-persisted browser-certificate binding is honored, while
+/// unknown CA-valid certificates remain ungranted. A separate sticky marker
+/// records completion so losing `iam.json` can never make a later certificate
+/// root.
 pub fn initialize_browser_mtls_root_if_needed(
     cert_dir: &Path,
     fingerprint: &str,
@@ -986,6 +1020,24 @@ pub fn initialize_browser_mtls_root_if_needed(
         write_browser_mtls_initialized_marker(cert_dir)?;
         Ok((state.clone(), false))
     })
+}
+
+/// Trusted daemon-startup migration for access stores created before setup
+/// persisted the generated owner certificate in local IAM.
+///
+/// This is deliberately separate from request authentication: fetching a
+/// dashboard asset or API route must never mint root. The migration is rooted
+/// only in the exact `client.crt` already generated in the daemon-owned access
+/// directory, and [`initialize_browser_mtls_root_if_needed`] preserves an
+/// explicit scoped/revoked binding instead of upgrading it.
+pub fn migrate_generated_browser_mtls_owner_root_at_startup(cert_dir: &Path) -> AccessResult<bool> {
+    let marker = browser_mtls_initialized_path(cert_dir);
+    if marker.exists() || !cert_dir.join("client.crt").exists() {
+        return Ok(false);
+    }
+    let fingerprint = super::certs::read_owner_client_cert_fingerprint(cert_dir)?;
+    let _ = initialize_browser_mtls_root_if_needed(cert_dir, &fingerprint)?;
+    Ok(marker.exists())
 }
 
 fn load_state_unlocked(cert_dir: &Path) -> AccessResult<(LocalIamState, bool)> {
@@ -1087,7 +1139,7 @@ fn save_state_locked(cert_dir: &Path, state: &LocalIamState) -> AccessResult<()>
     // fingerprint re-check below is the correctness backbone, so a lost
     // refresh only costs one re-parse.
     if let Some(fingerprint) = iam_state_fingerprint(&path) {
-        store_cached_iam_state(&path, fingerprint, normalized);
+        let _ = store_cached_iam_state(&path, fingerprint, normalized);
     }
     Ok(())
 }
@@ -1149,7 +1201,12 @@ fn iam_state_cache(
 
 const IAM_STATE_CACHE_MAX_DIRS: usize = 8;
 
-fn store_cached_iam_state(path: &Path, fingerprint: IamStateFingerprint, state: LocalIamState) {
+fn store_cached_iam_state(
+    path: &Path,
+    fingerprint: IamStateFingerprint,
+    state: LocalIamState,
+) -> std::sync::Arc<LocalIamState> {
+    let state = std::sync::Arc::new(state);
     let mut cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= IAM_STATE_CACHE_MAX_DIRS && !cache.contains_key(path) {
         cache.clear();
@@ -1158,9 +1215,10 @@ fn store_cached_iam_state(path: &Path, fingerprint: IamStateFingerprint, state: 
         path.to_path_buf(),
         IamStateCacheEntry {
             fingerprint,
-            state: std::sync::Arc::new(state),
+            state: std::sync::Arc::clone(&state),
         },
     );
+    state
 }
 
 /// [`load_state`] behind a stat-fingerprint cache: the per-request read
@@ -1170,12 +1228,12 @@ fn store_cached_iam_state(path: &Path, fingerprint: IamStateFingerprint, state: 
 /// invalidation alone — every call re-checks the fingerprint, so writers
 /// that bypass [`save_state`] (other processes, hand edits) are picked up
 /// on the next request. Parse errors are never cached.
-pub fn load_state_cached(cert_dir: &Path) -> AccessResult<LocalIamState> {
+pub fn load_state_cached_arc(cert_dir: &Path) -> AccessResult<std::sync::Arc<LocalIamState>> {
     let path = iam_state_path(cert_dir);
     let Some(fingerprint) = iam_state_fingerprint(&path) else {
         // Missing file: same contract as load_state. Nothing to cache —
         // the default is cheap relative to a request.
-        return Ok(LocalIamState::default());
+        return Ok(std::sync::Arc::new(LocalIamState::default()));
     };
     {
         let cache = iam_state_cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -1183,20 +1241,25 @@ pub fn load_state_cached(cert_dir: &Path) -> AccessResult<LocalIamState> {
             .get(&path)
             .filter(|entry| entry.fingerprint == fingerprint)
         {
-            return Ok((*entry.state).clone());
+            return Ok(std::sync::Arc::clone(&entry.state));
         }
     }
     let state = load_state(cert_dir)?;
     // Re-stat AFTER the read: if the file changed between the stat and the
     // read, caching the read under the pre-read fingerprint could pin a
     // torn view. Matching fingerprints prove read and stat saw one file.
-    match iam_state_fingerprint(&path) {
-        Some(after) if after == fingerprint => {
-            store_cached_iam_state(&path, fingerprint, state.clone());
-        }
-        _ => {}
+    if matches!(iam_state_fingerprint(&path), Some(after) if after == fingerprint) {
+        return Ok(store_cached_iam_state(&path, fingerprint, state));
     }
-    Ok(state)
+    Ok(std::sync::Arc::new(state))
+}
+
+/// Owned compatibility wrapper for callers that intentionally mutate or
+/// retain an independent IAM snapshot. Hot authorization paths should prefer
+/// [`load_state_cached_arc`] so an unchanged state does not deep-clone its
+/// principals, grants, and audit history on every input frame.
+pub fn load_state_cached(cert_dir: &Path) -> AccessResult<LocalIamState> {
+    load_state_cached_arc(cert_dir).map(|state| (*state).clone())
 }
 
 struct UserClientBinding {
@@ -2143,6 +2206,14 @@ fn now_unix_ms() -> u64 {
 }
 
 pub fn overview_metadata(load: &LoadedIamState) -> Value {
+    const ENFORCED_PRINCIPAL_KINDS: &[&str] = &[
+        "root_session",
+        "peer_daemon",
+        "human_user",
+        "browser_certificate",
+        "agent_session",
+        "local_process",
+    ];
     json!({
         "schema_version": load.state.schema_version,
         "state_path": load.path.display().to_string(),
@@ -2165,8 +2236,8 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "peer_profile_grants": true,
             "user_client_grants": true,
             "principal_binding": "root_peer_and_local_user_client",
-            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "client_key", "agent_session", "local_process"],
-            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys or browser mTLS certificates. Connect account records are metadata only and never authenticate. /mcp requests bind to supervised agent sessions (session_id + token), the MCP token holder, or the local loopback principal, and every tool call is evaluated per-operation."
+            "enforced_principal_kinds": ENFORCED_PRINCIPAL_KINDS,
+            "reason": "The daemon enforces trusted owner/root dashboard sessions, approved daemon peer profiles, browser/native mTLS identities (including mTLS-bound human-user grants), supervised agent sessions, MCP token holders, and trusted local-process grants. Browser client-key and Connect-account records remain available for enrollment, fleet signatures, attribution, migration, and audit. Peer offers can verify a browser key for attribution, but no alpha request ingress admits either record kind as its controlling IAM principal. Every admitted request is still evaluated per operation."
         },
         "role_ceilings": load.state.role_ceilings.clone(),
         "hosted_origins": load.state.hosted_origins.clone(),
@@ -2501,11 +2572,11 @@ pub fn is_hosted_session(state: &LocalIamState, principal: &AccessPrincipal) -> 
 /// Origin class of a session for the custody trail
 /// (docs/src/trust-tiers.md): `hosted` (Connect account or a browser key
 /// enrolled from one of `hosted_origins`), `direct` (a key or mTLS
-/// certificate on a daemon-served origin — fleet-name origins included:
-/// daemon-served for code, rendezvous-named for routing; the finer
-/// routing distinction is [`origin_route_class`]), `local` (the owner's
+/// certificate admitted on an independently reached daemon origin), `local` (the owner's
 /// own dashboard / loopback), or `peer` (a federated daemon).
-/// Classification mirrors [`is_hosted_session`]'s provenance rules.
+/// Classification mirrors [`is_hosted_session`]'s provenance rules. A public
+/// fleet-name connection never reaches this custody classifier: the gateway
+/// rejects protected traffic on fleet SNI before constructing an authority.
 pub fn session_origin_class(
     hosted_origins: &[String],
     principal: &AccessPrincipal,
@@ -2547,14 +2618,16 @@ pub fn session_origin_class(
 ///
 /// - `hosted`: one of `hosted_origins` — the rendezvous serves the code.
 /// - `fleet`: a name under the rendezvous's delegated fleet zone — the
-///   daemon serves the code, but the rendezvous names the route (it could
-///   hijack DNS and mint a certificate; active-only, CT-logged).
+///   daemon may serve public discovery code, but the rendezvous names the
+///   route and can redirect it or mint another certificate. The gateway
+///   therefore admits no protected request on this route; CT is diagnostic.
 /// - `direct`: any other explicit origin (typed IP, mDNS, own domain).
 /// - `unknown`: no origin recorded (pre-origin enrollments).
 ///
-/// Distinct from [`session_origin_class`]: that classifies for custody
-/// (code provenance), this classifies for approval decisions (route
-/// provenance). A fleet origin is `direct`-grade there and `fleet` here.
+/// Distinct from [`session_origin_class`]: that classifies admitted sessions
+/// for custody, while this classifies historical/staged enrollment records by
+/// route provenance. Fleet traffic is discovery-only and creates no admitted
+/// session to classify.
 pub fn origin_route_class(
     origin: &str,
     hosted_origins: &[String],
@@ -3261,6 +3334,14 @@ mod tests {
             .collect()
     }
 
+    fn quoted_snake_case_ids(text: &str) -> std::collections::BTreeSet<String> {
+        let pattern = regex::Regex::new(r"'([a-z][a-z0-9_]*)'").unwrap();
+        pattern
+            .captures_iter(text)
+            .map(|caps| caps[1].to_string())
+            .collect()
+    }
+
     #[test]
     fn dashboard_fallback_role_catalog_mirrors_builtin_roles() {
         let app = app_html();
@@ -3327,6 +3408,29 @@ mod tests {
         assert!(
             app.contains("Nothing (immutable)"),
             "the dashboard should state the compiled discovery-only policy"
+        );
+    }
+
+    #[test]
+    fn dashboard_fallback_enforced_principal_kinds_mirror_overview() {
+        let app = app_html();
+        let fallback = slice_between(app, "enforced_principal_kinds: [", "],");
+        let load = LoadedIamState {
+            path: PathBuf::new(),
+            state: LocalIamState::default(),
+            status: IamStateStatus::Missing,
+        };
+        let expected: std::collections::BTreeSet<String> = overview_metadata(&load)["enforcement"]
+            ["enforced_principal_kinds"]
+            .as_array()
+            .expect("overview enforced_principal_kinds array")
+            .iter()
+            .map(|kind| kind.as_str().expect("principal kind string").to_string())
+            .collect();
+        assert_eq!(
+            quoted_snake_case_ids(fallback),
+            expected,
+            "dashboard fallback enforced_principal_kinds drifted from IAM overview"
         );
     }
 
@@ -3586,7 +3690,7 @@ mod tests {
                 .unwrap()
                 .status,
             "revoked",
-            "retired browser-key owner bootstrap must require mTLS/native re-enrollment"
+            "retired browser-key owner bootstrap must require direct-mTLS re-enrollment"
         );
         assert!(migrated
             .audit_events
@@ -3645,6 +3749,37 @@ mod tests {
                 .is_none()
         );
         assert_eq!(after.grants.len(), 1, "unknown cert must not add a grant");
+    }
+
+    #[test]
+    fn trusted_startup_migrates_generated_owner_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_fingerprint = generate_owner_access_cert(tmp.path());
+
+        assert!(migrate_generated_browser_mtls_owner_root_at_startup(tmp.path()).unwrap());
+        assert!(browser_mtls_initialized_path(tmp.path()).exists());
+        let state = load_state(tmp.path()).unwrap();
+        assert!(principal_for_browser_mtls_cert(
+            &state,
+            &owner_fingerprint,
+            "test-startup-owner-mtls"
+        )
+        .is_some_and(|principal| principal.role_id == "role:root"));
+
+        assert!(
+            !migrate_generated_browser_mtls_owner_root_at_startup(tmp.path()).unwrap(),
+            "the sticky marker makes subsequent startups a no-op"
+        );
+        assert_eq!(load_state(tmp.path()).unwrap().grants.len(), 1);
+    }
+
+    #[test]
+    fn trusted_startup_without_generated_owner_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(!migrate_generated_browser_mtls_owner_root_at_startup(tmp.path()).unwrap());
+        assert!(!iam_state_path(tmp.path()).exists());
+        assert!(!browser_mtls_initialized_path(tmp.path()).exists());
     }
 
     #[test]
@@ -3866,6 +4001,7 @@ mod tests {
             .any(|p| p.id == "principal:cache-a"));
         // Second read (a cache hit) is identical.
         assert_eq!(load_state_cached(tmp.path()).unwrap(), cached);
+        assert_eq!(*load_state_cached_arc(tmp.path()).unwrap(), cached);
 
         // A writer that bypasses save_state (another process, a hand
         // edit) must be picked up by the per-call fingerprint re-check —

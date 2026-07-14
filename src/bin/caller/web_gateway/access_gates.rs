@@ -334,8 +334,9 @@ pub(crate) fn ws_frame_operation(
 /// once-per-frame-type warning logged — so the caller drops the frame.
 /// Root-equivalent grants (the trusted-local dashboard and explicitly
 /// enrolled direct-mTLS root principals) short-circuit to allow inside the
-/// evaluator; the check is pure in-memory, safe at keystroke/audio-frame
-/// rates.
+/// evaluator. Scoped grants revalidate their backing IAM or peer identity
+/// record through stat-fingerprint caches on every frame, so revocation is
+/// live without reparsing unchanged files at keystroke/audio-frame rates.
 pub(crate) fn deny_ws_frame_if_unauthorized(
     grant: &crate::dashboard_control::DashboardControlGrant,
     json: &serde_json::Value,

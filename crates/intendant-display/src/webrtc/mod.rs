@@ -157,6 +157,14 @@ pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
     command_tx: mpsc::Sender<Command>,
+    /// Live capability gate for both directions of clipboard sync. Display
+    /// viewing alone must not disclose or mutate the host clipboard; callers
+    /// bind this to the same authority that admits interactive display input.
+    clipboard_authorized: crate::BrowserInputAuthorization,
+    /// Production display peers retain the source so `close()` can invalidate
+    /// input/clipboard synchronously, before the async driver observes its
+    /// cancellation token. Direct constructor tests may leave this absent.
+    interactive_source: Option<Arc<crate::BrowserInputSource>>,
     /// **Phase 4d.1**: per-peer recent observed send bitrate in
     /// bits/sec, computed by the driver every `TWCC_POLL_INTERVAL`
     /// from outbound `bytes_sent` deltas across one polling window.
@@ -369,6 +377,8 @@ impl WebRtcPeer {
         Self {
             peer_id,
             command_tx,
+            clipboard_authorized: crate::BrowserInputAuthorization::new(Arc::new(|| true)),
+            interactive_source: None,
             observed_send_bitrate_rx,
             remote_inbound_health_rx,
             twcc_health_rx,
@@ -555,7 +565,10 @@ impl TileDataChannel {
 /// Commands sent from the public `WebRtcPeer` handle to the driver task.
 pub(crate) enum Command {
     AddIceCandidate(String),
-    SendClipboard(ClipboardContent),
+    SendClipboard {
+        content: ClipboardContent,
+        admitted_revision: Option<u64>,
+    },
     /// F-1.2: federated authority state push to the
     /// `display_input_authority` data channel. If the channel is not
     /// yet open, the driver queues the message in

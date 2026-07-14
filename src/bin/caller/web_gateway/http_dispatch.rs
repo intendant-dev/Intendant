@@ -69,6 +69,7 @@ pub(crate) async fn serve_http_request(
     peer_addr: std::net::SocketAddr,
     source_hint: String,
     is_tls: bool,
+    tls_fleet_origin: bool,
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_connection_identity: Option<PeerConnectionIdentity>,
@@ -264,6 +265,88 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path);
+
+    // A public fleet/WebPKI name is convenient discovery, but it is not an
+    // authority anchor: the fleet DNS operator can serve JavaScript at that
+    // exact origin and later point it at this daemon. SOP, Origin checks, and
+    // a browser-held client certificate cannot distinguish that code from the
+    // daemon's own page. Keep the endpoint strictly discovery-only before any
+    // IAM, loopback, browser-mTLS, process-token `/mcp`, or signaling context
+    // is resolved. SNI provenance comes from rustls certificate selection,
+    // never this request's mutable Host header.
+    let fleet_origin = tls_fleet_origin || request_names_known_fleet_origin(header_text);
+    if fleet_origin && !authority_free_request {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::json!({
+            "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
+        })
+        .to_string();
+        let response = json_response("403 Forbidden", body);
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
+    // Browser-origin rejection precedes transport-authority resolution for
+    // every route that is not explicitly authority-free. A certificate
+    // attached by the browser, the loopback fallback, or an old IAM file must
+    // never be consulted on behalf of foreign hosted code. Fetch Metadata
+    // closes the navigation/subresource case where browsers omit Origin.
+    // Public signed-document doorbells remain cross-origin by design; their
+    // payload signature is the authority and they receive role:none below.
+    let request_origin = extract_origin_header(header_text);
+    let mut fleet_cors_origin: Option<String> = None;
+    if let Some(origin) = request_origin
+        .as_deref()
+        .filter(|_| !authority_free_request)
+    {
+        let own = is_own_or_app_origin(origin, is_tls, header_text);
+        let fleet_allowed = !own
+            && (is_fleet_cors_access_path(req_path) || req_path == "/config")
+            && fleet_access_origin_allowed(
+                origin,
+                is_tls,
+                header_text,
+                peer_registry.as_ref(),
+                &cert_dir,
+            );
+        if fleet_allowed {
+            fleet_cors_origin = Some(origin.to_string());
+        } else if !own {
+            use tokio::io::AsyncWriteExt;
+            let body = serde_json::json!({
+                "error": "cross-origin caller is not allowed on this API",
+                "origin": origin,
+            })
+            .to_string();
+            let response = json_response("403 Forbidden", body);
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    } else if !authority_free_request
+        && matches!(
+            http_header_value(header_text, "sec-fetch-site")
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("cross-site" | "same-site")
+        )
+    {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::json!({
+            "error": "cross-site browser navigation is not allowed on this route",
+            "sec_fetch_site": http_header_value(header_text, "sec-fetch-site").unwrap_or(""),
+        })
+        .to_string();
+        let response = json_response("403 Forbidden", body);
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
     let remote_client_auth_missing = remote_dashboard_client_auth_missing(
         peer_addr,
         header_text,
@@ -272,7 +355,7 @@ pub(crate) async fn serve_http_request(
     );
     if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
         && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
-        && !allows_remote_certless_http(request_line, req_method, req_path)
+        && !authority_free_request
     {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
@@ -292,21 +375,24 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let http_access_context = match http_access_context(
-        &cert_dir,
-        peer_connection_identity.as_ref(),
-        tls_client_cert_fingerprint.as_deref(),
-        tls_client_cert_present,
-        is_tls,
-    ) {
-        Ok(context) => context,
-        Err(message) => {
-            use tokio::io::AsyncWriteExt;
-            let response = json_error("500 Internal Server Error", message);
-            let _ = stream.write_all(response.as_bytes()).await;
-            finalize_http_stream(&mut stream).await;
-            return;
+    let http_access_context = if authority_free_request {
+        authority_free_http_access_context(is_tls)
+    } else {
+        match http_access_context(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+            is_tls,
+        ) {
+            Ok(context) => context,
+            Err(message) => {
+                use tokio::io::AsyncWriteExt;
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
         }
     };
 
@@ -390,55 +476,6 @@ pub(crate) async fn serve_http_request(
         if !decision.allowed {
             use tokio::io::AsyncWriteExt;
             let response = http_access_forbidden_response(&http_access_context, decision);
-            let _ = stream.write_all(response.as_bytes()).await;
-            finalize_http_stream(&mut stream).await;
-            return;
-        }
-    }
-
-    // API origin gate + CORS echo. A browser sends an Origin
-    // header on every cross-origin request (and on
-    // same-origin POSTs); the browser-attached mTLS
-    // certificate must not let an arbitrary website drive or
-    // read these APIs cross-site. Policy:
-    //   - no Origin header (same-origin GETs, curl, native
-    //     code, the macOS app's URLSession proxy): untouched;
-    //   - own origin or the intendant:// app scheme: allowed;
-    //   - fleet-allowlisted origins: allowed on the six fleet
-    //     Access APIs, which also echo the origin so the
-    //     anchor page can read the responses;
-    //   - anything else on any /api/ path: 403, except the
-    //     public doorbell, which is designed to be knocked on.
-    let request_origin = extract_origin_header(header_text);
-    let mut fleet_cors_origin: Option<String> = None;
-    if let Some(origin) = request_origin.as_deref().filter(|_| {
-        (req_path.starts_with("/api/")
-            && !is_public_peer_access_request_path(request_line)
-            && !is_public_org_grant_path(request_line))
-            || (req_method == "POST" && req_path == "/session")
-            || is_connect_dashboard_signaling_path(req_path)
-            || req_path == "/config"
-    }) {
-        let own = is_own_or_app_origin(origin, is_tls, header_text);
-        let fleet_allowed = !own
-            && (is_fleet_cors_access_path(req_path) || req_path == "/config")
-            && fleet_access_origin_allowed(
-                origin,
-                is_tls,
-                header_text,
-                peer_registry.as_ref(),
-                &cert_dir,
-            );
-        if fleet_allowed {
-            fleet_cors_origin = Some(origin.to_string());
-        } else if !own {
-            use tokio::io::AsyncWriteExt;
-            let body = serde_json::json!({
-                "error": "cross-origin caller is not allowed on this API",
-                "origin": origin,
-            })
-            .to_string();
-            let response = json_response("403 Forbidden", body);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;

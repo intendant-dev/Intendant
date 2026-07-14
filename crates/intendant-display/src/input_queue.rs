@@ -38,23 +38,27 @@
 //!   commentary in `webrtc/driver.rs::drain_outputs` and
 //!   `dashboard_control/wire.rs::drain_control_outputs`), so the pressure
 //!   valve is bounded growth instead of an await. [`INPUT_QUEUE_HARD_CAP`]
-//!   is the absolute memory bound: past it the oldest event is dropped
-//!   (loudly) — at that point injection has been wedged for so long that
-//!   the input stream is already lost, and memory safety wins.
+//!   is the absolute memory bound: reaching it trips the browser-input lane,
+//!   clears the pending backlog, and makes the pump synthesize releases for
+//!   every possibly-held key/button before exiting. It never drops one edge
+//!   and continues, which could strand a key or mouse button down.
 //!
-//! Authority gating stays where it was: each lane's gate runs *before*
-//! `push`, so a refused event never enters the queue (see
-//! [`crate::gated_input_handler`] and the `/ws` + dashboard-control lanes
-//! in the caller).
+//! Authority is checked twice: each lane gates *before* `push`, so a
+//! refused event never enters the queue, and the pump checks the same live
+//! predicate immediately before backend injection. The second check is what
+//! makes revocation discard already-buffered input instead of letting an old
+//! authorized backlog execute afterward (see [`crate::gated_input_handler`]
+//! and the `/ws` + dashboard-control lanes in the caller).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{input_telemetry, DisplayBackend, InputEvent};
+use crate::{input_telemetry, BrowserInputAuthorization, DisplayBackend, InputEvent};
 
 /// Target bound for the queue. Sized for multi-second injection stalls at
 /// human input rates (a fast typist plus pointer motion is well under 100
@@ -64,7 +68,8 @@ pub(crate) const INPUT_QUEUE_SOFT_CAP: usize = 256;
 /// Absolute bound. Only reachable when the backlog is entirely discrete
 /// events (an all-`kd`/`ku`/`md`/`mu` queue past the soft cap), which
 /// requires an injection backend wedged for tens of seconds or a hostile
-/// flood on an authorized channel. Past this, the oldest event is dropped.
+/// flood on an authorized channel. Reaching this bound trips the lane and
+/// requires recreating the display session before browser input resumes.
 pub(crate) const INPUT_QUEUE_HARD_CAP: usize = 1024;
 
 /// Minimum interval between overflow log lines (the counters keep exact
@@ -81,9 +86,33 @@ fn is_continuous(event: &InputEvent) -> bool {
     )
 }
 
+#[cfg(test)]
+type InputAuthorization = Arc<dyn Fn() -> bool + Send + Sync>;
+
+struct QueuedInput {
+    event: InputEvent,
+    /// `None` is reserved for the queue's own unit-test producers. Every
+    /// production browser lane supplies its live transport/authority guard.
+    authorization: Option<BrowserInputAuthorization>,
+    admitted_authority_revision: Option<u64>,
+    /// Queue epoch at admission. Every authority/transport reset advances the
+    /// epoch, so an item already popped by the pump cannot become authorized
+    /// again after an A -> B -> A holder transition.
+    generation: u64,
+}
+
+enum PumpItem {
+    Input(QueuedInput),
+    Reset,
+}
+
 struct Inner {
-    queue: VecDeque<InputEvent>,
+    queue: VecDeque<QueuedInput>,
+    generation: u64,
+    authority_revision: Option<u64>,
     closed: bool,
+    tripped: bool,
+    reset_requested: bool,
     coalesced: u64,
     dropped_continuous: u64,
     dropped_discrete: u64,
@@ -96,6 +125,7 @@ struct Inner {
 pub(crate) struct InputQueue {
     inner: Mutex<Inner>,
     notify: tokio::sync::Notify,
+    held_edges: AtomicUsize,
 }
 
 impl InputQueue {
@@ -103,50 +133,119 @@ impl InputQueue {
         Self {
             inner: Mutex::new(Inner {
                 queue: VecDeque::new(),
+                generation: 0,
+                authority_revision: None,
                 closed: false,
+                tripped: false,
+                reset_requested: false,
                 coalesced: 0,
                 dropped_continuous: 0,
                 dropped_discrete: 0,
                 last_drop_log: None,
             }),
             notify: tokio::sync::Notify::new(),
+            held_edges: AtomicUsize::new(0),
         }
     }
 
     /// Enqueue one event, preserving arrival order. Never blocks and never
     /// awaits — safe from sync contexts (the `rtc` poll loops). Events
     /// pushed after [`InputQueue::close`] are discarded (session teardown).
+    #[cfg(test)]
     pub(crate) fn push(&self, event: InputEvent) {
+        let _ = self.push_guarded(event, None, None);
+    }
+
+    /// Enqueue an event together with the live authority predicate that must
+    /// still hold when the pump is ready to inject it. The lane must already
+    /// have checked the predicate once before calling this method.
+    #[cfg(test)]
+    pub(crate) fn push_authorized(&self, event: InputEvent, authorization: InputAuthorization) {
+        let _ = self.push_guarded(
+            event,
+            Some(BrowserInputAuthorization::new(authorization)),
+            None,
+        );
+    }
+
+    pub(crate) fn push_browser_authorized(
+        &self,
+        event: InputEvent,
+        authorization: BrowserInputAuthorization,
+        admitted_authority_revision: Option<u64>,
+    ) -> Option<u64> {
+        self.push_guarded(event, Some(authorization), admitted_authority_revision)
+    }
+
+    fn push_guarded(
+        &self,
+        event: InputEvent,
+        authorization: Option<BrowserInputAuthorization>,
+        admitted_authority_revision: Option<u64>,
+    ) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.closed {
-            return;
+            return None;
         }
+
+        if let Some(admitted_revision) = admitted_authority_revision {
+            match inner.authority_revision {
+                Some(current) if current != admitted_revision => {
+                    // Couple an authority epoch change to the same ordered
+                    // pump before admitting the new holder's event. This
+                    // releases native state from the old holder before the
+                    // new frame can inject, even if the gateway's async
+                    // transition observer has not run yet.
+                    Self::reset_locked(
+                        &mut inner,
+                        "browser input arrived under a new authority revision",
+                    );
+                }
+                _ => {}
+            }
+            inner.authority_revision = Some(admitted_revision);
+        }
+
+        let generation = inner.generation;
+        let queued = QueuedInput {
+            event,
+            authorization,
+            admitted_authority_revision,
+            generation,
+        };
 
         // Latest-wins coalescing: an absolute mouse-move directly behind a
         // still-pending mouse-move supersedes it. Tail-adjacency only —
         // never reorders relative to discrete events or scrolls.
-        if matches!(event, InputEvent::MouseMove { .. })
-            && matches!(inner.queue.back(), Some(InputEvent::MouseMove { .. }))
+        if matches!(&queued.event, InputEvent::MouseMove { .. })
+            && matches!(
+                inner.queue.back().map(|entry| &entry.event),
+                Some(InputEvent::MouseMove { .. })
+            )
         {
             *inner
                 .queue
                 .back_mut()
-                .expect("back() was Some under the same lock") = event;
+                .expect("back() was Some under the same lock") = queued;
             inner.coalesced = inner.coalesced.wrapping_add(1);
             drop(inner);
             input_telemetry::record_queue_coalesced();
             self.notify.notify_one();
-            return;
+            return Some(generation);
         }
 
         if inner.queue.len() >= INPUT_QUEUE_SOFT_CAP {
-            if let Some(idx) = inner.queue.iter().position(is_continuous) {
+            if let Some(idx) = inner
+                .queue
+                .iter()
+                .position(|entry| is_continuous(&entry.event))
+            {
                 // Evict the oldest continuous event to make room.
                 inner.queue.remove(idx);
                 inner.dropped_continuous += 1;
                 Self::log_drop_throttled(&mut inner, "an old continuous event");
                 input_telemetry::record_queue_dropped_continuous();
-            } else if is_continuous(&event) {
+            } else if is_continuous(&queued.event) {
                 // All-discrete backlog: a new continuous event is the one
                 // thing we may shed while keeping the queue at the soft
                 // cap — the next mm will carry a fresher position anyway.
@@ -154,28 +253,34 @@ impl InputQueue {
                 Self::log_drop_throttled(&mut inner, "a new continuous event");
                 drop(inner);
                 input_telemetry::record_queue_dropped_continuous();
-                return;
+                return None;
             } else if inner.queue.len() >= INPUT_QUEUE_HARD_CAP {
-                // Absolute bound (see module docs): drop the oldest event.
-                inner.queue.pop_front();
+                // Never evict one edge and continue: if that edge is a ku/mu,
+                // an already-injected kd/md remains latched. Trip the entire
+                // browser-input lane; the pump releases every pessimistically
+                // tracked key/button before it exits.
                 inner.dropped_discrete += 1;
-                Self::log_drop_throttled(&mut inner, "the oldest DISCRETE event");
                 input_telemetry::record_queue_dropped_discrete();
+                Self::trip_locked(&mut inner, "all-discrete backlog reached the hard cap");
+                drop(inner);
+                self.notify.notify_one();
+                return None;
             }
             // else: all-discrete backlog under the hard cap — grow past
             // the soft cap rather than drop a discrete event (the
             // producers cannot await; see module docs).
         }
 
-        inner.queue.push_back(event);
+        inner.queue.push_back(queued);
         drop(inner);
         self.notify.notify_one();
+        Some(generation)
     }
 
     /// Await the next event in arrival order. Returns `None` once the
     /// queue is closed and drained. Single-consumer by design (the pump);
     /// cancel-safe — an event is only popped when the future completes.
-    pub(crate) async fn recv(&self) -> Option<InputEvent> {
+    async fn recv(&self) -> Option<PumpItem> {
         loop {
             // Register interest BEFORE checking state so a push that lands
             // between the check and the await still wakes us.
@@ -184,8 +289,12 @@ impl InputQueue {
             notified.as_mut().enable();
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.reset_requested {
+                    inner.reset_requested = false;
+                    return Some(PumpItem::Reset);
+                }
                 if let Some(event) = inner.queue.pop_front() {
-                    return Some(event);
+                    return Some(PumpItem::Input(event));
                 }
                 if inner.closed {
                     return None;
@@ -199,10 +308,123 @@ impl InputQueue {
     /// `push` calls become no-ops, and `recv` returns `None`. Idempotent.
     pub(crate) fn close(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.generation = inner.generation.wrapping_add(1);
         inner.closed = true;
+        inner.reset_requested = false;
         inner.queue.clear();
         drop(inner);
         self.notify.notify_one();
+    }
+
+    /// Fail the browser-input lane closed. Pending events are discarded as a
+    /// unit, future pushes are rejected, and the pump is woken so it can issue
+    /// best-effort releases for every key/button it may have injected. This is
+    /// intentionally terminal for the display session: without per-source
+    /// queue identities, reopening the same queue could let the offending
+    /// flood or revoked source resume immediately.
+    pub(crate) fn trip(&self, reason: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::trip_locked(&mut inner, reason);
+        drop(inner);
+        self.notify.notify_one();
+    }
+
+    /// Trip only when the pump believes a key or mouse button may currently
+    /// be held. Used by peer teardown: a passive viewer disconnecting should
+    /// not disable input for the whole display, while a controller vanishing
+    /// mid-gesture must release native state.
+    pub(crate) fn trip_if_active(&self, reason: &str) {
+        if self.held_edges.load(Ordering::SeqCst) > 0 {
+            self.trip(reason);
+        }
+    }
+
+    /// Request a recoverable safety reset when an authority holder or
+    /// transport changes. Pending events are cleared, the pump releases held
+    /// native edges, then the same display session can accept a newly
+    /// authorized source. Unlike [`Self::trip`], this is not an overload
+    /// circuit breaker and does not permanently close the queue.
+    pub(crate) fn reset_if_active(&self, reason: &str) {
+        if self.held_edges.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        self.reset(reason);
+    }
+
+    pub(crate) fn reset(&self, reason: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            return;
+        }
+        Self::reset_locked(&mut inner, reason);
+        drop(inner);
+        self.notify.notify_one();
+    }
+
+    /// Reset only if no other reset/handoff has advanced the queue since the
+    /// caller observed `generation`. This makes stale source teardown unable
+    /// to clear a newly authorized source's backlog or held native edge.
+    pub(crate) fn reset_if_generation(&self, generation: u64, reason: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed || inner.generation != generation {
+            return false;
+        }
+        Self::reset_locked(&mut inner, reason);
+        drop(inner);
+        self.notify.notify_one();
+        true
+    }
+
+    fn reset_locked(inner: &mut Inner, reason: &str) {
+        inner.generation = inner.generation.wrapping_add(1);
+        Self::discard_pending(inner);
+        inner.reset_requested = true;
+        eprintln!(
+            "[display/input-queue] resetting held browser input: {reason}; \
+             pending events were cleared and safety releases will run"
+        );
+    }
+
+    fn trip_locked(inner: &mut Inner, reason: &str) {
+        if inner.closed {
+            return;
+        }
+        inner.generation = inner.generation.wrapping_add(1);
+        Self::discard_pending(inner);
+        inner.closed = true;
+        inner.tripped = true;
+        inner.reset_requested = false;
+        eprintln!(
+            "[display/input-queue] browser input tripped: {reason} \
+             (totals: continuous_dropped={} discrete_dropped={} coalesced={}); \
+             held keys/buttons will be released and the display session must be recreated",
+            inner.dropped_continuous, inner.dropped_discrete, inner.coalesced,
+        );
+    }
+
+    fn discard_pending(inner: &mut Inner) {
+        let pending = std::mem::take(&mut inner.queue);
+        for queued in pending {
+            if is_continuous(&queued.event) {
+                inner.dropped_continuous = inner.dropped_continuous.wrapping_add(1);
+                input_telemetry::record_queue_dropped_continuous();
+            } else {
+                inner.dropped_discrete = inner.dropped_discrete.wrapping_add(1);
+                input_telemetry::record_queue_dropped_discrete();
+            }
+        }
+    }
+
+    fn generation_is_current(&self, generation: u64) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        !inner.closed && inner.generation == generation
+    }
+
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
     }
 
     fn log_drop_throttled(inner: &mut Inner, what: &str) {
@@ -229,7 +451,7 @@ impl InputQueue {
             .unwrap_or_else(|e| e.into_inner())
             .queue
             .iter()
-            .map(InputEvent::wire_tag)
+            .map(|entry| entry.event.wire_tag())
             .collect()
     }
 
@@ -242,21 +464,152 @@ impl InputQueue {
             .queue
             .len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).tripped
+    }
+}
+
+#[derive(Clone)]
+struct HeldKey {
+    key: String,
+}
+
+#[derive(Default)]
+struct PressedState {
+    keys: BTreeMap<String, HeldKey>,
+    buttons: BTreeMap<u8, (f64, f64)>,
+    pointer: Option<(f64, f64)>,
+}
+
+impl PressedState {
+    fn len(&self) -> usize {
+        self.keys.len() + self.buttons.len()
+    }
+
+    /// Record downs before awaiting the platform backend. A backend error may
+    /// happen after a native event was partially posted, so pessimistically
+    /// treating the edge as held is the only safe recovery posture.
+    fn before_inject(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::KeyDown { code, key, .. } => {
+                self.keys.insert(code.clone(), HeldKey { key: key.clone() });
+            }
+            InputEvent::MouseDown { x, y, b } => {
+                self.pointer = Some((*x, *y));
+                self.buttons.insert(*b, (*x, *y));
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove a held edge only after its matching release completed. Successful
+    /// pointer motion updates the coordinates used by synthesized mouse-ups.
+    fn after_success(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::KeyUp { code, .. } => {
+                self.keys.remove(code);
+            }
+            InputEvent::MouseUp { x, y, b } => {
+                self.pointer = Some((*x, *y));
+                self.buttons.remove(b);
+            }
+            InputEvent::MouseMove { x, y, .. } | InputEvent::Scroll { x, y, .. } => {
+                self.pointer = Some((*x, *y));
+                for coords in self.buttons.values_mut() {
+                    *coords = (*x, *y);
+                }
+            }
+            InputEvent::MouseDown { x, y, b } => {
+                self.pointer = Some((*x, *y));
+                self.buttons.insert(*b, (*x, *y));
+            }
+            InputEvent::KeyDown { .. } => {}
+        }
+    }
+
+    fn take_releases(&mut self) -> Vec<InputEvent> {
+        let mut releases = Vec::with_capacity(self.keys.len() + self.buttons.len());
+        for (code, held) in std::mem::take(&mut self.keys) {
+            releases.push(InputEvent::KeyUp {
+                code,
+                key: held.key,
+                // Safety release-all is an escape hatch, not a replay of the
+                // key-down snapshot. In particular macOS applies these flags
+                // to key-up CGEvents; stale true modifier bits can make the
+                // release itself assert modifiers in the target app.
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            });
+        }
+        let fallback = self.pointer.unwrap_or((0.5, 0.5));
+        for (b, (x, y)) in std::mem::take(&mut self.buttons) {
+            let (x, y) = if x.is_finite() && y.is_finite() {
+                (x, y)
+            } else {
+                fallback
+            };
+            releases.push(InputEvent::MouseUp { x, y, b });
+        }
+        releases
+    }
+
+    /// Preserve only releases the backend explicitly failed. Retrying a
+    /// successful key-up could interfere with a local user's later physical
+    /// press; retrying the failed subset is the pessimistic safe posture.
+    fn retain_failed_release(&mut self, release: &InputEvent) {
+        match release {
+            InputEvent::KeyUp { code, key, .. } => {
+                self.keys.insert(code.clone(), HeldKey { key: key.clone() });
+            }
+            InputEvent::MouseUp { x, y, b } => {
+                self.pointer = Some((*x, *y));
+                self.buttons.insert(*b, (*x, *y));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn release_pressed(backend: &Arc<dyn DisplayBackend>, pressed: &mut PressedState) -> bool {
+    let mut all_released = true;
+    for release in pressed.take_releases() {
+        let kind = release.wire_tag();
+        input_telemetry::record_inject_started(kind);
+        let started = Instant::now();
+        match backend.inject_input(release.clone()).await {
+            Ok(()) => input_telemetry::record_inject_completed(started.elapsed()),
+            Err(error) => {
+                input_telemetry::record_inject_failed(started.elapsed());
+                eprintln!("[display/input] best-effort safety release failed ({kind}): {error}");
+                pressed.retain_failed_release(&release);
+                all_released = false;
+            }
+        }
+    }
+    all_released
 }
 
 /// Spawn the per-session input pump: the single consumer that drains an
 /// [`InputQueue`] and injects each event into `backend`, sequentially, so
 /// injection order equals arrival order. Exits when `shutdown` fires or
 /// the queue closes. Injection failures are logged and do not stop the
-/// pump (matching the previous per-event dispatch behavior on every lane).
+/// pump. A failure advances the queue epoch, clears stale backlog, and
+/// immediately attempts safety releases before accepting new input: a
+/// backend can fail after partially posting an edge, including a key-up or
+/// mouse-up whose source-side bookkeeping already looks balanced.
 pub(crate) fn spawn_input_pump(
     queue: Arc<InputQueue>,
     backend: Arc<dyn DisplayBackend>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut pressed = PressedState::default();
         loop {
-            let event = tokio::select! {
+            let item = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
                 event = queue.recv() => match event {
@@ -264,17 +617,60 @@ pub(crate) fn spawn_input_pump(
                     None => break,
                 },
             };
-            let kind = event.wire_tag();
+            let queued = match item {
+                PumpItem::Input(queued) => queued,
+                PumpItem::Reset => {
+                    let all_released = release_pressed(&backend, &mut pressed).await;
+                    queue.held_edges.store(pressed.len(), Ordering::SeqCst);
+                    if !all_released {
+                        queue.trip("the platform backend failed a safety release");
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let kind = queued.event.wire_tag();
+            // Perform every rejection check before pessimistically recording
+            // a down edge. Synthesizing a release for an edge that was never
+            // injected could release another controller's or a local user's
+            // physical key/button state.
+            if !queue.generation_is_current(queued.generation)
+                || queued.authorization.as_ref().is_some_and(|authorization| {
+                    !authorization.remains_current(queued.admitted_authority_revision)
+                })
+            {
+                input_telemetry::record_authority_drop(kind);
+                queue.reset("a buffered event lost its live input epoch or authority");
+                continue;
+            }
+            pressed.before_inject(&queued.event);
+            queue.held_edges.store(pressed.len(), Ordering::SeqCst);
             input_telemetry::record_inject_started(kind);
             let started = Instant::now();
-            match backend.inject_input(event).await {
-                Ok(()) => input_telemetry::record_inject_completed(started.elapsed()),
+            let event = queued.event;
+            match backend.inject_input(event.clone()).await {
+                Ok(()) => {
+                    pressed.after_success(&event);
+                    queue.held_edges.store(pressed.len(), Ordering::SeqCst);
+                    input_telemetry::record_inject_completed(started.elapsed());
+                }
                 Err(e) => {
                     input_telemetry::record_inject_failed(started.elapsed());
                     eprintln!("[display/input] input injection failed ({kind}): {e}");
+                    queue.reset("the platform input backend reported an injection failure");
+                    let all_released = release_pressed(&backend, &mut pressed).await;
+                    queue.held_edges.store(pressed.len(), Ordering::SeqCst);
+                    if !all_released {
+                        queue.trip("the platform backend failed a safety release");
+                    }
                 }
             }
         }
+        // Shutdown, overload, queue closure, and live-authority loss all take
+        // this path. Safety releases bypass the stale source authorization:
+        // they only reduce host state and must remain possible after revoke.
+        let _ = release_pressed(&backend, &mut pressed).await;
+        queue.held_edges.store(pressed.len(), Ordering::SeqCst);
     })
 }
 
@@ -373,6 +769,108 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "recording"
+        }
+    }
+
+    struct BlockingFirstBackend {
+        injected: mpsc::UnboundedSender<String>,
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Semaphore>,
+        first: std::sync::atomic::AtomicBool,
+    }
+
+    struct FailOneReleaseBackend {
+        attempted: mpsc::UnboundedSender<String>,
+    }
+
+    struct FailFirstMatchingBackend {
+        attempted: mpsc::UnboundedSender<String>,
+        fail_identity: &'static str,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl DisplayBackend for FailOneReleaseBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+            let identity = ident(&event);
+            let _ = self.attempted.send(identity.clone());
+            if identity == "ku:KeyA" {
+                Err(CallerError::Display("synthetic release failed".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "fail-one-release"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DisplayBackend for FailFirstMatchingBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+            let identity = ident(&event);
+            let _ = self.attempted.send(identity.clone());
+            if identity == self.fail_identity
+                && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(CallerError::Display(
+                    "synthetic ordinary key-up failed".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "fail-first-matching"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DisplayBackend for BlockingFirstBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+            if !self.first.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.started.send(());
+                let permit = self.release.acquire().await.unwrap();
+                permit.forget();
+            }
+            let _ = self.injected.send(ident(&event));
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "blocking-first"
         }
     }
 
@@ -488,7 +986,11 @@ mod tests {
 
         assert_eq!(queue.queued_tags(), vec!["kd", "mm", "md", "mm"]);
         let inner = queue.inner.lock().unwrap();
-        let coords: Vec<String> = inner.queue.iter().map(ident).collect();
+        let coords: Vec<String> = inner
+            .queue
+            .iter()
+            .map(|entry| ident(&entry.event))
+            .collect();
         assert_eq!(
             coords,
             vec!["kd:KeyA", "mm:0.3", "md:0", "mm:0.4"],
@@ -544,10 +1046,10 @@ mod tests {
         );
     }
 
-    /// An all-discrete backlog grows past the soft cap instead of dropping
-    /// discrete events, and is memory-bounded by the hard cap.
+    /// An all-discrete backlog grows past the soft cap without dropping one
+    /// edge. At the hard cap the whole lane trips and clears atomically.
     #[test]
-    fn all_discrete_backlog_grows_to_hard_cap_without_discrete_loss() {
+    fn all_discrete_backlog_trips_at_hard_cap_without_edge_eviction() {
         let queue = InputQueue::new();
         for i in 0..INPUT_QUEUE_SOFT_CAP + 10 {
             queue.push(kd(&format!("K{i}")));
@@ -567,16 +1069,202 @@ mod tests {
         queue.push(mm(0.9));
         assert_eq!(queue.len(), INPUT_QUEUE_SOFT_CAP + 10);
 
-        // Past the hard cap the oldest event goes (memory bound).
+        // Reaching the hard cap trips rather than evicting one edge and
+        // continuing with an unpaired stream.
         for i in 0..INPUT_QUEUE_HARD_CAP {
             queue.push(kd(&format!("H{i}")));
         }
-        assert_eq!(queue.len(), INPUT_QUEUE_HARD_CAP);
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_tripped());
         let inner = queue.inner.lock().unwrap();
         assert!(
             inner.dropped_discrete > 0,
-            "hard cap must have evicted oldest events"
+            "hard-cap trip must account for the discarded backlog"
         );
+    }
+
+    #[tokio::test]
+    async fn hard_cap_trip_releases_an_in_flight_key_down() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let queue = Arc::new(InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(BlockingFirstBackend {
+                injected: injected_tx,
+                started: started_tx,
+                release: Arc::clone(&release),
+                first: std::sync::atomic::AtomicBool::new(false),
+            }),
+            shutdown,
+        );
+
+        queue.push(kd("KeyHeld"));
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("first key-down must reach the blocking backend")
+            .expect("started channel closed");
+        for i in 0..=INPUT_QUEUE_HARD_CAP {
+            queue.push(kd(&format!("Flood{i}")));
+        }
+        assert!(queue.is_tripped());
+        assert_eq!(queue.len(), 0, "trip must clear the pending flood");
+
+        release.add_permits(1);
+        assert_eq!(
+            drain_n(&mut injected_rx, 2).await,
+            vec!["kd:KeyHeld", "ku:KeyHeld"],
+            "the in-flight down must be followed by a synthesized release"
+        );
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("tripped pump must exit")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_trip_releases_a_held_mouse_button() {
+        let (queue, _shutdown, pump, mut rx) = recording_rig();
+        queue.push(md());
+        assert_eq!(drain_n(&mut rx, 1).await, vec!["md:0"]);
+        queue.trip("unit-test peer disconnect");
+        assert_eq!(
+            drain_n(&mut rx, 1).await,
+            vec!["mu:0"],
+            "trip must synthesize a mouse-up for every held button"
+        );
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("tripped pump must exit")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn safety_release_attempts_every_edge_after_one_backend_failure() {
+        let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(InputQueue::new());
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(FailOneReleaseBackend {
+                attempted: attempted_tx,
+            }),
+            CancellationToken::new(),
+        );
+        queue.push(kd("KeyA"));
+        queue.push(kd("KeyB"));
+        assert_eq!(
+            drain_n(&mut attempted_rx, 2).await,
+            vec!["kd:KeyA", "kd:KeyB"]
+        );
+        queue.trip("unit-test release failure");
+        assert_eq!(
+            drain_n(&mut attempted_rx, 2).await,
+            vec!["ku:KeyA", "ku:KeyB"],
+            "one failed release must not prevent attempts for remaining held edges"
+        );
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("tripped pump must exit after attempting all releases")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_release_failure_immediately_resets_and_safety_releases() {
+        let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(FailFirstMatchingBackend {
+                attempted: attempted_tx,
+                fail_identity: "ku:KeyA",
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            shutdown.clone(),
+        );
+
+        queue.push(kd("KeyA"));
+        queue.push(ku("KeyA"));
+        assert_eq!(
+            drain_n(&mut attempted_rx, 3).await,
+            vec!["kd:KeyA", "ku:KeyA", "ku:KeyA"],
+            "a failed ordinary key-up must be followed immediately by a synthesized safety release"
+        );
+
+        queue.push(kd("KeyB"));
+        queue.push(ku("KeyB"));
+        assert_eq!(
+            drain_n(&mut attempted_rx, 2).await,
+            vec!["kd:KeyB", "ku:KeyB"],
+            "the recoverable reset must leave the display usable"
+        );
+        assert!(!queue.is_tripped());
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the recovered pump")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_key_down_failure_gets_a_fail_safe_key_up() {
+        let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(FailFirstMatchingBackend {
+                attempted: attempted_tx,
+                fail_identity: "kd:KeyA",
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            shutdown.clone(),
+        );
+
+        queue.push(kd("KeyA"));
+        assert_eq!(
+            drain_n(&mut attempted_rx, 2).await,
+            vec!["kd:KeyA", "ku:KeyA"],
+            "a failed down is ambiguous and must be followed by a pessimistic release"
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the recovered pump")
+            .unwrap();
+    }
+
+    #[test]
+    fn synthesized_modifier_key_up_clears_all_modifier_flags() {
+        let mut pressed = PressedState::default();
+        pressed.before_inject(&InputEvent::KeyDown {
+            code: "ShiftLeft".to_string(),
+            key: "Shift".to_string(),
+            shift: true,
+            ctrl: true,
+            alt: true,
+            meta: true,
+        });
+
+        let releases = pressed.take_releases();
+        assert_eq!(releases.len(), 1);
+        match &releases[0] {
+            InputEvent::KeyUp {
+                code,
+                shift,
+                ctrl,
+                alt,
+                meta,
+                ..
+            } => {
+                assert_eq!(code, "ShiftLeft");
+                assert!(!shift && !ctrl && !alt && !meta);
+            }
+            other => panic!("expected synthesized key-up, got {other:?}"),
+        }
     }
 
     /// close() drains pending events, makes push a no-op, and unblocks the
@@ -614,5 +1302,102 @@ mod tests {
             .await
             .expect("pump must exit promptly on shutdown")
             .expect("pump must not panic");
+    }
+
+    /// Revocation after a key-down but before its queued key-up must produce a
+    /// positive safety release and then stop the pump. This is deterministic:
+    /// the assertion waits for the synthesized `ku` instead of treating a
+    /// short absence timeout as proof that the worker ran.
+    #[tokio::test]
+    async fn pump_rechecks_authority_before_injection() {
+        let (queue, shutdown, pump, mut rx) = recording_rig();
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let allowed_for_guard = Arc::clone(&allowed);
+        let guard: InputAuthorization =
+            Arc::new(move || allowed_for_guard.load(std::sync::atomic::Ordering::SeqCst));
+        queue.push_authorized(kd("KeyA"), Arc::clone(&guard));
+        assert_eq!(drain_n(&mut rx, 1).await, vec!["kd:KeyA"]);
+
+        allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        queue.push_authorized(ku("KeyA"), guard);
+
+        assert_eq!(
+            drain_n(&mut rx, 1).await,
+            vec!["ku:KeyA"],
+            "revocation must synthesize the release that the stale queued ku cannot carry"
+        );
+        allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let allowed_for_recovery = Arc::clone(&allowed);
+        let recovery_guard: InputAuthorization =
+            Arc::new(move || allowed_for_recovery.load(std::sync::atomic::Ordering::SeqCst));
+        queue.push_authorized(kd("KeyB"), Arc::clone(&recovery_guard));
+        queue.push_authorized(ku("KeyB"), recovery_guard);
+        assert_eq!(
+            drain_n(&mut rx, 2).await,
+            vec!["kd:KeyB", "ku:KeyB"],
+            "authority reset must leave the display usable by a newly authorized source"
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the recovered pump")
+            .unwrap();
+        assert!(!queue.is_tripped());
+    }
+
+    #[tokio::test]
+    async fn versioned_authority_rejects_stale_a_after_fast_a_b_a_handoff() {
+        let (injected_tx, mut rx) = mpsc::unbounded_channel();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let queue = Arc::new(InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(BlockingFirstBackend {
+                injected: injected_tx,
+                started: started_tx,
+                release: Arc::clone(&release),
+                first: std::sync::atomic::AtomicBool::new(false),
+            }),
+            shutdown.clone(),
+        );
+        queue.push(kd("Blocker"));
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("blocker must reach the backend")
+            .expect("started channel closed");
+
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let authorization =
+            BrowserInputAuthorization::versioned(Arc::new(|| true), Arc::clone(&revision));
+        let admitted = authorization.admission_revision().unwrap();
+        assert_eq!(admitted, Some(0));
+        queue.push_browser_authorized(kd("StaleA"), authorization.clone(), admitted);
+
+        // B takes authority and A takes it back before the pump evaluates the
+        // identity predicate. The predicate is true again, but the monotonic
+        // revision proves this event belongs to the old A epoch.
+        revision.store(2, std::sync::atomic::Ordering::SeqCst);
+        release.add_permits(1);
+        assert_eq!(
+            drain_n(&mut rx, 2).await,
+            vec!["kd:Blocker", "ku:Blocker"],
+            "stale authority must reset held state without injecting StaleA"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an event admitted before A -> B -> A must not inject"
+        );
+
+        let admitted = authorization.admission_revision().unwrap();
+        queue.push_browser_authorized(kd("FreshA"), authorization.clone(), admitted);
+        queue.push_browser_authorized(ku("FreshA"), authorization, admitted);
+        assert_eq!(drain_n(&mut rx, 2).await, vec!["kd:FreshA", "ku:FreshA"]);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("shutdown must stop the pump")
+            .unwrap();
     }
 }

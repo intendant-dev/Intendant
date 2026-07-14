@@ -197,7 +197,7 @@ pub(crate) fn control_frame_response(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
-    display_input_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    display_input_tx: &DisplayInputForwarder,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -242,7 +242,7 @@ pub(crate) fn control_frame_response(
             // frames sequentially and this send preserves that order —
             // never a per-event spawn, which would race events across
             // runtime workers and could invert kd/ku or md/mu pairs.
-            let _ = display_input_tx.send(parsed);
+            display_input_tx.try_forward(parsed);
             None
         }
         "terminal_open" => {
@@ -2041,18 +2041,95 @@ pub(crate) async fn dashboard_async_query(frame: serde_json::Value, runtime: Con
 /// runtime workers, and a `kd`/`ku` or `md`/`mu` inversion wedges a key
 /// or scrambles a click (the window widens under host load). The wire
 /// loop (`drain_control_outputs`) dispatches frames sequentially, its
-/// `unbounded_send` into this channel preserves that order, and the
-/// single consumer here preserves it into `enqueue_input` — whose
-/// per-session pump preserves it into the backend.
+/// a non-blocking bounded send into this channel preserves that order, and
+/// the single consumer here preserves it into `enqueue_input` — whose
+/// per-session pump preserves it into the backend. Saturation cancels the
+/// connection instead of dropping one edge-triggered key/button frame and
+/// leaving the lane alive in a potentially stuck state.
 ///
 /// The forwarder ends when the wire loop drops the sender (connection
 /// teardown) or the shared shutdown token fires.
+pub(crate) struct DisplayInputForwarder {
+    tx: mpsc::Sender<serde_json::Value>,
+    shutdown: CancellationToken,
+    overload_reported: Arc<AtomicBool>,
+    sources:
+        Arc<std::sync::Mutex<HashMap<u32, std::sync::Weak<crate::display::BrowserInputSource>>>>,
+}
+
+impl DisplayInputForwarder {
+    fn new(tx: mpsc::Sender<serde_json::Value>, shutdown: CancellationToken) -> Self {
+        Self {
+            tx,
+            shutdown,
+            overload_reported: Arc::new(AtomicBool::new(false)),
+            sources: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn trip_active_sources(&self, reason: &str) {
+        let sources: Vec<_> = self
+            .sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for source in sources {
+            source.invalidate(reason);
+        }
+    }
+
+    /// Sync/non-blocking handoff from the sans-I/O control driver. A full
+    /// queue means the async resolver is not keeping up with an authorized
+    /// input flood; fail closed by ending the connection and letting its
+    /// authority cleanup run instead of silently dropping a key/button edge.
+    fn try_forward(&self, frame: serde_json::Value) -> bool {
+        match self.tx.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if !self.overload_reported.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "[dashboard/control] display-input handoff reached its {}-frame hard cap; closing the control connection",
+                        crate::display::BROWSER_INPUT_QUEUE_HARD_CAP,
+                    );
+                }
+                self.trip_active_sources("the dashboard-control input handoff overloaded");
+                self.shutdown.cancel();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.trip_active_sources("the dashboard-control input handoff closed");
+                self.shutdown.cancel();
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self::new(tx, CancellationToken::new())
+    }
+}
+
 pub(crate) fn spawn_display_input_forwarder(
     runtime: ControlRuntime,
     shutdown: CancellationToken,
-) -> mpsc::UnboundedSender<serde_json::Value> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+) -> DisplayInputForwarder {
+    let (tx, mut rx) =
+        mpsc::channel::<serde_json::Value>(crate::display::BROWSER_INPUT_QUEUE_HARD_CAP);
+    let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+    let sources = Arc::clone(&forwarder.sources);
+    let runtime = Arc::new(runtime);
     tokio::spawn(async move {
+        let mut input_sources: HashMap<
+            u32,
+            (
+                std::sync::Weak<crate::display::DisplaySession>,
+                Arc<crate::display::BrowserInputSource>,
+            ),
+        > = HashMap::new();
         loop {
             let frame = tokio::select! {
                 biased;
@@ -2062,17 +2139,38 @@ pub(crate) fn spawn_display_input_forwarder(
                     None => break,
                 },
             };
-            forward_dashboard_display_input(frame, &runtime).await;
+            forward_dashboard_display_input(
+                frame,
+                &runtime,
+                &shutdown,
+                &sources,
+                &mut input_sources,
+            )
+            .await;
         }
     });
-    tx
+    forwarder
 }
 
 /// Route one `display_input` frame: parse, authority-gate, resolve the
 /// display session, and enqueue onto its ordered input queue. Gating
 /// happens before enqueue (per-event, so authority revocation applies to
 /// every later event), preserving the pre-queue semantics.
-async fn forward_dashboard_display_input(frame: serde_json::Value, runtime: &ControlRuntime) {
+async fn forward_dashboard_display_input(
+    frame: serde_json::Value,
+    runtime: &Arc<ControlRuntime>,
+    shutdown: &CancellationToken,
+    sources: &Arc<
+        std::sync::Mutex<HashMap<u32, std::sync::Weak<crate::display::BrowserInputSource>>>,
+    >,
+    input_sources: &mut HashMap<
+        u32,
+        (
+            std::sync::Weak<crate::display::DisplaySession>,
+            Arc<crate::display::BrowserInputSource>,
+        ),
+    >,
+) {
     let display_id = frame
         .get("display_id")
         .and_then(|value| value.as_u64())
@@ -2084,10 +2182,7 @@ async fn forward_dashboard_display_input(frame: serde_json::Value, runtime: &Con
     let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
         return;
     };
-    let Some(bridge) = runtime.display_authority.as_ref() else {
-        return;
-    };
-    if !bridge.input_authorized(&runtime.session_id, display_id) {
+    if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
         return;
     }
     let session_registry = {
@@ -2102,10 +2197,63 @@ async fn forward_dashboard_display_input(frame: serde_json::Value, runtime: &Con
         registry.get(display_id)
     };
     if let Some(display_session) = display_session {
-        // Fire-and-forget: the session's input pump injects queued
-        // events in order and logs failures.
-        display_session.enqueue_input(input_event);
+        // The registry reads above yield. Re-check after them so a live IAM,
+        // peer-identity, or holder change cannot race the final enqueue.
+        if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
+            return;
+        }
+        let replace = input_sources
+            .get(&display_id)
+            .and_then(|(known, _)| known.upgrade())
+            .is_none_or(|known| !Arc::ptr_eq(&known, &display_session));
+        if replace {
+            let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let runtime = Arc::clone(runtime);
+                let shutdown = shutdown.clone();
+                Arc::new(move || {
+                    dashboard_display_input_remains_authorized(&runtime, display_id, &shutdown)
+                })
+            };
+            let source = display_session.browser_input_source(
+                crate::display::BrowserInputAuthorization::versioned(
+                    input_authorized,
+                    runtime
+                        .display_authority
+                        .as_ref()
+                        .expect("authorized display input requires authority bridge")
+                        .input_revision(display_id),
+                ),
+            );
+            sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(display_id, Arc::downgrade(&source));
+            input_sources.insert(display_id, (Arc::downgrade(&display_session), source));
+        }
+        if let Some((_, source)) = input_sources.get(&display_id) {
+            // Fire-and-forget: the source binds buffered events to this
+            // dashboard-control worker; the session pump preserves order and
+            // performs the final live check.
+            source.enqueue(input_event);
+        }
     }
+}
+
+/// Revalidate a frame that already passed the operation gate in
+/// [`control_frame_response`]. Exact opening-grant equality implies the
+/// original DisplayInput permission is unchanged; the remaining checks bind
+/// the buffered event to the live transport and current display holder.
+fn dashboard_display_input_remains_authorized(
+    runtime: &ControlRuntime,
+    display_id: u32,
+    shutdown: &CancellationToken,
+) -> bool {
+    !shutdown.is_cancelled()
+        && runtime.grant.opening_authority_is_current()
+        && runtime
+            .display_authority
+            .as_ref()
+            .is_some_and(|bridge| bridge.input_authorized(&runtime.session_id, display_id))
 }
 
 pub(crate) fn cached_bootstrap_events_response_frame(
@@ -2425,6 +2573,175 @@ mod tests {
     use super::*;
     use crate::dashboard_control::tests::{runtime, scoped_user_client_grant};
 
+    struct ForwarderResetBackend {
+        injected: mpsc::UnboundedSender<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for ForwarderResetBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, intendant_core::error::CallerError>
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(
+            &self,
+            event: crate::display::InputEvent,
+        ) -> Result<(), intendant_core::error::CallerError> {
+            let tag = match event {
+                crate::display::InputEvent::KeyDown { .. } => "kd",
+                crate::display::InputEvent::KeyUp { .. } => "ku",
+                crate::display::InputEvent::MouseDown { .. } => "md",
+                crate::display::InputEvent::MouseUp { .. } => "mu",
+                crate::display::InputEvent::MouseMove { .. } => "mm",
+                crate::display::InputEvent::Scroll { .. } => "sc",
+            };
+            let _ = self.injected.send(tag);
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "forwarder-reset-test"
+        }
+    }
+
+    #[test]
+    fn display_input_forwarder_is_bounded_and_cancels_on_overflow() {
+        let shutdown = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 1})));
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 2})));
+        assert!(!forwarder.try_forward(serde_json::json!({"seq": 3})));
+        assert!(shutdown.is_cancelled(), "overflow must close the lane");
+        assert_eq!(rx.try_recv().unwrap()["seq"], 1);
+        assert_eq!(rx.try_recv().unwrap()["seq"], 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "the channel must never exceed its cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_input_forwarder_overload_releases_held_native_input() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let display = Arc::new(crate::display::DisplaySession::new(
+            0,
+            Arc::new(ForwarderResetBackend {
+                injected: injected_tx,
+            }),
+        ));
+        let source = display.browser_input_source(crate::display::BrowserInputAuthorization::new(
+            Arc::new(|| true),
+        ));
+        source.enqueue(crate::display::InputEvent::KeyDown {
+            code: "KeyA".to_string(),
+            key: "a".to_string(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .unwrap(),
+            Some("kd")
+        );
+
+        let shutdown = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+        forwarder
+            .sources
+            .lock()
+            .unwrap()
+            .insert(0, Arc::downgrade(&source));
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 1})));
+        assert!(!forwarder.try_forward(serde_json::json!({"seq": 2})));
+        assert!(shutdown.is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .unwrap(),
+            Some("ku"),
+            "overload cancellation must synthesize a release for held input"
+        );
+        display.stop().await;
+    }
+
+    #[test]
+    fn display_input_rechecks_persisted_iam_before_enqueue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:77".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:77",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+
+        let (change_tx, _change_rx) = tokio::sync::broadcast::channel(1);
+        let subscribe_tx = change_tx.clone();
+        let bridge = DashboardDisplayAuthorityBridge::new(
+            |_session_id, _display_ids| Vec::new(),
+            |_session_id, _display_id| None,
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| true,
+            |_display_id| Arc::new(AtomicU64::new(0)),
+            |_session_id| {},
+            move || subscribe_tx.subscribe(),
+        );
+        let mut rt = runtime();
+        rt.display_authority = Some(bridge);
+        rt.grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        let shutdown = CancellationToken::new();
+        assert!(dashboard_display_input_remains_authorized(
+            &rt, 0, &shutdown
+        ));
+
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(
+            !dashboard_display_input_remains_authorized(&rt, 0, &shutdown),
+            "a queued frame must observe live IAM revocation"
+        );
+    }
+
     #[test]
     fn frame_api_response_fails_closed_on_byte_payloads() {
         let response = crate::web_gateway::ApiResponse::Bytes {
@@ -2609,7 +2926,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let bytes = b"hello upload";
         let first = &bytes[..6];
         let second = &bytes[6..];
@@ -2721,7 +3038,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
 
         let start = serde_json::json!({
             "t": "upload_start",
@@ -2795,7 +3112,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let terminal_id = "dash-control-test-shell";
 
         let open = serde_json::json!({
@@ -2936,7 +3253,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let mut frame = |text: &str,
                          rt: &mut ControlRuntime,
                          pending: &mut HashMap<String, CancellationToken>,

@@ -1971,6 +1971,46 @@ mod tests {
             "foreign origin should be refused on non-fleet APIs: {}",
             resp.lines().next().unwrap_or("")
         );
+        // Legacy protected reads and source-viewer fallthroughs are covered by
+        // the same pre-authority gate, not just route-table APIs.
+        for path in ["/debug", "/recordings", "/frames/example"] {
+            let resp = http_request(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                "foreign origin reached protected legacy path {path}: {}",
+                resp.lines().next().unwrap_or("")
+            );
+        }
+        // Browser navigations often omit Origin. Fetch Metadata must still
+        // stop a same-site/cross-site page before authority resolution.
+        let resp = http_request(
+            port,
+            "GET /debug HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "cross-site navigation reached protected legacy path: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Authority-free shell bytes remain deliberately public even with
+        // cross-site Fetch Metadata; they resolve under anonymous role:none.
+        let resp = http_request(
+            port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "authority-free shell should remain public: {}",
+            resp.lines().next().unwrap_or("")
+        );
         // The daemon's own origin sails through and is echoed on fleet paths.
         let resp = http_request(
             port,
@@ -2404,6 +2444,10 @@ mod tests {
     /// self-signed), writes the request as cleartext into the TLS session,
     /// and reads to EOF. Returns the decrypted bytes as a lossy string.
     async fn https_request(port: u16, request: &str) -> String {
+        https_request_for_server_name(port, "localhost", request).await
+    }
+
+    async fn https_request_for_server_name(port: u16, server_name: &str, request: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -2413,7 +2457,7 @@ mod tests {
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
         let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
@@ -2444,6 +2488,46 @@ mod tests {
             );
         }
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn public_fleet_name_is_discovery_only_even_at_its_own_origin() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let fleet_name = "discovery-only-fleet.test";
+        let fleet_cert = rcgen::generate_simple_self_signed(vec![fleet_name.to_string()]).unwrap();
+        crate::web_tls::install_fleet_certificate(
+            fleet_name,
+            &fleet_cert.cert.pem(),
+            &fleet_cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
+
+        for request in [
+            format!("GET /api/project-root HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            format!("POST /mcp HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nContent-Length: 0\r\n\r\n"),
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nOrigin: https://{fleet_name}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+        ] {
+            let response = https_request_for_server_name(port, fleet_name, &request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "fleet control route was not refused: {response}"
+            );
+            assert!(response.contains("discovery-only"));
+        }
+
+        let public_shell = https_request_for_server_name(
+            port,
+            fleet_name,
+            &format!("GET / HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            public_shell.starts_with("HTTP/1.1 200"),
+            "authority-free shell should remain available: {public_shell}"
+        );
+        handle.abort();
     }
 
     /// Routes served by the legacy dispatch chain (the non-API surface:
@@ -3889,7 +3973,7 @@ mod tests {
     /// it return `Err`, which the production code already tolerates
     /// (the WS-close path would have cleared this entry in real life).
     pub(crate) fn seed_holder(
-        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        map: &Arc<DisplayInputAuthority>,
         display_id: u32,
         connection_id: &str,
     ) {

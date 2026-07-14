@@ -7,6 +7,7 @@
 //! signed by the access CA as equivalent.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,119 @@ pub(crate) fn unix_timestamp() -> i64 {
 /// pairing arriving input-capable.
 pub const DEFAULT_PROFILE: &str = "read-only-display";
 const POLICY_DIR: &str = "peer-access-identities";
+
+/// Stat-level identity of one peer record. Identity writes replace the file
+/// atomically, so a fresh inode distinguishes same-length/same-timestamp
+/// replacements on Unix; length and mtime provide the portable fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerRecordFingerprint {
+    len: u64,
+    mtime_nanos: u128,
+    dev: u64,
+    ino: u64,
+}
+
+fn peer_record_fingerprint_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> Option<PeerRecordFingerprint> {
+    if !metadata.is_file() {
+        return None;
+    }
+    let (dev, ino) = crate::platform::metadata_dev_ino(metadata);
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(PeerRecordFingerprint {
+        len: metadata.len(),
+        mtime_nanos,
+        dev,
+        ino,
+    })
+}
+
+fn peer_record_fingerprint(path: &Path) -> Option<PeerRecordFingerprint> {
+    peer_record_fingerprint_from_metadata(&std::fs::metadata(path).ok()?)
+}
+
+struct PeerRecordCacheEntry {
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+}
+
+type PeerRecordCache = std::collections::HashMap<PathBuf, PeerRecordCacheEntry>;
+
+/// Peer records are reread from their own file, so key the cache by the full
+/// path rather than only the certificate fingerprint. Tests and multiple
+/// configured stores in one process must never share an entry.
+fn peer_record_cache() -> &'static Mutex<PeerRecordCache> {
+    static CACHE: OnceLock<Mutex<PeerRecordCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+const PEER_RECORD_CACHE_MAX_PATHS: usize = 128;
+
+fn cached_peer_record_in(
+    cache: &PeerRecordCache,
+    path: &Path,
+    fingerprint: &PeerRecordFingerprint,
+) -> Option<Arc<PeerIdentityRecord>> {
+    cache
+        .get(path)
+        .filter(|entry| entry.fingerprint == *fingerprint)
+        .map(|entry| Arc::clone(&entry.record))
+}
+
+fn cached_peer_record(
+    path: &Path,
+    fingerprint: &PeerRecordFingerprint,
+) -> Option<Arc<PeerIdentityRecord>> {
+    let cache = peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cached_peer_record_in(&cache, path, fingerprint)
+}
+
+fn store_cached_peer_record_in(
+    cache: &mut PeerRecordCache,
+    path: &Path,
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+) {
+    if cache.len() >= PEER_RECORD_CACHE_MAX_PATHS && !cache.contains_key(path) {
+        // Peer stores are tiny in normal operation. Clearing instead of
+        // maintaining an eviction list keeps this authorization cache
+        // bounded without introducing recency bookkeeping on the hot path.
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        PeerRecordCacheEntry {
+            fingerprint,
+            record,
+        },
+    );
+}
+
+fn store_cached_peer_record(
+    path: &Path,
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+) {
+    let mut cache = peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    store_cached_peer_record_in(&mut cache, path, fingerprint, record);
+}
+
+fn invalidate_cached_peer_record(path: &Path) {
+    peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(path);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1043,18 +1157,53 @@ pub fn write_approved_identity(
     })
 }
 
+pub(crate) fn lookup_identity_cached_arc(
+    cert_dir: &Path,
+    fingerprint: &str,
+) -> Result<Option<Arc<PeerIdentityRecord>>, CallerError> {
+    let fingerprint = normalize_fingerprint(fingerprint)?;
+    let path = identity_path(cert_dir, &fingerprint);
+    // Path::exists also performs metadata I/O and collapses errors to false.
+    // Do that compatibility check and build the cache fingerprint from one
+    // metadata call so an unchanged hot-path lookup pays exactly one stat.
+    let before = match std::fs::metadata(&path) {
+        Ok(metadata) => peer_record_fingerprint_from_metadata(&metadata),
+        Err(_) => {
+            invalidate_cached_peer_record(&path);
+            return Ok(None);
+        }
+    };
+    if let Some(cached) = before
+        .as_ref()
+        .and_then(|fingerprint| cached_peer_record(&path, fingerprint))
+    {
+        return Ok(Some(cached));
+    }
+
+    let text = std::fs::read_to_string(&path)?;
+    let record = Arc::new(serde_json::from_str::<PeerIdentityRecord>(&text)?);
+    // Re-stat after the read. If an atomic replacement raced the read, the
+    // parsed record is still a valid point-in-time result, but caching it
+    // under the pre-read fingerprint could pin that stale view indefinitely.
+    // Parse failures return above and are never cached.
+    if let Some(before) = before {
+        if matches!(peer_record_fingerprint(&path), Some(after) if after == before) {
+            store_cached_peer_record(&path, before, Arc::clone(&record));
+        } else {
+            invalidate_cached_peer_record(&path);
+        }
+    } else {
+        invalidate_cached_peer_record(&path);
+    }
+    Ok(Some(record))
+}
+
 pub fn lookup_identity(
     cert_dir: &Path,
     fingerprint: &str,
 ) -> Result<Option<PeerIdentityRecord>, CallerError> {
-    let fingerprint = normalize_fingerprint(fingerprint)?;
-    let path = identity_path(cert_dir, &fingerprint);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(path)?;
-    let record: PeerIdentityRecord = serde_json::from_str(&text)?;
-    Ok(Some(record))
+    lookup_identity_cached_arc(cert_dir, fingerprint)
+        .map(|record| record.map(|record| (*record).clone()))
 }
 
 pub fn list_identities(cert_dir: &Path) -> Result<Vec<PeerIdentityRecord>, CallerError> {
@@ -1230,13 +1379,27 @@ pub fn write_identity_record(
     record: &PeerIdentityRecord,
 ) -> Result<(), CallerError> {
     with_identity_store_lock(cert_dir, || {
+        let path = identity_path(cert_dir, &record.fingerprint);
         let mut body = serde_json::to_vec_pretty(record)?;
         body.push(b'\n');
-        super::authority_store::atomic_write_private_locked(
-            &identity_path(cert_dir, &record.fingerprint),
-            &body,
-        )
-        .map_err(|error| CallerError::Config(error.to_string()))
+        super::authority_store::atomic_write_private_locked(&path, &body)
+            .map_err(|error| CallerError::Config(error.to_string()))?;
+        // Best-effort write-through refresh. Correctness never depends on
+        // this: every lookup stats the file and rejects a mismatched cache
+        // entry. Refreshing here lets in-process revoke/profile writes avoid
+        // paying a read+parse on the next authorization predicate.
+        let before = peer_record_fingerprint(&path);
+        let persisted_bytes_match = std::fs::read(&path)
+            .map(|persisted| persisted == body)
+            .unwrap_or(false);
+        let after = peer_record_fingerprint(&path);
+        match (before, after, persisted_bytes_match) {
+            (Some(before), Some(after), true) if before == after => {
+                store_cached_peer_record(&path, after, Arc::new(record.clone()));
+            }
+            _ => invalidate_cached_peer_record(&path),
+        }
+        Ok(())
     })
 }
 
@@ -1733,6 +1896,136 @@ mod tests {
         let revoked = revoke_identity(tmp.path(), "peer-a").unwrap();
         assert_eq!(revoked.status, PeerIdentityStatus::Revoked);
         assert!(revoked.revoked_at_unix.is_some());
+    }
+
+    fn replace_peer_record_bytes_without_cache(
+        cert_dir: &Path,
+        fingerprint: &str,
+        contents: &[u8],
+    ) {
+        let path = identity_path(cert_dir, fingerprint);
+        crate::access::authority_store::with_lock(cert_dir, || {
+            crate::access::authority_store::atomic_write_private_locked(&path, contents)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn peer_record_cache_hit_requires_the_exact_file_fingerprint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Arc::new(
+            write_approved_identity(tmp.path(), fp, "peer-cache", "stats", None, None).unwrap(),
+        );
+        let path = identity_path(tmp.path(), fp);
+        let fingerprint = peer_record_fingerprint(&path).unwrap();
+        let mut cache = PeerRecordCache::new();
+        cache.insert(
+            path.clone(),
+            PeerRecordCacheEntry {
+                fingerprint: fingerprint.clone(),
+                record: Arc::clone(&record),
+            },
+        );
+
+        let hit = cached_peer_record_in(&cache, &path, &fingerprint).unwrap();
+        assert!(Arc::ptr_eq(&record, &hit));
+
+        let mut changed = fingerprint;
+        changed.len = changed.len.wrapping_add(1);
+        assert!(
+            cached_peer_record_in(&cache, &path, &changed).is_none(),
+            "a changed stat fingerprint must never reuse the parsed record"
+        );
+    }
+
+    #[test]
+    fn peer_record_cache_is_bounded_by_full_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Arc::new(
+            write_approved_identity(tmp.path(), fp, "peer-bound", "stats", None, None).unwrap(),
+        );
+        let mut cache = PeerRecordCache::new();
+        for index in 0..=PEER_RECORD_CACHE_MAX_PATHS {
+            let path = PathBuf::from(format!("isolated/peer-record-{index}.json"));
+            let fingerprint = PeerRecordFingerprint {
+                len: index as u64,
+                mtime_nanos: index as u128,
+                dev: 1,
+                ino: index as u64 + 1,
+            };
+            store_cached_peer_record_in(
+                &mut cache,
+                &path,
+                fingerprint.clone(),
+                Arc::clone(&record),
+            );
+            assert!(cache.len() <= PEER_RECORD_CACHE_MAX_PATHS);
+        }
+        let last_index = PEER_RECORD_CACHE_MAX_PATHS;
+        let last_path = PathBuf::from(format!("isolated/peer-record-{last_index}.json"));
+        let last_fingerprint = PeerRecordFingerprint {
+            len: last_index as u64,
+            mtime_nanos: last_index as u128,
+            dev: 1,
+            ino: last_index as u64 + 1,
+        };
+        let hit = cached_peer_record_in(&cache, &last_path, &last_fingerprint).unwrap();
+        assert!(Arc::ptr_eq(&record, &hit));
+    }
+
+    #[test]
+    fn external_peer_record_replacement_invalidates_the_cached_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let opening =
+            write_approved_identity(tmp.path(), fp, "peer-external", "stats", None, None).unwrap();
+        let cached = lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+
+        // Bypass write_identity_record to model another daemon/CLI process
+        // replacing the shared authority file. The next lookup must detect
+        // the new file fingerprint rather than trusting in-process invalidation.
+        let mut replacement = opening;
+        replacement.profile = "peer-root".to_string();
+        let mut body = serde_json::to_vec_pretty(&replacement).unwrap();
+        body.push(b'\n');
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, &body);
+
+        let reloaded = lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+        assert_eq!(reloaded.profile, "peer-root");
+        assert!(
+            !Arc::ptr_eq(&cached, &reloaded),
+            "an atomic external replacement must discard the cached parse"
+        );
+    }
+
+    #[test]
+    fn malformed_peer_record_replacement_is_never_masked_or_cached() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut valid =
+            write_approved_identity(tmp.path(), fp, "peer-malformed", "stats", None, None).unwrap();
+        lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, b"not-json\n");
+        assert!(
+            lookup_identity(tmp.path(), fp).is_err(),
+            "a changed malformed record must fail closed instead of returning the old cache entry"
+        );
+        assert!(
+            lookup_identity(tmp.path(), fp).is_err(),
+            "parse errors must not become successful cached results"
+        );
+
+        valid.profile = "read-only-display".to_string();
+        let mut body = serde_json::to_vec_pretty(&valid).unwrap();
+        body.push(b'\n');
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, &body);
+        assert_eq!(
+            lookup_identity(tmp.path(), fp).unwrap().unwrap().profile,
+            "read-only-display"
+        );
     }
 
     #[test]

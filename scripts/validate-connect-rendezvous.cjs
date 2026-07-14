@@ -544,6 +544,7 @@ function publicBootstrapHtml() {
     completedChunkedResponses: 0,
     completedByteStreams: 0,
     lastStatus: null,
+    lastError: '',
     seq: 0,
     async start() {
       this.pc = new RTCPeerConnection({});
@@ -1097,6 +1098,7 @@ function publicBootstrapHtml() {
     status() {
       return {
         daemonId,
+        lastError: this.lastError,
         connected: this.pc?.connectionState === 'connected',
         pcState: this.pc?.connectionState || '',
         channelState: this.channel?.readyState || '',
@@ -1204,7 +1206,8 @@ function publicBootstrapHtml() {
   window.intendantPublicConnectDashboard = connect;
   connect.start().catch(err => {
     console.error(err);
-    paint(err?.message || String(err));
+    connect.lastError = err?.message || String(err);
+    paint(connect.lastError);
   });
 })();
 </script>
@@ -1281,6 +1284,7 @@ function writeAdversarialClientKeyGrant(homeDir, fingerprint, accountName = REND
     client_key: 'role:operator',
   };
   fs.writeFileSync(iamPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  return { iamPath, bytes: fs.readFileSync(iamPath, 'utf8') };
 }
 
 function prepareDaemonHomeAccessCerts(binary, homeDir, label) {
@@ -1508,7 +1512,7 @@ async function main() {
       /role:none|hosted control is unavailable|not authorized|no effective hosted permission/i.test(String(ungranted.lastError)),
       `expected fail-closed hosted refusal: ${JSON.stringify(ungranted)}`
     );
-    writeAdversarialClientKeyGrant(
+    const adversarialIam = writeAdversarialClientKeyGrant(
       daemonHome,
       rendezvous.testClientKeyFingerprint,
       RENDEZVOUS_TEST_ACCOUNT_NAME
@@ -1528,9 +1532,12 @@ async function main() {
       0,
       'hosted rendezvous unexpectedly opened a dashboard-control DataChannel'
     );
-    const normalizedIam = JSON.parse(fs.readFileSync(path.join(daemonHome, '.intendant', 'access-certs', 'iam.json'), 'utf8'));
-    assert.strictEqual(normalizedIam.role_ceilings?.connect_account, 'role:none');
-    assert.strictEqual(normalizedIam.role_ceilings?.client_key, 'role:none');
+    const iamAfter = fs.readFileSync(adversarialIam.iamPath, 'utf8');
+    assert.strictEqual(
+      iamAfter,
+      adversarialIam.bytes,
+      'hosted signaling refusal must happen before touching local IAM state'
+    );
     console.log(JSON.stringify({
       ok: true,
       publicOrigin,

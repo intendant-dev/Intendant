@@ -2528,13 +2528,23 @@ pub(crate) type HttpAccessContext = RequestAuthority;
 
 fn browser_mtls_state_for_request(
     cert_dir: &std::path::Path,
-    fingerprint: &str,
+    _fingerprint: &str,
 ) -> Result<crate::access::iam::LocalIamState, String> {
-    if crate::access::iam::browser_mtls_initialized_path(cert_dir).exists() {
-        return load_local_iam_state_for_request(cert_dir).map(|state| state.unwrap_or_default());
+    // Compatibility enrollment of the exact daemon-generated owner client.crt
+    // runs at trusted web startup. Request authentication may durably apply a
+    // fail-closed IAM schema migration, but it cannot mint or grant authority.
+    load_local_iam_state_for_request(cert_dir).map(|state| state.unwrap_or_default())
+}
+
+pub(crate) fn authority_free_http_access_context(is_tls: bool) -> HttpAccessContext {
+    HttpAccessContext {
+        principal: crate::access::iam::AccessPrincipal::authority_free_http(if is_tls {
+            "https"
+        } else {
+            "http"
+        }),
+        iam_state: None,
     }
-    crate::access::iam::initialize_browser_mtls_root_if_needed(cert_dir, fingerprint)
-        .map_err(|error| format!("initialize browser mTLS IAM: {error}"))
 }
 
 fn browser_mtls_principal_for_state(
@@ -3467,6 +3477,61 @@ mod tests {
         assert!(
             !access
                 .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn browser_mtls_request_cannot_mint_generated_owner_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(tmp.path(), &names, "owner", false).unwrap();
+        let owner_fingerprint =
+            crate::access::certs::read_owner_client_cert_fingerprint(tmp.path()).unwrap();
+
+        let request =
+            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        assert_eq!(request.principal.kind, "browser_certificate");
+        assert_eq!(request.principal.source, "browser-mtls-ungranted");
+        assert_eq!(request.principal.role_id, "role:none");
+        assert!(
+            !request
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+        assert!(
+            !crate::access::iam::iam_state_path(tmp.path()).exists(),
+            "request authentication must not persist IAM"
+        );
+        assert!(
+            !crate::access::iam::browser_mtls_initialized_path(tmp.path()).exists(),
+            "request authentication must not consume the startup migration marker"
+        );
+
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(tmp.path())
+                .unwrap()
+        );
+        let after_startup =
+            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        assert_eq!(after_startup.principal.role_id, "role:root");
+    }
+
+    #[test]
+    fn authority_free_http_context_is_always_role_none() {
+        let context = authority_free_http_access_context(true);
+        assert_eq!(context.principal.kind, "anonymous");
+        assert_eq!(context.principal.source, "public-http");
+        assert_eq!(context.principal.role_id, "role:none");
+        assert!(context.iam_state.is_none());
+        assert!(
+            !context
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
                 .allowed
         );
     }

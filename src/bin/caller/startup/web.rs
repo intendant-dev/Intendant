@@ -220,7 +220,8 @@ pub(crate) fn build_web_tls_acceptor(
                     Some(cert_dir) => {
                         eprintln!(
                             "[access] first boot: generated dashboard access certificates \
-                             in {} — enroll a browser via the claim flow or `intendant access`",
+                             in {} — enroll a browser with `intendant access serve-certs`; \
+                             the Connect claim flow is discovery-only",
                             cert_dir.display()
                         );
                         installed_access_tls_cert_source()?.ok_or_else(|| {
@@ -261,6 +262,31 @@ pub(crate) fn build_web_tls_acceptor(
     } else {
         web_tls::ClientAuth::None
     };
+
+    // Legacy access stores predate setup-time IAM seeding. Complete that
+    // exact-local-client.crt migration here, before the listener accepts any
+    // request, whenever this gateway trusts the installed access CA. Request
+    // authentication cannot mint or grant authority, so hosted JS cannot
+    // reach a root mutation through an asset load or cross-origin navigation.
+    let installed_cert_dir = installed_access_cert_dir();
+    let installed_ca_path = installed_cert_dir.join("ca.crt");
+    let trusts_installed_access_ca = match &client_auth {
+        web_tls::ClientAuth::OptionalCa { ca_path }
+        | web_tls::ClientAuth::RequireCa { ca_path } => ca_path == &installed_ca_path,
+        web_tls::ClientAuth::None => false,
+    };
+    if trusts_installed_access_ca
+        && access::iam::migrate_generated_browser_mtls_owner_root_at_startup(&installed_cert_dir)
+            .map_err(|error| {
+                CallerError::Config(format!(
+                "migrate installed owner mTLS identity into local IAM before web startup: {error}"
+            ))
+            })?
+    {
+        eprintln!(
+            "[access] completed trusted startup migration for the generated owner mTLS identity"
+        );
+    }
 
     match &source {
         web_tls::TlsCertSource::Files {

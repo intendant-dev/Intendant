@@ -1,6 +1,8 @@
-//! Connect-relayed dashboard bootstrap: offer/ice/close responses for
-//! browsers arriving via the rendezvous, and the self-contained bootstrap
-//! HTML page.
+//! Daemon-origin dashboard bootstrap: offer/ice/close responses for clients
+//! already admitted by a trusted local, independently verified direct-mTLS, or
+//! authenticated peer transport, plus the self-contained bootstrap HTML page.
+//! The `connect_*` names are retained for wire compatibility; hosted Connect
+//! does not serve or relay this control path.
 
 use super::*;
 

@@ -140,6 +140,19 @@ use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
 
+/// The legacy browser-key owner bootstrap is retired on every CLI entry point,
+/// including the service install/supervisor boundaries that bypass the normal
+/// daemon flag parser.
+const RETIRED_OWNER_ERROR: &str =
+    "--owner is retired: browser identity keys cannot anchor root authority. \
+Run `intendant access setup`, then use the generated mTLS certificate over an \
+independently verified direct daemon URL. Loopback access remains local root; \
+this release has no signed-native remote anchor.";
+
+fn is_retired_owner_arg(arg: &str) -> bool {
+    arg == "--owner" || arg.starts_with("--owner=")
+}
+
 /// Session log directory for the panic hook to write panic.log into.
 /// Set once when a session starts; read by the panic hook on crash.
 static PANIC_LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -181,8 +194,9 @@ fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -
 ///
 /// This is the single source of truth for the dispatch log line: it lives in
 /// the backend (where the task is actually accepted for processing) rather
-/// than in any frontend, so the log is consistent across TUI, headless, and
-/// daemon modes regardless of which interface originated the task.
+/// than in any frontend, so the log is consistent across dashboard, MCP,
+/// JSON, and headless daemon modes regardless of which interface originated
+/// the task.
 fn emit_task_dispatched_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -338,7 +352,7 @@ fn print_help() {
         "    --mtls                Require client certificates signed by the Intendant access CA (default)"
     );
     println!("    --mtls-ca <PATH>      PEM CA bundle for --mtls client certificate verification");
-    println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
+    println!("    --no-web              Disable web dashboard and run headless in the terminal");
     println!("    --transcription       Enable user speech transcription");
     println!(
         "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
@@ -389,9 +403,28 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     parse_cli_flags_from(env::args().skip(1).collect())
 }
 
-/// Testable core of [`parse_cli_flags`]: `args` is argv minus the binary
-/// name.
+enum CliParseOutcome {
+    Flags(Box<CliFlags>),
+    Help,
+}
+
+/// Testable wrapper for normal process startup. The reusable parser below
+/// reports help as data so service installation can validate daemon argv
+/// without accidentally exiting the installer process.
 fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
+    match parse_cli_flags_outcome(args)? {
+        CliParseOutcome::Flags(flags) => Ok(*flags),
+        CliParseOutcome::Help => {
+            print_help();
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Pure CLI parser: `args` is argv minus the binary name. Service mode uses
+/// this same parser before persisting/spawning daemon arguments, so value
+/// consumption and the `--` task delimiter cannot drift from real startup.
+fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerError> {
     let mut flags = CliFlags {
         task: None,
         task_file: None,
@@ -434,8 +467,7 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
+                return Ok(CliParseOutcome::Help);
             }
             "--provider" => {
                 if i + 1 < args.len() {
@@ -573,13 +605,8 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
                     return Err(CallerError::Config("Missing value for --bind".to_string()));
                 }
             }
-            "--owner" => {
-                return Err(CallerError::Config(
-                    "--owner is retired: browser identity keys cannot anchor root authority. \
-                     Run `intendant access setup`, then use the generated mTLS certificate or \
-                     signed native app for remote root access. Loopback access remains local root."
-                        .to_string(),
-                ));
+            arg if is_retired_owner_arg(arg) => {
+                return Err(CallerError::Config(RETIRED_OWNER_ERROR.to_string()));
             }
             "--no-tls" => {
                 flags.no_tls = true;
@@ -712,7 +739,7 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
     }
     validate_tls_cli_flags(&flags)?;
 
-    Ok(flags)
+    Ok(CliParseOutcome::Flags(Box::new(flags)))
 }
 
 /// Wire the fission branch lifecycle into a startup path: spawn the bus
@@ -1275,11 +1302,11 @@ async fn start_external_display_recordings(
 /// Side effects a user approval carries beyond unblocking the waiting
 /// command: dedup recording for plain approvals, autonomy escalation for
 /// approve-all, and the first DisplayControl approval granting user-display
-/// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
+/// access session-wide. Every approval surface (JSON stdin, dashboard/MCP
 /// registry) must apply these identically, or an approval "succeeds" and
 /// the action still fails its grant check afterwards.
 /// Shared side effects for NATIVE runtime approvals, applied identically
-/// by every surface (TUI Enter, web, MCP): Approve records the command
+/// by every surface (JSON stdin, web, MCP): Approve records the command
 /// for dedup, ApproveAll raises global autonomy to Full, DisplayControl
 /// grants user display access.
 ///
@@ -1929,13 +1956,18 @@ Also: {"source": "bare"}"#;
     fn parse_cli_flags_retired_owner_fails_with_mtls_migration_guidance() {
         let fingerprint = "-vyeJaE3hyqm4J45K5j_sVTXAAAABBBBCCCCDDDDEEE";
         assert_eq!(fingerprint.len(), 43);
-        let error = match parse_cli_flags_from(cli(&["--owner", fingerprint])) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("retired --owner must fail closed"),
-        };
-        assert!(error.contains("--owner is retired"), "{error}");
-        assert!(error.contains("intendant access setup"), "{error}");
-        assert!(error.contains("mTLS"), "{error}");
+        for argv in [
+            cli(&["--owner", fingerprint]),
+            cli(&[&format!("--owner={fingerprint}")]),
+        ] {
+            let error = match parse_cli_flags_from(argv) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("retired --owner must fail closed"),
+            };
+            assert!(error.contains("--owner is retired"), "{error}");
+            assert!(error.contains("intendant access setup"), "{error}");
+            assert!(error.contains("mTLS"), "{error}");
+        }
     }
 
     #[test]
@@ -2189,7 +2221,7 @@ Also: {"source": "bare"}"#;
         let mut events = bus.subscribe();
 
         // Plain approval records the command for dedup; a DisplayControl
-        // approval grants the user display session-wide. The TUI/MCP
+        // approval grants the user display session-wide. The dashboard/MCP
         // registry path used to skip both, so approving there left the
         // action failing its grant check afterwards.
         apply_user_approval(
@@ -2859,6 +2891,25 @@ pub fn spawn_user_display_listener(
                         "capture lost",
                     );
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // A missed grant/revoke/capture-loss leaves no trustworthy
+                    // lifecycle state. Fail closed: registry drain invokes the
+                    // synchronous input-authority observer before any stale
+                    // session can be looked up again; stop captures and Xvfb
+                    // guards outside the registry lock. The user can explicitly
+                    // re-open the displays after the event stream recovers.
+                    eprintln!(
+                        "[user_display] lifecycle listener lagged by {skipped} events; \
+                         closing all display sessions fail-closed"
+                    );
+                    let sessions = session_registry.write().await.drain();
+                    virtual_display_guards.clear();
+                    for session in sessions {
+                        tokio::spawn(async move {
+                            session.stop().await;
+                        });
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
             }
@@ -3216,22 +3267,14 @@ async fn main() -> Result<(), CallerError> {
         std::process::exit(vault_deposits::run_vault_cli(argv).await);
     }
     if env::args().nth(1).as_deref() == Some("access") {
-        #[cfg(not(target_os = "windows"))]
-        {
-            let argv: Vec<String> = env::args().skip(2).collect();
-            return match access::run(argv).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            };
-        }
-        #[cfg(target_os = "windows")]
-        {
-            eprintln!("error: `intendant access` is not supported on Windows yet");
-            std::process::exit(1);
-        }
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match access::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // Intercept `intendant peer <action>` before normal project/provider

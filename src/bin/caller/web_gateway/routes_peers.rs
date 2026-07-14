@@ -1891,12 +1891,15 @@ pub(crate) async fn handle_federated_webrtc_signal(
     // (see [`DisplayInputHolder::FederatedWebRtc`]). The remaining
     // refs route to the same shared registry + broadcast the local 5c
     // path uses, so cross-provenance arbitration (local takes from
-    // federated and vice versa) goes through one source of truth.
+    // federated and vice versa) goes through one source of truth. The
+    // live predicate is bound by the caller to the exact opening peer/IAM
+    // grant and federation-WS lifetime; both the authority handler and the
+    // queued-input guard re-evaluate it instead of retaining a bool snapshot.
     federation_connection_id: String,
-    display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    display_input_authority: Arc<DisplayInputAuthority>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     federated_authority_subscribers: FederatedAuthoritySubscribers,
-    federated_display_input_allowed: bool,
+    federated_display_input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     // Short tag used as the `source` on every log line this handler
     // emits, so the operator can filter the session log to just the
@@ -2032,33 +2035,32 @@ pub(crate) async fn handle_federated_webrtc_signal(
             // shape to the local 5c authorizer above — the closure is
             // the entire boundary, `display/mod.rs` doesn't see the
             // registry. Strict deny-by-default for unclaimed (no
-            // holder); only the matching federated holder identity
-            // returns true. See [`build_federated_input_authorizer`]
-            // for the matching positive/negative test cases.
-            let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
-                if federated_display_input_allowed {
-                    build_federated_input_authorizer(
-                        display_id,
-                        federation_connection_id.clone(),
-                        session_id.clone(),
-                        Arc::clone(&display_input_authority),
-                    )
-                } else {
-                    Arc::new(|| false)
-                };
+            // holder); only a still-authorized session with the matching
+            // federated holder identity returns true. The display queue
+            // retains this closure and checks it again before injection.
+            // See [`build_federated_input_authorizer`] for the matching
+            // positive, holder-handoff, and live-revocation tests.
+            let input_authorized = build_federated_input_authorizer(
+                display_id,
+                federation_connection_id.clone(),
+                session_id.clone(),
+                Arc::clone(&display_input_authority),
+                Arc::clone(&federated_display_input_authorized),
+            );
             // F-1.3b3: real federated authority handler. Identity is
             // captured at construction so messages from this peer
             // always arbitrate against this peer's
             // `(federation_connection_id, session_id)`. Display-ID
             // mismatches drop silently (the federated peer is bound
-            // to one display).
+            // to one display). Authority requests also recheck the live
+            // session predicate so a revoked peer cannot reclaim the slot.
             let authority_handler = build_federated_authority_handler(
                 display_id,
                 federation_connection_id.clone(),
                 session_id.clone(),
                 Arc::clone(&display_input_authority),
                 authority_change_tx.clone(),
-                federated_display_input_allowed,
+                Arc::clone(&federated_display_input_authorized),
             );
             let answer_result = session
                 .handle_offer(
@@ -2068,7 +2070,10 @@ pub(crate) async fn handle_federated_webrtc_signal(
                     Some(tcp_peer_registry.clone()),
                     tcp_advertised_addr,
                     ice_tx,
-                    input_authorized,
+                    crate::display::BrowserInputAuthorization::versioned(
+                        input_authorized,
+                        display_input_authority.revision(display_id),
+                    ),
                     authority_handler,
                 )
                 .await;
@@ -2576,6 +2581,7 @@ pub(crate) fn peer_filesystem_query_request(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn peer_identity_allows_operation(
     identity: Option<&PeerConnectionIdentity>,
     op: crate::peer::access_policy::PeerOperation,
@@ -2761,6 +2767,10 @@ mod tests {
         .unwrap();
         let owner_fingerprint =
             crate::access::certs::read_owner_client_cert_fingerprint(tmp.path()).unwrap();
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(tmp.path())
+                .unwrap()
+        );
         let root =
             http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
         assert_eq!(root.principal.kind, "browser_certificate");
