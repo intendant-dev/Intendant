@@ -23,8 +23,9 @@ and are converted to milliseconds (clamped to 30 s) at parse time.
 The full `CuAction` vocabulary (the same tagged JSON accepted by the MCP
 `execute_cu_actions` tool and `intendant ctl cu actions`):
 `click`, `double_click`, `triple_click`, `mouse_down`, `mouse_up`, `type`,
-`paste` (clipboard + paste chord — fast for long text; restores the previous
-clipboard text on the user's macOS session), `key`, `hold_key`, `scroll`,
+`paste` (clipboard + paste chord — fast for long text; previous clipboard
+text is restored where the platform allows, see "Action results" below),
+`key`, `hold_key`, `scroll`,
 `move_mouse`, `drag`, `screenshot`, `zoom` (region capture at the highest
 resolution the platform can supply — native 2x pixels on Retina), and `wait`.
 `intendant ctl cu actions --help` prints the per-action field shapes with an
@@ -50,9 +51,11 @@ the executor returns an actionable error naming the recovery path. X11 and
 macOS inject input directly — X11 uses a persistent `x11rb`/XTest connection
 with in-process root-window capture and clipboard support; macOS posts
 CoreGraphics `CGEvent`s in-process (no `cliclick`/`osascript` subprocesses; key
-chords use ANSI-US virtual keycodes, unicode typing is layout-independent) —
-and prefer the in-memory frame of a live capture session for screenshots,
-falling back to their platform capture paths when no session exists.
+chords and typed ASCII use ANSI-US virtual keycodes, characters with no
+ANSI-US key ride paced unicode-string events, and typed text is read back via
+AX where possible — see "Action results" below) — and prefer the in-memory
+frame of a live capture session for screenshots, falling back to their
+platform capture paths when no session exists.
 
 **Post-action freshness:** capture backends are damage-driven, so a screenshot
 taken right after an input action waits (bounded, 300 ms) for a frame captured
@@ -65,6 +68,52 @@ on HiDPI and under the Wayland portal, which reports its own stream size).
 `zoom` is the deliberate exception: on macOS it captures raw physical pixels
 (2x on Retina) and crops the requested logical region, because detail is the
 point.
+
+### Action results: dispatch vs. effect
+
+OS input APIs only confirm that events were *dispatched* — not that the
+target app acted on them — so every action result carries an honest status
+(`CuActionStatus`) instead of a bare boolean:
+
+- **`ok`** — the intended effect was verified: screenshots and zooms (the
+  captured bytes are the effect), `wait`, and `type` on the macOS user
+  session when the focused element's AX value was read back and contained
+  the typed text.
+- **`injected`** — events were dispatched to the OS but the effect was not
+  verified. This is the honest ceiling for clicks, keys, scrolls, drags, and
+  typing on backends without read-back; verify from the post-action
+  screenshot. A dispatched-but-ineffective action (a click that only
+  activated an inactive window, a chord swallowed by the wrong app) reports
+  `injected`, never `ok`.
+- **`failed`** — dispatch failed, or verification contradicted the intent: a
+  macOS `type` whose read-back does not contain the typed text returns
+  `failed` with expected-vs-observed evidence rather than pretending
+  success.
+
+Type read-back is bounded and best-effort (two AX reads of the focused
+element): multi-line/control text (Return may submit, Tab may move focus),
+secure fields, and elements without an AX-readable value stay `injected`
+with the reason in the result detail.
+
+**Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
+same proven event shape as `key`), newlines as Return and tabs as Tab;
+characters with no ANSI-US key are delivered as paced unicode-string events
+(≤ 20 UTF-16 units per event, payload on both keyDown and keyUp, surrogate
+pairs never split). This replaces the 2026-07-13 failure mode where
+back-to-back `CGEventKeyboardSetUnicodeString` chunks were silently dropped
+by the focused app while the action still reported success.
+
+**Clipboard hygiene (`paste`)**: paste routes through the system clipboard,
+so each backend restores what it can and reports what it did in the result
+detail. macOS captures the previous *text* clipboard (`pbpaste`) and
+restores it ~300 ms after the chord — non-text content (images) cannot be
+captured, so the clipboard is cleared rather than left holding the paste
+payload; Windows does the same via arboard. X11 and Wayland selections are
+pull-based (the target may fetch the payload after the chord returns), so
+restore would race the paste itself: the pasted text deliberately remains
+the active selection and the result detail says so. The restore delay is an
+honest race, not a guarantee — an app that lazily re-reads the clipboard
+later sees the restored content.
 
 ### Screen-capture permissions & signing identity (macOS)
 
@@ -79,7 +128,13 @@ recovery path to the error (permission missing **or** invalidated by a
 re-signed build; toggle it off/on under System Settings → Privacy &
 Security → Screen & System Audio Recording, then relaunch — grants are only
 re-read at launch), and requests screen-capture access once per process so
-a fresh install gets the native prompt.
+a fresh install gets the native prompt. The CU executor's raw
+`screencapture` fallback gets the same treatment
+(`cu_readiness::enrich_capture_failure`): when the capture fails **and**
+`CGPreflightScreenCaptureAccess` confirms the permission is missing, the
+error names Screen Recording, the affected binary path, and the System
+Settings destination instead of the bare "could not create image from
+display".
 
 `scripts/bundle-macos.sh` defends the identity's stability:
 
@@ -116,6 +171,16 @@ available. Exposed as an MCP tool (in the `core` bootstrap profile) and as
 `intendant ctl cu elements [--format json]`. Pixels remain the fallback for
 visual verification and for apps with sparse accessibility trees (web views
 notably).
+
+Long element values and window titles (a `data:` URL, a whole document in a
+text view) are length-capped **once, centrally**
+(`computer_use::cap_screen_elements_texts`, 80 chars) with a stable marker —
+`prefix… [N chars total, #hash8]` — so one long value cannot dominate the
+observation while staying distinguishable from other long values sharing its
+prefix. The platform readers deliberately do not pre-truncate; the
+`full_values: true` tool param (`ctl cu elements --full-values`) skips the
+cap for exact-value requests (Linux AT-SPI still bounds each text fetch at a
+documented 4096-char transport cap).
 
 ### Who Can Call CU
 
@@ -184,6 +249,39 @@ Computer Use, the operator must enable **Allow Remote Interaction** in the
 physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
+
+### CU Readiness Diagnosis (`display_readiness`)
+
+The display grant is **Intendant authority only** — OS-level capability is a
+separate set of layers, and any of them can block actual CU while the grant
+reads as held (the classic macOS shape: `already_granted`, yet Screen
+Recording denies every capture). `src/bin/caller/cu_readiness.rs` probes five
+layers independently and names the non-ready ones, each with a fix:
+
+1. **`intendant_display_authority`** — the user-display grant / caller trust
+   (virtual targets need none).
+2. **`screen_capture_permission`** — macOS Screen Recording
+   (`CGPreflightScreenCaptureAccess`); Linux Wayland portal session or X11
+   socket; Windows desktop capture session.
+3. **`accessibility_permission`** — macOS Accessibility (`AXIsProcessTrusted`);
+   Linux AT-SPI bus reachability (bounded probe); Windows UIA client
+   instantiation.
+4. **`target_display`** — the requested display exists / has a live capture
+   session.
+5. **`input_backend`** — CGEvent (macOS, rides Accessibility), XTest (X11),
+   portal remote desktop (Wayland), SendInput via session (Windows).
+
+Probes are cheap, strictly read-only (they never pop permission prompts), and
+**never cached** — TCC and portal state can change or be revoked at any
+moment. A probe that cannot determine its layer reports `unknown`, and
+unknown counts as **not ready** (fail closed). Surfaces:
+
+- the `display_readiness` MCP tool (display-view IAM class; listed in the
+  `core` and `screen` profiles),
+- `intendant ctl display status [--target TARGET]`,
+- `request_user_display` answers (`already_granted` and approvals) carry an
+  `os_readiness` gap block naming any still-blocked OS layers, so a granted
+  request can never masquerade as a CU-ready one.
 
 ### Three separate concepts: private view, agent share, presence streaming
 

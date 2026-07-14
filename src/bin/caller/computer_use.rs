@@ -222,12 +222,99 @@ pub struct CuCallMetadata {
     pub safety_decision: Option<String>,
 }
 
+/// How far a CU action's outcome was actually confirmed.
+///
+/// OS input APIs only report that events were *dispatched*, not that the
+/// target application acted on them (the live failure class: typed text
+/// silently dropped by the focused app, shortcuts landing in a different
+/// window — both with a clean dispatch). The status keeps that distinction
+/// honest instead of collapsing everything to one boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuActionStatus {
+    /// The intended effect was confirmed (screenshot bytes captured, wait
+    /// elapsed, type read-back found the text in the focused element).
+    Verified,
+    /// Events were dispatched to the OS but the effect was not verified —
+    /// the honest ceiling for most input injection on every platform.
+    Injected,
+    /// Dispatch failed, or verification observed a different outcome.
+    Failed,
+}
+
+impl CuActionStatus {
+    /// Wire/summary label, as shown to models and in tool output.
+    pub fn label(self) -> &'static str {
+        match self {
+            CuActionStatus::Verified => "ok",
+            CuActionStatus::Injected => "injected",
+            CuActionStatus::Failed => "failed",
+        }
+    }
+}
+
 /// Result of executing a CU action.
 #[derive(Debug)]
 pub struct CuActionResult {
-    pub success: bool,
+    pub status: CuActionStatus,
     pub screenshot: Option<ScreenshotData>,
     pub error: Option<String>,
+    /// Best-effort evidence/context for the status (read-back excerpts,
+    /// clipboard restore notes) — may accompany any status.
+    pub detail: Option<String>,
+}
+
+impl CuActionResult {
+    /// Effect confirmed.
+    pub fn verified() -> Self {
+        Self {
+            status: CuActionStatus::Verified,
+            screenshot: None,
+            error: None,
+            detail: None,
+        }
+    }
+
+    /// A successful capture: the screenshot itself is the verified effect.
+    pub fn captured(screenshot: ScreenshotData) -> Self {
+        Self {
+            screenshot: Some(screenshot),
+            ..Self::verified()
+        }
+    }
+
+    /// Dispatched to the OS; effect unverified.
+    pub fn injected() -> Self {
+        Self {
+            status: CuActionStatus::Injected,
+            screenshot: None,
+            error: None,
+            detail: None,
+        }
+    }
+
+    /// Dispatched to the OS; effect unverified, with context.
+    pub fn injected_with(detail: impl Into<String>) -> Self {
+        Self {
+            detail: Some(detail.into()),
+            ..Self::injected()
+        }
+    }
+
+    /// Dispatch failed, or verification contradicted the intended effect.
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: CuActionStatus::Failed,
+            screenshot: None,
+            error: Some(error.into()),
+            detail: None,
+        }
+    }
+
+    /// Whether the action was dispatched without a hard failure
+    /// (`Verified` or `Injected`).
+    pub fn success(&self) -> bool {
+        self.status != CuActionStatus::Failed
+    }
 }
 
 /// A captured screenshot.
@@ -284,6 +371,74 @@ pub struct ScreenElements {
 pub const ELEMENT_TREE_MAX_DEPTH: usize = 12;
 /// Node-count cap for element-tree walks (keeps the observation a few KB).
 pub const ELEMENT_TREE_MAX_NODES: usize = 400;
+/// Display cap for element labels/values and window titles: one long
+/// `data:`/URL value must not dominate the whole observation. Applied once,
+/// centrally, by [`cap_screen_elements_texts`]; `read_screen`'s
+/// `full_values` opt-out skips it for explicit detail requests.
+pub const UI_TEXT_CAP: usize = 80;
+
+/// FNV-1a 64-bit over the text's UTF-8 bytes: a tiny, dependency-free,
+/// stable content fingerprint for the truncation marker (identity aid,
+/// not a security hash).
+fn fnv1a_64(text: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Length-cap one UI text with a stable marker: the first `cap` chars, an
+/// ellipsis, then the total char count and a short content hash so (a) the
+/// reader knows exactly how much was cut and (b) two long values that share
+/// a prefix remain distinguishable. Identical input always produces the
+/// identical marker. Texts within the cap pass through unchanged.
+pub(crate) fn cap_ui_text(text: &str, cap: usize) -> String {
+    let total = text.chars().count();
+    if total <= cap {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(cap).collect();
+    // Fold the 64-bit FNV to 32 bits for a compact 8-hex marker.
+    let hash = fnv1a_64(text);
+    let folded = (hash >> 32) as u32 ^ hash as u32;
+    format!("{prefix}… [{total} chars total, #{folded:08x}]")
+}
+
+/// Apply [`cap_ui_text`] once across a snapshot: window title, every
+/// element label/value, and the other-window summaries. This is the single
+/// cross-platform cap point — the macOS AX, Linux AT-SPI, and Windows UIA
+/// readers deliberately do not cap display text themselves.
+pub(crate) fn cap_screen_elements_texts(snapshot: &mut ScreenElements) {
+    fn cap_opt(value: &mut Option<String>) {
+        if let Some(text) = value {
+            let capped = cap_ui_text(text, UI_TEXT_CAP);
+            if capped.len() != text.len() {
+                *value = Some(capped);
+            }
+        }
+    }
+    fn cap_element(element: &mut UiElement) {
+        cap_opt(&mut element.label);
+        cap_opt(&mut element.value);
+        for child in &mut element.children {
+            cap_element(child);
+        }
+    }
+    cap_opt(&mut snapshot.window_title);
+    if let Some(root) = &mut snapshot.root {
+        cap_element(root);
+    }
+    for window in &mut snapshot.other_windows {
+        let capped = cap_ui_text(window, UI_TEXT_CAP);
+        if capped.len() != window.len() {
+            *window = capped;
+        }
+    }
+}
 
 /// Read the element tree of the frontmost application on the user's display.
 ///
@@ -293,7 +448,25 @@ pub const ELEMENT_TREE_MAX_NODES: usize = 400;
 /// deterministically (click the center of a reported frame). Pixels remain
 /// the fallback for visual verification and for apps with poor accessibility
 /// support.
-pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElements, String> {
+///
+/// `full_values: false` (the default) applies the central
+/// [`cap_screen_elements_texts`] pass so one long URL/`data:` value cannot
+/// dominate the observation; `true` returns values/titles uncapped for
+/// explicit detail requests (Linux AT-SPI still bounds each text fetch at
+/// its transport cap).
+pub async fn read_screen_elements(
+    target: DisplayTarget,
+    full_values: bool,
+) -> Result<ScreenElements, String> {
+    let mut snapshot = read_screen_elements_raw(target).await?;
+    if !full_values {
+        cap_screen_elements_texts(&mut snapshot);
+    }
+    Ok(snapshot)
+}
+
+/// Platform dispatch for [`read_screen_elements`], before the display cap.
+async fn read_screen_elements_raw(target: DisplayTarget) -> Result<ScreenElements, String> {
     #[cfg(target_os = "macos")]
     {
         if !target.is_user_session() {
@@ -649,6 +822,36 @@ pub fn cu_action_raw_call(action: &CuAction) -> String {
     }
 }
 
+/// Honest batch summary for the native CU loop's tool results: failures win
+/// the headline, dispatch-only injection is never dressed up as a verified
+/// effect, and per-action evidence (read-back, clipboard notes) rides along.
+/// `results` may carry one trailing auto-screenshot result beyond `actions`.
+pub fn summarize_results_for_model(actions: &[CuAction], results: &[CuActionResult]) -> String {
+    let mut out = if results.iter().all(|r| r.success()) {
+        let injected = results
+            .iter()
+            .filter(|r| r.status == CuActionStatus::Injected)
+            .count();
+        if injected == 0 {
+            "Actions executed successfully.".to_string()
+        } else {
+            format!(
+                "Actions dispatched ({injected} injected: input delivered to the OS, \
+                 effect not independently verified — confirm from the screenshot)."
+            )
+        }
+    } else {
+        let errors: Vec<&str> = results.iter().filter_map(|r| r.error.as_deref()).collect();
+        format!("Some actions failed: {}", errors.join("; "))
+    };
+    for (action, result) in actions.iter().zip(results.iter()) {
+        if let Some(detail) = &result.detail {
+            out.push_str(&format!("\n{}: {}", cu_action_kind(action), detail));
+        }
+    }
+    out
+}
+
 // ── Executor ─────────────────────────────────────────────────────────────────
 
 /// Execute a batch of CU actions on the given display.
@@ -684,11 +887,7 @@ pub async fn execute_actions(
         // (a screenshot-only batch still gets its one denial).
         return actions
             .iter()
-            .map(|_| CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(user_session_denied_message().to_string()),
-            })
+            .map(|_| CuActionResult::failed(user_session_denied_message()))
             .collect();
     }
 
@@ -719,15 +918,11 @@ pub async fn execute_actions(
                 )
                 .await;
             }
-            return vec![CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(no_session_message(
-                    effective_backend,
-                    &target,
-                    user_session_allowed,
-                )),
-            }];
+            return vec![CuActionResult::failed(no_session_message(
+                effective_backend,
+                &target,
+                user_session_allowed,
+            ))];
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
     }
@@ -751,6 +946,10 @@ pub async fn execute_actions(
     let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
+        // Whether input events were actually dispatched — the Live overlay
+        // renders what the agent DID, so a type whose read-back later
+        // downgrades the result still paints its keypress chip.
+        let mut dispatched_ok: Option<bool> = None;
         let result = match action {
             CuAction::Screenshot => {
                 match capture_screenshot_preferring_session(
@@ -763,16 +962,8 @@ pub async fn execute_actions(
                 )
                 .await
                 {
-                    Ok(s) => CuActionResult {
-                        success: true,
-                        screenshot: Some(s),
-                        error: None,
-                    },
-                    Err(e) => CuActionResult {
-                        success: false,
-                        screenshot: None,
-                        error: Some(e),
-                    },
+                    Ok(s) => CuActionResult::captured(s),
+                    Err(e) => CuActionResult::failed(e),
                 }
             }
             CuAction::Zoom {
@@ -792,16 +983,8 @@ pub async fn execute_actions(
                 )
                 .await
                 {
-                    Ok(s) => CuActionResult {
-                        success: true,
-                        screenshot: Some(s),
-                        error: None,
-                    },
-                    Err(e) => CuActionResult {
-                        success: false,
-                        screenshot: None,
-                        error: Some(e),
-                    },
+                    Ok(s) => CuActionResult::captured(s),
+                    Err(e) => CuActionResult::failed(e),
                 }
             }
             _ => {
@@ -816,13 +999,14 @@ pub async fn execute_actions(
                 if !matches!(action, CuAction::Wait { .. }) {
                     last_input_at = Some(std::time::Instant::now());
                 }
-                result
+                dispatched_ok = Some(result.success());
+                verify_action_effect(action, result, effective_backend, target).await
             }
         };
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
-        if result.success {
+        if dispatched_ok.unwrap_or_else(|| result.success()) {
             if let Some(obs) = observer {
                 obs.observe(target, observe_ref, action);
             }
@@ -847,18 +1031,10 @@ pub async fn execute_actions(
         match auto {
             Ok(s) => {
                 last_screenshot = Some(s.clone());
-                results.push(CuActionResult {
-                    success: true,
-                    screenshot: Some(s),
-                    error: None,
-                });
+                results.push(CuActionResult::captured(s));
             }
             Err(e) => {
-                results.push(CuActionResult {
-                    success: false,
-                    screenshot: None,
-                    error: Some(e),
-                });
+                results.push(CuActionResult::failed(e));
             }
         }
     }
@@ -872,6 +1048,136 @@ pub async fn execute_actions(
     }
 
     results
+}
+
+// ── Post-dispatch verification ───────────────────────────────────────────────
+
+/// Best-effort, bounded verification of a dispatched action's effect.
+///
+/// Deliberately not a postcondition engine: it upgrades/downgrades the one
+/// case where the platform offers cheap evidence — `type` on the macOS user
+/// session, read back from the focused element's AX value — and leaves every
+/// other action at its honest dispatch status (`Injected`).
+async fn verify_action_effect(
+    action: &CuAction,
+    result: CuActionResult,
+    backend: DisplayBackend,
+    target: DisplayTarget,
+) -> CuActionResult {
+    #[cfg(target_os = "macos")]
+    {
+        if let CuAction::Type { text } = action {
+            if backend == DisplayBackend::MacOS && target.is_user_session() && result.success() {
+                return verify_macos_type_readback(text, result).await;
+            }
+        }
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (action, backend, target);
+        result
+    }
+}
+
+/// The exact string a `type` action should find in the focused element's
+/// value afterwards, or `None` when read-back would be meaningless: empty
+/// input, or text with control characters (`\n` may submit or insert breaks,
+/// `\t` may move focus to a different element).
+#[cfg(any(target_os = "macos", test))]
+fn type_readback_expectation(text: &str) -> Option<&str> {
+    if text.is_empty() || text.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(text)
+}
+
+/// Char-safe excerpt for read-back evidence strings.
+#[cfg(any(target_os = "macos", test))]
+fn excerpt(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(cap).collect();
+    format!("{cut}…")
+}
+
+/// Settle before the first read-back attempt (apps commit typed text
+/// asynchronously) and before the single retry (WebKit's field values lag
+/// an IPC round-trip behind the keystrokes).
+#[cfg(target_os = "macos")]
+const TYPE_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+#[cfg(target_os = "macos")]
+const TYPE_READBACK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Read the focused element's value back after a `type` and adjust the
+/// result honestly: `Verified` when the typed text is present, `Failed`
+/// (with expected-vs-observed evidence) when the element is readable but the
+/// text is not there, and `Injected` with the reason whenever read-back is
+/// unavailable (no AX trust, no focused element, secure field, non-string
+/// value). Bounded: at most two AX reads, one element deep.
+#[cfg(target_os = "macos")]
+async fn verify_macos_type_readback(text: &str, dispatched: CuActionResult) -> CuActionResult {
+    let Some(expected) = type_readback_expectation(text) else {
+        let mut dispatched = dispatched;
+        if dispatched.detail.is_none() {
+            dispatched.detail = Some(
+                "type dispatched; read-back skipped (multi-line or control-character \
+                 text may submit or move focus)"
+                    .to_string(),
+            );
+        }
+        return dispatched;
+    };
+    let unverified = |dispatched: CuActionResult, reason: String| CuActionResult {
+        detail: Some(format!("type dispatched; delivery unverified — {reason}")),
+        ..dispatched
+    };
+    tokio::time::sleep(TYPE_READBACK_SETTLE).await;
+    let mut observed = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(TYPE_READBACK_RETRY).await;
+        }
+        // The AX read is blocking IPC into the focused app (same treatment
+        // as `read_screen_elements`).
+        let snapshot = match tokio::task::spawn_blocking(crate::ax::focused_element_text).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(reason)) => return unverified(dispatched, reason),
+            Err(e) => return unverified(dispatched, format!("read-back task failed: {e}")),
+        };
+        let role = snapshot.role.unwrap_or_else(|| "element".to_string());
+        if role == "securetextfield" {
+            return unverified(
+                dispatched,
+                "secure field values are not readable".to_string(),
+            );
+        }
+        let Some(value) = snapshot.value else {
+            return unverified(dispatched, format!("focused {role} has no readable value"));
+        };
+        if value.contains(expected) {
+            return CuActionResult {
+                status: CuActionStatus::Verified,
+                detail: Some(format!(
+                    "read-back confirmed the typed text in the focused {role}"
+                )),
+                ..dispatched
+            };
+        }
+        observed = value;
+    }
+    CuActionResult {
+        status: CuActionStatus::Failed,
+        error: Some(format!(
+            "type read-back mismatch: expected the focused element's value to contain \
+             \"{}\" but observed \"{}\" — the app dropped or transformed the input; \
+             re-focus the field and retry, or use paste",
+            excerpt(expected, 120),
+            excerpt(&observed, 200),
+        )),
+        ..dispatched
+    }
 }
 
 /// Get the logical display size for the main display. Cached after first call.
@@ -1070,20 +1376,22 @@ async fn execute_single(
         CuAction::Paste { text } => match backend {
             #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => macos_input::paste(text).await,
-            _ => cu_result(x11_cu::paste(display, text).await),
+            _ => match x11_cu::paste(display, text).await {
+                // X11 clipboards are pull-based (the target fetches the
+                // selection when it processes the chord, possibly later), so
+                // restoring the previous owner's content is inherently racy
+                // and `x11_input::paste` deliberately doesn't — say so.
+                Ok(()) => CuActionResult::injected_with(
+                    "clipboard: previous content not restored (X11 selections are \
+                     pull-based); the pasted text remains the CLIPBOARD selection",
+                ),
+                Err(e) => cu_result(Err(e)),
+            },
         },
         CuAction::Screenshot => {
             match take_screenshot(display, backend, screenshot_dir, counter).await {
-                Ok(s) => CuActionResult {
-                    success: true,
-                    screenshot: Some(s),
-                    error: None,
-                },
-                Err(e) => CuActionResult {
-                    success: false,
-                    screenshot: None,
-                    error: Some(e),
-                },
+                Ok(s) => CuActionResult::captured(s),
+                Err(e) => CuActionResult::failed(e),
             }
         }
         CuAction::Zoom {
@@ -1103,25 +1411,14 @@ async fn execute_single(
             )
             .await
             {
-                Ok(s) => CuActionResult {
-                    success: true,
-                    screenshot: Some(s),
-                    error: None,
-                },
-                Err(e) => CuActionResult {
-                    success: false,
-                    screenshot: None,
-                    error: Some(e),
-                },
+                Ok(s) => CuActionResult::captured(s),
+                Err(e) => CuActionResult::failed(e),
             }
         }
         CuAction::Wait { ms } => {
             tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
-            CuActionResult {
-                success: true,
-                screenshot: None,
-                error: None,
-            }
+            // The elapsed sleep IS the effect — nothing left to verify.
+            CuActionResult::verified()
         }
     }
 }
@@ -1182,18 +1479,11 @@ mod x11_cu {
 
 /// Adapt an `x11_input` result into a `CuActionResult`, attaching the Linux
 /// GUI-environment diagnostic to failures (as the old xdotool wrapper did).
+/// Success means the events were dispatched, nothing more — `Injected`.
 fn cu_result(r: Result<(), String>) -> CuActionResult {
     match r {
-        Ok(()) => CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        },
-        Err(e) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(with_linux_gui_env_diagnostic(e)),
-        },
+        Ok(()) => CuActionResult::injected(),
+        Err(e) => CuActionResult::failed(with_linux_gui_env_diagnostic(e)),
     }
 }
 
@@ -1219,12 +1509,14 @@ fn dom_key_sequence(key: &str) -> Result<Vec<(String, bool)>, String> {
 /// binary, no fork per action, a real middle button (cliclick approximated it
 /// as a triple-click), and the same Accessibility (TCC) permission
 /// requirement. Coordinates are logical points, matching the normalized
-/// screenshots. Key chords use ANSI-US virtual keycodes (the same layout
-/// assumption cliclick made); `type_text` posts unicode strings directly and
-/// is layout-independent.
+/// screenshots. Key chords and `type_text`'s ASCII fast path use ANSI-US
+/// virtual keycodes (the same layout assumption cliclick made); characters
+/// with no ANSI-US key are posted as paced unicode-string events, and typed
+/// text is read back from the focused element where AX allows so garbled or
+/// dropped delivery is reported instead of assumed.
 #[cfg(target_os = "macos")]
 mod macos_input {
-    use super::{CuActionResult, MouseButton, ScrollDirection};
+    use super::{CuActionResult, CuActionStatus, MouseButton, ScrollDirection};
     use core_graphics::event::{
         CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
         EventField, KeyCode, ScrollEventUnit,
@@ -1241,9 +1533,22 @@ mod macos_input {
     const PRESS_DELAY: Duration = Duration::from_millis(20);
     /// Pause between the two clicks of a double-click.
     const DOUBLE_CLICK_DELAY: Duration = Duration::from_millis(50);
-    /// Unicode-typing chunk size: `CGEventKeyboardSetUnicodeString` accepts
-    /// long strings, but some apps drop oversized injections.
+    /// Unicode-typing chunk size: `CGEventKeyboardSetUnicodeString` has a
+    /// historic ~20-UTF-16-unit practical limit per event; larger payloads
+    /// get truncated or dropped by receivers.
     const TYPE_CHUNK_UTF16: usize = 20;
+    /// Settle before the first keystroke of a `type` action, so the target
+    /// app finishes processing an immediately preceding click / activation
+    /// (the 2026-07-13 failure class: leading events swallowed during a
+    /// focus transition while the tail landed).
+    const TYPE_LEAD_IN: Duration = Duration::from_millis(100);
+    /// Pause between individual typed keystrokes (~hardware typing rate;
+    /// posting the whole text back-to-back outruns slow consumers).
+    const TYPE_KEY_GAP: Duration = Duration::from_millis(8);
+    /// Pause after a unicode-string chunk. These events have no hardware
+    /// analogue and WebKit consumes them noticeably slower than real
+    /// keycodes, so they get more headroom than `TYPE_KEY_GAP`.
+    const TYPE_CHUNK_GAP: Duration = Duration::from_millis(30);
 
     fn source() -> Result<CGEventSource, String> {
         CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
@@ -1253,25 +1558,19 @@ mod macos_input {
         })
     }
 
-    fn ok() -> CuActionResult {
-        CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        }
+    /// Events were posted; whether the frontmost app honored them is unknown
+    /// — the honest ceiling for raw CGEvent injection.
+    fn injected() -> CuActionResult {
+        CuActionResult::injected()
     }
 
     fn fail(error: String) -> CuActionResult {
-        CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(error),
-        }
+        CuActionResult::failed(error)
     }
 
     fn result(outcome: Result<(), String>) -> CuActionResult {
         match outcome {
-            Ok(()) => ok(),
+            Ok(()) => injected(),
             Err(e) => fail(e),
         }
     }
@@ -1337,7 +1636,7 @@ mod macos_input {
                 return fail(e);
             }
         }
-        ok()
+        injected()
     }
 
     pub async fn move_mouse(x: i32, y: i32) -> CuActionResult {
@@ -1393,13 +1692,25 @@ mod macos_input {
         result(outcome)
     }
 
-    /// Set the clipboard to `text`, press ⌘V, and restore the previous
-    /// clipboard text. Far faster than `type_text` for long strings; note
-    /// that a non-text clipboard (e.g. an image) is not restored.
+    /// How long the frontmost app gets to consume the clipboard after ⌘V
+    /// before the previous content is restored. Paste is consumed while the
+    /// app processes the keypress, so this bounds the honest race: an app
+    /// that lazily re-reads the clipboard later sees the restored content.
+    const PASTE_CONSUME_DELAY: Duration = Duration::from_millis(300);
+
+    /// Set the clipboard to `text`, press ⌘V, then restore the previous
+    /// clipboard text (pbpaste/pbcopy are text-only: non-text content such
+    /// as images cannot be captured, so the clipboard is cleared instead of
+    /// left holding the pasted text). Far faster than `type_text` for long
+    /// strings. The result detail states exactly what happened to the
+    /// clipboard.
     pub async fn paste(text: &str) -> CuActionResult {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
 
+        // `pbpaste` succeeds with empty output for both an empty clipboard
+        // and non-text content — those two are indistinguishable, and
+        // neither yields anything restorable.
         let previous = Command::new("pbpaste")
             .output()
             .await
@@ -1431,14 +1742,38 @@ mod macos_input {
         if let Err(e) = set_clipboard(text.as_bytes().to_vec()).await {
             return fail(e);
         }
-        let paste_result = key("cmd+v").await;
+        let chord = key("cmd+v").await;
         // Give the frontmost app time to consume the clipboard before
-        // restoring what the user had there.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        if let Some(previous) = previous {
-            let _ = set_clipboard(previous).await;
+        // touching it again.
+        tokio::time::sleep(PASTE_CONSUME_DELAY).await;
+        let note = match previous {
+            None => "clipboard: previous content could not be captured; \
+                 the pasted text remains on the clipboard"
+                .to_string(),
+            Some(prev) => {
+                let restorable = !prev.is_empty();
+                match (set_clipboard(prev).await, restorable) {
+                    (Ok(()), true) => "clipboard: previous text restored after paste".to_string(),
+                    // Clearing beats leaving the pasted text behind, but
+                    // non-text content (e.g. an image) is already gone.
+                    (Ok(()), false) => "clipboard: previous clipboard had no text \
+                         (empty or non-text); cleared after paste"
+                        .to_string(),
+                    (Err(e), _) => format!(
+                        "clipboard: restore failed ({e}); \
+                         the pasted text remains on the clipboard"
+                    ),
+                }
+            }
+        };
+        match chord.status {
+            // The restore above ran either way — keep its note on the failure.
+            CuActionStatus::Failed => CuActionResult {
+                detail: Some(note),
+                ..chord
+            },
+            _ => CuActionResult::injected_with(note),
         }
-        paste_result
     }
 
     /// Press at the start point, drag through interpolated positions, and
@@ -1511,39 +1846,172 @@ mod macos_input {
         result(outcome)
     }
 
-    /// Type unicode text. A trailing newline becomes a Return press, matching
-    /// CU models' habit of appending `\n` to mean Enter (and the previous
-    /// cliclick behavior).
+    /// One planned keystroke of a `type` action.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TypeStep {
+        /// A key that exists on the ANSI-US layout, pressed via its virtual
+        /// keycode (with Shift where needed) — the same proven event shape
+        /// as [`key`]. `\n`/`\r` become Return and `\t` becomes Tab, so apps
+        /// see real keypresses.
+        Keycode { code: CGKeyCode, shift: bool },
+        /// UTF-16 units delivered via `CGEventKeyboardSetUnicodeString` for
+        /// characters with no ANSI-US key. At most [`TYPE_CHUNK_UTF16`]
+        /// units, never splitting a surrogate pair.
+        Unicode(Vec<u16>),
+    }
+
+    /// Plan the keystroke sequence for `text`.
+    ///
+    /// ASCII rides real keycodes because that is the event shape macOS apps
+    /// reliably consume: the 2026-07-13 live run showed Safari dropping
+    /// whole `CGEventKeyboardSetUnicodeString` chunks (keycode 0 + string)
+    /// while plain keycode events (`cmd+v`, chords) always landed. Keycodes
+    /// assume the ANSI-US layout — the documented assumption `key()` already
+    /// makes — and the read-back verification in `execute_actions` catches
+    /// (and reports honestly) the garbled output a non-US layout would
+    /// produce. Everything else falls back to paired, paced unicode-string
+    /// events.
+    fn plan_type_steps(text: &str) -> Vec<TypeStep> {
+        let mut steps = Vec::new();
+        let mut pending: Vec<u16> = Vec::new();
+        let flush = |pending: &mut Vec<u16>, steps: &mut Vec<TypeStep>| {
+            if !pending.is_empty() {
+                steps.push(TypeStep::Unicode(std::mem::take(pending)));
+            }
+        };
+        for ch in text.chars() {
+            if let Some((code, shift)) = typed_char_keycode(ch) {
+                flush(&mut pending, &mut steps);
+                steps.push(TypeStep::Keycode { code, shift });
+            } else {
+                if pending.len() + ch.len_utf16() > TYPE_CHUNK_UTF16 {
+                    flush(&mut pending, &mut steps);
+                }
+                let mut units = [0u16; 2];
+                pending.extend_from_slice(ch.encode_utf16(&mut units));
+            }
+        }
+        flush(&mut pending, &mut steps);
+        steps
+    }
+
+    /// ANSI-US keycode (+ Shift) for a directly typeable character.
+    fn typed_char_keycode(ch: char) -> Option<(CGKeyCode, bool)> {
+        match ch {
+            '\n' | '\r' => return Some((KeyCode::RETURN, false)),
+            '\t' => return Some((KeyCode::TAB, false)),
+            ' ' => return Some((KeyCode::SPACE, false)),
+            _ => {}
+        }
+        if let Some(code) = char_keycode(ch) {
+            return Some((code, false));
+        }
+        if ch.is_ascii_uppercase() {
+            return char_keycode(ch.to_ascii_lowercase()).map(|code| (code, true));
+        }
+        let base = match ch {
+            '!' => '1',
+            '@' => '2',
+            '#' => '3',
+            '$' => '4',
+            '%' => '5',
+            '^' => '6',
+            '&' => '7',
+            '*' => '8',
+            '(' => '9',
+            ')' => '0',
+            '_' => '-',
+            '+' => '=',
+            '{' => '[',
+            '}' => ']',
+            '|' => '\\',
+            ':' => ';',
+            '"' => '\'',
+            '<' => ',',
+            '>' => '.',
+            '?' => '/',
+            '~' => '`',
+            _ => return None,
+        };
+        char_keycode(base).map(|code| (code, true))
+    }
+
+    /// Post one down/up keycode pair (Shift as event flags, like `key()`).
+    fn post_typed_keycode(
+        source: &CGEventSource,
+        code: CGKeyCode,
+        shift: bool,
+    ) -> Result<(), String> {
+        let flags = if shift {
+            CGEventFlags::CGEventFlagShift
+        } else {
+            CGEventFlags::CGEventFlagNull
+        };
+        let down = CGEvent::new_keyboard_event(source.clone(), code, true)
+            .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+        down.set_flags(flags);
+        down.post(CGEventTapLocation::HID);
+        let up = CGEvent::new_keyboard_event(source.clone(), code, false)
+            .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+        up.set_flags(flags);
+        up.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Post one down/up unicode-string pair. The payload rides on **both**
+    /// events (a lone stringless keycode-0 keyUp reads as an `a` release
+    /// and some consumers ignore the mispaired down).
+    fn post_unicode_chunk(source: &CGEventSource, units: &[u16]) -> Result<(), String> {
+        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
+            .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+        down.set_string_from_utf16_unchecked(units);
+        down.post(CGEventTapLocation::HID);
+        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+            .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+        up.set_string_from_utf16_unchecked(units);
+        up.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Deliver a planned keystroke sequence. Runs on one thread with one
+    /// event source: posts stay ordered and paced without runtime-scheduling
+    /// jitter between events (`CGEventSource` is also `!Send`, so it cannot
+    /// be held across `await` points).
+    fn deliver_type_steps(steps: &[TypeStep]) -> Result<(), String> {
+        let source = source()?;
+        for step in steps {
+            match step {
+                TypeStep::Keycode { code, shift } => {
+                    post_typed_keycode(&source, *code, *shift)?;
+                    std::thread::sleep(TYPE_KEY_GAP);
+                }
+                TypeStep::Unicode(units) => {
+                    post_unicode_chunk(&source, units)?;
+                    std::thread::sleep(TYPE_CHUNK_GAP);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Type text: real ANSI-US keycode events for characters that have one
+    /// (newlines as Return, tabs as Tab), paced unicode-string events for
+    /// the rest. See [`plan_type_steps`] for why.
+    ///
+    /// Returns `Injected` — delivery into the focused element is verified
+    /// (and the status upgraded/downgraded) by the read-back pass in
+    /// `execute_actions`, which has the display-target context this
+    /// function lacks.
     pub async fn type_text(text: &str) -> CuActionResult {
-        let presses_return = text.ends_with('\n');
-        let clean = text.trim_end_matches('\n');
-        let utf16: Vec<u16> = clean.encode_utf16().collect();
-        for chunk in utf16.chunks(TYPE_CHUNK_UTF16) {
-            let outcome = source().and_then(|source| {
-                let down = CGEvent::new_keyboard_event(source, 0, true)
-                    .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
-                down.set_string_from_utf16_unchecked(chunk);
-                down.post(CGEventTapLocation::HID);
-                Ok(())
-            });
-            if let Err(e) = outcome {
-                return fail(e);
-            }
-            let outcome = source().and_then(|source| {
-                let up = CGEvent::new_keyboard_event(source, 0, false)
-                    .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
-                up.post(CGEventTapLocation::HID);
-                Ok(())
-            });
-            if let Err(e) = outcome {
-                return fail(e);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let steps = plan_type_steps(text);
+        if steps.is_empty() {
+            return CuActionResult::injected_with("empty text; nothing typed");
         }
-        if presses_return {
-            return key("Return").await;
-        }
-        ok()
+        tokio::time::sleep(TYPE_LEAD_IN).await;
+        let outcome = tokio::task::spawn_blocking(move || deliver_type_steps(&steps))
+            .await
+            .unwrap_or_else(|e| Err(format!("type delivery task failed: {e}")));
+        result(outcome)
     }
 
     /// Press an xdotool-style key or chord (e.g. `Return`, `ctrl+shift+t`,
@@ -1746,6 +2214,119 @@ mod macos_input {
             assert!(parse_key("no_such_key").is_err());
             assert!(parse_key("badmod+x").is_err());
         }
+
+        #[test]
+        fn typed_char_keycode_maps_shift_pairs_and_controls() {
+            assert_eq!(typed_char_keycode('a'), Some((KeyCode::ANSI_A, false)));
+            assert_eq!(typed_char_keycode('A'), Some((KeyCode::ANSI_A, true)));
+            assert_eq!(typed_char_keycode('1'), Some((KeyCode::ANSI_1, false)));
+            assert_eq!(typed_char_keycode('!'), Some((KeyCode::ANSI_1, true)));
+            assert_eq!(typed_char_keycode('~'), Some((KeyCode::ANSI_GRAVE, true)));
+            assert_eq!(typed_char_keycode('"'), Some((KeyCode::ANSI_QUOTE, true)));
+            assert_eq!(typed_char_keycode(' '), Some((KeyCode::SPACE, false)));
+            assert_eq!(typed_char_keycode('\n'), Some((KeyCode::RETURN, false)));
+            assert_eq!(typed_char_keycode('\r'), Some((KeyCode::RETURN, false)));
+            assert_eq!(typed_char_keycode('\t'), Some((KeyCode::TAB, false)));
+            // No ANSI-US key — must fall to the unicode path.
+            assert_eq!(typed_char_keycode('✓'), None);
+            assert_eq!(typed_char_keycode('é'), None);
+        }
+
+        #[test]
+        fn plan_type_steps_ascii_rides_keycodes_with_unicode_residue() {
+            // The live-regression phrase: 27 ASCII chars + one non-keyboard
+            // char. Every ASCII char must become a keycode step (the proven
+            // event shape); only the ✓ may use a unicode-string event.
+            let steps = plan_type_steps("Typed through Intendant CU ✓");
+            assert_eq!(steps.len(), 28);
+            for step in &steps[..27] {
+                assert!(
+                    matches!(step, TypeStep::Keycode { .. }),
+                    "ASCII must use keycodes: {step:?}"
+                );
+            }
+            assert_eq!(steps[27], TypeStep::Unicode(vec![0x2713]));
+            // Shift rides the uppercase letters.
+            assert_eq!(
+                steps[0],
+                TypeStep::Keycode {
+                    code: KeyCode::ANSI_T,
+                    shift: true
+                }
+            );
+            assert_eq!(
+                steps[1],
+                TypeStep::Keycode {
+                    code: KeyCode::ANSI_Y,
+                    shift: false
+                }
+            );
+        }
+
+        #[test]
+        fn plan_type_steps_chunks_unicode_at_twenty_units() {
+            // 28 consecutive non-keyboard chars: the exact shape of the
+            // 2026-07-13 live failure (20-unit chunk + 8-unit tail, first
+            // chunk dropped). The plan must produce both chunks, capped.
+            let text: String = std::iter::repeat('✓').take(28).collect();
+            let steps = plan_type_steps(&text);
+            assert_eq!(
+                steps,
+                vec![
+                    TypeStep::Unicode(vec![0x2713; 20]),
+                    TypeStep::Unicode(vec![0x2713; 8]),
+                ]
+            );
+        }
+
+        #[test]
+        fn plan_type_steps_never_splits_surrogate_pairs() {
+            // 😀 is two UTF-16 units; eleven of them (22 units) must chunk
+            // as 10 pairs + 1 pair, never splitting a pair at the 20-unit
+            // boundary.
+            let text: String = std::iter::repeat('😀').take(11).collect();
+            let steps = plan_type_steps(&text);
+            assert_eq!(steps.len(), 2);
+            let (first, second) = (&steps[0], &steps[1]);
+            let TypeStep::Unicode(first) = first else {
+                panic!("expected unicode step: {first:?}");
+            };
+            let TypeStep::Unicode(second) = second else {
+                panic!("expected unicode step: {second:?}");
+            };
+            assert_eq!(first.len(), 20);
+            assert_eq!(second.len(), 2);
+            // Each chunk decodes cleanly — no lone surrogates.
+            assert!(String::from_utf16(first).is_ok());
+            assert!(String::from_utf16(second).is_ok());
+        }
+
+        #[test]
+        fn plan_type_steps_mixed_text_interleaves_and_flushes() {
+            // Unicode runs flush before and after keycode chars, and
+            // newlines become Return keycodes anywhere in the text.
+            let steps = plan_type_steps("é1\né");
+            assert_eq!(
+                steps,
+                vec![
+                    TypeStep::Unicode("é".encode_utf16().collect()),
+                    TypeStep::Keycode {
+                        code: KeyCode::ANSI_1,
+                        shift: false
+                    },
+                    TypeStep::Keycode {
+                        code: KeyCode::RETURN,
+                        shift: false
+                    },
+                    TypeStep::Unicode("é".encode_utf16().collect()),
+                ]
+            );
+        }
+
+        #[test]
+        fn plan_type_steps_empty_text_plans_nothing() {
+            assert!(plan_type_steps("").is_empty());
+        }
     }
 }
 
@@ -1772,10 +2353,13 @@ async fn take_screenshot(
                 .await
                 .map_err(|e| format!("screencapture exec error: {}", e))?;
             if !output.status.success() {
-                return Err(format!(
+                // A bare "could not create image from display" is usually the
+                // Screen Recording (TCC) denial — name it when the preflight
+                // confirms the permission is missing (CU-04).
+                return Err(crate::cu_readiness::enrich_capture_failure(format!(
                     "screencapture failed: {}",
                     String::from_utf8_lossy(&output.stderr)
-                ));
+                )));
             }
             tokio::fs::read(&path)
                 .await
@@ -2075,29 +2659,19 @@ async fn execute_via_session(
                                 use base64::Engine;
                                 let base64_png =
                                     base64::engine::general_purpose::STANDARD.encode(&cropped);
-                                CuActionResult {
-                                    success: true,
-                                    screenshot: Some(ScreenshotData {
-                                        path,
-                                        base64_png,
-                                        width: w,
-                                        height: h,
-                                    }),
-                                    error: None,
-                                }
+                                CuActionResult::captured(ScreenshotData {
+                                    path,
+                                    base64_png,
+                                    width: w,
+                                    height: h,
+                                })
                             }
-                            Err(e) => CuActionResult {
-                                success: false,
-                                screenshot: None,
-                                error: Some(format!("Failed to write zoom screenshot: {e}")),
-                            },
+                            Err(e) => CuActionResult::failed(format!(
+                                "Failed to write zoom screenshot: {e}"
+                            )),
                         }
                     }
-                    Err(e) => CuActionResult {
-                        success: false,
-                        screenshot: None,
-                        error: Some(e),
-                    },
+                    Err(e) => CuActionResult::failed(e),
                 };
                 results.push(result);
                 needs_auto_screenshot = false;
@@ -2120,16 +2694,10 @@ async fn execute_via_session(
                 {
                     errors.push(format!("mouse up: {e}"));
                 }
-                let success = errors.is_empty();
-                let error = if success {
-                    None
+                results.push(if errors.is_empty() {
+                    CuActionResult::injected()
                 } else {
-                    Some(format!("Click injection failed: {}", errors.join("; ")))
-                };
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error,
+                    CuActionResult::failed(format!("Click injection failed: {}", errors.join("; ")))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2154,18 +2722,13 @@ async fn execute_via_session(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                let success = errors.is_empty();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some(format!(
-                            "DoubleClick injection failed: {}",
-                            errors.join("; ")
-                        ))
-                    },
+                results.push(if errors.is_empty() {
+                    CuActionResult::injected()
+                } else {
+                    CuActionResult::failed(format!(
+                        "DoubleClick injection failed: {}",
+                        errors.join("; ")
+                    ))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2190,18 +2753,13 @@ async fn execute_via_session(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                let success = errors.is_empty();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some(format!(
-                            "TripleClick injection failed: {}",
-                            errors.join("; ")
-                        ))
-                    },
+                results.push(if errors.is_empty() {
+                    CuActionResult::injected()
+                } else {
+                    CuActionResult::failed(format!(
+                        "TripleClick injection failed: {}",
+                        errors.join("; ")
+                    ))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2212,11 +2770,9 @@ async fn execute_via_session(
                 let result = session
                     .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
                     .await;
-                let success = result.is_ok();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: result.err().map(|e| format!("mouse down: {e}")),
+                results.push(match result {
+                    Ok(()) => CuActionResult::injected(),
+                    Err(e) => CuActionResult::failed(format!("mouse down: {e}")),
                 });
                 needs_auto_screenshot = true;
             }
@@ -2227,34 +2783,33 @@ async fn execute_via_session(
                 let result = session
                     .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
                     .await;
-                let success = result.is_ok();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: result.err().map(|e| format!("mouse up: {e}")),
+                results.push(match result {
+                    Ok(()) => CuActionResult::injected(),
+                    Err(e) => CuActionResult::failed(format!("mouse up: {e}")),
                 });
                 needs_auto_screenshot = true;
             }
             CuAction::Type { text } => {
                 let result = session.inject_text(text).await;
-                let success = result.is_ok();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: result.err().map(|e| e.to_string()),
+                results.push(match result {
+                    Ok(()) => CuActionResult::injected(),
+                    Err(e) => CuActionResult::failed(e.to_string()),
                 });
                 needs_auto_screenshot = true;
             }
             CuAction::Paste { text } => {
                 // Clipboard paste through the backend (Windows: arboard +
                 // ctrl+v; Wayland: portal clipboard). Backends without
-                // clipboard access return the trait-default error.
+                // clipboard access return the trait-default error. The
+                // outcome's note reports what happened to the previous
+                // clipboard content (restored / not restorable).
                 let result = session.paste_text(text).await;
-                let success = result.is_ok();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: result.err().map(|e| e.to_string()),
+                results.push(match result {
+                    Ok(outcome) => match outcome.clipboard_note {
+                        Some(note) => CuActionResult::injected_with(note),
+                        None => CuActionResult::injected(),
+                    },
+                    Err(e) => CuActionResult::failed(e.to_string()),
                 });
                 needs_auto_screenshot = true;
             }
@@ -2304,10 +2859,10 @@ async fn execute_via_session(
                         }
                     }
                 }
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error,
+                results.push(if success {
+                    CuActionResult::injected()
+                } else {
+                    CuActionResult::failed(error.unwrap_or_else(|| "key injection failed".into()))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2348,15 +2903,10 @@ async fn execute_via_session(
                         }
                     }
                 }
-                let success = errors.is_empty();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some(errors.join("; "))
-                    },
+                results.push(if errors.is_empty() {
+                    CuActionResult::injected()
+                } else {
+                    CuActionResult::failed(errors.join("; "))
                 });
                 needs_auto_screenshot = true;
             }
@@ -2384,10 +2934,9 @@ async fn execute_via_session(
                         dy,
                     })
                     .await;
-                results.push(CuActionResult {
-                    success: r.is_ok(),
-                    screenshot: None,
-                    error: r.err().map(|e| e.to_string()),
+                results.push(match r {
+                    Ok(()) => CuActionResult::injected(),
+                    Err(e) => CuActionResult::failed(e.to_string()),
                 });
                 needs_auto_screenshot = true;
             }
@@ -2401,10 +2950,9 @@ async fn execute_via_session(
                         buttons: 0,
                     })
                     .await;
-                results.push(CuActionResult {
-                    success: r.is_ok(),
-                    screenshot: None,
-                    error: r.err().map(|e| e.to_string()),
+                results.push(match r {
+                    Ok(()) => CuActionResult::injected(),
+                    Err(e) => CuActionResult::failed(e.to_string()),
                 });
                 needs_auto_screenshot = true;
             }
@@ -2450,25 +2998,17 @@ async fn execute_via_session(
                 {
                     errors.push(format!("mouse up: {e}"));
                 }
-                let success = errors.is_empty();
-                results.push(CuActionResult {
-                    success,
-                    screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some(format!("Drag injection failed: {}", errors.join("; ")))
-                    },
+                results.push(if errors.is_empty() {
+                    CuActionResult::injected()
+                } else {
+                    CuActionResult::failed(format!("Drag injection failed: {}", errors.join("; ")))
                 });
                 needs_auto_screenshot = true;
             }
             CuAction::Wait { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
-                results.push(CuActionResult {
-                    success: true,
-                    screenshot: None,
-                    error: None,
-                });
+                // The elapsed sleep IS the effect — nothing left to verify.
+                results.push(CuActionResult::verified());
             }
         }
         if !matches!(
@@ -2478,7 +3018,7 @@ async fn execute_via_session(
             last_input_at = Some(std::time::Instant::now());
         }
         // Every arm above pushes exactly one result for `action`.
-        if results.last().is_some_and(|r| r.success) {
+        if results.last().is_some_and(|r| r.success()) {
             if let Some(obs) = observer {
                 obs.observe(target, (width, height), action);
             }
@@ -2489,7 +3029,7 @@ async fn execute_via_session(
     if needs_auto_screenshot {
         let auto =
             take_session_screenshot(session, screenshot_dir, action_counter, last_input_at).await;
-        if auto.success {
+        if auto.success() {
             let screenshot = auto.screenshot.clone();
             results.push(auto);
             // Attach to first result if it has no screenshot (convenience for callers).
@@ -2560,16 +3100,8 @@ async fn take_session_screenshot(
     min_fresh: Option<std::time::Instant>,
 ) -> CuActionResult {
     match session_screenshot_data(session, screenshot_dir, counter, min_fresh, false).await {
-        Ok(s) => CuActionResult {
-            success: true,
-            screenshot: Some(s),
-            error: None,
-        },
-        Err(e) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(e),
-        },
+        Ok(s) => CuActionResult::captured(s),
+        Err(e) => CuActionResult::failed(e),
     }
 }
 
@@ -2654,10 +3186,11 @@ async fn capture_zoom_screenshot(
                     .await
                     .map_err(|e| format!("screencapture exec error: {e}"))?;
                 if !output.status.success() {
-                    return Err(format!(
+                    // Same TCC-denial naming as take_screenshot (CU-04).
+                    return Err(crate::cu_readiness::enrich_capture_failure(format!(
                         "zoom capture failed: {}",
                         String::from_utf8_lossy(&output.stderr)
-                    ));
+                    )));
                 }
                 let bytes = tokio::fs::read(&path)
                     .await
@@ -3082,6 +3615,96 @@ mod tests {
     }
 
     #[test]
+    fn cap_ui_text_passes_short_text_and_marks_long_text() {
+        // Within the cap (incl. exactly at it): unchanged.
+        assert_eq!(cap_ui_text("Save", 80), "Save");
+        let exactly = "x".repeat(80);
+        assert_eq!(cap_ui_text(&exactly, 80), exactly);
+
+        // Beyond the cap: prefix + ellipsis + total length + content hash.
+        let long = format!("data:image/png;base64,{}", "A".repeat(500));
+        let capped = cap_ui_text(&long, 80);
+        let prefix: String = long.chars().take(80).collect();
+        assert!(capped.starts_with(&prefix), "prefix preserved: {capped}");
+        assert!(capped.contains("… ["), "marker present: {capped}");
+        assert!(
+            capped.contains(&format!("{} chars total", long.chars().count())),
+            "total length named: {capped}"
+        );
+        assert!(capped.contains('#'), "content hash present: {capped}");
+
+        // Stable: identical input, identical marker.
+        assert_eq!(cap_ui_text(&long, 80), capped);
+
+        // Two long values sharing the 80-char prefix stay distinguishable
+        // through the hash.
+        let other = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(499).to_string() + "B"
+        );
+        let other_capped = cap_ui_text(&other, 80);
+        assert_ne!(capped, other_capped, "same-prefix values must differ");
+    }
+
+    #[test]
+    fn cap_ui_text_counts_chars_not_bytes() {
+        // Multibyte text: the cap must cut on char boundaries.
+        let long = "é".repeat(100);
+        let capped = cap_ui_text(&long, 80);
+        assert!(capped.starts_with(&"é".repeat(80)));
+        assert!(capped.contains("100 chars total"), "marker: {capped}");
+    }
+
+    #[test]
+    fn cap_screen_elements_texts_caps_titles_values_and_other_windows() {
+        let long_url = format!("data:text/html;base64,{}", "Q".repeat(400));
+        let mut field = leaf("textfield", Some(long_url.as_str()), (0, 0, 10, 10));
+        field.value = Some(long_url.clone());
+        let window = UiElement {
+            role: "window".to_string(),
+            label: None,
+            value: None,
+            frame: (0, 0, 100, 100),
+            focused: false,
+            enabled: true,
+            children: vec![field],
+        };
+        let mut snapshot = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: Some(long_url.clone()),
+            root: Some(window),
+            other_windows: vec![format!("Safari — \"{long_url}\"")],
+            truncated: None,
+        };
+        cap_screen_elements_texts(&mut snapshot);
+
+        let title = snapshot.window_title.as_deref().unwrap();
+        assert!(title.contains("chars total"), "title capped: {title}");
+        assert!(
+            title.chars().count() < long_url.chars().count(),
+            "title shortened"
+        );
+        let child = &snapshot.root.as_ref().unwrap().children[0];
+        assert!(child.label.as_deref().unwrap().contains("chars total"));
+        assert!(child.value.as_deref().unwrap().contains("chars total"));
+        assert!(snapshot.other_windows[0].contains("chars total"));
+
+        // Short texts stay untouched.
+        let mut short = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: Some("GitHub".to_string()),
+            root: None,
+            other_windows: vec!["Finder".to_string()],
+            truncated: None,
+        };
+        cap_screen_elements_texts(&mut short);
+        assert_eq!(short.window_title.as_deref(), Some("GitHub"));
+        assert_eq!(short.other_windows[0], "Finder");
+    }
+
+    #[test]
     fn mouse_button_x11_numbers() {
         assert_eq!(MouseButton::Left.x11_button(), 1);
         assert_eq!(MouseButton::Right.x11_button(), 3);
@@ -3414,7 +4037,7 @@ mod tests {
             .await;
             assert_eq!(results.len(), actions.len(), "one result per action");
             for result in results {
-                assert!(!result.success);
+                assert!(!result.success());
                 assert_eq!(
                     result.error.as_deref(),
                     Some(user_session_denied_message()),
@@ -3487,7 +4110,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(!results[0].success);
+        assert!(!results[0].success());
         assert_eq!(
             results[0].error.as_deref(),
             Some(no_session_message(
@@ -3513,7 +4136,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(!results[0].success);
+        assert!(!results[0].success());
         assert!(
             results[0]
                 .error
@@ -3684,7 +4307,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_screen_elements_rejects_virtual_target_on_linux() {
-        let err = read_screen_elements(DisplayTarget::Virtual { id: 99 })
+        let err = read_screen_elements(DisplayTarget::Virtual { id: 99 }, false)
             .await
             .unwrap_err();
         assert!(err.contains("user_session"), "{err}");
@@ -3912,5 +4535,100 @@ mod tests {
         assert_eq!(mouse_button_index(MouseButton::Left), 0);
         assert_eq!(mouse_button_index(MouseButton::Middle), 1);
         assert_eq!(mouse_button_index(MouseButton::Right), 2);
+    }
+
+    // ── Result statuses & read-back helpers ─────────────────────────────
+
+    #[test]
+    fn action_status_labels_and_success_are_consistent() {
+        let verified = CuActionResult::verified();
+        assert_eq!(verified.status.label(), "ok");
+        assert!(verified.success());
+
+        let injected = CuActionResult::injected();
+        assert_eq!(injected.status.label(), "injected");
+        assert!(injected.success(), "injected is dispatched, not failed");
+        assert!(injected.error.is_none());
+
+        let with_note = CuActionResult::injected_with("clipboard: restored");
+        assert_eq!(with_note.status, CuActionStatus::Injected);
+        assert_eq!(with_note.detail.as_deref(), Some("clipboard: restored"));
+
+        let failed = CuActionResult::failed("boom");
+        assert_eq!(failed.status.label(), "failed");
+        assert!(!failed.success());
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn type_readback_expectation_skips_empty_and_control_text() {
+        // Empty and control-bearing text can submit forms or move focus —
+        // reading the focused element afterwards would verify nothing.
+        assert_eq!(type_readback_expectation(""), None);
+        assert_eq!(type_readback_expectation("hello\n"), None);
+        assert_eq!(type_readback_expectation("a\tb"), None);
+        assert_eq!(type_readback_expectation("line1\nline2"), None);
+        // Plain single-line text (unicode included) is verifiable.
+        assert_eq!(
+            type_readback_expectation("Typed through Intendant CU ✓"),
+            Some("Typed through Intendant CU ✓")
+        );
+    }
+
+    #[test]
+    fn excerpt_truncates_on_char_boundaries() {
+        assert_eq!(excerpt("short", 10), "short");
+        assert_eq!(excerpt("✓✓✓✓", 2), "✓✓…");
+        assert_eq!(excerpt("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn summarize_results_distinguishes_dispatch_from_verified() {
+        let click = CuAction::Click {
+            x: 1,
+            y: 2,
+            button: MouseButton::Left,
+        };
+        let type_action = CuAction::Type { text: "hi".into() };
+
+        // All verified (e.g. screenshot-only batches) keeps the plain wording.
+        let summary =
+            summarize_results_for_model(&[CuAction::Screenshot], &[CuActionResult::verified()]);
+        assert_eq!(summary, "Actions executed successfully.");
+
+        // Injected-only batches must not read as verified success, and
+        // per-action details ride along, labeled by action kind.
+        let summary = summarize_results_for_model(
+            &[click.clone(), type_action.clone()],
+            &[
+                CuActionResult::injected(),
+                CuActionResult::injected_with(
+                    "type dispatched; delivery unverified — no focused element",
+                ),
+            ],
+        );
+        assert!(
+            summary.starts_with("Actions dispatched (2 injected"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("effect not independently verified"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("type: type dispatched; delivery unverified"),
+            "{summary}"
+        );
+
+        // Any failure wins the headline and carries the error text.
+        let summary = summarize_results_for_model(
+            &[click, type_action],
+            &[
+                CuActionResult::injected(),
+                CuActionResult::failed("type read-back mismatch: expected \"hi\""),
+            ],
+        );
+        assert!(summary.starts_with("Some actions failed:"), "{summary}");
+        assert!(summary.contains("read-back mismatch"), "{summary}");
     }
 }

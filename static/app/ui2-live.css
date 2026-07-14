@@ -718,12 +718,13 @@ html.ui-v2 .shared-view-focus-box {
     0 0 0 1px rgba(7, 8, 16, .72),
     0 0 12px rgba(var(--amber-rgb), .38);
 }
-html.ui-v2 .shared-view-focus-box::after {
+html.ui-v2 .shared-view-focus-note {
   border-radius: 8px;
   background: rgba(11, 13, 18, .92);
   border-color: rgba(228, 168, 91, .5);
   color: var(--cu-stage-text);
   font-family: var(--sans);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .38);
 }
 /* light theme: the stage stays a dark viewport, but its .5-black drop
    shadow is dark-tuned — soften toward the light elevation vocabulary. */
@@ -1722,7 +1723,7 @@ html.ui-v2 .ui2-live-activity {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  max-height: 190px;
+  max-height: 240px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -1731,10 +1732,19 @@ html.ui-v2 .ui2-live-activity-row {
   grid-template-columns: 7px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
+  /* Rows size to their wrapped content and the LIST scrolls. Never let
+     these flex items shrink: the explicit min-height replaces the
+     `min-height: auto` floor, so a shrinkable row gets squashed to 31px
+     when entries exceed the list budget and its wrapped text paints over
+     the neighboring rows (the 2026-07-13 feed-overlap bug). */
+  flex: 0 0 auto;
   min-height: 31px;
-  padding: 5px 2px;
+  padding: 5px 4px;
   border-bottom: 1px solid var(--line);
+  border-radius: 6px;
+  transition: background var(--t-fast);
 }
+html.ui-v2 .ui2-live-activity-row:hover { background: var(--hover-wash); }
 html.ui-v2 .ui2-live-activity-row:last-child { border-bottom: 0; }
 /* Feed dots: 8px + 3px semantic halo (concept grammar). Color map:
    sky = look/connect · iris = click/focus · violet = type · amber =
@@ -1826,6 +1836,30 @@ html.ui-v2 .cu-action-raw {
   font-family: var(--mono);
   font-size: 11px;
   word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Long raw payloads render collapsed (readable preview + char count) with
+   the full literal call one click away — the disclosure is a real button
+   so keyboards and screen readers get it for free. */
+html.ui-v2 .cu-action-raw-toggle {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: color var(--t-fast);
+}
+html.ui-v2 .cu-action-raw-toggle:hover { color: var(--text-2); }
+html.ui-v2 .cu-action-raw-toggle:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
 }
 @keyframes cu-row-in {
   from { opacity: 0; transform: translateX(6px); }
@@ -1902,7 +1936,41 @@ html.ui-v2 .cu-overlay-cursor {
 }
 html.ui-v2 .cu-overlay-cursor svg {
   display: block;
+  position: relative;
+  z-index: 1;
   filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .55));
+}
+/* Presence halo: a soft breathing ring centered on the pointer hotspot so
+   the agent cursor stays findable on busy content. It rides the cursor
+   element (inherits its ease + idle fade) and hides entirely while the
+   dashboard user holds input — their real cursor rules the stage, and a
+   glowing second cursor would read as a double pointer. */
+html.ui-v2 .cu-cursor-halo {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid rgba(var(--iris-rgb), .58);
+  background: radial-gradient(circle,
+    rgba(var(--iris-rgb), .16) 0%,
+    rgba(var(--iris-rgb), .07) 52%,
+    transparent 68%);
+  box-shadow:
+    0 0 16px rgba(var(--iris-rgb), .38),
+    inset 0 0 9px rgba(var(--iris-rgb), .2);
+  pointer-events: none;
+  transition: opacity var(--t-med);
+}
+html.ui-v2 .cu-overlay-cursor.cu-user-driving .cu-cursor-halo { opacity: 0; }
+@keyframes cu-halo-breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.12); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .cu-cursor-halo { animation: cu-halo-breathe 2.6s ease-in-out infinite; }
 }
 html.ui-v2 .cu-cursor-pill {
   position: absolute;

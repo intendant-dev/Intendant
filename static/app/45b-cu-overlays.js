@@ -79,6 +79,20 @@ function cuRawArgs(raw) {
   return m ? m[1] : '';
 }
 
+// Percent-encoded typed text reads better decoded in the friendly line
+// (`%20name%3D` → " name="). Presentation only — the feed row's mono
+// detail keeps the literal call (full text behind its disclosure), so
+// nothing daemon-reported is lost or invented.
+function cuDecodedPreview(text, max) {
+  let t = text;
+  if (/%[0-9A-Fa-f]{2}/.test(t)) {
+    try {
+      t = decodeURIComponent(t.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+    } catch (_) { /* not valid percent-encoding — keep the literal text */ }
+  }
+  return t.length > max ? t.slice(0, max) + '…' : t;
+}
+
 // Friendly first line for the feed. Generic on purpose: the wire carries
 // coordinates and raw calls, not element semantics, so the sentence never
 // pretends to know WHAT was clicked.
@@ -104,8 +118,7 @@ function cuFriendlyFor(d) {
     case 'type': {
       const text = cuRawQuotedText(d.raw);
       if (!text) return 'Typed text';
-      const preview = text.length > 32 ? text.slice(0, 32) + '…' : text;
-      return `Typed “${preview}”`;
+      return `Typed “${cuDecodedPreview(text, 32)}”`;
     }
     case 'paste': return 'Pasted text';
     case 'key': {
@@ -160,8 +173,14 @@ class CuOverlayEngine {
     this.rippleEl = layer('cu-overlay-ripple', 16);
     this.keysEl = layer('cu-overlay-keys', 18);
     this.cursorEl = layer('cu-overlay-cursor', 20);
-    // Concept-exact white arrow (24×26) + iris verb pill.
+    // Presence halo (under the arrow, centered on the hotspot) +
+    // concept-exact white arrow (24×26) + iris verb pill. The halo keeps
+    // the agent pointer findable on busy content; it rides this element's
+    // ease/idle-fade and is CSS-hidden while YOU hold input (the
+    // `cu-user-driving` class below) so it never reads as a second live
+    // cursor next to your real one.
     this.cursorEl.innerHTML =
+      '<span class="cu-cursor-halo"></span>' +
       '<svg width="24" height="26" viewBox="0 0 24 26">' +
       '<path d="M2 2 L2 20.5 L6.6 16.2 L9.9 23.4 L13 22 L9.7 15 L16 14.6 Z" ' +
       'fill="#ffffff" stroke="rgba(10,12,20,.55)" stroke-width="1.2" ' +
@@ -288,6 +307,9 @@ class CuOverlayEngine {
     // agent's), and fades out entirely after idle.
     const idle = now - this.lastActivityAt > CU_OVERLAY_IDLE_FADE_MS;
     const userDriving = this.slot.authorityState === 'you';
+    // classList.toggle with a force flag is a no-op when already in the
+    // desired state, so this is safe at animation-frame cadence.
+    this.cursorEl.classList.toggle('cu-user-driving', userDriving);
     const targetOpacity = !this.cursorShown || idle || !this.placed
       ? 0
       : (userDriving ? CU_OVERLAY_DIMMED_OPACITY : 1);

@@ -486,6 +486,21 @@ pub struct ReadScreenParams {
     /// "text" (default) for the compact indented tree, or "json".
     #[serde(default)]
     pub format: Option<String>,
+    /// Return element values and window titles uncapped. By default long
+    /// texts are capped at 80 chars with a stable marker (`… [N chars
+    /// total, #hash]`) so one long URL cannot dominate the result; set
+    /// true only when you need an exact long value.
+    #[serde(default)]
+    pub full_values: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DisplayReadinessParams {
+    /// Display target to probe: "user_session", "display_99", etc.
+    /// Auto-detects like take_screenshot if omitted: a live agent virtual
+    /// display when one exists, else the user session.
+    #[serde(default)]
+    pub display_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -605,6 +620,13 @@ pub struct ShowSharedViewParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HideSharedViewParams {
     /// Optional reason for dismissing the collaboration view.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearSharedViewFocusParams {
+    /// Optional reason for clearing the focus annotation.
     #[serde(default)]
     pub reason: Option<String>,
 }

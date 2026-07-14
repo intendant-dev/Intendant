@@ -24,11 +24,12 @@ use std::ffi::c_void;
 
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDescriptionAttribute, kAXEnabledAttribute, kAXErrorSuccess,
-    kAXFocusedAttribute, kAXFocusedWindowAttribute, kAXPositionAttribute, kAXRoleAttribute,
-    kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementRef,
-    AXUIElementSetMessagingTimeout, AXValueGetTypeID, AXValueGetValue, AXValueRef,
+    kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXFocusedWindowAttribute,
+    kAXPositionAttribute, kAXRoleAttribute, kAXSizeAttribute, kAXTitleAttribute, kAXValueAttribute,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute, AXIsProcessTrusted,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout, AXValueGetTypeID,
+    AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFGetTypeID, CFType, TCFType};
@@ -51,8 +52,6 @@ impl_TCFType!(AXUIElement, AXUIElementRef, AXUIElementGetTypeID);
 declare_TCFType!(AXValue, AXValueRef);
 impl_TCFType!(AXValue, AXValueRef, AXValueGetTypeID);
 
-/// Cap for label/value text carried per element.
-const TEXT_CAP: usize = 80;
 /// How many "other visible windows" summaries to include.
 const OTHER_WINDOWS_CAP: usize = 8;
 /// Per-attribute IPC timeout so one unresponsive app cannot hang the read.
@@ -133,6 +132,47 @@ pub fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElemen
     })
 }
 
+/// The focused element's role and readable value, for bounded `type`
+/// read-back verification.
+pub struct FocusedElementText {
+    /// Normalized role (`AXTextField` → `textfield`), when readable.
+    pub role: Option<String>,
+    /// The element's `AXValue` rendered as text — `None` when the value is
+    /// missing or not a string/number/bool.
+    pub value: Option<String>,
+}
+
+/// Read the system-wide focused UI element's role and value.
+///
+/// Bounded like every AX read in this module (per-element messaging
+/// timeout, two attribute copies). The attribute copies are synchronous IPC
+/// into the focused app — call from `spawn_blocking`.
+pub fn focused_element_text() -> Result<FocusedElementText, String> {
+    if !is_trusted() {
+        return Err(
+            "reading UI elements requires the Accessibility permission — grant Intendant \
+             access in System Settings → Privacy & Security → Accessibility and retry"
+                .to_string(),
+        );
+    }
+    // SAFETY: AXUIElementCreateSystemWide follows the Create rule and has no
+    // preconditions; the wrapper takes ownership and releases on drop.
+    let system = unsafe { AXUIElement::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+    // SAFETY: system is a valid AXUIElement for the duration of the call.
+    unsafe { AXUIElementSetMessagingTimeout(system.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS) };
+    let focused: AXUIElement = copy_attr(&system, kAXFocusedUIElementAttribute)
+        .and_then(|cf| cf.downcast_into())
+        .ok_or_else(|| "no focused UI element".to_string())?;
+    // SAFETY: focused is a valid AXUIElement for the duration of the call.
+    unsafe {
+        AXUIElementSetMessagingTimeout(focused.as_concrete_TypeRef(), MESSAGING_TIMEOUT_SECS)
+    };
+    Ok(FocusedElementText {
+        role: attr_string(&focused, kAXRoleAttribute).map(|r| normalize_role(&r)),
+        value: attr_value_string(&focused),
+    })
+}
+
 /// The frontmost app's focused window, falling back to its first window.
 fn focused_window(app_element: &AXUIElement) -> Option<AXUIElement> {
     if let Some(window) =
@@ -197,11 +237,13 @@ fn walk(
     let role = attr_string(element, kAXRoleAttribute)
         .map(|r| normalize_role(&r))
         .unwrap_or_else(|| "unknown".to_string());
+    // Labels/values are carried in full here; the display cap is applied
+    // once, centrally, by computer_use::cap_screen_elements_texts (so the
+    // read_screen `full_values` opt-out can serve the uncapped text).
     let label = attr_string(element, kAXTitleAttribute)
         .filter(|s| !s.is_empty())
-        .or_else(|| attr_string(element, kAXDescriptionAttribute).filter(|s| !s.is_empty()))
-        .map(|s| truncate(&s, TEXT_CAP));
-    let value = attr_value_string(element).map(|s| truncate(&s, TEXT_CAP));
+        .or_else(|| attr_string(element, kAXDescriptionAttribute).filter(|s| !s.is_empty()));
+    let value = attr_value_string(element);
     let focused = attr_bool(element, kAXFocusedAttribute).unwrap_or(false);
     let enabled = attr_bool(element, kAXEnabledAttribute).unwrap_or(true);
     let frame = element_frame(element).unwrap_or((0, 0, 0, 0));
@@ -234,14 +276,6 @@ fn walk(
 /// `AXButton` → `button`; unknown shapes are lowercased as-is.
 fn normalize_role(role: &str) -> String {
     role.strip_prefix("AX").unwrap_or(role).to_ascii_lowercase()
-}
-
-fn truncate(text: &str, cap: usize) -> String {
-    if text.chars().count() <= cap {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(cap).collect();
-    format!("{cut}…")
 }
 
 /// Copy one AX attribute, taking ownership of the returned object.
