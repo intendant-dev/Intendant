@@ -78,11 +78,6 @@
 //! 0" desktop) -- see the crate-level Windows-port notes.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
-
-/// How long the focused app gets to consume the clipboard after ctrl+v
-/// before the previous content is restored (paste is consumed while the app
-/// processes the chord; a lazy re-read afterwards sees the restored content).
-const PASTE_CONSUME_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 use async_trait::async_trait;
 use intendant_core::error::CallerError;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -129,6 +124,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
+
+/// How long the focused app gets to consume the clipboard after ctrl+v
+/// before the previous content is restored (paste is consumed while the app
+/// processes the chord; a lazy re-read afterwards sees the restored content).
+const PASTE_CONSUME_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Active capture state: holds the thread handle for cleanup.
 struct CaptureState {
