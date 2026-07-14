@@ -80,9 +80,35 @@ class RecordingPlayer {
       this.seekToGlobal(pct * this.totalDuration);
     };
     this._onPlayClick = () => this.togglePlayback();
+    // The element is the source of truth for playing state: browsers
+    // pause media on their own (WebKit parks hidden-tab video; OS media
+    // keys; power saving), and a `playing` flag written only by our
+    // play()/pause() methods desyncs — the rAF label loop keeps running
+    // and the play button shows the wrong glyph. End-of-media is the one
+    // carve-out: the spec fires `pause` immediately before `ended`, and
+    // segment advance (_onSegmentEnd → _loadSegment) relies on `playing`
+    // staying true to auto-resume the next segment — so ended-adjacent
+    // pauses stay owned by _onSegmentEnd (which calls pause() itself on
+    // the last segment). Both handlers are idempotent against the events
+    // our own play()/pause() methods queue.
+    this._onVideoPause = () => {
+      if (this.video.ended) return;
+      if (!this.playing) return;
+      this.playing = false;
+      this.playBtn.textContent = '\u25B6';
+      this._stopAnimLoop();
+    };
+    this._onVideoPlay = () => {
+      if (this.playing) return;
+      this.playing = true;
+      this.playBtn.textContent = '\u23F8';
+      this._startAnimLoop();
+    };
 
     this.video.addEventListener('ended', this._onEnded);
     this.video.addEventListener('timeupdate', this._onTimeUpdate);
+    this.video.addEventListener('pause', this._onVideoPause);
+    this.video.addEventListener('play', this._onVideoPlay);
     this.timelineEl.addEventListener('click', this._onTimelineClick);
     playBtn.addEventListener('click', this._onPlayClick);
   }
@@ -604,6 +630,8 @@ class RecordingPlayer {
     // Remove event listeners to prevent stale handlers on the shared video element
     this.video.removeEventListener('ended', this._onEnded);
     this.video.removeEventListener('timeupdate', this._onTimeUpdate);
+    this.video.removeEventListener('pause', this._onVideoPause);
+    this.video.removeEventListener('play', this._onVideoPlay);
     this.timelineEl.removeEventListener('click', this._onTimelineClick);
     this.playBtn.removeEventListener('click', this._onPlayClick);
     // Abort any in-flight MSE loading

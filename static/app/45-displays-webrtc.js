@@ -241,6 +241,10 @@ class DisplaySlot {
     this._statsTimer = null;        // live metrics chip sampler
     this._statsPrev = null;
     this._takePendingTimer = null;  // Take Control 5s no-answer timeout
+    // Item F6: parked-on-transport-outage poll. Non-null while this slot
+    // is waiting for display signaling to return instead of burning its
+    // bounded retry budget on offers that cannot leave the browser.
+    this._transportWaitTimer = null;
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
@@ -299,13 +303,34 @@ class DisplaySlot {
     // Video element for WebRTC media track
     this.videoEl = document.createElement('video');
     this.videoEl.autoplay = true;
-    this.videoEl.playsinline = true;
+    // The IDL property is camelCase — the lowercase assignment set a dead
+    // expando, so the element never actually carried playsinline. Set the
+    // attribute too for engines that read it directly.
+    this.videoEl.playsInline = true;
+    this.videoEl.setAttribute('playsinline', '');
     this.videoEl.muted = true;
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.videoEl.setAttribute('aria-label', `Live view of ${label}`);
     this.videoEl.setAttribute('aria-describedby', `ds-status-${displayId} ds-authority-${displayId}`);
     this.canvasEl.appendChild(this.videoEl);
+    // Live-video pause guard (shared driver in 45-display-viewer-core —
+    // WebKit pauses muted live video on tab switches / DOM reparents and
+    // never auto-resumes; full rationale there). Armed once: this element
+    // lives for the slot's whole life. "Live" is pc + connected; the
+    // breadcrumb rides the display activity rail so a pause-storm is
+    // visible instead of masquerading as network lag.
+    displayViewerArmPauseGuard(
+      this,
+      this.videoEl,
+      () => Boolean(this.pc && this.connected),
+      () => {
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            'Playback auto-resumed after a browser pause');
+        }
+      },
+    );
     // In-stage connection status overlay (time-to-first-frame): staged
     // copy while negotiating ("Negotiating…" → "Waiting for first
     // frame…"), and a visible error state with a Reconnect button on
@@ -680,6 +705,10 @@ class DisplaySlot {
         this._firstFrameSeen = true;
         this._clearNoTrackWatchdog();
         this._setStageOverlay(null);
+        // From here on, "frames stopped advancing" is the failure mode
+        // the no-track watchdog can't see — hand over to the freeze
+        // watchdog for the rest of this negotiation.
+        this._armFreezeWatchdog();
       });
     };
 
@@ -718,6 +747,15 @@ class DisplaySlot {
         // with the flag cleared.
         if (this._closedByUser) return;
         this.connected = false;
+        // Item F6: the bounded budget measures THIS DISPLAY's failures.
+        // While the signaling transport itself is down (daemon restart,
+        // event-lane reconnect), an offer cannot even leave the browser
+        // — park on the transport instead of burning attempts into a
+        // void and dead-ending every open slot.
+        if (!this._displaySignalingAvailable()) {
+          this._waitForDisplaySignaling();
+          return;
+        }
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
         if (attempts <= DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
@@ -730,6 +768,13 @@ class DisplaySlot {
           this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS})…`);
           setTimeout(() => {
             if (this._closedByUser) return;
+            // The transport can die during the backoff — re-check at
+            // fire time so this attempt parks instead of failing into
+            // the dead-end overlay while nothing can be signaled.
+            if (!this._displaySignalingAvailable()) {
+              this._waitForDisplaySignaling();
+              return;
+            }
             this.connect();
           }, delay);
         } else {
@@ -789,6 +834,14 @@ class DisplaySlot {
     }).then(async () => {
       await this.sendDisplayOffer(this.pc.localDescription.sdp);
     }).catch(err => {
+      // Item F6: an offer that failed while the signaling transport is
+      // down is the transport's failure, not this display's — park until
+      // it returns rather than dead-ending on a Reconnect button whose
+      // click couldn't signal either.
+      if (!this._closedByUser && !this._displaySignalingAvailable()) {
+        this._waitForDisplaySignaling();
+        return;
+      }
       this.statusEl.textContent = 'Offer FAILED: ' + err.message;
       this.statusEl.className = 'display-status error';
       // Offer/signaling failure used to be a quiet toolbar note on a dark
@@ -820,6 +873,57 @@ class DisplaySlot {
     displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
   }
 
+  // Re-kick playback if the element sits paused under a live connection
+  // (tab return, missed pause event during a reparent). Safe to call any
+  // time; no-ops unless connected with a stream attached. Shared driver
+  // in 45-display-viewer-core (the constructor arms the guard; behavior —
+  // 120ms macrotask delay, pending-dedupe, activity breadcrumb — is the
+  // pre-extraction #299 semantics unchanged).
+  resumeLiveVideoIfPaused() {
+    displayViewerResumeLiveVideoIfPaused(this);
+  }
+
+  // Post-first-frame freeze watchdog (shared driver in
+  // 45-display-viewer-core): armed by the first rendered frame of each
+  // negotiation, cleared by disconnect(). Presented-frame progress via
+  // rVFC (framesDecoded fallback); on a stall it first re-kicks playback
+  // through the pause-guard path, then surfaces the stage overlay with
+  // the manual Reconnect — never an automatic reconnect loop.
+  _armFreezeWatchdog() {
+    displayViewerArmFreezeWatchdog(this, {
+      videoEl: () => this.videoEl,
+      isLive: () => Boolean(this.pc && this.connected),
+      tryResume: () => this.resumeLiveVideoIfPaused(),
+      onStalled: (seconds) => {
+        this.statusEl.textContent = `No new frames for ${seconds}s`;
+        this.statusEl.className = 'display-status error';
+        this._setStageOverlay('error',
+          `No new frames for ${seconds}s — the connection reports connected but the video has stopped advancing. Reconnecting usually fixes it.`, {
+            retryLabel: 'Reconnect',
+            onRetry: () => this.manualReconnect(),
+          });
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            `No new frames for ${seconds}s — stream looks frozen`);
+        }
+      },
+      onRecovered: () => {
+        this._setStageOverlay(null);
+        if (this.connected) {
+          const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
+          this.statusEl.textContent = this.interactive
+            ? `Interactive${res}`
+            : `Connected (view-only)${res}`;
+          this.statusEl.className = 'display-status connected';
+        }
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'live',
+            'Stream frames resumed');
+        }
+      },
+    });
+  }
+
   // User-facing recovery entry point (overlay Reconnect button, revived
   // slots). Resets the bounded-retry budget and renegotiates from scratch.
   manualReconnect() {
@@ -827,6 +931,50 @@ class DisplaySlot {
     this._reconnectAttempts = 0;
     this.disconnect();
     this.connect();
+  }
+
+  // ── Item F6: don't burn the retry budget on transport outages ───────
+
+  // Whether a display offer/ICE signal can leave the browser right now:
+  // the verified dashboard-control tunnel (availability-driven —
+  // daemonApi reports 'transport-down' during an outage and recovers
+  // when the tunnel reconnects), else the legacy /ws bridge on
+  // direct-origin dashboards. The /ws socket's own liveness is only
+  // observable at send time, so bridge presence is the honest static
+  // signal there — a refused send still surfaces through the offer
+  // path's failure handling.
+  _displaySignalingAvailable() {
+    if (dashboardTransport?.canUseDisplayWebRtcSignal?.()) return true;
+    if (dashboardConnectModeEnabled()) return false;
+    return Boolean(app && (app.send_raw || app.send_server_action));
+  }
+
+  // Park this slot until display signaling returns, WITHOUT consuming
+  // `_reconnectAttempts` — a daemon restart used to burn the whole
+  // bounded budget on offers that could never leave the browser and
+  // dead-end every open slot. Cleared by disconnect() (manual
+  // Reconnect, user close, and the display_ready revive path all run
+  // it); self-clears into connect() when the transport comes back.
+  _waitForDisplaySignaling() {
+    if (this._transportWaitTimer) return;
+    // disconnect() first (mirrors the retry arm): it clears watchdogs
+    // and samplers and hides the overlay — write the waiting copy after.
+    this.disconnect();
+    this.statusEl.textContent = 'Dashboard link to the daemon is down — waiting to reconnect…';
+    this.statusEl.className = 'display-status warn';
+    this._setStageOverlay('progress',
+      'Dashboard link to the daemon is down — this display reconnects when it returns…');
+    this._transportWaitTimer = window.setInterval(() => {
+      if (this._closedByUser) {
+        window.clearInterval(this._transportWaitTimer);
+        this._transportWaitTimer = null;
+        return;
+      }
+      if (!this._displaySignalingAvailable()) return;
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+      this.connect();
+    }, 2000);
   }
 
   // No-video watchdog, ported from the peer path (shared driver in
@@ -1019,21 +1167,44 @@ class DisplaySlot {
     // server demotes us) otherwise auto-repeats remotely forever.
     this._heldKeys = new Set();
 
-    // Input transport — the LOCAL policy: prefer the verified
-    // dashboard-control input lane (sendDisplayInputForSlot), fall back
-    // to this pc's data channels. The federated path sends over its
-    // data channels only.
+    // Input transport — the LOCAL policy, split by event class:
+    //
+    // DISCRETE events (kd/ku/md/mu — loss- and reorder-intolerant)
+    // prefer the verified dashboard-control input lane and fall back to
+    // this pc's reliable `control` channel. Never dropped.
+    //
+    // CONTINUOUS latest-wins events (mm/sc) go the other way round: the
+    // purpose-built lossy `pointer` channel first (ordered:false,
+    // maxRetransmits:0 — drop beats head-of-line blocking), because the
+    // dashboard-control tunnel is reliable+ordered and SHARED with all
+    // RPC/upload traffic — a pointer firehose queued behind a congested
+    // tunnel replays stale moves in order and reads as catastrophic
+    // remote-control lag. The tunnel remains the fallback while the
+    // pointer channel isn't open (early negotiation, channel loss), and
+    // it drops above a bufferedAmount watermark there (see
+    // DashboardControlTransport.displayInput) rather than queueing.
+    //
+    // The daemon dispatches the 'control' and 'pointer' channel labels
+    // through the same gated_input_handler as the tunnel lane, so only
+    // the transport preference changes here — input-authority gating is
+    // identical on every path. All raw sends are wrapped against throw
+    // (close races, full SCTP buffers).
     const sendControl = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      try {
+        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        this.controlChannel.send(JSON.stringify(msg));
+        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
       }
     };
     const sendPointer = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
-        this.pointerChannel.send(JSON.stringify(msg));
+        try {
+          this.pointerChannel.send(JSON.stringify(msg));
+          return;
+        } catch (_) { /* closing race / full buffer — try the tunnel */ }
       }
+      try { sendDisplayInputForSlot(this.displayId, msg); } catch (_) {}
     };
 
     // Held-key flusher, stored on the instance so `_exitInteractive`
@@ -1489,6 +1660,11 @@ class DisplaySlot {
     // every per-connection timer — no leaked intervals across teardowns.
     this._connectEpoch++;
     this._clearNoTrackWatchdog();
+    displayViewerClearFreezeWatchdog(this);
+    if (this._transportWaitTimer) {
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+    }
     this._stopStatsSampler();
     this._setStageOverlay(null);
     this._clearRecordingPending();
@@ -2585,6 +2761,37 @@ function applyDisplayStripState() {
     scheduleWorkspace();
   };
 
+  // Lifecycle breadcrumbs from the slot layer (one-line rows, deduped by
+  // addDisplayActivity's consecutive-repeat check) — e.g. the live-video
+  // pause guard's auto-resume note.
+  window.noteLiveDisplayLifecycle = function(displayId, kind, text) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, String(kind || 'neutral'), String(text || ''));
+    scheduleWorkspace();
+  };
+
+  // Safari parks media in hidden tabs and can defer the element's own
+  // pause event until nobody is listening usefully; returning to the tab
+  // (or a bfcache restore) must therefore sweep every live slot. The
+  // per-element pause guard in DisplaySlot covers reparents; this covers
+  // backgrounding.
+  const resumeAllLiveDisplayVideos = () => {
+    for (const slot of displaySlots.values()) {
+      if (typeof slot.resumeLiveVideoIfPaused === 'function') slot.resumeLiveVideoIfPaused();
+    }
+    // Federated peer panes (and the Station HUD thumbnails drawImage-ing
+    // their video elements) have the same WebKit-parking exposure; their
+    // registry lives beside PeerDisplayConnection (52-peer-display.js).
+    for (const conn of peerDisplayConnections.values()) {
+      if (typeof conn.resumeLiveVideoIfPaused === 'function') conn.resumeLiveVideoIfPaused();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeAllLiveDisplayVideos();
+  });
+  window.addEventListener('pageshow', resumeAllLiveDisplayVideos);
+
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
     const next = snapshotSlot(slot);
@@ -3100,6 +3307,10 @@ function applyDisplayStripState() {
         userDisplayMode: userDisplayGranted
           ? (userDisplayAgentVisible ? 'agent' : 'private')
           : 'off',
+        // Item F4: pointer moves deliberately dropped by the shared
+        // reliable tunnel's bufferedAmount watermark (the fallback lane
+        // for mm when the per-display pointer channel isn't open).
+        inputTunnelMovesDropped: dashboardControlTunnelPointerMovesDropped,
         slots: Array.from(displaySlots.values()).map(slot => {
           const id = Number(slot.displayId);
           return {
@@ -3107,6 +3318,15 @@ function applyDisplayStripState() {
             selected: id === selectedDisplayId,
             connected: Boolean(slot.connected),
             firstFrameSeen: Boolean(slot._firstFrameSeen),
+            paused: Boolean(slot.videoEl && slot.videoEl.paused),
+            // Freeze-watchdog snapshot (null until the first frame arms
+            // it): { armed, source: 'rvfc'|'stats', stalledMs,
+            // resumeAttempted, overlayShown }.
+            freeze: displayViewerFreezeWatchQa(slot),
+            pointerChannelOpen: Boolean(
+              slot.pointerChannel && slot.pointerChannel.readyState === 'open'),
+            reconnectAttempts: Number(slot._reconnectAttempts) || 0,
+            waitingForSignalTransport: Boolean(slot._transportWaitTimer),
             intrinsicWidth: Number(slot.videoEl && slot.videoEl.videoWidth) || 0,
             intrinsicHeight: Number(slot.videoEl && slot.videoEl.videoHeight) || 0,
             authorityState: slot.authorityState || 'unknown',

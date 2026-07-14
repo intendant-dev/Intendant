@@ -787,6 +787,12 @@ const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+// Item F4: watermark above which continuous pointer moves ('mm') falling
+// back onto the shared reliable tunnel are dropped instead of queued —
+// 16 KB is already dozens of queued moves; beyond it, replaying stale
+// positions in order reads as remote-control lag, so latest-wins drops
+// are the honest choice. Discrete input (kd/ku/md/mu) is never dropped.
+const DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES = 16 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;

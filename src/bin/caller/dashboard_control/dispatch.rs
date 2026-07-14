@@ -197,6 +197,7 @@ pub(crate) fn control_frame_response(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+    display_input_tx: &mpsc::UnboundedSender<serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -236,7 +237,12 @@ pub(crate) fn control_frame_response(
             "unix_ms": chrono::Utc::now().timestamp_millis(),
         })),
         "display_input" => {
-            spawn_dashboard_display_input(parsed, runtime.clone());
+            // Ordered handoff to the per-connection forwarder (see
+            // `spawn_display_input_forwarder`): the wire loop dispatches
+            // frames sequentially and this send preserves that order —
+            // never a per-event spawn, which would race events across
+            // runtime workers and could invert kd/ku or md/mu pairs.
+            let _ = display_input_tx.send(parsed);
             None
         }
         "terminal_open" => {
@@ -2025,42 +2031,81 @@ pub(crate) async fn dashboard_async_query(frame: serde_json::Value, runtime: Con
     );
 }
 
-pub(crate) fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
+/// Spawn the per-connection display-input forwarder (F1, 2026-07-13
+/// display review): ONE task per control connection that consumes
+/// `display_input` frames from an ordered channel and routes each to the
+/// display session's ordered input queue.
+///
+/// The previous shape — one `tokio::spawn` per input event — discarded
+/// the data channel's wire ordering: two spawned tasks race across
+/// runtime workers, and a `kd`/`ku` or `md`/`mu` inversion wedges a key
+/// or scrambles a click (the window widens under host load). The wire
+/// loop (`drain_control_outputs`) dispatches frames sequentially, its
+/// `unbounded_send` into this channel preserves that order, and the
+/// single consumer here preserves it into `enqueue_input` — whose
+/// per-session pump preserves it into the backend.
+///
+/// The forwarder ends when the wire loop drops the sender (connection
+/// teardown) or the shared shutdown token fires.
+pub(crate) fn spawn_display_input_forwarder(
+    runtime: ControlRuntime,
+    shutdown: CancellationToken,
+) -> mpsc::UnboundedSender<serde_json::Value> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
     tokio::spawn(async move {
-        let display_id = frame
-            .get("display_id")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(0);
-        let Some(event) = frame.get("event").cloned() else {
-            return;
-        };
-        let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
-            return;
-        };
-        let Some(bridge) = runtime.display_authority.as_ref() else {
-            return;
-        };
-        if !bridge.input_authorized(&runtime.session_id, display_id) {
-            return;
-        }
-        let session_registry = {
-            let session = runtime.shared_session.read().await;
-            session.session_registry.clone()
-        };
-        let Some(session_registry) = session_registry else {
-            return;
-        };
-        let display_session = {
-            let registry = session_registry.read().await;
-            registry.get(display_id)
-        };
-        if let Some(display_session) = display_session {
-            if let Err(e) = display_session.inject_input(input_event).await {
-                eprintln!("[dashboard/control] display input injection failed: {e}");
-            }
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                frame = rx.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
+            forward_dashboard_display_input(frame, &runtime).await;
         }
     });
+    tx
+}
+
+/// Route one `display_input` frame: parse, authority-gate, resolve the
+/// display session, and enqueue onto its ordered input queue. Gating
+/// happens before enqueue (per-event, so authority revocation applies to
+/// every later event), preserving the pre-queue semantics.
+async fn forward_dashboard_display_input(frame: serde_json::Value, runtime: &ControlRuntime) {
+    let display_id = frame
+        .get("display_id")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let Some(event) = frame.get("event").cloned() else {
+        return;
+    };
+    let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
+        return;
+    };
+    let Some(bridge) = runtime.display_authority.as_ref() else {
+        return;
+    };
+    if !bridge.input_authorized(&runtime.session_id, display_id) {
+        return;
+    }
+    let session_registry = {
+        let session = runtime.shared_session.read().await;
+        session.session_registry.clone()
+    };
+    let Some(session_registry) = session_registry else {
+        return;
+    };
+    let display_session = {
+        let registry = session_registry.read().await;
+        registry.get(display_id)
+    };
+    if let Some(display_session) = display_session {
+        // Fire-and-forget: the session's input pump injects queued
+        // events in order and logs failures.
+        display_session.enqueue_input(input_event);
+    }
 }
 
 pub(crate) fn cached_bootstrap_events_response_frame(
@@ -2564,6 +2609,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
         let bytes = b"hello upload";
         let first = &bytes[..6];
         let second = &bytes[6..];
@@ -2590,6 +2636,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
         assert!(pending.contains_key("up1"));
@@ -2610,6 +2657,7 @@ mod tests {
                 &mut inbound_uploads,
                 &terminal_tx,
                 &mut terminal_forwarders,
+                &display_input_tx,
             )
             .is_none());
         }
@@ -2628,6 +2676,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2672,6 +2721,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
 
         let start = serde_json::json!({
             "t": "upload_start",
@@ -2695,6 +2745,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
         assert!(pending.contains_key("up-empty"));
@@ -2713,6 +2764,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2743,6 +2795,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
         let terminal_id = "dash-control-test-shell";
 
         let open = serde_json::json!({
@@ -2761,6 +2814,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2837,6 +2891,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2859,6 +2914,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         );
         for (_, handle) in terminal_forwarders {
             handle.abort();
@@ -2880,6 +2936,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
         let mut frame = |text: &str,
                          rt: &mut ControlRuntime,
                          pending: &mut HashMap<String, CancellationToken>,
@@ -2894,6 +2951,7 @@ mod tests {
                 inbound,
                 &terminal_tx,
                 &mut terminal_forwarders,
+                &display_input_tx,
             )
         };
 

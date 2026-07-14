@@ -3070,6 +3070,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
         control_frame_response(
             text,
             runtime,
@@ -3079,6 +3080,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
     }
 

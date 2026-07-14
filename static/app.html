@@ -27195,7 +27195,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'dafbdc5cc3f53cdf';
+const INTENDANT_APP_BUILD = 'df9e15bd1cbb0a08';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -27969,6 +27969,12 @@ const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+// Item F4: watermark above which continuous pointer moves ('mm') falling
+// back onto the shared reliable tunnel are dropped instead of queued —
+// 16 KB is already dozens of queued moves; beyond it, replaying stale
+// positions in order reads as remote-control lag, so latest-wins drops
+// are the honest choice. Discrete input (kd/ku/md/mu) is never dropped.
+const DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES = 16 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
@@ -62522,7 +62528,9 @@ document.addEventListener('keydown', (e) => {
 // PeerFileTransferConnection instances; helpers touch only fields the
 // callers already share (`pc`, `_answerApplied`, `_pendingCandidates`,
 // `_heldKeys`, `_flushHeldKeys`, `_noTrackTimer`, `_statsTimer`,
-// `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`).
+// `_statsPrev`, `_attachCounter`, `interactive`, `_sampleStats()`, plus
+// the liveness-guard state this file owns: `_pauseGuard`,
+// `_resumeVideoPending`, `_freezeWatch`, `_freezeWatchGen`).
 // Per-class UX (status vocabulary, toasts, chip DOM ids, log copy) stays
 // in the classes and reaches the core through the hook parameters.
 
@@ -63104,6 +63112,259 @@ function displayViewerClearNoTrackWatchdog(viewer) {
   }
 }
 
+// ── Live-video pause guard (shared driver) ──────────────────────────────
+// WebKit pauses a muted live <video> on tab switches and on every DOM
+// reparent (the local stage moves whole through the thumb / fullscreen /
+// Station containers; peer pane DOM is rebuilt on every daemons-list
+// re-render) and does NOT auto-resume; Chromium mostly resumes srcObject
+// streams on its own, which is why this never surfaced before Safari
+// became a supported consumer. A paused element under a live track shows
+// a frozen frame while the input datachannels keep working — it reads as
+// catastrophic remote-control lag (live incident, 2026-07-13). While the
+// viewer is live, every pause is spurious: resume it.
+//
+// The guard state lives on `owner._pauseGuard` and is REBOUND by every
+// `displayViewerArmPauseGuard` call: the local DisplaySlot arms once (its
+// element lives for the slot's whole life), the peer path re-arms on
+// every pane rebuild so the resume path always targets the CURRENT
+// element. Stale listeners on replaced elements go inert via the
+// owner/element identity checks rather than being removed (the old
+// element is garbage as soon as the pane rebuild drops it).
+const DISPLAY_VIEWER_PAUSE_RESUME_DELAY_MS = 120;
+
+function displayViewerArmPauseGuard(owner, videoEl, isLive, onResume) {
+  owner._pauseGuard = {
+    videoEl: videoEl || null,
+    isLive: isLive || (() => true),
+    onResume: onResume || null,
+  };
+  if (!videoEl || videoEl._displayViewerPauseGuardFor === owner) return;
+  videoEl._displayViewerPauseGuardFor = owner;
+  videoEl.addEventListener('pause', () => {
+    const guard = owner._pauseGuard;
+    // Inert when the guard was rebound to a replacement element (peer
+    // pane rebuild) or the element to a newer connection (peer retry
+    // reuses the pane): the CURRENT binding owns resumes.
+    if (!guard || guard.videoEl !== videoEl) return;
+    if (videoEl._displayViewerPauseGuardFor !== owner) return;
+    displayViewerResumeLiveVideoSoon(owner);
+  });
+}
+
+function displayViewerResumeLiveVideoSoon(owner) {
+  const guard = owner._pauseGuard;
+  if (!guard || owner._resumeVideoPending) return;
+  if (!guard.isLive() || !guard.videoEl || !guard.videoEl.srcObject) return;
+  owner._resumeVideoPending = true;
+  // Next macrotask: a reparent's pause fires between the removal and the
+  // re-insert, and a play() issued while the element is out of the
+  // document is voided by the move itself.
+  setTimeout(() => {
+    owner._resumeVideoPending = false;
+    // Re-read the guard: a pane rebuild inside the delay retargets the
+    // resume at the current element (the replaced one is garbage).
+    const g = owner._pauseGuard;
+    if (!g || !g.isLive() || !g.videoEl || !g.videoEl.srcObject) return;
+    if (!g.videoEl.paused) return;
+    const p = g.videoEl.play();
+    if (p && p.catch) p.catch(() => {});
+    if (g.onResume) g.onResume();
+  }, DISPLAY_VIEWER_PAUSE_RESUME_DELAY_MS);
+}
+
+// Re-kick playback if the element sits paused under a live connection
+// (tab return, missed pause event during a reparent). Safe to call any
+// time; no-ops unless the owner's guard says live with a stream attached.
+function displayViewerResumeLiveVideoIfPaused(owner) {
+  const guard = owner._pauseGuard;
+  if (guard && guard.videoEl && guard.videoEl.paused) {
+    displayViewerResumeLiveVideoSoon(owner);
+  }
+}
+
+// ── Post-first-frame freeze watchdog (shared driver) ────────────────────
+// The no-track watchdog above covers "connected but no video EVER
+// arrived"; this covers the rest of the session: a stream that rendered
+// fine and then stopped advancing. Progress is measured as PRESENTED
+// frames via a requestVideoFrameCallback pump where the engine supports
+// it (the pump is the honest signal for the incident class — a paused or
+// wedged element under a live track, where DECODE keeps advancing);
+// engines without rVFC fall back to framesDecoded deltas from the shared
+// 3s stats sampler (`viewer._statsPrev`), which catches stream-level
+// freezes but cannot see a stalled element.
+//
+// Honesty of the timeout: the daemon-side capture bridge re-pushes the
+// latest frame once per second on idle desktops (IDLE_HEARTBEAT in
+// crates/intendant-display), so ≥1 fps reaches a healthy viewer even
+// with nothing changing on screen — six missed heartbeats is evidence of
+// a stall, not an idle desktop.
+//
+// Escalation ladder (never an auto-reconnect loop): after
+// DISPLAY_VIEWER_FREEZE_TIMEOUT_MS without progress, ONE automatic
+// resume attempt through the pause-guard path; if frames still don't
+// advance within the grace window, `onStalled(seconds)` fires once so
+// the class surfaces its stage overlay with the manual reconnect
+// affordance. `onRecovered()` fires only on real frame progress after
+// either step, so the class can clear that overlay.
+//
+// Gating: ticks are inert while the connection isn't live (retry /
+// disconnect machinery owns messaging then — the watchdog never stomps
+// their overlays), while the tab is hidden, and while the element isn't
+// actually rendered (display:none pane, deselected `ui2-live-inactive`
+// stage, tile-mode-hidden peer video, 0-dim containers) — rVFC
+// legitimately stops firing in all of those, so freshness is unknowable
+// and the pause-guard visibility sweep owns resume-on-return instead.
+const DISPLAY_VIEWER_FREEZE_TIMEOUT_MS = 6000;
+const DISPLAY_VIEWER_FREEZE_RESUME_GRACE_MS = 2000;
+const DISPLAY_VIEWER_FREEZE_POLL_MS = 1000;
+
+// `hooks`: { videoEl(), isLive(), tryResume(), onStalled(seconds),
+// onRecovered() } — all required. Arm on first rendered frame; re-arming
+// replaces the previous watchdog (fresh negotiation = fresh baseline).
+function displayViewerArmFreezeWatchdog(viewer, hooks) {
+  displayViewerClearFreezeWatchdog(viewer);
+  const gen = (viewer._freezeWatchGen || 0) + 1;
+  viewer._freezeWatchGen = gen;
+  viewer._freezeWatch = {
+    gen,
+    hooks,
+    lastProgressAt: performance.now(),
+    lastFrames: viewer._statsPrev ? viewer._statsPrev.frames : null,
+    resumeAttempted: false,
+    overlayShown: false,
+    pumpEl: null,
+    timer: window.setInterval(
+      () => displayViewerFreezeWatchTick(viewer, gen),
+      DISPLAY_VIEWER_FREEZE_POLL_MS,
+    ),
+  };
+  displayViewerFreezeWatchBindPump(viewer);
+}
+
+function displayViewerClearFreezeWatchdog(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  if (w.timer) window.clearInterval(w.timer);
+  viewer._freezeWatch = null;
+}
+
+// (Re)bind the rVFC pump to the CURRENT video element. The local slot's
+// element is constructor-owned so the arm-time bind is final; the peer
+// path calls this again from attachToDom because its pane <video> is
+// rebuilt on every daemons-list re-render. A pump on a replaced element
+// stops re-arming itself the next time it fires and sees it lost the
+// element identity check.
+function displayViewerFreezeWatchBindPump(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  const el = w.hooks.videoEl();
+  if (!el || typeof el.requestVideoFrameCallback !== 'function') return;
+  if (w.pumpEl === el) return;
+  w.pumpEl = el;
+  const gen = w.gen;
+  const pump = () => {
+    const cur = viewer._freezeWatch;
+    if (!cur || cur.gen !== gen) return; // watchdog cleared or re-armed
+    if (cur.hooks.videoEl() !== el) {
+      // Element replaced; the attachToDom rebind owns the new one. Fall
+      // back to stats probing until it lands.
+      if (cur.pumpEl === el) cur.pumpEl = null;
+      return;
+    }
+    displayViewerFreezeWatchMarkProgress(viewer);
+    el.requestVideoFrameCallback(pump);
+  };
+  el.requestVideoFrameCallback(pump);
+}
+
+function displayViewerFreezeWatchMarkProgress(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return;
+  w.lastProgressAt = performance.now();
+  w.resumeAttempted = false;
+  if (w.overlayShown) {
+    w.overlayShown = false;
+    w.hooks.onRecovered();
+  }
+}
+
+// An element is "rendered" when it has a laid-out box with real area:
+// covers detached nodes, display:none ancestors (deselected stages,
+// hidden tab panels, the peer video hidden under tile mode), and 0-dim
+// containers. visibility:hidden still measures — acceptable: engines
+// keep presenting those, so the watchdog stays honest there.
+function displayViewerElementRendered(el) {
+  if (!el || !el.isConnected) return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 1 && rect.height > 1;
+}
+
+function displayViewerFreezeWatchTick(viewer, gen) {
+  const w = viewer._freezeWatch;
+  if (!w || w.gen !== gen) return;
+  const hooks = w.hooks;
+  const now = performance.now();
+  if (!hooks.isLive()) {
+    // Retry/teardown machinery owns status + overlay from here; stand
+    // down without touching them (a shown freeze overlay stays until
+    // frames really resume or the class clears the watchdog).
+    w.lastProgressAt = now;
+    w.resumeAttempted = false;
+    return;
+  }
+  // Fallback progress probe: only when no rVFC pump is driving (decode
+  // progress cannot vouch for presentation, so it must not mask a
+  // stalled element when the pump is available).
+  if (!w.pumpEl) {
+    const frames = viewer._statsPrev ? viewer._statsPrev.frames : null;
+    if (frames !== null && frames !== undefined && frames !== w.lastFrames) {
+      w.lastFrames = frames;
+      displayViewerFreezeWatchMarkProgress(viewer);
+      return;
+    }
+  }
+  const el = hooks.videoEl();
+  if (document.hidden || !displayViewerElementRendered(el)) {
+    // Not being presented anywhere the user can see: freshness is
+    // unknowable (rVFC legitimately idles), so reset the clock instead
+    // of alarming. The visibilitychange/pageshow sweep owns resume.
+    w.lastProgressAt = now;
+    w.resumeAttempted = false;
+    return;
+  }
+  const stalledMs = now - w.lastProgressAt;
+  if (stalledMs < DISPLAY_VIEWER_FREEZE_TIMEOUT_MS) return;
+  if (!w.resumeAttempted) {
+    // Step 1, once per episode: the pause-guard resume path (a paused
+    // element under a live track is the incident class; play() on an
+    // already-playing element is harmless).
+    w.resumeAttempted = true;
+    hooks.tryResume();
+    return;
+  }
+  if (stalledMs < DISPLAY_VIEWER_FREEZE_TIMEOUT_MS + DISPLAY_VIEWER_FREEZE_RESUME_GRACE_MS) return;
+  if (!w.overlayShown) {
+    // Step 2, once per episode: a visible, actionable state. The class
+    // decides the copy + retry affordance; no automatic reconnects.
+    w.overlayShown = true;
+    hooks.onStalled(Math.max(1, Math.round(stalledMs / 1000)));
+  }
+}
+
+// QA snapshot of a viewer's freeze-watchdog state (null when unarmed) —
+// consumed by qa.liveDisplay() / qa.peerDisplays().
+function displayViewerFreezeWatchQa(viewer) {
+  const w = viewer._freezeWatch;
+  if (!w) return null;
+  return {
+    armed: true,
+    source: w.pumpEl ? 'rvfc' : 'stats',
+    stalledMs: Math.max(0, Math.round(performance.now() - w.lastProgressAt)),
+    resumeAttempted: Boolean(w.resumeAttempted),
+    overlayShown: Boolean(w.overlayShown),
+  };
+}
+
 // ── Frame capture + attach lane ─────────────────────────────────────────
 // Rasterize a live surface (<video> or the peer tile canvas) at the given
 // target size into { canvas, dataUrl, b64, width, height } — the frame
@@ -63445,6 +63706,10 @@ class DisplaySlot {
     this._statsTimer = null;        // live metrics chip sampler
     this._statsPrev = null;
     this._takePendingTimer = null;  // Take Control 5s no-answer timeout
+    // Item F6: parked-on-transport-outage poll. Non-null while this slot
+    // is waiting for display signaling to return instead of burning its
+    // bounded retry budget on offers that cannot leave the browser.
+    this._transportWaitTimer = null;
     this._streamCanvas = document.createElement('canvas');
     this._focusResizeObserver = null;
     this._boundHandlers = {};
@@ -63503,13 +63768,34 @@ class DisplaySlot {
     // Video element for WebRTC media track
     this.videoEl = document.createElement('video');
     this.videoEl.autoplay = true;
-    this.videoEl.playsinline = true;
+    // The IDL property is camelCase — the lowercase assignment set a dead
+    // expando, so the element never actually carried playsinline. Set the
+    // attribute too for engines that read it directly.
+    this.videoEl.playsInline = true;
+    this.videoEl.setAttribute('playsinline', '');
     this.videoEl.muted = true;
     this.videoEl.style.width = '100%';
     this.videoEl.style.backgroundColor = '#000';
     this.videoEl.setAttribute('aria-label', `Live view of ${label}`);
     this.videoEl.setAttribute('aria-describedby', `ds-status-${displayId} ds-authority-${displayId}`);
     this.canvasEl.appendChild(this.videoEl);
+    // Live-video pause guard (shared driver in 45-display-viewer-core —
+    // WebKit pauses muted live video on tab switches / DOM reparents and
+    // never auto-resumes; full rationale there). Armed once: this element
+    // lives for the slot's whole life. "Live" is pc + connected; the
+    // breadcrumb rides the display activity rail so a pause-storm is
+    // visible instead of masquerading as network lag.
+    displayViewerArmPauseGuard(
+      this,
+      this.videoEl,
+      () => Boolean(this.pc && this.connected),
+      () => {
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            'Playback auto-resumed after a browser pause');
+        }
+      },
+    );
     // In-stage connection status overlay (time-to-first-frame): staged
     // copy while negotiating ("Negotiating…" → "Waiting for first
     // frame…"), and a visible error state with a Reconnect button on
@@ -63884,6 +64170,10 @@ class DisplaySlot {
         this._firstFrameSeen = true;
         this._clearNoTrackWatchdog();
         this._setStageOverlay(null);
+        // From here on, "frames stopped advancing" is the failure mode
+        // the no-track watchdog can't see — hand over to the freeze
+        // watchdog for the rest of this negotiation.
+        this._armFreezeWatchdog();
       });
     };
 
@@ -63922,6 +64212,15 @@ class DisplaySlot {
         // with the flag cleared.
         if (this._closedByUser) return;
         this.connected = false;
+        // Item F6: the bounded budget measures THIS DISPLAY's failures.
+        // While the signaling transport itself is down (daemon restart,
+        // event-lane reconnect), an offer cannot even leave the browser
+        // — park on the transport instead of burning attempts into a
+        // void and dead-ending every open slot.
+        if (!this._displaySignalingAvailable()) {
+          this._waitForDisplaySignaling();
+          return;
+        }
         const attempts = (this._reconnectAttempts || 0) + 1;
         this._reconnectAttempts = attempts;
         if (attempts <= DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
@@ -63934,6 +64233,13 @@ class DisplaySlot {
           this._setStageOverlay('progress', `Connection failed — reconnecting in ${delay/1000}s (attempt ${attempts} of ${DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS})…`);
           setTimeout(() => {
             if (this._closedByUser) return;
+            // The transport can die during the backoff — re-check at
+            // fire time so this attempt parks instead of failing into
+            // the dead-end overlay while nothing can be signaled.
+            if (!this._displaySignalingAvailable()) {
+              this._waitForDisplaySignaling();
+              return;
+            }
             this.connect();
           }, delay);
         } else {
@@ -63993,6 +64299,14 @@ class DisplaySlot {
     }).then(async () => {
       await this.sendDisplayOffer(this.pc.localDescription.sdp);
     }).catch(err => {
+      // Item F6: an offer that failed while the signaling transport is
+      // down is the transport's failure, not this display's — park until
+      // it returns rather than dead-ending on a Reconnect button whose
+      // click couldn't signal either.
+      if (!this._closedByUser && !this._displaySignalingAvailable()) {
+        this._waitForDisplaySignaling();
+        return;
+      }
       this.statusEl.textContent = 'Offer FAILED: ' + err.message;
       this.statusEl.className = 'display-status error';
       // Offer/signaling failure used to be a quiet toolbar note on a dark
@@ -64024,6 +64338,57 @@ class DisplaySlot {
     displayViewerOnFirstFrame(this.videoEl, () => epoch !== this._connectEpoch, cb);
   }
 
+  // Re-kick playback if the element sits paused under a live connection
+  // (tab return, missed pause event during a reparent). Safe to call any
+  // time; no-ops unless connected with a stream attached. Shared driver
+  // in 45-display-viewer-core (the constructor arms the guard; behavior —
+  // 120ms macrotask delay, pending-dedupe, activity breadcrumb — is the
+  // pre-extraction #299 semantics unchanged).
+  resumeLiveVideoIfPaused() {
+    displayViewerResumeLiveVideoIfPaused(this);
+  }
+
+  // Post-first-frame freeze watchdog (shared driver in
+  // 45-display-viewer-core): armed by the first rendered frame of each
+  // negotiation, cleared by disconnect(). Presented-frame progress via
+  // rVFC (framesDecoded fallback); on a stall it first re-kicks playback
+  // through the pause-guard path, then surfaces the stage overlay with
+  // the manual Reconnect — never an automatic reconnect loop.
+  _armFreezeWatchdog() {
+    displayViewerArmFreezeWatchdog(this, {
+      videoEl: () => this.videoEl,
+      isLive: () => Boolean(this.pc && this.connected),
+      tryResume: () => this.resumeLiveVideoIfPaused(),
+      onStalled: (seconds) => {
+        this.statusEl.textContent = `No new frames for ${seconds}s`;
+        this.statusEl.className = 'display-status error';
+        this._setStageOverlay('error',
+          `No new frames for ${seconds}s — the connection reports connected but the video has stopped advancing. Reconnecting usually fixes it.`, {
+            retryLabel: 'Reconnect',
+            onRetry: () => this.manualReconnect(),
+          });
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'attention',
+            `No new frames for ${seconds}s — stream looks frozen`);
+        }
+      },
+      onRecovered: () => {
+        this._setStageOverlay(null);
+        if (this.connected) {
+          const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
+          this.statusEl.textContent = this.interactive
+            ? `Interactive${res}`
+            : `Connected (view-only)${res}`;
+          this.statusEl.className = 'display-status connected';
+        }
+        if (typeof window.noteLiveDisplayLifecycle === 'function') {
+          window.noteLiveDisplayLifecycle(this.displayId, 'live',
+            'Stream frames resumed');
+        }
+      },
+    });
+  }
+
   // User-facing recovery entry point (overlay Reconnect button, revived
   // slots). Resets the bounded-retry budget and renegotiates from scratch.
   manualReconnect() {
@@ -64031,6 +64396,50 @@ class DisplaySlot {
     this._reconnectAttempts = 0;
     this.disconnect();
     this.connect();
+  }
+
+  // ── Item F6: don't burn the retry budget on transport outages ───────
+
+  // Whether a display offer/ICE signal can leave the browser right now:
+  // the verified dashboard-control tunnel (availability-driven —
+  // daemonApi reports 'transport-down' during an outage and recovers
+  // when the tunnel reconnects), else the legacy /ws bridge on
+  // direct-origin dashboards. The /ws socket's own liveness is only
+  // observable at send time, so bridge presence is the honest static
+  // signal there — a refused send still surfaces through the offer
+  // path's failure handling.
+  _displaySignalingAvailable() {
+    if (dashboardTransport?.canUseDisplayWebRtcSignal?.()) return true;
+    if (dashboardConnectModeEnabled()) return false;
+    return Boolean(app && (app.send_raw || app.send_server_action));
+  }
+
+  // Park this slot until display signaling returns, WITHOUT consuming
+  // `_reconnectAttempts` — a daemon restart used to burn the whole
+  // bounded budget on offers that could never leave the browser and
+  // dead-end every open slot. Cleared by disconnect() (manual
+  // Reconnect, user close, and the display_ready revive path all run
+  // it); self-clears into connect() when the transport comes back.
+  _waitForDisplaySignaling() {
+    if (this._transportWaitTimer) return;
+    // disconnect() first (mirrors the retry arm): it clears watchdogs
+    // and samplers and hides the overlay — write the waiting copy after.
+    this.disconnect();
+    this.statusEl.textContent = 'Dashboard link to the daemon is down — waiting to reconnect…';
+    this.statusEl.className = 'display-status warn';
+    this._setStageOverlay('progress',
+      'Dashboard link to the daemon is down — this display reconnects when it returns…');
+    this._transportWaitTimer = window.setInterval(() => {
+      if (this._closedByUser) {
+        window.clearInterval(this._transportWaitTimer);
+        this._transportWaitTimer = null;
+        return;
+      }
+      if (!this._displaySignalingAvailable()) return;
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+      this.connect();
+    }, 2000);
   }
 
   // No-video watchdog, ported from the peer path (shared driver in
@@ -64223,21 +64632,44 @@ class DisplaySlot {
     // server demotes us) otherwise auto-repeats remotely forever.
     this._heldKeys = new Set();
 
-    // Input transport — the LOCAL policy: prefer the verified
-    // dashboard-control input lane (sendDisplayInputForSlot), fall back
-    // to this pc's data channels. The federated path sends over its
-    // data channels only.
+    // Input transport — the LOCAL policy, split by event class:
+    //
+    // DISCRETE events (kd/ku/md/mu — loss- and reorder-intolerant)
+    // prefer the verified dashboard-control input lane and fall back to
+    // this pc's reliable `control` channel. Never dropped.
+    //
+    // CONTINUOUS latest-wins events (mm/sc) go the other way round: the
+    // purpose-built lossy `pointer` channel first (ordered:false,
+    // maxRetransmits:0 — drop beats head-of-line blocking), because the
+    // dashboard-control tunnel is reliable+ordered and SHARED with all
+    // RPC/upload traffic — a pointer firehose queued behind a congested
+    // tunnel replays stale moves in order and reads as catastrophic
+    // remote-control lag. The tunnel remains the fallback while the
+    // pointer channel isn't open (early negotiation, channel loss), and
+    // it drops above a bufferedAmount watermark there (see
+    // DashboardControlTransport.displayInput) rather than queueing.
+    //
+    // The daemon dispatches the 'control' and 'pointer' channel labels
+    // through the same gated_input_handler as the tunnel lane, so only
+    // the transport preference changes here — input-authority gating is
+    // identical on every path. All raw sends are wrapped against throw
+    // (close races, full SCTP buffers).
     const sendControl = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      try {
+        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+      } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        this.controlChannel.send(JSON.stringify(msg));
+        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
       }
     };
     const sendPointer = (msg) => {
-      if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
-        this.pointerChannel.send(JSON.stringify(msg));
+        try {
+          this.pointerChannel.send(JSON.stringify(msg));
+          return;
+        } catch (_) { /* closing race / full buffer — try the tunnel */ }
       }
+      try { sendDisplayInputForSlot(this.displayId, msg); } catch (_) {}
     };
 
     // Held-key flusher, stored on the instance so `_exitInteractive`
@@ -64693,6 +65125,11 @@ class DisplaySlot {
     // every per-connection timer — no leaked intervals across teardowns.
     this._connectEpoch++;
     this._clearNoTrackWatchdog();
+    displayViewerClearFreezeWatchdog(this);
+    if (this._transportWaitTimer) {
+      window.clearInterval(this._transportWaitTimer);
+      this._transportWaitTimer = null;
+    }
     this._stopStatsSampler();
     this._setStageOverlay(null);
     this._clearRecordingPending();
@@ -65789,6 +66226,37 @@ function applyDisplayStripState() {
     scheduleWorkspace();
   };
 
+  // Lifecycle breadcrumbs from the slot layer (one-line rows, deduped by
+  // addDisplayActivity's consecutive-repeat check) — e.g. the live-video
+  // pause guard's auto-resume note.
+  window.noteLiveDisplayLifecycle = function(displayId, kind, text) {
+    const id = Number(displayId);
+    if (!Number.isFinite(id)) return;
+    addDisplayActivity(id, String(kind || 'neutral'), String(text || ''));
+    scheduleWorkspace();
+  };
+
+  // Safari parks media in hidden tabs and can defer the element's own
+  // pause event until nobody is listening usefully; returning to the tab
+  // (or a bfcache restore) must therefore sweep every live slot. The
+  // per-element pause guard in DisplaySlot covers reparents; this covers
+  // backgrounding.
+  const resumeAllLiveDisplayVideos = () => {
+    for (const slot of displaySlots.values()) {
+      if (typeof slot.resumeLiveVideoIfPaused === 'function') slot.resumeLiveVideoIfPaused();
+    }
+    // Federated peer panes (and the Station HUD thumbnails drawImage-ing
+    // their video elements) have the same WebKit-parking exposure; their
+    // registry lives beside PeerDisplayConnection (52-peer-display.js).
+    for (const conn of peerDisplayConnections.values()) {
+      if (typeof conn.resumeLiveVideoIfPaused === 'function') conn.resumeLiveVideoIfPaused();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeAllLiveDisplayVideos();
+  });
+  window.addEventListener('pageshow', resumeAllLiveDisplayVideos);
+
   function captureSlotActivity(slot) {
     const id = Number(slot.displayId);
     const next = snapshotSlot(slot);
@@ -66304,6 +66772,10 @@ function applyDisplayStripState() {
         userDisplayMode: userDisplayGranted
           ? (userDisplayAgentVisible ? 'agent' : 'private')
           : 'off',
+        // Item F4: pointer moves deliberately dropped by the shared
+        // reliable tunnel's bufferedAmount watermark (the fallback lane
+        // for mm when the per-display pointer channel isn't open).
+        inputTunnelMovesDropped: dashboardControlTunnelPointerMovesDropped,
         slots: Array.from(displaySlots.values()).map(slot => {
           const id = Number(slot.displayId);
           return {
@@ -66311,6 +66783,15 @@ function applyDisplayStripState() {
             selected: id === selectedDisplayId,
             connected: Boolean(slot.connected),
             firstFrameSeen: Boolean(slot._firstFrameSeen),
+            paused: Boolean(slot.videoEl && slot.videoEl.paused),
+            // Freeze-watchdog snapshot (null until the first frame arms
+            // it): { armed, source: 'rvfc'|'stats', stalledMs,
+            // resumeAttempted, overlayShown }.
+            freeze: displayViewerFreezeWatchQa(slot),
+            pointerChannelOpen: Boolean(
+              slot.pointerChannel && slot.pointerChannel.readyState === 'open'),
+            reconnectAttempts: Number(slot._reconnectAttempts) || 0,
+            waitingForSignalTransport: Boolean(slot._transportWaitTimer),
             intrinsicWidth: Number(slot.videoEl && slot.videoEl.videoWidth) || 0,
             intrinsicHeight: Number(slot.videoEl && slot.videoEl.videoHeight) || 0,
             authorityState: slot.authorityState || 'unknown',
@@ -66947,9 +67428,35 @@ class RecordingPlayer {
       this.seekToGlobal(pct * this.totalDuration);
     };
     this._onPlayClick = () => this.togglePlayback();
+    // The element is the source of truth for playing state: browsers
+    // pause media on their own (WebKit parks hidden-tab video; OS media
+    // keys; power saving), and a `playing` flag written only by our
+    // play()/pause() methods desyncs — the rAF label loop keeps running
+    // and the play button shows the wrong glyph. End-of-media is the one
+    // carve-out: the spec fires `pause` immediately before `ended`, and
+    // segment advance (_onSegmentEnd → _loadSegment) relies on `playing`
+    // staying true to auto-resume the next segment — so ended-adjacent
+    // pauses stay owned by _onSegmentEnd (which calls pause() itself on
+    // the last segment). Both handlers are idempotent against the events
+    // our own play()/pause() methods queue.
+    this._onVideoPause = () => {
+      if (this.video.ended) return;
+      if (!this.playing) return;
+      this.playing = false;
+      this.playBtn.textContent = '\u25B6';
+      this._stopAnimLoop();
+    };
+    this._onVideoPlay = () => {
+      if (this.playing) return;
+      this.playing = true;
+      this.playBtn.textContent = '\u23F8';
+      this._startAnimLoop();
+    };
 
     this.video.addEventListener('ended', this._onEnded);
     this.video.addEventListener('timeupdate', this._onTimeUpdate);
+    this.video.addEventListener('pause', this._onVideoPause);
+    this.video.addEventListener('play', this._onVideoPlay);
     this.timelineEl.addEventListener('click', this._onTimelineClick);
     playBtn.addEventListener('click', this._onPlayClick);
   }
@@ -67471,6 +67978,8 @@ class RecordingPlayer {
     // Remove event listeners to prevent stale handlers on the shared video element
     this.video.removeEventListener('ended', this._onEnded);
     this.video.removeEventListener('timeupdate', this._onTimeUpdate);
+    this.video.removeEventListener('pause', this._onVideoPause);
+    this.video.removeEventListener('play', this._onVideoPlay);
     this.timelineEl.removeEventListener('click', this._onTimelineClick);
     this.playBtn.removeEventListener('click', this._onPlayClick);
     // Abort any in-flight MSE loading
@@ -75285,6 +75794,11 @@ window.intendantDashboardControl = {
 };
 
 /* ── static/app/50-control-transport.js ── */
+// Item F4: pointer moves ('mm') deliberately dropped by displayInput's
+// bufferedAmount watermark instead of queueing behind a congested shared
+// tunnel. Page-session counter, surfaced via qa.liveDisplay().
+let dashboardControlTunnelPointerMovesDropped = 0;
+
 class DashboardControlTransport {
   constructor() {
     this.pc = null;
@@ -76048,11 +76562,31 @@ class DashboardControlTransport {
 
   displayInput(displayId, event) {
     if (!this.canUseRpc()) return false;
-    this.sendFrame({
-      t: 'display_input',
-      display_id: Number(displayId) || 0,
-      event,
-    });
+    // This channel is reliable+ordered and shared with every RPC,
+    // upload, and terminal frame. Continuous latest-wins pointer moves
+    // must never queue behind a backlog here — stale moves replayed in
+    // order read as catastrophic remote-control lag. Above the
+    // watermark, dropping the move is the honest choice (the next one
+    // supersedes it); discrete events (kd/ku/md/mu) always send. The
+    // per-display lossy `pointer` datachannel is the preferred mm/sc
+    // lane anyway (DisplaySlot._enterInteractive) — this path is its
+    // fallback.
+    if (event?.t === 'mm' &&
+        this.channel.bufferedAmount > DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES) {
+      dashboardControlTunnelPointerMovesDropped += 1;
+      return true; // handled: deliberately dropped — never reroute a stale move
+    }
+    try {
+      this.sendFrame({
+        t: 'display_input',
+        display_id: Number(displayId) || 0,
+        event,
+      });
+    } catch (_) {
+      // Close race / full SCTP buffer: report unsent so the slot can
+      // fall back to its own data channels.
+      return false;
+    }
     return true;
   }
 
@@ -80003,6 +80537,75 @@ class PeerDisplayConnection {
     displayViewerClearNoTrackWatchdog(this);
   }
 
+  // ── Live-video pause guard + freeze watchdog (peer wiring) ──────────
+  // Shared drivers in 45-display-viewer-core; what is OURS here is the
+  // liveness definition (`pc` alive + `stream` attached — this class's
+  // own idiom: close() nulls both, and every retry replaces the whole
+  // connection object) and the per-pane element churn (the pane <video>
+  // is rebuilt on every daemons-list re-render, so attachToDom re-arms
+  // the guard and re-binds the watchdog's rVFC pump each pass).
+
+  _armVideoPauseGuard(videoEl) {
+    displayViewerArmPauseGuard(
+      this,
+      videoEl,
+      () => Boolean(this.pc && this.stream),
+      // No display-scoped activity feed exists on the peer rail — log to
+      // the scoped console lane rather than inventing one.
+      () => this._log('info', 'video playback auto-resumed after a browser pause'),
+    );
+  }
+
+  // Called by the shared visibilitychange/pageshow sweep in
+  // 45-displays-webrtc.js (Safari parks media in hidden tabs; the HUD
+  // thumbnails drawImage this element and would render a paused frame
+  // indefinitely otherwise).
+  resumeLiveVideoIfPaused() {
+    displayViewerResumeLiveVideoIfPaused(this);
+  }
+
+  // The CURRENT pane video element across every container this host has
+  // (daemons-list panel + Station endpoint) — pane DOM is rebuilt on
+  // every re-render, so this is resolved fresh wherever it's needed.
+  _currentVideoEl() {
+    for (const container of this._containerCandidates()) {
+      const el = container.querySelector('.peer-display-video');
+      if (el) return el;
+    }
+    return null;
+  }
+
+  _armFreezeWatchdog() {
+    displayViewerArmFreezeWatchdog(this, {
+      videoEl: () => this._currentVideoEl(),
+      isLive: () => Boolean(
+        this.pc && this.pc.connectionState === 'connected' && this.stream),
+      tryResume: () => this.resumeLiveVideoIfPaused(),
+      onStalled: (seconds) => {
+        const message = `No new frames for ${seconds}s`;
+        this._log('warn', `${message} while connected — surfacing manual retry`);
+        this.setStatus(message, 'error');
+        // Same overlay plumbing as the no-track verdict: an error state
+        // whose Retry re-runs the full open path (fresh session id).
+        this._setStageOverlay('error',
+          `${message} — the connection is up but the video has stopped advancing.`, true);
+        stationPublishActivityEvent({
+          id: `peer-display-freeze:${this.hostId}:${this.displayId}:${this.sessionId}`,
+          hostId: this.hostId,
+          level: 'warn',
+          source: 'display',
+          msg: `Display ${this.displayId} on ${stationHostLabel(this.hostId)} stopped advancing — no new frames for ${seconds}s`,
+        });
+      },
+      onRecovered: () => {
+        this._setStageOverlay(null);
+        if (this.pc && this.pc.connectionState === 'connected') {
+          this.setStatus('Connected (view-only)', 'connected');
+        }
+      },
+    });
+  }
+
   sessionKey() {
     return `${this.hostId}|${this.displayId}|${this.sessionId}`;
   }
@@ -80095,12 +80698,27 @@ class PeerDisplayConnection {
     }
     container.style.display = 'block';
     const videoEl = container.querySelector('.peer-display-video');
+    // WebKit pause guard (shared driver in 45-display-viewer-core): the
+    // pane <video> is rebuilt on every daemons-list re-render, so every
+    // pass re-arms the guard against the CURRENT element.
+    if (videoEl) this._armVideoPauseGuard(videoEl);
     if (videoEl && this.stream) {
-      videoEl.srcObject = this.stream;
-      // autoplay doesn't re-fire when a stream is (re)attached to an
-      // element living in the offscreen endpoint container; without an
-      // explicit play() the pane sits paused on a black first frame.
+      // Reassigning the SAME stream re-runs the media-load algorithm
+      // (decoder reset + a black flash on WebKit) — and this path runs
+      // after every daemons-list re-render (peer add/remove/state
+      // pushes, display upserts, refreshes). Only assign on real change.
+      if (videoEl.srcObject !== this.stream) {
+        videoEl.srcObject = this.stream;
+      }
+      // KEEP the play() kick unconditionally: autoplay doesn't re-fire
+      // when a stream is (re)attached to an element living in the
+      // offscreen endpoint container (and reparents pause WebKit video);
+      // without an explicit play() the pane sits paused on a black
+      // first frame.
       videoEl.play().catch(() => {});
+      // The freeze watchdog's rVFC pump follows the element across pane
+      // rebuilds (no-op until the watchdog is armed by the first frame).
+      displayViewerFreezeWatchBindPump(this);
     }
     stationRegisterVideoSource(
       `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
@@ -80464,6 +81082,10 @@ class PeerDisplayConnection {
         // See the reapply path above: explicit play() because autoplay
         // doesn't re-fire on (re)attached offscreen elements.
         videoEl.play().catch(() => {});
+        // WebKit pause guard — the pane can predate the stream (built by
+        // attachToDom before ontrack), so arm here too; re-arming the
+        // same element is a no-op.
+        this._armVideoPauseGuard(videoEl);
       }
       // Item 5: track arrived, frames haven't — stage the last step and
       // drop the overlay on the first actually-rendered frame.
@@ -80475,6 +81097,10 @@ class PeerDisplayConnection {
       displayViewerOnFirstFrame(videoEl, () => !this.pc, () => {
         this._firstFrameSeen = true;
         this._setStageOverlay(null);
+        // From here on, "frames stopped advancing" is the failure mode
+        // the no-track watchdog can't see — hand over to the freeze
+        // watchdog for the rest of this connection.
+        this._armFreezeWatchdog();
       });
       if (videoEl) {
         stationRegisterVideoSource(
@@ -81132,6 +81758,7 @@ class PeerDisplayConnection {
 
   async close() {
     this._clearNoTrackWatchdog();
+    displayViewerClearFreezeWatchdog(this);
     // Stop every per-connection timer — no leaked intervals/timeouts
     // across close/retry cycles.
     if (this._retryTimer) {
@@ -81317,6 +81944,36 @@ function reapplyPeerDisplayPanes() {
     conn.attachToDom();
   }
 }
+
+// Stable, side-effect-free QA surface for the federated peer-display
+// path — the peer twin of qa.liveDisplay() (45-displays-webrtc.js), so
+// CDP probes can assert pause/freeze liveness without reaching into the
+// module-scoped registry.
+window.qa = Object.assign(window.qa || {}, {
+  peerDisplays() {
+    return Array.from(peerDisplayConnections.values()).map(conn => {
+      const videoEl = conn._currentVideoEl ? conn._currentVideoEl() : null;
+      return {
+        hostId: conn.hostId,
+        displayId: Number(conn.displayId),
+        sessionId: conn.sessionId,
+        connectionState: conn.pc ? conn.pc.connectionState : 'closed',
+        hasStream: Boolean(conn.stream),
+        firstFrameSeen: Boolean(conn._firstFrameSeen),
+        paused: Boolean(videoEl && videoEl.paused),
+        tileMode: Boolean(conn.tileCompositor),
+        // Freeze-watchdog snapshot (null until the first frame arms it):
+        // { armed, source: 'rvfc'|'stats', stalledMs, resumeAttempted,
+        // overlayShown }.
+        freeze: displayViewerFreezeWatchQa(conn),
+        overlay: conn._overlay
+          ? { mode: conn._overlay.mode, text: conn._overlay.text }
+          : null,
+        authority: conn.peerAuthorityState,
+      };
+    });
+  },
+});
 
 class PeerFileTransferConnection {
   constructor(hostId, sessionId) {

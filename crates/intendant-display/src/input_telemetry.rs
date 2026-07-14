@@ -51,6 +51,34 @@ pub(crate) fn record_authority_drop(kind: &'static str) {
     telemetry.maybe_report();
 }
 
+pub(crate) fn record_queue_coalesced() {
+    let Some(telemetry) = telemetry() else {
+        return;
+    };
+    telemetry.queue_coalesced.fetch_add(1, Ordering::Relaxed);
+    telemetry.maybe_report();
+}
+
+pub(crate) fn record_queue_dropped_continuous() {
+    let Some(telemetry) = telemetry() else {
+        return;
+    };
+    telemetry
+        .queue_dropped_continuous
+        .fetch_add(1, Ordering::Relaxed);
+    telemetry.maybe_report();
+}
+
+pub(crate) fn record_queue_dropped_discrete() {
+    let Some(telemetry) = telemetry() else {
+        return;
+    };
+    telemetry
+        .queue_dropped_discrete
+        .fetch_add(1, Ordering::Relaxed);
+    telemetry.maybe_report();
+}
+
 pub(crate) fn record_inject_started(kind: &'static str) {
     let Some(telemetry) = telemetry() else {
         return;
@@ -124,6 +152,9 @@ struct InputTelemetry {
     dc_unknown_events: AtomicU64,
     dc_parse_errors: AtomicU64,
     authority_drops: AtomicU64,
+    queue_coalesced: AtomicU64,
+    queue_dropped_continuous: AtomicU64,
+    queue_dropped_discrete: AtomicU64,
     inject_started: AtomicU64,
     inject_ok: AtomicU64,
     inject_err: AtomicU64,
@@ -151,6 +182,9 @@ impl InputTelemetry {
             dc_unknown_events: AtomicU64::new(0),
             dc_parse_errors: AtomicU64::new(0),
             authority_drops: AtomicU64::new(0),
+            queue_coalesced: AtomicU64::new(0),
+            queue_dropped_continuous: AtomicU64::new(0),
+            queue_dropped_discrete: AtomicU64::new(0),
             inject_started: AtomicU64::new(0),
             inject_ok: AtomicU64::new(0),
             inject_err: AtomicU64::new(0),
@@ -196,7 +230,8 @@ impl InputTelemetry {
 
         eprintln!(
             "[display/input-telemetry] dc=control:{}/{}B pointer:{}/{}B unknown:{} parse_err:{} \
-             auth_drop:{} inject=start:{} ok:{} err:{} avg_us:{} max_us:{} \
+             auth_drop:{} queue=coalesced:{} drop_cont:{} drop_disc:{} \
+             inject=start:{} ok:{} err:{} avg_us:{} max_us:{} \
              events=kd:{} ku:{} md:{} mu:{} mm:{} sc:{} \
              macos_post=n:{} avg_us:{} max_us:{}",
             snapshot.dc_control_events,
@@ -206,6 +241,9 @@ impl InputTelemetry {
             snapshot.dc_unknown_events,
             snapshot.dc_parse_errors,
             snapshot.authority_drops,
+            snapshot.queue_coalesced,
+            snapshot.queue_dropped_continuous,
+            snapshot.queue_dropped_discrete,
             snapshot.inject_started,
             snapshot.inject_ok,
             snapshot.inject_err,
@@ -235,6 +273,9 @@ impl InputTelemetry {
             dc_unknown_events: take(&self.dc_unknown_events),
             dc_parse_errors: take(&self.dc_parse_errors),
             authority_drops: take(&self.authority_drops),
+            queue_coalesced: take(&self.queue_coalesced),
+            queue_dropped_continuous: take(&self.queue_dropped_continuous),
+            queue_dropped_discrete: take(&self.queue_dropped_discrete),
             inject_started: take(&self.inject_started),
             inject_ok: take(&self.inject_ok),
             inject_err: take(&self.inject_err),
@@ -261,6 +302,9 @@ struct InputTelemetrySnapshot {
     dc_unknown_events: u64,
     dc_parse_errors: u64,
     authority_drops: u64,
+    queue_coalesced: u64,
+    queue_dropped_continuous: u64,
+    queue_dropped_discrete: u64,
     inject_started: u64,
     inject_ok: u64,
     inject_err: u64,
@@ -284,6 +328,9 @@ impl InputTelemetrySnapshot {
             + self.dc_unknown_events
             + self.dc_parse_errors
             + self.authority_drops
+            + self.queue_coalesced
+            + self.queue_dropped_continuous
+            + self.queue_dropped_discrete
             + self.inject_started
             + self.inject_ok
             + self.inject_err
