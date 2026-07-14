@@ -760,7 +760,7 @@ fn start_fission_lifecycle(
     bus: &EventBus,
     session_log: &SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
-    let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
+    let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus);
     match fission_lifecycle::rehydrate_from_logs(&platform::intendant_home().join("logs")) {
         Ok(0) => {}
         Ok(count) => slog(session_log, |l| {
