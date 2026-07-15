@@ -178,6 +178,14 @@ struct CcShared {
     /// notices are written mid-turn (absorbed by the running turn) instead
     /// of being queued as a prelude for the next message.
     turn_active: AtomicBool,
+    /// The permission mode Intendant asked the CLI to run — set at spawn
+    /// alongside `--permission-mode`, updated by a live
+    /// `set_permission_mode` switch — so the reader can reconcile the
+    /// `system:init` echo against it.
+    requested_permission_mode: StdMutex<String>,
+    /// The effective mode the CLI last echoed in `system:init`. `None`
+    /// until the first init.
+    effective_permission_mode: StdMutex<Option<String>>,
 }
 
 impl CcShared {
@@ -189,6 +197,8 @@ impl CcShared {
             goal: StdMutex::new(GoalEngine::default()),
             cumulative_fresh_tokens: AtomicU64::new(0),
             turn_active: AtomicBool::new(false),
+            requested_permission_mode: StdMutex::new("default".to_string()),
+            effective_permission_mode: StdMutex::new(None),
         }
     }
 
@@ -224,6 +234,40 @@ impl CcShared {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = Some(id.to_string());
+    }
+
+    fn requested_permission_mode(&self) -> String {
+        match self.requested_permission_mode.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_requested_permission_mode(&self, mode: &str) {
+        let mut guard = match self.requested_permission_mode.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = mode.to_string();
+    }
+
+    /// The permission mode the CLI last reported running. Stored for
+    /// future consumers (nothing outside the reader's divergence warning
+    /// and its tests reads it yet).
+    #[allow(dead_code)]
+    fn effective_permission_mode(&self) -> Option<String> {
+        match self.effective_permission_mode.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_effective_permission_mode(&self, mode: &str) {
+        let mut guard = match self.effective_permission_mode.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(mode.to_string());
     }
 }
 
@@ -497,16 +541,16 @@ fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str)
 }
 
 /// Map Intendant's configured permission mode onto Claude Code's CLI
-/// values. `None` means "don't pass `--permission-mode`" (the CLI default).
-/// Canonicalization lives in [`crate::project::normalize_claude_permission_mode`]
-/// so the settings surfaces and this adapter agree on the vocabulary.
-fn normalize_permission_mode(mode: &str) -> Option<String> {
-    let canonical = crate::project::normalize_claude_permission_mode(mode);
-    if canonical == "default" {
-        None
-    } else {
-        Some(canonical)
-    }
+/// values. Always yields a flag value — `default` included: when
+/// `--permission-mode` is omitted the CLI resolves its default from the
+/// user's own settings (`~/.claude/settings.json` `permissions.defaultMode`),
+/// so the process can silently run a different mode than the one Intendant
+/// recorded in the session's launch config. Canonicalization lives in
+/// [`crate::project::normalize_claude_permission_mode`] (unknown values pass
+/// through trimmed, deliberately — future CLI modes stay usable) so the
+/// settings surfaces and this adapter agree on the vocabulary.
+fn normalize_permission_mode(mode: &str) -> String {
+    crate::project::normalize_claude_permission_mode(mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +816,11 @@ struct CcReader {
     last_call_usage: Option<serde_json::Value>,
     last_intendant_mcp_status: Option<String>,
     init_logged: bool,
+    /// The echoed effective permission mode a divergence warning was
+    /// already emitted for. `system:init` re-fires after every user
+    /// message, so the warning fires once per distinct echoed value, not
+    /// per init.
+    permission_mode_warned: Option<String>,
     announced_session_id: Option<String>,
 }
 
@@ -798,6 +847,7 @@ impl CcReader {
             last_call_usage: None,
             last_intendant_mcp_status: None,
             init_logged: false,
+            permission_mode_warned: None,
             announced_session_id: None,
         }
     }
@@ -1113,6 +1163,23 @@ impl CcReader {
                     self.model, permission_mode, tool_count
                 ),
             );
+        }
+        // Reconcile the CLI's echoed effective mode against the mode
+        // Intendant requested (spawn `--permission-mode`, or a live
+        // `set_permission_mode`): a divergence means the process runs under
+        // authority the recorded session config doesn't name.
+        if let Some(echoed) = msg.get("permissionMode").and_then(|m| m.as_str()) {
+            self.shared.set_effective_permission_mode(echoed);
+            let requested = self.shared.requested_permission_mode();
+            if echoed != requested && self.permission_mode_warned.as_deref() != Some(echoed) {
+                self.permission_mode_warned = Some(echoed.to_string());
+                out.log(
+                    "warn",
+                    format!(
+                        "Claude Code permission mode diverged: requested {requested}, running {echoed}"
+                    ),
+                );
+            }
         }
         if self.expect_intendant_mcp {
             self.report_intendant_mcp_status(msg, out);
@@ -2230,6 +2297,9 @@ impl ClaudeCodeAgent {
         )
         .await?;
         self.permission_mode = mode.clone();
+        // Keep the reader's reconciliation baseline current, so the next
+        // init echo is compared against the live mode, not the spawn mode.
+        self.shared.set_requested_permission_mode(&mode);
         Ok(format!(
             "permission mode switched to {mode} for the running session"
         ))
@@ -2320,10 +2390,14 @@ impl ExternalAgent for ClaudeCodeAgent {
             }
         }
 
-        if let Some(mode) = normalize_permission_mode(&self.permission_mode) {
-            args.push("--permission-mode".into());
-            args.push(mode);
-        }
+        // Always passed explicitly, so the effective mode can never be
+        // silently substituted by the user's own settings default (see
+        // `normalize_permission_mode`). The reader reconciles the CLI's
+        // `system:init` echo against this requested value.
+        let permission_mode = normalize_permission_mode(&self.permission_mode);
+        self.shared.set_requested_permission_mode(&permission_mode);
+        args.push("--permission-mode".into());
+        args.push(permission_mode);
 
         if let Some(ref effort) = self.effort {
             args.push("--effort".into());
@@ -3028,36 +3102,80 @@ mod tests {
     fn permission_mode_normalization() {
         // "auto" is a documented CLI mode since 2.1.x (classifier-based
         // approvals; accepted on 2.1.206) — it passes through. "manual" is
-        // the CLI's alias for default, so like default the flag is omitted.
-        assert_eq!(normalize_permission_mode("auto").as_deref(), Some("auto"));
+        // the CLI's alias for default. Every mode — "default" included —
+        // yields a flag value: omitting --permission-mode would let the
+        // CLI resolve the mode from the user's own settings
+        // (permissions.defaultMode), diverging from the recorded config.
+        assert_eq!(normalize_permission_mode("auto"), "auto");
+        assert_eq!(normalize_permission_mode("dontAsk"), "dontAsk");
+        assert_eq!(normalize_permission_mode("dont-ask"), "dontAsk");
+        assert_eq!(normalize_permission_mode("manual"), "default");
+        assert_eq!(normalize_permission_mode("default"), "default");
+        assert_eq!(normalize_permission_mode(""), "default");
+        assert_eq!(normalize_permission_mode("acceptEdits"), "acceptEdits");
+        assert_eq!(normalize_permission_mode("acceptedits"), "acceptEdits");
         assert_eq!(
-            normalize_permission_mode("dontAsk").as_deref(),
-            Some("dontAsk")
+            normalize_permission_mode("bypassPermissions"),
+            "bypassPermissions"
         );
-        assert_eq!(
-            normalize_permission_mode("dont-ask").as_deref(),
-            Some("dontAsk")
-        );
-        assert_eq!(normalize_permission_mode("manual"), None);
-        assert_eq!(normalize_permission_mode("default"), None);
-        assert_eq!(normalize_permission_mode(""), None);
-        assert_eq!(
-            normalize_permission_mode("acceptEdits").as_deref(),
-            Some("acceptEdits")
-        );
-        assert_eq!(
-            normalize_permission_mode("acceptedits").as_deref(),
-            Some("acceptEdits")
-        );
-        assert_eq!(
-            normalize_permission_mode("bypassPermissions").as_deref(),
-            Some("bypassPermissions")
-        );
-        assert_eq!(normalize_permission_mode("plan").as_deref(), Some("plan"));
+        assert_eq!(normalize_permission_mode("plan"), "plan");
         // Forward-compat: unknown modes pass through untouched.
+        assert_eq!(normalize_permission_mode("futureMode"), "futureMode");
+    }
+
+    #[test]
+    fn reader_warns_once_per_echoed_value_on_permission_mode_divergence() {
+        let mut reader = test_reader();
+        reader.shared.set_requested_permission_mode("default");
+        let diverged = r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"auto","session_id":"s1"}"#;
+        let out = reader.process_line(diverged);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message }
+                if level == "warn"
+                    && message.contains("requested default")
+                    && message.contains("running auto")
+        )));
         assert_eq!(
-            normalize_permission_mode("futureMode").as_deref(),
-            Some("futureMode")
+            reader.shared.effective_permission_mode().as_deref(),
+            Some("auto")
+        );
+
+        // Init re-fires after every user message; the same echo stays quiet.
+        let out = reader.process_line(diverged);
+        assert!(!out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.contains("permission mode diverged")
+        )));
+
+        // A different echoed value is a new divergence and warns again.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"plan","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("running plan")
+        )));
+        assert_eq!(
+            reader.shared.effective_permission_mode().as_deref(),
+            Some("plan")
+        );
+    }
+
+    #[test]
+    fn reader_stays_quiet_when_effective_permission_mode_matches() {
+        let mut reader = test_reader();
+        reader.shared.set_requested_permission_mode("acceptEdits");
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"acceptEdits","session_id":"s1"}"#,
+        );
+        assert!(!out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, .. } if level == "warn"
+        )));
+        assert_eq!(
+            reader.shared.effective_permission_mode().as_deref(),
+            Some("acceptEdits")
         );
     }
 
