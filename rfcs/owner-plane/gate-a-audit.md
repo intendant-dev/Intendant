@@ -1,26 +1,34 @@
 # D0-A Gate-A Discrepancy Audit — amended after the repair tranche
 
-**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15 (predicate complete)
+**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
 **Spec:** `owner-plane-d0a-spec.md` v0.5.20, SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef` (the ratification amendments; v0.5.19 = `410880e0…`, archived byte-exact)
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `a3d6f779d30492978d6871b97d42037143f4a95c97256aaa92bf5aaa8be0f319` (amendments #1–#4; #3 = the phrase-derive negative arm, #4 = the erase-crash `rotation_ops` control context)
-**Corpus:** 157 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×26, f08×4, f09×11, f10×7, f11×30, f12×15, f13×16, f14×4)
+**Corpus:** 157 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×27, f08×4, f09×11, f10×7, f11×29, f12×15, f13×16, f14×4 — the earlier histogram miscounted f07/f11 by one each; review R8.4)
 **Suites at this amendment:** core 140/140 · reducer 35/35 · the strict harness 157/157 with a nonzero-exit gate · the portable-storage lane 19/19 on real files · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate) · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage map)
 
-> **VERDICT: PREDICATE SATISFIED — awaiting the owner's Gate-A
-> stamp (§16).** Gate A is **not** hereby stamped; this document
-> issues no PASS. The 2026-07-14 FAIL rested on two unratified scope
-> reductions (never-executed browser and per-OS storage lanes
-> treated as annotation-satisfiable; the §13.3/§10.4 coverage debt
-> untracked) and four artifact defects the repair tranche closed (a
-> gate that could not go red, vacuous convergence orders, an
-> erase-lane oracle that read the answer from the stream under
-> replay, and a journal reopen trace whose cited invalidation could
-> not kill its basis). Since then: the owner's rulings landed
-> (D-201..D-203), the C.1 mechanisms and coverage machinery
-> executed, and BOTH execution lanes delivered with green CI —
-> as of 2026-07-15 every clause of the §5 predicate holds. The
-> freeze-time prose ratifications and the stamp are the owner's.
+> **VERDICT: FAIL.** Gate A is **not** stamped. The interim
+> 2026-07-15 amendment claimed the twelve-clause predicate
+> satisfied; the reconciled verification review
+> (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`)
+> refuted that claim with executable evidence, and this audit's own
+> reproduction confirms its central findings: the reducer is NOT
+> order-convergent (legal unlisted delivery orders drive six
+> committed vectors to different durable final states — reproduced
+> here 3/3 sampled before this re-amendment), the control pipeline
+> places placement before body validation against D-99's express
+> resolution (the reducer comment cites D-99 for its opposite), a
+> signature-invalid recovery operation verifies a Journal reopen
+> kill, audit-partition "exactness" is compared against the
+> vector's own answer sheet, both execution lanes' required-run
+> sets derive from mutable self-annotations, the storage lane never
+> executes the §13.2-named flush/replacement primitives, and
+> D-202's ruled lifecycle is recorded but not executable. The
+> committed 157-vector corpus remains green on both implementations
+> — the failures are properties BEYOND the listed corpus, which is
+> exactly what the three-run standard could not see. §5 restates
+> the predicate with the reconciled adjudication; the repair
+> tranche (review §"Bounded repair tranche") is in progress.
 
 ## 0. Scope and method
 
@@ -351,13 +359,21 @@ every §C.2 row is the binding fail-closed contract — two of them
 
 ## 5. Gate-A verdict
 
-**PREDICATE SATISFIED — the verdict is the owner's to stamp
-(§16).** Gate A is NOT hereby stamped: under this audit's
-conventions a PASS is a fresh audit judgment plus the owner's
-stamp, and this document issues neither. What it records is that
-as of 2026-07-15 every clause of the amended predicate holds — the
-prior FAIL's sole stated basis (the funded Chromium browser lane
-and its first green CI run) was resolved by the lane's delivery.
+**FAIL.** Gate A is not stamped, and this document must not be
+read as a conditional pass. The 2026-07-15 interim claim that the
+predicate was satisfied is withdrawn: it verified the clauses as
+worded against the listed corpus, and the reconciled verification
+review demonstrated that several clauses fail IN SUBSTANCE on
+evidence the listed corpus cannot express (unlisted legal orders,
+forged evidence, self-referential oracles, shrinkable lane
+manifests). The reconciled per-clause adjudication (review
+§"Clause-by-clause adjudication", accepted by this audit):
+clauses 2, 6, 8, and 10 FAIL; clause 7 is partially executed
+(D-202's lifecycle is not executable); clause 1 is narrowly
+verified with hardening required (empty-corpus vacuous green,
+non-permutation deliveries accepted); clause 4's narrow pair holds
+while the governing D-99 pipeline is nonconformant — and that
+pipeline violation blocks independently of the clause wording.
 The amended predicate — every clause must hold before a future
 audit may say PASS:
 
@@ -411,15 +427,27 @@ audit may say PASS:
     recorded** (spec v0.5.20, D-201..D-203; the wire gap is shelved
     for v1 with the reducer's honest Unimplemented standing).
 
-All twelve clauses hold. The 2026-07-14 FAIL rested solely on
-clause 10's Chromium leg; that lane was delivered 2026-07-15
-(WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate,
-negative controls red, 56/56 green locally and on CI at
-`94848163`). No owner decision is outstanding; no other artifact
-work is known to be required. The auditor's finding of record:
-the predicate is satisfied and the Gate-A decision now rests with
-the owner — the freeze-time prose ratifications (§3 conventions)
-and the §16 stamp are the owner's acts, not this document's.
+The execution lanes DID deliver (the browser lane 56/56 with the
+f13 IndexedDB/Web-Locks substrate; the storage lane 19/19 on real
+files, 3-OS) and that work stands — but delivery of the lanes did
+not make the predicate hold. Open at this re-amendment, per the
+reconciled review's findings R1–R8: (R1) six committed vectors
+reach different durable states under legal unlisted orders — the
+fold engine needs set-derived/canonical pending resolution, not
+eight more fixture orders; (R2) the D-99 control pipeline order
+(body before placement; request-ID consumption transition-last);
+(R3) authenticated/admitted invalidation facts for Journal reopen
+kills; (R4) independent released-result inputs for audit-partition
+exactness; (R5) pinned lane manifests immune to annotation drift;
+(R6) real flush + atomic-replacement execution in the storage lane
+(owner: build, 2026-07-15); (R7) the D-202 receipt-arrival
+lifecycle made executable (owner: build, 2026-07-15); (R8) gate
+hygiene (empty corpus, permutation validation, convergence output)
+and the documentation corrections. The review's twelve acceptance
+criteria (§"Acceptance criteria for the next review") bind the
+next amendment; the owner directed the repair tranche 2026-07-15.
+No prose/protocol reopening is required — the repairs conform the
+implementation to already-ratified semantics.
 
 Nothing in this verdict stamps the spec, opens P1, or amends the
 Gate-A predicate silently; P1 writes stay barred until Gate B and

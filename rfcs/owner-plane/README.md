@@ -18,7 +18,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
 | `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, an independent BIP-39 leg, B.2/B.3 transcription). `cargo run --bin harness` is a real gate: nonzero exit on any structural failure, semantic FAIL, or Unimplemented. The full 157-vector corpus is reproduced; `--bin storage_lane` executes the storage-annotated subset on real files (the delivered per-OS lane) |
 | `browser-lane/` | The **browser execution lane** (delivered): the schema-less reducer + a WebCrypto backend compiled to wasm; `driver.cjs` runs every browser-annotated vector in headless Chromium over raw CDP — semantics via `crypto.subtle`, the family-13 substrate over real IndexedDB transactions + Web Locks — and exits nonzero unless all green |
-| `gate-a-audit.md` | **The Gate-A discrepancy audit, amended after the repair tranche** (2026-07-14): the differential scoreboard incl. the tranche's findings (a real D-185 engine gap among them), the twelve D-items with per-item status, the conventions, the machine-enforced coverage pointers — and the verdict: **predicate satisfied, awaiting the owner's Gate-A stamp** (amended 2026-07-15 when the browser lane delivered; this document never self-stamps a PASS) |
+| `gate-a-audit.md` | **The Gate-A discrepancy audit, amended after the repair tranche** (2026-07-14): the differential scoreboard incl. the tranche's findings (a real D-185 engine gap among them), the twelve D-items with per-item status, the conventions, the machine-enforced coverage pointers — and the **FAIL verdict** (re-amended 2026-07-15 on the reconciled verification review; the interim predicate-satisfied claim is withdrawn) |
 | `coverage/` | The **machine-enforced coverage inventory**: `outcomes-map.json` (generated §10.4 outcome → vector map; 22/59 uncovered, pinned shrink-only) and `obligations-13-3.json` (the §13.3 obligation ledger — verbatim quote pins + full line coverage of the section; 14 vectored / 25 partial / 43 pending) |
 | `decisions-pending.md` | The **D2/D5 decision record — both RULED 2026-07-14** (D-201 no-class/no-vote; D-202 sticky + re-proposal): the alternatives, authority consequences, and the drafts the rulings chose from, now minted |
 | `p1-v1-profile.md` | The **P1 v1 profile — RATIFIED as drafted (D-203)**: five implement-before-Gate-A mechanisms; every other unimplemented normative mechanism fail-closed with a named outcome |
@@ -63,11 +63,17 @@ review record, and the byte-exact baseline outranks path cosmetics.
 - **The Chromium browser lane is DELIVERED (2026-07-15)** — every
   browser-annotated vector executes in headless Chromium (WebCrypto
   semantics; the family-13 IndexedDB Txn + Web Locks substrate),
-  green locally and on CI with negative controls verified red. With
-  it the audit's twelve-clause predicate is fully satisfied: **no
-  open artifact item remains, and the Gate-A decision rests with
-  the owner** (the freeze-time prose ratifications + the §16 stamp).
-  No owner decision besides the gate itself is outstanding.
+  green locally and on CI with negative controls verified red.
+- **The 2026-07-15 reconciled verification review returned FAIL**
+  (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`):
+  the reducer is not order-convergent on legal unlisted delivery
+  orders, the D-99 control pipeline order is violated, Journal
+  reopen kills accept unauthenticated evidence, audit-partition
+  exactness self-references, lane manifests are shrinkable, the
+  storage lane omits flush/replacement, and D-202's lifecycle is
+  unexecuted. The interim "predicate satisfied" audit claim is
+  withdrawn; the **bounded repair tranche is in progress** (owner
+  directive 2026-07-15, both optional items funded).
 - **Durable P1 Memory writes stay prohibited** until Gate B plus the
   umbrella's P0.5/tombed-cutover prerequisites (spec header) —
   independent of Gate A.
