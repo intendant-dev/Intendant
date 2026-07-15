@@ -280,7 +280,11 @@ class DashboardControlTransport {
         return;
       }
       if (dashboardServerMessageDispatcher) {
-        dashboardServerMessageDispatcher(JSON.stringify(msg));
+        // Pass the already-parsed frame: the dispatcher and the WASM
+        // handoff accept objects (the tunnel event path below has always
+        // passed payload objects) — re-stringifying here forced a
+        // parse → stringify → parse round trip per PTY output frame.
+        dashboardServerMessageDispatcher(msg);
       }
       return;
     }
@@ -413,7 +417,9 @@ class DashboardControlTransport {
     if (!completed && this.chunkedResponses.has(chunkKey)) {
       this.sendChunkCredit(id, 1, chunkKey === id ? null : chunkKey);
     }
-    dashboardUpdateTransportStatus();
+    // Per-chunk progress: coalesced tick. Completion/rejection inside
+    // maybeCompleteChunkedResponse already rendered immediately.
+    dashboardScheduleTransportStatusUpdate();
   }
 
   handleResponseEnd(msg) {
@@ -544,7 +550,8 @@ class DashboardControlTransport {
     if (!completed && this.byteStreams.has(streamId)) {
       this.sendChunkCredit(id, 1, streamId === id ? null : streamId);
     }
-    dashboardUpdateTransportStatus();
+    // Per-chunk progress: coalesced tick (transitions render immediately).
+    dashboardScheduleTransportStatusUpdate();
   }
 
   handleByteStreamEnd(msg) {
@@ -1605,11 +1612,14 @@ function dashboardControlBase64ToBytes(value) {
 }
 
 function dashboardControlBytesToBase64(bytes) {
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i += 1) {
-    binary += String.fromCharCode(bytes[i]);
+  // Batch via fromCharCode.apply over bounded slices: the per-byte string
+  // concatenation this replaces built ~16k intermediate strings per upload
+  // chunk. 0x8000 stays comfortably under engine argument-count limits.
+  const chunks = [];
+  for (let i = 0; i < bytes.byteLength; i += 0x8000) {
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(''));
 }
 
 function dashboardControlRequestTimeoutMs(method) {
@@ -2764,6 +2774,23 @@ async function fetchRemoteAgentCard(baseUrl) {
   return card;
 }
 
+// Last-rendered snapshot guards: peer status flips (idle↔working) arrive per
+// remote task activity and used to rebuild the whole daemons list — plus a
+// seven-surface cascade (host filter sweep over up to 10k log entries, three
+// select rebuilds) — even when nothing rendered had changed. The row HTML is
+// its own signature for the list; the pickers' inputs (id/label/connected)
+// get a dedicated one so a mid-row change (e.g. version skew) doesn't churn
+// the selects.
+let daemonsListHostOptionsSig = null;
+
+function daemonsListHostOptionsSignature() {
+  return JSON.stringify([
+    selfPeerId,
+    selfHostLabel,
+    ...daemons.map(d => [d.host_id, d.label || '', d.connected !== false]),
+  ]);
+}
+
 function renderDaemonsList() {
   const el = document.getElementById('daemons-list');
   if (!el) return;
@@ -2782,7 +2809,16 @@ function renderDaemonsList() {
   for (const d of daemons) {
     rows.push(renderDaemonRow(d, false));
   }
-  el.innerHTML = rows.join('');
+  const html = rows.join('');
+  if (el.__intendantRenderedHtml === html) {
+    // Identical rendered list: the existing DOM (with its listeners,
+    // expansion state, approvals section, and attached display panes)
+    // stays — skip straight to the cheap always-on consumers below.
+    renderDaemonsListTail();
+    return;
+  }
+  el.__intendantRenderedHtml = html;
+  el.innerHTML = html;
 
   // Wire remove buttons.
   el.querySelectorAll('.daemon-row .remove-btn').forEach(btn => {
@@ -2862,8 +2898,19 @@ function renderDaemonsList() {
   // attached to the freshly-rendered <video> elements after re-render.
   reapplyPeerDisplayPanes();
 
+  renderDaemonsListTail();
+}
+
+// The always-on consumers of a daemons-list render — run on every call,
+// whether or not the row DOM was rebuilt. The four host pickers rebuild
+// only when their actual inputs changed (see daemonsListHostOptionsSig):
+// refreshHostFilterOptions ends in applyHostFilter, a class-toggle sweep
+// over every retained log entry, and each picker resets its <select>.
+function renderDaemonsListTail() {
   // Keep the Station header's peer-display chips in sync with the same
-  // peer add/remove/state events that re-render this list.
+  // peer add/remove/state events that re-render this list. Cheap
+  // (replaceChildren over a handful of peers) and display lists aren't
+  // fully encoded in the row HTML, so this stays unconditional.
   stationRenderPeerChips();
 
   // Toggle host-badge visibility in the Activity tab. Single-host
@@ -2873,18 +2920,23 @@ function renderDaemonsList() {
     logStream.classList.toggle('show-host-badges', daemons.length > 0);
   }
 
-  // Keep the Activity host filter dropdown in sync with the current
-  // daemon list (options may have been added/removed).
-  refreshHostFilterOptions();
+  const optionsSig = daemonsListHostOptionsSignature();
+  if (daemonsListHostOptionsSig !== optionsSig) {
+    daemonsListHostOptionsSig = optionsSig;
 
-  // Same for the Stats tab host picker.
-  refreshStatsHostPicker();
+    // Keep the Activity host filter dropdown in sync with the current
+    // daemon list (options may have been added/removed).
+    refreshHostFilterOptions();
 
-  // Same for the Files tab download source selector.
-  refreshFilesDownloadHostOptions();
+    // Same for the Stats tab host picker.
+    refreshStatsHostPicker();
 
-  // Same for the Terminal Shell target selector.
-  refreshShellHostOptions();
+    // Same for the Files tab download source selector.
+    refreshFilesDownloadHostOptions();
+
+    // Same for the Terminal Shell target selector.
+    refreshShellHostOptions();
+  }
 
   // Target summaries reuse the same daemon list and should track
   // add/remove/offline transitions immediately.

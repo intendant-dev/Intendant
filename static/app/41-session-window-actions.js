@@ -420,6 +420,27 @@ function ensureSessionWindow(sessionId, meta = {}) {
   return win;
 }
 
+// Applies a phase change to the window chrome: status chip repaint plus the
+// approval-confirm hook. Shared by the wide render below and the phase-only
+// fast path — the hook (maybeConfirmApprovalSendFromWindowPhase) must fire
+// on EVERY phase application, both paths.
+function applySessionWindowPhase(win, sid, phase) {
+  const nextPhase = normalizeSessionPhase(phase);
+  // A real phase transition is fresh evidence about the session; it
+  // retires the "optimistic thinking expired" steer demotion below.
+  if (win.phase !== nextPhase) win.optimisticActiveExpired = false;
+  win.phase = nextPhase;
+  if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
+    win.pendingActiveUntil = 0;
+  }
+  win.status.textContent = sessionPhaseLabel(win.phase);
+  win.status.title = sessionPhaseLabel(win.phase);
+  win.status.className = 'session-window-status';
+  const cls = sessionPhaseClass(win.phase);
+  if (cls) win.status.classList.add(cls);
+  maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+}
+
 function updateSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -428,12 +449,31 @@ function updateSessionWindow(sessionId, meta = {}) {
   const merged = mergeSessionWindowMetadata(sid, meta);
   meta = merged.meta;
   updateSessionWindowRelationshipStyle(sid);
-  const signature = sessionWindowMetadataSignature(meta);
+  const signature = merged.signature;
   if (win.metadataSignature === signature) {
-    persistSessionWindowState();
+    // Nothing rendered from — nothing persisted from. The unconditional
+    // persist here was a synchronous localStorage write per rendered log
+    // line (this early-out is the steady-state exit of the per-line
+    // phase-inference path).
     return;
   }
+  // Phase-only fast path: streaming log lines alternate thinking↔running
+  // several times per turn (inferSessionPhaseFromLog), and phase rides the
+  // metadata signature — so each alternation used to defeat the early-out
+  // and re-run the full header render (identity DOM rebuild, path
+  // elements, goal/tier/vitals, relationship badges, menu visibility).
+  // When the signatures differ ONLY in phase, repaint the status chip and
+  // fire the approval-confirm hook — the only phase consumers here.
+  const signatureNoPhase = sessionWindowMetadataSignature({ ...meta, phase: '' });
+  const phaseOnly = Boolean(win.metadataSignature) &&
+    win.metadataSignatureNoPhase === signatureNoPhase;
   win.metadataSignature = signature;
+  win.metadataSignatureNoPhase = signatureNoPhase;
+  if (phaseOnly) {
+    if (meta.phase) applySessionWindowPhase(win, sid, meta.phase);
+    schedulePersistSessionWindowState();
+    return;
+  }
   renderSessionIdentity(win.id, sid, { order: 'id-name' });
   if (meta.projectRoot) {
     setSessionWindowPathElement(
@@ -491,25 +531,14 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (win.ended) win.pendingActiveUntil = 0;
   }
   if (meta.phase) {
-    const nextPhase = normalizeSessionPhase(meta.phase);
-    // A real phase transition is fresh evidence about the session; it
-    // retires the "optimistic thinking expired" steer demotion below.
-    if (win.phase !== nextPhase) win.optimisticActiveExpired = false;
-    win.phase = nextPhase;
-    if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
-      win.pendingActiveUntil = 0;
-    }
-    win.status.textContent = sessionPhaseLabel(win.phase);
-    win.status.title = sessionPhaseLabel(win.phase);
-    win.status.className = 'session-window-status';
-    const cls = sessionPhaseClass(win.phase);
-    if (cls) win.status.classList.add(cls);
-    maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+    applySessionWindowPhase(win, sid, meta.phase);
   }
-  renderSessionWindowGoal(win, meta.goal || null);
+  // Arm-only: this window's goal was just rendered; the 1 s ticker owns
+  // elapsed-time repaints for the rest (re-rendering EVERY window's goal
+  // per metadata update was the waste).
+  ensureSessionGoalTickerArmed(renderSessionWindowGoal(win, meta.goal || null));
   renderSessionWindowTier(win);
   renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
-  refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateControlFastButtonState();
   updateSessionRelationshipBadges(sid);
@@ -521,7 +550,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (win.log && win.log.firstElementChild?.classList?.contains('session-window-empty')) {
     renderSessionWindowLogPlaceholder(win);
   }
-  persistSessionWindowState();
+  schedulePersistSessionWindowState();
 }
 
 // Worktree badge next to the project path: branch name up front, the full
@@ -1498,6 +1527,23 @@ function createLogScaffold(c, extraClass) {
   return { entry, hostId };
 }
 
+// rAF-coalesced follow for the MAIN stream (finding: interleaved layout
+// read/write per appended entry). Reading scrollHeight right after each
+// append forces a synchronous layout of the 10k-node scroller — N entries
+// in one frame cost N layout passes. One scrollTop write per frame, with
+// the follow flags re-checked at flush so a user grab mid-burst wins.
+let mainLogScrollScheduled = false;
+function scheduleMainLogScrollToBottom() {
+  if (mainLogScrollScheduled) return;
+  mainLogScrollScheduled = true;
+  requestAnimationFrame(() => {
+    mainLogScrollScheduled = false;
+    if (concurrentLogDetachedFragment || !autoScroll) return;
+    const stream = document.getElementById('log-stream');
+    if (stream) stream.scrollTop = stream.scrollHeight;
+  });
+}
+
 function appendLogEntryElement(entry, sessionRecord = null) {
   if (logReplayAppendBatch && !entry.classList.contains('command-output-group')) {
     logReplayAppendBatch.mainFragment.appendChild(entry);
@@ -1526,7 +1572,7 @@ function appendLogEntryElement(entry, sessionRecord = null) {
   updateLogEmptyState();
   pruneMainLogContainer(container);
   if (!concurrentLogDetachedFragment && autoScroll && stream) {
-    stream.scrollTop = stream.scrollHeight;
+    scheduleMainLogScrollToBottom();
   } else if (!processingLogReplay) {
     noteMainLogNewBelow();
   }
@@ -1728,7 +1774,19 @@ function appendCommandOutputChunk(group, c) {
       sessionScrollStates.set(win, sessionWindowShouldFollowNextOutput(win));
     }
   }
-  if (group.copyRef && text) group.copyRef.text += text;
+  if (group.copyRef && text && !group.copyRefCapped) {
+    if (group.copyRef.text.length + text.length > COMMAND_OUTPUT_COPY_TEXT_CAP) {
+      // Stop retaining the concatenation of ALL streamed output in JS heap
+      // for the session's lifetime. The copy button re-fetches the full
+      // text lazily through the persisted-output lane (same source the
+      // expand-after-finalize path loads); the captured prefix stays as
+      // the offline fallback.
+      group.copyRefCapped = true;
+      group.copyRef.fetchText = () => fetchCommandOutputGroupText(group);
+    } else {
+      group.copyRef.text += text;
+    }
+  }
   if (c.output_id && !group.outputIdSet.has(c.output_id)) {
     group.outputIdSet.add(c.output_id);
     group.outputIds.push(c.output_id);
@@ -1809,7 +1867,7 @@ function renderCommandOutputEntry(c) {
   }
   appendCommandOutputChunk(activeCommandOutputGroup, c);
   const stream = document.getElementById('log-stream');
-  if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
+  if (!concurrentLogDetachedFragment && autoScroll && stream) scheduleMainLogScrollToBottom();
 }
 
 function finalizeCommandOutputGroup(group) {
@@ -1874,6 +1932,22 @@ async function loadCommandOutputIntoBody(group, body) {
   if (!body.childElementCount) {
     body.textContent = 'No persisted output found.';
   }
+}
+
+// Copy-text retention cap for streaming command-output groups (2 MiB of
+// UTF-16 units). Beyond it the copy ref switches to the lazy fetch below.
+const COMMAND_OUTPUT_COPY_TEXT_CAP = 2 * 1024 * 1024;
+
+// Full output text for a capped group's copy button — same persisted-output
+// RPC the finalized expand path uses, joined in stream order.
+async function fetchCommandOutputGroupText(group) {
+  if (!group?.outputIds?.length) return '';
+  const resp = await daemonApi.request('api_session_current_agent_output', { ids: group.outputIds });
+  const json = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+  if (!resp.ok) throw new Error(json.error || `HTTP ${resp.status}`);
+  return (json.outputs || [])
+    .map(out => [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : ''))
+    .join('');
 }
 
 async function toggleCommandOutputView(group, view) {
@@ -2473,11 +2547,19 @@ function parseUsageJson(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+// One full update_usage payload per session ever seen otherwise accumulates
+// for the lifetime of the tab (days-long dashboards → MBs). LRU past the cap:
+// re-inserting on write keeps the actively-updating sessions at the tail.
+const SESSION_USAGE_CACHE_CAP = 500;
 function cacheSessionUsage(c) {
   if (!c || typeof c !== 'object') return;
   const sid = String(c.session_id || '').trim();
   if (sid) {
+    sessionUsageById.delete(sid);
     sessionUsageById.set(sid, c);
+    while (sessionUsageById.size > SESSION_USAGE_CACHE_CAP) {
+      sessionUsageById.delete(sessionUsageById.keys().next().value);
+    }
   } else {
     latestGlobalUsage = c;
   }
@@ -2567,13 +2649,20 @@ function updateStatusBar(d, opts = {}) {
                && relatedSessionIdsForSession(statusSid).has(foreground)))
         : false);
   if (drivesForeground) {
-    if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
-    if (d.model) document.getElementById('sb-model').textContent = d.model;
-    if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
+    // Null-guarded like the rest of the file: this runs mid-UiCommand
+    // batch, and a missing chip must degrade to a skipped write, not an
+    // exception that eats the remaining commands.
+    const providerEl = document.getElementById('sb-provider');
+    if (d.provider && providerEl) providerEl.textContent = d.provider;
+    const modelEl = document.getElementById('sb-model');
+    if (d.model && modelEl) modelEl.textContent = d.model;
+    const turnEl = document.getElementById('sb-turn');
+    if (d.turn !== undefined && d.turn !== null && turnEl) turnEl.textContent = 'T' + d.turn;
     if (d.budget_pct !== undefined && d.budget_pct !== null) setContextUsagePct(d.budget_pct);
   }
-  if (d.autonomy) {
-    const el = document.getElementById('sb-autonomy');
+  const autonomyEl = document.getElementById('sb-autonomy');
+  if (d.autonomy && autonomyEl) {
+    const el = autonomyEl;
     const autonomy = normalizeAutonomyLabel(d.autonomy);
     el.textContent = autonomy;
     const colors = { Low: 'var(--red)', Medium: 'var(--yellow)', High: 'var(--teal)', Full: 'var(--green)' };

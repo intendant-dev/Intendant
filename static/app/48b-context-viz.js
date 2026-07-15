@@ -752,7 +752,8 @@ function stepContextReplaySnapshot(delta) {
     contextReplayMode = 'replay';
     contextReplayIndexBySession.set(key, next);
     contextSelectedPartId = null;
-    renderContextPane();
+    // Coalesced like the slider: held arrow keys repeat faster than frames.
+    scheduleContextPaneRender();
   }
   return true;
 }
@@ -853,7 +854,11 @@ function wireContextPaneListeners() {
     contextReplayMode = 'replay';
     contextReplayIndexBySession.set(key, Math.max(0, Math.min(timeline.length - 1, Number(target.value) || 0)));
     contextSelectedPartId = null;
-    renderContextPane();
+    // rAF-coalesced: range inputs fire per pixel while dragging, and each
+    // distinct index is a different snapshot (full analyze + scene build).
+    // Intermediate positions within one frame render nothing the eye
+    // would have seen; the trailing frame shows the slider's final index.
+    scheduleContextPaneRender();
   });
   document.addEventListener('keydown', ev => {
     if (contextShouldHandleKeyboardEvent(ev)) {
@@ -885,6 +890,9 @@ function focusContextPart(partId) {
   contextUpdateMeshSelection();
   contextViz.zoom = Math.min(contextViz.zoom, 28);
   contextRenderThree();
+  // The bob loop runs only while a part is selected — (re)arm it here
+  // (it exits on deselect/tab-away by itself).
+  if (contextPaneVisible()) contextStartThreeAnimation();
 }
 
 function contextDisposeObject(object) {
@@ -1110,13 +1118,45 @@ function contextLabelSprite(text, color = CONTEXT_VIZ_THEME.labelText, scale = 1
   return sprite;
 }
 
+// Label sprites are the GPU-upload churn of a scene rebuild (2D-canvas text
+// rasterize + CanvasTexture upload per label). Text/color/scale triples
+// recur across rebuilds — category lane names, the timeline caption — so
+// cache the sprites and let contextClearThreeRoot detach them undisposed.
+// Eviction disposes only unparented sprites; one still in the scene loses
+// its cached flag instead, so the next root clear disposes it normally.
+const contextLabelSpriteCache = new Map();
+const CONTEXT_LABEL_SPRITE_CACHE_CAP = 96;
+function contextLabelSpriteCached(text, color = CONTEXT_VIZ_THEME.labelText, scale = 1) {
+  // labelBg is read inside contextLabelSprite - key on it too so a theme
+  // flip re-rasterizes instead of serving stale-background sprites.
+  const key = [text, color, scale, CONTEXT_VIZ_THEME.labelBg].join('\u001f');
+  let sprite = contextLabelSpriteCache.get(key);
+  if (sprite) {
+    contextLabelSpriteCache.delete(key);
+    contextLabelSpriteCache.set(key, sprite); // LRU bump
+    return sprite;
+  }
+  sprite = contextLabelSprite(text, color, scale);
+  sprite.userData.cachedLabel = true;
+  contextLabelSpriteCache.set(key, sprite);
+  while (contextLabelSpriteCache.size > CONTEXT_LABEL_SPRITE_CACHE_CAP) {
+    const [oldKey, old] = contextLabelSpriteCache.entries().next().value;
+    contextLabelSpriteCache.delete(oldKey);
+    if (old.parent) old.userData.cachedLabel = false;
+    else contextDisposeObject(old);
+  }
+  return sprite;
+}
+
 function contextClearThreeRoot() {
   if (!contextViz.root) return;
   for (const child of [...contextViz.root.children]) {
     contextViz.root.remove(child);
+    if (child.userData && child.userData.cachedLabel) continue;
     contextDisposeObject(child);
   }
   contextViz.meshes = [];
+  contextViz.sceneKey = '';
 }
 
 function contextPressureColor(pct) {
@@ -1129,8 +1169,30 @@ function contextBuildThree(analysis, snapshot) {
   const empty = document.getElementById('context-scene-empty');
   if (empty) empty.style.display = analysis && analysis.parts.length ? 'none' : 'flex';
   if (!contextInitThree()) return;
+  // Scene identity: analyzed snapshot + the timeline shape the rail bars
+  // render from (+ theme, whose colors bake into materials). Re-renders
+  // for the SAME scene — another session's context_snapshot arriving while
+  // this pane is visible, detail-pane churn, selection changes — used to
+  // tear down and rebuild every geometry, material, and label texture.
+  // Selection highlighting mutates in place (contextUpdateMeshSelection),
+  // so it deliberately stays out of the key.
+  const { timeline } = contextTimelineForForegroundSession();
+  const sceneKey = analysis && analysis.parts.length
+    ? [
+        contextRawRenderKey(snapshot),
+        timeline.length,
+        timeline.indexOf(snapshot),
+        CONTEXT_VIZ_THEME.labelBg,
+      ].join('|')
+    : 'empty';
+  if (contextViz.sceneKey === sceneKey && (sceneKey === 'empty' || contextViz.meshes.length)) {
+    contextUpdateMeshSelection();
+    contextRenderThree();
+    return;
+  }
   contextClearThreeRoot();
   if (!analysis || !analysis.parts.length) {
+    contextViz.sceneKey = 'empty';
     contextRenderThree();
     return;
   }
@@ -1147,7 +1209,7 @@ function contextBuildThree(analysis, snapshot) {
     lane.position.set(x, -0.06, 0);
     root.add(lane);
     const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
-    const label = contextLabelSprite(def.label, def.color, 1.25);
+    const label = contextLabelSpriteCached(def.label, def.color, 1.25);
     label.position.set(x, 0.65, -zSpread / 2 - 2.2);
     root.add(label);
   }
@@ -1205,16 +1267,15 @@ function contextBuildThree(analysis, snapshot) {
   );
   fill.position.set(reservoirX, fillHeight / 2, 0);
   root.add(fill);
-  const usageLabel = contextLabelSprite(`${Math.round(pct * 100)}% window`, contextPressureColor(pct), 1.1);
+  const usageLabel = contextLabelSpriteCached(`${Math.round(pct * 100)}% window`, contextPressureColor(pct), 1.1);
   usageLabel.position.set(reservoirX, reservoirHeight + 1.1, 0);
   root.add(usageLabel);
   if (hardWindow && hardWindow !== effectiveWindow) {
-    const hardLabel = contextLabelSprite('hard limit tracked', CONTEXT_VIZ_THEME.pressure.high, 0.9);
+    const hardLabel = contextLabelSpriteCached('hard limit tracked', CONTEXT_VIZ_THEME.pressure.high, 0.9);
     hardLabel.position.set(reservoirX, -0.2, 2.7);
     root.add(hardLabel);
   }
 
-  const { timeline } = contextTimelineForForegroundSession();
   if (timeline.length > 1) {
     const selectedIdx = timeline.indexOf(snapshot);
     const railWidth = Math.min(28, Math.max(10, timeline.length * 0.72));
@@ -1234,11 +1295,12 @@ function contextBuildThree(analysis, snapshot) {
       bar.position.set(x, barHeight / 2, zSpread / 2 + 3.6);
       root.add(bar);
     });
-    const railLabel = contextLabelSprite('session replay timeline', CONTEXT_VIZ_THEME.railLabel, 1.0);
+    const railLabel = contextLabelSpriteCached('session replay timeline', CONTEXT_VIZ_THEME.railLabel, 1.0);
     railLabel.position.set(0, 5.6, zSpread / 2 + 3.6);
     root.add(railLabel);
   }
 
+  contextViz.sceneKey = sceneKey;
   contextUpdateMeshSelection();
   contextRenderThree();
 }
@@ -1286,10 +1348,12 @@ function contextRenderThree(time = 0) {
   if (contextViz.root) {
     contextViz.root.rotation.set(0, 0, 0);
   }
-  if (time && contextViz.meshes.length) {
+  if (contextViz.meshes.length) {
     const t = time * 0.001;
     for (const mesh of contextViz.meshes) {
-      const selected = mesh.userData.partId === contextSelectedPartId;
+      // On-demand renders pass time=0: settle every mesh at its base so a
+      // retired bob loop can't strand the previously-selected mesh mid-arc.
+      const selected = time && mesh.userData.partId === contextSelectedPartId;
       if (selected) {
         mesh.position.y = mesh.userData.baseY + Math.sin(t * 3.2) * 0.08;
       } else {
@@ -1300,13 +1364,25 @@ function contextRenderThree(time = 0) {
   contextViz.renderer.render(contextViz.scene, contextViz.camera);
 }
 
+// The only per-frame animation is the selected-part bob — with nothing
+// selected the scene is static and every interaction (drag, zoom, snapshot,
+// slider) already renders on demand, so the 60 fps loop only runs while a
+// part is selected and stops itself on deselect/tab-away (with one settling
+// render so the bob doesn't freeze mid-arc).
 function contextStartThreeAnimation() {
+  if (!contextSelectedPartId) {
+    contextStopThreeAnimation();
+    contextRenderThree();
+    return;
+  }
   if (contextViz.raf) return;
   const frame = time => {
     contextViz.raf = null;
-    if (activeTab === 'activity' && activeActivitySubtab === 'context') {
+    if (activeTab === 'activity' && activeActivitySubtab === 'context' && contextSelectedPartId) {
       contextRenderThree(time);
       contextViz.raf = requestAnimationFrame(frame);
+    } else {
+      contextRenderThree();
     }
   };
   contextViz.raf = requestAnimationFrame(frame);

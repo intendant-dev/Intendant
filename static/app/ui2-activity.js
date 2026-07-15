@@ -216,7 +216,6 @@ function ui2QueueFocusSurface() {
   requestAnimationFrame(() => {
     ui2FocusSurfaceQueued = false;
     ui2ApplyFocusSurface();
-    ui2TagRawEntries();
   });
 }
 
@@ -226,31 +225,64 @@ function ui2QueueFocusSurface() {
 // quiet meta hairlines instead of full-voice rows. Runs over BOTH the
 // combined stream and the session windows — Focus promotes a window, so
 // tagging the stream alone misses everything the user actually reads.
+function ui2TagEntry(e) {
+  if (e.classList.contains('ui2-raw-checked')) return;
+  e.classList.add('ui2-raw-checked');
+  const text = (e.querySelector('.log-content')?.textContent || '').trim();
+  if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+    e.classList.add('ui2-stderr');
+  }
+  if (e.classList.contains('source-steer')) {
+    e.classList.add('ui2-meta');
+    return;
+  }
+  const level = e.dataset.level || '';
+  if (
+    (level === 'info' || level === 'detail') &&
+    /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
+  ) {
+    e.classList.add('ui2-meta');
+  }
+}
+
 function ui2TagEntriesIn(rootEl) {
   if (!rootEl) return;
-  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
-    e.classList.add('ui2-raw-checked');
-    const text = (e.querySelector('.log-content')?.textContent || '').trim();
-    if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
-      e.classList.add('ui2-stderr');
-    }
-    if (e.classList.contains('source-steer')) {
-      e.classList.add('ui2-meta');
-      return;
-    }
-    const level = e.dataset.level || '';
-    if (
-      (level === 'info' || level === 'detail') &&
-      /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
-    ) {
-      e.classList.add('ui2-meta');
-    }
-  });
+  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach(ui2TagEntry);
 }
 
 function ui2TagRawEntries() {
   ui2TagEntriesIn(document.getElementById('log-stream'));
   ui2TagEntriesIn(document.getElementById('session-window-grid'));
+}
+
+// Added-node tagging: the tagger used to re-run the `.log-entry:not(...)`
+// selector over the 10k-cap stream PLUS every window log on every grid
+// mutation — including the 1 Hz goal/vitals ticker text writes, i.e. a
+// full match-test of ~10-15k nodes every second while idle. The observers
+// now hand over exactly what was ADDED; text/attribute churn never queues
+// a pass (their addedNodes are text nodes), and a container insertion
+// (replay fragment, re-rendered window range) scans only its own subtree.
+// Clones inherit the source entry's classes, so re-tagging is a no-op skip.
+let ui2PendingTagNodes = new Set();
+let ui2TagPassQueued = false;
+function ui2QueueEntryTagging(records) {
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (node.nodeType === 1) ui2PendingTagNodes.add(node);
+    }
+  }
+  if (!ui2PendingTagNodes.size || ui2TagPassQueued) return;
+  ui2TagPassQueued = true;
+  requestAnimationFrame(() => {
+    ui2TagPassQueued = false;
+    const nodes = ui2PendingTagNodes;
+    ui2PendingTagNodes = new Set();
+    for (const node of nodes) {
+      if (!node.isConnected) continue;
+      if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
+      else ui2TagEntriesIn(node);
+    }
+  });
 }
 
 // The approval hero names its session — with several agents running,
@@ -403,22 +435,35 @@ function ui2RailTick(force) {
     ui2BuildVitalsRail();
     ui2RailTick(true);
     setInterval(() => ui2RailTick(), 1000);
-    // Focus surface + raw-entry hygiene: follow stream appends, target
-    // changes (the chip re-renders on every change), layout flips, and the
-    // session-window grid's own membership — a session resumed from the
-    // Sessions tab materializes its window there, and that is the only
-    // signal Focus gets that the window it must promote now exists.
+    // Focus surface: follow stream appends, target changes (the chip
+    // re-renders on every change), layout flips, and the session-window
+    // grid's own MEMBERSHIP — a session resumed from the Sessions tab
+    // materializes its window there, and that is the only signal Focus
+    // gets that the window it must promote now exists. Membership is
+    // childList on the grid ROOT: appends inside a window's log (or the
+    // per-second ticker text writes) cannot change what Focus promotes,
+    // and routing them here re-ran the promote pass once per frame during
+    // bursts and once per second while idle.
     const stream = document.getElementById('log-stream');
-    if (stream) new MutationObserver(ui2QueueFocusSurface).observe(stream, { childList: true });
+    if (stream) {
+      new MutationObserver((records) => {
+        ui2QueueFocusSurface();
+        ui2QueueEntryTagging(records);
+      }).observe(stream, { childList: true });
+    }
     const chip = document.getElementById('task-target-chip');
     if (chip) new MutationObserver(ui2QueueFocusSurface).observe(chip, {
       childList: true, characterData: true, subtree: true, attributes: true,
     });
-    // subtree: entries append INSIDE window logs — the meta/stderr tagger
-    // must see them, not just window add/remove. ui2QueueFocusSurface is
-    // rAF-debounced, so per-entry firing collapses to one pass a frame.
     const windowGrid = document.getElementById('session-window-grid');
-    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true, subtree: true });
+    if (windowGrid) {
+      new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true });
+      // subtree: entries append INSIDE window logs — the meta/stderr tagger
+      // must see them, not just window add/remove. It consumes only
+      // addedNodes (see ui2QueueEntryTagging), so ticker text churn and
+      // attribute writes never trigger a scan.
+      new MutationObserver(ui2QueueEntryTagging).observe(windowGrid, { childList: true, subtree: true });
+    }
     ui2ApplyFocusSurface();
     ui2TagRawEntries();
     // Approval hero session identity.

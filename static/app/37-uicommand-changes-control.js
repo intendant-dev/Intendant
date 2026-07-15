@@ -10,6 +10,10 @@ function processCommands(cmds) {
       if (c.cmd !== 'update_status_bar' && c.cmd !== 'set_phase') {
         pendingStatusPhaseGuard = null;
       }
+      // Per-command isolation: sibling commands in a batch are independent
+      // renders — one throwing handler (e.g. a missing DOM node after a
+      // shell-markup change) must not eat the rest of the batch.
+      try {
       switch (c.cmd) {
       case 'add_log_entry':
         maybeFailNewSessionSpawnFromLog(c);
@@ -269,6 +273,9 @@ function processCommands(cmds) {
       case 'peer_dashboard_control_signal':
         handlePeerDashboardControlSignal(c.host_id, c.session_id, c.signal);
         break;
+      }
+      } catch (err) {
+        console.warn('[ui-command]', c?.cmd || 'unknown command', err);
       }
     }
   } finally {

@@ -1930,6 +1930,18 @@ function stationMaybeRefreshTranscript(force = false) {
   const key = stationLatestEventKeyForSession(live.sessionId);
   if (!force && key && key === live.lastEventKey && age < 8000) return;
   if (!force && !key && age < 8000) return;
+  // Idle-arm gate: the ~8 s fallback exists for sessions whose output
+  // never surfaces in the activity stream — but when the stream key is
+  // UNCHANGED and the session itself reports an inactive phase, there is
+  // nothing new to fetch. Skipping here parks the 300-row refetch+rebuild
+  // instead of re-running it forever under an idle open viewer; an
+  // unknown phase keeps the old fallback cadence (fail open).
+  if (!force && key === live.lastEventKey) {
+    const phase = String(
+      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+    );
+    if (phase === 'idle' || phase === 'done' || phase === 'interrupted') return;
+  }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;
   stationOpenTranscript(live.sessionId, { source: live.source, refresh: true });

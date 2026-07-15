@@ -27790,7 +27790,6 @@ function ui2QueueFocusSurface() {
   requestAnimationFrame(() => {
     ui2FocusSurfaceQueued = false;
     ui2ApplyFocusSurface();
-    ui2TagRawEntries();
   });
 }
 
@@ -27800,31 +27799,64 @@ function ui2QueueFocusSurface() {
 // quiet meta hairlines instead of full-voice rows. Runs over BOTH the
 // combined stream and the session windows — Focus promotes a window, so
 // tagging the stream alone misses everything the user actually reads.
+function ui2TagEntry(e) {
+  if (e.classList.contains('ui2-raw-checked')) return;
+  e.classList.add('ui2-raw-checked');
+  const text = (e.querySelector('.log-content')?.textContent || '').trim();
+  if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+    e.classList.add('ui2-stderr');
+  }
+  if (e.classList.contains('source-steer')) {
+    e.classList.add('ui2-meta');
+    return;
+  }
+  const level = e.dataset.level || '';
+  if (
+    (level === 'info' || level === 'detail') &&
+    /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
+  ) {
+    e.classList.add('ui2-meta');
+  }
+}
+
 function ui2TagEntriesIn(rootEl) {
   if (!rootEl) return;
-  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach((e) => {
-    e.classList.add('ui2-raw-checked');
-    const text = (e.querySelector('.log-content')?.textContent || '').trim();
-    if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
-      e.classList.add('ui2-stderr');
-    }
-    if (e.classList.contains('source-steer')) {
-      e.classList.add('ui2-meta');
-      return;
-    }
-    const level = e.dataset.level || '';
-    if (
-      (level === 'info' || level === 'detail') &&
-      /^(Round \d+ complete|Turn \d+ started|Session (started|attached)|Done signal)/.test(text)
-    ) {
-      e.classList.add('ui2-meta');
-    }
-  });
+  rootEl.querySelectorAll('.log-entry:not(.ui2-raw-checked)').forEach(ui2TagEntry);
 }
 
 function ui2TagRawEntries() {
   ui2TagEntriesIn(document.getElementById('log-stream'));
   ui2TagEntriesIn(document.getElementById('session-window-grid'));
+}
+
+// Added-node tagging: the tagger used to re-run the `.log-entry:not(...)`
+// selector over the 10k-cap stream PLUS every window log on every grid
+// mutation — including the 1 Hz goal/vitals ticker text writes, i.e. a
+// full match-test of ~10-15k nodes every second while idle. The observers
+// now hand over exactly what was ADDED; text/attribute churn never queues
+// a pass (their addedNodes are text nodes), and a container insertion
+// (replay fragment, re-rendered window range) scans only its own subtree.
+// Clones inherit the source entry's classes, so re-tagging is a no-op skip.
+let ui2PendingTagNodes = new Set();
+let ui2TagPassQueued = false;
+function ui2QueueEntryTagging(records) {
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (node.nodeType === 1) ui2PendingTagNodes.add(node);
+    }
+  }
+  if (!ui2PendingTagNodes.size || ui2TagPassQueued) return;
+  ui2TagPassQueued = true;
+  requestAnimationFrame(() => {
+    ui2TagPassQueued = false;
+    const nodes = ui2PendingTagNodes;
+    ui2PendingTagNodes = new Set();
+    for (const node of nodes) {
+      if (!node.isConnected) continue;
+      if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
+      else ui2TagEntriesIn(node);
+    }
+  });
 }
 
 // The approval hero names its session — with several agents running,
@@ -27977,22 +28009,35 @@ function ui2RailTick(force) {
     ui2BuildVitalsRail();
     ui2RailTick(true);
     setInterval(() => ui2RailTick(), 1000);
-    // Focus surface + raw-entry hygiene: follow stream appends, target
-    // changes (the chip re-renders on every change), layout flips, and the
-    // session-window grid's own membership — a session resumed from the
-    // Sessions tab materializes its window there, and that is the only
-    // signal Focus gets that the window it must promote now exists.
+    // Focus surface: follow stream appends, target changes (the chip
+    // re-renders on every change), layout flips, and the session-window
+    // grid's own MEMBERSHIP — a session resumed from the Sessions tab
+    // materializes its window there, and that is the only signal Focus
+    // gets that the window it must promote now exists. Membership is
+    // childList on the grid ROOT: appends inside a window's log (or the
+    // per-second ticker text writes) cannot change what Focus promotes,
+    // and routing them here re-ran the promote pass once per frame during
+    // bursts and once per second while idle.
     const stream = document.getElementById('log-stream');
-    if (stream) new MutationObserver(ui2QueueFocusSurface).observe(stream, { childList: true });
+    if (stream) {
+      new MutationObserver((records) => {
+        ui2QueueFocusSurface();
+        ui2QueueEntryTagging(records);
+      }).observe(stream, { childList: true });
+    }
     const chip = document.getElementById('task-target-chip');
     if (chip) new MutationObserver(ui2QueueFocusSurface).observe(chip, {
       childList: true, characterData: true, subtree: true, attributes: true,
     });
-    // subtree: entries append INSIDE window logs — the meta/stderr tagger
-    // must see them, not just window add/remove. ui2QueueFocusSurface is
-    // rAF-debounced, so per-entry firing collapses to one pass a frame.
     const windowGrid = document.getElementById('session-window-grid');
-    if (windowGrid) new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true, subtree: true });
+    if (windowGrid) {
+      new MutationObserver(ui2QueueFocusSurface).observe(windowGrid, { childList: true });
+      // subtree: entries append INSIDE window logs — the meta/stderr tagger
+      // must see them, not just window add/remove. It consumes only
+      // addedNodes (see ui2QueueEntryTagging), so ticker text churn and
+      // attribute writes never trigger a scan.
+      new MutationObserver(ui2QueueEntryTagging).observe(windowGrid, { childList: true, subtree: true });
+    }
     ui2ApplyFocusSurface();
     ui2TagRawEntries();
     // Approval hero session identity.
@@ -28028,7 +28073,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c9799413fe5b0e7e';
+const INTENDANT_APP_BUILD = '79868a67bb6b6b5b';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -35508,6 +35553,9 @@ async function stationRefreshDisplayTelemetry(key, pc) {
   if (!pc || typeof pc.getStats !== 'function') return;
   const stats = await pc.getStats();
   const cached = stationDisplayTelemetry.get(key) || {};
+  // Snapshot the DISPLAYED values before folding the fresh sample in: the
+  // completion below only reschedules when they moved.
+  const labelBefore = stationDisplayTelemetryLabel(cached);
   const codecs = new Map();
   const inbound = [];
   stats.forEach(report => {
@@ -35539,7 +35587,13 @@ async function stationRefreshDisplayTelemetry(key, pc) {
     cached.quality = 'steady';
   }
   stationDisplayTelemetry.set(key, cached);
-  stationScheduleUpdate();
+  // Unconditional rescheduling here made the pipeline self-perpetuating:
+  // snapshot build → telemetry poll (1.5 s throttle) → this completion →
+  // schedule (300 ms) → next build → next poll — a full rebuild every
+  // ~1.8 s on an idle Station tab with any stream open. The snapshot only
+  // renders the ROUNDED label, so reschedule only when that label moved;
+  // real fps/codec/quality changes still repaint.
+  if (stationDisplayTelemetryLabel(cached) !== labelBefore) stationScheduleUpdate();
 }
 
 function stationDisplayRunwayPayload(controlsSummary = null) {
@@ -38571,6 +38625,18 @@ function stationMaybeRefreshTranscript(force = false) {
   const key = stationLatestEventKeyForSession(live.sessionId);
   if (!force && key && key === live.lastEventKey && age < 8000) return;
   if (!force && !key && age < 8000) return;
+  // Idle-arm gate: the ~8 s fallback exists for sessions whose output
+  // never surfaces in the activity stream — but when the stream key is
+  // UNCHANGED and the session itself reports an inactive phase, there is
+  // nothing new to fetch. Skipping here parks the 300-row refetch+rebuild
+  // instead of re-running it forever under an idle open viewer; an
+  // unknown phase keeps the old fallback cadence (fail open).
+  if (!force && key === live.lastEventKey) {
+    const phase = String(
+      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+    );
+    if (phase === 'idle' || phase === 'done' || phase === 'interrupted') return;
+  }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;
   stationOpenTranscript(live.sessionId, { source: live.source, refresh: true });
@@ -42407,6 +42473,10 @@ function processCommands(cmds) {
       if (c.cmd !== 'update_status_bar' && c.cmd !== 'set_phase') {
         pendingStatusPhaseGuard = null;
       }
+      // Per-command isolation: sibling commands in a batch are independent
+      // renders — one throwing handler (e.g. a missing DOM node after a
+      // shell-markup change) must not eat the rest of the batch.
+      try {
       switch (c.cmd) {
       case 'add_log_entry':
         maybeFailNewSessionSpawnFromLog(c);
@@ -42666,6 +42736,9 @@ function processCommands(cmds) {
       case 'peer_dashboard_control_signal':
         handlePeerDashboardControlSignal(c.host_id, c.session_id, c.signal);
         break;
+      }
+      } catch (err) {
+        console.warn('[ui-command]', c?.cmd || 'unknown command', err);
       }
     }
   } finally {
@@ -47774,9 +47847,16 @@ function mergeSessionWindowMetadata(sessionId, meta = {}) {
   const merged = Object.keys(normalized).length > 0
     ? { ...previous, ...normalized }
     : previous;
-  const changed = sessionWindowMetadataSignature(previous) !== sessionWindowMetadataSignature(merged);
+  // The merged signature rides the return value so updateSessionWindow —
+  // reached per rendered log line via inferSessionPhaseFromLog — doesn't
+  // recompute the ~35-field join a third time per call.
+  const previousSignature = sessionWindowMetadataSignature(previous);
+  const signature = merged === previous
+    ? previousSignature
+    : sessionWindowMetadataSignature(merged);
+  const changed = previousSignature !== signature;
   if (sid && changed) sessionMetadataById.set(sid, merged);
-  return { meta: merged, changed };
+  return { meta: merged, changed, signature };
 }
 
 function currentSessionGoalElapsedSeconds(goal) {
@@ -47808,22 +47888,27 @@ function goalStatusClass(status) {
 
 function renderSessionWindowGoal(win, goal) {
   if (!win?.goal || !win?.goalText) return false;
+  // Write-guards throughout: this runs for EVERY window on the 1 Hz goal
+  // ticker, and unconditional textContent/className assignment churns text
+  // nodes (and feeds every subtree MutationObserver watching the grid)
+  // even when the rendered second hasn't rolled over.
+  const setText = (el, prop, value) => { if (el[prop] !== value) el[prop] = value; };
   if (!goal?.objective) {
-    win.goal.className = 'session-window-goal hidden';
-    win.goalText.textContent = '';
-    win.goal.title = '';
+    setText(win.goal, 'className', 'session-window-goal hidden');
+    setText(win.goalText, 'textContent', '');
+    setText(win.goal, 'title', '');
     return false;
   }
   const status = normalizeGoalStatus(goal.status);
   const elapsed = formatGoalElapsed(currentSessionGoalElapsedSeconds(goal));
-  win.goal.className = `session-window-goal ${goalStatusClass(status)}`;
-  win.goalText.textContent = status === 'active'
+  setText(win.goal, 'className', `session-window-goal ${goalStatusClass(status)}`);
+  setText(win.goalText, 'textContent', status === 'active'
     ? `${goal.objective} · ${elapsed}`
-    : `${status} · ${goal.objective} · ${elapsed}`;
+    : `${status} · ${goal.objective} · ${elapsed}`);
   const tokenText = goal.tokensUsed !== null && goal.tokensUsed !== undefined
     ? `\nTokens: ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` / ${goal.tokenBudget.toLocaleString()}` : ''}`
     : (goal.tokenBudget ? `\nBudget: ${goal.tokenBudget.toLocaleString()} tokens` : '');
-  win.goal.title = `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`;
+  setText(win.goal, 'title', `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`);
   return status === 'active';
 }
 
@@ -47859,6 +47944,16 @@ function refreshSessionGoalTicker() {
   } else if (!hasActiveGoal && sessionGoalTicker) {
     clearInterval(sessionGoalTicker);
     sessionGoalTicker = null;
+  }
+}
+
+// Arm-only twin for per-window update paths: updateSessionWindow already
+// rendered ITS window's goal — re-rendering every other window's goal per
+// metadata tick (the old refreshSessionGoalTicker call) was pure waste.
+// The 1 s ticker still owns elapsed-time repaints and disarms itself.
+function ensureSessionGoalTickerArmed(hasActiveGoal) {
+  if (hasActiveGoal && !sessionGoalTicker) {
+    sessionGoalTicker = setInterval(refreshSessionGoalTicker, 1000);
   }
 }
 
@@ -48318,6 +48413,7 @@ function renderSessionWindowVitals(win, vitals) {
     win.vitals.replaceChildren();
     win.vitals.removeAttribute('title');
     delete win.vitals.dataset.vitSig;
+    win.vitalsRowTicking = false;
     return false;
   }
   wireVitalsChipRow(win);
@@ -48334,7 +48430,8 @@ function renderSessionWindowVitals(win, vitals) {
       ttlChip.textContent = ttl.text;
       ttlChip.title = ttl.explainLines[0] || ttl.label;
     }
-    return models.some((m) => m.ticking);
+    win.vitalsRowTicking = models.some((m) => m.ticking);
+    return win.vitalsRowTicking;
   }
   win.vitals.dataset.vitSig = signature;
   win.vitals.className = 'session-window-vitals';
@@ -48369,7 +48466,8 @@ function renderSessionWindowVitals(win, vitals) {
     nodes.push(more);
   }
   win.vitals.replaceChildren(...nodes);
-  return models.some((m) => m.ticking);
+  win.vitalsRowTicking = models.some((m) => m.ticking);
+  return win.vitalsRowTicking;
 }
 
 // One delegated listener per window (chips are rebuilt every render).
@@ -48738,10 +48836,36 @@ function showCacheExpiryToast(sid, text) {
   setTimeout(() => { if (toast.parentNode) toast.remove(); }, 12000);
 }
 
+// Cheap per-tick predicate: does this session's vitals row need a 1 Hz
+// repaint at all? True for the warm-cache countdown (the only `ticking`
+// model vitalsChipModels emits) and for status-only rate-limit chips whose
+// "resets in ~Xm" text is time-derived. Everything else changes only on
+// real vitals/metadata events, which re-render directly — so the ticker no
+// longer rebuilds every window's full chip-model array each second just to
+// hit the stable-DOM fast path.
+function sessionVitalsNeedsTick(vitals) {
+  if (!vitals || typeof vitals !== 'object') return false;
+  const remaining = sessionCacheCountdownSeconds(vitals.cache);
+  if (remaining !== null && remaining > 0) return true;
+  const limits = Array.isArray(vitals.limits) ? vitals.limits : [];
+  return limits.some((w) => {
+    // Mirrors the chip model: the reset countdown only renders when the
+    // provider reports no percentage (status-only limits).
+    const pctRaw = Number(w?.usedPct);
+    const hasPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined;
+    return !hasPct && Number(w?.resetsAtEpoch) > Date.now() / 1000;
+  });
+}
+
 function refreshSessionVitalsTicker() {
   let ticking = false;
   for (const [sid, win] of sessionWindows) {
     const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
+    const needsTick = sessionVitalsNeedsTick(vitals);
+    // One trailing render after ticking stops (win.vitalsRowTicking is
+    // maintained by renderSessionWindowVitals on every render path) flips
+    // the countdown chip to its cold glyph instead of freezing mid-count.
+    if (!needsTick && !win.vitalsRowTicking) continue;
     if (renderSessionWindowVitals(win, vitals)) ticking = true;
     maybeAlertCacheExpiry(sid, win, vitals);
   }
@@ -49076,8 +49200,41 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   return record;
 }
 
+// Trailing-debounced twin for the streaming path. updateSessionWindow runs
+// per rendered log line (inferSessionPhaseFromLog flips phase on model/agent
+// lines) and used to re-derive every window's record, JSON.stringify it, and
+// synchronously localStorage.setItem — tens of disk-backed writes per second
+// under load, forever. Metadata churn now coalesces into at most one write
+// per second; structural transitions (open/close/layout ops) keep calling
+// the immediate form, and pagehide/hidden flush a pending write so a closing
+// tab still persists its newest state.
+let sessionWindowPersistTimer = 0;
+function schedulePersistSessionWindowState() {
+  if (restoringPersistedSessionWindows || sessionWindowPersistTimer) return;
+  sessionWindowPersistTimer = window.setTimeout(() => {
+    sessionWindowPersistTimer = 0;
+    persistSessionWindowState();
+  }, 1000);
+}
+
+function flushPendingSessionWindowPersist() {
+  if (!sessionWindowPersistTimer) return;
+  clearTimeout(sessionWindowPersistTimer);
+  sessionWindowPersistTimer = 0;
+  persistSessionWindowState();
+}
+window.addEventListener('pagehide', flushPendingSessionWindowPersist);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) flushPendingSessionWindowPersist();
+});
+
 function persistSessionWindowState() {
   if (restoringPersistedSessionWindows) return;
+  // A direct persist supersedes any scheduled one.
+  if (sessionWindowPersistTimer) {
+    clearTimeout(sessionWindowPersistTimer);
+    sessionWindowPersistTimer = 0;
+  }
   let windows = [];
   for (const [sid, win] of sessionWindows) {
     const record = persistedSessionWindowRecord(sid, win);
@@ -50229,6 +50386,13 @@ function pruneMainLogContainer(container = currentMainLogContainer()) {
     while (logEntryCount > 10000) {
       const first = container.querySelector('.log-entry, .log-turn-sep');
       if (!first) break;
+      // A pruned command-output group must leave the strong registry too:
+      // commandOutputGroups otherwise pins the detached entry DOM, its
+      // clone views, and the full accumulated copy text for the lifetime
+      // of the page (clearLogs was the only eviction). Live clones keep
+      // the group reachable through their own click closures.
+      const groupId = first.dataset ? first.dataset.outputGroupId : '';
+      if (groupId) commandOutputGroups.delete(groupId);
       first.remove();
       logEntryCount--;
     }
@@ -50563,6 +50727,23 @@ function getLogEntryCopyText(entry) {
   return entry?.querySelector?.('.log-content')?.innerText || '';
 }
 
+// Async twin for capped copy refs: a command-output group whose streamed
+// text outgrew COMMAND_OUTPUT_COPY_TEXT_CAP carries a fetchText resolver
+// (the persisted-output lane) instead of retaining megabytes in the ref.
+// Falls back to the captured prefix if the fetch fails.
+async function resolveLogEntryCopyText(entry) {
+  const ref = entry ? logEntryCopyTextByEntry.get(entry) : null;
+  if (ref && typeof ref.fetchText === 'function') {
+    try {
+      const text = await ref.fetchText();
+      if (text) return String(text);
+    } catch (err) {
+      console.warn('lazy copy-text fetch failed; copying captured prefix', err);
+    }
+  }
+  return getLogEntryCopyText(entry);
+}
+
 function resetLogCopyButton(btn) {
   if (!btn) return;
   btn.classList.remove('copied');
@@ -50577,7 +50758,7 @@ async function onLogCopyButtonClick(ev) {
   const btn = ev.currentTarget;
   const entry = btn.closest('.log-entry');
   try {
-    await copyTextToClipboard(getLogEntryCopyText(entry));
+    await copyTextToClipboard(await resolveLogEntryCopyText(entry));
     btn.classList.add('copied');
     btn.innerHTML = '&#x2713;';
     btn.title = 'Copied';
@@ -52423,16 +52604,34 @@ function updateSessionWindowJumpButton(win) {
   win.jumpBottom.setAttribute('aria-hidden', show ? 'false' : 'true');
 }
 
+// rAF-coalesced per-window bottom-follow (finding: interleaved layout
+// read/write per appended entry). The scrollHeight read forces synchronous
+// layout of the window's scroller; bursts used to pay it once per entry per
+// window. The follow DECISION and flags stay synchronous below — only the
+// scrollTop write (and thus the layout read) coalesces to one per window
+// per frame, re-checking followOutput at flush so a user grab between
+// schedule and flush wins (updateSessionWindowFollowFromScroll clears it).
+const sessionWindowScrollFollowPending = new Set();
+function scheduleSessionWindowScrollToBottom(win) {
+  if (!win || !win.log || sessionWindowScrollFollowPending.has(win)) return;
+  sessionWindowScrollFollowPending.add(win);
+  requestAnimationFrame(() => {
+    sessionWindowScrollFollowPending.delete(win);
+    if (!win.log || !win.followOutput) return;
+    win.log.scrollTop = win.log.scrollHeight;
+  });
+}
+
 function scrollSessionWindowToBottom(win) {
   if (!win || !win.log) return;
   const history = ensureSessionWindowHistory(win);
   if (!sessionWindowIsRenderingTail(win, history.length) || win.renderEnd !== history.length) {
     renderSessionWindowTail(win);
   }
-  win.log.scrollTop = win.log.scrollHeight;
   win.followOutput = true;
   win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
+  scheduleSessionWindowScrollToBottom(win);
 }
 
 function applySessionWindowOutputScroll(win, shouldFollow) {
@@ -53985,6 +54184,27 @@ function ensureSessionWindow(sessionId, meta = {}) {
   return win;
 }
 
+// Applies a phase change to the window chrome: status chip repaint plus the
+// approval-confirm hook. Shared by the wide render below and the phase-only
+// fast path — the hook (maybeConfirmApprovalSendFromWindowPhase) must fire
+// on EVERY phase application, both paths.
+function applySessionWindowPhase(win, sid, phase) {
+  const nextPhase = normalizeSessionPhase(phase);
+  // A real phase transition is fresh evidence about the session; it
+  // retires the "optimistic thinking expired" steer demotion below.
+  if (win.phase !== nextPhase) win.optimisticActiveExpired = false;
+  win.phase = nextPhase;
+  if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
+    win.pendingActiveUntil = 0;
+  }
+  win.status.textContent = sessionPhaseLabel(win.phase);
+  win.status.title = sessionPhaseLabel(win.phase);
+  win.status.className = 'session-window-status';
+  const cls = sessionPhaseClass(win.phase);
+  if (cls) win.status.classList.add(cls);
+  maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+}
+
 function updateSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -53993,12 +54213,31 @@ function updateSessionWindow(sessionId, meta = {}) {
   const merged = mergeSessionWindowMetadata(sid, meta);
   meta = merged.meta;
   updateSessionWindowRelationshipStyle(sid);
-  const signature = sessionWindowMetadataSignature(meta);
+  const signature = merged.signature;
   if (win.metadataSignature === signature) {
-    persistSessionWindowState();
+    // Nothing rendered from — nothing persisted from. The unconditional
+    // persist here was a synchronous localStorage write per rendered log
+    // line (this early-out is the steady-state exit of the per-line
+    // phase-inference path).
     return;
   }
+  // Phase-only fast path: streaming log lines alternate thinking↔running
+  // several times per turn (inferSessionPhaseFromLog), and phase rides the
+  // metadata signature — so each alternation used to defeat the early-out
+  // and re-run the full header render (identity DOM rebuild, path
+  // elements, goal/tier/vitals, relationship badges, menu visibility).
+  // When the signatures differ ONLY in phase, repaint the status chip and
+  // fire the approval-confirm hook — the only phase consumers here.
+  const signatureNoPhase = sessionWindowMetadataSignature({ ...meta, phase: '' });
+  const phaseOnly = Boolean(win.metadataSignature) &&
+    win.metadataSignatureNoPhase === signatureNoPhase;
   win.metadataSignature = signature;
+  win.metadataSignatureNoPhase = signatureNoPhase;
+  if (phaseOnly) {
+    if (meta.phase) applySessionWindowPhase(win, sid, meta.phase);
+    schedulePersistSessionWindowState();
+    return;
+  }
   renderSessionIdentity(win.id, sid, { order: 'id-name' });
   if (meta.projectRoot) {
     setSessionWindowPathElement(
@@ -54056,25 +54295,14 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (win.ended) win.pendingActiveUntil = 0;
   }
   if (meta.phase) {
-    const nextPhase = normalizeSessionPhase(meta.phase);
-    // A real phase transition is fresh evidence about the session; it
-    // retires the "optimistic thinking expired" steer demotion below.
-    if (win.phase !== nextPhase) win.optimisticActiveExpired = false;
-    win.phase = nextPhase;
-    if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
-      win.pendingActiveUntil = 0;
-    }
-    win.status.textContent = sessionPhaseLabel(win.phase);
-    win.status.title = sessionPhaseLabel(win.phase);
-    win.status.className = 'session-window-status';
-    const cls = sessionPhaseClass(win.phase);
-    if (cls) win.status.classList.add(cls);
-    maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+    applySessionWindowPhase(win, sid, meta.phase);
   }
-  renderSessionWindowGoal(win, meta.goal || null);
+  // Arm-only: this window's goal was just rendered; the 1 s ticker owns
+  // elapsed-time repaints for the rest (re-rendering EVERY window's goal
+  // per metadata update was the waste).
+  ensureSessionGoalTickerArmed(renderSessionWindowGoal(win, meta.goal || null));
   renderSessionWindowTier(win);
   renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
-  refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
   updateControlFastButtonState();
   updateSessionRelationshipBadges(sid);
@@ -54086,7 +54314,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (win.log && win.log.firstElementChild?.classList?.contains('session-window-empty')) {
     renderSessionWindowLogPlaceholder(win);
   }
-  persistSessionWindowState();
+  schedulePersistSessionWindowState();
 }
 
 // Worktree badge next to the project path: branch name up front, the full
@@ -55063,6 +55291,23 @@ function createLogScaffold(c, extraClass) {
   return { entry, hostId };
 }
 
+// rAF-coalesced follow for the MAIN stream (finding: interleaved layout
+// read/write per appended entry). Reading scrollHeight right after each
+// append forces a synchronous layout of the 10k-node scroller — N entries
+// in one frame cost N layout passes. One scrollTop write per frame, with
+// the follow flags re-checked at flush so a user grab mid-burst wins.
+let mainLogScrollScheduled = false;
+function scheduleMainLogScrollToBottom() {
+  if (mainLogScrollScheduled) return;
+  mainLogScrollScheduled = true;
+  requestAnimationFrame(() => {
+    mainLogScrollScheduled = false;
+    if (concurrentLogDetachedFragment || !autoScroll) return;
+    const stream = document.getElementById('log-stream');
+    if (stream) stream.scrollTop = stream.scrollHeight;
+  });
+}
+
 function appendLogEntryElement(entry, sessionRecord = null) {
   if (logReplayAppendBatch && !entry.classList.contains('command-output-group')) {
     logReplayAppendBatch.mainFragment.appendChild(entry);
@@ -55091,7 +55336,7 @@ function appendLogEntryElement(entry, sessionRecord = null) {
   updateLogEmptyState();
   pruneMainLogContainer(container);
   if (!concurrentLogDetachedFragment && autoScroll && stream) {
-    stream.scrollTop = stream.scrollHeight;
+    scheduleMainLogScrollToBottom();
   } else if (!processingLogReplay) {
     noteMainLogNewBelow();
   }
@@ -55293,7 +55538,19 @@ function appendCommandOutputChunk(group, c) {
       sessionScrollStates.set(win, sessionWindowShouldFollowNextOutput(win));
     }
   }
-  if (group.copyRef && text) group.copyRef.text += text;
+  if (group.copyRef && text && !group.copyRefCapped) {
+    if (group.copyRef.text.length + text.length > COMMAND_OUTPUT_COPY_TEXT_CAP) {
+      // Stop retaining the concatenation of ALL streamed output in JS heap
+      // for the session's lifetime. The copy button re-fetches the full
+      // text lazily through the persisted-output lane (same source the
+      // expand-after-finalize path loads); the captured prefix stays as
+      // the offline fallback.
+      group.copyRefCapped = true;
+      group.copyRef.fetchText = () => fetchCommandOutputGroupText(group);
+    } else {
+      group.copyRef.text += text;
+    }
+  }
   if (c.output_id && !group.outputIdSet.has(c.output_id)) {
     group.outputIdSet.add(c.output_id);
     group.outputIds.push(c.output_id);
@@ -55374,7 +55631,7 @@ function renderCommandOutputEntry(c) {
   }
   appendCommandOutputChunk(activeCommandOutputGroup, c);
   const stream = document.getElementById('log-stream');
-  if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
+  if (!concurrentLogDetachedFragment && autoScroll && stream) scheduleMainLogScrollToBottom();
 }
 
 function finalizeCommandOutputGroup(group) {
@@ -55439,6 +55696,22 @@ async function loadCommandOutputIntoBody(group, body) {
   if (!body.childElementCount) {
     body.textContent = 'No persisted output found.';
   }
+}
+
+// Copy-text retention cap for streaming command-output groups (2 MiB of
+// UTF-16 units). Beyond it the copy ref switches to the lazy fetch below.
+const COMMAND_OUTPUT_COPY_TEXT_CAP = 2 * 1024 * 1024;
+
+// Full output text for a capped group's copy button — same persisted-output
+// RPC the finalized expand path uses, joined in stream order.
+async function fetchCommandOutputGroupText(group) {
+  if (!group?.outputIds?.length) return '';
+  const resp = await daemonApi.request('api_session_current_agent_output', { ids: group.outputIds });
+  const json = (resp.body && typeof resp.body === 'object') ? resp.body : {};
+  if (!resp.ok) throw new Error(json.error || `HTTP ${resp.status}`);
+  return (json.outputs || [])
+    .map(out => [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : ''))
+    .join('');
 }
 
 async function toggleCommandOutputView(group, view) {
@@ -56038,11 +56311,19 @@ function parseUsageJson(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+// One full update_usage payload per session ever seen otherwise accumulates
+// for the lifetime of the tab (days-long dashboards → MBs). LRU past the cap:
+// re-inserting on write keeps the actively-updating sessions at the tail.
+const SESSION_USAGE_CACHE_CAP = 500;
 function cacheSessionUsage(c) {
   if (!c || typeof c !== 'object') return;
   const sid = String(c.session_id || '').trim();
   if (sid) {
+    sessionUsageById.delete(sid);
     sessionUsageById.set(sid, c);
+    while (sessionUsageById.size > SESSION_USAGE_CACHE_CAP) {
+      sessionUsageById.delete(sessionUsageById.keys().next().value);
+    }
   } else {
     latestGlobalUsage = c;
   }
@@ -56132,13 +56413,20 @@ function updateStatusBar(d, opts = {}) {
                && relatedSessionIdsForSession(statusSid).has(foreground)))
         : false);
   if (drivesForeground) {
-    if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
-    if (d.model) document.getElementById('sb-model').textContent = d.model;
-    if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
+    // Null-guarded like the rest of the file: this runs mid-UiCommand
+    // batch, and a missing chip must degrade to a skipped write, not an
+    // exception that eats the remaining commands.
+    const providerEl = document.getElementById('sb-provider');
+    if (d.provider && providerEl) providerEl.textContent = d.provider;
+    const modelEl = document.getElementById('sb-model');
+    if (d.model && modelEl) modelEl.textContent = d.model;
+    const turnEl = document.getElementById('sb-turn');
+    if (d.turn !== undefined && d.turn !== null && turnEl) turnEl.textContent = 'T' + d.turn;
     if (d.budget_pct !== undefined && d.budget_pct !== null) setContextUsagePct(d.budget_pct);
   }
-  if (d.autonomy) {
-    const el = document.getElementById('sb-autonomy');
+  const autonomyEl = document.getElementById('sb-autonomy');
+  if (d.autonomy && autonomyEl) {
+    const el = autonomyEl;
     const autonomy = normalizeAutonomyLabel(d.autonomy);
     el.textContent = autonomy;
     const colors = { Low: 'var(--red)', Medium: 'var(--yellow)', High: 'var(--teal)', Full: 'var(--green)' };
@@ -65085,7 +65373,12 @@ class DisplaySlot {
     // is waiting for display signaling to return instead of burning its
     // bounded retry budget on offers that cannot leave the browser.
     this._transportWaitTimer = null;
+    // Presence streaming: dedicated capture canvases per lane, sized on
+    // dimension change only (assigning canvas.width reallocates the backing
+    // store — the old single shared canvas paid two reallocations per tick).
     this._streamCanvas = document.createElement('canvas');
+    this._hqStreamCanvas = document.createElement('canvas');
+    this._streamEncodePending = false;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -66247,6 +66540,31 @@ class DisplaySlot {
   toggleStreaming() {
     if (this.streaming) { this.stopStreaming(); } else { this.startStreaming(); }
   }
+  // Size a capture canvas once per dimension change — width/height
+  // assignment reallocates the backing store even when the value is equal
+  // in some engines, so guard both.
+  static _sizeCanvas(canvas, w, h) {
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+  }
+  // Async JPEG→base64: toBlob lets the browser encode off the main thread
+  // where it can; only the byte→base64 conversion (chunked) stays on it.
+  // The old toDataURL path blocked the main thread for encode AND base64
+  // (~10-40 ms/tick at retina), on the same thread as remote-control input.
+  static _canvasJpegBase64(canvas, quality) {
+    return new Promise((resolve, reject) => {
+      if (typeof canvas.toBlob !== 'function') {
+        resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+        return;
+      }
+      canvas.toBlob(blob => {
+        if (!blob) { reject(new Error('canvas JPEG encode failed')); return; }
+        blob.arrayBuffer()
+          .then(buf => resolve(dashboardControlBytesToBase64(new Uint8Array(buf))))
+          .catch(reject);
+      }, 'image/jpeg', quality);
+    });
+  }
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
@@ -66255,47 +66573,55 @@ class DisplaySlot {
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
     this.frameIdEl.style.display = '';
     const streamName = 'display_' + this.displayId;
-    const ctx = this._streamCanvas.getContext('2d');
+    const liveCtx = this._streamCanvas.getContext('2d');
+    const hqCtx = this._hqStreamCanvas.getContext('2d');
     this._streamIntervalId = setInterval(() => {
       if (!this.streaming || !this.connected || !app) return;
       const vid = this.videoEl;
       if (!vid.videoWidth || !vid.videoHeight) return;
+      // Last tick's encode still in flight (slow machine / huge retina
+      // frame): skip this tick instead of stacking encodes.
+      if (this._streamEncodePending) return;
       const sw = vid.videoWidth;
       const sh = vid.videoHeight;
       this._streamFrameCounter++;
       const frameId = streamName + '-f' + String(this._streamFrameCounter).padStart(5, '0');
       // Live-res: scale to LIVE_RES maintaining aspect ratio within a square
       const scale = Math.min(LIVE_RES / sw, LIVE_RES / sh);
-      const lw = Math.round(sw * scale);
-      const lh = Math.round(sh * scale);
-      this._streamCanvas.width = lw;
-      this._streamCanvas.height = lh;
-      ctx.drawImage(vid, 0, 0, lw, lh);
-      const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
-      const liveB64 = liveJpeg.split(',')[1];
-      // Skip duplicate frames for voice model — still send HQ to server for archival
-      const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
-      const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
-      if (!frameDup) {
-        this._lastFrameLen = liveB64.length;
-        app.send_frame(liveB64, frameId);
-        this.frameIdEl.textContent = frameId.split('-').pop();
-        this.frameIdEl.style.color = 'var(--overlay0)';
-        tickerFramesSent++;
-      } else {
-        this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
-        this.frameIdEl.style.color = 'var(--yellow)';
-        tickerFramesDropped++;
-        sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
-      }
-      // HQ: logical resolution — always sent for archival
+      DisplaySlot._sizeCanvas(this._streamCanvas, Math.round(sw * scale), Math.round(sh * scale));
+      liveCtx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
+      // HQ: logical resolution — always sent for archival. Drawn in the
+      // same tick as the live lane so both lanes capture the same instant.
       const dpr = window.devicePixelRatio || 1;
-      this._streamCanvas.width = Math.round(sw / dpr);
-      this._streamCanvas.height = Math.round(sh / dpr);
-      ctx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
-      const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.80);
-      const hqB64 = hqJpeg.split(',')[1];
-      sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+      DisplaySlot._sizeCanvas(this._hqStreamCanvas, Math.round(sw / dpr), Math.round(sh / dpr));
+      hqCtx.drawImage(vid, 0, 0, this._hqStreamCanvas.width, this._hqStreamCanvas.height);
+      this._streamEncodePending = true;
+      Promise.all([
+        DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
+        DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
+      ]).then(([liveB64, hqB64]) => {
+        if (!this.streaming) return;
+        // Skip duplicate frames for voice model — still send HQ to server for archival
+        const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
+        const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
+        if (!frameDup) {
+          this._lastFrameLen = liveB64.length;
+          app.send_frame(liveB64, frameId);
+          this.frameIdEl.textContent = frameId.split('-').pop();
+          this.frameIdEl.style.color = 'var(--overlay0)';
+          tickerFramesSent++;
+        } else {
+          this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+          this.frameIdEl.style.color = 'var(--yellow)';
+          tickerFramesDropped++;
+          sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
+        }
+        sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+      }).catch(err => {
+        console.warn('[DisplaySlot] stream frame encode failed', err);
+      }).finally(() => {
+        this._streamEncodePending = false;
+      });
     }, 1000);
   }
   stopStreaming() {
@@ -68224,9 +68550,34 @@ function applyDisplayStripState() {
     railRaf = requestAnimationFrame(renderWorkspace);
   }
 
-  function observe(element, options) {
+  // Self-feed filter: the 3 s getStats sampler writes the metrics chip and
+  // the 1 Hz presence-stream tick writes the frame-id chip — both INSIDE
+  // the observed container — so every sample re-rendered the whole rail
+  // forever, even on a tab the user wasn't looking at. Mutations that only
+  // touch those periodic chips are dropped here; every rail-visible state
+  // they correlate with (streaming class flips, status text, connection
+  // classes) still arrives through its own mutation. characterData records
+  // target TEXT nodes — classify by the parent element.
+  const RAIL_SELF_FEED_SELECTOR = '.display-live-metrics, .stream-frame-id';
+  function railMutationIgnored(record) {
+    const target = record.target;
+    const el = target.nodeType === 1 ? target : target.parentElement;
+    return Boolean(el && el.closest && el.closest(RAIL_SELF_FEED_SELECTOR));
+  }
+  function observe(element, options, filterSelfFeed = false) {
     if (!element) return;
-    new MutationObserver(scheduleWorkspace).observe(element, options);
+    if (!filterSelfFeed) {
+      new MutationObserver(scheduleWorkspace).observe(element, options);
+      return;
+    }
+    new MutationObserver((records) => {
+      for (const record of records) {
+        if (!railMutationIgnored(record)) {
+          scheduleWorkspace();
+          return;
+        }
+      }
+    }).observe(element, options);
   }
   // The observer catches legacy direct DOM writes without rebuilding the
   // rail. Keyed rows and stable authority/screen controls preserve focus;
@@ -68238,7 +68589,7 @@ function applyDisplayStripState() {
     characterData: true,
     attributes: true,
     attributeFilter: ['class', 'style', 'aria-pressed', 'disabled'],
-  });
+  }, true);
   observe(document.getElementById('station-peer-chips'), {
     subtree: true,
     childList: true,
@@ -72150,19 +72501,31 @@ async function* extractClipFrames(player, inSecs, outSecs, fps, keyframes, annot
     }
 
     const blob = await new Promise(r => captureCanvas.toBlob(r, 'image/jpeg', quality));
-    const b64 = await new Promise(r => {
-      const reader = new FileReader();
-      reader.onload = () => r(reader.result.split(',')[1]);
-      reader.readAsDataURL(blob);
-    });
+    // Raw bytes are the canonical yield: the tunnel lane uploads them
+    // directly, and only the legacy /ws payload and attach data-URLs
+    // derive base64 (clipFrameBase64) — the old per-frame FileReader
+    // base64 round-tripped 20-60 MB per clip through encode → decode.
+    const bytes = new Uint8Array(await blob.arrayBuffer());
 
-    yield { index: i, total: timestamps.length, t, isKeyframe, annotated: hasAnnotation, b64, blob };
+    yield { index: i, total: timestamps.length, t, isKeyframe, annotated: hasAnnotation, bytes, blob };
   }
+}
+
+// Base64 for the lanes that still speak it (legacy /ws media messages,
+// pending-attachment data URLs). Chunked conversion — see
+// dashboardControlBytesToBase64 (50-control-transport.js).
+function clipFrameBase64(frame) {
+  return dashboardControlBytesToBase64(frame.bytes);
 }
 
 async function generateClipPreview() {
   if (clipInSecs === null || clipOutSecs === null || !recPlayer) return;
   const strip = document.getElementById('clip-preview-strip');
+  // Revoke the previous preview's object URLs before discarding the DOM —
+  // innerHTML='' alone pinned every prior strip's frame blobs until unload.
+  strip.querySelectorAll('img[src^="blob:"]').forEach(img => {
+    try { URL.revokeObjectURL(img.src); } catch (_) {}
+  });
   strip.innerHTML = '';
   strip.classList.remove('hidden');
 
@@ -72277,17 +72640,8 @@ async function submitClip(action) {
       progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
 
       const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
-      const framePayload = {
-        t: 'clip_frame',
-        clip_id: clipId,
-        frame_id: frameId,
-        frame_index: frame.index,
-        timestamp_secs: frame.t,
-        is_keyframe: frame.isKeyframe,
-        annotated: frame.annotated,
-        data: frame.b64,
-      };
       if (useMediaTunnel) {
+        // Binary lane: raw bytes straight through — no base64 round trip.
         await uploadDashboardMediaTunnel('api_media_clip_frame', {
           clip_id: clipId,
           frame_id: frameId,
@@ -72295,12 +72649,21 @@ async function submitClip(action) {
           timestamp_secs: frame.t,
           is_keyframe: frame.isKeyframe,
           annotated: frame.annotated,
-        }, dashboardControlBase64ToBytes(frame.b64), 'clip frame');
+        }, frame.bytes, 'clip frame');
       } else {
-        sendLegacyMediaEditorMessage(framePayload);
+        sendLegacyMediaEditorMessage({
+          t: 'clip_frame',
+          clip_id: clipId,
+          frame_id: frameId,
+          frame_index: frame.index,
+          timestamp_secs: frame.t,
+          is_keyframe: frame.isKeyframe,
+          annotated: frame.annotated,
+          data: clipFrameBase64(frame),
+        });
       }
       if (action === 'attach') {
-        sentFrames.push({ frameId, b64: frame.b64 });
+        sentFrames.push({ frameId, b64: clipFrameBase64(frame) });
       }
       frameIndex++;
 
@@ -72981,6 +73344,10 @@ const contextViz = {
   rotationX: 0.34,
   rotationY: -0.48,
   zoom: 38,
+  // Identity of the analyzed snapshot + timeline shape the current Three
+  // scene was built from; contextBuildThree skips the teardown/rebuild
+  // when it matches (48b-context-viz.js).
+  sceneKey: '',
 };
 
 // analyzeContextSnapshot walks the entire raw payload, which is expensive at
@@ -73959,7 +74326,8 @@ function stepContextReplaySnapshot(delta) {
     contextReplayMode = 'replay';
     contextReplayIndexBySession.set(key, next);
     contextSelectedPartId = null;
-    renderContextPane();
+    // Coalesced like the slider: held arrow keys repeat faster than frames.
+    scheduleContextPaneRender();
   }
   return true;
 }
@@ -74060,7 +74428,11 @@ function wireContextPaneListeners() {
     contextReplayMode = 'replay';
     contextReplayIndexBySession.set(key, Math.max(0, Math.min(timeline.length - 1, Number(target.value) || 0)));
     contextSelectedPartId = null;
-    renderContextPane();
+    // rAF-coalesced: range inputs fire per pixel while dragging, and each
+    // distinct index is a different snapshot (full analyze + scene build).
+    // Intermediate positions within one frame render nothing the eye
+    // would have seen; the trailing frame shows the slider's final index.
+    scheduleContextPaneRender();
   });
   document.addEventListener('keydown', ev => {
     if (contextShouldHandleKeyboardEvent(ev)) {
@@ -74092,6 +74464,9 @@ function focusContextPart(partId) {
   contextUpdateMeshSelection();
   contextViz.zoom = Math.min(contextViz.zoom, 28);
   contextRenderThree();
+  // The bob loop runs only while a part is selected — (re)arm it here
+  // (it exits on deselect/tab-away by itself).
+  if (contextPaneVisible()) contextStartThreeAnimation();
 }
 
 function contextDisposeObject(object) {
@@ -74317,13 +74692,45 @@ function contextLabelSprite(text, color = CONTEXT_VIZ_THEME.labelText, scale = 1
   return sprite;
 }
 
+// Label sprites are the GPU-upload churn of a scene rebuild (2D-canvas text
+// rasterize + CanvasTexture upload per label). Text/color/scale triples
+// recur across rebuilds — category lane names, the timeline caption — so
+// cache the sprites and let contextClearThreeRoot detach them undisposed.
+// Eviction disposes only unparented sprites; one still in the scene loses
+// its cached flag instead, so the next root clear disposes it normally.
+const contextLabelSpriteCache = new Map();
+const CONTEXT_LABEL_SPRITE_CACHE_CAP = 96;
+function contextLabelSpriteCached(text, color = CONTEXT_VIZ_THEME.labelText, scale = 1) {
+  // labelBg is read inside contextLabelSprite - key on it too so a theme
+  // flip re-rasterizes instead of serving stale-background sprites.
+  const key = [text, color, scale, CONTEXT_VIZ_THEME.labelBg].join('\u001f');
+  let sprite = contextLabelSpriteCache.get(key);
+  if (sprite) {
+    contextLabelSpriteCache.delete(key);
+    contextLabelSpriteCache.set(key, sprite); // LRU bump
+    return sprite;
+  }
+  sprite = contextLabelSprite(text, color, scale);
+  sprite.userData.cachedLabel = true;
+  contextLabelSpriteCache.set(key, sprite);
+  while (contextLabelSpriteCache.size > CONTEXT_LABEL_SPRITE_CACHE_CAP) {
+    const [oldKey, old] = contextLabelSpriteCache.entries().next().value;
+    contextLabelSpriteCache.delete(oldKey);
+    if (old.parent) old.userData.cachedLabel = false;
+    else contextDisposeObject(old);
+  }
+  return sprite;
+}
+
 function contextClearThreeRoot() {
   if (!contextViz.root) return;
   for (const child of [...contextViz.root.children]) {
     contextViz.root.remove(child);
+    if (child.userData && child.userData.cachedLabel) continue;
     contextDisposeObject(child);
   }
   contextViz.meshes = [];
+  contextViz.sceneKey = '';
 }
 
 function contextPressureColor(pct) {
@@ -74336,8 +74743,30 @@ function contextBuildThree(analysis, snapshot) {
   const empty = document.getElementById('context-scene-empty');
   if (empty) empty.style.display = analysis && analysis.parts.length ? 'none' : 'flex';
   if (!contextInitThree()) return;
+  // Scene identity: analyzed snapshot + the timeline shape the rail bars
+  // render from (+ theme, whose colors bake into materials). Re-renders
+  // for the SAME scene — another session's context_snapshot arriving while
+  // this pane is visible, detail-pane churn, selection changes — used to
+  // tear down and rebuild every geometry, material, and label texture.
+  // Selection highlighting mutates in place (contextUpdateMeshSelection),
+  // so it deliberately stays out of the key.
+  const { timeline } = contextTimelineForForegroundSession();
+  const sceneKey = analysis && analysis.parts.length
+    ? [
+        contextRawRenderKey(snapshot),
+        timeline.length,
+        timeline.indexOf(snapshot),
+        CONTEXT_VIZ_THEME.labelBg,
+      ].join('|')
+    : 'empty';
+  if (contextViz.sceneKey === sceneKey && (sceneKey === 'empty' || contextViz.meshes.length)) {
+    contextUpdateMeshSelection();
+    contextRenderThree();
+    return;
+  }
   contextClearThreeRoot();
   if (!analysis || !analysis.parts.length) {
+    contextViz.sceneKey = 'empty';
     contextRenderThree();
     return;
   }
@@ -74354,7 +74783,7 @@ function contextBuildThree(analysis, snapshot) {
     lane.position.set(x, -0.06, 0);
     root.add(lane);
     const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
-    const label = contextLabelSprite(def.label, def.color, 1.25);
+    const label = contextLabelSpriteCached(def.label, def.color, 1.25);
     label.position.set(x, 0.65, -zSpread / 2 - 2.2);
     root.add(label);
   }
@@ -74412,16 +74841,15 @@ function contextBuildThree(analysis, snapshot) {
   );
   fill.position.set(reservoirX, fillHeight / 2, 0);
   root.add(fill);
-  const usageLabel = contextLabelSprite(`${Math.round(pct * 100)}% window`, contextPressureColor(pct), 1.1);
+  const usageLabel = contextLabelSpriteCached(`${Math.round(pct * 100)}% window`, contextPressureColor(pct), 1.1);
   usageLabel.position.set(reservoirX, reservoirHeight + 1.1, 0);
   root.add(usageLabel);
   if (hardWindow && hardWindow !== effectiveWindow) {
-    const hardLabel = contextLabelSprite('hard limit tracked', CONTEXT_VIZ_THEME.pressure.high, 0.9);
+    const hardLabel = contextLabelSpriteCached('hard limit tracked', CONTEXT_VIZ_THEME.pressure.high, 0.9);
     hardLabel.position.set(reservoirX, -0.2, 2.7);
     root.add(hardLabel);
   }
 
-  const { timeline } = contextTimelineForForegroundSession();
   if (timeline.length > 1) {
     const selectedIdx = timeline.indexOf(snapshot);
     const railWidth = Math.min(28, Math.max(10, timeline.length * 0.72));
@@ -74441,11 +74869,12 @@ function contextBuildThree(analysis, snapshot) {
       bar.position.set(x, barHeight / 2, zSpread / 2 + 3.6);
       root.add(bar);
     });
-    const railLabel = contextLabelSprite('session replay timeline', CONTEXT_VIZ_THEME.railLabel, 1.0);
+    const railLabel = contextLabelSpriteCached('session replay timeline', CONTEXT_VIZ_THEME.railLabel, 1.0);
     railLabel.position.set(0, 5.6, zSpread / 2 + 3.6);
     root.add(railLabel);
   }
 
+  contextViz.sceneKey = sceneKey;
   contextUpdateMeshSelection();
   contextRenderThree();
 }
@@ -74493,10 +74922,12 @@ function contextRenderThree(time = 0) {
   if (contextViz.root) {
     contextViz.root.rotation.set(0, 0, 0);
   }
-  if (time && contextViz.meshes.length) {
+  if (contextViz.meshes.length) {
     const t = time * 0.001;
     for (const mesh of contextViz.meshes) {
-      const selected = mesh.userData.partId === contextSelectedPartId;
+      // On-demand renders pass time=0: settle every mesh at its base so a
+      // retired bob loop can't strand the previously-selected mesh mid-arc.
+      const selected = time && mesh.userData.partId === contextSelectedPartId;
       if (selected) {
         mesh.position.y = mesh.userData.baseY + Math.sin(t * 3.2) * 0.08;
       } else {
@@ -74507,13 +74938,25 @@ function contextRenderThree(time = 0) {
   contextViz.renderer.render(contextViz.scene, contextViz.camera);
 }
 
+// The only per-frame animation is the selected-part bob — with nothing
+// selected the scene is static and every interaction (drag, zoom, snapshot,
+// slider) already renders on demand, so the 60 fps loop only runs while a
+// part is selected and stops itself on deselect/tab-away (with one settling
+// render so the bob doesn't freeze mid-arc).
 function contextStartThreeAnimation() {
+  if (!contextSelectedPartId) {
+    contextStopThreeAnimation();
+    contextRenderThree();
+    return;
+  }
   if (contextViz.raf) return;
   const frame = time => {
     contextViz.raf = null;
-    if (activeTab === 'activity' && activeActivitySubtab === 'context') {
+    if (activeTab === 'activity' && activeActivitySubtab === 'context' && contextSelectedPartId) {
       contextRenderThree(time);
       contextViz.raf = requestAnimationFrame(frame);
+    } else {
+      contextRenderThree();
     }
   };
   contextViz.raf = requestAnimationFrame(frame);
@@ -75117,6 +75560,22 @@ async function refreshVirtualDisplayAvailability() {
     }
   }
   updateVirtualDisplayAvailabilityUi();
+}
+
+// Coalesced twin for PROGRESS-driven callers (per-chunk response/byte-stream
+// frames). dashboardUpdateTransportStatus rebuilds the full debugStatus
+// object, re-renders four target summaries, and refreshes several dependent
+// surfaces — running that per 16 KiB chunk burned ~0.3–1 ms of main thread
+// per chunk on large pulls. Steady-state progress coalesces into one
+// trailing 100 ms tick; state TRANSITIONS (open/close/error, stream
+// start/end/complete/reject) keep calling the immediate form.
+let dashboardTransportStatusTickTimer = 0;
+function dashboardScheduleTransportStatusUpdate() {
+  if (dashboardTransportStatusTickTimer) return;
+  dashboardTransportStatusTickTimer = window.setTimeout(() => {
+    dashboardTransportStatusTickTimer = 0;
+    dashboardUpdateTransportStatus();
+  }, 100);
 }
 
 function dashboardUpdateTransportStatus() {
@@ -77577,7 +78036,11 @@ class DashboardControlTransport {
         return;
       }
       if (dashboardServerMessageDispatcher) {
-        dashboardServerMessageDispatcher(JSON.stringify(msg));
+        // Pass the already-parsed frame: the dispatcher and the WASM
+        // handoff accept objects (the tunnel event path below has always
+        // passed payload objects) — re-stringifying here forced a
+        // parse → stringify → parse round trip per PTY output frame.
+        dashboardServerMessageDispatcher(msg);
       }
       return;
     }
@@ -77710,7 +78173,9 @@ class DashboardControlTransport {
     if (!completed && this.chunkedResponses.has(chunkKey)) {
       this.sendChunkCredit(id, 1, chunkKey === id ? null : chunkKey);
     }
-    dashboardUpdateTransportStatus();
+    // Per-chunk progress: coalesced tick. Completion/rejection inside
+    // maybeCompleteChunkedResponse already rendered immediately.
+    dashboardScheduleTransportStatusUpdate();
   }
 
   handleResponseEnd(msg) {
@@ -77841,7 +78306,8 @@ class DashboardControlTransport {
     if (!completed && this.byteStreams.has(streamId)) {
       this.sendChunkCredit(id, 1, streamId === id ? null : streamId);
     }
-    dashboardUpdateTransportStatus();
+    // Per-chunk progress: coalesced tick (transitions render immediately).
+    dashboardScheduleTransportStatusUpdate();
   }
 
   handleByteStreamEnd(msg) {
@@ -78902,11 +79368,14 @@ function dashboardControlBase64ToBytes(value) {
 }
 
 function dashboardControlBytesToBase64(bytes) {
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i += 1) {
-    binary += String.fromCharCode(bytes[i]);
+  // Batch via fromCharCode.apply over bounded slices: the per-byte string
+  // concatenation this replaces built ~16k intermediate strings per upload
+  // chunk. 0x8000 stays comfortably under engine argument-count limits.
+  const chunks = [];
+  for (let i = 0; i < bytes.byteLength; i += 0x8000) {
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(''));
 }
 
 function dashboardControlRequestTimeoutMs(method) {
@@ -80061,6 +80530,23 @@ async function fetchRemoteAgentCard(baseUrl) {
   return card;
 }
 
+// Last-rendered snapshot guards: peer status flips (idle↔working) arrive per
+// remote task activity and used to rebuild the whole daemons list — plus a
+// seven-surface cascade (host filter sweep over up to 10k log entries, three
+// select rebuilds) — even when nothing rendered had changed. The row HTML is
+// its own signature for the list; the pickers' inputs (id/label/connected)
+// get a dedicated one so a mid-row change (e.g. version skew) doesn't churn
+// the selects.
+let daemonsListHostOptionsSig = null;
+
+function daemonsListHostOptionsSignature() {
+  return JSON.stringify([
+    selfPeerId,
+    selfHostLabel,
+    ...daemons.map(d => [d.host_id, d.label || '', d.connected !== false]),
+  ]);
+}
+
 function renderDaemonsList() {
   const el = document.getElementById('daemons-list');
   if (!el) return;
@@ -80079,7 +80565,16 @@ function renderDaemonsList() {
   for (const d of daemons) {
     rows.push(renderDaemonRow(d, false));
   }
-  el.innerHTML = rows.join('');
+  const html = rows.join('');
+  if (el.__intendantRenderedHtml === html) {
+    // Identical rendered list: the existing DOM (with its listeners,
+    // expansion state, approvals section, and attached display panes)
+    // stays — skip straight to the cheap always-on consumers below.
+    renderDaemonsListTail();
+    return;
+  }
+  el.__intendantRenderedHtml = html;
+  el.innerHTML = html;
 
   // Wire remove buttons.
   el.querySelectorAll('.daemon-row .remove-btn').forEach(btn => {
@@ -80159,8 +80654,19 @@ function renderDaemonsList() {
   // attached to the freshly-rendered <video> elements after re-render.
   reapplyPeerDisplayPanes();
 
+  renderDaemonsListTail();
+}
+
+// The always-on consumers of a daemons-list render — run on every call,
+// whether or not the row DOM was rebuilt. The four host pickers rebuild
+// only when their actual inputs changed (see daemonsListHostOptionsSig):
+// refreshHostFilterOptions ends in applyHostFilter, a class-toggle sweep
+// over every retained log entry, and each picker resets its <select>.
+function renderDaemonsListTail() {
   // Keep the Station header's peer-display chips in sync with the same
-  // peer add/remove/state events that re-render this list.
+  // peer add/remove/state events that re-render this list. Cheap
+  // (replaceChildren over a handful of peers) and display lists aren't
+  // fully encoded in the row HTML, so this stays unconditional.
   stationRenderPeerChips();
 
   // Toggle host-badge visibility in the Activity tab. Single-host
@@ -80170,18 +80676,23 @@ function renderDaemonsList() {
     logStream.classList.toggle('show-host-badges', daemons.length > 0);
   }
 
-  // Keep the Activity host filter dropdown in sync with the current
-  // daemon list (options may have been added/removed).
-  refreshHostFilterOptions();
+  const optionsSig = daemonsListHostOptionsSignature();
+  if (daemonsListHostOptionsSig !== optionsSig) {
+    daemonsListHostOptionsSig = optionsSig;
 
-  // Same for the Stats tab host picker.
-  refreshStatsHostPicker();
+    // Keep the Activity host filter dropdown in sync with the current
+    // daemon list (options may have been added/removed).
+    refreshHostFilterOptions();
 
-  // Same for the Files tab download source selector.
-  refreshFilesDownloadHostOptions();
+    // Same for the Stats tab host picker.
+    refreshStatsHostPicker();
 
-  // Same for the Terminal Shell target selector.
-  refreshShellHostOptions();
+    // Same for the Files tab download source selector.
+    refreshFilesDownloadHostOptions();
+
+    // Same for the Terminal Shell target selector.
+    refreshShellHostOptions();
+  }
 
   // Target summaries reuse the same daemon list and should track
   // add/remove/offline transitions immediately.
@@ -89465,6 +89976,11 @@ function filesTransferPersistable(transfer) {
 }
 
 function filesTransferPersistState() {
+  // A direct persist supersedes any scheduled one.
+  if (filesTransferPersistTimer) {
+    clearTimeout(filesTransferPersistTimer);
+    filesTransferPersistTimer = 0;
+  }
   try {
     const state = filesTransfers
       .map(filesTransferPersistable)
@@ -89475,6 +89991,24 @@ function filesTransferPersistState() {
     console.warn('Persist transfer state failed:', err);
   }
 }
+
+// Trailing-throttled twin for the per-chunk progress paths: a fast LAN
+// download lands ~50 chunks/s, and each chunk used to JSON.stringify up to
+// 50 transfer records into a synchronous localStorage.setItem. Progress
+// coalesces to ≤1 write/s; status transitions keep the immediate form, and
+// chunk-level resume state already lives durably in IndexedDB (losing ≤1 s
+// of rangeCount on a crash just re-fetches that tail on resume).
+let filesTransferPersistTimer = 0;
+function filesTransferPersistStateSoon() {
+  if (filesTransferPersistTimer) return;
+  filesTransferPersistTimer = window.setTimeout(() => {
+    filesTransferPersistTimer = 0;
+    filesTransferPersistState();
+  }, 1000);
+}
+window.addEventListener('pagehide', () => {
+  if (filesTransferPersistTimer) filesTransferPersistState();
+});
 
 function restoreFilesTransferState() {
   let state = [];
@@ -90027,74 +90561,143 @@ function renderFilesTransfers() {
     renderFilesTransfersNow();
   });
 }
+// Keyed rows, patched in place. The rAF-coalesced full rebuild above still
+// rebuilt EVERY row — titles, meters, fresh action buttons for ~100 history
+// entries — per animation frame during a fast download. A row's structure
+// (status classes, actions, title) rebuilds only when its structure
+// signature moves; per-chunk progress patches just the meta text and meter
+// width on the existing nodes.
+const filesTransferRowCache = new Map(); // transfer.id → { row, meta, fill, sig }
+
+function filesTransferRowStructureSig(transfer) {
+  return [
+    transfer.status || 'queued',
+    transfer.kind || '',
+    transfer.serverJobId || transfer.resumeToken ? 'server' : '',
+    filesTransferTitle(transfer),
+    transfer.sourceLabel || transfer.path || transfer.file?.name || '',
+    transfer.error || '',
+    transfer.destination || '',
+    // Action-set inputs beyond status/kind:
+    (transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored) ? 'resumable-upload' : '',
+    transfer.loaded > 0 ? 'has-progress' : '',
+    transfer.result?.blob ? 'has-blob' : '',
+    transfer.rangeCount > 0 ? 'has-ranges' : '',
+  ].join('|');
+}
+
+function filesTransferRowMetaText(transfer) {
+  const direction = transfer.kind === 'upload' ? 'upload' : 'download';
+  const range = transfer.kind === 'download' && transfer.rangeCount
+    ? ` · ${transfer.rangeCount} range${transfer.rangeCount === 1 ? '' : 's'}`
+    : '';
+  const error = transfer.error ? ` · ${transfer.error}` : '';
+  const destination = transfer.kind === 'upload' && transfer.destination ? ` · ${transfer.destination}` : '';
+  const sourceText = transfer.kind === 'download' ? (transfer.sourceLabel || transfer.path || '') : '';
+  const source = sourceText ? ` · ${sourceText}` : '';
+  return `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${destination}${source}${error}`;
+}
+
+function filesTransferMeterWidth(transfer) {
+  const total = Number(transfer.totalSize || transfer.file?.size || 0);
+  const loaded = Number(transfer.loaded || 0);
+  return total > 0 ? `${Math.max(0, Math.min(100, loaded * 100 / total))}%` : '0%';
+}
+
+function buildFilesTransferRow(transfer) {
+  const row = document.createElement('div');
+  row.className = `files-transfer-row ${transfer.status || 'queued'}${transfer.serverJobId || transfer.resumeToken ? ' server' : ''}`;
+  row.dataset.transferId = transfer.id;
+  const main = document.createElement('div');
+  main.className = 'files-transfer-main';
+  const title = document.createElement('div');
+  title.className = 'files-transfer-title';
+  title.textContent = filesTransferTitle(transfer);
+  title.title = transfer.sourceLabel || transfer.path || transfer.file?.name || '';
+  const meta = document.createElement('div');
+  meta.className = 'files-transfer-meta';
+  meta.textContent = filesTransferRowMetaText(transfer);
+  const meter = document.createElement('div');
+  meter.className = 'files-transfer-meter';
+  const fill = document.createElement('div');
+  fill.className = 'files-transfer-meter-fill';
+  fill.style.width = filesTransferMeterWidth(transfer);
+  meter.appendChild(fill);
+  main.append(title, meta, meter);
+  const actions = document.createElement('div');
+  actions.className = 'files-transfer-actions';
+  const addAction = (label, handler, className = '') => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.className = className ? `ui-btn ${className}` : 'ui-btn';
+    btn.addEventListener('click', () => handler(transfer.id));
+    actions.appendChild(btn);
+  };
+  const canResumeUpload = transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored;
+  if (transfer.status === 'running' && transfer.kind === 'download') addAction('Pause', pauseFilesTransfer);
+  if (transfer.status === 'running') addAction('Cancel', cancelFilesTransfer, 'danger');
+  if (transfer.status === 'queued') addAction('Cancel', cancelFilesTransfer, 'danger');
+  if (transfer.status === 'paused' && canResumeUpload) addAction('Resume', resumeFilesTransfer);
+  if (transfer.status === 'failed' && transfer.kind === 'download' && transfer.loaded > 0) addAction('Resume', resumeFilesTransfer);
+  if (['failed', 'cancelled'].includes(transfer.status)) addAction('Retry', retryFilesTransfer);
+  if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.result?.blob) {
+    addAction('Save', () => downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type));
+  } else if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.rangeCount > 0) {
+    addAction('Save', saveCompletedFilesDownload);
+  }
+  row.append(main, actions);
+  return { row, meta, fill };
+}
+
 function renderFilesTransfersNow() {
   pruneFinishedFilesTransfers();
   const list = document.getElementById('files-transfer-list');
   if (!list) return;
-  list.innerHTML = '';
   if (filesTransfers.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'files-transfer-empty ui-empty compact';
-    empty.innerHTML = '<div class="ui-empty-title">No transfers</div>' +
-      '<div class="ui-empty-hint">Downloads and uploads show up here with live progress.</div>';
-    list.appendChild(empty);
+    filesTransferRowCache.clear();
+    if (!list.querySelector('.files-transfer-empty')) {
+      list.innerHTML = '';
+      const empty = document.createElement('div');
+      empty.className = 'files-transfer-empty ui-empty compact';
+      empty.innerHTML = '<div class="ui-empty-title">No transfers</div>' +
+        '<div class="ui-empty-hint">Downloads and uploads show up here with live progress.</div>';
+      list.appendChild(empty);
+    }
     return;
   }
-  for (const transfer of filesTransfers) {
-    const row = document.createElement('div');
-    row.className = `files-transfer-row ${transfer.status || 'queued'}${transfer.serverJobId || transfer.resumeToken ? ' server' : ''}`;
-    row.dataset.transferId = transfer.id;
-    const main = document.createElement('div');
-    main.className = 'files-transfer-main';
-    const title = document.createElement('div');
-    title.className = 'files-transfer-title';
-    title.textContent = filesTransferTitle(transfer);
-    title.title = transfer.sourceLabel || transfer.path || transfer.file?.name || '';
-    const meta = document.createElement('div');
-    meta.className = 'files-transfer-meta';
-    const direction = transfer.kind === 'upload' ? 'upload' : 'download';
-    const range = transfer.kind === 'download' && transfer.rangeCount
-      ? ` · ${transfer.rangeCount} range${transfer.rangeCount === 1 ? '' : 's'}`
-      : '';
-    const error = transfer.error ? ` · ${transfer.error}` : '';
-    const destination = transfer.kind === 'upload' && transfer.destination ? ` · ${transfer.destination}` : '';
-    const sourceText = transfer.kind === 'download' ? (transfer.sourceLabel || transfer.path || '') : '';
-    const source = sourceText ? ` · ${sourceText}` : '';
-    meta.textContent = `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${destination}${source}${error}`;
-    const meter = document.createElement('div');
-    meter.className = 'files-transfer-meter';
-    const fill = document.createElement('div');
-    fill.className = 'files-transfer-meter-fill';
-    const total = Number(transfer.totalSize || transfer.file?.size || 0);
-    const loaded = Number(transfer.loaded || 0);
-    fill.style.width = total > 0 ? `${Math.max(0, Math.min(100, loaded * 100 / total))}%` : '0%';
-    meter.appendChild(fill);
-    main.append(title, meta, meter);
-    const actions = document.createElement('div');
-    actions.className = 'files-transfer-actions';
-    const addAction = (label, handler, className = '') => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = label;
-      btn.className = className ? `ui-btn ${className}` : 'ui-btn';
-      btn.addEventListener('click', () => handler(transfer.id));
-      actions.appendChild(btn);
-    };
-    const canResumeUpload = transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored;
-    if (transfer.status === 'running' && transfer.kind === 'download') addAction('Pause', pauseFilesTransfer);
-    if (transfer.status === 'running') addAction('Cancel', cancelFilesTransfer, 'danger');
-    if (transfer.status === 'queued') addAction('Cancel', cancelFilesTransfer, 'danger');
-    if (transfer.status === 'paused' && canResumeUpload) addAction('Resume', resumeFilesTransfer);
-    if (transfer.status === 'failed' && transfer.kind === 'download' && transfer.loaded > 0) addAction('Resume', resumeFilesTransfer);
-    if (['failed', 'cancelled'].includes(transfer.status)) addAction('Retry', retryFilesTransfer);
-    if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.result?.blob) {
-      addAction('Save', () => downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type));
-    } else if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.rangeCount > 0) {
-      addAction('Save', saveCompletedFilesDownload);
+  list.querySelector('.files-transfer-empty')?.remove();
+  const liveIds = new Set(filesTransfers.map(t => t.id));
+  for (const [id, record] of filesTransferRowCache) {
+    if (!liveIds.has(id)) {
+      record.row.remove();
+      filesTransferRowCache.delete(id);
     }
-    row.append(main, actions);
-    list.appendChild(row);
   }
+  const orderedRows = [];
+  for (const transfer of filesTransfers) {
+    const sig = filesTransferRowStructureSig(transfer);
+    let record = filesTransferRowCache.get(transfer.id);
+    if (!record || record.sig !== sig) {
+      const built = buildFilesTransferRow(transfer);
+      if (record) record.row.replaceWith(built.row);
+      record = { ...built, sig };
+      filesTransferRowCache.set(transfer.id, record);
+    } else {
+      // Progress-only tick: meta text + meter width, guarded writes.
+      const metaText = filesTransferRowMetaText(transfer);
+      if (record.meta.textContent !== metaText) record.meta.textContent = metaText;
+      const width = filesTransferMeterWidth(transfer);
+      if (record.fill.style.width !== width) record.fill.style.width = width;
+    }
+    orderedRows.push(record.row);
+  }
+  // Reconcile order/membership only when it actually changed — moving
+  // nodes re-appends them (listeners survive, but focus does not).
+  const currentRows = Array.from(list.children).filter(el => el.classList.contains('files-transfer-row'));
+  const orderMatches = currentRows.length === orderedRows.length &&
+    currentRows.every((el, i) => el === orderedRows[i]);
+  if (!orderMatches) list.replaceChildren(...orderedRows);
 }
 
 function filesUpdateActiveDownloadSummary(transfer = null) {
@@ -90202,6 +90805,11 @@ function queueDashboardArtifactDownload(artifact, options = {}) {
 }
 
 function resetFilesDownloadTransfer(transfer) {
+  // Capture before zeroing: the persisted rangeCount bounds the IndexedDB
+  // cleanup — the unconditional 512 default issued up to 512 sequential
+  // no-op deletes per reset (IDB delete succeeds on missing keys, so the
+  // early-break never fired).
+  const rangeCount = Number(transfer.rangeCount || 0) || 512;
   transfer.loaded = 0;
   transfer.totalSize = 0;
   transfer.parts = [];
@@ -90214,7 +90822,7 @@ function resetFilesDownloadTransfer(transfer) {
   transfer.cancelRequested = false;
   transfer.abortController = null;
   transfer.debugFailedOnce = false;
-  filesTransferDeleteDownloadParts(transfer.id, 512);
+  filesTransferDeleteDownloadParts(transfer.id, rangeCount);
   filesTransferPersistState();
 }
 
@@ -90418,7 +91026,7 @@ async function runFilesDownloadTransfer(transfer) {
       transfer.parts.push(range.bytes);
       transfer.loaded = range.rangeEnd;
       transfer.rangeCount += 1;
-      filesTransferPersistState();
+      filesTransferPersistStateSoon();
       if (typeof transfer.onProgress === 'function') {
         transfer.onProgress({
           loaded: transfer.loaded,
@@ -90475,7 +91083,6 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
   const result = {
     ok: true,
     blob,
-    parts: transfer.parts.slice(),
     filename: transfer.filename || 'download.bin',
     content_type: transfer.contentType,
     size: blob.size,
@@ -90485,6 +91092,14 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
     range_count: transfer.rangeCount,
     resumable,
   };
+  // Drop the raw chunk arrays now that the Blob owns a snapshot of the
+  // bytes: keeping transfer.parts (plus a second result.parts copy of the
+  // same references) pinned the entire download in JS heap for as long as
+  // the terminal transfer sat in history — one 512 MB download held ~1 GB
+  // until reload. The chunks are durably in IndexedDB; Save-after-eviction
+  // rehydrates through filesTransferLoadDownloadParts, and completion
+  // consumers read result.blob, which stays.
+  transfer.parts = [];
   transfer.result = result;
   filesTransferTransition(transfer, 'completed', { actor: 'runner', result });
   setFilesDownloadProgress(result.size, result.total_size || result.size);
@@ -90847,7 +91462,7 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     filesTransferApplyServerJob(transfer, result.body.job);
     transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
-    filesTransferPersistState();
+    filesTransferPersistStateSoon();
     renderFilesTransfers();
     setFilesUploadStatus('warn', `Uploading ${filesTransferProgressText(transfer)}`);
     if (
@@ -91776,20 +92391,10 @@ function renderFilesIdeTree() {
     );
   }
   container.innerHTML = html.join('') || '<div class="files-ide-tree-notice">Empty directory</div>';
-  container.querySelectorAll('.files-ide-tree-row').forEach(rowEl => {
-    const path = rowEl.dataset.path || '';
-    const isDir = rowEl.dataset.dir === '1';
-    const open = () => (isDir ? filesIdeToggleDir(path) : filesIdeOpenFile(filesIdeSelectedHostId(), path));
-    rowEl.addEventListener('click', ev => {
-      if (ev.target.closest('.files-ide-row-act')) return;
-      state.focusedPath = path; // keep the roving tab stop on the clicked row
-      open();
-    });
-    // Keyboard activation (Enter/Space) rides the delegated container
-    // listener (filesIdeTreeKeydown), not a per-row handler.
-    rowEl.querySelector('[data-act="rename"]')?.addEventListener('click', () => filesIdeBeginRename(path, isDir));
-    rowEl.querySelector('[data-act="delete"]')?.addEventListener('click', () => filesIdeDeleteRequested(path, isDir));
-  });
+  // Row and action clicks ride ONE delegated container listener
+  // (filesIdeTreeClick), exactly like keydown always has — the per-row
+  // wiring this replaces attached three fresh listeners per row on every
+  // rebuild (each expand/collapse/arrow-key near the 500-entry cap).
   // Re-renders triggered from the keyboard (expand/collapse/arming) must
   // not dump focus onto <body>: put it back on the roving row. The create
   // and rename inputs are focused below and win when present.
@@ -91908,11 +92513,37 @@ function filesIdeTreeKeydown(ev) {
   ev.preventDefault();
 }
 
+// Delegated click twin of filesIdeTreeKeydown: rows are re-rendered
+// wholesale via innerHTML, so per-row listeners cost three attaches per row
+// per render. Same guards as the old per-row handlers — action buttons
+// resolve before the row, and clicks inside create/rename inputs fall
+// through to the fields.
+function filesIdeTreeClick(ev) {
+  const target = ev.target instanceof Element ? ev.target : null;
+  if (!target || target.closest('input, textarea')) return;
+  const row = target.closest('.files-ide-tree-row');
+  if (!row) return;
+  const path = row.dataset.path || '';
+  const isDir = row.dataset.dir === '1';
+  const act = target.closest('.files-ide-row-act');
+  if (act) {
+    if (act.dataset.act === 'rename') filesIdeBeginRename(path, isDir);
+    else if (act.dataset.act === 'delete') filesIdeDeleteRequested(path, isDir);
+    return;
+  }
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.focusedPath = path; // keep the roving tab stop on the clicked row
+  if (isDir) filesIdeToggleDir(path);
+  else filesIdeOpenFile(filesIdeSelectedHostId(), path);
+}
+
 // The container survives renders (only its innerHTML is rebuilt), so this
 // attaches exactly once. DOMContentLoaded per the shared-module-script
 // convention for wiring.
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('files-ide-tree')?.addEventListener('keydown', filesIdeTreeKeydown);
+  const tree = document.getElementById('files-ide-tree');
+  tree?.addEventListener('keydown', filesIdeTreeKeydown);
+  tree?.addEventListener('click', filesIdeTreeClick);
 });
 
 function filesIdeBeginCreate(kind) {

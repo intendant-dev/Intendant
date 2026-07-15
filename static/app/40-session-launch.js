@@ -1506,16 +1506,34 @@ function updateSessionWindowJumpButton(win) {
   win.jumpBottom.setAttribute('aria-hidden', show ? 'false' : 'true');
 }
 
+// rAF-coalesced per-window bottom-follow (finding: interleaved layout
+// read/write per appended entry). The scrollHeight read forces synchronous
+// layout of the window's scroller; bursts used to pay it once per entry per
+// window. The follow DECISION and flags stay synchronous below — only the
+// scrollTop write (and thus the layout read) coalesces to one per window
+// per frame, re-checking followOutput at flush so a user grab between
+// schedule and flush wins (updateSessionWindowFollowFromScroll clears it).
+const sessionWindowScrollFollowPending = new Set();
+function scheduleSessionWindowScrollToBottom(win) {
+  if (!win || !win.log || sessionWindowScrollFollowPending.has(win)) return;
+  sessionWindowScrollFollowPending.add(win);
+  requestAnimationFrame(() => {
+    sessionWindowScrollFollowPending.delete(win);
+    if (!win.log || !win.followOutput) return;
+    win.log.scrollTop = win.log.scrollHeight;
+  });
+}
+
 function scrollSessionWindowToBottom(win) {
   if (!win || !win.log) return;
   const history = ensureSessionWindowHistory(win);
   if (!sessionWindowIsRenderingTail(win, history.length) || win.renderEnd !== history.length) {
     renderSessionWindowTail(win);
   }
-  win.log.scrollTop = win.log.scrollHeight;
   win.followOutput = true;
   win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
+  scheduleSessionWindowScrollToBottom(win);
 }
 
 function applySessionWindowOutputScroll(win, shouldFollow) {
