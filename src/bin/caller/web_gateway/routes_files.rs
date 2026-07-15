@@ -1514,6 +1514,17 @@ pub(crate) fn dashboard_fs_read_file(
     raw: &str,
     range_header: Option<&str>,
 ) -> Result<DashboardFsReadResponse, DashboardFsReadError> {
+    dashboard_fs_read_file_with_cap(raw, range_header, UPLOAD_MAX_BYTES as u64)
+}
+
+/// `max_read_bytes` bounds how much of the file ONE request may buffer —
+/// rangeless or ranged alike (tests shrink it; production uses
+/// [`UPLOAD_MAX_BYTES`], the same per-request cap as the tunnel form).
+fn dashboard_fs_read_file_with_cap(
+    raw: &str,
+    range_header: Option<&str>,
+    max_read_bytes: u64,
+) -> Result<DashboardFsReadResponse, DashboardFsReadError> {
     let path = expand_dashboard_fs_path(raw)
         .map_err(|e| DashboardFsReadError::new("400 Bad Request", e))?;
     let canonical = std::fs::canonicalize(&path).map_err(|e| {
@@ -1545,7 +1556,7 @@ pub(crate) fn dashboard_fs_read_file(
             })
         })
         .transpose()?;
-    let (range_start, range_end, partial) = if let Some(range) = requested_range {
+    let (range_start, mut range_end, partial) = if let Some(range) = requested_range {
         (range.start, range.end.saturating_add(1), true)
     } else {
         // Rangeless reads buffer the whole file in daemon memory: hold
@@ -1554,19 +1565,25 @@ pub(crate) fn dashboard_fs_read_file(
         // recording cannot spike RSS by the file size (self-DoS). Larger
         // files stay fully downloadable through ranged requests — the
         // chunked flow the dashboard already uses.
-        if total_size > UPLOAD_MAX_BYTES as u64 {
+        if total_size > max_read_bytes {
             return Err(DashboardFsReadError::new(
                 "413 Payload Too Large",
                 format!(
                     "{} is {} bytes; full reads are capped at {} bytes — use Range requests for larger files",
                     canonical.display(),
                     total_size,
-                    UPLOAD_MAX_BYTES,
+                    max_read_bytes,
                 ),
             ));
         }
         (0, total_size, false)
     };
+    // An open-ended range (`bytes=0-`) resolves to end-of-file, which
+    // would buffer the whole file and defeat the cap above. Clamp the
+    // served window to the cap and answer the valid 206 partial (the
+    // Content-Range built below reflects the clamped window, so ranged
+    // clients simply continue from where this response ends).
+    range_end = range_end.min(range_start.saturating_add(max_read_bytes));
     let read_len = range_end.saturating_sub(range_start);
     let read_len_usize: usize = read_len.try_into().map_err(|_| {
         DashboardFsReadError::new(
@@ -3196,6 +3213,36 @@ mod tests {
 
         assert_eq!(err.status, "416 Range Not Satisfiable");
         assert_eq!(err.total_size, Some(5));
+    }
+
+    #[test]
+    fn dashboard_fs_read_caps_rangeless_and_open_ended_ranged_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, b"0123456789abcdefghij").unwrap(); // 20 bytes
+
+        // Rangeless read beyond the cap: 413 with the remedy text.
+        let err = dashboard_fs_read_file_with_cap(file.to_str().unwrap(), None, 8).unwrap_err();
+        assert_eq!(err.status, "413 Payload Too Large");
+        assert!(err.message.contains("Range requests"));
+
+        // Open-ended range (`bytes=0-`) resolves to EOF and would buffer
+        // the whole file: clamp to the cap and serve the valid partial
+        // with an accurate window.
+        let result =
+            dashboard_fs_read_file_with_cap(file.to_str().unwrap(), Some("bytes=0-"), 8).unwrap();
+        assert!(result.partial);
+        assert_eq!(result.total_size, 20);
+        assert_eq!(result.range_start, 0);
+        assert_eq!(result.range_end, 8);
+        assert_eq!(result.bytes, b"01234567");
+
+        // An explicit sub-cap range is untouched.
+        let result =
+            dashboard_fs_read_file_with_cap(file.to_str().unwrap(), Some("bytes=6-9"), 8).unwrap();
+        assert_eq!(result.range_start, 6);
+        assert_eq!(result.range_end, 10);
+        assert_eq!(result.bytes, b"6789");
     }
 
     #[test]

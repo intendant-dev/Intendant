@@ -40,7 +40,20 @@ pub(crate) fn log_tls_failure_rate_limited(
                 < std::time::Duration::from_secs(TLS_FAILURE_LOG_INTERVAL_SECS)
         });
         if map.len() >= TLS_FAILURE_LOG_MAX_ENTRIES {
-            map.clear();
+            // Everything is inside the window (key churn): evict the
+            // stalest entries down to half the cap instead of clearing —
+            // a clear-all would wipe the HOT keys' suppression state and
+            // let them log again every churn cycle. Log-budget only, so
+            // the sort on this rare overflow path is fine.
+            let mut by_age: Vec<(String, std::time::Instant)> = map
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.last_logged))
+                .collect();
+            by_age.sort_by_key(|(_, last_logged)| *last_logged);
+            let excess = map.len().saturating_sub(TLS_FAILURE_LOG_MAX_ENTRIES / 2);
+            for (stale_key, _) in by_age.into_iter().take(excess) {
+                map.remove(&stale_key);
+            }
         }
     }
     match map.get_mut(&key) {

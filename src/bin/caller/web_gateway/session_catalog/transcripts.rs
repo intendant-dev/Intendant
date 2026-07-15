@@ -68,6 +68,17 @@ pub(crate) fn store_external_transcript_entries(
     if key.len > EXTERNAL_TRANSCRIPT_CACHE_MAX_SOURCE_BYTES {
         return;
     }
+    // Admission re-check AFTER the parse: the key was stat'd before it,
+    // and a live writer can grow the file past the cap (or past the
+    // keyed snapshot) while we parse — caching that parse would pin an
+    // oversized vec under a key no future lookup matches. Only cache
+    // when the file still IS the keyed snapshot.
+    match std::fs::metadata(Path::new(&key.path)) {
+        Ok(metadata)
+            if metadata.len() == key.len
+                && metadata_mtime_nanos(&metadata) == key.mtime_nanos => {}
+        _ => return,
+    }
     let slot = external_transcript_cache_slot(&key);
     let mut cache = external_transcript_cache()
         .lock()
@@ -1009,10 +1020,13 @@ pub(crate) fn find_claude_session_file_for_transcript(
         .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
 }
 
-/// session_id → chat path for gemini lookups, so a repeat fetch verifies
-/// ONE file instead of read+parsing every chat in the store again.
-fn gemini_transcript_path_cache() -> &'static Mutex<HashMap<String, PathBuf>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+/// (home, session_id) → chat path for gemini lookups, so a repeat fetch
+/// verifies ONE file instead of read+parsing every chat in the store
+/// again. Keyed by the caller-supplied home: the same session id under
+/// two homes (tests inject temp homes; leased stores differ) must
+/// resolve independently.
+fn gemini_transcript_path_cache() -> &'static Mutex<HashMap<(PathBuf, String), PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1039,10 +1053,11 @@ pub(crate) fn find_gemini_session_file_for_transcript(
     home: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
+    let cache_key = (home.to_path_buf(), session_id.to_string());
     if let Some(cached) = gemini_transcript_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(session_id)
+        .get(&cache_key)
         .cloned()
     {
         // Re-verify the single remembered file (ids are stable but chats
@@ -1059,10 +1074,10 @@ pub(crate) fn find_gemini_session_file_for_transcript(
     let mut cache = gemini_transcript_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= 512 && !cache.contains_key(session_id) {
+    if cache.len() >= 512 && !cache.contains_key(&cache_key) {
         cache.clear();
     }
-    cache.insert(session_id.to_string(), found.clone());
+    cache.insert(cache_key, found.clone());
     Some(found)
 }
 
@@ -1592,6 +1607,61 @@ pub(crate) fn session_ended_id_from_wire(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_transcript_lookup_is_scoped_per_home() {
+        let write_chat = |home: &Path, session_id: &str, text: &str| {
+            let chats = home.join(".gemini").join("tmp").join("proj").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            let body = serde_json::json!({
+                "sessionId": session_id,
+                "messages": [{ "role": "user", "content": text }],
+            });
+            std::fs::write(chats.join("chat-1.json"), body.to_string()).unwrap();
+        };
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        // The SAME session id exists under both homes: each lookup must
+        // resolve within its own home — a shared id-only cache key would
+        // serve home A's transcript to home B.
+        write_chat(home_a.path(), "shared-id", "from home a");
+        write_chat(home_b.path(), "shared-id", "from home b");
+
+        let found_a = find_gemini_session_file_for_transcript(home_a.path(), "shared-id")
+            .expect("home a chat resolves");
+        assert!(found_a.starts_with(home_a.path()), "{}", found_a.display());
+        // Repeat (cache-hit path) must stay inside home B, not replay A.
+        for _ in 0..2 {
+            let found_b = find_gemini_session_file_for_transcript(home_b.path(), "shared-id")
+                .expect("home b chat resolves");
+            assert!(found_b.starts_with(home_b.path()), "{}", found_b.display());
+        }
+    }
+
+    #[test]
+    fn transcript_cache_admission_rechecks_the_source_after_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-post-parse.jsonl");
+        std::fs::write(&path, b"{\"type\":\"noise\"}\n").unwrap();
+        // Key stat'd BEFORE the (simulated) parse...
+        let key = external_transcript_cache_key("codex", "post-parse-growth", &path)
+            .expect("key from pre-parse stat");
+        // ...then the file grows mid-parse: caching now would pin the
+        // parse under a key no future lookup matches (and could exceed
+        // the byte gate unnoticed).
+        std::fs::write(&path, b"{\"type\":\"noise\"}\n{\"type\":\"more\"}\n").unwrap();
+        let entries = std::sync::Arc::new(vec![serde_json::json!({ "content": "stale parse" })]);
+        store_external_transcript_entries(key.clone(), &entries);
+        assert!(
+            cached_external_transcript_entries(&key).is_none(),
+            "a parse of bytes that no longer match the keyed snapshot must not be cached"
+        );
+        // The steady case (file unchanged since the key) still caches.
+        let fresh_key = external_transcript_cache_key("codex", "post-parse-growth", &path)
+            .expect("fresh key");
+        store_external_transcript_entries(fresh_key.clone(), &entries);
+        assert!(cached_external_transcript_entries(&fresh_key).is_some());
+    }
 
     #[test]
     fn external_transcript_cache_invalidates_when_source_file_changes() {

@@ -524,11 +524,13 @@ impl Indexer {
                         .unwrap_or(0);
                     // Exact source-set match (no removed transcript may
                     // linger in the fold; a removed source must shrink the
-                    // shard exactly as a full re-extract would).
+                    // shard exactly as a full re-extract would), and the
+                    // main cursor must carry BOTH rewrite-detection
+                    // windows — a pre-tail-window cursor never resumes.
                     let sources_match = saved_for_session == 1 + transcript_agents.len()
-                        && cursor_by_path
-                            .get(&main_path)
-                            .is_some_and(|(key, _)| key == &session_key)
+                        && cursor_by_path.get(&main_path).is_some_and(|(key, cursor)| {
+                            key == &session_key && cursor.supports_incremental_resume()
+                        })
                         && transcript_agents.iter().all(|path| {
                             cursor_by_path
                                 .get(path.as_path())

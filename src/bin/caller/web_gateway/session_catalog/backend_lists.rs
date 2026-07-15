@@ -628,6 +628,13 @@ struct ClaudeRowAccumulator {
     /// same window).
     prefix_hash16: String,
     prefix_hash_bytes: usize,
+    /// Second rewrite-detection window: hash of the last
+    /// `min(4096, consumed_len)` bytes ENDING at the consumed offset.
+    /// The head window alone cannot exclude a rewrite past the first
+    /// 4 KiB that also grows the file; requiring both narrows the
+    /// undetected residual to a head-and-tail-preserving growth rewrite
+    /// (documented, same contract as the message-search cursor).
+    consumed_tail_hash16: String,
     /// Offset just past the last COMPLETE line folded.
     consumed_len: u64,
     /// Complete lines folded so far — continues the historical 0-based
@@ -737,7 +744,11 @@ impl ClaudeRowAccumulator {
     }
 
     /// Whether the checkpoint may resume against the file's current state:
-    /// same reliable identity, no truncation, unchanged consumed head.
+    /// same reliable identity, no truncation, unchanged consumed head AND
+    /// unchanged consumed tail. Requiring both hash windows narrows the
+    /// undetected rewrite to one that preserves the first 4 KiB, the last
+    /// 4 KiB before the consumed offset, and grows the file — the same
+    /// documented residual as the message-search cursor.
     fn resumable_for(&self, path: &Path, current_len: u64) -> bool {
         if current_len < self.consumed_len {
             return false;
@@ -752,6 +763,13 @@ impl ClaudeRowAccumulator {
             _ => false,
         };
         if !identity_ok {
+            return false;
+        }
+        if self.consumed_tail_hash16.is_empty()
+            || crate::message_search::cursor::tail_hash16_ending_at(path, self.consumed_len)
+                .as_deref()
+                != Some(self.consumed_tail_hash16.as_str())
+        {
             return false;
         }
         crate::message_search::cursor::prefix_hash16_bytes(path, self.prefix_hash_bytes).as_deref()
@@ -834,20 +852,31 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
         consumed.min(crate::message_search::cursor::PREFIX_HASH_BYTES as u64) as usize;
     acc.prefix_hash16 =
         crate::message_search::cursor::prefix_hash16_bytes(path, acc.prefix_hash_bytes)?;
+    acc.consumed_tail_hash16 =
+        crate::message_search::cursor::tail_hash16_ending_at(path, consumed)?;
 
     // Parity with the historical whole-file `.lines()` read: an
     // unterminated trailing line still renders into THIS row, but never
     // into the retained checkpoint (its bytes re-read once complete).
-    let mut render = acc.clone();
-    if let Some(tail) = read_unterminated_tail(path, consumed) {
-        for piece in tail.split('\n') {
-            let piece = piece.trim_end_matches('\r');
-            if !piece.is_empty() {
-                render.fold_line(piece);
+    let session = match read_unterminated_tail(path, consumed) {
+        UnterminatedTail::None => acc.clone().render(path, session_id),
+        UnterminatedTail::Tail(tail) => {
+            let mut render = acc.clone();
+            for piece in tail.split('\n') {
+                let piece = piece.trim_end_matches('\r');
+                if !piece.is_empty() {
+                    render.fold_line(piece);
+                }
             }
+            render.render(path, session_id)
         }
-    }
-    let session = render.render(path, session_id);
+        // A valid final record can legitimately exceed the tail cap (one
+        // huge unterminated paste): silently omitting it would leave the
+        // row permanently short on a stable file. Render such rows from
+        // a full streaming `.lines()` pass instead — the checkpoint
+        // (complete lines only) stays valid either way.
+        UnterminatedTail::Oversized => claude_row_full_render(path, session_id)?,
+    };
 
     {
         let mut cache = claude_row_accumulators()
@@ -862,23 +891,63 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
     Some(session)
 }
 
-/// Bytes past the last complete line (a live writer mid-append). Bounded:
-/// a torn tail larger than the cap renders on a later rebuild instead.
-fn read_unterminated_tail(path: &Path, from: u64) -> Option<String> {
-    const TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
+/// In-memory bound on the unterminated-tail fast path; larger tails take
+/// the full streaming render instead of being buffered here.
+const CLAUDE_ROW_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+enum UnterminatedTail {
+    /// The file ends exactly at the consumed offset.
+    None,
+    /// Bytes past the last complete line (a live writer mid-append).
+    Tail(String),
+    /// More tail bytes than the in-memory cap: the caller must render
+    /// via the full streaming pass, never omit the record.
+    Oversized,
+}
+
+fn read_unterminated_tail(path: &Path, from: u64) -> UnterminatedTail {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len <= from || len - from > TAIL_CAP_BYTES {
-        return None;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return UnterminatedTail::None;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return UnterminatedTail::None;
+    };
+    let len = metadata.len();
+    if len <= from {
+        return UnterminatedTail::None;
     }
-    file.seek(SeekFrom::Start(from)).ok()?;
+    if len - from > CLAUDE_ROW_TAIL_CAP_BYTES {
+        return UnterminatedTail::Oversized;
+    }
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return UnterminatedTail::None;
+    }
     let mut buf = Vec::with_capacity((len - from) as usize);
-    file.take(TAIL_CAP_BYTES).read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
-        return None;
+    if file
+        .take(CLAUDE_ROW_TAIL_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+        || buf.is_empty()
+    {
+        return UnterminatedTail::None;
     }
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    UnterminatedTail::Tail(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Full streaming render including a final unterminated line of any size
+/// (the historical `.lines()` semantics) — the oversized-tail fallback.
+fn claude_row_full_render(path: &Path, session_id: String) -> Option<serde_json::Value> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut acc = ClaudeRowAccumulator::default();
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        acc.fold_line(&line);
+    }
+    Some(acc.render(path, session_id))
 }
 
 #[allow(dead_code)]
@@ -2749,6 +2818,87 @@ mod tests {
             rewritten["task"].as_str(),
             Some("brand new history"),
             "stale folded state must not survive a rewrite"
+        );
+    }
+
+    #[test]
+    fn claude_row_post_prefix_rewrite_that_grows_falls_back_to_full_parse() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home.path().join(".claude").join("projects").join("-tmp-rw");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("fold-rewrite-abc.jsonl");
+
+        // First record alone fills the 4 KiB head window, so a rewrite
+        // past it leaves the prefix hash intact.
+        let padded = serde_json::json!({
+            "timestamp": "2026-07-15T09:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/rw",
+            "message": {"content": "p".repeat(5000)}
+        });
+        let old_second = serde_json::json!({
+            "timestamp": "2026-07-15T09:01:00Z",
+            "type": "user",
+            "message": {"content": "old second"}
+        });
+        std::fs::write(&path, format!("{padded}\n{old_second}\n")).unwrap();
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(row["turns"].as_u64(), Some(2));
+
+        // Rewrite past the prefix window AND grow the file (same inode:
+        // fs::write truncates in place). A checkpoint resume here would
+        // fold suffix bytes onto stale totals; the consumed-tail window
+        // must force the full re-parse.
+        let new_second = serde_json::json!({
+            "timestamp": "2026-07-15T09:02:00Z",
+            "type": "user",
+            "message": {"content": "new second"}
+        });
+        let third = serde_json::json!({
+            "timestamp": "2026-07-15T09:03:00Z",
+            "type": "user",
+            "message": {"content": "third prompt"}
+        });
+        std::fs::write(&path, format!("{padded}\n{new_second}\n{third}\n")).unwrap();
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(3),
+            "stale checkpoint state must not survive a post-prefix rewrite"
+        );
+        let preview = row["preview"].to_string();
+        assert!(preview.contains("new second"), "{preview}");
+        assert!(!preview.contains("old second"), "{preview}");
+    }
+
+    #[test]
+    fn claude_row_renders_an_oversized_unterminated_final_record() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home.path().join(".claude").join("projects").join("-tmp-ov");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("oversized-tail-abc.jsonl");
+
+        let first = serde_json::json!({
+            "timestamp": "2026-07-15T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/ov",
+            "message": {"content": "small first"}
+        });
+        // A VALID final record larger than the tail fast-path cap,
+        // WITHOUT a trailing newline: it must still count (the old cap
+        // silently dropped it from the row forever on a stable file).
+        let huge = serde_json::json!({
+            "timestamp": "2026-07-15T10:01:00Z",
+            "type": "user",
+            "message": {"content": "h".repeat(CLAUDE_ROW_TAIL_CAP_BYTES as usize + 4096)}
+        });
+        std::fs::write(&path, format!("{first}\n{huge}")).unwrap();
+
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(2),
+            "an oversized unterminated final record must render via the full parse"
         );
     }
 

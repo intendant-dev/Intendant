@@ -28,6 +28,17 @@ pub(crate) struct SourceCursor {
     /// trailing line (no newline yet) stays unread until it completes.
     pub last_complete_line_offset: u64,
     pub prefix_hash16: String,
+    /// Second rewrite-detection window: hash of the last
+    /// `min(4096, last_complete_line_offset)` bytes ENDING at the consumed
+    /// offset. The head window alone cannot exclude a rewrite past the
+    /// first 4 KiB that also grows the file (it would read as a benign
+    /// append); requiring both windows narrows the undetected residual to
+    /// a rewrite that preserves the head, the pre-consumed tail, AND grows
+    /// the file — accepted and documented. Empty on cursors persisted
+    /// before the field existed: those classify as before but are never
+    /// eligible for incremental resume.
+    #[serde(default)]
+    pub consumed_tail_hash16: String,
     pub parser_version: u32,
 }
 
@@ -78,6 +89,32 @@ pub(crate) fn prefix_hash16_bytes(path: &Path, max_bytes: usize) -> Option<Strin
     Some(hash16(&buf))
 }
 
+/// Hash16 over the `min(4096, end)` bytes ENDING at offset `end` — the
+/// second rewrite-detection window (see `consumed_tail_hash16`). For
+/// consumed ranges under 4 KiB this window covers every consumed byte,
+/// which is what closes the small-file head-mutation hole the prefix
+/// window's "not comparable on growth" rule leaves open.
+pub(crate) fn tail_hash16_ending_at(path: &Path, end: u64) -> Option<String> {
+    let window = end.min(PREFIX_HASH_BYTES as u64);
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(end - window)).ok()?;
+    let mut buf = vec![0u8; window as usize];
+    let mut read = 0usize;
+    loop {
+        if read == buf.len() {
+            break;
+        }
+        match file.read(&mut buf[read..]) {
+            // Shorter than the recorded consumed range: a concurrent
+            // truncation; the caller's length checks classify it.
+            Ok(0) => return None,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
+    }
+    Some(hash16(&buf))
+}
+
 fn hash16(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -99,8 +136,17 @@ impl SourceCursor {
             mtime_ms: file_mtime_ms(&metadata),
             last_complete_line_offset,
             prefix_hash16: prefix_hash16(path)?,
+            consumed_tail_hash16: tail_hash16_ending_at(path, last_complete_line_offset)?,
             parser_version: super::record::PARSER_VERSION,
         })
+    }
+
+    /// Whether this cursor carries the second (consumed-tail) hash window.
+    /// Incremental resume REQUIRES it: cursors persisted before the field
+    /// existed classify exactly as before, but never resume — the next
+    /// full re-parse re-captures with both windows.
+    pub(crate) fn supports_incremental_resume(&self) -> bool {
+        !self.consumed_tail_hash16.is_empty()
     }
 
     /// Compare the file on disk against this cursor.
@@ -147,7 +193,10 @@ impl SourceCursor {
                     // only when the saved file already filled the window, or
                     // the length hasn't changed — an append to a small file
                     // widens the hashed window and is NOT comparable (and is
-                    // exactly the benign case the offset check below handles).
+                    // exactly the benign case the offset check below handles;
+                    // the consumed-tail window below covers every consumed
+                    // byte of such a small file, so a head mutation on a
+                    // grown small file still reads as Rewritten).
                     let comparable =
                         self.len as usize >= PREFIX_HASH_BYTES || metadata.len() == self.len;
                     if comparable && hash != self.prefix_hash16 {
@@ -155,6 +204,19 @@ impl SourceCursor {
                     }
                 }
                 None => return CursorCheck::Gone,
+            }
+            // Second window: the head hash alone cannot exclude a rewrite
+            // past the first 4 KiB that also grows the file — it would
+            // read as a benign append. An honest append never changes
+            // bytes at or before the consumed offset, so a moved tail
+            // window is proof of rewrite. (Both-windows-preserved growth
+            // rewrites remain the documented residual.)
+            if !self.consumed_tail_hash16.is_empty() {
+                match tail_hash16_ending_at(&self.path, self.last_complete_line_offset) {
+                    Some(hash) if hash == self.consumed_tail_hash16 => {}
+                    Some(_) => return CursorCheck::Rewritten,
+                    None => return CursorCheck::Gone,
+                }
             }
         }
         if metadata.len() > self.last_complete_line_offset {
@@ -262,6 +324,58 @@ mod tests {
         let cursor = SourceCursor::capture(&path, 10).unwrap();
         std::fs::write(&path, "zzzz\nbbbb\n").unwrap(); // same len, new head
         assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    #[test]
+    fn post_prefix_rewrite_that_grows_reads_as_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // First line fills the 4 KiB prefix window; the second is the
+        // post-prefix content a growth rewrite mutates.
+        let head = format!("{}\n", "h".repeat(PREFIX_HASH_BYTES));
+        let body = format!("{head}old-tail-line\n");
+        std::fs::write(&path, &body).unwrap();
+        let cursor = SourceCursor::capture(&path, body.len() as u64).unwrap();
+        assert!(cursor.supports_incremental_resume());
+
+        // Same head 4 KiB, mutated bytes past it, file GROWN: the head
+        // window matches and the length check passes — only the
+        // consumed-tail window can (and must) catch it.
+        std::fs::write(&path, format!("{head}new-tail-line\nappended line\n")).unwrap();
+        assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    #[test]
+    fn small_file_head_mutating_grow_reads_as_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap(); // well under 4 KiB
+        let cursor = SourceCursor::capture(&path, 10).unwrap();
+
+        // Head mutated AND grown: the prefix window is "not comparable"
+        // (saved len < window, length changed), which used to read as a
+        // benign append; the consumed-tail window covers every consumed
+        // byte of a small file and catches it.
+        std::fs::write(&path, "zzzz\nbbbb\ncccc\n").unwrap();
+        assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    #[test]
+    fn honest_append_keeps_both_windows_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let head = format!("{}\n", "h".repeat(PREFIX_HASH_BYTES));
+        let body = format!("{head}tail-line\n");
+        std::fs::write(&path, &body).unwrap();
+        let cursor = SourceCursor::capture(&path, body.len() as u64).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"appended line\n").unwrap();
+        drop(file);
+        assert_eq!(cursor.check(), CursorCheck::Appended);
     }
 
     #[test]
