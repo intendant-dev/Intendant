@@ -132,8 +132,10 @@ fn mtime_nanos_of(metadata: &fs::Metadata) -> u128 {
 /// The multi-MB log is NOT re-parsed per call: folded facts are cached per
 /// path and extended incrementally — an unchanged (len, mtime) serves from
 /// cache with one stat, an append folds only the new complete lines, and a
-/// shrunk file (never produced by the append-only writer) re-folds from
-/// scratch.
+/// detected rewrite (shrunk file, or an mtime change at unchanged length)
+/// re-folds from scratch. The writer is append-only today, so rewrite
+/// detection is contract hardening; a rewrite that regrows PAST the cursor
+/// within one poll interval is the residual undetected case.
 pub fn read_lineage_ledger(
     log_dir: &Path,
     source_session_id: &str,
@@ -156,9 +158,11 @@ pub fn read_lineage_ledger(
     let entry = match cached {
         // Unchanged file: derive straight from the cached facts.
         Some(entry) if entry.consumed_bytes == len && entry.mtime_nanos == mtime_nanos => entry,
-        // Grown file: fold only the appended complete lines.
-        Some(entry) if entry.consumed_bytes <= len => {
-            match read_new_complete_lines_sync(&path, entry.consumed_bytes)? {
+        // Grown file: fold only the appended complete lines. (Strictly
+        // greater — an mtime change at unchanged length is a rewrite and
+        // falls through to the full refold below.)
+        Some(entry) if entry.consumed_bytes < len => {
+            match read_new_complete_lines_sync(&path, entry.consumed_bytes, len)? {
                 Some((text, consumed)) => {
                     let mut facts = entry.facts.clone();
                     for line in text.lines() {
@@ -173,11 +177,13 @@ pub fn read_lineage_ledger(
                     entry
                 }
                 // No complete new line yet — evaluate the cached facts and
-                // leave the cursor for the next call.
+                // leave the cursor (including its recorded mtime) for the
+                // next call to retry.
                 None => entry,
             }
         }
-        // Cold cache or a shrunk (rewritten) file: fold from scratch.
+        // Cold cache, a shrunk file, or a same-length rewrite (mtime moved
+        // with no growth): fold from scratch.
         _ => {
             let contents = match fs::read_to_string(&path) {
                 Ok(contents) => contents,
@@ -232,8 +238,14 @@ fn complete_lines_prefix(contents: &str) -> (&str, u64) {
 
 /// Read the consumable lines appended past `offset`
 /// ([`consumable_jsonl_prefix`]); `None` when nothing consumable arrived.
-/// Never consumes a partially flushed trailing line.
-fn read_new_complete_lines_sync(path: &Path, offset: u64) -> io::Result<Option<(String, u64)>> {
+/// Never consumes a partially flushed trailing line. The read is clamped to
+/// the caller's stat snapshot (`stat_len`) so the recorded mtime stays
+/// paired with the consumed length.
+fn read_new_complete_lines_sync(
+    path: &Path,
+    offset: u64,
+    stat_len: u64,
+) -> io::Result<Option<(String, u64)>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
@@ -244,7 +256,8 @@ fn read_new_complete_lines_sync(path: &Path, offset: u64) -> io::Result<Option<(
         file.seek(SeekFrom::Start(offset))?;
     }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    file.take(stat_len.saturating_sub(offset))
+        .read_to_end(&mut buf)?;
     let Some(consumed) = consumable_jsonl_prefix(&buf) else {
         return Ok(None);
     };
@@ -940,5 +953,46 @@ mod tests {
             .expect("ledger");
         assert_eq!(ledger.groups[0].branches.len(), 1);
         assert_eq!(ledger.groups[0].branches[0].status, "running");
+    }
+
+    #[test]
+    fn read_lineage_ledger_refolds_on_same_length_rewrite() {
+        fn set_mtime(path: &Path, secs_since_epoch: u64) {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch),
+            )
+            .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let rel_line = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child","relationship":"subagent","ephemeral":false}}"#;
+        let done_a = r#"{"event":"task_complete","data":{"session_id":"child","reason":"done","summary":"parser is fine"}}"#;
+        let done_b = r#"{"event":"task_complete","data":{"session_id":"child","reason":"done","summary":"parser is FINE"}}"#;
+        assert_eq!(done_a.len(), done_b.len(), "test needs equal-length lines");
+
+        std::fs::write(&path, format!("{rel_line}\n{done_a}\n")).unwrap();
+        set_mtime(&path, 1_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(
+            ledger.groups[0].branches[0].summary.as_deref(),
+            Some("parser is fine")
+        );
+
+        // Same total length, different content, different mtime: the pure
+        // (consumed <= len) model would read zero new bytes and serve the
+        // stale facts forever.
+        std::fs::write(&path, format!("{rel_line}\n{done_b}\n")).unwrap();
+        set_mtime(&path, 2_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(
+            ledger.groups[0].branches[0].summary.as_deref(),
+            Some("parser is FINE")
+        );
     }
 }
