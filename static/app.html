@@ -84,15 +84,8 @@
   --log-error: var(--red);
   --log-warn: var(--yellow);
   --log-subagent: var(--mauve);
-  --log-detail: #a2a8be;
   --log-debug: var(--overlay1);
   --log-presence: var(--green);
-  --concurrent-view-bg: rgba(24, 24, 37, 0.68);
-  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.78);
-  --session-window-bg: rgba(24, 24, 37, 0.72);
-  --session-window-header-bg: rgba(17, 17, 27, 0.64);
-  --session-window-hover-bg: rgba(24, 24, 37, 0.80);
-  --session-window-chip-bg: rgba(49, 50, 68, 0.64);
 
   /* Liquid-glass chrome tokens. backdrop-filter is reserved for flow-layout
      chrome that can never overlap the Station canvases (status bar, ticker,
@@ -100,20 +93,9 @@
      the canvas area (toasts, pickers, #station-status) use the translucent
      layered backgrounds WITHOUT blur so the WebGPU/canvas scene is never
      forced into constant recomposite. */
-  --glass-bg: rgba(24, 24, 37, 0.58);
-  --glass-bg-deep: linear-gradient(180deg, rgba(30, 30, 46, 0.72), rgba(17, 17, 27, 0.62));
-  --glass-hairline: rgba(205, 214, 244, 0.09);
-  --glass-hairline-bright: rgba(205, 214, 244, 0.16);
-  --glass-highlight: inset 0 1px 0 rgba(205, 214, 244, 0.05);
   --glass-blur: blur(14px) saturate(1.2);
   /* Validated viz ramps (dataviz method; ordinal blue ramp passes monotone-L,
      step-gap, and light-end checks on the Mocha surface). */
-  --viz-ramp-1: #455477;
-  --viz-ramp-2: #566c98;
-  --viz-ramp-3: #6784b8;
-  --viz-ramp-4: #789cd9;
-  --viz-ramp-5: #89b4fa;
-  --viz-empty: #313244;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -166,51 +148,6 @@ html {
 
 /* ── Tab buttons (shared contract: the ui-v2 rail stamps .tab-btn on its
    nav items so the router binds them) ── */
-.tab-btn {
-  padding: 8px 16px;
-  min-height: 36px;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  border-radius: 9px 9px 0 0;
-  color: var(--overlay1);
-  font-family: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  position: relative;
-}
-.tab-btn:hover {
-  color: var(--subtext1);
-  background: color-mix(in srgb, var(--text) 4.5%, transparent);
-}
-.tab-btn.active {
-  color: var(--blue);
-  border-bottom-color: var(--blue);
-}
-.tab-btn .badge {
-  position: absolute;
-  top: 4px; right: 4px;
-  min-width: 16px; height: 16px;
-  border-radius: 8px;
-  background: var(--red);
-  color: var(--crust);
-  font-size: 10px;
-  font-weight: 700;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 0 4px;
-}
-.tab-btn .badge.visible { display: flex; }
-
-/* ── Tab Content ── */
-.tab-content {
-  flex: 1;
-  position: relative;
-  overflow: hidden;
-}
 .tab-pane {
   display: none;
   flex-direction: column;
@@ -4188,36 +4125,6 @@ body.context-focus-active {
 
 /* Stop button — interrupt the current agent turn. Lives in the Activity
    toolbar and is shown only while a turn is in flight. */
-.stop-btn {
-  background: var(--red);
-  color: var(--base);
-  border: none;
-  border-radius: 4px;
-  min-height: 32px;
-  padding: 4px 10px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.stop-btn:hover { background: var(--red); }
-.stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-/* ── Global Task Bar ──
-   Primary control surface hoisted above the tab bar so the task input
-   and live phase indicator are visible from every tab. */
-.global-task-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: var(--glass-bg);
-  border-bottom: 1px solid var(--glass-hairline);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-highlight);
-  flex-shrink: 0;
-}
-.global-task-bar .phase-banner { min-width: 160px; }
 .task-target-chip {
   display: inline-flex;
   align-items: center;
@@ -4512,25 +4419,6 @@ body.context-focus-active {
   display: none;
 }
 
-/* ── Phase Banner ── */
-.phase-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0;
-  font-size: 13px;
-  flex-shrink: 0;
-}
-.phase-banner .spinner {
-  display: inline-block;
-  width: 14px;
-  text-align: center;
-}
-.phase-banner.phase-thinking .phase-text { color: var(--lavender); }
-.phase-banner.phase-running .phase-text { color: var(--teal); }
-.phase-banner.phase-waiting .phase-text { color: var(--yellow); }
-.phase-banner.phase-done .phase-text { color: var(--green); }
-.phase-banner.phase-idle .phase-text { color: var(--overlay1); }
 
 /* ── Log Stream ── */
 .concurrent-log-region {
@@ -11571,14 +11459,6 @@ body.display-fullscreen-open {
   cursor: pointer;
 }
 .make-active-btn:hover { background: var(--peach); color: var(--crust); }
-.voice-dot {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  background: var(--surface2);
-}
-.voice-dot.ok { background: var(--green); }
-.voice-dot.err { background: var(--red); }
 
 /* ── Dialogs ── */
 .dialog-overlay {
@@ -11619,25 +11499,6 @@ body.display-fullscreen-open {
 
 /* ── Mobile ── */
 @media (max-width: 600px) {
-  /* One swipeable line instead of four wrapped rows — the same pattern
-     as the tab bar, reclaiming ~140px of viewport above the composer. */
-  .status-bar {
-    font-size: 11px; gap: 8px; padding: 4px 8px;
-    flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  .status-bar::-webkit-scrollbar { display: none; }
-  .status-bar > span, .status-bar > div { flex-shrink: 0; }
-  .status-bar .provider { max-width: 92px; }
-  .status-bar .model { max-width: 150px; }
-  .status-bar .session { max-width: 120px; }
-  .status-bar #sb-voice-label { max-width: 72px; }
-  .ticker-collapsed {
-    flex-wrap: wrap;
-    white-space: normal;
-    row-gap: 2px;
-  }
-  .status-bar .session { display: inline-block; flex-shrink: 1; }
   .tab-btn { padding: 8px 12px; min-height: 40px; font-size: 12px; }
   .settings-pane-body {
     padding: 12px;
@@ -11971,7 +11832,6 @@ body.display-fullscreen-open {
     margin-top: 6px;
   }
   .session-card .sc-meta { gap: 8px; }
-  .budget-bar .bar-track { width: 40px; }
   .mic-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-preview { width: 120px; height: 90px; }
@@ -11993,7 +11853,6 @@ body.display-fullscreen-open {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .stop-btn,
   .task-new-session-btn {
     order: 1;
   }
@@ -28145,7 +28004,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'db1c9ece58c59b92';
+const INTENDANT_APP_BUILD = '014802003d07f568';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {

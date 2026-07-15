@@ -1374,14 +1374,6 @@ body.display-fullscreen-open {
   cursor: pointer;
 }
 .make-active-btn:hover { background: var(--peach); color: var(--crust); }
-.voice-dot {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  background: var(--surface2);
-}
-.voice-dot.ok { background: var(--green); }
-.voice-dot.err { background: var(--red); }
 
 /* ── Dialogs ── */
 .dialog-overlay {
@@ -1422,25 +1414,6 @@ body.display-fullscreen-open {
 
 /* ── Mobile ── */
 @media (max-width: 600px) {
-  /* One swipeable line instead of four wrapped rows — the same pattern
-     as the tab bar, reclaiming ~140px of viewport above the composer. */
-  .status-bar {
-    font-size: 11px; gap: 8px; padding: 4px 8px;
-    flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  .status-bar::-webkit-scrollbar { display: none; }
-  .status-bar > span, .status-bar > div { flex-shrink: 0; }
-  .status-bar .provider { max-width: 92px; }
-  .status-bar .model { max-width: 150px; }
-  .status-bar .session { max-width: 120px; }
-  .status-bar #sb-voice-label { max-width: 72px; }
-  .ticker-collapsed {
-    flex-wrap: wrap;
-    white-space: normal;
-    row-gap: 2px;
-  }
-  .status-bar .session { display: inline-block; flex-shrink: 1; }
   .tab-btn { padding: 8px 12px; min-height: 40px; font-size: 12px; }
   .settings-pane-body {
     padding: 12px;
@@ -1774,7 +1747,6 @@ body.display-fullscreen-open {
     margin-top: 6px;
   }
   .session-card .sc-meta { gap: 8px; }
-  .budget-bar .bar-track { width: 40px; }
   .mic-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-preview { width: 120px; height: 90px; }
@@ -1796,7 +1768,6 @@ body.display-fullscreen-open {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .stop-btn,
   .task-new-session-btn {
     order: 1;
   }

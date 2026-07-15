@@ -416,36 +416,6 @@ body.context-focus-active {
 
 /* Stop button — interrupt the current agent turn. Lives in the Activity
    toolbar and is shown only while a turn is in flight. */
-.stop-btn {
-  background: var(--red);
-  color: var(--base);
-  border: none;
-  border-radius: 4px;
-  min-height: 32px;
-  padding: 4px 10px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.stop-btn:hover { background: var(--red); }
-.stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-/* ── Global Task Bar ──
-   Primary control surface hoisted above the tab bar so the task input
-   and live phase indicator are visible from every tab. */
-.global-task-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: var(--glass-bg);
-  border-bottom: 1px solid var(--glass-hairline);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-highlight);
-  flex-shrink: 0;
-}
-.global-task-bar .phase-banner { min-width: 160px; }
 .task-target-chip {
   display: inline-flex;
   align-items: center;
@@ -740,25 +710,6 @@ body.context-focus-active {
   display: none;
 }
 
-/* ── Phase Banner ── */
-.phase-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0;
-  font-size: 13px;
-  flex-shrink: 0;
-}
-.phase-banner .spinner {
-  display: inline-block;
-  width: 14px;
-  text-align: center;
-}
-.phase-banner.phase-thinking .phase-text { color: var(--lavender); }
-.phase-banner.phase-running .phase-text { color: var(--teal); }
-.phase-banner.phase-waiting .phase-text { color: var(--yellow); }
-.phase-banner.phase-done .phase-text { color: var(--green); }
-.phase-banner.phase-idle .phase-text { color: var(--overlay1); }
 
 /* ── Log Stream ── */
 .concurrent-log-region {
