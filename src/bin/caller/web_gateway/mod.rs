@@ -79,10 +79,6 @@ pub(crate) use ws_session::*;
 mod http_dispatch;
 pub(crate) use http_dispatch::*;
 
-/// Monotonically increasing counter for assigning unique peer IDs to WebSocket
-/// connections.  Used for WebRTC signaling so that each browser tab gets a
-/// stable identity within a display session.
-static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_LIST_LIMITED_RESPONSE_CACHE: OnceLock<
     Mutex<HashMap<usize, SessionListResponseCacheEntry>>,
 > = OnceLock::new();
@@ -336,13 +332,11 @@ fn ensure_idle(
 pub(crate) async fn displays_response_body_from(
     displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
 ) -> String {
-    // This route serves the owner's dashboards (the display picker), so
-    // each entry is annotated with its live capture state via the
-    // unfiltered registry view: `capture_active` plus `agent_visible`
-    // (false = private user view). Agent-facing display enumeration
-    // (MCP `list_displays`, ctl) uses the filtered lookups and never
-    // sees a private view's session.
+    // Annotate live capture state through the caller's visibility boundary.
+    // Generic display.view callers see agent-visible capture sessions only;
+    // an authenticated owner dashboard may additionally see private views.
     let mut displays: Vec<serde_json::Value> = displays
         .iter()
         .map(|d| serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({})))
@@ -353,7 +347,12 @@ pub(crate) async fn displays_response_body_from(
             let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
                 continue;
             };
-            if let Some(session) = reg.get_any(id as u32) {
+            let session = if include_private {
+                reg.get_any(id as u32)
+            } else {
+                reg.get(id as u32)
+            };
+            if let Some(session) = session {
                 entry["capture_active"] = serde_json::json!(true);
                 entry["agent_visible"] = serde_json::json!(session.agent_visible());
             }
@@ -1948,7 +1947,7 @@ mod tests {
         let local = &targets[0];
         assert_eq!(local["local"], true);
         assert_eq!(local["access_domain"], "user_client");
-        assert_eq!(local["route"], "current_dashboard");
+        assert_eq!(local["route"], "trusted_local");
         assert_eq!(local["effective_role"], "root");
         assert_eq!(local["connected"], true);
 
@@ -1978,6 +1977,46 @@ mod tests {
         assert!(
             resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
             "foreign origin should be refused on non-fleet APIs: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Legacy protected reads and source-viewer fallthroughs are covered by
+        // the same pre-authority gate, not just route-table APIs.
+        for path in ["/debug", "/recordings", "/frames/example"] {
+            let resp = http_request(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                "foreign origin reached protected legacy path {path}: {}",
+                resp.lines().next().unwrap_or("")
+            );
+        }
+        // Browser navigations often omit Origin. Fetch Metadata must still
+        // stop a same-site/cross-site page before authority resolution.
+        let resp = http_request(
+            port,
+            "GET /debug HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "cross-site navigation reached protected legacy path: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Authority-free shell bytes remain deliberately public even with
+        // cross-site Fetch Metadata; they resolve under anonymous role:none.
+        let resp = http_request(
+            port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "authority-free shell should remain public: {}",
             resp.lines().next().unwrap_or("")
         );
         // The daemon's own origin sails through and is echoed on fleet paths.
@@ -2171,6 +2210,25 @@ mod tests {
         handle.abort();
     }
 
+    /// The daemon origin is privileged (and may receive a browser's mTLS
+    /// credential automatically), so it must never boot the hosted Connect
+    /// client with an attacker-selected rendezvous origin.
+    #[tokio::test]
+    async fn daemon_origin_refuses_hosted_connect_mode() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        for request in [
+            "GET /?connect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?%63onnect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "POST /?connect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let resp = http_request(port, request).await;
+            assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
+            assert!(resp.contains("Hosted Connect mode is not served"));
+            assert!(!resp.to_ascii_lowercase().contains("<!doctype html"));
+        }
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_dashboard_fs_read_serves_file_bytes() {
         let (port, handle) = spawn_test_gateway_with_registry(None).await;
@@ -2287,25 +2345,39 @@ mod tests {
         (port, handle)
     }
 
+    /// Own the scratch access store for a default TLS test gateway for as
+    /// long as its listener task can run. Aborting on drop prevents a test
+    /// panic from detaching the listener after its temporary store disappears.
+    struct TlsTestGatewayHandle {
+        task: tokio::task::JoinHandle<()>,
+        _access_cert_dir: tempfile::TempDir,
+    }
+
+    impl TlsTestGatewayHandle {
+        fn abort(&self) {
+            self.task.abort();
+        }
+    }
+
+    impl Drop for TlsTestGatewayHandle {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     /// Spawn a gateway with a self-signed TLS acceptor wired in (strict
     /// HTTPS/WSS mode) plus an optional inbound bearer token. Used by the
     /// strict-TLS demux tests and the TLS variant of the /ws bearer test
     /// (audit F2), which only manifests over TLS — rustls buffers the
     /// response ciphertext, so a missing flush truncates it to empty.
-    async fn spawn_test_gateway_tls(
-        bearer_token: Option<String>,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn spawn_test_gateway_tls(bearer_token: Option<String>) -> (u16, TlsTestGatewayHandle) {
         spawn_test_gateway_tls_with_client_cert_requirement(bearer_token, false).await
     }
 
     async fn spawn_test_gateway_tls_with_client_cert_requirement(
         bearer_token: Option<String>,
         tls_client_cert_required: bool,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
-        let bus = EventBus::new();
-        let (broadcast_tx, _) = broadcast::channel::<String>(16);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    ) -> (u16, TlsTestGatewayHandle) {
         // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
         // same construction the production `--tls` self-signed path uses.
         let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
@@ -2313,7 +2385,42 @@ mod tests {
             hostname: None,
         })
         .expect("self-signed acceptor builds");
-        let handle = spawn_web_gateway(
+        spawn_test_gateway_with_tls_acceptor(bearer_token, tls_client_cert_required, acceptor).await
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> (u16, TlsTestGatewayHandle) {
+        let access_cert_dir = tempfile::tempdir().expect("TLS test access store");
+        let (port, task) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            bearer_token,
+            tls_client_cert_required,
+            acceptor,
+            access_cert_dir.path().to_path_buf(),
+        )
+        .await;
+        (
+            port,
+            TlsTestGatewayHandle {
+                task,
+                _access_cert_dir: access_cert_dir,
+            },
+        )
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+        access_cert_dir: std::path::PathBuf,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway_from_cert_dir(
             listener,
             bus,
             broadcast_tx,
@@ -2329,6 +2436,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             tls_client_cert_required,
             Some(acceptor),
+            access_cert_dir,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -2394,16 +2502,38 @@ mod tests {
     /// self-signed), writes the request as cleartext into the TLS session,
     /// and reads to EOF. Returns the decrypted bytes as a lossy string.
     async fn https_request(port: u16, request: &str) -> String {
+        https_request_for_server_name(port, "localhost", request).await
+    }
+
+    async fn https_request_for_server_name(port: u16, server_name: &str, request: &str) -> String {
+        https_request_for_server_name_with_client_identity(port, server_name, request, None).await
+    }
+
+    async fn https_request_for_server_name_with_client_identity(
+        port: u16,
+        server_name: &str,
+        request: &str,
+        client_identity: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)));
+        let config = match client_identity {
+            Some((cert_path, key_path)) => {
+                let (cert_chain, key) = crate::web_tls::load_pem_cert_and_key(cert_path, key_path)
+                    .expect("test client identity loads");
+                builder
+                    .with_client_auth_cert(cert_chain, key)
+                    .expect("test client identity is usable")
+            }
+            None => builder.with_no_client_auth(),
+        };
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
         let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
@@ -2436,6 +2566,108 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    #[tokio::test]
+    async fn public_fleet_name_is_discovery_only_even_at_its_own_origin() {
+        let access_dir = tempfile::tempdir().unwrap();
+        let server_names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(
+            access_dir.path(),
+            &server_names,
+            "fleet-sni-client-cert",
+            false,
+        )
+        .unwrap();
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(
+                access_dir.path()
+            )
+            .unwrap(),
+            "fixture client certificate must be enrolled before the fleet request"
+        );
+        let acceptor = crate::web_tls::build_acceptor_with_client_auth(
+            &crate::web_tls::TlsCertSource::Files {
+                cert_path: access_dir.path().join("server.crt"),
+                key_path: access_dir.path().join("server.key"),
+            },
+            &crate::web_tls::ClientAuth::RequireCa {
+                ca_path: access_dir.path().join("ca.crt"),
+            },
+        )
+        .expect("access-CA TLS acceptor builds");
+        let (port, handle) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            None,
+            true,
+            acceptor,
+            access_dir.path().to_path_buf(),
+        )
+        .await;
+        let fleet_name = "discovery-only-fleet.test";
+        let fleet_cert = rcgen::generate_simple_self_signed(vec![fleet_name.to_string()]).unwrap();
+        crate::web_tls::install_fleet_certificate(
+            fleet_name,
+            &fleet_cert.cert.pem(),
+            &fleet_cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
+
+        let client_cert_path = access_dir.path().join("client.crt");
+        let client_key_path = access_dir.path().join("client.key");
+        // This is a protected route, not the authority-free dashboard shell:
+        // RequireCa proves rustls received and verified the certificate, and
+        // the 200 proves request IAM resolved that same fingerprint through
+        // the injected temp store as the enrolled owner root.
+        let authenticated_direct = https_request_for_server_name_with_client_identity(
+            port,
+            "localhost",
+            &format!("GET /api/project-root HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
+        )
+        .await;
+        assert!(
+            authenticated_direct.starts_with("HTTP/1.1 200"),
+            "the enrolled access-CA client certificate must authorize the protected direct-SNI route: {authenticated_direct}"
+        );
+
+        for request in [
+            format!("GET /api/project-root HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            format!("POST /mcp HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nContent-Length: 0\r\n\r\n"),
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nOrigin: https://{fleet_name}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+        ] {
+            let response = https_request_for_server_name_with_client_identity(
+                port,
+                fleet_name,
+                &request,
+                Some((&client_cert_path, &client_key_path)),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "fleet control route was not refused: {response}"
+            );
+            assert!(response.contains("discovery-only"));
+        }
+
+        let public_shell = https_request_for_server_name_with_client_identity(
+            port,
+            fleet_name,
+            &format!("GET / HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
+        )
+        .await;
+        assert!(
+            public_shell.starts_with("HTTP/1.1 200"),
+            "authority-free shell should remain available: {public_shell}"
+        );
+        handle.abort();
+    }
+
     /// Routes served by the legacy dispatch chain (the non-API surface:
     /// connect bootstrap, recordings, frames, debug, config, static/SPA)
     /// must never match the table — a route is served by exactly one of
@@ -2449,7 +2681,6 @@ mod tests {
             ("POST", "/connect/dashboard/ice"),
             ("POST", "/connect/dashboard/close"),
             ("GET", "/frames/f1"),
-            ("POST", "/session"),
             ("GET", "/recordings"),
             ("GET", "/recordings/stream1/meta"),
             ("GET", "/debug"),
@@ -2469,6 +2700,110 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_token_mint_rejects_foreign_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let response = http_request(
+            port,
+            &format!(
+                "POST /session HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://attacker.example\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "foreign page must not spend a daemon-held provider credential: {response}"
+        );
+        assert!(
+            response.contains("cross-origin caller is not allowed"),
+            "unexpected rejection: {response}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_dashboard_signaling_rejects_foreign_browser_origins() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = http_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed"),
+            "got: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "authority-bearing signaling must never be wildcard-CORS: {resp}"
+        );
+
+        // DNS rebinding preserves matching Origin + Host while changing
+        // where the hostname resolves. Cleartext loopback authority only
+        // accepts a literal loopback/localhost origin, so this must still
+        // fail even though the two attacker-controlled headers match.
+        let rebound = http_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: attacker.example:{port}\r\n\
+                 Origin: http://attacker.example:{port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(
+            rebound.contains("401 Unauthorized") || rebound.contains("403 Forbidden"),
+            "DNS-rebound signaling must be rejected before upgrade: {rebound}"
+        );
+        assert!(!rebound.contains("101 Switching Protocols"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_dashboard_signaling_requires_client_cert_under_mtls() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = https_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("401 Unauthorized"), "got: {resp}");
+        assert!(
+            resp.contains("mTLS client certificate required"),
+            "got: {resp}"
+        );
+        handle.abort();
+    }
+
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
     // -----------------------------------------------------------------
@@ -2480,7 +2815,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         // Request without auth — should 401, NOT pass through to the
         // 503-no-registry response that would happen otherwise.
-        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
         assert!(resp.contains("missing Authorization"));
         assert!(
@@ -2496,7 +2831,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n",
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n",
         )
         .await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
@@ -2512,7 +2847,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n\r\n",
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
         )
         .await;
         // Auth passed; handler returned its 503 (no registry).
@@ -2527,17 +2862,50 @@ mod tests {
     /// /config is exempt — even when bearer is required for
     /// federation endpoints, the dashboard bootstrap continues to work
     /// without auth. This is how the dashboard remains usable on the
-    /// loopback / trusted-network case where the operator has set a
-    /// bearer for WAN federation.
+    /// direct-loopback case where the operator has set a bearer for WAN
+    /// federation. Remote browsers still require mTLS.
     #[tokio::test]
     async fn test_config_endpoint_unauthenticated_when_bearer_set() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
-        let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
             resp.contains("200 OK"),
             "config should serve unauthenticated, got: {resp}"
         );
         assert!(!resp.contains("401"));
+        assert!(
+            resp.contains("Cache-Control: no-store"),
+            "TURN-bearing config must never be stored: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "runtime config must not be wildcard-readable: {resp}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn config_rejects_foreign_browser_origin_without_wildcard_cors() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /config HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://attacker.example\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed"),
+            "unexpected rejection: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "rejected config must not publish wildcard CORS: {resp}"
+        );
         handle.abort();
     }
 
@@ -2546,7 +2914,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
 
         for path in ["/icon-128.png", "/favicon.ico"] {
-            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             let resp = http_request_bytes(port, &request).await;
             let response_str = String::from_utf8_lossy(&resp);
             assert!(
@@ -2586,7 +2954,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2602,6 +2970,107 @@ mod tests {
         assert!(
             !resp.contains("101 Switching Protocols"),
             "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// WebSocket SOP is a server-side Origin check. A foreign hosted page
+    /// must not turn the loopback/no-mTLS dashboard's trusted-local fallback
+    /// into a cross-site root session.
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_foreign_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "expected 403, got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed on this WebSocket"),
+            "got: {resp}"
+        );
+        assert!(!resp.contains("101 Switching Protocols"), "got: {resp}");
+
+        let rebound = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: attacker.example:{port}\r\n\
+                 Origin: http://attacker.example:{port}\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            rebound.contains("403 Forbidden"),
+            "DNS-rebound matching Origin + Host must fail: {rebound}"
+        );
+        assert!(!rebound.contains("101 Switching Protocols"));
+        handle.abort();
+    }
+
+    /// Pin the gate ahead of mTLS grant resolution. Browser-held client
+    /// certificates are connection credentials, not permission for a foreign
+    /// page to drive the daemon; the Origin verdict is independent of whether
+    /// the TLS handshake supplied a certificate.
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_foreign_origin_before_mtls_identity() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let resp = https_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "expected 403, got: {resp}");
+        assert!(
+            !resp.contains("mTLS client certificate required"),
+            "Origin must be rejected before transport authority is resolved: {resp}"
+        );
+        assert!(!resp.contains("101 Switching Protocols"), "got: {resp}");
+        handle.abort();
+    }
+
+    /// The browser dashboard's own origin remains able to open the legacy
+    /// event socket when no bearer token is configured.
+    #[tokio::test]
+    async fn test_ws_upgrade_accepts_same_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: http://localhost:{port}\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.contains("101 Switching Protocols"),
+            "expected same-origin upgrade success, got: {resp}"
         );
         handle.abort();
     }
@@ -2623,7 +3092,7 @@ mod tests {
         let resp = https_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2654,7 +3123,7 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_cleartext_http() {
         let (port, handle) = spawn_test_gateway_tls(None).await;
-        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
             resp.contains("426"),
             "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
@@ -2675,7 +3144,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2835,7 +3304,7 @@ mod tests {
         // it falls through to the SPA shell like any unknown route.
         let resp = http_request(
             port,
-            "POST /x/api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /x/api/api-keys HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .await;
         assert!(
@@ -2847,7 +3316,7 @@ mod tests {
         // The exact route still reaches the writer (a JSON responder).
         let resp = http_request(
             port,
-            "POST /api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /api/api-keys HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .await;
         assert!(
@@ -2864,7 +3333,7 @@ mod tests {
         // list, which scans the real home directory.)
         let resp = http_request(
             port,
-            "GET /debug?note=/api/project-root HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /debug?note=/api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
@@ -2874,7 +3343,11 @@ mod tests {
         );
 
         // Look-alike longer paths are not the route.
-        let resp = http_request(port, "GET /api/sessionsfoo HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(
+            port,
+            "GET /api/sessionsfoo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
         assert!(
             resp.contains("Content-Type: text/html"),
             "look-alike path must fall through, got: {}",
@@ -2886,7 +3359,7 @@ mod tests {
         // /api/session/current/changes/{path}).
         let resp = http_request(
             port,
-            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
@@ -2907,7 +3380,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2932,7 +3405,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws?token=ws-token HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2954,7 +3427,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2976,7 +3449,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
@@ -3638,7 +4111,7 @@ mod tests {
     /// it return `Err`, which the production code already tolerates
     /// (the WS-close path would have cleared this entry in real life).
     pub(crate) fn seed_holder(
-        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        map: &Arc<DisplayInputAuthority>,
         display_id: u32,
         connection_id: &str,
     ) {

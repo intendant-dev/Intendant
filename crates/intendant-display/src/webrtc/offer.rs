@@ -509,7 +509,9 @@ impl WebRtcPeer {
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
         tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
+        interactive_source: Option<Arc<crate::BrowserInputSource>>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+        clipboard_authorized: crate::BrowserInputAuthorization,
         authority_handler: AuthorityChannelHandler,
         tile_control_handler: TileControlHandler,
         ice_tx: mpsc::Sender<(PeerId, String)>,
@@ -990,7 +992,9 @@ impl WebRtcPeer {
             encoded_frame_rx,
             command_rx,
             input_handler,
+            interactive_source.clone(),
             clipboard_handler,
+            clipboard_authorized.clone(),
             authority_handler,
             tile_control_handler,
             keyframe_request_tx,
@@ -1010,6 +1014,8 @@ impl WebRtcPeer {
             Self {
                 peer_id,
                 command_tx,
+                clipboard_authorized,
+                interactive_source,
                 observed_send_bitrate_rx,
                 remote_inbound_health_rx,
                 twcc_health_rx,
@@ -1063,7 +1069,9 @@ impl WebRtcPeer {
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
         tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
+        interactive_source: Option<Arc<crate::BrowserInputSource>>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+        clipboard_authorized: crate::BrowserInputAuthorization,
         authority_handler: AuthorityChannelHandler,
         tile_control_handler: TileControlHandler,
         ice_tx: mpsc::Sender<(PeerId, String)>,
@@ -1231,7 +1239,9 @@ impl WebRtcPeer {
             tcp_peer_registry,
             tcp_advertised_addr,
             input_handler,
+            interactive_source,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1278,12 +1288,18 @@ impl WebRtcPeer {
 
     /// Send a clipboard update to the browser via the clipboard data channel.
     ///
-    /// Returns `Ok(true)` if the command was queued, `Ok(false)` if the driver
-    /// is shutting down.
+    /// Returns `Ok(true)` if the command was queued, `Ok(false)` when live
+    /// interactive authority is absent or the driver is shutting down.
     pub async fn send_clipboard(&self, content: &ClipboardContent) -> Result<bool, CallerError> {
+        let Ok(admitted_revision) = self.clipboard_authorized.admission_revision() else {
+            return Ok(false);
+        };
         match self
             .command_tx
-            .send(Command::SendClipboard(content.clone()))
+            .send(Command::SendClipboard {
+                content: content.clone(),
+                admitted_revision,
+            })
             .await
         {
             Ok(()) => Ok(true),
@@ -1395,6 +1411,9 @@ impl WebRtcPeer {
 
     /// Gracefully close this peer.
     pub async fn close(&self) {
+        if let Some(source) = self.interactive_source.as_ref() {
+            source.invalidate("the WebRTC display peer closed");
+        }
         self.shutdown.cancel();
         // Driver exits on the next select! iteration; channels close on drop.
     }
@@ -1404,7 +1423,7 @@ impl WebRtcPeer {
     /// external teardown, and the pool intake task cancels it when the peer
     /// can no longer be served. The session's per-peer reaper keys on this
     /// to deregister the peer from the session maps.
-    pub(crate) fn closed(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+    pub fn closed(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
         self.shutdown.clone().cancelled_owned()
     }
 }
@@ -1444,6 +1463,7 @@ mod tests {
         };
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1459,7 +1479,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1650,6 +1672,7 @@ mod tests {
         let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1664,7 +1687,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1767,6 +1792,7 @@ mod tests {
         let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1781,7 +1807,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1824,6 +1852,7 @@ mod tests {
         let ice_config = crate::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1838,7 +1867,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1881,6 +1912,7 @@ mod tests {
         let ice_config = IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1895,7 +1927,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -1956,6 +1990,7 @@ mod tests {
         let ice_config = IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_authorized = crate::BrowserInputAuthorization::new(Arc::new(|| true));
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -1970,7 +2005,9 @@ mod tests {
             None,
             None,
             input_handler,
+            None,
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,

@@ -1,7 +1,16 @@
 # Credential Custody: the Vault and Leases
 
-> Status: **shipped 2026-07-03, all six rollout steps + access-token
-> OAuth mode.** The four sign-off decisions were resolved as recommended:
+> Status: **the vault backends, lease RPCs, and client-egress machinery are
+> implemented; the default product does not yet expose a Connect account-vault
+> client or bridge that backend to a trusted local/direct-mTLS daemon session.**
+> Hosted Connect is fixed at `role:none` and deliberately does not serve the
+> daemon dashboard, its vault client, or `vault-kernel.js`. Connect can store
+> opaque account-vault envelopes through its API, but the shipped directory UI
+> cannot create or unseal them. A direct daemon-origin vault can use an
+> authorized local/direct-mTLS channel. A future independently trusted client
+> bridge is required
+> to move or spend Connect-account vault entries. The four sign-off decisions
+> were resolved as recommended:
 > offline-lease default **24h**; full-credential OAuth leases **built but
 > off by default in the browser UX**; recovery phrase **mandatory** at
 > vault creation;
@@ -14,12 +23,12 @@
 > OpenAI's token endpoint serves any browser origin, so Codex works
 > out of the box; Anthropic's origin-allowlists browsers away, so Claude
 > Code still needs the full-credential opt-in until that changes.
-> End-to-end coverage: `scripts/validate-vault.cjs` (vault
-> custody, nine scenarios), `scripts/validate-credential-leases.cjs`
-> (lease lifecycle, OAuth materialization, UI fueling, `--owner`
-> bootstrap, access-token mode against a mock token endpoint), and
-> `scripts/validate-client-egress.cjs` (browser-relayed calls against a
-> mock provider, custody + allowlist proofs). The
+> Coverage: `scripts/validate-vault.cjs` exercises vault custody;
+> `scripts/validate-credential-leases.cjs` and
+> `scripts/validate-client-egress.cjs` pin the default hosted boundary
+> (route-only claim, immutable refusal even with an adversarial grant, no
+> delivery). Component-level RPC and direct-origin tests cover the underlying
+> lease/egress mechanisms. The
 > access-control counterpart (who may reach a daemon at all) is
 > [Trust Architecture](./trust-architecture.md); this chapter is about the
 > *other* secrets — the model-provider credentials a daemon spends.
@@ -36,8 +45,9 @@ macOS keychain). Consequences:
   that runs a daemon — in disk images, VPS snapshots, backups, and
   whatever a future compromise of an idle box turns up.
 - Standing up a new daemon means **copying secrets to it** — the worst
-  step of an otherwise clean bootstrap (claim phrase + key-verified
-  tunnel), and the step that keeps casual "spin up a box for the
+  step of an otherwise clean bootstrap (one-time route link, trusted owner
+  enrollment, and a key-verified tunnel), and the step that keeps casual
+  "spin up a box for the
   afternoon" out of reach.
 - The user's *subscription* identities (ChatGPT plan auth for Codex,
   Claude plan auth for Claude Code — both now permitted for programmatic
@@ -66,8 +76,10 @@ optional per-daemon scoping rules (below).
 
 Entries may also carry an **unseal policy** (`unseal_policy:
 "trusted"`; absent = anywhere): a trusted-only entry refuses use from
-hosted tabs — no reveal, no lease fueling, no egress relay, no voice
-mirror — while still syncing inside the encrypted body. This is
+hosted-origin vault code — no reveal, no lease fueling, no egress relay, no
+voice mirror — while still syncing inside the encrypted body. The current
+Connect directory ships no vault client, so this matters today on the direct
+dashboard and remains a constraint on any future hosted client. This is
 client-side self-enforcement (a guard against mistakes and casual
 exfiltration, not against a malicious bundle — see
 [Trust Tiers](./trust-tiers.md)). On a **direct** dashboard backed by
@@ -79,10 +91,11 @@ to every store like any other entry field.
 blind to its contents, and the dashboard says which one backs it (the
 store chip on the vault card):
 
-- **Account store** (hosted tabs): the Connect service keeps one blob
-  per account — the vault follows the person across daemons. This is
-  the original path and remains the default wherever the dashboard
-  arrived through Connect.
+- **Account store** (backend implemented, client not shipped): the Connect
+  service keeps one opaque blob per account. The API retains the original
+  cross-device storage design, but the default Connect directory serves no
+  dashboard vault client or crypto worker, so users cannot create, unseal, or
+  spend this store through the shipped hosted UI.
 - **Daemon store** (direct dashboards): the daemon itself keeps the
   blob at `~/.intendant/vault-blob.json` (0600), served over the
   verified control channel (`api_daemon_vault_fetch` /
@@ -94,15 +107,15 @@ store chip on the vault card):
   validation, the monotonic-revision rollback ratchet, same-revision
   divergence conflicts, and the MAC-presence ratchet.
 
-The two stores are **independent** — each keeps its own revision
-ratchet, and nothing syncs implicitly between them. Moving a vault is
-an explicit action: a hosted tab with an unlocked vault offers **"Keep
-a sealed copy on this daemon"**, which publishes the encrypted blob to
-the tunneled daemon's store; the direct dashboard there then unseals it
-with the same recovery phrase, or with a passkey enrolled from that
-origin (passkeys are origin-scoped, so the first unseal on a new origin
-is phrase-first, then enroll the local passkey — the blob holds one
-envelope per unlocker).
+The two stores are **independent** — each keeps its own revision ratchet, and
+nothing syncs implicitly between them. The daemon publish RPC and dashboard
+transfer code exist, but the default Connect directory supplies neither the
+source-vault client nor a channel to that RPC; therefore there is currently no
+shipped Connect-account-vault → direct-daemon-vault transfer path. A
+independently trusted client bridge must be built before that action can be
+advertised as working. A direct dashboard can create and use its own
+daemon-store vault today; moving an account vault into it is manual and
+out of band.
 
 **Keying.** A random 256-bit vault master key `K` encrypts the vault
 body (AES-GCM). `K` itself is never stored — it is wrapped into one
@@ -112,16 +125,18 @@ body (AES-GCM). `K` itself is never stored — it is wrapped into one
   passkey's WebAuthn PRF output (HKDF, salt `intendant-vault-v1` — a
   domain separate from the fleet-sync derivation, so the two features
   never share key material);
-- optionally one envelope for a **recovery phrase** (BIP39 12-word, the
-  claim-phrase plumbing reused), generated client-side, shown once.
+- optionally one envelope for a **recovery phrase** (BIP39 12-word, reusing
+  the mnemonic/word-grid plumbing rather than Connect claim semantics),
+  generated client-side, shown once.
 
 Losing a passkey therefore loses one envelope, not the vault: any
 surviving unlocker recovers `K`, and enrolling a new device is adding an
 envelope (one small re-wrap), not re-encrypting anything. This dissolves
 the "lost passkey = lost vault" objection that parked the vault idea.
 
-**Sync.** The encrypted vault blob syncs through the rendezvous blind
-and size-capped, and every blob is **authenticated end-to-end**: the
+**Account-store protocol (backend shipped; hosted client unshipped).** The
+encrypted account-vault blob can be stored through the rendezvous blind and
+size-capped, and every blob is **authenticated end-to-end**: the
 revision number is bound into the body ciphertext (AES-GCM AAD), and the
 whole blob — version, revision, envelope set, body — carries an
 HMAC-SHA-256 under a key HKDF-derived from the vault master key
@@ -137,16 +152,19 @@ it can never produce a master-key MAC, so the MAC is what shipped.)
 trick) plus each device's local high-water mark. The trust-ledger entry
 is the usual one: a malicious store can withhold or serve a stale
 revision — detectably, once any device has seen a newer one — and
-nothing else. Local copies in origin storage keep the vault usable when
-the rendezvous is down.
+nothing else. The shipped daemon-origin vault client keeps an origin-local
+cache of its separate daemon-store vault. There is no shipped Connect vault
+client whose account-vault copy remains usable offline when the rendezvous is
+down.
 
-**Where it unseals.** Only in the browser, only in memory, only behind a
-passkey gesture. Hosted-origin pages may unseal (that is the point of
-multi-device custody), consistent with the trust rule: what a
-hosted-origin page handles is bounded by what that page is for, and a
-credential lease is already scoped, time-boxed, and revocable (below).
-Users who refuse hosted-origin unsealing browse from an anchor origin —
-both escape hatches stay first-class.
+**Where it unseals.** Only in a browser worker, only in memory, and only behind
+an unlock gesture. The shipped direct daemon-origin dashboard can unseal its
+separate daemon-store vault. The default Connect directory does not serve the
+vault client or worker, so its account-store envelopes do not currently unseal
+in the product UI. Any future hosted client would still run under
+Connect-controlled JavaScript and would need to state that malicious hosted
+code could misuse entries while unlocked. Bridging the custody domains remains
+future work.
 
 ### The crypto kernel
 
@@ -161,19 +179,19 @@ in the worker and are wiped on `lock`; the page holds an opaque unlock
 token, and `32-vault-custody.js` keeps only policy and state — envelope
 choice, the MAC-downgrade ratchet, storage, rendering.
 
-The point is *pinned instantiation*: the app.html assembler hashes the
-kernel at build time and injects the sha256 as `VAULT_KERNEL_SHA256`
+The point is *pinned instantiation*: the daemon dashboard's app.html assembler
+hashes the kernel at build time and injects the sha256 as `VAULT_KERNEL_SHA256`
 (a placeholder in the fragment source, substituted at assembly — see
 `crates/app-html-assembler`); at first vault use the page fetches
-`/vault-kernel.js` (served embedded by the daemon gateway and from the
-static root by the hosted service), hashes the bytes, and instantiates a
+`/vault-kernel.js` (served only as an explicit embedded daemon-gateway asset),
+hashes the bytes, and instantiates a
 worker from them (blob URL) **only on a hash match** — a mismatch is a
-loud hard-refusal with no inline-crypto fallback. On the hosted service
-the kernel file is part of the artifact-transparency manifest
-(`artifact_manifest` log entries), so the pinning chain runs assembler
-hash → served bytes → public log → out-of-band verification by
-`intendant hosted-verify` and the daemon tripwires. A tampered bundle
-that once could exfiltrate the master key at unlock now has to tamper
+loud hard-refusal with no inline-crypto fallback. The Connect binary's static
+cutoff intentionally returns 404 for `/vault-kernel.js` (and for the daemon
+SPA/WASM tree); `--static-root` cannot re-enable it. Connect's transparency
+manifest therefore covers only the Connect pages and explicitly embedded
+assets it actually serves, not this daemon-only worker. A tampered daemon
+dashboard that once could exfiltrate the master key at unlock now has to tamper
 with one small, manifest-committed, humanly auditable file instead of
 hiding in ~3.4 MB of dashboard.
 
@@ -221,13 +239,21 @@ variant.
 
 ## Authority transport: credential leases
 
-A daemon never stores credentials; it **borrows** them.
+In the lease path, a daemon **borrows** credentials instead of configuring
+them durably. This is optional: `.env` remains supported, and full-credential
+OAuth leases temporarily materialize private auth files as documented below.
 
-When a browser session opens over the E2E-verified dashboard tunnel (the
-binding the browser already verifies, the client key the daemon already
-verifies), the browser unseals the needed entries and grants the daemon a
+When an **authorized trusted loopback/direct-mTLS browser session** opens over an
+E2E-verified dashboard channel (the binding the browser verifies and the
+loopback or mTLS principal the daemon authenticates), its daemon-store vault
+can unseal the needed entries and grant the daemon a
 **lease**: the credential material, delivered over the tunnel, held by
 the controller **in memory only**, tagged with an expiry.
+
+The Connect-origin account vault cannot use this transport in the default
+build: the service refuses offer/ICE/close and the daemon independently stamps
+hosted provenance `role:none`. No cross-origin handoff to an already-open
+direct dashboard exists yet.
 
 **Dashboard-control request methods** (mirroring existing RPC conventions;
 raw frame names are reserved for the `egress_*` relay path):
@@ -346,15 +372,16 @@ failure for their server farm — and it isn't even uniformly possible:
 | OpenAI | Generally no | completions API refuses browser CORS |
 | Codex / Claude Code (subscription) | No | they are local child processes by nature |
 
-So: **leases are the default egress-preserving mechanism** (daemon calls
+For an authorized trusted channel, **leases are the default
+egress-preserving mechanism** (daemon calls
 providers directly, as today, with borrowed credentials), and
 **client egress is an optional per-provider mode** — worthwhile for the
-maximally cautious, and as a zero-lease way to drive a brand-new daemon
-before deciding to fuel it at all. In client-egress mode the daemon
+maximally cautious. In client-egress mode the daemon
 sends prompt payloads to the browser over the tunnel, the browser calls
 the provider, and streams results back; the credential never leaves the
 browser. The mode advertises itself per-session so the UI can show which
-path is live.
+path is live. It is not reachable from the Connect account vault today;
+an independently trusted client bridge is still required.
 
 As shipped: a session holding `credentials.manage` registers as the
 relay per kind (`api_credential_egress_register`); the daemon ships each
@@ -372,53 +399,69 @@ probe (`api_credential_egress_probe`).
 
 | Scenario | Today (`.env`) | With leases |
 |---|---|---|
-| Stolen disk / VPS snapshot / backup leak / idle-box compromise | full credential loss | **nothing to steal** |
-| Runtime compromise, no active lease | full credential loss | nothing to steal |
+| Stolen disk / VPS snapshot / backup leak / idle-box compromise | full credential loss | no provider secret **only when deliberately keyless and outside an active full-credential OAuth lease**; `.env` and active materialized auth homes remain disk exposure |
+| Runtime compromise, no active lease | full credential loss | no leased material; locally configured `.env`/auth stores remain reachable |
 | Runtime compromise during a lease | full credential loss, unbounded | capability abuse **bounded by TTL + offline window**, per-daemon scoped credential, browser-witnessed lease log, revocable from any of the user's devices |
-| Malicious rendezvous | n/a | sees only the encrypted vault blob; can withhold or serve stale (detectable), cannot read or forge |
+| Malicious rendezvous | n/a | the passive store sees only ciphertext and can withhold or serve stale; malicious Connect-served code can read or misuse entries exposed after a hosted unlock, but the default build gives it no daemon delivery channel |
 
-The middle row is most real-world credential leakage; the design wins it
-outright. The third row is the honest limit of *any* design in which the
+For a deliberately keyless daemon, leases remove durable provider material
+from the first two rows outside an active full-credential OAuth lease. A daemon
+configured with `.env` or another local auth store retains that exposure; the
+custody machinery does not erase it. The active-lease row is the honest limit
+of *any* design in which the
 daemon composes prompts and consumes outputs — client egress does not
 beat it either (a runtime-compromised daemon spends tokens through
 whatever path exists while connected); what leases add there is bounded
-time, bounded blast radius, and an audit trail the daemon cannot forge.
+time, bounded blast radius, and a daemon-local custody log for normal
+operations. That JSONL log is not tamper-proof: a compromised daemon can
+alter or omit its own record, so independent client/provider records remain
+the stronger forensic source.
 
 ## The bootstrap this unlocks
 
 With custody and leases in place, standing up a new daemon copies no
-secrets, installs nothing on the user's device, and takes about ninety
-seconds from a phone:
+provider secrets. Connect discovery remains a roughly ninety-second browser
+flow, while ownership deliberately requires a trusted anchor:
 
-1. **Install**: `curl -fsSL https://intendant.dev/install.sh | sh -s --
-   --owner <client-key-fingerprint>` on the fresh box (every rendezvous —
-   hosted or self-run — serves its own version-matched installer at
-   `/install.sh`). The fingerprint
-   is public (shown in the Access drawer); the daemon boots with an
-   owner grant pinned to that browser key — authority minted locally, as
-   always. Nothing sensitive appears in the command or on the wire.
-   On Windows the same step is
-   `& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <fp>`
-   from PowerShell. On an unattended box add `--service` (`-Service`):
+1. **Install**: `curl -fsSL https://intendant.dev/install.sh | sh` on the
+   fresh box (every rendezvous — hosted or self-run — serves its own
+   version-matched installer at `/install.sh`). On Windows the same step is
+   `& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))` from
+   PowerShell. On an unattended box add `--service` (`-Service`):
    `intendant service install` picks the platform's native supervisor —
    systemd **where present**, launchd on macOS, Task Scheduler on
    Windows, cron `@reboot` plus the built-in restart supervisor on
    systemd-less Linux; no init system is a dependency — so the daemon
    outlives the SSH session and restarts on failure, and the installer
-   prints where the claim phrase lands (journal or service log). The
+   prints where the one-time claim code lands (journal or service log). The
    landing page's fold-out advisor ("Not sure which shape fits?") maps
    four questions — OS, where it runs, what fuels it, attended or not —
    onto this same command plus an honest fueling plan.
-2. **Claim**: the daemon prints its claim phrase; the user claims it in
-   the browser they are already holding (existing flow).
-3. **Fuel**: the first dashboard session opens over the verified tunnel
-   and the browser grants leases from the vault, per that daemon's
-   scoping rules (e.g. "new daemons get the scoped work key, never the
-   personal Anthropic key").
+2. **Link**: the daemon prints a single-use twelve-word claim code; the user
+   enters it in Connect to add discovery and route metadata to the account.
+   Linking creates no IAM principal or grant and grants no access.
+3. **Anchor**: establish root through `intendant access setup` from the
+   machine's console/SSH session or a direct mTLS root connection. The packaged
+   macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized
+   release has been published for this alpha; an `-unsigned-dev` artifact is
+   not an anchor. The former
+   `--owner <client-key-fingerprint>` shortcut is
+   retired; alpha root establishment does not treat a bare browser-key
+   fingerprint as authentication.
+4. **Authorize on a trusted surface**: install an owner-approved browser mTLS
+   certificate from the daemon enrollment flow. A future verified signed and
+   notarized native release could provide the packaged local bridge.
+   Browser identity keys remain record/signature vocabulary and are not an
+   alpha login. Hosted Connect remains discovery-only: its compiled ceiling is immutably
+   `role:none`, with no opt-in or role-raising control.
+5. **Fuel**: create or unlock the separate daemon-store vault from that trusted
+   direct dashboard, or use existing local credential configuration. The
+   Connect account vault cannot be handed across to this session in the default
+   build; an independently trusted client bridge is still unimplemented.
 
-Step 1's `--owner` bootstrap is the only new trust mechanism, and it is
-key-first in the existing spirit: ownership asserted by public key,
-enforced by the daemon's own IAM from first boot.
+Claiming and custody are intentionally independent: the claim makes a machine
+findable and the trusted anchor creates authority. Vault storage alone does not
+create the missing cross-origin delivery bridge.
 
 ## Rollout
 
@@ -442,26 +485,27 @@ enforced by the daemon's own IAM from first boot.
    usage audit fields), dry-daemon Web Push. Custody trail shipped: the
    daemon records every grant/expiry/revocation/relay change (+ restart
    resets) locally and serves them over `api_credential_custody_trail`.
-5. ✅ Client-egress mode for Anthropic/Gemini (host-allowlisted browser
-   relay, credit-windowed streaming, probe); per-session path indicator
-   in the fueling panel and lease status.
-6. ✅ `--owner` bootstrap flag + `scripts/install.sh`.
+5. ✅ Client-egress mechanism for Anthropic/Gemini on an authorized control
+   channel (host-allowlisted browser relay, credit-windowed streaming, probe);
+   **not reachable from the Connect account vault until a trusted bridge ships**.
+6. ✅ Hosted installers leave route linking authority-free by default;
+   legacy `--owner <browser-key>` bootstrap is retired/rejected rather than
+   shipping an incomplete certless key-auth protocol.
+7. ⏳ Independently trusted client bridge for transferring or spending a
+   Connect-account vault in a daemon-origin session.
 
-## Open questions for sign-off
+## V1 decisions
 
-1. **Offline-lease default**: `0` (fuel only while connected — maximum
-   custody, breaks overnight autonomy) or `24h`/`72h` (agents keep
-   working, bounded exposure)? Recommendation: **24h**, per-daemon
-   adjustable, surfaced at fueling time.
-2. **Full-credential OAuth lease**: allowed at all in v1, or
-   access-token-only until demand proves out? Recommendation: build the
-   plumbing, ship **off by default** behind an explicit per-daemon
-   toggle with the honest warning.
-3. **Recovery phrase**: mandatory at vault creation (no vault without a
-   second unlocker) or optional-with-nagging? Recommendation:
-   **mandatory** — a single-envelope vault is a support incident waiting
-   to happen, and the ceremony is one screen.
-4. **Scoping model**: per-daemon allow-lists on vault entries in v1, or
-   defer to v2 and lease everything to every owned daemon?
-   Recommendation: v1 ships a single default rule ("lease to any daemon
-   I own, ask per new daemon") with per-entry overrides deferred.
+1. **Offline leases default to 24 hours.** The fueling UI exposes the
+   per-daemon choice (`while connected`, 1h, 24h, or 72h); grants made after a
+   change use the new value.
+2. **Full-credential OAuth is implemented but opt-in.** Browser fueling uses
+   refresh-free access-token leases by default. An explicit per-daemon toggle,
+   off by default and accompanied by the durable-authority warning, enables
+   full auth-file leases where provider CORS or unattended duration requires
+   them.
+3. **A recovery phrase is mandatory at vault creation.** Every new vault has a
+   second unlocker rather than depending on one passkey envelope.
+4. **V1 uses one default daemon-scoping rule.** "Lease to any daemon I own,
+   ask per new daemon" is the shipped policy; per-entry overrides remain a v2
+   item.

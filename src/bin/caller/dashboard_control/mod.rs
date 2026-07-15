@@ -1,9 +1,11 @@
 //! Daemon-scoped WebRTC control tunnel for dashboard RPC experiments.
 //!
 //! The dashboard still uses HTTP plus the main WebSocket by default. This
-//! module provides the first substrate for a future public-origin dashboard:
-//! WebSocket signaling creates a direct browser-to-daemon WebRTC data channel,
-//! then the channel carries small JSON RPC frames.
+//! module provides a lower-latency path for clients already admitted through a
+//! trusted local, independently verified direct-mTLS, or authenticated peer
+//! transport: daemon/peer signaling creates a direct WebRTC data channel, then
+//! the channel carries small JSON RPC frames. Hosted Connect has no signaling
+//! or control path into this module.
 
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
@@ -32,7 +34,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -53,6 +55,10 @@ mod api_control;
 pub(crate) use api_control::*;
 
 const CONTROL_CHANNEL_LABEL: &str = "intendant-dashboard-control";
+/// Maximum idle-session delay before a long-lived dashboard transport notices
+/// that its opening IAM authority changed and tears itself down. Active
+/// inbound/outbound paths re-check synchronously before processing a frame.
+pub(crate) const LIVE_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const CONTROL_PROTOCOL_VERSION: u32 = 1;
 const CONTROL_SIGNATURE_CONTEXT: &str = "intendant-dashboard-control-v1";
 const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
@@ -63,7 +69,6 @@ const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
-static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// One dashboard-control method's declared surface. The effective method
 /// table (`all_control_methods`) is the single source the method authorizer
 /// (`authorize_dashboard_control_method`), the advertised feature list
@@ -141,7 +146,7 @@ const CONTROL_ONLY_METHODS: &[ControlMethodSpec] = &[
         advertised: true,
         upload: false,
     },
-    method("config", PeerOperation::RuntimeControl),
+    method("config", PeerOperation::PresenceRead),
     method("status", PeerOperation::PresenceRead),
     method("api_agent_card", PeerOperation::PresenceRead),
     method("api_cached_bootstrap_events", PeerOperation::SessionInspect),
@@ -150,9 +155,9 @@ const CONTROL_ONLY_METHODS: &[ControlMethodSpec] = &[
     // The access inspect reads (api_access_overview, api_access_iam_state,
     // api_access_enrollment_requests, api_dashboard_targets), the connect
     // admin quartet (status, claim-code, config, unclaim), and the
-    // trust-tier pair (set_tier, set_hosted_ceiling) live as tunnel
-    // columns on their route rows — their IAM operations derive from the
-    // rows (S6).
+    // trust-tier setter lives as a tunnel column on its route row — its IAM
+    // operation derives from that row (S6). Hosted ceilings are immutable
+    // `role:none`; the former setter is deliberately absent.
     // api_fleet_cert_request lives as a tunnel column on its ROW-NEW
     // (POST /api/access/fleet-cert/request — S6 closed the family's one
     // missing HTTP twin).
@@ -442,22 +447,26 @@ pub struct DashboardControlRegistry {
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum DashboardControlGrant {
-    #[default]
     TrustedLocal,
-    UserClientRoot {
-        principal: crate::access::iam::AccessPrincipal,
-    },
     UserClient {
         principal: crate::access::iam::AccessPrincipal,
         iam_state: crate::access::iam::LocalIamState,
+        /// Production sessions reload this daemon-owned IAM directory through
+        /// the stat-fingerprint cache before every authorization decision.
+        /// `None` is reserved for hermetic in-memory tests.
+        iam_cert_dir: Option<PathBuf>,
     },
     Peer {
         fingerprint: String,
         label: String,
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+        /// Exact active peer-identity record that authenticated the opening,
+        /// plus its daemon-owned directory for live revocation checks.
+        identity_record: Option<crate::peer::access_policy::PeerIdentityRecord>,
+        iam_cert_dir: Option<PathBuf>,
         /// Delegation-lane attribution (docs/src/trust-tiers.md § Two
         /// lanes): the browser identity key that signed the relayed
         /// offer, when one did. Attribution never widens authority —
@@ -466,6 +475,31 @@ pub enum DashboardControlGrant {
         /// daemon principal.
         attributed: Option<PeerAttribution>,
     },
+}
+
+/// Stable identity of the transport credential + principal + grant that
+/// opened a dashboard-control session. Follow-up HTTP signaling is stateless,
+/// so the registry retains this binding and refuses ICE/close from another
+/// CA-valid certificate or from a principal whose grant changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DashboardControlSessionOwner {
+    TrustedLocal,
+    UserClient {
+        principal_id: String,
+        grant_id: Option<String>,
+        authn_kind: Option<String>,
+        authn_binding: Option<String>,
+    },
+    Peer {
+        fingerprint: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DashboardControlSessionMutation {
+    Applied,
+    NotFound,
+    Forbidden,
 }
 
 /// The verified human identity behind a delegation-lane connection.
@@ -484,10 +518,124 @@ pub struct PeerAttribution {
 }
 
 impl DashboardControlGrant {
+    fn current_user_client_state(&self) -> Result<Arc<crate::access::iam::LocalIamState>, String> {
+        let Self::UserClient {
+            iam_state,
+            iam_cert_dir,
+            ..
+        } = self
+        else {
+            return Err("dashboard grant is not a local IAM user/client".to_string());
+        };
+        match iam_cert_dir {
+            Some(cert_dir) => crate::access::iam::load_state_cached_arc(cert_dir)
+                .map_err(|error| format!("reload local IAM state: {error}")),
+            None => Ok(Arc::new(iam_state.clone())),
+        }
+    }
+
+    /// A long-lived browser session must never outlive the exact IAM record
+    /// that opened it. Any grant/principal mutation (including downgrade,
+    /// revocation, expiry/ORL materialization, scope edit, deletion, or a
+    /// reload error) makes the session stale and forces a reconnect under the
+    /// new authority. Unrelated IAM edits do not disturb it.
+    pub(crate) fn opening_authority_is_current(&self) -> bool {
+        match self {
+            Self::UserClient {
+                principal,
+                iam_state,
+                ..
+            } => {
+                let Some(grant_id) = principal.grant_id.as_deref() else {
+                    return false;
+                };
+                let Ok(current) = self.current_user_client_state() else {
+                    return false;
+                };
+                let Some(opening_grant) =
+                    iam_state.grants.iter().find(|grant| grant.id == grant_id)
+                else {
+                    return false;
+                };
+                let Some(current_grant) = current.grants.iter().find(|grant| grant.id == grant_id)
+                else {
+                    return false;
+                };
+                let Some(opening_principal) = iam_state
+                    .principals
+                    .iter()
+                    .find(|record| record.id == principal.id)
+                else {
+                    return false;
+                };
+                let Some(current_principal) = current
+                    .principals
+                    .iter()
+                    .find(|record| record.id == principal.id)
+                else {
+                    return false;
+                };
+                let role_id = if opening_grant.role_id.trim().is_empty() {
+                    "role:scoped-human"
+                } else {
+                    opening_grant.role_id.as_str()
+                };
+                let Some(opening_role) = iam_state.roles.iter().find(|role| role.id == role_id)
+                else {
+                    return false;
+                };
+                let Some(current_role) = current.roles.iter().find(|role| role.id == role_id)
+                else {
+                    return false;
+                };
+                let hosted_provenance_unchanged = principal.authn_kind.as_deref()
+                    != Some("client_key")
+                    || iam_state.hosted_origins == current.hosted_origins;
+                opening_grant == current_grant
+                    && opening_principal == current_principal
+                    && opening_role == current_role
+                    && hosted_provenance_unchanged
+                    && current_grant.is_active_at(crate::access::client_key::now_unix_ms())
+                    && crate::access::iam::is_enforced_status(&current_principal.status)
+            }
+            Self::Peer {
+                fingerprint,
+                identity_record,
+                iam_cert_dir,
+                ..
+            } => match (identity_record, iam_cert_dir) {
+                (None, None) => true,
+                (Some(opening), Some(cert_dir)) => {
+                    let now_unix = crate::access::client_key::now_unix_ms() / 1000;
+                    matches!(
+                        crate::peer::access_policy::lookup_identity_cached_arc(cert_dir, fingerprint),
+                        Ok(Some(current)) if current.as_ref() == opening && current.is_active(now_unix)
+                    )
+                }
+                _ => false,
+            },
+            Self::TrustedLocal => true,
+        }
+    }
+
+    fn signaling_owner(&self) -> DashboardControlSessionOwner {
+        match self {
+            Self::TrustedLocal => DashboardControlSessionOwner::TrustedLocal,
+            Self::UserClient { principal, .. } => DashboardControlSessionOwner::UserClient {
+                principal_id: principal.id.clone(),
+                grant_id: principal.grant_id.clone(),
+                authn_kind: principal.authn_kind.clone(),
+                authn_binding: principal.authn_binding.clone(),
+            },
+            Self::Peer { fingerprint, .. } => DashboardControlSessionOwner::Peer {
+                fingerprint: fingerprint.clone(),
+            },
+        }
+    }
+
     pub(crate) fn label(&self) -> &str {
         match self {
             Self::TrustedLocal => "trusted-local",
-            Self::UserClientRoot { principal } => principal.label.as_str(),
             Self::UserClient { principal, .. } => principal.label.as_str(),
             Self::Peer { label, .. } => label.as_str(),
         }
@@ -499,28 +647,34 @@ impl DashboardControlGrant {
     pub(crate) fn connection_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "local",
-            Self::UserClientRoot { .. } | Self::UserClient { .. } => "client",
+            Self::UserClient { .. } => "client",
             Self::Peer { .. } => "peer",
         }
     }
 
     fn profile(&self) -> Option<&str> {
         match self {
-            Self::TrustedLocal | Self::UserClientRoot { .. } | Self::UserClient { .. } => None,
+            Self::TrustedLocal | Self::UserClient { .. } => None,
             Self::Peer { profile, .. } => Some(profile.as_str()),
         }
     }
 
-    pub(crate) fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+    pub(crate) fn filesystem(&self) -> Option<crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
-            // TrustedLocal is the owner's own dashboard; a root client key
-            // is equivalent. Scoping applies to granted principals.
-            Self::TrustedLocal | Self::UserClientRoot { .. } => None,
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::fs_scope_for_principal(iam_state, principal),
-            Self::Peer { filesystem, .. } => Some(filesystem),
+            // TrustedLocal is the owner's own dashboard. Every enrolled
+            // client, including a root-role client, is re-derived from IAM.
+            Self::TrustedLocal => None,
+            Self::UserClient { principal, .. } => match self.current_user_client_state() {
+                Ok(state) => crate::access::iam::fs_scope_for_principal(&state, principal).cloned(),
+                // A malformed/unreadable live IAM file must not turn a scoped
+                // grant into unrestricted filesystem access.
+                Err(_) => Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
+            },
+            Self::Peer { filesystem, .. } => Some(if self.opening_authority_is_current() {
+                filesystem.clone()
+            } else {
+                crate::peer::access_policy::FilesystemAccessPolicy::default()
+            }),
         }
     }
 
@@ -530,8 +684,22 @@ impl DashboardControlGrant {
                 "dashboard-control",
                 "webrtc-datachannel",
             ),
-            Self::UserClientRoot { principal } => principal.clone(),
-            Self::UserClient { principal, .. } => principal.clone(),
+            Self::UserClient { principal, .. } => {
+                let mut current = principal.clone();
+                if let Ok(state) = self.current_user_client_state() {
+                    if let Some(grant_id) = principal.grant_id.as_deref() {
+                        if let Some(grant) = state.grants.iter().find(|grant| grant.id == grant_id)
+                        {
+                            current.role_id = if grant.role_id.trim().is_empty() {
+                                "role:scoped-human".to_string()
+                            } else {
+                                grant.role_id.clone()
+                            };
+                        }
+                    }
+                }
+                current
+            }
             Self::Peer {
                 fingerprint,
                 label,
@@ -549,34 +717,161 @@ impl DashboardControlGrant {
     /// Origin class of this session for the custody trail —
     /// `hosted` / `direct` / `local` / `peer`
     /// (`access::iam::session_origin_class`). `UserClient` grants carry
-    /// their IAM snapshot's `hosted_origins`; the root-equivalent
-    /// variants classify against the compiled default list.
+    /// their IAM snapshot's `hosted_origins`.
     pub(crate) fn custody_origin_class(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "local",
-            Self::UserClientRoot { principal } => crate::access::iam::session_origin_class(
-                &crate::access::iam::default_hosted_origins(),
-                principal,
-            ),
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::session_origin_class(&iam_state.hosted_origins, principal),
+            Self::UserClient { principal, .. } => self
+                .current_user_client_state()
+                .map(|state| {
+                    crate::access::iam::session_origin_class(&state.hosted_origins, principal)
+                })
+                .unwrap_or("direct"),
             Self::Peer { .. } => "peer",
         }
     }
 
-    /// The terminal actor lane for this connection: root-equivalent
-    /// grants (trusted local, unbound mTLS root) own the root lane and
-    /// see every shell session; everyone else acts as their principal id
-    /// and sees only owned or shared sessions.
+    /// The terminal actor lane for this connection: trusted-local and
+    /// explicitly granted root principals own the root lane and see every
+    /// shell session; everyone else acts as their principal id and sees only
+    /// owned or shared sessions.
     pub(crate) fn terminal_actor(&self) -> crate::terminal::TerminalActor {
         let principal = self.access_principal();
-        if principal.kind == "root_session" {
+        let is_root = match self {
+            Self::TrustedLocal => true,
+            Self::UserClient { .. } => {
+                principal.role_id == "role:root" && self.opening_authority_is_current()
+            }
+            Self::Peer { .. } => false,
+        };
+        if is_root {
             crate::terminal::TerminalActor::Root
         } else {
             crate::terminal::TerminalActor::Principal(principal.id)
         }
+    }
+
+    /// Whether this connection is one of the owner's authenticated dashboard
+    /// surfaces. Private user-session displays and actions that mint access to
+    /// them must never be exposed merely by granting `display.view` or
+    /// `display.input` to a delegate.
+    pub(crate) fn has_owner_dashboard_authority(&self) -> bool {
+        match self {
+            Self::TrustedLocal => true,
+            Self::UserClient { principal, .. } => {
+                principal.role_id == "role:root" && self.opening_authority_is_current()
+            }
+            Self::Peer { .. } => false,
+        }
+    }
+
+    /// Resolve a display through this connection's visibility boundary.
+    /// Generic display permissions expose agent-visible displays only; the
+    /// owner's authenticated dashboard may additionally resolve private user
+    /// views.
+    pub(crate) fn display_session(
+        &self,
+        registry: &crate::display::SessionRegistry,
+        display_id: u32,
+    ) -> Option<Arc<crate::display::DisplaySession>> {
+        if self.has_owner_dashboard_authority() {
+            registry.get_any(display_id)
+        } else {
+            registry.get(display_id)
+        }
+    }
+
+    /// Enumerate displays through the same visibility boundary as
+    /// [`Self::display_session`].
+    pub(crate) fn display_ids(&self, registry: &crate::display::SessionRegistry) -> Vec<u32> {
+        if self.has_owner_dashboard_authority() {
+            registry.all_display_ids()
+        } else {
+            registry.display_ids()
+        }
+    }
+
+    /// Apply the owner-only boundary to dashboard event streams. This hides
+    /// explicit private ready/grant records, display-request prompts, and
+    /// portal approval prompts from scoped dashboards. Display lifecycle
+    /// failure/teardown metadata does not carry the original visibility bit
+    /// and remains audit metadata rather than a secrecy boundary.
+    pub(crate) fn allows_dashboard_event_line(&self, line: &str) -> bool {
+        self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
+    }
+
+    pub(crate) fn dashboard_event_line_requires_owner(line: &str) -> bool {
+        if !line.contains("display_request_raised")
+            && !line.contains("display_request_resolved")
+            && !line.contains("display_approval_pending")
+            && !line.contains("\"agent_visible\"")
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        match value.get("event").and_then(serde_json::Value::as_str) {
+            Some(
+                "display_request_raised" | "display_request_resolved" | "display_approval_pending",
+            ) => true,
+            Some("display_ready" | "user_display_granted") => {
+                value
+                    .get("agent_visible")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove owner-only display events from a browser bootstrap replay.
+    ///
+    /// Session logs remain the daemon's audit record; this filters only the
+    /// live dashboard projection so a historical private `display_ready`
+    /// cannot recreate a denied display slot for a scoped client.
+    pub(crate) fn filter_dashboard_replay_payload(&self, replay: &mut serde_json::Value) {
+        if self.has_owner_dashboard_authority() {
+            return;
+        }
+        let Some(entries) = replay
+            .get_mut("entries")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        entries.retain(|entry| {
+            serde_json::to_string(entry)
+                .ok()
+                .is_none_or(|line| !Self::dashboard_event_line_requires_owner(&line))
+        });
+    }
+
+    /// Display target carried by a serialized dashboard event, when present.
+    /// Live event loops use it to suppress every event for an active private
+    /// session, including variants such as resize that do not repeat the
+    /// `agent_visible` bit.
+    pub(crate) fn dashboard_event_display_id(line: &str) -> Option<u32> {
+        if !line.contains("\"display_id\"") {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()?
+            .get("display_id")?
+            .as_u64()
+            .and_then(|display_id| u32::try_from(display_id).ok())
+    }
+
+    pub(crate) fn dashboard_event_targets_hidden_display(
+        &self,
+        line: &str,
+        registry: &crate::display::SessionRegistry,
+    ) -> bool {
+        let Some(display_id) = Self::dashboard_event_display_id(line) else {
+            return false;
+        };
+        registry.get_any(display_id).is_some()
+            && self.display_session(registry, display_id).is_none()
     }
 
     pub(crate) fn access_decision(
@@ -584,20 +879,85 @@ impl DashboardControlGrant {
         op: crate::peer::access_policy::PeerOperation,
     ) -> crate::access::iam::AccessDecision {
         match self {
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::evaluate_principal_operation_with_state(
-                iam_state, principal, op,
-            ),
+            Self::UserClient { principal, .. } => match self.current_user_client_state() {
+                Ok(state) => crate::access::iam::evaluate_principal_operation_with_state(
+                    &state, principal, op,
+                ),
+                Err(error) => crate::access::iam::AccessDecision::denied(
+                    principal,
+                    op,
+                    format!("local IAM state is unavailable: {error}"),
+                ),
+            },
+            Self::Peer { .. } if !self.opening_authority_is_current() => {
+                let principal = self.access_principal();
+                crate::access::iam::AccessDecision::denied(
+                    &principal,
+                    op,
+                    "peer identity changed, expired, was revoked, or could not be reloaded",
+                )
+            }
             _ => crate::access::iam::evaluate_principal_operation(&self.access_principal(), op),
         }
+    }
+
+    /// Authorize the concrete action carried inside a multiplexed control RPC.
+    /// The outer method's permission is only a conservative admission floor;
+    /// it must not become a confused-deputy grant for every action in the
+    /// method's allowlist.
+    pub(crate) fn control_msg_access_decision(
+        &self,
+        ctrl: &ControlMsg,
+    ) -> crate::access::iam::AccessDecision {
+        let operation = crate::access::access_policy::control_msg_operation(ctrl);
+        if crate::access::access_policy::control_msg_requires_owner_dashboard(ctrl)
+            && !self.has_owner_dashboard_authority()
+        {
+            let principal = self.access_principal();
+            return crate::access::iam::AccessDecision::denied(
+                &principal,
+                operation,
+                "owner dashboard authority is required for this action",
+            );
+        }
+        self.access_decision(operation)
+    }
+
+    /// Pre-session fail-closed gate for transports that push snapshots or
+    /// transcripts immediately after opening. A principal with no effective
+    /// operation must not reach the WebSocket/DataChannel stage, because
+    /// inbound frame authorization cannot retract already-sent outbound data.
+    pub(crate) fn has_any_effective_operation(&self) -> bool {
+        crate::access::access_policy::ALL_OPERATIONS
+            .iter()
+            .copied()
+            .any(|operation| self.access_decision(operation).allowed)
+    }
+
+    /// Whether this grant may enter the legacy `/ws` event lane. That lane
+    /// sends a whole-dashboard bootstrap and then an unfiltered broadcast
+    /// stream, so method-level inbound authorization cannot make a narrower
+    /// role safe. Until outbound events are permission-filtered, require the
+    /// complete built-in observer read set. Root/operator and an equivalent
+    /// custom role pass; scoped-human and single-purpose roles do not.
+    pub(crate) fn allows_unfiltered_websocket_stream(&self) -> bool {
+        use crate::access::access_policy::PeerOperation;
+
+        [
+            PeerOperation::PresenceRead,
+            PeerOperation::StatsRead,
+            PeerOperation::DisplayView,
+            PeerOperation::AccessInspect,
+            PeerOperation::PeerInspect,
+            PeerOperation::SessionInspect,
+        ]
+        .into_iter()
+        .all(|operation| self.access_decision(operation).allowed)
     }
 
     pub(crate) fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
-            Self::UserClientRoot { .. } => "user-client-root",
             Self::UserClient { .. } => "user-client",
             Self::Peer { .. } => "peer",
         }
@@ -712,27 +1072,32 @@ impl DashboardPresenceBridge {
 /// dashboard client id (and a display id / id list) and returns event JSON.
 type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
+type AuthorityRequestFn = dyn Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
 type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
+type AuthorityInputRevisionFn = dyn Fn(u32) -> Arc<AtomicU64> + Send + Sync;
 
 #[derive(Clone)]
 pub struct DashboardDisplayAuthorityBridge {
     snapshot: Arc<AuthoritySnapshotFn>,
     state_frame: Arc<AuthorityStateFrameFn>,
-    request: Arc<AuthorityEventsFn>,
+    request: Arc<AuthorityRequestFn>,
     release: Arc<AuthorityEventsFn>,
     input_authorized: Arc<AuthorityInputAuthorizedFn>,
+    input_revision: Arc<AuthorityInputRevisionFn>,
     cleanup: Arc<dyn Fn(&str) + Send + Sync>,
     subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
 }
 
 impl DashboardDisplayAuthorityBridge {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: impl Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync + 'static,
         state_frame: impl Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync + 'static,
-        request: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        request: impl Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync + 'static,
         release: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
         input_authorized: impl Fn(&str, u32) -> bool + Send + Sync + 'static,
+        input_revision: impl Fn(u32) -> Arc<AtomicU64> + Send + Sync + 'static,
         cleanup: impl Fn(&str) + Send + Sync + 'static,
         subscribe: impl Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync + 'static,
     ) -> Self {
@@ -742,6 +1107,7 @@ impl DashboardDisplayAuthorityBridge {
             request: Arc::new(request),
             release: Arc::new(release),
             input_authorized: Arc::new(input_authorized),
+            input_revision: Arc::new(input_revision),
             cleanup: Arc::new(cleanup),
             subscribe: Arc::new(subscribe),
         }
@@ -755,8 +1121,13 @@ impl DashboardDisplayAuthorityBridge {
         (self.state_frame)(session_id, display_id)
     }
 
-    fn request(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
-        (self.request)(session_id, display_id)
+    fn request(
+        &self,
+        session_id: &str,
+        display_id: u32,
+        include_private: bool,
+    ) -> Vec<serde_json::Value> {
+        (self.request)(session_id, display_id, include_private)
     }
 
     fn release(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
@@ -765,6 +1136,10 @@ impl DashboardDisplayAuthorityBridge {
 
     fn input_authorized(&self, session_id: &str, display_id: u32) -> bool {
         (self.input_authorized)(session_id, display_id)
+    }
+
+    fn input_revision(&self, display_id: u32) -> Arc<AtomicU64> {
+        (self.input_revision)(display_id)
     }
 
     fn cleanup(&self, session_id: &str) {
@@ -842,22 +1217,6 @@ impl DashboardControlRegistry {
     /// has registered the session).
     pub(crate) fn note_tab_id(&self, session_id: &str, tab_id: &str) {
         self.tabs.note_tab_id(session_id, tab_id);
-    }
-
-    #[allow(dead_code)]
-    pub async fn answer_offer(
-        &self,
-        offer_sdp: String,
-        session_grant: Option<String>,
-        client_nonce: Option<String>,
-    ) -> Result<DashboardControlAnswer, String> {
-        self.answer_offer_with_grant(
-            offer_sdp,
-            session_grant,
-            client_nonce,
-            DashboardControlGrant::TrustedLocal,
-        )
-        .await
     }
 
     pub async fn answer_offer_with_grant(
@@ -947,7 +1306,17 @@ impl DashboardControlRegistry {
         )
         .await
         .map_err(|e| e.to_string())?;
-        self.peers.lock().await.insert(session_id.clone(), peer);
+        let rejected = {
+            let mut peers = self.peers.lock().await;
+            insert_dashboard_control_peer_if_vacant(&mut peers, session_id.clone(), peer).err()
+        };
+        if let Some(rejected) = rejected {
+            rejected.close().await;
+            return Err(
+                "dashboard-control session id is already occupied; refusing to replace it"
+                    .to_string(),
+            );
+        }
         self.tabs.register(&session_id, tab_entry);
         Ok(DashboardControlAnswer {
             session_id,
@@ -969,7 +1338,44 @@ impl DashboardControlRegistry {
         Ok(true)
     }
 
-    pub async fn close(&self, session_id: &str) {
+    pub(crate) async fn add_ice_candidate_for_grant(
+        &self,
+        session_id: &str,
+        candidate_json: &serde_json::Value,
+        caller: &DashboardControlGrant,
+    ) -> Result<DashboardControlSessionMutation, String> {
+        let peers = self.peers.lock().await;
+        let Some(peer) = peers.get(session_id) else {
+            return Ok(DashboardControlSessionMutation::NotFound);
+        };
+        if !peer.belongs_to(caller) {
+            return Ok(DashboardControlSessionMutation::Forbidden);
+        }
+        peer.add_ice_candidate(candidate_json).await?;
+        Ok(DashboardControlSessionMutation::Applied)
+    }
+
+    pub(crate) async fn close_for_grant(
+        &self,
+        session_id: &str,
+        caller: &DashboardControlGrant,
+    ) -> DashboardControlSessionMutation {
+        let peer = {
+            let mut peers = self.peers.lock().await;
+            let Some(peer) = peers.get(session_id) else {
+                return DashboardControlSessionMutation::NotFound;
+            };
+            if !peer.belongs_to(caller) {
+                return DashboardControlSessionMutation::Forbidden;
+            }
+            peers
+                .remove(session_id)
+                .expect("dashboard-control peer existed under the same lock")
+        };
+        // Kill the live transport guard before any cleanup callback can yield.
+        // Once an explicit close is accepted, no buffered control frame may
+        // retain the opening grant while presence/authority teardown runs.
+        peer.close().await;
         self.tabs.unregister(session_id);
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
@@ -977,8 +1383,20 @@ impl DashboardControlRegistry {
         if let Some(bridge) = &self.presence {
             bridge.cleanup(session_id.to_string()).await;
         }
-        if let Some(peer) = self.peers.lock().await.remove(session_id) {
+        DashboardControlSessionMutation::Applied
+    }
+
+    pub async fn close(&self, session_id: &str) {
+        let peer = self.peers.lock().await.remove(session_id);
+        if let Some(peer) = peer {
             peer.close().await;
+        }
+        self.tabs.unregister(session_id);
+        if let Some(bridge) = &self.display_authority {
+            bridge.cleanup(session_id);
+        }
+        if let Some(bridge) = &self.presence {
+            bridge.cleanup(session_id.to_string()).await;
         }
     }
 
@@ -1081,9 +1499,28 @@ impl DashboardControlBinding {
 pub struct DashboardControlPeer {
     command_tx: mpsc::Sender<ControlCommand>,
     shutdown: CancellationToken,
+    owner: DashboardControlSessionOwner,
+}
+
+fn insert_dashboard_control_peer_if_vacant(
+    peers: &mut HashMap<String, DashboardControlPeer>,
+    session_id: String,
+    peer: DashboardControlPeer,
+) -> Result<(), DashboardControlPeer> {
+    match peers.entry(session_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(peer);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(_) => Err(peer),
+    }
 }
 
 impl DashboardControlPeer {
+    fn belongs_to(&self, caller: &DashboardControlGrant) -> bool {
+        self.owner == caller.signaling_owner()
+    }
+
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     async fn answer_offer(
         session_id: String,
@@ -1111,6 +1548,7 @@ impl DashboardControlPeer {
         grant: DashboardControlGrant,
         tabs: crate::web_gateway::DashboardTabsRegistry,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
+        let owner = grant.signaling_owner();
         let local_ufrag = new_control_ice_fragment();
         let local_pwd = new_control_ice_password();
         let mut setting_engine = SettingEngine::default();
@@ -1195,6 +1633,11 @@ impl DashboardControlPeer {
             session_grant.as_deref(),
             client_nonce.as_deref(),
         );
+        let display_peer_id = crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+            .ok_or_else(|| {
+                CallerError::WebRtc("dashboard display peer-id namespace exhausted".to_string())
+            })?;
+        let shutdown = CancellationToken::new();
         let runtime = ControlRuntime {
             session_id,
             daemon_public_key: identity.public_key_b64u(),
@@ -1220,13 +1663,14 @@ impl DashboardControlPeer {
             tcp_advertised,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
+            display_peer_id,
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant,
+            shutdown: shutdown.clone(),
             tabs,
             state_root: crate::platform::intendant_home(),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
-        let shutdown = CancellationToken::new();
         tokio::spawn(control_driver(
             rtc,
             sockets,
@@ -1242,6 +1686,7 @@ impl DashboardControlPeer {
             Self {
                 command_tx,
                 shutdown,
+                owner,
             },
             answer_sdp,
             binding,
@@ -1298,17 +1743,28 @@ pub(crate) struct ControlRuntime {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
-    /// The ICE-TCP tuple this control session itself advertised (the
-    /// rendezvous-observed public address on the gateway port for hosted
-    /// Connect sessions; `None` for locally-signaled sessions, whose
-    /// browsers signal displays over the gateway WS instead). Display
-    /// offers arriving on the control channel advertise the same tuple —
-    /// the browser reached us through it, so display traffic can too.
+    /// The ICE-TCP tuple supplied by an authenticated peer signaling path.
+    /// Trusted local and independently verified direct-mTLS sessions use
+    /// `None` and signal displays over the gateway WebSocket instead. Display
+    /// offers arriving on a peer control channel advertise the same tuple —
+    /// that peer reached us through it, so display traffic can too.
     tcp_advertised: Option<SocketAddr>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
+    /// Display sessions on which this control transport has attempted to
+    /// register `display_peer_id`. A display's media WebRTC transport is
+    /// separate from this control peer, so the control driver tracks sessions
+    /// so teardown can close a still-live media peer on disconnect or IAM
+    /// revocation without retaining a completed display session. The weak
+    /// vector is pointer-deduplicated and pruned when offers arrive.
+    display_peer_sessions: Arc<Mutex<Vec<std::sync::Weak<crate::display::DisplaySession>>>>,
     grant: DashboardControlGrant,
+    /// Lifetime of the authenticated control transport. Interactive display
+    /// channels created through it retain this token so queued input and
+    /// clipboard access die with the session even if the separate display
+    /// WebRTC transport has not reaped yet.
+    shutdown: CancellationToken,
     /// The live tabs-presence registry (shared with the `/ws` lane) —
     /// serves the `api_dashboard_tabs` twin.
     tabs: crate::web_gateway::DashboardTabsRegistry,
@@ -1518,6 +1974,378 @@ impl OutboundControlQueue {
 mod fs_scope_grant_tests {
     use super::*;
 
+    fn browser_grant_for_role(role_id: &str, fingerprint: &str) -> DashboardControlGrant {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some(fingerprint.to_string()),
+                role_id: Some(role_id.to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&state, fingerprint, "https")
+                .unwrap();
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+            iam_cert_dir: None,
+        }
+    }
+
+    #[test]
+    fn scoped_human_and_files_read_cannot_enter_unfiltered_websocket_bootstrap() {
+        for (role, fingerprint) in [("role:scoped-human", "AA:01"), ("role:files-read", "AA:02")] {
+            let grant = browser_grant_for_role(role, fingerprint);
+            assert!(grant.has_any_effective_operation());
+            assert!(
+                !grant.allows_unfiltered_websocket_stream(),
+                "{role} must be rejected before /ws upgrade and bootstrap"
+            );
+        }
+
+        assert!(
+            browser_grant_for_role("role:observer", "AA:03").allows_unfiltered_websocket_stream(),
+            "the complete observer read set is the conservative /ws floor"
+        );
+        assert!(DashboardControlGrant::TrustedLocal.allows_unfiltered_websocket_stream());
+    }
+
+    #[test]
+    fn private_display_owner_authority_requires_local_or_current_root() {
+        let local = DashboardControlGrant::TrustedLocal;
+        let root = browser_grant_for_role("role:root", "AA:ROOT");
+        let observer = browser_grant_for_role("role:observer", "AA:OBSERVER");
+        assert!(local.has_owner_dashboard_authority());
+        assert!(root.has_owner_dashboard_authority());
+        assert!(
+            !browser_grant_for_role("role:operator", "AA:OPERATOR").has_owner_dashboard_authority()
+        );
+        assert!(!observer.has_owner_dashboard_authority());
+
+        let private_ready = r#"{"event":"display_ready","display_id":9,"agent_visible":false}"#;
+        let public_ready = r#"{"event":"display_ready","display_id":8,"agent_visible":true}"#;
+        let request = r#"{"event":"display_request_raised","id":1}"#;
+        let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
+        assert!(root.allows_dashboard_event_line(private_ready));
+        assert!(!observer.allows_dashboard_event_line(private_ready));
+        assert!(observer.allows_dashboard_event_line(public_ready));
+        assert!(!observer.allows_dashboard_event_line(request));
+        assert!(!observer.allows_dashboard_event_line(approval));
+
+        let replay = serde_json::json!({
+            "t": "log_replay",
+            "entries": [
+                serde_json::from_str::<serde_json::Value>(private_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(public_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(request).unwrap(),
+                serde_json::from_str::<serde_json::Value>(approval).unwrap(),
+                {"event": "display_capture_lost", "display_id": 9, "reason": "closed"},
+            ],
+        });
+        let mut owner_replay = replay.clone();
+        root.filter_dashboard_replay_payload(&mut owner_replay);
+        assert_eq!(owner_replay, replay);
+
+        let mut replay = replay;
+        observer.filter_dashboard_replay_payload(&mut replay);
+        let events = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("event").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec!["display_ready", "display_capture_lost"]);
+    }
+
+    #[test]
+    fn live_iam_change_or_reload_failure_invalidates_opening_authority() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert!(LIVE_AUTHORITY_RECHECK_INTERVAL <= Duration::from_millis(500));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:55".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:55",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.has_owner_dashboard_authority());
+        assert!(grant.access_decision(PeerOperation::RuntimeControl).allowed);
+
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        assert!(!grant.has_owner_dashboard_authority());
+        assert!(!grant.access_decision(PeerOperation::RuntimeControl).allowed);
+        assert!(matches!(
+            grant.terminal_actor(),
+            crate::terminal::TerminalActor::Principal(_)
+        ));
+
+        std::fs::write(crate::access::iam::iam_state_path(tmp.path()), b"not-json").unwrap();
+        assert!(!grant.opening_authority_is_current());
+        let denied = grant.access_decision(PeerOperation::PresenceRead);
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("unavailable"), "{}", denied.reason);
+    }
+
+    #[test]
+    fn live_custom_role_downgrade_invalidates_opening_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:56".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let mut custom_role = state
+            .roles
+            .iter()
+            .find(|role| role.id == "role:observer")
+            .unwrap()
+            .clone();
+        custom_role.id = "role:test-custom-observer".to_string();
+        custom_role.label = "Test custom observer".to_string();
+        custom_role.source = "local-test".to_string();
+        state.roles.push(custom_role);
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                role_id: Some("role:test-custom-observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:56",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.allows_unfiltered_websocket_stream());
+
+        let role = state
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:test-custom-observer")
+            .unwrap();
+        role.permissions
+            .retain(|permission| permission != "presence.read");
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        assert!(!grant.allows_unfiltered_websocket_stream());
+    }
+
+    #[test]
+    fn live_peer_revocation_invalidates_opening_authority() {
+        use crate::peer::access_policy::PeerOperation;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let record = crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            fingerprint,
+            "peer-a",
+            "peer-operator",
+            None,
+            None,
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::Peer {
+            fingerprint: record.fingerprint.clone(),
+            label: record.label.clone(),
+            profile: record.profile.clone(),
+            filesystem: record.filesystem.clone(),
+            identity_record: Some(record),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+            attributed: None,
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.access_decision(PeerOperation::PresenceRead).allowed);
+
+        crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        let denied = grant.access_decision(PeerOperation::PresenceRead);
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("peer identity changed"));
+    }
+
+    #[test]
+    fn followup_signaling_rejects_unknown_revoked_and_different_openers() {
+        let opening = browser_grant_for_role("role:files-read", "AA:10");
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let peer = DashboardControlPeer {
+            command_tx,
+            shutdown: CancellationToken::new(),
+            owner: opening.signaling_owner(),
+        };
+        assert!(peer.belongs_to(&opening));
+
+        let different_principal = browser_grant_for_role("role:files-read", "BB:20");
+        assert!(!peer.belongs_to(&different_principal));
+
+        // A single human principal may carry several certificates. Matching
+        // principal/grant ids are insufficient: the exact certificate that
+        // opened the session remains part of the signaling binding.
+        let mut different_certificate = opening.clone();
+        if let DashboardControlGrant::UserClient { principal, .. } = &mut different_certificate {
+            principal.authn_binding = Some("cc30".to_string());
+        }
+        assert!(!peer.belongs_to(&different_certificate));
+
+        // Revocation keeps the binding recognizable for audit, but the HTTP
+        // pre-gate denies it before ICE/close can reach the owner comparison.
+        let mut revoked = opening.clone();
+        if let DashboardControlGrant::UserClient { iam_state, .. } = &mut revoked {
+            iam_state.grants[0].status = "revoked".to_string();
+            iam_state.grants[0].revoked_at_unix_ms = Some(1);
+        }
+        assert!(peer.belongs_to(&revoked));
+        assert!(!revoked.has_any_effective_operation());
+
+        let unknown = DashboardControlGrant::UserClient {
+            principal: crate::access::iam::AccessPrincipal::ungranted_browser_mtls(
+                Some("DD:40"),
+                "webrtc-datachannel",
+            ),
+            iam_state: crate::access::iam::LocalIamState::default(),
+            iam_cert_dir: None,
+        };
+        assert!(!peer.belongs_to(&unknown));
+        assert!(!unknown.has_any_effective_operation());
+
+        let peer_a = DashboardControlGrant::Peer {
+            fingerprint: "peer-a".to_string(),
+            label: "Peer A".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let peer_b = DashboardControlGrant::Peer {
+            fingerprint: "peer-b".to_string(),
+            label: "Peer B".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let peer_session = DashboardControlPeer {
+            command_tx,
+            shutdown: CancellationToken::new(),
+            owner: peer_a.signaling_owner(),
+        };
+        assert!(peer_session.belongs_to(&peer_a));
+        assert!(!peer_session.belongs_to(&peer_b));
+    }
+
+    #[test]
+    fn caller_selected_session_collision_never_replaces_existing_owner() {
+        let peer_a = DashboardControlGrant::Peer {
+            fingerprint: "peer-a".to_string(),
+            label: "Peer A".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let peer_b = DashboardControlGrant::Peer {
+            fingerprint: "peer-b".to_string(),
+            label: "Peer B".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let mut peers = HashMap::new();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        assert!(insert_dashboard_control_peer_if_vacant(
+            &mut peers,
+            "chosen-id".to_string(),
+            DashboardControlPeer {
+                command_tx: tx_a,
+                shutdown: CancellationToken::new(),
+                owner: peer_a.signaling_owner(),
+            },
+        )
+        .is_ok());
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        let rejected = insert_dashboard_control_peer_if_vacant(
+            &mut peers,
+            "chosen-id".to_string(),
+            DashboardControlPeer {
+                command_tx: tx_b,
+                shutdown: CancellationToken::new(),
+                owner: peer_b.signaling_owner(),
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.belongs_to(&peer_b));
+        assert_eq!(peers.len(), 1);
+        let existing = peers.get("chosen-id").unwrap();
+        assert!(existing.belongs_to(&peer_a));
+        assert!(!existing.belongs_to(&peer_b));
+    }
+
     #[test]
     fn user_client_grant_resolves_fs_scope_and_owner_paths_stay_open() {
         // Platform-absolute fixture path: `/srv/shared` is not absolute on
@@ -1554,21 +2382,13 @@ mod fs_scope_grant_tests {
         let scoped = DashboardControlGrant::UserClient {
             principal,
             iam_state: state.clone(),
+            iam_cert_dir: None,
         };
         let scope = scoped.filesystem().expect("scoped grant exposes fs scope");
         assert_eq!(scope.read_roots, vec![std::path::PathBuf::from(srv_shared)]);
 
         // Owner surfaces stay unrestricted.
         assert!(DashboardControlGrant::TrustedLocal.filesystem().is_none());
-        let unscoped_principal = crate::access::iam::AccessPrincipal::root_dashboard_session(
-            "root-key",
-            "dashboard-control",
-        );
-        assert!(DashboardControlGrant::UserClientRoot {
-            principal: unscoped_principal
-        }
-        .filesystem()
-        .is_none());
     }
 }
 
@@ -1665,7 +2485,7 @@ fn authorize_dashboard_control_filesystem(
                 return Err("filesystem request missing path".to_string());
             };
             let path = crate::web_gateway::expand_dashboard_fs_path(&target)?;
-            crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
+            crate::peer::access_policy::filesystem_access_allowed(&policy, kind, &path)?;
             return Ok(Some(target));
         }
         "api_transfer_upload_chunk"
@@ -1682,7 +2502,7 @@ fn authorize_dashboard_control_filesystem(
                 .unwrap_or_default();
             let store = transfer_store_scope(runtime);
             let check =
-                crate::web_gateway::check_scoped_transfer_job(&store, policy, &handle, access);
+                crate::web_gateway::check_scoped_transfer_job(&store, &policy, &handle, access);
             if check.allowed {
                 return Ok(check.path.map(|path| path.display().to_string()));
             }
@@ -1698,7 +2518,7 @@ fn authorize_dashboard_control_filesystem(
     }
     for raw_path in &raw_paths {
         let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
-        crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
+        crate::peer::access_policy::filesystem_access_allowed(&policy, kind, &path)?;
     }
     Ok(None)
 }
@@ -2394,11 +3214,14 @@ mod tests {
             tcp_advertised: None,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: 1,
+            display_peer_id: crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+                .expect("test dashboard-control peer id"),
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant: DashboardControlGrant::TrustedLocal,
+            shutdown: CancellationToken::new(),
             tabs: crate::web_gateway::DashboardTabsRegistry::new(
                 Arc::new(std::sync::Mutex::new(None)),
-                Arc::new(std::sync::RwLock::new(HashMap::new())),
+                Arc::new(crate::web_gateway::DisplayInputAuthority::default()),
             ),
             // Per-instance scratch (never the machine's real ~/.intendant):
             // projectless adapters resolve the daemon-global store under
@@ -2452,6 +3275,7 @@ mod tests {
         DashboardControlGrant::UserClient {
             principal,
             iam_state,
+            iam_cert_dir: None,
         }
     }
 
@@ -2465,7 +3289,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
-        let (display_input_tx, _display_input_rx) = mpsc::unbounded_channel();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(
             text,
             runtime,
@@ -2549,6 +3373,8 @@ mod tests {
             profile: "peer-root".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
 
         let status = test_control_frame_response(
@@ -2650,6 +3476,8 @@ mod tests {
             profile: "peer-operator".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let denied = test_control_frame_response(
             r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
@@ -3059,6 +3887,23 @@ mod tests {
     }
 
     #[test]
+    fn cached_bootstrap_hides_private_display_grants_from_non_owners() {
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+        *rt.bootstrap_caches.last_user_display_json.lock().unwrap() = Some(
+            r#"{"event":"user_display_granted","display_id":9,"agent_visible":false}"#.to_string(),
+        );
+
+        let filtered = cached_bootstrap_events_response_frame(
+            "private-cache".to_string(),
+            &rt.bootstrap_caches,
+            &rt.grant,
+        );
+        assert_eq!(filtered["result"]["event_count"], 0);
+        assert_eq!(filtered["result"]["events"], serde_json::json!([]));
+    }
+
+    #[test]
     fn control_method_table_is_coherent() {
         // Coherence holds over the effective union (route-row tunnel
         // specs ∪ the CONTROL_ONLY_METHODS residue): a name declared on both
@@ -3112,7 +3957,7 @@ mod tests {
         use Source::{Residue, Row};
         let frozen: &[(&str, Source, Option<Op>)] = &[
             ("ping", Residue, None),
-            ("config", Residue, Some(Op::RuntimeControl)),
+            ("config", Residue, Some(Op::PresenceRead)),
             ("status", Residue, Some(Op::PresenceRead)),
             ("api_agent_card", Residue, Some(Op::PresenceRead)),
             (
@@ -3136,7 +3981,6 @@ mod tests {
             ("api_access_connect_config", Row, Some(Op::AccessManage)),
             ("api_access_connect_unclaim", Row, Some(Op::AccessManage)),
             ("api_access_set_tier", Row, Some(Op::AccessManage)),
-            ("api_access_set_hosted_ceiling", Row, Some(Op::AccessManage)),
             ("api_fleet_cert_request", Row, Some(Op::AccessManage)),
             (
                 "api_credential_lease_grant",
@@ -3470,7 +4314,9 @@ mod tests {
     /// `CONTROL_ONLY_METHODS`; the verb + instantiated path resolve to a
     /// declared route whose verb is declared exactly (never via `Any`);
     /// the row's IAM operation equals the tunnel method's (the signed-org
-    /// doorbell rows are Public on HTTP by design and instead pin their
+    /// courier rows are Public on HTTP by design — public authenticates no
+    /// caller and creates no control session; the verified document can only
+    /// affect its named subject — and instead pin their
     /// documented tunnel op-override; the peers/coordinator federation
     /// rows pin the row's own derivation — the federation ladder on the
     /// canonical leaf); and the path
@@ -3627,7 +4473,6 @@ mod tests {
             "api_access_connect_config",
             "api_access_connect_unclaim",
             "api_access_set_tier",
-            "api_access_set_hosted_ceiling",
             "api_fleet_cert_request",
             "api_dashboard_targets",
             "api_dashboard_tabs",
@@ -3713,8 +4558,10 @@ mod tests {
                     op, tunnel_op,
                     "{method_name}: tunnel op {tunnel_op:?} != route op {op:?}"
                 ),
-                // The signed-org doorbell rows are Public on HTTP by
-                // design (the signed document is the authorization)
+                // The signed-org courier rows are Public on HTTP by
+                // design. Public means no caller/session authentication:
+                // the verified document authorizes only subject-bound
+                // processing, never daemon control by its courier.
                 // while their tunnel twins gate stricter through
                 // documented op-overrides (F4). Require the row to carry
                 // this method's tunnel column with an override matching
@@ -3831,8 +4678,9 @@ mod tests {
     #[test]
     fn contract_pins_for_deliberate_method_gates() {
         use crate::peer::access_policy::PeerOperation;
-        // ORL apply is courierable by any session — the root signature is
-        // the authority (see the table row comment).
+        // ORL apply is courierable by any session. The root signature
+        // authorizes only application of signed revocation facts; it does
+        // not authenticate the courier or grant that session daemon control.
         assert_eq!(
             method_operation("api_access_org_orl_apply"),
             Some(PeerOperation::PresenceRead)
@@ -4255,6 +5103,8 @@ mod tests {
                     write_roots: vec![dir.path().to_path_buf()],
                 },
                 attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             };
             rt
         };

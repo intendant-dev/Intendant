@@ -301,9 +301,10 @@ impl CurrentUploadRawError {
 /// HTTP form — one unbounded full-body read; `Some((offset, length))` is
 /// the tunnel's resumable form — seek plus a read capped at
 /// [`UPLOAD_MAX_BYTES`] per request (`length: None` reads to end of
-/// file). The success carries both lanes' decoration: the inline
-/// `Content-Disposition` header tail for HTTP, the range/descriptor meta
-/// object for the tunnel's `byte_stream_end.result`.
+/// file). The success carries both lanes' decoration: an attachment
+/// `Content-Disposition` plus `X-Content-Type-Options: nosniff` for HTTP,
+/// and the range/descriptor meta object for the tunnel's
+/// `byte_stream_end.result`.
 pub(crate) fn current_upload_raw_api_response(
     upload_id: &str,
     range: Option<(u64, Option<u64>)>,
@@ -375,8 +376,12 @@ pub(crate) fn current_upload_raw_api_response(
         headers: vec![
             (
                 "Content-Disposition",
-                format!("inline; filename=\"{}\"", descriptor.name.replace('"', "")),
+                format!(
+                    "attachment; filename=\"{}\"",
+                    descriptor.name.replace('"', "")
+                ),
             ),
+            ("X-Content-Type-Options", "nosniff".to_string()),
             ("Cache-Control", "no-cache".to_string()),
             ("Access-Control-Allow-Origin", "*".to_string()),
             ("Connection", "close".to_string()),
@@ -448,6 +453,7 @@ pub(crate) fn source_viewer_file_candidate(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+#[cfg(test)]
 pub(crate) fn dashboard_local_file_response(
     request_line: &str,
 ) -> Option<DashboardLocalFileResponse> {
@@ -460,21 +466,54 @@ pub(crate) fn dashboard_local_file_response(
     }
 }
 
-/// [`dashboard_local_file_response`] off the reactor: the source-viewer
-/// fallback probes the decoded URL path with `fs::metadata` /
-/// `canonicalize` (and reads the file when it matches) for every
-/// otherwise-unmatched GET — blocking syscalls that can stall the accept
-/// loop on slow filesystems (network mounts). URL semantics are
-/// unchanged; a failed join answers as "no local file" and the request
-/// falls through to the SPA shell exactly like a non-matching path.
-pub(crate) async fn dashboard_local_file_response_blocking(
+/// IAM- and scope-aware source-viewer edge. Resolve the candidate and its
+/// canonical target, authorize that exact target, then render from the
+/// canonical path in one blocking closure. This prevents an unmatched GET
+/// from becoming an arbitrary-file read and prevents `..`/symlink escapes
+/// from crossing a scoped grant's roots.
+pub(crate) async fn authorized_dashboard_local_file_response_blocking(
     request_line: &str,
-) -> Option<DashboardLocalFileResponse> {
+    access: &HttpAccessContext,
+    identity: Option<&PeerConnectionIdentity>,
+    bus: &EventBus,
+) -> Option<Result<DashboardLocalFileResponse, String>> {
     let request_line = request_line.to_string();
-    tokio::task::spawn_blocking(move || dashboard_local_file_response(&request_line))
-        .await
-        .ok()
-        .flatten()
+    let access = access.clone();
+    let identity = identity.cloned();
+    let bus = bus.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut request = dashboard_source_request_from_line(&request_line)?;
+        let canonical = match std::fs::canonicalize(&request.path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(Err(format!(
+                    "{} is not accessible: {error}",
+                    request.path.display()
+                )))
+            }
+        };
+        let raw_path = canonical.to_string_lossy().to_string();
+        if let Err(error) = authorize_http_filesystem_access(
+            &access,
+            identity.as_ref(),
+            crate::peer::access_policy::PeerOperation::FilesystemRead,
+            crate::peer::access_policy::FilesystemAccessKind::Read,
+            &raw_path,
+            &bus,
+        ) {
+            return Some(Err(error));
+        }
+        request.path = canonical;
+        let response = if let Some(content_type) = dashboard_image_content_type(&request.path) {
+            render_dashboard_image_file_response(request, content_type)
+        } else {
+            let (status, body) = render_dashboard_source_viewer_response(request);
+            DashboardLocalFileResponse::Html { status, body }
+        };
+        Some(Ok(response))
+    })
+    .await
+    .unwrap_or_else(|error| Some(Err(format!("source viewer task failed: {error}"))))
 }
 
 pub(crate) fn effective_upload_destination(
@@ -2893,6 +2932,152 @@ mod tests {
         }
     }
 
+    fn source_viewer_files_read_authority(
+        root: &std::path::Path,
+    ) -> (HttpAccessContext, crate::access::iam::LocalIamState) {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("test", "trusted-local");
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:55".to_string()),
+                role_id: Some("role:files-read".to_string()),
+                fs_read_roots: vec![root.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&state, "aa55", "https").unwrap();
+        (
+            HttpAccessContext {
+                principal,
+                iam_state: Some(state.clone()),
+            },
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn source_viewer_requires_filesystem_permission_and_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed_dir = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        let allowed = allowed_dir.join("visible.rs");
+        let secret = temp.path().join("secret.env");
+        std::fs::write(&allowed, "pub fn visible() {}\n").unwrap();
+        std::fs::write(&secret, "SECRET=must-not-leak\n").unwrap();
+        let bus = EventBus::new();
+        let request = |path: &std::path::Path| format!("GET {} HTTP/1.1", path.to_string_lossy());
+
+        let unknown = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::ungranted_browser_mtls(
+                Some("BB:66"),
+                "https",
+            ),
+            iam_state: Some(crate::access::iam::LocalIamState::default()),
+        };
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&allowed),
+            &unknown,
+            None,
+            &bus,
+        )
+        .await
+        .expect("existing source candidate")
+        .is_err());
+
+        let (scoped, mut revoked_state) = source_viewer_files_read_authority(&allowed_dir);
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&allowed),
+            &scoped,
+            None,
+            &bus,
+        )
+        .await
+        .expect("allowed source candidate")
+        .is_ok());
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&secret),
+            &scoped,
+            None,
+            &bus,
+        )
+        .await
+        .expect("outside source candidate")
+        .is_err());
+
+        let traversal = allowed_dir.join("..").join("secret.env");
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&traversal),
+            &scoped,
+            None,
+            &bus,
+        )
+        .await
+        .expect("traversal source candidate")
+        .is_err());
+
+        revoked_state.grants[0].status = "revoked".to_string();
+        revoked_state.grants[0].revoked_at_unix_ms = Some(1);
+        let revoked = HttpAccessContext {
+            principal: scoped.principal.clone(),
+            iam_state: Some(revoked_state),
+        };
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&allowed),
+            &revoked,
+            None,
+            &bus,
+        )
+        .await
+        .expect("revoked source candidate")
+        .is_err());
+
+        let root = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "test", "loopback",
+            ),
+            iam_state: None,
+        };
+        assert!(authorized_dashboard_local_file_response_blocking(
+            &request(&secret),
+            &root,
+            None,
+            &bus,
+        )
+        .await
+        .expect("root source candidate")
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_viewer_scope_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed_dir = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        let secret = temp.path().join("secret.env");
+        std::fs::write(&secret, "SECRET=must-not-leak\n").unwrap();
+        let link = allowed_dir.join("looks-safe.env");
+        symlink(&secret, &link).unwrap();
+        let (scoped, _) = source_viewer_files_read_authority(&allowed_dir);
+        let result = authorized_dashboard_local_file_response_blocking(
+            &format!("GET {} HTTP/1.1", link.to_string_lossy()),
+            &scoped,
+            None,
+            &EventBus::new(),
+        )
+        .await
+        .expect("symlink source candidate");
+        assert!(result.is_err());
+    }
+
     #[test]
     fn pending_upload_session_dir_follows_store_scope() {
         let root = std::path::PathBuf::from("/tmp/project");
@@ -4087,6 +4272,64 @@ mod tests {
             path.starts_with(&store_root.to_string_lossy().to_string()),
             "projectless upload must land in the global store: {path}"
         );
+    }
+
+    #[tokio::test]
+    async fn current_upload_raw_active_html_is_attachment_and_nosniff() {
+        use std::io::Write as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let scope = crate::global_store::StoreScope::resolve(Some(project.path()));
+        let session_dir = pending_upload_session_dir(&scope);
+        let payload = b"<!doctype html><script>parent.pwned = true</script>";
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        staged.write_all(payload).unwrap();
+        let descriptor = crate::upload_store::commit_upload(
+            staged,
+            "active.html",
+            "text/html",
+            payload.len() as u64,
+            crate::upload_store::UploadDestination::Task,
+            &session_dir,
+            "raw-security-test",
+            &scope,
+        )
+        .unwrap();
+
+        let request_line = format!(
+            "GET /api/session/current/uploads/{}/raw HTTP/1.1",
+            descriptor.id
+        );
+        let root = project.path().to_path_buf();
+        let response = collect_upload_handler_response(|stream| {
+            handle_current_uploads_get(
+                stream,
+                &request_line,
+                Some(root),
+                None,
+                crate::gateway_routes::CorsPosture::OwnOrigin,
+                None,
+            )
+        })
+        .await;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response header terminator");
+        let head = std::str::from_utf8(&response[..header_end]).unwrap();
+        let body = &response[header_end + 4..];
+
+        assert!(head.contains("Content-Type: text/html\r\n"), "{head}");
+        assert!(
+            head.contains("Content-Disposition: attachment; filename=\"active.html\"\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("X-Content-Type-Options: nosniff\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("Content-Disposition: inline"), "{head}");
+        assert_eq!(body, payload, "raw bytes must be preserved exactly");
     }
 
     #[tokio::test]

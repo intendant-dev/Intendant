@@ -1,6 +1,9 @@
 /* ── Credential vault (credential custody v1) ──
    The user's provider credentials, end-to-end encrypted client-side and
-   synced blind through the hosted rendezvous (/api/vault). A random
+   stored as an opaque blob on the daemon used by this trusted dashboard.
+   Connect retains an account-vault storage API for compatibility, but the
+   default hosted directory serves no vault client and has no bridge to a
+   daemon. A random
    256-bit master key encrypts the vault body; that key is stored only
    wrapped, one envelope per enrolled unlocker: each account passkey (via
    the vault's OWN WebAuthn PRF salt 'intendant-vault-v1', evaluated as
@@ -57,16 +60,14 @@ let vaultPublishChain = Promise.resolve(true);
 const vaultRevealedEntries = new Set();
 
 /* ── Vault storage backends ──
-   The blob has two possible homes, both blind to its contents:
-   - 'account': the Connect service stores one blob per account (hosted
-     tabs — the original path; follows the person across daemons).
-   - 'daemon': this daemon stores the blob itself (~/.intendant/
-     vault-blob.json via api_daemon_vault_fetch/publish) — the local
-     vault for direct dashboards, no Connect service in the loop.
-   The stores are independent (each keeps its own revision ratchet);
-   copying between them is an explicit user action, never implicit. */
+   The shipped dashboard uses the daemon store (~/.intendant/vault-blob.json
+   via api_daemon_vault_fetch/publish), with no Connect service in the loop.
+   The dormant 'account' branch is wire-compatibility scaffolding for a
+   future, separately trusted client; Connect does not serve this bundle.
+   The stores are independent (each keeps its own revision ratchet), and a
+   future copy between them must remain an explicit user action. */
 function vaultDaemonStoreReady() {
-  if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
+  if (DASHBOARD_CONNECT_MODE) return false; // retired hosted-dashboard mode
   // daemonApi availability (transport F6): the tunnel status boolean when
   // it has landed (false = this session's role is refused the custody
   // gate), the hello_ack features list before that (absent = the daemon
@@ -80,25 +81,25 @@ function vaultDaemonStoreReady() {
 function vaultDaemonStoreUnavailableText() {
   const reason = daemonApi.availability('api_daemon_vault_fetch').reason;
   if (reason === 'denied') {
-    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Hosted Connect dashboards use the account vault instead.";
+    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Reopen it through an authorized loopback/direct-mTLS session or grant that permission from a trusted root surface.";
   }
   if (reason === 'unsupported') {
-    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect dashboards use the account vault instead.';
+    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect is discovery-only and cannot supply a vault client.';
   }
   // 'transport-down': the store rides the secure control channel (a
   // tunnel-only method). Whether that channel is even coming decides the
   // honest copy — "retries automatically" was a lie on dashboards that
   // never open one.
   if (!dashboardControlTransportEnabled()) {
-    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics, or open this daemon through a hosted Connect dashboard to use the account vault instead.';
+    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics or use a trusted loopback/direct-mTLS dashboard.';
   }
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: true, connected: false };
   if (dashboardTransportStatusSummary(status).kind === 'err') {
-    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect dashboards use the account vault instead.';
+    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect cannot bridge an account vault to this daemon.';
   }
-  return 'No vault store reachable yet: the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
+  return 'No vault store reachable yet: the trusted control channel is still connecting (retries automatically).';
 }
 
 function vaultBackendKind() {
@@ -321,7 +322,7 @@ function vaultMarkMacSeen() {
   }
 }
 
-/* ── Local cache + hosted sync ── */
+/* ── Local cache + backing-store sync ── */
 
 function vaultReadLocal() {
   try {
@@ -403,7 +404,7 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   if (!blob || !revision) return;
   if (fromServer) {
     vaultState.rollbackWarning = vaultState.highWater > revision
-      ? `The hosted store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
+      ? `The backing store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
       : '';
   }
   if (revision < vaultState.revision) return;
@@ -732,7 +733,7 @@ async function vaultUnlockWithPhrase(input) {
 }
 
 async function vaultCreate(phrase) {
-  if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
+  if (!vaultAvailable()) throw new Error('the vault needs an authorized trusted dashboard session');
   const now = Date.now();
   // The page owns the metadata (ids, labels, timestamps); the kernel
   // generates the master key, wraps the envelopes, encrypts the empty
@@ -873,12 +874,11 @@ function vaultQueuePersist() {
 
 /* Per-entry unseal policy (docs/src/trust-tiers.md, hook 3). 'any' (or
    absent — every pre-policy entry) uses the entry everywhere the vault
-   opens; 'trusted' refuses use from hosted tabs. Client-side self-
-   enforcement: it defends against mistakes and casual exfiltration, not
-   against a malicious page — and since today the vault only opens
-   through a Connect service, a trusted-only entry stays sealed until
-   the direct/app vault path lands. It still syncs, and the policy
-   rides inside the encrypted body like every other entry field. */
+   opens; 'trusted' refuses use from a future hosted client. The shipped
+   vault UI is already daemon-origin and uses the daemon store. This remains
+   client-side self-enforcement: useful against mistakes, not malicious code
+   on whatever origin is allowed to unseal. The policy rides inside the
+   encrypted body like every other entry field. */
 function vaultEntryUnsealPolicy(entry) {
   return entry?.unseal_policy === 'trusted' ? 'trusted' : 'any';
 }
@@ -2143,7 +2143,7 @@ function vaultRenderAddForm(card) {
   const policySelect = document.createElement('select');
   for (const [value, label, title] of [
     ['any', 'Anywhere this vault opens', 'The default: usable from every dashboard that can open your vault.'],
-    ['trusted', 'Trusted origins only (direct / app)', 'Sealed against hosted tabs: no reveal, fueling, or relay from them. Client-side policy — a guard against mistakes, not a malicious page. Today the vault itself opens through Connect, so a trusted-only entry stays stored-but-sealed until the direct/app vault path lands.'],
+    ['trusted', 'Trusted origins only (direct / app)', 'Usable from this daemon-origin/native vault. Any future hosted vault client must keep it sealed: no reveal, fueling, or relay. Client-side policy guards against mistakes, not malicious served code.'],
   ]) {
     const option = document.createElement('option');
     option.value = value;
@@ -2193,8 +2193,8 @@ function vaultRenderAddForm(card) {
 }
 
 /* Fueling panel: this daemon's active leases + a fuel button per
-   fuelable vault entry. Renders wherever a vault store is reachable —
-   hosted tabs (account vault) and direct dashboards (local vault). */
+   fuelable vault entry. The shipped path is the trusted loopback/direct-mTLS
+   dashboard backed by this daemon's local vault. */
 function vaultRenderFueling(card) {
   if (!vaultAvailable()) return;
   const head = document.createElement('div');
@@ -3379,4 +3379,3 @@ function stationStatus(text) {
   }
   el.textContent = value;
 }
-

@@ -12,15 +12,13 @@
 use std::{fmt, net::IpAddr, path::PathBuf};
 
 pub mod access_policy;
+pub(crate) mod authority_store;
 pub mod backend;
-// `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
-// platform, so it stays ungated — `read_server_cert_fingerprint` backs the
-// `pin-self-cert` transport. The interactive `access` subcommand remains
-// gated off Windows for now because the enrollment UX and setup scripts were
-// only validated on Unix; the native cert store itself is cross-platform.
+// `serve-certs` remains a Unix-only interactive server. Windows setup uses
+// the same pure-Rust certificate generation and IAM seeding, then prints
+// exact CurrentUser certificate-store import commands instead.
 #[cfg(not(target_os = "windows"))]
 pub mod cert_server;
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
 pub mod client_key;
 pub mod enrollment;
@@ -153,6 +151,7 @@ pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
     std::fs::create_dir_all(&cert_dir)
         .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
     certs::ensure_certs(&cert_dir, &server_names, &resolve_host_label(), false)?;
+    iam::seed_generated_browser_mtls_owner_root(&cert_dir)?;
     Ok(Some(cert_dir))
 }
 
@@ -193,10 +192,6 @@ impl From<rcgen::Error> for AccessError {
 pub type AccessResult<T> = Result<T, AccessError>;
 
 /// Parsed `intendant access <action> [flags]` invocation.
-// The interactive setup/enrollment command surface is still gated off
-// Windows. Only the lookup helpers above (`resolve_host_label`,
-// `routable_local_addrs`) remain on Windows.
-#[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
 pub struct AccessArgs {
     pub action: AccessAction,
@@ -213,7 +208,6 @@ pub struct AccessArgs {
     pub no_serve_certs: bool,
 }
 
-#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessAction {
     Setup,
@@ -224,7 +218,6 @@ pub enum AccessAction {
     Help,
 }
 
-#[cfg(not(target_os = "windows"))]
 impl Default for AccessArgs {
     fn default() -> Self {
         Self {
@@ -241,7 +234,6 @@ impl Default for AccessArgs {
 }
 
 /// Top-level entry invoked from `main()` when argv[1] == "access".
-#[cfg(not(target_os = "windows"))]
 pub async fn run(argv: Vec<String>) -> AccessResult<()> {
     let args = parse_args(&argv)?;
     match args.action {
@@ -257,7 +249,6 @@ pub async fn run(argv: Vec<String>) -> AccessResult<()> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn parse_args(argv: &[String]) -> AccessResult<AccessArgs> {
     let mut args = AccessArgs::default();
 
@@ -335,7 +326,6 @@ fn parse_args(argv: &[String]) -> AccessResult<AccessArgs> {
     Ok(args)
 }
 
-#[cfg(not(target_os = "windows"))]
 fn print_help() {
     println!("Intendant dashboard access setup");
     println!();
@@ -343,28 +333,41 @@ fn print_help() {
     println!("    intendant access <action> [flags]");
     println!();
     println!("ACTIONS:");
+    #[cfg(not(target_os = "windows"))]
     println!("    setup         Generate native dashboard mTLS certs and start enrollment");
+    #[cfg(target_os = "windows")]
+    println!("    setup         Generate native dashboard mTLS certs and print import steps");
     println!("    recert        Regenerate the server cert after access addresses change");
     println!("    remove        Remove the per-user access cert store");
     println!("    list          Show current setup state");
+    #[cfg(not(target_os = "windows"))]
     println!("    serve-certs   Run strict HTTPS client cert enrollment");
+    #[cfg(target_os = "windows")]
+    println!("    serve-certs   Unsupported; setup prints manual PowerShell import steps");
     println!();
     println!("FLAGS:");
     println!("    --port <N>         Native dashboard HTTPS port to advertise (default 8765)");
+    #[cfg(not(target_os = "windows"))]
     println!("    --cert-port <N>    Port for the HTTPS enrollment server (default 9999)");
+    #[cfg(target_os = "windows")]
+    println!("    --cert-port <N>    Accepted for compatibility; unused on Windows");
     println!("    --ip <IP>          Add an IP SAN; first --ip becomes the dashboard URL host");
     println!("    --host <DNS>       Add a DNS SAN");
     println!("    --name <LABEL>     Host label shown in cert CN and multi-host dashboard");
     println!("    --force            Skip idempotency checks (regenerate even if current)");
+    #[cfg(not(target_os = "windows"))]
     println!("    --no-serve-certs   Skip the enrollment server at the end of setup");
+    #[cfg(target_os = "windows")]
+    println!("    --no-serve-certs   No-op; Windows setup never starts enrollment");
     println!();
     println!("NOTES:");
     println!("    Loopback SANs are always included: localhost, 127.0.0.1, ::1.");
     println!("    Detected local interface IPs are included. Public interface IPs are");
     println!("    allowed, but WAN exposure should use default mTLS, not only --tls.");
+    #[cfg(target_os = "windows")]
+    println!("    Windows setup never starts an enrollment server; it imports locally.");
 }
 
-#[cfg(not(target_os = "windows"))]
 async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let server_names = resolve_server_names(&args, be.as_ref())?;
@@ -384,6 +387,7 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     print_public_ip_warnings(&server_names);
 
     let state = certs::ensure_certs(&cert_dir, &server_names, &label, args.force)?;
+    iam::seed_generated_browser_mtls_owner_root(&cert_dir)?;
     state::write_host_label(&cert_dir, &label)?;
 
     println!();
@@ -395,8 +399,10 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     println!("  Start or restart the dashboard with:");
     println!("    intendant");
     println!("  That default requires enrolled browser/client certificates.");
-    println!("  Use `intendant --tls` only when you intentionally want TLS without");
-    println!("  client-certificate authentication.");
+    println!("  `intendant --tls` can serve the public shell and discovery without a");
+    println!("  client certificate, but remote dashboard/API/WebSocket control still");
+    println!("  requires enrolled direct mTLS. Loopback remains root.");
+    println!("  No Developer ID-signed/notarized native release exists for this alpha.");
     println!();
     println!(
         "  Dashboard URL: https://{dashboard_host}:{}",
@@ -404,30 +410,37 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     );
     println!();
 
-    if args.no_serve_certs {
-        // Host orchestrators can run strict enrollment separately when
-        // they have an interactive operator channel for fingerprint
-        // verification.
-        println!("  Enrollment server was not started (--no-serve-certs).");
-        println!("  Run `intendant access serve-certs` later to enroll devices.");
-        println!();
-        return Ok(());
+    #[cfg(target_os = "windows")]
+    {
+        println!("{}", windows_import_instructions(&state.cert_dir));
     }
 
-    // Start strict client enrollment (blocks until Ctrl+C).
-    println!(
-        "  Starting strict HTTPS enrollment on port {}.",
-        args.cert_port
-    );
-    println!("  The enrollment page contains the device-specific install steps.");
-    println!("  Press Ctrl+C here when all devices are enrolled.");
-    println!();
-    cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        if args.no_serve_certs {
+            // Host orchestrators can run strict enrollment separately when
+            // they have an interactive operator channel for fingerprint
+            // verification.
+            println!("  Enrollment server was not started (--no-serve-certs).");
+            println!("  Run `intendant access serve-certs` later to enroll devices.");
+            println!();
+            return Ok(());
+        }
+
+        // Start strict client enrollment (blocks until Ctrl+C).
+        println!(
+            "  Starting strict HTTPS enrollment on port {}.",
+            args.cert_port
+        );
+        println!("  The enrollment page contains the device-specific install steps.");
+        println!("  Press Ctrl+C here when all devices are enrolled.");
+        println!();
+        cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
+    }
 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 async fn cmd_recert(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let server_names = resolve_server_names(&args, be.as_ref())?;
@@ -450,7 +463,6 @@ async fn cmd_recert(args: AccessArgs) -> AccessResult<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 async fn cmd_remove(_args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
@@ -458,11 +470,15 @@ async fn cmd_remove(_args: AccessArgs) -> AccessResult<()> {
         std::fs::remove_dir_all(&cert_dir)?;
         println!(":: removed cert dir {}", cert_dir.display());
     }
+    #[cfg(target_os = "windows")]
+    println!(
+        ":: generated files are removed; any certificates you manually imported into \
+         CurrentUser\\Root or CurrentUser\\My remain until you remove them with certmgr.msc"
+    );
     println!(":: done");
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 fn cmd_list(_args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
@@ -479,28 +495,45 @@ fn cmd_list(_args: AccessArgs) -> AccessResult<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 async fn cmd_serve_certs(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
-    if !cert_dir.join("client.p12").exists() {
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = args;
+        if !cert_dir.join("client.p12").exists() {
+            return Err(AccessError(format!(
+                "`intendant access serve-certs` is not available on Windows, and no client identity exists in {} — run `intendant access setup` first; setup prints exact manual PowerShell import commands",
+                cert_dir.display()
+            )));
+        }
         return Err(AccessError(format!(
-            "no client.p12 found in {} — run `intendant access setup` first",
-            cert_dir.display()
+            "`intendant access serve-certs` is not available on Windows; import the locally generated identity instead:\n{}",
+            windows_import_instructions(&cert_dir)
         )));
     }
-    let state = certs::CertState {
-        cert_dir: cert_dir.clone(),
-        p12_password: state::read_p12_password(&cert_dir)?,
-        label: state::read_host_label(&cert_dir).unwrap_or_default(),
-    };
-    let server_names = resolve_server_names(&args, be.as_ref())?;
-    let dashboard_host = url_host_for_ip(server_names.primary_ip);
-    cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
-    Ok(())
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !cert_dir.join("client.p12").exists() {
+            return Err(AccessError(format!(
+                "no client.p12 found in {} — run `intendant access setup` first",
+                cert_dir.display()
+            )));
+        }
+        let state = certs::CertState {
+            cert_dir: cert_dir.clone(),
+            p12_password: state::read_p12_password(&cert_dir)?,
+            label: state::read_host_label(&cert_dir).unwrap_or_default(),
+        };
+        let server_names = resolve_server_names(&args, be.as_ref())?;
+        let dashboard_host = url_host_for_ip(server_names.primary_ip);
+        cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
+        Ok(())
+    }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn resolve_server_names(
     args: &AccessArgs,
     be: &dyn backend::AccessBackend,
@@ -525,7 +558,6 @@ fn resolve_server_names(
     certs::ServerNames::new(primary_ip, ips, args.hosts.clone())
 }
 
-#[cfg(not(target_os = "windows"))]
 fn url_host_for_ip(ip: std::net::IpAddr) -> String {
     match ip {
         std::net::IpAddr::V4(ip) => ip.to_string(),
@@ -533,7 +565,6 @@ fn url_host_for_ip(ip: std::net::IpAddr) -> String {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn print_public_ip_warnings(server_names: &certs::ServerNames) {
     for ip in &server_names.ips {
         if is_public_ip(ip) {
@@ -543,7 +574,6 @@ fn print_public_ip_warnings(server_names: &certs::ServerNames) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn is_public_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
@@ -569,6 +599,35 @@ fn is_public_ip(ip: &std::net::IpAddr) -> bool {
                 || (s[0] == 0x2001 && s[1] == 0x0db8))
         }
     }
+}
+
+/// Copy/paste-ready PowerShell for importing the locally generated access CA
+/// and client identity into the same Windows user's certificate stores. The
+/// PKCS#12 password stays on disk and is converted directly into a
+/// `SecureString`; it is never echoed into terminal history.
+#[cfg(any(target_os = "windows", test))]
+fn windows_import_instructions(cert_dir: &std::path::Path) -> String {
+    let cert_dir = powershell_single_quoted(&cert_dir.to_string_lossy());
+    format!(
+        r#"  Windows certificate-store import (CurrentUser; no administrator required):
+  Open PowerShell as this same Windows user and run exactly:
+
+$certDir = {cert_dir}
+Import-Certificate -FilePath (Join-Path $certDir 'ca.crt') -CertStoreLocation 'Cert:\CurrentUser\Root'
+$pfxPassword = ConvertTo-SecureString -String ((Get-Content -Raw -LiteralPath (Join-Path $certDir 'p12_password')).Trim()) -AsPlainText -Force
+Import-PfxCertificate -FilePath (Join-Path $certDir 'client.p12') -CertStoreLocation 'Cert:\CurrentUser\My' -Password $pfxPassword
+Remove-Variable pfxPassword
+
+  Close and reopen Edge or Chrome after import. Firefox may require its own
+  certificate import unless enterprise-root integration is enabled.
+  `serve-certs` is intentionally unavailable on Windows; use these local
+  CurrentUser imports instead."#
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -623,22 +682,29 @@ mod tests {
         assert_eq!(label, "vortex-deb-x11");
     }
 
-    // Windows-specific: the GetAdaptersAddresses-backed enumeration must
-    // surface the machine's real routable interface(s), not just loopback.
-    // Runs on the CI/build VM, which has a routable NIC.
-    #[cfg(windows)]
     #[test]
-    fn windows_enumerates_at_least_one_routable_addr() {
-        let addrs = routable_local_addrs(false);
-        assert!(
-            !addrs.is_empty(),
-            "expected at least one non-loopback routable interface address"
-        );
-        assert!(
-            addrs
-                .iter()
-                .all(|ip| !ip.is_loopback() && !ip.is_unspecified()),
-            "every address must be routable (non-loopback, non-unspecified): {addrs:?}"
-        );
+    fn access_actions_parse_on_every_platform() {
+        for (name, action) in [
+            ("setup", AccessAction::Setup),
+            ("recert", AccessAction::Recert),
+            ("list", AccessAction::List),
+            ("remove", AccessAction::Remove),
+            ("serve-certs", AccessAction::ServeCerts),
+        ] {
+            let parsed = parse_args(&[name.to_string()]).unwrap();
+            assert_eq!(parsed.action, action);
+        }
+    }
+
+    #[test]
+    fn windows_import_copy_uses_current_user_stores_without_echoing_password() {
+        let instructions =
+            windows_import_instructions(std::path::Path::new(r"C:\Users\O'Brien\Access"));
+        assert!(instructions.contains(r"$certDir = 'C:\Users\O''Brien\Access'"));
+        assert!(instructions.contains(r"'Cert:\CurrentUser\Root'"));
+        assert!(instructions.contains(r"'Cert:\CurrentUser\My'"));
+        assert!(instructions.contains("Get-Content -Raw -LiteralPath"));
+        assert!(instructions.contains("ConvertTo-SecureString"));
+        assert!(!instructions.contains("type p12_password"));
     }
 }

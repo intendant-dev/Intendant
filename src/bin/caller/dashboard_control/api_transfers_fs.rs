@@ -337,10 +337,10 @@ pub(crate) async fn api_transfer_jobs_response(
     // Scope-restricted grants get the shared core's scope-filtered
     // listing (HTTP passes its caller's policy the same way);
     // unrestricted grants list unchanged.
+    let filesystem = runtime.grant.filesystem();
     frame_api_response(
         id,
-        crate::web_gateway::transfer_jobs_api_response(scope, &params, runtime.grant.filesystem())
-            .await,
+        crate::web_gateway::transfer_jobs_api_response(scope, &params, filesystem.as_ref()).await,
         "transfer jobs",
     )
 }
@@ -1271,6 +1271,8 @@ mod tests {
                     write_roots: vec![dir.path().to_path_buf()],
                 },
                 attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             };
             rt
         };
@@ -1317,6 +1319,8 @@ mod tests {
                 write_roots: vec![dir.path().to_path_buf()],
             },
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let upload = test_upload_state(
             "api_fs_write",
@@ -1375,6 +1379,8 @@ mod tests {
                 write_roots: vec![dir.path().to_path_buf()],
             },
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let mut events = rt.bus.subscribe();
 
@@ -2913,6 +2919,8 @@ mod tests {
             profile: "file-operator".into(),
             filesystem: shared_scope_policy(rig),
             attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         rt
     }
@@ -2936,6 +2944,7 @@ mod tests {
             label: "scoped-peer".into(),
             profile: "file-operator".into(),
             filesystem: shared_scope_policy(&rig),
+            record: None,
         };
         let http_root = crate::web_gateway::HttpAccessContext {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(

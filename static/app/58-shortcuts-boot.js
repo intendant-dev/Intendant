@@ -341,7 +341,7 @@ function showDisplayPicker(displays, mode) {
   // to the live rail's "Your screen" card (the control that proxies the
   // grant under v2). Single-display hosts grant instantly and never open
   // the picker, which is why this only bit multi-display setups.
-  if (picker.closest('#status-bar')) {
+  if (picker.parentElement !== document.body) {
     document.body.appendChild(picker);
   }
   if (picker.parentElement === document.body) {
@@ -702,15 +702,6 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
   switchStatsHost(e.target.value);
 });
 
-// Hosts aggregate dot (and its surrounding label group) in the status
-// bar - click jumps to Access targets so the user can investigate
-// which host is disconnected/skewed.
-document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  if (DASHBOARD_ACCESS_PAGE_MODE) routeTo('access', 'daemons');
-  else window.location.href = accessHomeHref('daemons');
-});
-document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
-document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => openConnectionDiagnostics());
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
@@ -757,7 +748,6 @@ if (clientIdentitySupported()) {
 // Carry published org revocations to this daemon shortly after load —
 // after the control transport has had a chance to come up in connect mode.
 setTimeout(() => { orgRevocationCourier().catch(() => {}); }, 4000);
-syncAccessPageNavLink();
 
 // Auto-scroll detection
 (function() {

@@ -10,6 +10,9 @@
 //! - `permit-local-<i>`, i < local_reserved  — the interactive reservation
 //! - `permit-ci-<i>`,    i < ci_reserved     — the CI reservation
 //! - `demand-local`, `demand-ci`             — one demand file per class
+//! - `link-<i>`,         i < link_slots      — the heavyweight-link slots
+//!   (machine-global, classless: host memory doesn't care whose link it
+//!   is, so there is no reservation split and no demand gate)
 //!
 //! Protocol:
 //! - Holding a permit = holding LOCK_EX on its file. The governor holds
@@ -31,6 +34,20 @@
 //!   gate for the rest of the wait.
 //! - Nothing is ever killed or signalled; borrowed permits return naturally
 //!   when their holder exits.
+//!
+//! Link-slot ordering invariant (load-bearing — see `acquire_link_slot`):
+//! a heavyweight invocation takes its LINK SLOT FIRST, and only then its
+//! ordinary permit. **No ordinary-permit hoarding**: an invocation queued
+//! on the link gate holds zero ordinary permits, so however many
+//! heavyweights pile up, ordinary compiles keep the rest of the pool
+//! (three simultaneous final links — the observed cargo behavior — pin
+//! one slot and zero permits, not three permits). **Deadlock-free**: an
+//! ordinary-permit holder never waits on the link slot (only heavyweights
+//! do, and they acquired it first), so the wait graph has no cycle. The
+//! cost — a held slot idling while its owner queues for an ordinary
+//! permit — delays other *links* only, which is the acceptable direction.
+//! No FIFO/fairness guarantee exists in the flock+poll design; soak
+//! telemetry (govlog's wait fields) decides whether one is ever needed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -126,12 +143,42 @@ pub(crate) struct AcquiredPermit {
     pub(crate) wait_ms: u64,
 }
 
+/// A held heavyweight-link slot. Exactly the `AcquiredPermit` story:
+/// keeping the `File` open IS the slot, parent-held with O_CLOEXEC intact,
+/// kernel-released on any exit.
+pub(crate) struct AcquiredLinkSlot {
+    pub(crate) _file: File,
+    pub(crate) name: String,
+    pub(crate) wait_ms: u64,
+}
+
+/// Outcome of gating a heavyweight link.
+pub(crate) enum LinkGate {
+    /// Slot held: the link is serialized.
+    Held(AcquiredLinkSlot),
+    /// `link_slots = 0`: the gate is configured off on this box.
+    Off,
+    /// No slot file was usable (config grown past the installer-minted
+    /// files in a root-owned dir, or the dir denies creation). Link
+    /// gating degrades — the caller logs it and proceeds — but ordinary
+    /// governance NEVER rides with it: only the global kill-switch paths
+    /// drop the whole governor.
+    Degraded,
+    /// The config vanished or disabled mid-wait: the whole invocation
+    /// fails open (the caller drops nothing — no slot was acquired).
+    FailOpen,
+}
+
 fn permit_name(class: Class, i: u32) -> String {
     format!("permit-{}-{i}", class.as_str())
 }
 
 fn demand_name(class: Class) -> String {
     format!("demand-{}", class.as_str())
+}
+
+fn link_slot_name(i: u32) -> String {
+    format!("link-{i}")
 }
 
 /// Open (or, where the directory allows it, create) a lock file. flock(2)
@@ -181,6 +228,48 @@ fn foreign_has_no_waiters(demand: &File) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Acquire one machine-global link slot for a heavyweight link, waiting as
+/// long as it takes. Called BEFORE `acquire` — the ordering invariant in
+/// the module doc: a waiter here holds nothing, so it can hoard no
+/// ordinary capacity and can complete no deadlock cycle. No demand gate:
+/// the slots are classless, and the only takers are heavyweights in this
+/// same single queue. The live kill switch is honored mid-wait exactly
+/// like the permit poll.
+pub(crate) fn acquire_link_slot(cfg: &Config, config_path: &Path) -> LinkGate {
+    if cfg.link_slots == 0 {
+        return LinkGate::Off;
+    }
+    let dir = &cfg.permit_dir;
+    let _ = fs::create_dir_all(dir);
+    let mut slots: Vec<(String, File)> = (0..cfg.link_slots)
+        .filter_map(|i| {
+            let name = link_slot_name(i);
+            open_lock_file(&dir.join(&name)).map(|f| (name, f))
+        })
+        .collect();
+    if slots.is_empty() {
+        return LinkGate::Degraded;
+    }
+    let start = Instant::now();
+    loop {
+        if let Some((name, file)) = try_take(&mut slots) {
+            return LinkGate::Held(AcquiredLinkSlot {
+                _file: file,
+                name,
+                wait_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        // Same live kill switch as the permit poll below: a flipped
+        // `enabled = false` or a deleted config unwedges link waiters
+        // within one poll tick, fail-open.
+        match config::load(config_path) {
+            Some(live) if live.enabled => {}
+            _ => return LinkGate::FailOpen,
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -289,6 +378,7 @@ mod tests {
             permit_dir: permit_dir.clone(),
             local_reserved: local,
             ci_reserved: ci,
+            link_slots: 1,
             ci_users: vec!["_intendant-ci".into(), "ci".into()],
             wrap_with: None,
         };
@@ -337,6 +427,56 @@ mod tests {
     fn zero_permits_fails_open() {
         let (_tmp, cfg, path) = rig(0, 0);
         assert!(acquire(&cfg, Class::Local, &path).is_none());
+    }
+
+    #[test]
+    fn link_gate_off_and_degraded_never_block() {
+        let (_tmp, mut cfg, path) = rig(1, 0);
+        cfg.link_slots = 0;
+        assert!(matches!(acquire_link_slot(&cfg, &path), LinkGate::Off));
+        // An unusable permit dir (here: a plain file where the dir should
+        // be) means no slot file can be opened or created: Degraded, so
+        // the caller keeps ordinary governance instead of failing open.
+        cfg.link_slots = 1;
+        cfg.permit_dir = path.clone();
+        assert!(matches!(acquire_link_slot(&cfg, &path), LinkGate::Degraded));
+    }
+
+    #[test]
+    fn link_slots_serialize_and_release() {
+        let (_tmp, cfg, path) = rig(2, 0);
+        let a = match acquire_link_slot(&cfg, &path) {
+            LinkGate::Held(slot) => slot,
+            _ => panic!("first heavyweight must take the slot"),
+        };
+        assert_eq!(a.name, "link-0");
+        // The single slot is held: a second taker polls. Prove it waits
+        // by watching a thread not finish, then release and join.
+        let (cfg2, path2) = (cfg.clone(), path.clone());
+        let waiter = std::thread::spawn(move || acquire_link_slot(&cfg2, &path2));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !waiter.is_finished(),
+            "second heavyweight must queue on the held link slot"
+        );
+        drop(a);
+        match waiter.join().unwrap() {
+            LinkGate::Held(slot) => assert_eq!(slot.name, "link-0"),
+            _ => panic!("waiter must acquire after release"),
+        }
+    }
+
+    #[test]
+    fn multiple_link_slots_admit_that_many() {
+        let (_tmp, mut cfg, path) = rig(2, 0);
+        cfg.link_slots = 2;
+        let a = acquire_link_slot(&cfg, &path);
+        let b = acquire_link_slot(&cfg, &path);
+        let (a, b) = match (a, b) {
+            (LinkGate::Held(a), LinkGate::Held(b)) => (a, b),
+            _ => panic!("two slots must admit two links"),
+        };
+        assert_ne!(a.name, b.name);
     }
 
     #[test]

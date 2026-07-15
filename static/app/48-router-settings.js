@@ -129,7 +129,7 @@ function parseRoute() {
 
 function daemonDashboardHref(hash = '#activity') {
   if (DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
-    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${hash || ''}`;
+    return '/connect';
   }
   return `/${hash || ''}`;
 }
@@ -147,21 +147,6 @@ function openAccessHome() {
   }
 }
 
-function syncAccessPageNavLink() {
-  const prefix = document.getElementById('sb-access-page-prefix');
-  const label = document.getElementById('sb-access-page-label');
-  const group = document.getElementById('sb-access-page-link');
-  if (!prefix || !label || !group) return;
-  if (DASHBOARD_ACCESS_PAGE_MODE) {
-    prefix.textContent = 'back';
-    label.textContent = 'Dashboard';
-    group.title = 'Return to the daemon dashboard';
-  } else {
-    prefix.textContent = 'admin';
-    label.textContent = 'Access';
-    group.title = 'Open fleet access administration';
-  }
-}
 
 function tabDomMatches(tab) {
   const pane = document.getElementById('tab-' + tab);

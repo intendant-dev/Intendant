@@ -1191,11 +1191,15 @@ class DisplaySlot {
     // (close races, full SCTP buffers).
     const sendControl = (msg) => {
       try {
-        if (sendDisplayInputForSlot(this.displayId, msg)) return;
+        if (sendDisplayInputForSlot(this.displayId, msg)) return true;
       } catch (_) { /* fall through to the data channel */ }
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
-        try { this.controlChannel.send(JSON.stringify(msg)); } catch (_) {}
+        try {
+          this.controlChannel.send(JSON.stringify(msg));
+          return true;
+        } catch (_) {}
       }
+      return false;
     };
     const sendPointer = (msg) => {
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
@@ -1444,7 +1448,6 @@ class DisplaySlot {
         tickerFramesDropped++;
         sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
       }
-      updateTickerFrames();
       // HQ: logical resolution — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);

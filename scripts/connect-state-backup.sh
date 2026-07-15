@@ -3,8 +3,9 @@
 # Encrypted backup for hosted Intendant Connect state.
 #
 # The state file contains account records, passkey public-key records, daemon
-# ownership, labels, hashed claim phrases, and audit events. Use encryption for
-# normal backups; pass --allow-plaintext only for a deliberate local diagnostic.
+# account-route links, labels, hashed claim codes, and audit events. Use
+# encryption for normal backups; pass --allow-plaintext only for a deliberate
+# local diagnostic.
 #
 set -euo pipefail
 

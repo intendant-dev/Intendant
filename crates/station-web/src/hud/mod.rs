@@ -12,9 +12,9 @@ use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec
 use crate::util::{
     attention_level_color_css, css_rgba, epoch_seconds_now, fmt_compact, goal_status_color_css,
     hex_color, level_color_css, nonempty, pct_label, percent, phase_color_css, pressure_color,
-    tone_color_css, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS,
-    C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS,
-    C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    tone_color_css, truncate, Color, C_AMBER, C_AMBER_CSS, C_GREEN_CSS, C_IRIS, C_IRIS2,
+    C_IRIS2_CSS, C_IRIS_CSS, C_ROSE_CSS, C_SKY, C_SKY_CSS, C_TEXT2_CSS, C_TEXT3, C_TEXT3_CSS,
+    C_TEXT_CSS, C_VIOLET_CSS,
 };
 use crate::StationInner;
 
@@ -422,13 +422,13 @@ pub(crate) fn wrap_line(line: &str, max_chars: usize) -> Vec<String> {
 pub(crate) fn transcript_kind_color(kind: &str) -> &'static str {
     match kind {
         "user" => C_GREEN_CSS,
-        "model" | "assistant" => C_BLUE_CSS,
-        "agent" | "run" => C_TEAL_CSS,
-        "tool" | "command" | "detail" => C_LAVENDER_CSS,
-        "error" | "diff-del" => C_RED_CSS,
-        "warn" | "diff-meta" => C_YELLOW_CSS,
+        "model" | "assistant" => C_IRIS_CSS,
+        "agent" | "run" => C_SKY_CSS,
+        "tool" | "command" | "detail" => C_IRIS2_CSS,
+        "error" | "diff-del" => C_ROSE_CSS,
+        "warn" | "diff-meta" => C_AMBER_CSS,
         "diff-add" => C_GREEN_CSS,
-        _ => C_SUBTEXT0_CSS,
+        _ => C_TEXT2_CSS,
     }
 }
 

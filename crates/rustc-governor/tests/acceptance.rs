@@ -30,7 +30,12 @@ use std::time::{Duration, Instant};
 const GOVERNOR: &str = env!("CARGO_BIN_EXE_rustc-governor");
 /// Deadline for anything that should happen "promptly" — sized for a box
 /// saturated by parallel agents, not for the typical millisecond case.
-const GENEROUS: Duration = Duration::from_secs(15);
+/// 60s matches tests/sccache_chain.rs: at 15s, a deliberately provoked
+/// spawn storm (two of these suites concurrently on a loaded box) timed
+/// out five tests whose children are one-echo shell scripts. Green runs
+/// never wait on this constant — wait_deadline returns at completion —
+/// so only real failures pay the extra latency.
+const GENEROUS: Duration = Duration::from_secs(60);
 /// How long a should-be-blocked governor is observed before we believe it
 /// is really waiting (several 100ms poll ticks plus load headroom).
 const BLOCKED_OBSERVATION: Duration = Duration::from_millis(1200);
@@ -60,6 +65,8 @@ impl Rig {
     /// the tests never depend on which account actually runs them (CI
     /// fleet accounts are literally named "ci"), so "local" configs list
     /// an impossible username and "ci" configs list the real one.
+    /// `link_slots` stays at the binary's default (1) unless a test says
+    /// otherwise — exactly like a production conf without the key.
     fn config(
         &self,
         name: &str,
@@ -68,7 +75,7 @@ impl Rig {
         ci_user_is_me: bool,
         enabled: bool,
     ) -> PathBuf {
-        self.config_inner(name, local, ci, ci_user_is_me, enabled, None)
+        self.config_inner(name, local, ci, ci_user_is_me, enabled, None, None)
     }
 
     /// Same, plus a `wrap_with` chain front (the sccache stand-in).
@@ -81,9 +88,15 @@ impl Rig {
         enabled: bool,
         wrap: &Path,
     ) -> PathBuf {
-        self.config_inner(name, local, ci, ci_user_is_me, enabled, Some(wrap))
+        self.config_inner(name, local, ci, ci_user_is_me, enabled, Some(wrap), None)
     }
 
+    /// Same, with an explicit `link_slots` key.
+    fn config_with_links(&self, name: &str, local: u32, ci: u32, link_slots: u32) -> PathBuf {
+        self.config_inner(name, local, ci, false, true, None, Some(link_slots))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn config_inner(
         &self,
         name: &str,
@@ -92,6 +105,7 @@ impl Rig {
         ci_user_is_me: bool,
         enabled: bool,
         wrap: Option<&Path>,
+        link_slots: Option<u32>,
     ) -> PathBuf {
         let ci_users = if ci_user_is_me {
             format!("[\"{}\"]", me())
@@ -104,6 +118,9 @@ impl Rig {
         );
         if let Some(wrap) = wrap {
             text.push_str(&format!("wrap_with = \"{}\"\n", wrap.display()));
+        }
+        if let Some(slots) = link_slots {
+            text.push_str(&format!("link_slots = {slots}\n"));
         }
         let path = self.root.join(name);
         std::fs::write(&path, text).unwrap();
@@ -235,6 +252,16 @@ fn kill_and_reap(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The cargo bin-link argv shape (trimmed): classifies heavyweight, so a
+/// spawn with these args must also hold a link slot.
+const HEAVY_ARGS: &[&str] = &[
+    "--crate-name",
+    "x",
+    "--crate-type",
+    "bin",
+    "--emit=dep-info,link",
+];
 
 // ------------------------------------------------------------- tests ----
 
@@ -546,8 +573,11 @@ fn sigterm_forwards_to_child_and_signal_death_propagates() {
         ),
     );
     let config = rig.config("gov.toml", 1, 0, false, true);
-    let mut child = spawn_governor(&config, &script, &[], &[]);
+    // Heavyweight argv: the signal-death path must release the link slot
+    // exactly like the permit.
+    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
     wait_for(|| ticks.exists(), GENEROUS, "fixture to start ticking");
+    assert!(is_exclusively_locked(&rig.permit("link-0")));
     // SAFETY: pid was spawned by this test and not yet reaped; kill(2)
     // takes only the pid and signal number.
     let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -564,11 +594,14 @@ fn sigterm_forwards_to_child_and_signal_death_propagates() {
         after_settle,
         "tick file still growing: the governed child survived the forwarded SIGTERM"
     );
-    // And the permit came back with the governor's exit.
+    // And both locks came back with the governor's exit.
     wait_for(
-        || !is_exclusively_locked(&rig.permit("permit-local-0")),
+        || {
+            !is_exclusively_locked(&rig.permit("permit-local-0"))
+                && !is_exclusively_locked(&rig.permit("link-0"))
+        },
         GENEROUS,
-        "permit release after signal death",
+        "both locks to release after signal death",
     );
 }
 
@@ -881,6 +914,398 @@ fn zero_permits_fails_open() {
     let mut child = spawn_governor(&config, &script, &[], &[]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
     assert!(marker.exists());
+}
+
+// ----------------------------------------------------- the link gate ----
+
+/// Serialization: three heavyweight links against link_slots = 1 (the
+/// default — no key in the config) and THREE ordinary permits, so any
+/// serialization observed comes from the link gate alone, never the
+/// permit pool. Concurrency is measured from the fixture's own event
+/// stream, exactly like the global-ceiling test. All three completing is
+/// also the no-deadlock property for slot-then-permit acquisition.
+#[test]
+fn heavyweight_links_serialize_on_the_link_slot() {
+    let rig = Rig::new();
+    let events = rig.root.join("events");
+    let script = rig.script(
+        "link.sh",
+        &format!(
+            "echo start >> {ev}\nsleep 0.4\necho end >> {ev}",
+            ev = events.display()
+        ),
+    );
+    let config = rig.config("gov.toml", 3, 0, false, true);
+
+    let mut kids: Vec<Child> = (0..3)
+        .map(|_| spawn_governor(&config, &script, HEAVY_ARGS, &[]))
+        .collect();
+    let overall = Instant::now();
+    for child in &mut kids {
+        let left = Duration::from_secs(45)
+            .checked_sub(overall.elapsed())
+            .unwrap_or_default();
+        let status = wait_deadline(child, left).expect("heavyweight link must finish");
+        assert!(status.success());
+    }
+
+    let text = std::fs::read_to_string(&events).unwrap();
+    let (mut current, mut max, mut starts) = (0_i32, 0_i32, 0);
+    for line in text.lines() {
+        match line {
+            "start" => {
+                current += 1;
+                starts += 1;
+                max = max.max(current);
+            }
+            "end" => current -= 1,
+            other => panic!("unexpected event line {other:?}"),
+        }
+    }
+    assert_eq!(starts, 3);
+    assert_eq!(
+        max, 1,
+        "link gate violated: {max} concurrent heavyweight links (link_slots = 1)"
+    );
+    // Every run logged as a gated link, and the completion lines carry
+    // the runtime soak data.
+    let log = rig.log();
+    assert_eq!(
+        log.matches("kind=link link_slot=link-0").count(),
+        3,
+        "all three must serialize through the one slot: {log:?}"
+    );
+    assert_eq!(log.matches("kind=link-done runtime_ms=").count(), 3);
+    // Normal exits released everything.
+    assert!(!is_exclusively_locked(&rig.permit("link-0")));
+}
+
+/// No ordinary-permit hoarding (the acquisition-order invariant): an
+/// invocation queued on the link gate holds ZERO ordinary permits, so
+/// ordinary compiles keep the pool, and a probe that superficially
+/// resembles a bin invocation (cargo's startup probe carries
+/// `--crate-type bin`) still bypasses everything.
+#[test]
+fn queued_heavyweight_hoards_no_ordinary_permit() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config("gov.toml", 2, 0, false, true);
+
+    let slot_held = hold_exclusive(&rig.permit("link-0"));
+    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    assert_still_running_for(&mut heavy, BLOCKED_OBSERVATION);
+    assert!(!marker.exists(), "heavyweight ran while the slot was held");
+    assert!(
+        !is_exclusively_locked(&rig.permit("permit-local-0"))
+            && !is_exclusively_locked(&rig.permit("permit-local-1")),
+        "a link-gate waiter must hold no ordinary permit"
+    );
+
+    // Ordinary compiles proceed through the un-hoarded pool…
+    let mut ordinary = spawn_governor(&config, &script, &[], &[]);
+    assert!(wait_deadline(&mut ordinary, GENEROUS).unwrap().success());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().lines().count(),
+        1,
+        "the ordinary compile must complete while the heavyweight queues"
+    );
+    // …and a probe-shaped invocation carrying --crate-type bin execs
+    // directly (probe classification runs BEFORE link classification).
+    let mut probe = spawn_governor(
+        &config,
+        &script,
+        &[
+            "-",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info",
+            "--print=cfg",
+        ],
+        &[],
+    );
+    assert!(wait_deadline(&mut probe, GENEROUS).unwrap().success());
+
+    drop(slot_held);
+    let status = wait_deadline(&mut heavy, GENEROUS).expect("heavyweight must acquire the slot");
+    assert!(status.success());
+    let log = rig.log();
+    let heavy_line = log
+        .lines()
+        .find(|l| l.contains("kind=link "))
+        .expect("gated heavyweight must log");
+    assert!(
+        heavy_line.contains("crate=x")
+            && heavy_line.contains("link_slot=link-0")
+            && heavy_line.contains("link_wait_ms="),
+        "link line must carry the soak fields: {heavy_line:?}"
+    );
+    assert!(
+        !is_exclusively_locked(&rig.permit("link-0")),
+        "normal exit must release the slot"
+    );
+}
+
+/// While a heavyweight holds the slot and waits for an ordinary permit,
+/// borrowing still works: the composed gate never deadlocks against the
+/// class machinery. (Local reservation held; the idle CI reservation is
+/// borrowable because no CI demand is registered.)
+#[test]
+fn slot_holder_borrows_idle_foreign_permit() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config("gov.toml", 1, 1, false, true);
+
+    let _local_held = hold_exclusive(&rig.permit("permit-local-0"));
+    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let status = wait_deadline(&mut heavy, GENEROUS)
+        .expect("slot holder must borrow the idle CI permit, not deadlock");
+    assert!(status.success());
+    let log = rig.log();
+    let line = log.lines().find(|l| l.contains("kind=link ")).unwrap();
+    assert!(
+        line.contains("permit=permit-ci-0"),
+        "must have borrowed the idle CI permit: {line:?}"
+    );
+}
+
+/// `link_slots = 0` is the per-box opt-out: heavyweights run ungated
+/// (logged as such) but stay ordinary-governed.
+#[test]
+fn zero_link_slots_disables_the_gate_only() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config_with_links("gov.toml", 1, 0, 0);
+
+    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
+    let log = rig.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("kind=link-ungated"))
+        .expect("gate-off heavyweight must log its disposition");
+    assert!(
+        line.contains("reason=off") && line.contains("permit=permit-local-0"),
+        "{line:?}"
+    );
+    assert!(
+        log.contains("kind=link-done"),
+        "runtime soak line is wanted even ungated: {log:?}"
+    );
+
+    // And the ordinary ceiling still binds: hold the only permit, the
+    // heavyweight queues.
+    let _held = hold_exclusive(&rig.permit("permit-local-0"));
+    let mut queued = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    assert_still_running_for(&mut queued, BLOCKED_OBSERVATION);
+    kill_and_reap(queued);
+}
+
+/// Degraded link gating: the permit dir denies creating the slot files
+/// (the production shape: root-owned dir, config grown past the
+/// installer-minted files). The link gate degrades — logged — but
+/// ordinary governance is KEPT: reviewer contract, "link-gate failure
+/// must not discard ordinary governance".
+#[test]
+fn degraded_link_gate_keeps_ordinary_governance() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config("gov.toml", 1, 0, false, true);
+
+    // Pre-create everything the ordinary path needs (the installer's
+    // job in production), plus the log file — then make the dir
+    // read-only so link-0 cannot be created.
+    for name in [
+        "permit-local-0",
+        "demand-local",
+        "demand-ci",
+        "governor.log",
+    ] {
+        drop(open_rw(&rig.permit(name)));
+    }
+    let mut ro = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
+    ro.set_mode(0o555);
+    std::fs::set_permissions(&rig.permit_dir, ro).unwrap();
+
+    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let status = wait_deadline(&mut heavy, GENEROUS);
+
+    // Restore permissions FIRST (tempdir cleanup + rig.log both need the
+    // dir readable-writable), then assert.
+    let mut rw = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
+    rw.set_mode(0o755);
+    std::fs::set_permissions(&rig.permit_dir, rw).unwrap();
+
+    assert!(status.expect("degraded gate must not block").success());
+    assert!(marker.exists());
+    let log = rig.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("kind=link-ungated"))
+        .expect("degraded heavyweight must log its disposition");
+    assert!(
+        line.contains("reason=degraded") && line.contains("permit=permit-local-0"),
+        "ordinary governance must be kept through link-gate degradation: {line:?}"
+    );
+}
+
+/// SIGKILL on a slot-holding governor releases BOTH locks through kernel
+/// semantics (the fds close with the process), exactly like the
+/// permit-only crash test above.
+#[test]
+fn sigkilled_heavy_governor_releases_both_locks() {
+    let rig = Rig::new();
+    let ready = rig.root.join("ready");
+    let script = rig.script(
+        "hold.sh",
+        &format!(
+            "echo $$ >> {}\nwhile :; do sleep 0.05; done",
+            ready.display()
+        ),
+    );
+    let config = rig.config("gov.toml", 1, 0, false, true);
+
+    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    wait_for(
+        || {
+            std::fs::read_to_string(&ready)
+                .map(|s| s.ends_with('\n'))
+                .unwrap_or(false)
+        },
+        GENEROUS,
+        "holder to start",
+    );
+    assert!(is_exclusively_locked(&rig.permit("link-0")));
+    assert!(is_exclusively_locked(&rig.permit("permit-local-0")));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_for(
+        || {
+            !is_exclusively_locked(&rig.permit("link-0"))
+                && !is_exclusively_locked(&rig.permit("permit-local-0"))
+        },
+        GENEROUS,
+        "both locks to release after SIGKILL",
+    );
+    let orphan: libc::pid_t = std::fs::read_to_string(&ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("fixture wrote its pid");
+    // SAFETY: the pid was reported by the fixture this test (transitively)
+    // spawned; kill(2) takes only the pid and signal number.
+    unsafe {
+        libc::kill(orphan, libc::SIGKILL);
+    }
+}
+
+/// Neither lock fd is inheritable: a long-lived grandchild the chain
+/// leaves behind (the daemonized-sccache-server shape, minus sccache)
+/// must not keep either flock alive past the governor's exit. This is
+/// the general CLOEXEC + parent-held property; the real-sccache
+/// daemonization variant lives in tests/sccache_chain.rs (heavy bin
+/// shapes are non-cacheable there, so the rlib test carries it).
+#[test]
+fn long_lived_grandchild_inherits_neither_lock() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script(
+        "daemonish.sh",
+        &format!(
+            "sleep 3 >/dev/null 2>&1 &\necho spawned >> {}",
+            marker.display()
+        ),
+    );
+    let config = rig.config("gov.toml", 1, 0, false, true);
+
+    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
+    assert!(marker.exists());
+    // The governor exited; the backgrounded sleep (reparented, still
+    // alive for ~3s) must hold neither lock.
+    assert!(
+        !is_exclusively_locked(&rig.permit("link-0")),
+        "a grandchild inherited the link-slot fd"
+    );
+    assert!(
+        !is_exclusively_locked(&rig.permit("permit-local-0")),
+        "a grandchild inherited the permit fd"
+    );
+}
+
+/// The live kill switch unwedges LINK-slot waiters exactly like permit
+/// waiters, for every way the config can die: flipped off, deleted, or
+/// replaced with garbage. Fail-open runs are silent in the log, and the
+/// waiter never touched an ordinary permit.
+#[test]
+fn dying_config_unwedges_link_waiters_fail_open() {
+    for way in ["disable", "delete", "garbage"] {
+        let rig = Rig::new();
+        let marker = rig.root.join("marker");
+        let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+        let config = rig.config("gov.toml", 1, 0, false, true);
+
+        let _slot_held = hold_exclusive(&rig.permit("link-0"));
+        let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+        assert_still_running_for(&mut heavy, Duration::from_millis(600));
+        assert!(
+            !is_exclusively_locked(&rig.permit("permit-local-0")),
+            "[{way}] a link-gate waiter must hold no ordinary permit"
+        );
+
+        match way {
+            "disable" => {
+                rig.config("gov.toml", 1, 0, false, false);
+            }
+            "delete" => std::fs::remove_file(&config).unwrap(),
+            "garbage" => std::fs::write(&config, "enabled = maybe\n").unwrap(),
+            _ => unreachable!(),
+        }
+        let status = wait_deadline(&mut heavy, GENEROUS)
+            .unwrap_or_else(|| panic!("[{way}] link waiter must unwedge, fail-open"));
+        assert!(status.success(), "[{way}]");
+        assert!(marker.exists(), "[{way}]");
+        assert_eq!(rig.log(), "", "[{way}] fail-open must not log");
+    }
+}
+
+/// The config dying while a heavyweight HOLDS the slot but waits for an
+/// ordinary permit: the invocation fails open and the slot is dropped
+/// before the exec — never carried into an ungoverned chain.
+#[test]
+fn dying_config_drops_a_held_slot_before_fail_open() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config("gov.toml", 1, 0, false, true);
+
+    // The only ordinary permit is held forever; the link slot is free.
+    let _permit_held = hold_exclusive(&rig.permit("permit-local-0"));
+    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    // The heavyweight takes the slot, then queues on the permit.
+    wait_for(
+        || is_exclusively_locked(&rig.permit("link-0")),
+        GENEROUS,
+        "heavyweight to take the link slot",
+    );
+    assert_still_running_for(&mut heavy, Duration::from_millis(600));
+
+    std::fs::remove_file(&config).unwrap();
+    let status =
+        wait_deadline(&mut heavy, GENEROUS).expect("permit waiter must unwedge, fail-open");
+    assert!(status.success());
+    assert!(marker.exists());
+    assert!(
+        !is_exclusively_locked(&rig.permit("link-0")),
+        "the slot must be dropped when its holder fails open"
+    );
+    assert_eq!(rig.log(), "", "fail-open must not log");
 }
 
 // ---------------------------------------------------- wiring guards ----

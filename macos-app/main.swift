@@ -569,15 +569,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             : "Remote clients can connect right away — load the dashboard here only when you need it."
         webView.loadHTMLString("""
             <html>
-            <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+            <body style="background:#0B0C10;color:#EAECF2;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center;max-width:480px;padding:0 24px">
                 <div style="font-size:24px;margin-bottom:10px">\(title)</div>
-                <div style="font-size:14px;color:#6c7086;line-height:1.5">Serving on port \(port). \(detail)</div>
+                <div style="font-size:14px;color:#7E8896;line-height:1.5">Serving on port \(port). \(detail)</div>
                 <button onclick="window.webkit.messageHandlers.activate.postMessage(null)"
-                        style="margin-top:18px;padding:10px 28px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:15px;cursor:pointer">
+                        style="margin-top:18px;padding:10px 28px;border:1px solid #7E8CFA;border-radius:6px;background:transparent;color:#7E8CFA;font-size:15px;cursor:pointer">
                     Activate Dashboard
                 </button>
-                <div style="font-size:12px;color:#6c7086;margin-top:16px">Closing this window keeps the daemon running. Quit from the Dock or with Cmd+Q to stop it.</div>
+                <div style="font-size:12px;color:#7E8896;margin-top:16px">Closing this window keeps the daemon running. Quit from the Dock or with Cmd+Q to stop it.</div>
             </div>
             </body>
             </html>
@@ -959,10 +959,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     func showBackendStarting(detail: String) {
         webView?.loadHTMLString("""
             <html>
-            <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+            <body style="background:#0B0C10;color:#EAECF2;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center">
                 <div style="font-size:24px;margin-bottom:8px">Starting Intendant...</div>
-                <div style="font-size:14px;color:#6c7086">\(detail)</div>
+                <div style="font-size:14px;color:#7E8896">\(detail)</div>
             </div>
             </body>
             </html>
@@ -1001,12 +1001,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         }
         webView.loadHTMLString("""
             <html>
-            <body style="background:#1e1e2e;color:#cdd6f4;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+            <body style="background:#0B0C10;color:#EAECF2;font-family:-apple-system;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
             <div style="text-align:center">
-                <div style="font-size:20px;color:#f38ba8;margin-bottom:12px">\(esc(title))</div>
-                <div style="font-size:14px;color:#6c7086;margin-bottom:16px">\(esc(detail))</div>
+                <div style="font-size:20px;color:#EC6A85;margin-bottom:12px">\(esc(title))</div>
+                <div style="font-size:14px;color:#7E8896;margin-bottom:16px">\(esc(detail))</div>
                 <button onclick="window.webkit.messageHandlers.restart && window.webkit.messageHandlers.restart.postMessage(null)"
-                        style="padding:8px 24px;border:1px solid #89b4fa;border-radius:6px;background:transparent;color:#89b4fa;font-size:14px;cursor:pointer">
+                        style="padding:8px 24px;border:1px solid #7E8CFA;border-radius:6px;background:transparent;color:#7E8CFA;font-size:14px;cursor:pointer">
                     Restart now
                 </button>
             </div>

@@ -295,6 +295,8 @@ html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value {
   letter-spacing: -.01em;
   color: var(--text);
 }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-yellow { color: var(--amber); }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-red { color: var(--rose); }
 html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-sub {
   margin-top: 3px;
   font-size: 10.5px;
@@ -855,6 +857,33 @@ html.ui-v2 #tab-sessions .worktree-card .wt-label.unknown-merge {
   background: rgba(var(--amber-rgb), .1);
   color: var(--amber);
 }
+html.ui-v2 #tab-sessions .worktree-card .wt-sessions { gap: 5px; margin: 8px 0 0; }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip {
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 10.5px;
+}
+html.ui-v2 #tab-sessions button.wt-session-chip:hover,
+html.ui-v2 #tab-sessions button.wt-session-chip:focus-visible {
+  border-color: var(--iris);
+  color: var(--text);
+  background: var(--surface-3);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active {
+  border-color: rgba(var(--amber-rgb), .5);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-source {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-id { font-family: var(--mono); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 html.ui-v2 #tab-sessions .worktree-card .wt-safety {
   margin: 8px 0;
   padding: 7px 10px;

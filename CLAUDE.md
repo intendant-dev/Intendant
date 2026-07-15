@@ -1,25 +1,25 @@
 # CLAUDE.md
 
-> **Living document — last verified 2026-07-04 against `main` @ `3fb8eb30`.**
+> **Living document — reviewed 2026-07-13 for the alpha trust refactor, based on `main` @ `714f24af`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 3fb8eb30..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 714f24af..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, web dashboard, MCP, voice).
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
 
-Past the single box, the ambition is a **network of agentic networks** — fleets of daemons owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; browser identity keys protected by passkeys; org root keys sign grant documents and revocation lists; the hosted rendezvous is zero-authority and self-hostable), **credential custody** (daemons borrow time-boxed leases from a passkey-sealed vault or relay calls through the owner's browser — a disposable box's disk holds no durable secrets), and the **zero-install client** (the entire client is a browser tab: claim a fresh daemon with a twelve-word phrase, watch every fleet display live, phone included). The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
+Past the single box, daemons federate into a **network of agentic networks** — fleets owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; a hosted claim is discovery/route metadata and creates no principal or grant; the default binary fixes hosted provenance at the zero-permission `role:none` and treats rendezvous-controlled fleet WebPKI names as discovery-only, so shipped daemon control requires a trusted local or independently reached daemon-served direct/mTLS surface; org root keys sign grant documents and revocation lists), **credential custody** (sealed vault stores, time-boxed leases, and client egress exist, but the default build has no bridge from a Connect-origin account vault to a trusted daemon session; `.env` remains supported, and active full-credential OAuth leases temporarily materialize private auth files), and the **zero-install discovery client** (a browser tab can link a daemon with a single-use twelve-word claim code and find the fleet, but cannot control it). Connect remains self-hostable and is not an authority mint, but it is trusted for availability, account/route metadata, and the browser code and installers it serves. The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
 ## The Three Binaries (security boundary)
 
 - **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted on Linux, Seatbelt-wrapped on macOS, restricted-token re-exec on Windows (`src/win_sandbox.rs`). **Never holds API keys.**
 - **intendant** (`src/bin/caller/main.rs`) — controller. Drives the LLM loop, calls model APIs, dispatches tool calls to the runtime subprocess, supervises external agents, and runs every frontend.
-- **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores only what daemons and browsers publish; fleet records are browser-signed and re-verified client-side so the service cannot invent or alter them. Holds no daemon secrets and no API keys.
+- **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores what daemons and browsers publish. Fleet records are self-signed: the current browser detects same-key alteration, but there is not yet an owner/device trust set, so a malicious store can substitute a newly self-signed record on another device. That metadata never grants daemon authority. Connect also serves browser code and installers, so malicious served code can alter or exfiltrate what the Connect page sees and a malicious installer can compromise what it installs. It holds no daemon API keys, cannot mint daemon-local IAM, and the default daemon refuses hosted-provenance control at immutable `role:none`.
 
 The runtime/controller split is the load-bearing security decision: a compromised model conversation can't reach API keys; the runtime can't exfiltrate through model APIs. Preserve it.
 
@@ -70,6 +70,15 @@ box-wide compile governor (scripts/ci/README.md, "Governor") rides those
 settings, and overriding them opts your build out of the machine's
 RAM-protecting compile ceiling (the 2026-07-10 OOM-spiral class).
 Permitted only when deliberately diagnosing the wrapper chain itself.
+
+**Avoid needless final links** — they are the expensive step (a debug
+`intendant` link peaks ~2GiB linker RSS; concurrent final links are what
+swap-storm the box, and the governor serializes them machine-wide, so
+extra links also queue everyone else's): `cargo check` while iterating;
+when you need binaries, name them — `cargo build --bin intendant --bin
+intendant-runtime` covers running the controller (`intendant-connect`
+matters only for Connect work) — and save the all-binaries `cargo build`
+for validation that genuinely needs all three.
 
 **WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails: `bash scripts/build-wasm.sh`
 (the canonical builder — it carries the registry-path remap that makes

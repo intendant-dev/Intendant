@@ -28,6 +28,19 @@ pub(crate) struct JsonRpcResponse {
     pub(crate) result: serde_json::Value,
 }
 
+#[derive(Serialize)]
+pub(crate) struct JsonRpcErrorResponse {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: u64,
+    pub(crate) error: JsonRpcResponseError,
+}
+
+#[derive(Serialize)]
+pub(crate) struct JsonRpcResponseError {
+    pub(crate) code: i64,
+    pub(crate) message: String,
+}
+
 /// Unified incoming message: can be a response, notification, or server request.
 #[derive(Deserialize)]
 pub(crate) struct JsonRpcMessage {

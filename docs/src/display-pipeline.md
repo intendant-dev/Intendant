@@ -377,17 +377,22 @@ start/stop stress test for operator hardware
 
 Browser keyboard/mouse events (`kd`/`ku`/`md`/`mu`/`mm`/`sc` — key and mouse
 button edges, absolute mouse moves, relative scroll deltas) reach the daemon on
-three lanes: the per-peer WebRTC data channels (`control`/`pointer`, reliable
-and ordered), the dashboard-control tunnel (hosted Connect), and the legacy
-`/ws` gateway socket. All three converge on a **per-display-session ordered
+three lanes: authenticated peers' WebRTC data channels (`control`/`pointer`,
+reliable and ordered), the daemon-origin dashboard-control tunnel used by
+trusted local or direct-mTLS sessions (plus local development builds of the
+packaged macOS bridge), and the legacy
+`/ws` gateway socket on a trusted daemon surface. All three converge on a
+**per-display-session ordered
 input queue** (`crates/intendant-display/src/input_queue.rs`): each lane's
-authority gate runs first (a refused event never enqueues), the enqueue is a
-sync non-blocking push (the two WebRTC lanes push from inside sans-I/O `rtc`
-poll loops that must never block), and a **single pump task per session**
-drains the queue, awaiting each injection to completion before the next —
-so injection order always equals wire arrival order. (The pre-queue design
-dispatched one `tokio::spawn` per event, which could reorder adjacent events
-under load — a `kd`/`ku` inversion presents as a stuck auto-repeating key.)
+authority gate runs first (a refused event never enqueues), the queued event
+retains that live authorization predicate, and the pump rechecks it immediately
+before injection so revocation discards buffered input. The enqueue is a sync
+non-blocking push (the two WebRTC lanes push from inside sans-I/O `rtc` poll
+loops that must never block), and a **single pump task per session** drains the
+queue, awaiting each injection to completion before the next — so injection
+order always equals wire arrival order. (The pre-queue design dispatched one
+`tokio::spawn` per event, which could reorder adjacent events under load — a
+`kd`/`ku` inversion presents as a stuck auto-repeating key.)
 
 The queue coalesces **adjacent** pending mouse-moves latest-wins (both carry
 absolute coordinates; an `mm` never jumps over a discrete event, preserving
@@ -395,16 +400,29 @@ position-at-click semantics). Scroll events are never coalesced — their
 deltas are relative, and merging would change total scroll distance. On
 overflow (soft cap 256) the oldest *continuous* event (`mm`/`sc`) is evicted
 first; discrete events are never sacrificed for continuous ones — an
-all-discrete backlog instead grows to a hard cap (1024) before the oldest
-event is dropped loudly. Computer-use actions bypass the queue via
+all-discrete backlog instead grows to a hard cap (1024). Reaching that cap
+trips the browser-input lane as a unit: pending events are cleared, no further
+browser events are accepted for that display session, and the pump attempts a
+synthetic key-up/mouse-up for every edge it pessimistically tracks as held.
+That terminal trip is reserved for the hard-cap invariant violation. Ordinary
+authority changes, source transport closure, and queued events whose live
+authorization revision has expired take a **recoverable reset**: discard the
+old epoch's backlog, synthesize releases for its held edges, then let the next
+authorized source use a fresh queue generation. A dashboard-control handoff
+overflow similarly cancels that overloaded connection after resetting its
+source; it does not poison the display session for a later connection. No path
+drops one key/button edge and silently continues the same authority epoch.
+Browser blur/pointer-cancel handling sends the same releases as defense in
+depth; server-side tracking remains authoritative for abrupt disconnects.
+Computer-use actions bypass the queue via
 `DisplaySession::inject_input`, which awaits completion (a CU click must be
 injected before the follow-up screenshot).
 
 > **Browser input is physical-key-only (Phase 1).** Injected key events use the
 > DOM `code` field (physical key position), not `key`. Non-US keyboard layouts
 > therefore produce incorrect character output until a future phase adds
-> character-level injection. A blur/focus reset of modifier state guards against
-> stuck modifier keys.
+> character-level injection. Browser and server teardown reset every tracked key
+> and mouse button, not only modifiers.
 
 ## Bidirectional Clipboard
 
@@ -412,7 +430,11 @@ The `ClipboardMonitor` (`display/clipboard.rs`) polls the system clipboard every
 500 ms and syncs changes over a WebRTC data channel in both directions. It
 supports text and images (PNG, capped at 5 MB). On copy in the browser, content is
 pushed to the display's clipboard; on copy in the display, content is pushed to
-the browser. The per-platform read/write tools are listed in the matrix above.
+the browser. A `DisplayView` grant alone does not enable that channel: both
+inbound mutation and outbound clipboard content require the same live
+`DisplayInput` authority as interactive keyboard/mouse control, rechecked again
+when a queued clipboard command is sent. The per-platform read/write tools are
+listed in the matrix above.
 Polling is **gated on viewer presence**: with zero connected peers each tick is
 a no-op (no `pbpaste`/`osascript`/`xclip`/`wl-paste` subprocess is spawned for a
 sync nobody receives), and content that changed during the pause is re-baselined

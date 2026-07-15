@@ -42,6 +42,10 @@ pub mod clipboard;
 pub mod encode;
 pub mod forward;
 pub(crate) mod input_queue;
+/// Absolute bound used by both the caller's per-connection handoff and the
+/// display session's ordered browser-input queue. Keeping one exported value
+/// prevents the transport shim from growing a larger hidden backlog.
+pub const BROWSER_INPUT_QUEUE_HARD_CAP: usize = input_queue::INPUT_QUEUE_HARD_CAP;
 pub mod input_telemetry;
 pub mod keymap;
 #[cfg(target_os = "macos")]
@@ -336,6 +340,273 @@ impl InputEvent {
             Self::Scroll { .. } => "sc",
         }
     }
+}
+
+/// Live browser-input authority plus an optional monotonic authority revision.
+///
+/// A versioned admission snapshots the revision around the live predicate;
+/// the pump requires that exact revision immediately before injection. This
+/// closes fast A -> B -> A handoffs where an identity-only predicate could be
+/// true again before an asynchronous reset observer runs.
+#[derive(Clone)]
+pub struct BrowserInputAuthorization {
+    predicate: Arc<dyn Fn() -> bool + Send + Sync>,
+    revision: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl BrowserInputAuthorization {
+    pub fn new(predicate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            predicate,
+            revision: None,
+        }
+    }
+
+    pub fn versioned(
+        predicate: Arc<dyn Fn() -> bool + Send + Sync>,
+        revision: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            predicate,
+            revision: Some(revision),
+        }
+    }
+
+    fn with_predicate(&self, predicate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            predicate,
+            revision: self.revision.clone(),
+        }
+    }
+
+    /// Return the stable revision under which this event may be admitted.
+    /// A concurrent transition drops the event; the browser's next frame can
+    /// retry under the settled state.
+    fn admission_revision(&self) -> Result<Option<u64>, ()> {
+        let before = self
+            .revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::SeqCst));
+        if !(self.predicate)() {
+            return Err(());
+        }
+        let after = self
+            .revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::SeqCst));
+        if before == after {
+            Ok(after)
+        } else {
+            Err(())
+        }
+    }
+
+    fn remains_current(&self, admitted_revision: Option<u64>) -> bool {
+        let before = self
+            .revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::SeqCst));
+        if before != admitted_revision || !(self.predicate)() {
+            return false;
+        }
+        self.revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::SeqCst))
+            == admitted_revision
+    }
+}
+
+#[derive(Default)]
+struct SourceHeldEdges {
+    keys: HashSet<String>,
+    buttons: HashSet<u8>,
+    queue_generation: Option<u64>,
+}
+
+impl SourceHeldEdges {
+    fn observe(&mut self, event: &InputEvent, queue_generation: u64) {
+        if self.queue_generation != Some(queue_generation) {
+            self.keys.clear();
+            self.buttons.clear();
+            self.queue_generation = Some(queue_generation);
+        }
+        match event {
+            InputEvent::KeyDown { code, .. } => {
+                self.keys.insert(code.clone());
+            }
+            InputEvent::KeyUp { code, .. } => {
+                self.keys.remove(code);
+            }
+            InputEvent::MouseDown { b, .. } => {
+                self.buttons.insert(*b);
+            }
+            InputEvent::MouseUp { b, .. } => {
+                self.buttons.remove(b);
+            }
+            InputEvent::MouseMove { .. } | InputEvent::Scroll { .. } => {}
+        }
+    }
+
+    fn take_active(&mut self, queue_generation: u64) -> bool {
+        let active = self.queue_generation == Some(queue_generation)
+            && (!self.keys.is_empty() || !self.buttons.is_empty());
+        self.keys.clear();
+        self.buttons.clear();
+        self.queue_generation = None;
+        active
+    }
+}
+
+/// One authority- and transport-bound producer for browser input.
+///
+/// The source owns a liveness bit embedded in every queued event's guard.
+/// Dropping a WebRTC peer, WebSocket, or dashboard-control worker therefore
+/// invalidates that source's buffered events without letting a passive viewer
+/// reset another controller. If this source has an unmatched submitted down
+/// edge, teardown also asks the shared pump for a recoverable safety reset.
+pub struct BrowserInputSource {
+    queue: std::sync::Weak<input_queue::InputQueue>,
+    authorization: BrowserInputAuthorization,
+    alive: Arc<AtomicBool>,
+    lifecycle_gate: Arc<std::sync::RwLock<bool>>,
+    held_edges: std::sync::Mutex<SourceHeldEdges>,
+}
+
+impl BrowserInputSource {
+    fn new(
+        queue: &Arc<input_queue::InputQueue>,
+        external_authorization: BrowserInputAuthorization,
+    ) -> Arc<Self> {
+        let alive = Arc::new(AtomicBool::new(true));
+        let lifecycle_gate = Arc::new(std::sync::RwLock::new(true));
+        Self::new_with_liveness(queue, external_authorization, alive, lifecycle_gate)
+    }
+
+    fn new_with_liveness(
+        queue: &Arc<input_queue::InputQueue>,
+        external_authorization: BrowserInputAuthorization,
+        alive: Arc<AtomicBool>,
+        lifecycle_gate: Arc<std::sync::RwLock<bool>>,
+    ) -> Arc<Self> {
+        let alive_for_guard = Arc::clone(&alive);
+        let external_predicate = Arc::clone(&external_authorization.predicate);
+        let predicate: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || alive_for_guard.load(Ordering::SeqCst) && external_predicate());
+        let authorization = external_authorization.with_predicate(predicate);
+        Arc::new(Self {
+            queue: Arc::downgrade(queue),
+            authorization,
+            alive,
+            lifecycle_gate,
+            held_edges: std::sync::Mutex::new(SourceHeldEdges::default()),
+        })
+    }
+
+    /// Gate and enqueue one event without blocking the transport poll loop.
+    pub fn enqueue(&self, event: InputEvent) {
+        // Hold the same lifecycle read gate used by authority-channel
+        // dispatch across admission, queue insertion, and source-held-edge
+        // bookkeeping. invalidate() takes the write side before marking this
+        // source dead, so it cannot observe an empty source ledger while an
+        // already-admitted down edge is between push and observe.
+        let live = self
+            .lifecycle_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !*live {
+            input_telemetry::record_authority_drop(event.wire_tag());
+            return;
+        }
+        let kind = event.wire_tag();
+        let Ok(admitted_revision) = self.authorization.admission_revision() else {
+            drop(live);
+            input_telemetry::record_authority_drop(kind);
+            self.reset_if_active("an interactive display source lost live authority");
+            return;
+        };
+        let Some(queue) = self.queue.upgrade() else {
+            return;
+        };
+        let observed_event = event.clone();
+        if let Some(queue_generation) =
+            queue.push_browser_authorized(event, self.authorization.clone(), admitted_revision)
+        {
+            // Track exactly the generation stamped while the queue lock was
+            // held. A reset between admission and this bookkeeping makes the
+            // source state stale (and therefore harmless on Drop); the reset
+            // itself owns the release cycle for that generation.
+            self.held_edges
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .observe(&observed_event, queue_generation);
+        }
+    }
+
+    /// Invalidate only this transport/source. Its queued events fail their
+    /// live guard; any unmatched submitted down requests a recoverable,
+    /// generation-bound release. The queue's all-discrete hard cap remains
+    /// the terminal overload circuit breaker.
+    pub fn invalidate(&self, reason: &str) {
+        {
+            // Authority-channel dispatch holds a read guard across its
+            // mutation. Taking write here orders close against grant: either
+            // the grant finishes before close (and close-side release wins),
+            // or it observes false and cannot run afterward.
+            let mut live = self
+                .lifecycle_gate
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            *live = false;
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.reset_if_active(reason);
+    }
+
+    fn reset_if_active(&self, reason: &str) {
+        let Some(queue) = self.queue.upgrade() else {
+            return;
+        };
+        let queue_generation = queue.current_generation();
+        let active = self
+            .held_edges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take_active(queue_generation);
+        if active {
+            // The unmatched down may still be pending and therefore absent
+            // from the pump's native held-edge count. Couple the reset to the
+            // exact observed generation so a concurrent handoff/new source
+            // cannot be cleared by this stale source.
+            let _ = queue.reset_if_generation(queue_generation, reason);
+        }
+    }
+}
+
+impl Drop for BrowserInputSource {
+    fn drop(&mut self) {
+        // Invalidate balanced buffered events too. An unmatched submitted down
+        // additionally requests an immediate release/clear cycle.
+        self.invalidate("an interactive display source transport closed");
+    }
+}
+
+/// Keep authority-channel mutation ordered with this peer's transport
+/// teardown. The read guard intentionally spans the handler call: teardown
+/// takes the matching write guard before marking the source dead, so a grant
+/// either completes before close-side cleanup or cannot run afterward.
+fn lifecycle_gated_authority_handler(
+    source: &Arc<BrowserInputSource>,
+    inner: self::webrtc::AuthorityChannelHandler,
+) -> self::webrtc::AuthorityChannelHandler {
+    let lifecycle_gate = Arc::clone(&source.lifecycle_gate);
+    Arc::new(move |message| {
+        let live = lifecycle_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if *live {
+            inner(message);
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,24 +2078,59 @@ impl DisplaySession {
         // shutdown token) drains to a deterministic stop and any
         // late-arriving lane pushes become no-ops.
         self.input_queue.close();
-        self.backend.stop_capture().await;
-
-        if let Some(h) = self.capture_handle.lock().await.take() {
-            let _ = h.await;
-        }
-        if let Some(h) = self.clipboard_handle.lock().await.take() {
-            let _ = h.await;
-        }
         // Input pump: same deterministic-teardown parity as the other
-        // session-owned tasks. The std-mutex guard is dropped before the
-        // await (a held guard across `.await` would be the classic
-        // deadlock-on-poll hazard).
+        // session-owned tasks. Await it BEFORE stopping the capture backend:
+        // Wayland's portal session is also the input-injection transport, and
+        // safety key/button releases must still have a live backend. The
+        // std-mutex guard is dropped before the await (a held guard across
+        // `.await` would be the classic deadlock-on-poll hazard).
         let input_pump = self
             .input_pump_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(h) = input_pump {
+        let mut backend_stopped = false;
+        if let Some(mut h) = input_pump {
+            const INPUT_PUMP_STOP_TIMEOUT: Duration = if cfg!(test) {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(2)
+            };
+            if tokio::time::timeout(INPUT_PUMP_STOP_TIMEOUT, &mut h)
+                .await
+                .is_err()
+            {
+                // A platform injector can be waiting on the same portal or
+                // capture transport that stop_capture tears down. Do not let
+                // that in-flight call deadlock session shutdown forever: give
+                // normal safety releases a bounded head start, then close the
+                // backend to unblock it and bound the second wait too.
+                eprintln!(
+                    "[display/input] input pump did not stop within {:?}; stopping capture to unblock injection",
+                    INPUT_PUMP_STOP_TIMEOUT
+                );
+                self.backend.stop_capture().await;
+                backend_stopped = true;
+                if tokio::time::timeout(INPUT_PUMP_STOP_TIMEOUT, &mut h)
+                    .await
+                    .is_err()
+                {
+                    eprintln!(
+                        "[display/input] input pump remained stuck after backend stop; aborting it"
+                    );
+                    h.abort();
+                    let _ = h.await;
+                }
+            }
+        }
+        if !backend_stopped {
+            self.backend.stop_capture().await;
+        }
+
+        if let Some(h) = self.capture_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.clipboard_handle.lock().await.take() {
             let _ = h.await;
         }
         // 3c.3b.3c-followup: the pool-feed bridge observes
@@ -2142,8 +2448,10 @@ impl DisplaySession {
     /// clipboard monitoring, fires a peer-join keyframe + burst,
     /// and returns the SDP answer.
     #[allow(clippy::too_many_arguments)]
-    /// `input_authorized` is the per-peer gate the data-channel input
-    /// handler consults before forwarding events to [`DisplayBackend::inject_input`].
+    /// `interactive_authorized` is the per-peer gate the data-channel input
+    /// handler consults before forwarding events to [`DisplayBackend::inject_input`]
+    /// and before either direction of clipboard sync. A display-view grant is
+    /// intentionally insufficient for either host mutation.
     /// `display/mod.rs` deliberately does NOT know how authority is
     /// stored — the closure is the entire boundary. Phase 5a.1.
     ///
@@ -2161,7 +2469,7 @@ impl DisplaySession {
         tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
-        input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+        interactive_authorized: BrowserInputAuthorization,
         authority_handler: self::webrtc::AuthorityChannelHandler,
     ) -> Result<String, CallerError> {
         self.handle_offer_pool_mode(
@@ -2171,7 +2479,7 @@ impl DisplaySession {
             tcp_peer_registry,
             tcp_advertised_addr,
             ice_tx,
-            input_authorized,
+            interactive_authorized,
             authority_handler,
         )
         .await
@@ -2217,9 +2525,14 @@ impl DisplaySession {
         tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
-        input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+        interactive_authorized: BrowserInputAuthorization,
         authority_handler: self::webrtc::AuthorityChannelHandler,
     ) -> Result<String, CallerError> {
+        if self.shutdown.is_cancelled() {
+            return Err(CallerError::WebRtc(
+                "display session stopped before the offer could be accepted".to_string(),
+            ));
+        }
         let pool = self.pool.get().ok_or_else(|| {
             CallerError::WebRtc(
                 "pool-mode handle_offer: encoder pool not initialized — \
@@ -2261,14 +2574,52 @@ impl DisplaySession {
         // Input flows through the session's ordered queue (F1): the
         // handler gates then pushes; the pump injects in arrival order.
         self.ensure_input_pump();
-        let input_handler =
-            gated_input_handler(Arc::clone(&self.input_queue), input_authorized.clone());
+        // Session lifetime is part of interactive authority, not merely a
+        // peer-map bookkeeping detail. WebRtcPeer::new starts its driver
+        // before the peer can be inserted, so stop() racing construction
+        // must also make every input/clipboard callback fail closed during
+        // that short pre-registration window.
+        let shutdown_for_interactive = self.shutdown.clone();
+        let external_interactive_predicate = Arc::clone(&interactive_authorized.predicate);
+        let interactive_authorized = interactive_authorized.with_predicate(Arc::new(move || {
+            !shutdown_for_interactive.is_cancelled() && external_interactive_predicate()
+        }));
+        let peer_alive = Arc::new(AtomicBool::new(true));
+        let peer_lifecycle_gate = Arc::new(std::sync::RwLock::new(true));
+        let input_source = BrowserInputSource::new_with_liveness(
+            &self.input_queue,
+            interactive_authorized,
+            Arc::clone(&peer_alive),
+            Arc::clone(&peer_lifecycle_gate),
+        );
+        let interactive_authorization = input_source.authorization.clone();
+        let input_handler = gated_input_handler(Arc::clone(&input_source));
+        let shutdown_for_authority = self.shutdown.clone();
+        let authority_handler: self::webrtc::AuthorityChannelHandler = Arc::new(move |message| {
+            if !shutdown_for_authority.is_cancelled() {
+                authority_handler(message);
+            }
+        });
+        let authority_handler = lifecycle_gated_authority_handler(&input_source, authority_handler);
 
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
+        let clipboard_authorized = interactive_authorization.clone();
+        let clipboard_authorized_for_handler = interactive_authorization;
         let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
             Arc::new(move |content: clipboard::ClipboardContent| {
+                let Ok(admitted_revision) = clipboard_authorized_for_handler.admission_revision()
+                else {
+                    return;
+                };
                 let monitor = Arc::clone(&clipboard_monitor);
+                let still_authorized = clipboard_authorized_for_handler.clone();
                 tokio::spawn(async move {
+                    // The task may sit behind unrelated runtime work after the
+                    // data-channel callback returns. Re-check at the mutation
+                    // boundary so revocation/teardown in that window wins.
+                    if !still_authorized.remains_current(admitted_revision) {
+                        return;
+                    }
                     match content {
                         clipboard::ClipboardContent::Text(text) => {
                             if let Err(e) = monitor.set_text(&text).await {
@@ -2297,7 +2648,9 @@ impl DisplaySession {
             tcp_peer_registry,
             tcp_advertised_addr,
             input_handler,
+            Some(input_source),
             clipboard_handler,
+            clipboard_authorized,
             authority_handler,
             tile_control_handler,
             ice_tx,
@@ -2325,6 +2678,17 @@ impl DisplaySession {
         // for the federation-smoke-test backstory.
         let replaced = {
             let mut guard = self.peers.write().await;
+            // stop() cancels the token before taking this same write lock and
+            // draining the map. Re-check while holding the lock so an offer
+            // that finished construction after the drain cannot resurrect a
+            // live peer on an already-stopped display session.
+            if self.shutdown.is_cancelled() {
+                drop(guard);
+                peer.close().await;
+                return Err(CallerError::WebRtc(
+                    "display session stopped while the offer was being accepted".to_string(),
+                ));
+            }
             guard.insert(peer_id, Arc::clone(&peer))
         };
         match replaced {
@@ -3171,25 +3535,30 @@ impl DisplaySession {
         }
     }
 
-    /// Deregister the peer from the session maps when its driver tears
-    /// down. `remove_peer` only covers gateway-WS-signaled viewers (the
-    /// WS teardown path is its sole caller) — peers signaled over the
-    /// dashboard-control channel (hosted Connect) or torn down by ICE
-    /// failure had no deregistration path at all, leaving `peer_count`
-    /// and the presence policy's peer map stale, so the layer-pause idle
-    /// policy never engaged (observed live: `peers=1` forever on a cloud
-    /// box after its only viewer left). Identity-guarded (`Arc::ptr_eq`)
-    /// so a replaced peer's reaper cannot remove its successor under the
-    /// same id, and idempotent alongside `remove_peer`.
+    /// Deregister the peer from the session maps when its driver tears down or
+    /// the owning display session begins stopping.
+    /// Explicit gateway-WS, dashboard-control, and federated teardown paths
+    /// call `remove_peer`; this reaper is the independent backstop for a peer
+    /// whose driver or ICE transport closes first. Without it, `peer_count`
+    /// and the presence policy's peer map can stay stale, so the layer-pause
+    /// idle policy never engages (observed live: `peers=1` forever on a cloud
+    /// box after its only viewer left). Identity-guarded (`Arc::ptr_eq`) so a
+    /// replaced peer's reaper cannot remove its successor under the same id,
+    /// and idempotent alongside `remove_peer`.
     fn spawn_peer_reaper(&self, peer_id: PeerId, peer: &Arc<self::webrtc::WebRtcPeer>) {
         let peers = Arc::clone(&self.peers);
         let tile_subscribers = Arc::clone(&self.tile_subscribers);
         let counters = Arc::clone(&self.counters);
         let peer = Arc::clone(peer);
         let closed = peer.closed();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            closed.await;
-            reap_peer_registration(&peers, &tile_subscribers, &counters, peer_id, &peer).await;
+            tokio::select! {
+                _ = closed => {}
+                _ = shutdown.cancelled() => peer.close().await,
+            }
+            let _ =
+                reap_peer_registration(&peers, &tile_subscribers, &counters, peer_id, &peer).await;
         });
     }
 
@@ -3208,6 +3577,22 @@ impl DisplaySession {
         self.peers.read().await.get(&peer_id).cloned()
     }
 
+    /// Register a minimal test peer through the same replacement and gauge
+    /// semantics as a successful offer. This gives caller-bin cleanup tests a
+    /// real session peer to remove without constructing an SDP transport.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn register_test_peer_for_cleanup(&self, peer_id: PeerId) {
+        let peer = Arc::new(self::webrtc::WebRtcPeer::new_for_test(peer_id, Vec::new()));
+        let replaced = self.peers.write().await.insert(peer_id, Arc::clone(&peer));
+        match replaced {
+            Some(old) => old.close().await,
+            None => {
+                self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.spawn_peer_reaper(peer_id, &peer);
+    }
+
     /// Inject an input event into the display backend, awaiting its
     /// completion.
     ///
@@ -3221,21 +3606,68 @@ impl DisplaySession {
         self.backend.inject_input(event).await
     }
 
-    /// Enqueue a browser input event onto this session's ordered input
-    /// queue (fire-and-forget). Sync and non-blocking — callable from the
-    /// `rtc` data-channel receive path and the `/ws` read loop without
-    /// stalling them. A single pump task injects queued events strictly
-    /// in arrival order; see [`input_queue`] for the coalescing and
-    /// overflow policy. Injection failures are logged by the pump.
-    ///
-    /// Authority gating is the caller's job (each lane gates before
-    /// enqueue), matching the pre-queue convention.
-    ///
-    /// Must be called from within a tokio runtime (all input lanes are);
-    /// the first call spawns the pump.
-    pub fn enqueue_input(&self, event: InputEvent) {
+    /// Create one transport-bound producer for browser-originated input.
+    /// Callers cache the returned source for the lifetime of a WebRTC peer,
+    /// WebSocket, or dashboard-control worker; dropping it invalidates that
+    /// producer's buffered events and releases any unmatched submitted edge.
+    pub fn browser_input_source(
+        &self,
+        input_authorized: BrowserInputAuthorization,
+    ) -> Arc<BrowserInputSource> {
         self.ensure_input_pump();
-        self.input_queue.push(event);
+        BrowserInputSource::new(&self.input_queue, input_authorized)
+    }
+
+    /// Fail browser-originated input closed for this display session and wake
+    /// the pump to release any possibly-held keys/buttons. Direct agent
+    /// computer-use calls do not use this queue and are unaffected.
+    pub fn trip_browser_input(&self, reason: &str) {
+        self.input_queue.trip(reason);
+    }
+
+    /// Overload variant that trips only if its pump has a pessimistically
+    /// tracked down edge.
+    pub fn trip_browser_input_if_active(&self, reason: &str) {
+        self.input_queue.trip_if_active(reason);
+    }
+
+    /// Authority/transport-transition variant: release held edges and clear
+    /// stale backlog, then keep the display session usable by the next
+    /// authorized source. A passive viewer transition is a no-op.
+    pub fn reset_browser_input_if_active(&self, reason: &str) {
+        self.input_queue.reset_if_active(reason);
+    }
+
+    /// Invalidate every queued/popped browser event across an authority epoch
+    /// transition, even when no native edge is held yet. This prevents a stale
+    /// A event from resurrecting after an A -> B -> A holder sequence.
+    pub fn reset_browser_input(&self, reason: &str) {
+        self.input_queue.reset(reason);
+    }
+
+    /// Authority-observer variant that atomically advances the queue's
+    /// admitted authority revision while resetting. If input from this or a
+    /// newer revision already won the queue mutex, the reset is skipped so a
+    /// delayed observer cannot discard the new holder's backlog.
+    pub fn reset_browser_input_before_authority_revision(
+        &self,
+        authority_revision: u64,
+        reason: &str,
+    ) -> bool {
+        self.input_queue
+            .reset_before_authority_revision(authority_revision, reason)
+    }
+
+    /// Begin teardown synchronously. Registry lifecycle mutations call this
+    /// while holding their write guard, before an old session is removed or
+    /// replaced. Cancellation invalidates every WebRTC interactive predicate
+    /// (input-authority and clipboard included), while closing the ordered
+    /// queue rejects already-open raw/data-channel input immediately. The
+    /// async [`Self::stop`] method remains responsible for joining tasks and
+    /// closing peers/backend resources.
+    fn begin_stop(&self) {
+        self.shutdown.cancel();
+        self.input_queue.close();
     }
 
     /// Spawn the input pump exactly once. Sync (used from the sync
@@ -3284,6 +3716,11 @@ impl DisplaySession {
 pub struct SessionRegistry {
     sessions: HashMap<u32, Arc<DisplaySession>>,
     diagnostics_visual_marker_defaults: HashMap<u32, bool>,
+    /// Synchronous lifecycle boundary installed by the controller. It runs
+    /// while the registry write guard is still held and before an insert or
+    /// removal becomes visible, so transport-side authority tied to a reused
+    /// display ID can be invalidated atomically with the registry mutation.
+    lifecycle_observer: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 pub type SharedSessionRegistry = Arc<RwLock<SessionRegistry>>;
@@ -3299,6 +3736,25 @@ impl SessionRegistry {
         Self {
             sessions: HashMap::new(),
             diagnostics_visual_marker_defaults: HashMap::new(),
+            lifecycle_observer: None,
+        }
+    }
+
+    /// Install the controller's synchronous display-lifecycle observer.
+    /// Existing sessions are announced before the observer is stored so any
+    /// authority state created by a previous gateway epoch is invalidated too.
+    pub fn set_lifecycle_observer(&mut self, observer: Option<Arc<dyn Fn(u32) + Send + Sync>>) {
+        if let Some(observer) = observer.as_ref() {
+            for display_id in self.sessions.keys().copied() {
+                observer(display_id);
+            }
+        }
+        self.lifecycle_observer = observer;
+    }
+
+    fn notify_lifecycle_change(&self, display_id: u32) {
+        if let Some(observer) = self.lifecycle_observer.as_ref() {
+            observer(display_id);
         }
     }
 
@@ -3317,16 +3773,29 @@ impl SessionRegistry {
             .cloned()
     }
 
-    /// Unfiltered lookup for **user/dashboard surfaces only** (WebRTC
-    /// offers and input from the owner's dashboards, lifecycle teardown,
-    /// activation dedupe, explicit user-initiated recording). Returns
-    /// private user views too — never call this from a path whose output
-    /// reaches an agent.
+    /// Unfiltered lookup for authority-checked **owner/root dashboard** paths
+    /// (their WebRTC offers and input) and trusted lifecycle internals such as
+    /// teardown and activation dedupe. Returns private user views too — never
+    /// call this merely because a caller has generic dashboard/display access,
+    /// or from a path whose output reaches an agent or ordinary artifact
+    /// reader.
     pub fn get_any(&self, display_id: u32) -> Option<Arc<DisplaySession>> {
         self.sessions.get(&display_id).cloned()
     }
 
     pub fn insert(&mut self, display_id: u32, session: Arc<DisplaySession>) {
+        // Close a replaced session before advancing authority. WebRTC input
+        // sources retain their own Arc and do not consult this registry, so
+        // the queue itself is the synchronous lifecycle boundary.
+        if let Some(existing) = self.sessions.get(&display_id) {
+            if !Arc::ptr_eq(existing, &session) {
+                existing.begin_stop();
+            }
+        }
+        // Invalidate authority before publishing the new session. This is the
+        // security boundary for remove/recreate and replacement under the same
+        // stable display ID; an asynchronous DisplayReady observer is too late.
+        self.notify_lifecycle_change(display_id);
         if let Some(enabled) = self
             .diagnostics_visual_marker_defaults
             .get(&display_id)
@@ -3338,7 +3807,31 @@ impl SessionRegistry {
     }
 
     pub fn remove(&mut self, display_id: u32) -> Option<Arc<DisplaySession>> {
+        // Stop browser input before revoking authority: an unclaimed display
+        // is permissive, so a retained WebRTC source could otherwise observe
+        // the new revision and enqueue between the revision bump and the
+        // caller's asynchronous `DisplaySession::stop`.
+        if let Some(existing) = self.sessions.get(&display_id) {
+            existing.begin_stop();
+        }
+        // Revoke authority before the old session disappears. Notify even for
+        // an absent ID so a stale holder cannot survive a duplicate teardown.
+        self.notify_lifecycle_change(display_id);
         self.sessions.remove(&display_id)
+    }
+
+    /// Remove every session after synchronously invalidating its display-ID
+    /// authority epoch. Used by fail-closed recovery when lifecycle events are
+    /// lost; callers own stopping the returned sessions outside the lock.
+    pub fn drain(&mut self) -> Vec<Arc<DisplaySession>> {
+        let display_ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for session in self.sessions.values() {
+            session.begin_stop();
+        }
+        for display_id in display_ids {
+            self.notify_lifecycle_change(display_id);
+        }
+        self.sessions.drain().map(|(_, session)| session).collect()
     }
 
     /// Agent-visible display IDs — the fail-closed default enumeration
@@ -3352,8 +3845,9 @@ impl SessionRegistry {
     }
 
     /// All active display IDs including private user views — for
-    /// user/dashboard surfaces only (bootstrap replay, input-authority
-    /// snapshots, virtual-display id allocation).
+    /// authority-checked owner/root dashboard bootstrap and input-authority
+    /// snapshots, plus trusted lifecycle internals such as virtual-display id
+    /// allocation. Generic dashboard/display callers use [`Self::display_ids`].
     pub fn all_display_ids(&self) -> Vec<u32> {
         self.sessions.keys().copied().collect()
     }
@@ -3404,26 +3898,9 @@ impl SessionRegistry {
 /// from rtc's data-channel receive context (which is sync); the queue
 /// push is sync and non-blocking, so the rtc poll loop is never stalled.
 pub(crate) fn gated_input_handler(
-    queue: Arc<input_queue::InputQueue>,
-    input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+    source: Arc<BrowserInputSource>,
 ) -> Arc<dyn Fn(InputEvent) + Send + Sync> {
-    Arc::new(move |event: InputEvent| {
-        let kind = event.wire_tag();
-        // Phase 5a.1 authority gate: silent drop when the per-peer
-        // closure says no, matching the `/ws display_input` gate
-        // convention (no per-message denial feedback; the browser
-        // already learned it's not the holder via the
-        // `display_input_authority_state` notification).  Unclaimed
-        // and "this peer holds it" both resolve to `true` — see the
-        // closure builder in `web_gateway::spawn_web_gateway`.
-        // Gating happens BEFORE enqueue, so a refused event never
-        // enters the queue.
-        if !input_authorized() {
-            input_telemetry::record_authority_drop(kind);
-            return;
-        }
-        queue.push(event);
-    })
+    Arc::new(move |event: InputEvent| source.enqueue(event))
 }
 
 // ---------------------------------------------------------------------------
@@ -3594,6 +4071,31 @@ mod tests {
         counters.peer_count.store(0, Ordering::Relaxed);
         assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
         assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_peer_cleanup_registration_matches_real_peer_gauge_semantics() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        session.register_test_peer_for_cleanup(7).await;
+        assert!(session.get_peer(7).await.is_some());
+        assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 1);
+
+        session.register_test_peer_for_cleanup(7).await;
+        assert_eq!(
+            session.counters.peer_count.load(Ordering::Relaxed),
+            1,
+            "replacing a peer must not inflate the gauge"
+        );
+
+        session.remove_peer(7).await;
+        assert!(session.get_peer(7).await.is_none());
+        assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -4149,8 +4651,9 @@ mod tests {
             "agent-facing enumeration must exclude the private view"
         );
 
-        // Dashboard surfaces see everything.
-        assert!(reg.get_any(0).is_some(), "dashboard get_any sees the view");
+        // An authority-checked owner/root dashboard path can opt into the
+        // unfiltered accessors; generic dashboard paths cannot.
+        assert!(reg.get_any(0).is_some(), "owner/root get_any sees the view");
         let mut all = reg.all_display_ids();
         all.sort_unstable();
         assert_eq!(all, vec![0, 99]);
@@ -4164,6 +4667,94 @@ mod tests {
         let mut ids = reg.display_ids();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 99]);
+    }
+
+    #[test]
+    fn session_registry_lifecycle_observer_precedes_every_id_transition() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer_calls = Arc::clone(&calls);
+        let mut registry = SessionRegistry::new();
+        registry.set_lifecycle_observer(Some(Arc::new(move |display_id| {
+            observer_calls.lock().unwrap().push(display_id);
+        })));
+
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let first = Arc::new(DisplaySession::new(7, Arc::clone(&backend) as _));
+        registry.insert(7, first);
+        assert_eq!(&*calls.lock().unwrap(), &[7]);
+        assert!(registry.get_any(7).is_some());
+
+        // Replacement under the same stable ID is a fresh authority epoch.
+        let replacement = Arc::new(DisplaySession::new(7, Arc::clone(&backend) as _));
+        registry.insert(7, replacement);
+        assert_eq!(&*calls.lock().unwrap(), &[7, 7]);
+
+        assert!(registry.remove(7).is_some());
+        assert!(registry.remove(7).is_none());
+        assert_eq!(&*calls.lock().unwrap(), &[7, 7, 7, 7]);
+
+        registry.insert(
+            8,
+            Arc::new(DisplaySession::new(8, Arc::clone(&backend) as _)),
+        );
+        registry.insert(9, Arc::new(DisplaySession::new(9, backend as _)));
+        assert_eq!(registry.drain().len(), 2);
+        let mut drain_calls = calls.lock().unwrap()[6..].to_vec();
+        drain_calls.sort_unstable();
+        assert_eq!(drain_calls, vec![8, 9]);
+        assert!(registry.all_display_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_registry_closes_detached_browser_input_synchronously() {
+        let mut registry = SessionRegistry::new();
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+
+        let removed = Arc::new(DisplaySession::new(41, Arc::clone(&backend) as _));
+        let removed_source =
+            removed.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        registry.insert(41, Arc::clone(&removed));
+        assert!(!removed.input_queue.is_closed());
+        assert!(registry.remove(41).is_some());
+        assert!(removed.input_queue.is_closed());
+        assert!(removed.shutdown.is_cancelled());
+        removed_source.enqueue(InputEvent::KeyDown {
+            code: "KeyA".to_string(),
+            key: "a".to_string(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        });
+        assert_eq!(removed.input_queue.len(), 0);
+
+        let replaced = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
+        replaced.register_test_peer_for_cleanup(99).await;
+        assert_eq!(replaced.metrics().await.peer_count, 1);
+        registry.insert(42, Arc::clone(&replaced));
+        let replacement = Arc::new(DisplaySession::new(42, Arc::clone(&backend) as _));
+        registry.insert(42, replacement);
+        assert!(replaced.input_queue.is_closed());
+        assert!(replaced.shutdown.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while replaced.metrics().await.peer_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement shutdown must close and reap live media peers");
+
+        let drained = Arc::new(DisplaySession::new(43, backend as _));
+        registry.insert(43, Arc::clone(&drained));
+        registry.drain();
+        assert!(drained.input_queue.is_closed());
+        assert!(drained.shutdown.is_cancelled());
     }
 
     #[test]
@@ -5394,6 +5985,71 @@ mod tests {
         inject_count: Arc<std::sync::atomic::AtomicU64>,
     }
 
+    struct SourceRecordingBackend {
+        injected: mpsc::UnboundedSender<&'static str>,
+    }
+
+    struct StopUnblocksInputBackend {
+        inject_started: mpsc::UnboundedSender<()>,
+        stopped: AtomicBool,
+        stopped_notify: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl DisplayBackend for StopUnblocksInputBackend {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            self.stopped_notify.notify_waiters();
+        }
+        async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
+            let _ = self.inject_started.send(());
+            loop {
+                let notified = self.stopped_notify.notified();
+                if self.stopped.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                notified.await;
+            }
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "stop-unblocks-input"
+        }
+    }
+
+    #[async_trait]
+    impl DisplayBackend for SourceRecordingBackend {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+            let tag = match event {
+                InputEvent::KeyDown { .. } => "kd",
+                InputEvent::KeyUp { .. } => "ku",
+                InputEvent::MouseDown { .. } => "md",
+                InputEvent::MouseUp { .. } => "mu",
+                InputEvent::MouseMove { .. } => "mm",
+                InputEvent::Scroll { .. } => "sc",
+            };
+            let _ = self.injected.send(tag);
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "source-recording"
+        }
+    }
+
     #[async_trait]
     impl DisplayBackend for InjectCountingBackend {
         async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -5412,6 +6068,37 @@ mod tests {
         fn kind(&self) -> &'static str {
             "inject-counting"
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_session_refuses_offer_before_peer_construction() {
+        let backend: Arc<dyn DisplayBackend> = Arc::new(InjectCountingBackend {
+            width: 64,
+            height: 64,
+            inject_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let session = DisplaySession::new(7, backend);
+        session.stop().await;
+        let (ice_tx, _ice_rx) = mpsc::channel(1);
+
+        let error = session
+            .handle_offer(
+                99,
+                "v=0\r\n",
+                &IceConfig::default(),
+                None,
+                None,
+                ice_tx,
+                BrowserInputAuthorization::new(Arc::new(|| true)),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect_err("a stopped session must never build or register a new peer");
+        assert!(
+            error.to_string().contains("display session stopped"),
+            "unexpected rejection: {error}"
+        );
+        assert!(session.peers.read().await.is_empty());
     }
 
     /// Build the queue + pump rig the production offer path assembles
@@ -5434,7 +6121,11 @@ mod tests {
         let queue = Arc::new(input_queue::InputQueue::new());
         let shutdown = CancellationToken::new();
         let _pump = input_queue::spawn_input_pump(Arc::clone(&queue), backend, shutdown.clone());
-        let handler = super::gated_input_handler(Arc::clone(&queue), input_authorized);
+        let source = super::BrowserInputSource::new(
+            &queue,
+            super::BrowserInputAuthorization::new(input_authorized),
+        );
+        let handler = super::gated_input_handler(source);
         (handler, queue, shutdown)
     }
 
@@ -5447,6 +6138,124 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    #[test]
+    fn authority_handler_is_ordered_before_source_invalidation() {
+        let queue = Arc::new(input_queue::InputQueue::new());
+        let source =
+            BrowserInputSource::new(&queue, BrowserInputAuthorization::new(Arc::new(|| true)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let inner: webrtc::AuthorityChannelHandler = {
+            let calls = Arc::clone(&calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.wait();
+                    release.wait();
+                }
+            })
+        };
+        let handler = lifecycle_gated_authority_handler(&source, inner);
+        let handler_in_flight = Arc::clone(&handler);
+        let request_thread = std::thread::spawn(move || {
+            handler_in_flight(webrtc::AuthorityChannelMessage::Request { display_id: 0 });
+        });
+
+        // The callback is now running. Its lifecycle read guard must span the
+        // callback itself, not merely the pre-check, or close could release the
+        // holder and this request could re-grant it afterward.
+        entered.wait();
+        let write_was_blocked = matches!(
+            source.lifecycle_gate.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+
+        let (invalidate_started_tx, invalidate_started_rx) = std::sync::mpsc::channel();
+        let (invalidate_done_tx, invalidate_done_rx) = std::sync::mpsc::channel();
+        let source_for_close = Arc::clone(&source);
+        let invalidate_thread = std::thread::spawn(move || {
+            let _ = invalidate_started_tx.send(());
+            source_for_close.invalidate("lifecycle-gate concurrency test");
+            let _ = invalidate_done_tx.send(());
+        });
+        invalidate_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("invalidation thread started");
+        let invalidation_finished_while_handler_ran = invalidate_done_rx.try_recv().is_ok();
+
+        release.wait();
+        request_thread.join().expect("authority request thread");
+        invalidate_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("invalidation completes after handler releases its read gate");
+        invalidate_thread.join().expect("invalidation thread");
+
+        assert!(
+            write_was_blocked,
+            "source invalidation must wait for an in-flight authority mutation"
+        );
+        assert!(
+            !invalidation_finished_while_handler_ran,
+            "source invalidation completed while the authority callback still held the gate"
+        );
+        handler(webrtc::AuthorityChannelMessage::Request { display_id: 0 });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "authority dispatch after invalidation must be suppressed"
+        );
+    }
+
+    #[test]
+    fn source_enqueue_bookkeeping_is_ordered_before_invalidation() {
+        let queue = Arc::new(input_queue::InputQueue::new());
+        let source =
+            BrowserInputSource::new(&queue, BrowserInputAuthorization::new(Arc::new(|| true)));
+
+        // Freeze source bookkeeping after queue insertion. enqueue() must
+        // retain the lifecycle read gate while waiting for this mutex; the
+        // write side is invalidate()'s ordering boundary.
+        let held_guard = source
+            .held_edges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source_for_enqueue = Arc::clone(&source);
+        let enqueue_thread = std::thread::spawn(move || {
+            source_for_enqueue.enqueue(InputEvent::KeyDown {
+                code: "KeyA".to_string(),
+                key: "a".to_string(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while queue.len() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            queue.len(),
+            1,
+            "enqueue reached the queue insertion boundary"
+        );
+        assert!(
+            matches!(
+                source.lifecycle_gate.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "invalidation must not pass an enqueue whose held-edge bookkeeping is incomplete"
+        );
+
+        drop(held_guard);
+        enqueue_thread.join().expect("enqueue thread");
+        source.invalidate("enqueue/invalidate ordering regression test");
+        assert_eq!(queue.len(), 0, "invalidation clears the admitted down edge");
     }
 
     /// Closure returns `true` → events reach `inject_input`.  This is
@@ -5523,9 +6332,17 @@ mod tests {
         let allow_for_closure = Arc::clone(&allow);
         let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
             Arc::new(move || allow_for_closure.load(std::sync::atomic::Ordering::SeqCst));
-        let (handler, _queue, shutdown) = gated_handler_rig(&counter, input_authorized);
+        let (handler, queue, shutdown) = gated_handler_rig(&counter, input_authorized);
 
-        let key = |code: &str| InputEvent::KeyDown {
+        let key_down = |code: &str| InputEvent::KeyDown {
+            code: code.into(),
+            key: code.into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        };
+        let key_up = |code: &str| InputEvent::KeyUp {
             code: code.into(),
             key: code.into(),
             shift: false,
@@ -5534,19 +6351,121 @@ mod tests {
             meta: false,
         };
 
-        handler(key("KeyA"));
+        handler(key_down("KeyA"));
+        handler(key_up("KeyA"));
+        settle_pump().await;
         allow.store(false, std::sync::atomic::Ordering::SeqCst);
-        handler(key("KeyB"));
+        handler(key_down("KeyB"));
         allow.store(true, std::sync::atomic::Ordering::SeqCst);
-        handler(key("KeyC"));
+        handler(key_down("KeyC"));
+        handler(key_up("KeyC"));
 
         settle_pump().await;
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
-            2,
+            4,
             "gate must check authorization on every event, not at construction time"
         );
+        assert!(
+            !queue.is_tripped(),
+            "a source with no unmatched held edge must not trip the shared queue on denial"
+        );
         shutdown.cancel();
+    }
+
+    fn test_key_down() -> InputEvent {
+        InputEvent::KeyDown {
+            code: "KeyA".into(),
+            key: "a".into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        }
+    }
+
+    fn test_key_up() -> InputEvent {
+        InputEvent::KeyUp {
+            code: "KeyA".into(),
+            key: "a".into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn passive_source_drop_does_not_reset_an_active_source() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(input_queue::InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = input_queue::spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(SourceRecordingBackend { injected: tx }),
+            shutdown.clone(),
+        );
+        let active =
+            BrowserInputSource::new(&queue, BrowserInputAuthorization::new(Arc::new(|| true)));
+        let passive =
+            BrowserInputSource::new(&queue, BrowserInputAuthorization::new(Arc::new(|| false)));
+
+        active.enqueue(test_key_down());
+        assert_eq!(rx.recv().await, Some("kd"));
+        drop(passive);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err(),
+            "dropping a passive viewer must not synthesize another source's release"
+        );
+        active.enqueue(test_key_up());
+        assert_eq!(rx.recv().await, Some("ku"));
+        shutdown.cancel();
+        pump.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_source_invalidation_synthesizes_release_and_recovers() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = Arc::new(input_queue::InputQueue::new());
+        let shutdown = CancellationToken::new();
+        let pump = input_queue::spawn_input_pump(
+            Arc::clone(&queue),
+            Arc::new(SourceRecordingBackend { injected: tx }),
+            shutdown.clone(),
+        );
+        let source =
+            BrowserInputSource::new(&queue, BrowserInputAuthorization::new(Arc::new(|| true)));
+        source.enqueue(test_key_down());
+        assert_eq!(rx.recv().await, Some("kd"));
+        source.invalidate("unit-test transport close");
+        assert_eq!(rx.recv().await, Some("ku"));
+        assert!(!queue.is_tripped());
+        shutdown.cancel();
+        pump.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_uses_backend_teardown_to_unblock_a_stuck_input_pump() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(StopUnblocksInputBackend {
+            inject_started: started_tx,
+            stopped: AtomicBool::new(false),
+            stopped_notify: tokio::sync::Notify::new(),
+        });
+        let session = DisplaySession::new(0, backend);
+        let source =
+            session.browser_input_source(BrowserInputAuthorization::new(Arc::new(|| true)));
+        source.enqueue(test_key_down());
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("input injection must start")
+            .expect("started channel closed");
+
+        tokio::time::timeout(Duration::from_secs(1), session.stop())
+            .await
+            .expect("stop must tear down the backend instead of deadlocking on injection");
     }
 
     // -----------------------------------------------------------------------

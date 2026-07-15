@@ -120,7 +120,7 @@ async function main() {
     await waitFor(async () => (await fetch(`http://127.0.0.1:${CONNECT_PORT}/healthz`).catch(() => null))?.ok, START_TIMEOUT_MS, 'connect health');
     const claimCode = await waitFor(() => {
       const all = logs.connect.join('') + logs.daemon.join('');
-      const m = all.match(/claim_code=([^\s"'<>]+)/) || all.match(/claim this daemon with code ([^\s"'<>]+)/);
+      const m = all.match(/claim_code=([^\s"'<>]+)/) || all.match(/one-time claim code ([a-z0-9-]+)/i);
       return m && decodeURIComponent(m[1]);
     }, START_TIMEOUT_MS, 'claim code');
 
@@ -131,12 +131,12 @@ async function main() {
     await client.send('WebAuthn.addVirtualAuthenticator', { options: {
       protocol: 'ctap2', transport: 'internal', hasResidentKey: true,
       hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
-    await page.goto(`http://localhost:${CONNECT_PORT}/connect?claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
+    await page.goto(`http://localhost:${CONNECT_PORT}/connect#claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
     await page.evaluate(() => { document.getElementById('account').value = 'push-tester'; });
     await page.locator('#register').click();
     await page.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: 20000 });
     await page.locator('#claim').click();
-    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('claimed'), { timeout: START_TIMEOUT_MS });
+    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('No machine access was granted'), { timeout: START_TIMEOUT_MS });
 
     // Synthetic browser subscription: node holds the UA keys.
     const uaEcdh = crypto.createECDH('prime256v1');

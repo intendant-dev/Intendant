@@ -454,51 +454,72 @@ pub(crate) async fn api_daemon_revoke(
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "daemon_revoke", 30, 60_000).await?;
     let daemon_id = daemon_id.trim().to_string();
-    ensure_owned_daemon(&state, user.id, &daemon_id).await?;
+    let route_link_revision = {
+        let store = state.store.lock().await;
+        let daemon = store
+            .daemons
+            .iter()
+            .find(|daemon| daemon.daemon_id == daemon_id)
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+        if daemon.owner_user_id != Some(user.id) {
+            return Err(ApiError::forbidden("daemon belongs to a different account"));
+        }
+        daemon.route_link_revision
+    };
     let active_session_ids = active_dashboard_session_ids(&state, &daemon_id).await;
     let closed_sessions = active_session_ids.len();
     let mut store = state.store.lock().await;
-    let daemon_index = store
-        .daemons
-        .iter()
-        .position(|d| d.daemon_id == daemon_id)
-        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
-    if store.daemons[daemon_index].owner_user_id != Some(user.id) {
-        return Err(ApiError::forbidden("daemon belongs to a different account"));
-    }
-    let daemon = &mut store.daemons[daemon_index];
-    daemon.owner_user_id = None;
-    daemon.claim_code_hash = None;
-    daemon.claim_code_created_unix_ms = None;
-    daemon.updated_unix_ms = now_unix_ms();
-    let revoked_daemon_public_key = daemon.daemon_public_key.clone();
-    store.fleet_targets.retain(|target| {
-        !(target.user_id == user.id
-            && (target.host_id == daemon_id
-                || target.id == daemon_id
-                || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
-    });
-    // Binding removals belong in the transparency log just like the
-    // claims that created them — otherwise re-claim history is ambiguous.
-    append_log_entry(
+    update_store_transaction(
         &mut store,
-        "daemon_unclaimed",
-        json!({
-            "daemon_id": daemon_id,
-            "daemon_public_key": revoked_daemon_public_key,
-            "handle": user.account_name.clone(),
-            "initiated_by": "account",
-        }),
-    );
-    audit(
-        &mut store,
-        "daemon_revoked",
-        Some(user.id),
-        Some(daemon_id.clone()),
-        json!({ "closed_sessions": closed_sessions }),
-    );
-    persist_locked(&state, &store)?;
-    state.claim_codes.lock().await.remove(&daemon_id);
+        |next| {
+            let daemon_index = next
+                .daemons
+                .iter()
+                .position(|d| d.daemon_id == daemon_id)
+                .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+            if next.daemons[daemon_index].owner_user_id != Some(user.id)
+                || next.daemons[daemon_index].route_link_revision != route_link_revision
+            {
+                return Err(ApiError::conflict(
+                    "daemon route link changed while release was being processed",
+                ));
+            }
+            let daemon = &mut next.daemons[daemon_index];
+            daemon.owner_user_id = None;
+            daemon.claim_code_hash = None;
+            daemon.claim_code_created_unix_ms = None;
+            daemon.route_link_revision = daemon.route_link_revision.saturating_add(1);
+            daemon.updated_unix_ms = now_unix_ms();
+            let revoked_daemon_public_key = daemon.daemon_public_key.clone();
+            next.fleet_targets.retain(|target| {
+                !(target.user_id == user.id
+                    && (target.host_id == daemon_id
+                        || target.id == daemon_id
+                        || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
+            });
+            // Binding removals belong in the transparency log just like the
+            // claims that created them — otherwise re-claim history is ambiguous.
+            append_log_entry(
+                next,
+                "daemon_unclaimed",
+                json!({
+                    "daemon_id": daemon_id,
+                    "daemon_public_key": revoked_daemon_public_key,
+                    "handle": user.account_name.clone(),
+                    "initiated_by": "account",
+                }),
+            );
+            audit(
+                next,
+                "daemon_revoked",
+                Some(user.id),
+                Some(daemon_id.clone()),
+                json!({ "closed_sessions": closed_sessions }),
+            );
+            Ok(())
+        },
+        |next| persist_locked(&state, next),
+    )?;
     drop(store);
     close_active_dashboard_sessions(&state, &daemon_id, active_session_ids).await;
     log_json(
@@ -911,8 +932,10 @@ mod tests {
                 daemon_public_key: "daemon-key".to_string(),
                 owner_user_id: Some(user_id),
                 claim_code_hash: None,
-                claim_code_daemon_minted: false,
                 claim_code_created_unix_ms: None,
+                last_registration_proof_unix_ms: None,
+                route_link_revision: 0,
+                last_unclaim_proof_unix_ms: None,
                 registered_unix_ms: 10,
                 last_seen_unix_ms: now_unix_ms(),
                 updated_unix_ms: 20,
@@ -1032,7 +1055,6 @@ mod tests {
             listen: SocketAddr::from(([127, 0, 0, 1], 9876)),
             public_origin: "https://intendant.dev".to_string(),
             rp_id: "intendant.dev".to_string(),
-            static_root: PathBuf::from("static"),
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
             release_token: None,
@@ -1058,6 +1080,36 @@ mod tests {
             live.get("source").and_then(|v| v.as_str()),
             Some("connect_daemon")
         );
+        assert_eq!(
+            live.get("access_domain").and_then(|v| v.as_str()),
+            Some("route_metadata")
+        );
+        assert_eq!(
+            live.get("access_domain_label").and_then(|v| v.as_str()),
+            Some("Route metadata only")
+        );
+        assert_eq!(live.get("auth").and_then(|v| v.as_str()), Some("none"));
+        assert_eq!(
+            live.get("auth_label").and_then(|v| v.as_str()),
+            Some("No daemon authentication")
+        );
+        assert_eq!(
+            live.get("effective_role").and_then(|v| v.as_str()),
+            Some("none")
+        );
+        assert_eq!(live.get("url").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            live.get("effective_role").and_then(|v| v.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            live.get("effective_role_label").and_then(|v| v.as_str()),
+            Some("No access")
+        );
+        assert!(live
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .is_some_and(Vec::is_empty));
         let manual = targets
             .iter()
             .find(|target| target.get("host_id").and_then(|v| v.as_str()) == Some("manual"))

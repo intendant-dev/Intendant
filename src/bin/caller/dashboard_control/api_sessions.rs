@@ -2298,7 +2298,7 @@ mod tests {
     //  2. Header tails stay HTTP-lane decoration: the current/* family
     //     and upload POST/list/raw ride the wildcard-CORS tail,
     //     managed-context and the upload delete the canonical tail,
-    //     raw fetches the inline Content-Disposition; the tunnel
+    //     raw fetches an attachment Content-Disposition plus nosniff; the tunnel
     //     renders none of them.
     //  3. Transport-owned upload carriage: HTTP streams the raw POST
     //     body (100-continue, spool, its own 413/400 wordings); the

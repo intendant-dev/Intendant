@@ -31,19 +31,25 @@ impl From<Color> for [f32; 4] {
     }
 }
 
-pub(crate) const C_TEXT: Color = Color::rgb(205, 214, 244);
-pub(crate) const C_SUBTEXT0: Color = Color::rgb(166, 173, 200);
-pub(crate) const C_SURFACE0: Color = Color::rgb(49, 50, 68);
-pub(crate) const C_OVERLAY1: Color = Color::rgb(127, 132, 156);
-pub(crate) const C_BLUE: Color = Color::rgb(137, 180, 250);
-pub(crate) const C_LAVENDER: Color = Color::rgb(180, 190, 254);
-pub(crate) const C_SAPPHIRE: Color = Color::rgb(116, 199, 236);
-pub(crate) const C_TEAL: Color = Color::rgb(148, 226, 213);
-pub(crate) const C_GREEN: Color = Color::rgb(166, 227, 161);
-pub(crate) const C_YELLOW: Color = Color::rgb(249, 226, 175);
-pub(crate) const C_PEACH: Color = Color::rgb(250, 179, 135);
-pub(crate) const C_RED: Color = Color::rgb(243, 139, 168);
-pub(crate) const C_MAUVE: Color = Color::rgb(203, 166, 247);
+// The Iris design-system palette — the ui-v2 dark-theme values from
+// static/app/16-styles-v2-tokens.css. The Station scene is dark by design
+// even under the light app theme (ui2-station.css pins its chrome the same
+// way), so the canvas carries the dark block only. The Catppuccin-era
+// vocabulary collapsed along the tokens file's alias layer: blue+sapphire
+// land on iris, yellow+peach on amber, mauve on violet, lavender on
+// iris-2, teal on sky, red on rose, and the text/subtext/overlay ladder
+// becomes text/text-2/text-3.
+pub(crate) const C_TEXT: Color = Color::rgb(234, 236, 242); // --text
+pub(crate) const C_TEXT2: Color = Color::rgb(167, 174, 190); // --text-2
+pub(crate) const C_SURFACE2: Color = Color::rgb(26, 30, 40); // --surface-2
+pub(crate) const C_TEXT3: Color = Color::rgb(126, 136, 150); // --text-3
+pub(crate) const C_IRIS: Color = Color::rgb(126, 140, 250); // --iris
+pub(crate) const C_IRIS2: Color = Color::rgb(166, 174, 255); // --iris-2
+pub(crate) const C_SKY: Color = Color::rgb(93, 169, 230); // --sky
+pub(crate) const C_GREEN: Color = Color::rgb(88, 192, 140); // --green
+pub(crate) const C_AMBER: Color = Color::rgb(228, 168, 91); // --amber
+pub(crate) const C_ROSE: Color = Color::rgb(236, 106, 133); // --rose
+pub(crate) const C_VIOLET: Color = Color::rgb(155, 124, 242); // --violet
 
 /// Parse a `#rrggbb` CSS color into a scene `Color` (alpha 1.0), so
 /// world-pane consumers reuse the CSS palette the focus content carries
@@ -59,59 +65,64 @@ pub(crate) fn css_color(css: &str) -> Color {
     C_TEXT
 }
 
-pub(crate) const C_TEXT_CSS: &str = "#cdd6f4";
-pub(crate) const C_SUBTEXT0_CSS: &str = "#a6adc8";
-pub(crate) const C_OVERLAY1_CSS: &str = "#7f849c";
-pub(crate) const C_BLUE_CSS: &str = "#89b4fa";
-pub(crate) const C_LAVENDER_CSS: &str = "#b4befe";
-pub(crate) const C_TEAL_CSS: &str = "#94e2d5";
-pub(crate) const C_GREEN_CSS: &str = "#a6e3a1";
-pub(crate) const C_YELLOW_CSS: &str = "#f9e2af";
-pub(crate) const C_PEACH_CSS: &str = "#fab387";
-pub(crate) const C_RED_CSS: &str = "#f38ba8";
-pub(crate) const C_MAUVE_CSS: &str = "#cba6f7";
+pub(crate) const C_TEXT_CSS: &str = "#eaecf2";
+pub(crate) const C_TEXT2_CSS: &str = "#a7aebe";
+pub(crate) const C_TEXT3_CSS: &str = "#7e8896";
+pub(crate) const C_IRIS_CSS: &str = "#7e8cfa";
+pub(crate) const C_IRIS2_CSS: &str = "#a6aeff";
+pub(crate) const C_SKY_CSS: &str = "#5da9e6";
+pub(crate) const C_GREEN_CSS: &str = "#58c08c";
+pub(crate) const C_AMBER_CSS: &str = "#e4a85b";
+pub(crate) const C_ROSE_CSS: &str = "#ec6a85";
+pub(crate) const C_VIOLET_CSS: &str = "#9b7cf2";
 
 pub(crate) fn role_color(role: &str) -> Color {
     match role {
-        "orchestrator" => C_BLUE,
-        "sub-agent" => C_MAUVE,
-        "direct" => C_TEAL,
-        "session" => C_SAPPHIRE,
-        "external" => C_PEACH,
-        _ => C_TEAL,
+        "orchestrator" => C_IRIS,
+        // Same hue as the "subagent" relationship below: a sub-agent node
+        // and the edge that owns it must read as one thing, and the v2
+        // Activity grid already fixed that hue at green (ui2-grid.css).
+        "sub-agent" => C_GREEN,
+        "direct" => C_SKY,
+        "session" => C_IRIS,
+        "external" => C_AMBER,
+        _ => C_SKY,
     }
 }
 
 /// Edge tint for a parent/child session relationship. Falls back to the
 /// child's role color for unknown/absent kinds so pre-Phase-B nodes keep
-/// their look.
+/// their look. The kind hues are pinned to the v2 Activity grid's
+/// relationship vocabulary (ui2-grid.css: fork=iris, subagent=green,
+/// side=violet) so the canvas and the DOM grid tell the same story;
+/// fission branches stay in the fork family as the brighter iris-2.
 pub(crate) fn relationship_color(kind: &str, role: &str) -> Color {
     match kind {
-        "subagent" => C_MAUVE,
-        "fork" => C_PEACH,
-        "side" => C_TEAL,
-        "fission-branch" => C_LAVENDER,
+        "subagent" => C_GREEN,
+        "fork" => C_IRIS,
+        "side" => C_VIOLET,
+        "fission-branch" => C_IRIS2,
         _ => role_color(role),
     }
 }
 
 pub(crate) fn phase_color(phase: &str) -> Color {
     match phase {
-        "thinking" => C_LAVENDER,
-        "running" => C_TEAL,
-        "waiting" => C_YELLOW,
+        "thinking" => C_IRIS2,
+        "running" => C_SKY,
+        "waiting" => C_AMBER,
         "done" => C_GREEN,
-        _ => C_OVERLAY1,
+        _ => C_TEXT3,
     }
 }
 
 pub(crate) fn phase_color_css(phase: &str) -> &'static str {
     match phase {
-        "thinking" => C_LAVENDER_CSS,
-        "running" => C_TEAL_CSS,
-        "waiting" => C_YELLOW_CSS,
+        "thinking" => C_IRIS2_CSS,
+        "running" => C_SKY_CSS,
+        "waiting" => C_AMBER_CSS,
         "done" => C_GREEN_CSS,
-        _ => C_OVERLAY1_CSS,
+        _ => C_TEXT3_CSS,
     }
 }
 
@@ -120,42 +131,44 @@ pub(crate) fn phase_color_css(phase: &str) -> &'static str {
 pub(crate) fn goal_status_color(status: &str) -> Color {
     match status {
         "active" => C_GREEN,
-        "paused" | "budgetLimited" | "budget-limited" => C_YELLOW,
-        "completed" | "complete" => C_BLUE,
-        _ => C_LAVENDER,
+        "paused" | "budgetLimited" | "budget-limited" => C_AMBER,
+        "completed" | "complete" => C_IRIS,
+        _ => C_IRIS2,
     }
 }
 
 pub(crate) fn goal_status_color_css(status: &str) -> &'static str {
     match status {
         "active" => C_GREEN_CSS,
-        "paused" | "budgetLimited" | "budget-limited" => C_YELLOW_CSS,
-        "completed" | "complete" => C_BLUE_CSS,
-        _ => C_LAVENDER_CSS,
+        "paused" | "budgetLimited" | "budget-limited" => C_AMBER_CSS,
+        "completed" | "complete" => C_IRIS_CSS,
+        _ => C_IRIS2_CSS,
     }
 }
 
 pub(crate) fn level_color(level: &str) -> Color {
     match level {
-        "error" => C_RED,
-        "warn" => C_YELLOW,
-        "model" => C_BLUE,
-        "agent" => C_TEAL,
-        "subagent" => C_MAUVE,
+        "error" => C_ROSE,
+        "warn" => C_AMBER,
+        "model" => C_IRIS,
+        "agent" => C_SKY,
+        // Violet, not the relationship green: presence already owns green
+        // in this log-lane set, and a lane tint is not a relationship badge.
+        "subagent" => C_VIOLET,
         "presence" => C_GREEN,
-        _ => C_OVERLAY1,
+        _ => C_TEXT3,
     }
 }
 
 pub(crate) fn level_color_css(level: &str) -> &'static str {
     match level {
-        "error" => C_RED_CSS,
-        "warn" => C_YELLOW_CSS,
-        "model" => C_BLUE_CSS,
-        "agent" => C_TEAL_CSS,
-        "subagent" => C_MAUVE_CSS,
+        "error" => C_ROSE_CSS,
+        "warn" => C_AMBER_CSS,
+        "model" => C_IRIS_CSS,
+        "agent" => C_SKY_CSS,
+        "subagent" => C_VIOLET_CSS,
         "presence" => C_GREEN_CSS,
-        _ => C_OVERLAY1_CSS,
+        _ => C_TEXT3_CSS,
     }
 }
 
@@ -164,24 +177,24 @@ pub(crate) fn level_color_css(level: &str) -> &'static str {
 pub(crate) fn tone_color_css(tone: &str) -> &'static str {
     match tone {
         "ok" => C_GREEN_CSS,
-        "red" => C_RED_CSS,
-        "warning" => C_YELLOW_CSS,
-        "context" => C_BLUE_CSS,
-        "managed" => C_MAUVE_CSS,
-        "peer" => C_PEACH_CSS,
-        "session" => C_TEAL_CSS,
-        "changes" => C_BLUE_CSS,
-        _ => C_OVERLAY1_CSS,
+        "red" => C_ROSE_CSS,
+        "warning" => C_AMBER_CSS,
+        "context" => C_IRIS_CSS,
+        "managed" => C_VIOLET_CSS,
+        "peer" => C_AMBER_CSS,
+        "session" => C_SKY_CSS,
+        "changes" => C_IRIS_CSS,
+        _ => C_TEXT3_CSS,
     }
 }
 
 /// Attention-item level to its alert color (`blocked` is the hard stop).
 pub(crate) fn attention_level_color_css(level: &str) -> &'static str {
     match level {
-        "blocked" => C_RED_CSS,
-        "warn" => C_YELLOW_CSS,
+        "blocked" => C_ROSE_CSS,
+        "warn" => C_AMBER_CSS,
         "ready" => C_GREEN_CSS,
-        _ => C_OVERLAY1_CSS,
+        _ => C_TEXT3_CSS,
     }
 }
 
@@ -230,11 +243,11 @@ pub(crate) fn nonempty(value: &str, fallback: &str) -> String {
 
 pub(crate) fn pressure_color(pct: f32) -> &'static str {
     if pct >= 0.9 {
-        C_RED_CSS
+        C_ROSE_CSS
     } else if pct >= 0.72 {
-        C_YELLOW_CSS
+        C_AMBER_CSS
     } else if pct >= 0.5 {
-        C_BLUE_CSS
+        C_IRIS_CSS
     } else {
         C_GREEN_CSS
     }
@@ -348,8 +361,8 @@ mod tests {
     fn css_color_round_trips_the_palette_and_falls_back() {
         for (css, color) in [
             (C_TEXT_CSS, C_TEXT),
-            (C_RED_CSS, C_RED),
-            (C_BLUE_CSS, C_BLUE),
+            (C_ROSE_CSS, C_ROSE),
+            (C_IRIS_CSS, C_IRIS),
         ] {
             let parsed = css_color(css);
             assert!((parsed.r - color.r).abs() < 1e-6, "{css} r");
@@ -410,9 +423,9 @@ mod tests {
     #[test]
     fn pressure_color_thresholds() {
         assert_eq!(pressure_color(0.1), C_GREEN_CSS);
-        assert_eq!(pressure_color(0.5), C_BLUE_CSS);
-        assert_eq!(pressure_color(0.72), C_YELLOW_CSS);
-        assert_eq!(pressure_color(0.9), C_RED_CSS);
+        assert_eq!(pressure_color(0.5), C_IRIS_CSS);
+        assert_eq!(pressure_color(0.72), C_AMBER_CSS);
+        assert_eq!(pressure_color(0.9), C_ROSE_CSS);
     }
 
     #[test]
@@ -440,38 +453,38 @@ mod tests {
 
     #[test]
     fn hex_color_parses_palette_and_rejects_garbage() {
-        let blue = hex_color(C_BLUE_CSS).expect("palette constant parses");
-        let reference: [f32; 4] = C_BLUE.into();
-        let parsed: [f32; 4] = blue.into();
+        let iris = hex_color(C_IRIS_CSS).expect("palette constant parses");
+        let reference: [f32; 4] = C_IRIS.into();
+        let parsed: [f32; 4] = iris.into();
         assert_eq!(parsed, reference);
         assert!(hex_color("#fff").is_none());
-        assert!(hex_color("89b4fa").is_none());
-        assert!(hex_color("#89b4fg").is_none());
+        assert!(hex_color("7e8cfa").is_none());
+        assert!(hex_color("#7e8cfg").is_none());
         assert!(hex_color("").is_none());
     }
 
     #[test]
     fn color_with_alpha_keeps_rgb() {
-        let c = C_BLUE.with_alpha(0.5);
+        let c = C_IRIS.with_alpha(0.5);
         let arr: [f32; 4] = c.into();
         assert_eq!(arr[3], 0.5);
-        assert_eq!(arr[0], C_BLUE.r);
+        assert_eq!(arr[0], C_IRIS.r);
     }
 
     #[test]
     fn semantic_color_maps_cover_known_keys() {
-        assert_eq!(level_color_css("error"), C_RED_CSS);
-        assert_eq!(level_color_css("warn"), C_YELLOW_CSS);
-        assert_eq!(level_color_css("unknown"), C_OVERLAY1_CSS);
+        assert_eq!(level_color_css("error"), C_ROSE_CSS);
+        assert_eq!(level_color_css("warn"), C_AMBER_CSS);
+        assert_eq!(level_color_css("unknown"), C_TEXT3_CSS);
         let err: [f32; 4] = level_color("error").into();
-        let red: [f32; 4] = C_RED.into();
-        assert_eq!(err, red);
+        let rose: [f32; 4] = C_ROSE.into();
+        assert_eq!(err, rose);
         let orch: [f32; 4] = role_color("orchestrator").into();
-        let blue: [f32; 4] = C_BLUE.into();
-        assert_eq!(orch, blue);
+        let iris: [f32; 4] = C_IRIS.into();
+        assert_eq!(orch, iris);
         let think: [f32; 4] = phase_color("thinking").into();
-        let lavender: [f32; 4] = C_LAVENDER.into();
-        assert_eq!(think, lavender);
+        let iris2: [f32; 4] = C_IRIS2.into();
+        assert_eq!(think, iris2);
     }
 
     #[test]
@@ -503,19 +516,35 @@ mod tests {
 
     #[test]
     fn relationship_colors_key_edge_kinds_and_fall_back_to_role() {
-        let sub: [f32; 4] = relationship_color("subagent", "session").into();
-        let mauve: [f32; 4] = C_MAUVE.into();
-        assert_eq!(sub, mauve);
-        let fork: [f32; 4] = relationship_color("fork", "session").into();
-        let peach: [f32; 4] = C_PEACH.into();
-        assert_eq!(fork, peach);
+        // The kind hues are a cross-surface contract: the v2 Activity
+        // grid colors relationship chips/wires fork=iris, subagent=green,
+        // side=violet (ui2-grid.css), and the canvas must tell the same
+        // story. The literal hexes pin the ui2 token values so a palette
+        // edit that drifts from the DOM grid fails here instead of
+        // shipping two vocabularies.
+        for (kind, css) in [
+            ("fork", "#7e8cfa"),
+            ("subagent", "#58c08c"),
+            ("side", "#9b7cf2"),
+        ] {
+            let edge: [f32; 4] = relationship_color(kind, "session").into();
+            let pinned: [f32; 4] = hex_color(css).expect("pinned grid hue parses").into();
+            assert_eq!(edge, pinned, "grid-contract hue for {kind:?}");
+        }
+        // Fission branches stay in the fork family as the brighter iris-2.
+        let fission: [f32; 4] = relationship_color("fission-branch", "session").into();
+        let iris2: [f32; 4] = C_IRIS2.into();
+        assert_eq!(fission, iris2);
+        // A sub-agent node matches its edge: same green, one vocabulary.
+        let sub_role: [f32; 4] = role_color("sub-agent").into();
+        let green: [f32; 4] = C_GREEN.into();
+        assert_eq!(sub_role, green);
         // Unknown kinds keep the node's role color, so pre-Phase-B nodes
         // (which never set a kind) render exactly as before.
         let unknown: [f32; 4] = relationship_color("", "orchestrator").into();
-        let blue: [f32; 4] = C_BLUE.into();
-        assert_eq!(unknown, blue);
+        let iris: [f32; 4] = C_IRIS.into();
+        assert_eq!(unknown, iris);
         let session: [f32; 4] = role_color("session").into();
-        let sapphire: [f32; 4] = C_SAPPHIRE.into();
-        assert_eq!(session, sapphire);
+        assert_eq!(session, iris);
     }
 }

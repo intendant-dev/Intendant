@@ -499,7 +499,7 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
 /// 3. **Browser pages**: requests carrying browser origin markers must come
 ///    from this daemon's own origin (or the app bundle scheme) and then
 ///    bind exactly like any dashboard HTTP request (mTLS certificate
-///    principal or trusted-transport root). Foreign origins are refused —
+///    principal or trusted-local root). Foreign origins are refused —
 ///    the same posture as the rest of `/api/*`.
 /// 4. **mTLS client certificates** bind to their IAM principal.
 /// 5. **Tokenless loopback** processes bind to the `local_process`

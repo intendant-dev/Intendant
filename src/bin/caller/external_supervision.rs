@@ -738,11 +738,22 @@ pub(crate) async fn create_external_agent(
                 writable_roots: cfg.writable_roots.clone(),
                 managed_context: codex_managed_context,
             };
+            let effective_command = cfg.effective_command(codex_managed_context);
+            let protocol_watch = external_agent::protocol_watch::ProtocolWatchHandle::new_in(
+                crate::platform::intendant_home(),
+                AgentBackend::Codex,
+                if codex_managed_context {
+                    "managed"
+                } else {
+                    "vanilla"
+                },
+                &effective_command,
+            );
             // Managed sessions spawn the Intendant-aware fork when one is
             // configured (`codex.managed_command`); vanilla sessions and
             // legacy configs use `codex.command`.
             let agent = Box::new(external_agent::codex::CodexAgent::with_options(
-                cfg.effective_command(codex_managed_context),
+                effective_command,
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 sandbox_mode.clone(),
@@ -770,11 +781,18 @@ pub(crate) async fn create_external_agent(
                 resume_session: resume_session.clone(),
                 fork_resume,
                 codex_home,
+                protocol_watch,
             };
             (agent, config)
         }
         AgentBackend::ClaudeCode => {
             let cfg = &project.config.agent.claude_code;
+            let protocol_watch = external_agent::protocol_watch::ProtocolWatchHandle::new_in(
+                crate::platform::intendant_home(),
+                AgentBackend::ClaudeCode,
+                "default",
+                &cfg.command,
+            );
             let agent = Box::new(
                 external_agent::claude_code::ClaudeCodeAgent::new(
                     cfg.command.clone(),
@@ -806,6 +824,7 @@ pub(crate) async fn create_external_agent(
                 resume_session: resume_session.clone(),
                 fork_resume,
                 codex_home: None,
+                protocol_watch,
             };
             (agent, config)
         }
@@ -964,7 +983,6 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
 
     #[test]
     fn buffered_idle_agent_event_preempts_and_disables_on_disconnect() {

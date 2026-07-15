@@ -51,6 +51,13 @@ pub struct WorktreeScanRoot {
     pub repo_count: usize,
     pub truncated: bool,
     pub error: Option<String>,
+    /// Free/total capacity of the volume holding this root (existing roots
+    /// only) — the "can I still write here?" signal next to the worktree
+    /// sizes. `None` when the root is missing or the volume query fails.
+    #[serde(default)]
+    pub volume_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -64,6 +71,14 @@ pub struct WorktreeSummary {
     pub stale: usize,
     pub cleanup_candidates: usize,
     pub truncated_sizes: usize,
+    /// The tightest volume hosting the scanned worktrees: free/total of
+    /// whichever such volume has the least free space (what a full disk
+    /// hits first). Worktrees usually share one volume, in which case this
+    /// is simply that volume's capacity.
+    #[serde(default)]
+    pub volume_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +612,40 @@ fn scan_worktrees_with_size_budget(
         repos: repo_count,
         ..WorktreeSummary::default()
     };
+    // Headline capacity = the tightest volume actually hosting scanned
+    // worktrees. (A roots-based figure would let a session-cwd scan root on
+    // an unrelated, nearly-full mount skew the headline red.) Volumes are
+    // deduped by device id where Metadata exposes one, else by path prefix
+    // (Windows drive letters), so the query runs once per volume, not per
+    // worktree.
+    let mut seen_volumes: HashSet<String> = HashSet::new();
+    for wt in &worktrees {
+        let volume_key = std::fs::symlink_metadata(&wt.path)
+            .ok()
+            .map(|meta| crate::platform::metadata_dev_ino(&meta).0)
+            .filter(|dev| *dev != 0)
+            .map(|dev| format!("dev:{dev}"))
+            .unwrap_or_else(|| {
+                wt.path
+                    .components()
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| wt.path.to_string_lossy().into_owned())
+            });
+        if !seen_volumes.insert(volume_key) {
+            continue;
+        }
+        let Some(volume) = crate::platform::volume_space(&wt.path) else {
+            continue;
+        };
+        if summary
+            .volume_free_bytes
+            .is_none_or(|current| volume.free_bytes < current)
+        {
+            summary.volume_free_bytes = Some(volume.free_bytes);
+            summary.volume_total_bytes = Some(volume.total_bytes);
+        }
+    }
     for wt in &worktrees {
         summary.total_bytes = summary.total_bytes.saturating_add(wt.size_bytes);
         if wt.dirty {
@@ -745,6 +794,11 @@ fn default_scan_roots(
             return;
         }
         let exists = path.exists();
+        let volume = if exists {
+            crate::platform::volume_space(&path)
+        } else {
+            None
+        };
         roots.push(WorktreeScanRoot {
             path,
             kind: kind.to_string(),
@@ -752,6 +806,8 @@ fn default_scan_roots(
             repo_count: 0,
             truncated: false,
             error: None,
+            volume_free_bytes: volume.map(|v| v.free_bytes),
+            volume_total_bytes: volume.map(|v| v.total_bytes),
         });
     };
 
@@ -1787,6 +1843,49 @@ mod tests {
         assert!(!found.dirty);
         assert!(found.safe_to_remove);
         assert!(found.labels.iter().any(|l| l == "cleanup-candidate"));
+    }
+
+    #[test]
+    fn scan_reports_volume_capacity_for_existing_roots() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+
+        let project_root = scan
+            .roots
+            .iter()
+            .find(|root| root.kind == "current-project")
+            .expect("current-project root present");
+        assert!(project_root.exists);
+        let free = project_root
+            .volume_free_bytes
+            .expect("existing root reports volume free space");
+        let total = project_root
+            .volume_total_bytes
+            .expect("existing root reports volume capacity");
+        assert!(total > 0);
+        assert!(free <= total);
+
+        // Missing roots stay None rather than reporting a random volume.
+        for root in scan.roots.iter().filter(|root| !root.exists) {
+            assert_eq!(root.volume_free_bytes, None);
+            assert_eq!(root.volume_total_bytes, None);
+        }
+
+        // The summary carries the tightest volume hosting scanned worktrees;
+        // the fixture repo guarantees at least one worktree exists.
+        assert!(!scan.worktrees.is_empty());
+        let summary_free = scan
+            .summary
+            .volume_free_bytes
+            .expect("summary reports free space when any worktree exists");
+        let summary_total = scan
+            .summary
+            .volume_total_bytes
+            .expect("summary reports capacity when any worktree exists");
+        assert!(summary_total > 0);
+        assert!(summary_free <= summary_total);
     }
 
     #[test]

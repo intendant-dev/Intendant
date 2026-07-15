@@ -77,8 +77,14 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
         .as_ref()
         .map(DashboardDisplayAuthorityBridge::subscribe);
     let mut drop_stats = TransmitDropStats::default();
+    let mut authority_tick = tokio::time::interval(LIVE_AUTHORITY_RECHECK_INTERVAL);
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        if !runtime.grant.opening_authority_is_current() {
+            shutdown.cancel();
+            break;
+        }
         let timeout_at = match drain_control_outputs(
             &mut rtc,
             &sockets_by_addr,
@@ -108,6 +114,12 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = authority_tick.tick() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
+            }
             Some(pkt) = inbound_rx.recv() => {
                 let input = TaggedBytesMut {
                     now: pkt.received_at,
@@ -241,6 +253,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             Some(task_response) = task_rx.recv() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 if pending_requests.contains_key(&task_response.id) {
                     let task_id = task_response.id.clone();
                     let done = task_response.done;
@@ -258,8 +274,37 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             event = event_rx.recv(), if runtime.events_subscribed => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 match event {
                     Ok(line) => {
+                        let owner = runtime.grant.has_owner_dashboard_authority();
+                        if !owner
+                            && DashboardControlGrant::dashboard_event_line_requires_owner(&line)
+                        {
+                            continue;
+                        }
+                        if !owner {
+                            let private = {
+                                let active_session = runtime.shared_session.read().await;
+                                match active_session.session_registry.as_ref() {
+                                    Some(session_registry) => {
+                                        let registry = session_registry.read().await;
+                                        runtime
+                                            .grant
+                                            .dashboard_event_targets_hidden_display(
+                                                &line, &registry,
+                                            )
+                                    }
+                                    None => false,
+                                }
+                            };
+                            if private {
+                                continue;
+                            }
+                        }
                         runtime.events_sent = runtime.events_sent.saturating_add(1);
                         let frame = event_lane_frame(runtime.events_sent, &line);
                         send_control_text(&mut rtc, &channels, frame);
@@ -278,6 +323,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             Some(frame) = terminal_events_rx.recv() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 send_control_text(&mut rtc, &channels, frame.to_string());
                 let _ = rtc.handle_timeout(Instant::now());
             }
@@ -287,6 +336,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                     None => std::future::pending::<Option<Result<u32, tokio::sync::broadcast::error::RecvError>>>().await,
                 }
             }, if runtime.events_subscribed && display_authority_rx.is_some() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 match authority {
                     Some(Ok(display_id)) => {
                         send_display_authority_event(&mut rtc, &channels, &mut runtime, display_id);
@@ -316,6 +369,12 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
         }
     }
 
+    // Invalidate every interactive display guard minted by this control
+    // session before any other teardown can yield. The display transport is
+    // separate WebRTC and may reap a beat later; it must not retain input or
+    // clipboard authority during that window.
+    shutdown.cancel();
+    remove_dashboard_display_peers(&runtime).await;
     for (_, token) in pending_requests {
         token.cancel();
     }
@@ -326,6 +385,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     // Egress relays die with their session: no more frames can arrive,
     // so drop the registration and fail any in-flight relayed requests.
     crate::credential_egress::unregister_session(&runtime.session_id);
+    runtime.tabs.unregister(&runtime.session_id);
+    if let Some(bridge) = &runtime.display_authority {
+        bridge.cleanup(&runtime.session_id);
+    }
     if let Some(bridge) = &runtime.presence {
         bridge.cleanup(runtime.session_id.clone()).await;
     }
@@ -382,6 +445,24 @@ pub(crate) fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
     runtime: &mut ControlRuntime,
     display_id: u32,
 ) {
+    if !runtime.grant.has_owner_dashboard_authority() {
+        let Ok(active_session) = runtime.shared_session.try_read() else {
+            return;
+        };
+        let Some(session_registry) = active_session.session_registry.as_ref() else {
+            return;
+        };
+        let Ok(registry) = session_registry.try_read() else {
+            return;
+        };
+        if runtime
+            .grant
+            .display_session(&registry, display_id)
+            .is_none()
+        {
+            return;
+        }
+    }
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return;
     };
@@ -404,7 +485,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
-    display_input_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    display_input_tx: &DisplayInputForwarder,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1

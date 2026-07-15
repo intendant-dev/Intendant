@@ -33,7 +33,7 @@ impl StationInner {
             w,
             h,
             8.0,
-            hex_color(color).unwrap_or(C_OVERLAY1),
+            hex_color(color).unwrap_or(C_TEXT3),
             if selected {
                 1.7
             } else if hovered {
@@ -69,7 +69,7 @@ impl StationInner {
             );
         } else if h < 72.0 {
             if !kicker.is_empty() {
-                self.text(kicker, x + 20.0, y + 15.0, 7.5, C_OVERLAY1_CSS, "bold");
+                self.text(kicker, x + 20.0, y + 15.0, 7.5, C_TEXT3_CSS, "bold");
             }
             self.text(
                 title,
@@ -97,13 +97,13 @@ impl StationInner {
                     x + 20.0,
                     y + h - 11.0,
                     8.0,
-                    C_SUBTEXT0_CSS,
+                    C_TEXT2_CSS,
                     "normal",
                 );
             }
         } else {
             if !kicker.is_empty() {
-                self.text(kicker, x + 20.0, y + 16.0, 8.0, C_OVERLAY1_CSS, "bold");
+                self.text(kicker, x + 20.0, y + 16.0, 8.0, C_TEXT3_CSS, "bold");
             }
             self.text(
                 title,
@@ -127,7 +127,7 @@ impl StationInner {
                     x + 20.0,
                     y + h - 12.0,
                     8.5,
-                    C_SUBTEXT0_CSS,
+                    C_TEXT2_CSS,
                     "normal",
                 );
             }
@@ -160,15 +160,15 @@ impl StationInner {
                 },
                 "open-send",
                 72.0,
-                C_BLUE_CSS,
+                C_IRIS_CSS,
             ),
-            LaneAction::composer("new session", "open-launch", 112.0, C_TEAL_CSS),
+            LaneAction::composer("new session", "open-launch", 112.0, C_SKY_CSS),
         ];
         if controls.session_can_focus {
-            actions.push(LaneAction::activity("focus", "target", 72.0, C_PEACH_CSS));
+            actions.push(LaneAction::activity("focus", "target", 72.0, C_AMBER_CSS));
         }
         if controls.session_can_interrupt {
-            actions.push(LaneAction::activity("stop", "stop", 60.0, C_RED_CSS));
+            actions.push(LaneAction::activity("stop", "stop", 60.0, C_ROSE_CSS));
         }
         if controls.shared_view_can_take_input {
             actions.push(LaneAction::controls(
@@ -179,10 +179,10 @@ impl StationInner {
             ));
         }
         actions.extend([
-            LaneAction::select("context", "system:context", 82.0, C_BLUE_CSS),
-            LaneAction::select("managed", "system:managed", 88.0, C_MAUVE_CSS),
-            LaneAction::select("sessions", "system:sessions", 90.0, C_TEAL_CSS),
-            LaneAction::select("controls", "system:controls", 88.0, C_MAUVE_CSS),
+            LaneAction::select("context", "system:context", 82.0, C_IRIS_CSS),
+            LaneAction::select("managed", "system:managed", 88.0, C_VIOLET_CSS),
+            LaneAction::select("sessions", "system:sessions", 90.0, C_SKY_CSS),
+            LaneAction::select("controls", "system:controls", 88.0, C_VIOLET_CSS),
         ]);
         actions
     }
@@ -211,7 +211,7 @@ impl StationInner {
                     .unwrap_or_else(|| "waiting for events".to_string()),
                 color: latest_event
                     .map(|event| level_color_css(&event.level))
-                    .unwrap_or(C_TEAL_CSS),
+                    .unwrap_or(C_SKY_CSS),
             },
             SystemTarget {
                 id: "system:context",
@@ -271,7 +271,7 @@ impl StationInner {
                     ),
                     34,
                 ),
-                color: C_MAUVE_CSS,
+                color: C_VIOLET_CSS,
             },
             SystemTarget {
                 id: "system:sessions",
@@ -286,9 +286,9 @@ impl StationInner {
                     32,
                 ),
                 color: if self.snapshot.sessions.active > 0 {
-                    C_TEAL_CSS
+                    C_SKY_CSS
                 } else {
-                    C_BLUE_CSS
+                    C_IRIS_CSS
                 },
             },
             SystemTarget {
@@ -307,7 +307,7 @@ impl StationInner {
                     ),
                     34,
                 ),
-                color: C_PEACH_CSS,
+                color: C_AMBER_CSS,
             },
             SystemTarget {
                 id: "system:changes",
@@ -323,7 +323,7 @@ impl StationInner {
                 },
                 detail: truncate(&nonempty(&changes.latest_path, "working tree clean"), 34),
                 color: if changes.count > 0 || changes.status == "mismatch" {
-                    C_YELLOW_CSS
+                    C_AMBER_CSS
                 } else {
                     C_GREEN_CSS
                 },
@@ -343,9 +343,9 @@ impl StationInner {
                 color: if self.snapshot.sessions.worktree_dirty > 0
                     || self.snapshot.sessions.worktree_unmerged > 0
                 {
-                    C_YELLOW_CSS
+                    C_AMBER_CSS
                 } else {
-                    C_BLUE_CSS
+                    C_IRIS_CSS
                 },
             },
             SystemTarget {
@@ -358,7 +358,7 @@ impl StationInner {
                     self.fov_deg.round() as i32,
                     self.density
                 ),
-                color: C_LAVENDER_CSS,
+                color: C_IRIS2_CSS,
             },
         ]
     }
@@ -366,7 +366,7 @@ impl StationInner {
     pub(crate) fn draw_corners(&self, w: f32, h: f32) {
         let a = self.mood.glass();
         self.hud
-            .set_stroke(&css_rgba(C_LAVENDER.with_alpha(0.34 * a).into()));
+            .set_stroke(&css_rgba(C_IRIS2.with_alpha(0.34 * a).into()));
         let len = 26.0;
         for (x, y, sx, sy) in [
             (11.0, 50.0, 1.0, 1.0),
@@ -399,11 +399,11 @@ impl StationInner {
         self.hud.set_fill("rgba(13,14,24,0.55)");
         self.hud.ctx.fill();
         self.hud.set_stroke(&css_rgba(
-            C_LAVENDER.with_alpha(0.40 * self.mood.glass()).into(),
+            C_IRIS2.with_alpha(0.40 * self.mood.glass()).into(),
         ));
         self.hud.ctx.stroke();
         let angle = -self.yaw as f64;
-        self.hud.set_stroke(C_BLUE_CSS);
+        self.hud.set_stroke(C_IRIS_CSS);
         self.hud.ctx.begin_path();
         self.hud.ctx.move_to(cx as f64, cy as f64);
         self.hud.ctx.line_to(
@@ -411,12 +411,12 @@ impl StationInner {
             cy as f64 - angle.cos() * 14.0,
         );
         self.hud.ctx.stroke();
-        self.text("N", cx + 27.0, cy + 4.0, 10.0, C_OVERLAY1_CSS, "bold");
+        self.text("N", cx + 27.0, cy + 4.0, 10.0, C_TEXT3_CSS, "bold");
     }
 
     pub(crate) fn meter(&self, x: f32, y: f32, w: f32, pct: f32, color: &str) {
         let pct = pct.clamp(0.0, 1.0);
-        self.hud.set_fill("rgba(49,50,68,0.92)");
+        self.hud.set_fill("rgba(26,30,40,0.92)");
         self.hud
             .ctx
             .fill_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
@@ -424,7 +424,7 @@ impl StationInner {
         self.hud
             .ctx
             .fill_rect(x as f64, (y - 6.0) as f64, (w * pct) as f64, 5.0);
-        self.hud.set_stroke("rgba(127,132,156,0.5)");
+        self.hud.set_stroke("rgba(126,136,150,0.5)");
         self.hud
             .ctx
             .stroke_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
@@ -447,7 +447,7 @@ impl StationInner {
             w,
             h,
             label,
-            if active { C_BLUE_CSS } else { C_OVERLAY1_CSS },
+            if active { C_IRIS_CSS } else { C_TEXT3_CSS },
             active,
         );
         self.hit_zones.push(HitZone::new(x, y, w, h, action));
@@ -469,7 +469,7 @@ impl StationInner {
     ) {
         let ctx = &self.hud.ctx;
         let a = self.mood.glass();
-        let accent = hex_color(color).unwrap_or(C_OVERLAY1);
+        let accent = hex_color(color).unwrap_or(C_TEXT3);
         let hovered = self
             .hover_xy
             .is_some_and(|(hx, hy)| hx >= x && hx <= x + w && hy >= y && hy <= y + h);

@@ -1,7 +1,7 @@
 # static/app/ — dashboard SPA source
 
-`static/app.html` (the file the daemon embeds via `include_str!` and
-intendant-connect serves from disk) is **generated**: `build.rs` concatenates
+`static/app.html` (the daemon dashboard embedded by the `intendant` controller;
+`intendant-connect` deliberately never serves it) is **generated**: `build.rs` concatenates
 the fragments in this directory, in the order fixed by `manifest.txt`, via
 `crates/app-html-assembler`. Any `cargo build`/`check` reassembles it, and
 CI (`.github/workflows/app-html.yml`) fails when the committed artifact

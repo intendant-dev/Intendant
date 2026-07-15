@@ -1,49 +1,38 @@
 #!/usr/bin/env node
 'use strict';
 
-// Hosted-Connect transport E2E: asserts the OUTCOME the claim ceremony
-// exists for — a browser that signed up at the rendezvous, claimed a fresh
-// daemon with its twelve-word bootstrap phrase, and opened the hosted
-// dashboard actually gets an OPEN dashboard-control DataChannel to the
-// daemon. The fresh-VPS ceremony validation stopped at enrollment, and
-// three real transport bugs survived it undetected:
+// Hosted-Connect refusal E2E: a browser signs up at the rendezvous, links a
+// fresh daemon with a locally minted one-time claim code, then proves hosted
+// offer/ICE/close are hard 403s and the retired `/app` redirects without
+// constructing a control client. Successful DataChannel/ICE transport is
+// covered by the direct/local dashboard-control validators.
+// This rig also retains the public-address registration regression:
 //
-//   1. the reverse proxy dropped X-Forwarded-For, so the register echo's
-//      observed_ip was null and the daemon never learned its public address;
-//   2. the daemon then advertised no ICE-TCP candidate at all;
-//   3. the WebRTC engine stamped DTLS/SCTP transmits as UDP, the IO glue
-//      misrouted them off the nominated TCP pair, and DTLS timed out at 30s.
+//   the reverse proxy dropped X-Forwarded-For, so the register echo's
+//   observed_ip was null and the daemon never learned its public address.
 //
 // This rig reproduces the topology locally with no cloud resources and no
 // real accounts:
 //
 //   browser (headless Chromium) ── http ──> intendant-connect (127.0.0.1)
 //   daemon ── http ──> XFF-injecting forward proxy ──> intendant-connect
-//   browser ── WebRTC (ICE-TCP + DTLS + SCTP) ──> daemon gateway port
+//   browser ── attempted hosted signaling ──> daemon (refused before RPC)
 //
 // The proxy plays the production reverse proxy: it stamps every daemon->
 // service request with `X-Forwarded-For: <this machine's LAN IP>`, so the
 // register echo carries a non-loopback observed_ip and the daemon
-// advertises `<LAN-IP>:<gateway-port>` as its ICE-TCP candidate — locally
-// reachable, so the browser can really dial it. (A daemon polling the
-// service directly on 127.0.0.1 gets observed_ip=null and never advertises
-// the candidate: exactly the bug class under test, and untestable without
-// the proxy.)
+// records the expected public metadata. A daemon polling the service directly
+// on 127.0.0.1 gets observed_ip=null, which makes this regression untestable
+// without the proxy.
 //
 // Stages (each printed, each asserted):
 //   1. service + proxy + fresh-HOME daemon come up; register echo carries
 //      observed_ip == LAN IP (bug class 1);
 //   2. headless Chromium creates a passkey account (CDP virtual
-//      authenticator), enters the daemon-minted phrase, and the first-owner
-//      bootstrap enrolls the browser key as role:root;
-//   3. hosted /app dashboard connects: control DataChannel OPEN, binding
-//      verified, status RPC answered (grant, not refusal);
-//   4. TCP-forced pass: a fresh /app load with every UDP candidate stripped
-//      from the daemon's answer (what a cloud box's filtered network does),
-//      so ICE must nominate the advertised ICE-TCP candidate and DTLS+SCTP
-//      must flow over it (bug classes 2 and 3). Asserts the selected ICE
-//      pair is protocol=tcp at <LAN-IP>:<gateway-port> and the daemon logs
-//      a second "data channel open".
+//      authenticator) and enters the daemon-minted one-time claim code;
+//      IAM remains empty;
+//   3. hosted offer/ICE/close return 403, `/app` redirects to `/connect`, and
+//      no dashboard-control global or data channel is created.
 //
 // Prerequisites (this script builds nothing):
 //   cargo build --bin intendant --bin intendant-runtime --bin intendant-connect
@@ -61,6 +50,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { launchBrowser } = require('./lib/browser-automation.cjs');
+const { assertHostedControlUnavailable } = require('./lib/connect-hosted-refusal.cjs');
 
 const DEFAULT_SERVICE_PORT = 9891;
 const DEFAULT_PROXY_PORT = 9892;
@@ -68,7 +58,6 @@ const DEFAULT_DAEMON_PORT = 8891;
 const DEFAULT_DAEMON_ID = 'connect-transport-e2e';
 const START_TIMEOUT_MS = 60000;
 const CLAIM_TIMEOUT_MS = 75000;
-const TRANSPORT_TIMEOUT_MS = 45000;
 
 function usage() {
   console.log(`Usage:
@@ -278,6 +267,64 @@ function prepareDaemonAccessCerts(binary, homeDir, repoRoot, label) {
   }
 }
 
+function slugComponent(value) {
+  const slug = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return slug || 'unknown';
+}
+
+// This fixture stands in for a trusted local/direct owner decision. The
+// Connect claim itself remains route metadata and never writes IAM.
+function writeAdversarialObserverGrant(homeDir, fingerprint, accountName) {
+  assert(fingerprint, 'hosted browser key fingerprint is required');
+  const certDir = path.join(homeDir, '.intendant', 'access-certs');
+  fs.mkdirSync(certDir, { recursive: true });
+  const principalId = `principal:client-key:${slugComponent(fingerprint)}`;
+  const now = Date.now();
+  const state = {
+    schema_version: 2,
+    principals: [{
+      id: principalId,
+      kind: 'client_key',
+      label: accountName ? `@${accountName} browser` : 'Hosted browser',
+      status: 'active',
+      source: 'local_iam_state',
+      account: accountName ? { provider: 'intendant.dev', account_name: accountName, handle: accountName } : null,
+      organization: null,
+      authn: [{
+        kind: 'client_key',
+        label: 'Browser identity key',
+        fingerprint,
+        origin: 'hosted-connect-e2e',
+      }],
+      notes: 'adversarial hosted-refusal observer grant',
+      created_at_unix_ms: now,
+    }],
+    roles: [],
+    grants: [{
+      id: `grant:user-client:${slugComponent(principalId)}:local:role-observer`,
+      principal_id: principalId,
+      target_id: 'local',
+      role_id: 'role:observer',
+      policy_id: 'policy:observer',
+      status: 'active',
+      source: 'local_iam_state',
+      reason: 'adversarial hosted-refusal observer grant',
+      created_at_unix_ms: now,
+      revoked_at_unix_ms: null,
+    }],
+    audit_events: [],
+    role_ceilings: {
+      connect_account: 'role:none',
+      client_key: 'role:observer',
+    },
+  };
+  fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
 async function addVirtualAuthenticator(browser, page) {
   const options = {
     protocol: 'ctap2',
@@ -299,105 +346,6 @@ async function addVirtualAuthenticator(browser, page) {
     return;
   }
   throw new Error('browser driver does not expose CDP WebAuthn controls');
-}
-
-/// Fault injection for the TCP-forced pass, installed before the page
-/// loads: make UDP unroutable between browser and daemon, the exact
-/// topology of a cloud daemon whose UDP is filtered, so ICE can only
-/// nominate the daemon's advertised ICE-TCP candidate. Three legs, all
-/// needed:
-///   - strip UDP candidates from the daemon's answer SDP (and any remote
-///     trickle) so the browser never dials daemon UDP;
-///   - swallow the browser's own UDP trickle candidates before the page
-///     signals them, or the daemon would send UDP checks back and the
-///     browser would mint a working peer-reflexive UDP pair (observed:
-///     same-host prflx quietly un-forced an earlier version of this rig);
-///   - register every RTCPeerConnection so the driver can read getStats()
-///     and assert which pair actually got nominated.
-const TCP_ONLY_INIT_SCRIPT = `(() => {
-  if (window.__rigTcpOnlyInstalled) return;
-  window.__rigTcpOnlyInstalled = true;
-  window.__rigStrippedUdpLines = 0;
-  window.__rigDroppedRemoteUdpTrickle = 0;
-  window.__rigDroppedLocalUdpTrickle = 0;
-  window.__rigPCs = [];
-  const udpCandidateLine = line => /^(a=)?candidate:\\S+ \\d+ udp /i.test(String(line).trim());
-  const stripSdp = sdp => String(sdp)
-    .split(/\\r\\n|\\n/)
-    .filter(line => {
-      if (udpCandidateLine(line)) {
-        window.__rigStrippedUdpLines += 1;
-        return false;
-      }
-      return true;
-    })
-    .join('\\r\\n');
-  const NativePC = window.RTCPeerConnection;
-  const origSetRemote = NativePC.prototype.setRemoteDescription;
-  NativePC.prototype.setRemoteDescription = function (desc, ...rest) {
-    let next = desc;
-    try {
-      if (desc && typeof desc.sdp === 'string') next = { type: desc.type, sdp: stripSdp(desc.sdp) };
-    } catch (_) {
-      next = desc;
-    }
-    return origSetRemote.call(this, next, ...rest);
-  };
-  const origAddIce = NativePC.prototype.addIceCandidate;
-  NativePC.prototype.addIceCandidate = function (candidate, ...rest) {
-    try {
-      const line = candidate && typeof candidate.candidate === 'string' ? candidate.candidate : '';
-      if (udpCandidateLine(line)) {
-        window.__rigDroppedRemoteUdpTrickle += 1;
-        return Promise.resolve();
-      }
-    } catch (_) {}
-    return origAddIce.call(this, candidate, ...rest);
-  };
-  const accessor = Object.getOwnPropertyDescriptor(NativePC.prototype, 'onicecandidate');
-  if (accessor && accessor.set) {
-    Object.defineProperty(NativePC.prototype, 'onicecandidate', {
-      configurable: true,
-      enumerable: accessor.enumerable,
-      get() {
-        return accessor.get.call(this);
-      },
-      set(handler) {
-        const wrapped = typeof handler === 'function'
-          ? function (ev) {
-              const line = ev && ev.candidate && typeof ev.candidate.candidate === 'string'
-                ? ev.candidate.candidate
-                : '';
-              if (line && udpCandidateLine(line)) {
-                window.__rigDroppedLocalUdpTrickle += 1;
-                return undefined;
-              }
-              return handler.call(this, ev);
-            }
-          : handler;
-        return accessor.set.call(this, wrapped);
-      },
-    });
-  }
-  window.RTCPeerConnection = new Proxy(NativePC, {
-    construct(target, args) {
-      const pc = new target(...args);
-      window.__rigPCs.push(pc);
-      return pc;
-    },
-  });
-})();`;
-
-async function addInitScript(browser, page, source) {
-  if (browser.kind === 'playwright' && typeof page.addInitScript === 'function') {
-    await page.addInitScript(source);
-    return;
-  }
-  if (page.connection && page.sessionId) {
-    await page.connection.send('Page.addScriptToEvaluateOnNewDocument', { source }, page.sessionId);
-    return;
-  }
-  throw new Error('browser driver does not expose init-script injection');
 }
 
 async function click(page, selector) {
@@ -427,78 +375,6 @@ async function goto(page, url, opts = {}) {
     throw new Error(`${url} returned ${response.status()}`);
   }
   return response;
-}
-
-/// Wait for the hosted dashboard control transport to be fully live:
-/// channel OPEN, daemon binding verified, hosted signaling, and a status
-/// RPC answered over the channel (grantKind is only ever set from the
-/// daemon's status response — a refused session never reaches it).
-async function waitForHostedTransport(page, label) {
-  let last = null;
-  try {
-    return await waitFor(async () => {
-      last = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null);
-      if (
-        last &&
-        last.connected === true &&
-        last.channelState === 'open' &&
-        last.signalingMode === 'connect-rendezvous' &&
-        last.verifiedBinding &&
-        last.verifiedBinding.ok === true &&
-        last.grantKind
-      ) {
-        return last;
-      }
-      return null;
-    }, TRANSPORT_TIMEOUT_MS, label);
-  } catch (err) {
-    throw new Error(`${err.message}; last dashboard status: ${JSON.stringify(last)}`);
-  }
-}
-
-async function selectedIcePair(page) {
-  return page.evaluate(async () => {
-    const out = {
-      found: false,
-      pcCount: (window.__rigPCs || []).length,
-      strippedUdpLines: window.__rigStrippedUdpLines || 0,
-      droppedRemoteUdpTrickle: window.__rigDroppedRemoteUdpTrickle || 0,
-      droppedLocalUdpTrickle: window.__rigDroppedLocalUdpTrickle || 0,
-    };
-    for (const pc of window.__rigPCs || []) {
-      if (pc.connectionState !== 'connected') continue;
-      const stats = await pc.getStats();
-      let pair = null;
-      stats.forEach(report => {
-        if (report.type === 'transport' && report.selectedCandidatePairId) {
-          pair = stats.get(report.selectedCandidatePairId) || pair;
-        }
-      });
-      if (!pair) {
-        stats.forEach(report => {
-          if (
-            report.type === 'candidate-pair' &&
-            (report.selected || report.nominated) &&
-            (!report.state || report.state === 'succeeded')
-          ) {
-            pair = report;
-          }
-        });
-      }
-      if (!pair) continue;
-      const local = stats.get(pair.localCandidateId) || {};
-      const remote = stats.get(pair.remoteCandidateId) || {};
-      const view = c => ({
-        protocol: c.protocol || '',
-        address: c.address || c.ip || '',
-        port: c.port ?? null,
-        candidateType: c.candidateType || '',
-        tcpType: c.tcpType || '',
-      });
-      return { ...out, found: true, local: view(local), remote: view(remote) };
-    }
-    return out;
-  });
 }
 
 async function main() {
@@ -644,14 +520,20 @@ async function main() {
       lanIp,
       `register echoed observed_ip=${JSON.stringify(echo.observed_ip)}, expected the injected X-Forwarded-For ${lanIp}`
     );
-    assert.strictEqual(echo.claim_code_daemon_minted, true, `fresh daemon did not mint its own claim phrase: ${JSON.stringify(echo)}`);
-    stage('register echo ok', `observed_ip=${echo.observed_ip} (from X-Forwarded-For), daemon-minted claim phrase`);
+    assert.strictEqual(echo.claim_code, null, `Connect must not receive/return the plaintext claim code: ${JSON.stringify(echo)}`);
+    assert.strictEqual(echo.claim_code_daemon_minted, true, `register response did not mark daemon-side code custody: ${JSON.stringify(echo)}`);
+    assert.strictEqual(typeof echo.daemon_session_token, 'string', `register did not rotate a daemon-session credential: ${JSON.stringify(echo)}`);
+    assert(echo.daemon_session_token.length >= 32, `daemon-session credential is unexpectedly short: ${JSON.stringify(echo)}`);
+    assert(Number(echo.daemon_session_expires_unix_ms) > Date.now(), `daemon-session credential has no future expiry: ${JSON.stringify(echo)}`);
+    stage('register echo ok', `observed_ip=${echo.observed_ip} (from X-Forwarded-For), hash-only route code, rotating daemon session`);
 
-    const claimPhrase = await waitFor(() => {
-      const match = daemonLog().match(/first-owner bootstrap: claim this daemon at [^\s]*claim_code=([^\s"'<>]+)/);
-      return match ? decodeURIComponent(match[1]) : null;
-    }, START_TIMEOUT_MS, 'daemon-minted bootstrap claim phrase in the daemon log');
-    stage('bootstrap phrase minted', `${claimPhrase.split('-').length} words`);
+    const claimCode = await waitFor(() => {
+      const match = daemonLog().match(/one-time claim code: link this daemon at [^\s]*claim_code=([^\s"'<>]+)/);
+      if (match) return decodeURIComponent(match[1]);
+      const plain = daemonLog().match(/one-time claim code ([a-z0-9-]+)/i);
+      return plain ? plain[1] : null;
+    }, START_TIMEOUT_MS, 'daemon-minted one-time claim code in the daemon log');
+    stage('claim code minted', `${claimCode.split('-').length} groups`);
 
     // Sanity: the ICE-TCP candidate the daemon will advertise must be
     // dialable from this machine, or a failure below would be ambiguous.
@@ -661,7 +543,7 @@ async function main() {
     );
     stage('gateway reachable at advertised address', `${lanIp}:${options.daemonPort}`);
 
-    // ── Browser: account, claim, first-owner bootstrap ──────────────────
+    // ── Browser: account + route-only claim ─────────────────────────────
     browser = await launchBrowser({ headless: true, ignoreHTTPSErrors: true });
     const page = await browser.newPage();
     page.on('console', msg => {
@@ -681,7 +563,16 @@ async function main() {
     );
     stage('account created', `@${accountName} (passkey via CDP virtual authenticator)`);
 
-    await page.evaluate(`document.getElementById('claim-code').value = ${JSON.stringify(claimPhrase)}`);
+    const iamPath = path.join(daemonHome, '.intendant', 'access-certs', 'iam.json');
+    const iamBeforeRouteClaim = fs.existsSync(iamPath)
+      ? JSON.parse(fs.readFileSync(iamPath, 'utf8'))
+      : {};
+    const claimInvariantBefore = JSON.stringify({
+      principals: iamBeforeRouteClaim.principals || [],
+      grants: iamBeforeRouteClaim.grants || [],
+      role_ceilings: iamBeforeRouteClaim.role_ceilings || {},
+    });
+    await page.evaluate(`document.getElementById('claim-code').value = ${JSON.stringify(claimCode)}`);
     await click(page, '#claim');
     await waitFor(async () => {
       const text = await page.evaluate("document.getElementById('claim-status').textContent || ''");
@@ -690,90 +581,67 @@ async function main() {
         err.fatal = true;
         throw err;
       }
-      return text.includes('Claimed') && text.includes('first owner') ? text : null;
-    }, CLAIM_TIMEOUT_MS, 'first-owner bootstrap claim on the /connect page');
-    stage('claim ok', 'page reports first-owner bootstrap claim');
+      return text.includes('No machine access was granted') ? text : null;
+    }, CLAIM_TIMEOUT_MS, 'route-only claim on the /connect page');
+    stage('claim ok', 'page reports route link with no machine access');
 
     await waitFor(
-      () => daemonLog().includes('first-owner bootstrap: enrolled client key'),
+      () => daemonLog().includes('route link acknowledged for'),
       START_TIMEOUT_MS,
-      'daemon-side bootstrap enrollment log'
+      'daemon-side route-link acknowledgment log'
     );
-    await waitFor(
-      () => daemonLog().includes('claim acknowledged — this daemon co-signed'),
-      START_TIMEOUT_MS,
-      'daemon-side co-signed claim log'
-    );
-    const enrolled = daemonLog().match(/first-owner bootstrap: enrolled client key (\S+) as role:root[^\n]*/);
-    stage('bootstrap enrolled', enrolled ? enrolled[0].replace(/^.*enrolled/, 'enrolled') : 'role:root');
+    const iamAfterRouteClaim = fs.existsSync(iamPath)
+      ? JSON.parse(fs.readFileSync(iamPath, 'utf8'))
+      : {};
+    assert.strictEqual(JSON.stringify({
+      principals: iamAfterRouteClaim.principals || [],
+      grants: iamAfterRouteClaim.grants || [],
+      role_ceilings: iamAfterRouteClaim.role_ceilings || {},
+    }), claimInvariantBefore, 'route-only claim mutated daemon IAM authority');
+    stage('route link acknowledged', 'IAM authority unchanged');
 
     const daemons = await page.evaluate(() => fetch('/api/daemons').then(r => r.json()));
     assert.strictEqual(daemons.daemons?.length, 1, `expected one claimed daemon: ${JSON.stringify(daemons)}`);
     assert.strictEqual(daemons.daemons[0].daemon_id, options.daemonId);
 
-    // ── Pass A: hosted dashboard, unmodified network ────────────────────
-    const appUrl = `${serviceOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`;
-    await goto(page, appUrl, { timeout: START_TIMEOUT_MS });
-    const baseline = await waitForHostedTransport(page, 'hosted dashboard control transport (baseline)');
-    assert.strictEqual(baseline.claimedDaemonPublicKey, registered.daemon_public_key, 'baseline binding key mismatch');
-    assert(baseline.sessionGrantSha256, 'baseline session did not bind a Connect session grant');
-    await waitFor(
-      () => countMatches(daemonLog(), '[dashboard/control] data channel open:') >= 1,
-      START_TIMEOUT_MS,
-      'daemon "data channel open" log (baseline)'
-    );
-    stage(
-      'transport ready (baseline)',
-      `channel open, binding verified, grant=${baseline.grantKind}, ice=${baseline.iceCandidatePair || baseline.iceRoute || 'n/a'}`
-    );
-
-    // ── Pass B: TCP-forced — the cloud-daemon topology ──────────────────
-    const page2 = await browser.newPage();
-    page2.on('console', msg => {
-      const text = msg.text();
-      if (/error|warn|\[dashboard-control\]/i.test(text)) console.log(`[browser2:${msg.type()}] ${text}`);
-    });
-    await addInitScript(browser, page2, TCP_ONLY_INIT_SCRIPT);
-    await goto(page2, appUrl, { timeout: START_TIMEOUT_MS });
-    const forced = await waitForHostedTransport(page2, 'hosted dashboard control transport (TCP-forced)');
-    assert.strictEqual(forced.claimedDaemonPublicKey, registered.daemon_public_key, 'TCP-forced binding key mismatch');
-
-    // Bug class 2: the daemon must have advertised the observed address as
-    // an ICE-TCP candidate on the gateway port.
-    const iceTcpEnabled = `[dashboard/control] ICE-TCP enabled on ${lanIp}:${options.daemonPort}`;
-    assert(
-      daemonLog().includes(iceTcpEnabled),
-      `daemon log never announced "${iceTcpEnabled}" — no ICE-TCP candidate was advertised`
-    );
-
-    const pair = await selectedIcePair(page2);
-    assert(pair.strippedUdpLines > 0, `TCP-forcing never engaged (no UDP candidates stripped): ${JSON.stringify(pair)}`);
-    assert(
-      pair.droppedLocalUdpTrickle > 0,
-      `TCP-forcing did not suppress the browser's UDP trickle (prflx would un-force the pair): ${JSON.stringify(pair)}`
-    );
-    assert(pair.found, `no selected ICE candidate pair on the TCP-forced connection: ${JSON.stringify(pair)}`);
-    // Bug class 3: DTLS+SCTP actually flowed over the nominated TCP pair.
-    assert.strictEqual(
-      pair.remote.protocol,
-      'tcp',
-      `TCP-forced session selected a non-TCP pair: ${JSON.stringify(pair)}`
-    );
-    if (pair.remote.port !== null) {
-      assert.strictEqual(Number(pair.remote.port), options.daemonPort, `remote ICE-TCP port mismatch: ${JSON.stringify(pair)}`);
+    // ── Hosted control is absent, even under hostile persisted IAM ─────
+    // Exercise the refusal with a real active observer grant and a forged
+    // client-key ceiling already on disk. The route claim did not create
+    // either one, and the fixture is restored immediately after the probe.
+    const iamSnapshot = fs.existsSync(iamPath) ? fs.readFileSync(iamPath) : null;
+    let retiredAttempts;
+    try {
+      writeAdversarialObserverGrant(
+        daemonHome,
+        'bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd6677',
+        accountName
+      );
+      const adversarialIam = JSON.parse(fs.readFileSync(iamPath, 'utf8'));
+      assert(
+        adversarialIam.grants?.some(grant => grant.status === 'active' && grant.role_id === 'role:observer'),
+        'adversarial observer grant was not persisted before the refusal probe'
+      );
+      assert.strictEqual(
+        adversarialIam.role_ceilings?.client_key,
+        'role:observer',
+        'adversarial client-key ceiling was not persisted before the refusal probe'
+      );
+      retiredAttempts = await assertHostedControlUnavailable(
+        page,
+        serviceOrigin,
+        options.daemonId,
+        START_TIMEOUT_MS
+      );
+    } finally {
+      if (iamSnapshot === null) fs.rmSync(iamPath, { force: true });
+      else fs.writeFileSync(iamPath, iamSnapshot, { mode: 0o600 });
     }
-    if (pair.remote.address) {
-      assert.strictEqual(pair.remote.address, lanIp, `remote ICE-TCP address mismatch: ${JSON.stringify(pair)}`);
+    assert.strictEqual(fs.existsSync(iamPath), iamSnapshot !== null, 'adversarial IAM fixture changed file presence');
+    if (iamSnapshot !== null) {
+      assert(iamSnapshot.equals(fs.readFileSync(iamPath)), 'adversarial IAM fixture was not cleaned up');
     }
-    await waitFor(
-      () => countMatches(daemonLog(), '[dashboard/control] data channel open:') >= 2,
-      START_TIMEOUT_MS,
-      'daemon "data channel open" log (TCP-forced)'
-    );
-    stage(
-      'channel open over ICE-TCP',
-      `selected pair ${pair.local.protocol}/${pair.local.candidateType} -> ${pair.remote.protocol}/${pair.remote.candidateType} @ ${pair.remote.address || '<hidden>'}:${pair.remote.port ?? '?'}, grant=${forced.grantKind}`
-    );
+    assert.strictEqual(countMatches(daemonLog(), '[dashboard/control] data channel open:'), 0, 'hosted route unexpectedly opened a control data channel');
+    stage('hosted control absent', 'active observer grant cannot bypass 403 signaling; /app redirects; no data channel');
 
     console.log(JSON.stringify({
       ok: true,
@@ -782,18 +650,7 @@ async function main() {
       daemon_public_key: registered.daemon_public_key,
       observed_ip_echo: echo.observed_ip,
       account: accountName,
-      baseline: {
-        session_id: baseline.sessionId,
-        grant_kind: baseline.grantKind,
-        ice_candidate_pair: baseline.iceCandidatePair || null,
-      },
-      tcp_forced: {
-        session_id: forced.sessionId,
-        grant_kind: forced.grantKind,
-        stripped_udp_candidate_lines: pair.strippedUdpLines,
-        dropped_local_udp_trickle: pair.droppedLocalUdpTrickle,
-        selected_pair: pair,
-      },
+      hosted_signal_statuses: retiredAttempts.map(attempt => attempt.status),
       data_channel_open_logs: countMatches(daemonLog(), '[dashboard/control] data channel open:'),
     }, null, 2));
   } catch (err) {
