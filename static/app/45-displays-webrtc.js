@@ -182,6 +182,24 @@ const DISPLAY_SLOT_POLICY = {
   },
 };
 
+// Presence-stream generations, keyed by DISPLAY id at module level — not on
+// the slot instance. A removed display slot can be re-granted as a brand-new
+// DisplaySlot object whose stream reuses the same display_N identity; an
+// instance-local counter would let the old object's in-flight encode pass
+// its own generation check and emit stale pre-teardown pixels into the new
+// slot's stream. Bumped on every stream start AND on removeDisplaySlot;
+// completions compare against this map.
+const displayStreamGenerations = new Map();
+function displayStreamGeneration(displayId) {
+  return displayStreamGenerations.get(Number(displayId) || 0) || 0;
+}
+function bumpDisplayStreamGeneration(displayId) {
+  const id = Number(displayId) || 0;
+  const next = (displayStreamGenerations.get(id) || 0) + 1;
+  displayStreamGenerations.set(id, next);
+  return next;
+}
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -251,10 +269,6 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
-    // Monotonic per-start stream generation: a late async encode from
-    // generation N must never emit into (or clobber the pending flag of)
-    // generation N+1 after a quick stop→start.
-    this._streamGeneration = 0;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -1444,12 +1458,13 @@ class DisplaySlot {
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
-    // New generation: late completions from a previous run compare against
-    // this and drop; the pending flag belongs to the new run (a leftover
-    // true from a stopped run must not eat the first ticks).
-    this._streamGeneration += 1;
+    // New generation for this DISPLAY id (module-level; see the map above):
+    // late completions from a previous run — same slot object or a removed
+    // predecessor — compare against it and drop; the pending flag belongs
+    // to the new run (a leftover true from a stopped run must not eat the
+    // first ticks).
+    const gen = bumpDisplayStreamGeneration(this.displayId);
     this._streamEncodePending = false;
-    const gen = this._streamGeneration;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
@@ -1482,9 +1497,10 @@ class DisplaySlot {
         DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
         DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
       ]).then(([liveB64, hqB64]) => {
-        // Restarted since capture: these pixels belong to the retired
-        // sequence — never emit them into the new one.
-        if (gen !== this._streamGeneration) return;
+        // Restarted since capture — by this slot object, or by a new slot
+        // re-granted the same display id after this one was removed: these
+        // pixels belong to the retired sequence, never emit them.
+        if (gen !== displayStreamGeneration(this.displayId)) return;
         // Stopped (not restarted): the frame captured pre-stop pixels —
         // still deliver it (it is the stream's final frame), but leave the
         // torn-down chrome (frame-id chip) alone.
@@ -1512,9 +1528,9 @@ class DisplaySlot {
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
       }).finally(() => {
-        // Only this generation may clear its own pending flag — a late
+        // Only the live generation may clear its own pending flag — a late
         // completion must not unblock (or race) a restarted stream's ticks.
-        if (gen === this._streamGeneration) this._streamEncodePending = false;
+        if (gen === displayStreamGeneration(this.displayId)) this._streamEncodePending = false;
       });
     }, 1000);
   }
@@ -1786,6 +1802,11 @@ function removeDisplaySlot(displayId) {
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  // Invalidate the removed slot's stream generation: an in-flight encode
+  // from this slot must not deliver into a successor slot that reuses the
+  // display_N stream identity (the plain stop path deliberately still
+  // delivers its final frame; removal does not).
+  bumpDisplayStreamGeneration(displayId);
   if (typeof window.retireLiveDisplayWorkspaceSlot === 'function') {
     window.retireLiveDisplayWorkspaceSlot(displayId);
   }

@@ -28105,7 +28105,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '01176a9b40d476e2';
+const INTENDANT_APP_BUILD = 'a4a0530f37ba73a3';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38604,6 +38604,13 @@ async function stationOpenTranscript(sessionId, opts = {}) {
   ).trim() || 'intendant';
   const label = stationSessionTask(session) || shortSessionId(sid);
   if (!opts.refresh) stationStatus(`Loading transcript ${shortSessionId(sid)}`);
+  // Settle-edge seed, sampled SYNCHRONOUSLY before the detail fetch: the
+  // phase can flip idle during the await, and seeding from the post-await
+  // value would record an open-while-active session as never-active —
+  // silently skipping its one settling refetch.
+  const phaseAtOpen = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
+  );
   let payload;
   try {
     const data = await fetchSessionDetailPayload(sid, { source, limit: 300 });
@@ -38632,13 +38639,8 @@ async function stationOpenTranscript(sessionId, opts = {}) {
     console.warn('station set_transcript rejected:', err);
   }
   if (accepted) {
-    // Seed the settle-edge tracker from the phase at open, so a session
-    // that goes inactive before the first poll evaluation still gets its
-    // one final refetch (stationMaybeRefreshTranscript maintains it from
-    // here on).
-    const phaseAtOpen = String(
-      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
-    );
+    // Seed the settle-edge tracker from the pre-fetch phase sample above;
+    // stationMaybeRefreshTranscript maintains it from here on.
     stationTranscriptLive = {
       sessionId: sid,
       source,
@@ -38661,6 +38663,16 @@ async function stationOpenTranscript(sessionId, opts = {}) {
 function stationMaybeRefreshTranscript(force = false) {
   const live = stationTranscriptLive;
   if (!live || !stationRenderedPrimaryActive()) return;
+  // Observe the phase on EVERY call, BEFORE the fetch throttles below can
+  // return: arming is set-only here, so a short turn that starts and
+  // settles entirely inside the 8 s age window (whose calls all early-out
+  // below) still arms the settle edge. The grant is consumed only at an
+  // actual fetch decision, never by an early return.
+  const phase = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+  );
+  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  if (phase && !inactive) live.lastActivePhaseSeen = true;
   const age = Date.now() - live.fetchedAt;
   if (!force && age < 1500) return;
   const key = stationLatestEventKeyForSession(live.sessionId);
@@ -38669,22 +38681,16 @@ function stationMaybeRefreshTranscript(force = false) {
   // Idle-arm gate: the ~8 s fallback exists for sessions whose output
   // never surfaces in the activity stream — but when the stream key is
   // UNCHANGED and the session itself reports an inactive phase, there is
-  // nothing new to fetch. One exception, tracked via lastActivePhaseSeen:
+  // nothing new to fetch. One exception, the settle edge armed above:
   // output that lands transcript-only just before the phase settles would
   // otherwise never be fetched (key unchanged forever + phase now
-  // inactive), so the active→inactive TRANSITION grants exactly one final
-  // refetch before the gate parks. Unknown phase keeps the old fallback
-  // cadence (fail open).
-  const phase = String(
-    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
-  );
-  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  // inactive), so an observed active→inactive transition grants exactly
+  // one final refetch before the gate parks. Unknown phase keeps the old
+  // fallback cadence (fail open).
   if (inactive) {
     const settleEdge = live.lastActivePhaseSeen === true;
     live.lastActivePhaseSeen = false;
     if (!force && !settleEdge && key === live.lastEventKey) return;
-  } else if (phase) {
-    live.lastActivePhaseSeen = true;
   }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;
@@ -65373,6 +65379,24 @@ const DISPLAY_SLOT_POLICY = {
   },
 };
 
+// Presence-stream generations, keyed by DISPLAY id at module level — not on
+// the slot instance. A removed display slot can be re-granted as a brand-new
+// DisplaySlot object whose stream reuses the same display_N identity; an
+// instance-local counter would let the old object's in-flight encode pass
+// its own generation check and emit stale pre-teardown pixels into the new
+// slot's stream. Bumped on every stream start AND on removeDisplaySlot;
+// completions compare against this map.
+const displayStreamGenerations = new Map();
+function displayStreamGeneration(displayId) {
+  return displayStreamGenerations.get(Number(displayId) || 0) || 0;
+}
+function bumpDisplayStreamGeneration(displayId) {
+  const id = Number(displayId) || 0;
+  const next = (displayStreamGenerations.get(id) || 0) + 1;
+  displayStreamGenerations.set(id, next);
+  return next;
+}
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -65442,10 +65466,6 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
-    // Monotonic per-start stream generation: a late async encode from
-    // generation N must never emit into (or clobber the pending flag of)
-    // generation N+1 after a quick stop→start.
-    this._streamGeneration = 0;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -66635,12 +66655,13 @@ class DisplaySlot {
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
-    // New generation: late completions from a previous run compare against
-    // this and drop; the pending flag belongs to the new run (a leftover
-    // true from a stopped run must not eat the first ticks).
-    this._streamGeneration += 1;
+    // New generation for this DISPLAY id (module-level; see the map above):
+    // late completions from a previous run — same slot object or a removed
+    // predecessor — compare against it and drop; the pending flag belongs
+    // to the new run (a leftover true from a stopped run must not eat the
+    // first ticks).
+    const gen = bumpDisplayStreamGeneration(this.displayId);
     this._streamEncodePending = false;
-    const gen = this._streamGeneration;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
@@ -66673,9 +66694,10 @@ class DisplaySlot {
         DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
         DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
       ]).then(([liveB64, hqB64]) => {
-        // Restarted since capture: these pixels belong to the retired
-        // sequence — never emit them into the new one.
-        if (gen !== this._streamGeneration) return;
+        // Restarted since capture — by this slot object, or by a new slot
+        // re-granted the same display id after this one was removed: these
+        // pixels belong to the retired sequence, never emit them.
+        if (gen !== displayStreamGeneration(this.displayId)) return;
         // Stopped (not restarted): the frame captured pre-stop pixels —
         // still deliver it (it is the stream's final frame), but leave the
         // torn-down chrome (frame-id chip) alone.
@@ -66703,9 +66725,9 @@ class DisplaySlot {
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
       }).finally(() => {
-        // Only this generation may clear its own pending flag — a late
+        // Only the live generation may clear its own pending flag — a late
         // completion must not unblock (or race) a restarted stream's ticks.
-        if (gen === this._streamGeneration) this._streamEncodePending = false;
+        if (gen === displayStreamGeneration(this.displayId)) this._streamEncodePending = false;
       });
     }, 1000);
   }
@@ -66977,6 +66999,11 @@ function removeDisplaySlot(displayId) {
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  // Invalidate the removed slot's stream generation: an in-flight encode
+  // from this slot must not deliver into a successor slot that reuses the
+  // display_N stream identity (the plain stop path deliberately still
+  // delivers its final frame; removal does not).
+  bumpDisplayStreamGeneration(displayId);
   if (typeof window.retireLiveDisplayWorkspaceSlot === 'function') {
     window.retireLiveDisplayWorkspaceSlot(displayId);
   }

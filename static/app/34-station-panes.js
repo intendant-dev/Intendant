@@ -1877,6 +1877,13 @@ async function stationOpenTranscript(sessionId, opts = {}) {
   ).trim() || 'intendant';
   const label = stationSessionTask(session) || shortSessionId(sid);
   if (!opts.refresh) stationStatus(`Loading transcript ${shortSessionId(sid)}`);
+  // Settle-edge seed, sampled SYNCHRONOUSLY before the detail fetch: the
+  // phase can flip idle during the await, and seeding from the post-await
+  // value would record an open-while-active session as never-active —
+  // silently skipping its one settling refetch.
+  const phaseAtOpen = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
+  );
   let payload;
   try {
     const data = await fetchSessionDetailPayload(sid, { source, limit: 300 });
@@ -1905,13 +1912,8 @@ async function stationOpenTranscript(sessionId, opts = {}) {
     console.warn('station set_transcript rejected:', err);
   }
   if (accepted) {
-    // Seed the settle-edge tracker from the phase at open, so a session
-    // that goes inactive before the first poll evaluation still gets its
-    // one final refetch (stationMaybeRefreshTranscript maintains it from
-    // here on).
-    const phaseAtOpen = String(
-      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
-    );
+    // Seed the settle-edge tracker from the pre-fetch phase sample above;
+    // stationMaybeRefreshTranscript maintains it from here on.
     stationTranscriptLive = {
       sessionId: sid,
       source,
@@ -1934,6 +1936,16 @@ async function stationOpenTranscript(sessionId, opts = {}) {
 function stationMaybeRefreshTranscript(force = false) {
   const live = stationTranscriptLive;
   if (!live || !stationRenderedPrimaryActive()) return;
+  // Observe the phase on EVERY call, BEFORE the fetch throttles below can
+  // return: arming is set-only here, so a short turn that starts and
+  // settles entirely inside the 8 s age window (whose calls all early-out
+  // below) still arms the settle edge. The grant is consumed only at an
+  // actual fetch decision, never by an early return.
+  const phase = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+  );
+  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  if (phase && !inactive) live.lastActivePhaseSeen = true;
   const age = Date.now() - live.fetchedAt;
   if (!force && age < 1500) return;
   const key = stationLatestEventKeyForSession(live.sessionId);
@@ -1942,22 +1954,16 @@ function stationMaybeRefreshTranscript(force = false) {
   // Idle-arm gate: the ~8 s fallback exists for sessions whose output
   // never surfaces in the activity stream — but when the stream key is
   // UNCHANGED and the session itself reports an inactive phase, there is
-  // nothing new to fetch. One exception, tracked via lastActivePhaseSeen:
+  // nothing new to fetch. One exception, the settle edge armed above:
   // output that lands transcript-only just before the phase settles would
   // otherwise never be fetched (key unchanged forever + phase now
-  // inactive), so the active→inactive TRANSITION grants exactly one final
-  // refetch before the gate parks. Unknown phase keeps the old fallback
-  // cadence (fail open).
-  const phase = String(
-    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
-  );
-  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  // inactive), so an observed active→inactive transition grants exactly
+  // one final refetch before the gate parks. Unknown phase keeps the old
+  // fallback cadence (fail open).
   if (inactive) {
     const settleEdge = live.lastActivePhaseSeen === true;
     live.lastActivePhaseSeen = false;
     if (!force && !settleEdge && key === live.lastEventKey) return;
-  } else if (phase) {
-    live.lastActivePhaseSeen = true;
   }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;
