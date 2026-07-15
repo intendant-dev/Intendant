@@ -58,7 +58,15 @@
 //!      class). Classification runs over argv[2..]; see `probe.rs`.
 //!   3. **Class detection.** The euid's username, matched against the
 //!      config's `ci_users`, splits invocations into `ci` and `local`.
-//!   4. **Permits.** Own-class reservation first, then borrow the other
+//!   4. **The link gate.** A heavyweight final link (bin / `--test` target
+//!      emitting `link` — see `link.rs`) first takes one of the
+//!      machine-global `link_slots` flock slots, BEFORE its ordinary
+//!      permit: a waiter on the link gate holds nothing (no
+//!      ordinary-permit hoarding), and no permit holder ever waits on the
+//!      link slot, so the wait graph is acyclic. Gate failure degrades
+//!      (logged, ordinary governance kept); only the global fail-open
+//!      paths drop governance entirely.
+//!   5. **Permits.** Own-class reservation first, then borrow the other
 //!      class's spare permits iff that class has no registered waiters,
 //!      else register demand and poll — see `permits.rs` for the demand-gate
 //!      protocol. Nothing is ever killed or signalled; borrowed permits
@@ -87,6 +95,8 @@ mod config;
 mod flock;
 #[cfg(unix)]
 mod govlog;
+#[cfg_attr(not(unix), allow(dead_code))]
+mod link;
 #[cfg(unix)]
 mod permits;
 mod probe;
@@ -122,7 +132,7 @@ fn main() {
     let cfg = config::load(&config_path);
     let wrap = usable_wrap_with(cfg.as_ref());
     #[cfg(unix)]
-    run_unix(&real, &args, wrap, cfg, &config_path);
+    run_unix(&real, &args, wrap, cfg, &config_path, &lossy);
     #[cfg(not(unix))]
     run_portable(&real, &args, wrap);
 }
@@ -203,16 +213,17 @@ fn run_unix(
     wrap: Option<PathBuf>,
     cfg: Option<config::Config>,
     config_path: &Path,
+    lossy: &[String],
 ) -> ! {
-    match governed_permit(cfg, config_path) {
-        // Fail-open: no permit is held, so there is no fd whose lifetime
+    match governed_guards(cfg, config_path, lossy) {
+        // Fail-open: nothing is held, so there is no fd whose lifetime
         // must outlast the chain — exec(2) keeps the zero-overhead shape
         // (this process image simply BECOMES the chain, and a disabled
         // governor stays indistinguishable from a plain sccache
         // rustc-wrapper).
         None => exec_wrap_chain(real, args, wrap.as_deref()),
-        // Governed: the permit is parent-held — see `run_governed`.
-        Some(permit) => run_governed(real, args, wrap.as_deref(), permit),
+        // Governed: every lock is parent-held — see `run_governed`.
+        Some(guards) => run_governed(real, args, wrap.as_deref(), guards),
     }
 }
 
@@ -256,21 +267,23 @@ fn exec_wrap_chain(real: &Path, args: &[OsString], wrap: Option<&Path>) -> ! {
 /// and the child orphans and finishes its current compile momentarily
 /// ungoverned.
 #[cfg(unix)]
-fn run_governed(
-    real: &Path,
-    args: &[OsString],
-    wrap: Option<&Path>,
-    permit: permits::AcquiredPermit,
-) -> ! {
+fn run_governed(real: &Path, args: &[OsString], wrap: Option<&Path>, guards: Guards) -> ! {
+    let Guards {
+        permit,
+        link,
+        link_done,
+    } = guards;
+    let started = std::time::Instant::now();
     let Some(mut child) = spawn_chain(real, args, wrap) else {
         // Neither the wrap chain nor the compiler would spawn (messages
         // already printed by spawn_chain).
+        drop(link);
         drop(permit);
         std::process::exit(127);
     };
     // Between spawn and handler install, TERM/INT/HUP still hits the
-    // default disposition: the governor dies, the kernel releases the
-    // permit, the child orphans — the documented crash semantics, for a
+    // default disposition: the governor dies, the kernel releases every
+    // lock, the child orphans — the documented crash semantics, for a
     // few-instruction window.
     CHILD_PID.store(child.id() as i32, Ordering::Release);
     install_signal_forwarders();
@@ -278,10 +291,18 @@ fn run_governed(
     // The child is reaped: its pid is free for reuse, so the forwarders
     // must stop aiming at it before this process does anything else.
     CHILD_PID.store(0, Ordering::Release);
-    // The permit was held for the child's whole run (the fd kept
-    // O_CLOEXEC, so the child never saw it); releasing it now is
-    // release-on-exit made explicit.
+    // Both locks were held for the child's whole run (the fds kept
+    // O_CLOEXEC, so the child never saw them); releasing them now —
+    // before the log write below — is release-on-exit made explicit.
+    drop(link);
     drop(permit);
+    if let Some((permit_dir, crate_name)) = link_done {
+        govlog::log_link_done(
+            &permit_dir,
+            crate_name.as_deref(),
+            started.elapsed().as_millis() as u64,
+        );
+    }
     match status {
         Ok(status) => exit_like_child(status),
         Err(err) => {
@@ -412,20 +433,35 @@ fn exit_like_child(status: std::process::ExitStatus) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Decide whether this invocation is governed, and if so acquire its
-/// permit. `None` always means "run ungoverned" — every fail-open path
-/// funnels here, and the caller execs the same `wrap_with` chain,
-/// permitless: a disabled governor must be indistinguishable from a
-/// plain sccache rustc-wrapper. On `Some`, the permit fd deliberately
-/// keeps std's FD_CLOEXEC: the caller stays alive as the permit-holding
-/// parent, and the fd must be invisible to every child — a leaked fd in
-/// a long-lived child (in production: the sccache server the client
-/// daemonizes on demand) keeps the flock held long after the compile.
+/// Everything a governed invocation holds, parent-side, for the chain's
+/// whole run. Every fd keeps std's FD_CLOEXEC and must stay invisible to
+/// every child — a leaked fd in a long-lived child (in production: the
+/// sccache server the client daemonizes on demand) keeps its flock held
+/// long after the compile.
 #[cfg(unix)]
-fn governed_permit(
+struct Guards {
+    permit: permits::AcquiredPermit,
+    /// The held slot for a GATED heavyweight link; `None` for ordinary
+    /// compiles and for heavyweights running with the gate off/degraded.
+    link: Option<permits::AcquiredLinkSlot>,
+    /// `(permit_dir, crate name)` for every heavyweight link, gated or
+    /// not: drives the `kind=link-done` runtime line the soak data needs.
+    link_done: Option<(PathBuf, Option<String>)>,
+}
+
+/// Decide whether this invocation is governed, and if so acquire what it
+/// holds: the machine-global link slot first for heavyweight links (the
+/// no-hoarding order — a link-gate waiter owns nothing), then the ordinary
+/// class permit. `None` always means "run ungoverned" — every fail-open
+/// path funnels here, and the caller execs the same `wrap_with` chain,
+/// lockless: a disabled governor must be indistinguishable from a plain
+/// sccache rustc-wrapper.
+#[cfg(unix)]
+fn governed_guards(
     cfg: Option<config::Config>,
     config_path: &Path,
-) -> Option<permits::AcquiredPermit> {
+    lossy: &[String],
+) -> Option<Guards> {
     // Secondary, per-invocation kill switch (the config file is the primary
     // one). Any value other than "off" is ignored.
     if std::env::var_os("INTENDANT_GOVERNOR").is_some_and(|v| v == "off") {
@@ -437,15 +473,54 @@ fn governed_permit(
     if !cfg.enabled {
         return None;
     }
+    // Zero ordinary permits = the documented "governs nothing" state:
+    // checked before the link gate so a fail-open box never parks a
+    // heavyweight on a slot it would immediately have to drop.
+    if cfg.local_reserved == 0 && cfg.ci_reserved == 0 {
+        return None;
+    }
+    let classified = link::classify(lossy);
+    let (link_slot, link_disposition) = if classified.heavy {
+        match permits::acquire_link_slot(&cfg, config_path) {
+            permits::LinkGate::Held(slot) => (Some(slot), None),
+            permits::LinkGate::Off => (None, Some(govlog::LinkDisposition::Off)),
+            permits::LinkGate::Degraded => (None, Some(govlog::LinkDisposition::Degraded)),
+            permits::LinkGate::FailOpen => return None,
+        }
+    } else {
+        (None, None)
+    };
     let class = permits::classify(permits::current_username().as_deref(), &cfg);
-    let permit = permits::acquire(&cfg, class, config_path)?;
+    let Some(permit) = permits::acquire(&cfg, class, config_path) else {
+        // Mid-wait kill switch or an unusable ordinary pool: the whole
+        // invocation fails open. The link guard is dropped HERE, before
+        // the caller execs — never carried into a fail-open chain.
+        drop(link_slot);
+        return None;
+    };
+    let disposition = match &link_slot {
+        Some(slot) => Some(govlog::LinkDisposition::Gated {
+            slot: &slot.name,
+            link_wait_ms: slot.wait_ms,
+        }),
+        None => link_disposition,
+    };
     govlog::log_governed(
         &cfg.permit_dir,
         class.as_str(),
+        classified.crate_name.as_deref(),
+        disposition.as_ref(),
         &permit.name,
         permit.wait_ms,
     );
-    Some(permit)
+    let link_done = classified
+        .heavy
+        .then(|| (cfg.permit_dir.clone(), classified.crate_name.clone()));
+    Some(Guards {
+        permit,
+        link: link_slot,
+        link_done,
+    })
 }
 
 /// The governor is a Unix (macOS / Linux) tool — flock(2) permit pools

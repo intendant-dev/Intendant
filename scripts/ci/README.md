@@ -115,10 +115,17 @@ build out of the governor entirely — observed in the wild from an agent
 session (an ungoverned 1.8GB rustc while all permits sat free). The
 box's inhabitants are cooperative agents, so the enforcement stack is
 doctrine (CLAUDE.md forbids the override outside wrapper diagnostics)
-plus observability (the watchdog logs any substantial rustc with
-neither a governor nor an sccache ancestor). Enforcement below cargo's
-overridable layer was considered and deliberately skipped as
-disproportionate.
+plus observability: the watchdog logs any substantial rustc with
+neither a governor nor an sccache ancestor, every tick INCLUDING
+mid-job (an active CI job is precisely when big compiles exist — the
+detector originally sat below the watchdog's job_running early return
+and was blind through every one). The `GOVERNOR_MONITOR` conf knob
+gates it: `auto` (default) runs it only where the governor config file
+exists; governed hosts set `on` explicitly so an accidentally deleted
+governor config — the exact fail-open state worth surfacing — cannot
+silence the detector along with the governor; `off` for hosts that
+will never govern. Enforcement below cargo's overridable layer was
+considered and deliberately skipped as disproportionate.
 
 ### The chain
 
@@ -215,6 +222,45 @@ class has waiters and its reservation is honored. Nothing is ever
 killed or signalled; borrowed permits return naturally when their
 holder exits.
 
+### The link gate: heavyweight final links serialize
+
+The count ceiling alone proved insufficient the day every slot held a
+LINK (2026-07-15, with the governor verified correct — no bypass, no
+leak): a debug `intendant` link peaks ~2GiB linker RSS, and two of them
+concurrently drove the host compressor to 10–11GB with sustained
+two-way swap; a plain `cargo build` then launched three final links at
+once and pushed swap-out to ~124MiB/s. The causal probe was clean (two
+links = severe churn, one = recovering, zero = idle), so the gate
+matches it: ordinary compiles keep the permit pool, heavyweight links
+additionally serialize through `link_slots` machine-GLOBAL flock slots
+(`link-<i>` in the permit dir — classless on purpose: host memory does
+not care whose link it is).
+
+A heavyweight link is a bin / `--test` target that emits `link`
+(including rustc's no-`--emit` default); build scripts
+(`build_script_*` — a cargo-wide convention, dozens of trivial links
+per cold build) and library crate types are exempt, with `cdylib`
+exempt as a *scoped policy call* on today's small wasm links. Blanket
+bin/test gating with no crate allowlist is deliberate for the first
+soak — reliability first; the log's link fields are the data any
+future allowlist or weighting must earn itself with. Full
+classification contract + pinned argv matrix:
+`crates/rustc-governor/src/link.rs`.
+
+Acquisition order is load-bearing: **link slot first, ordinary permit
+second**. A link-gate waiter holds NOTHING — no ordinary-permit
+hoarding (cargo really does launch three links at once; under the
+reverse order they would pin three permits and starve every ordinary
+compile) — and no permit holder ever waits on the link slot, so the
+wait graph is acyclic. The cost, a held slot idling while its owner
+queues for a permit, delays other links only. There is deliberately no
+FIFO/fairness machinery in the flock+poll design; the soak telemetry
+decides whether any is ever needed. Gate failure DEGRADES instead of
+failing open: if no slot file is usable (config grown past the
+installer-minted files), the link runs ungated but still takes its
+ordinary permit — only the global kill-switch paths drop governance
+entirely. `link_slots = 0` is the per-box opt-out.
+
 ### Fail-open doctrine + live kill switch
 
 A governor must never break a build — and, since the wrapper-chain flip,
@@ -226,13 +272,18 @@ chain when it is configured (a disabled governor is indistinguishable
 from a plain sccache rustc-wrapper; only a missing/unparseable config,
 which cannot know `wrap_with`, runs the compiler directly). The config
 is re-read by every invocation (and once per poll tick by in-flight
-waiters), so `/usr/local/etc/intendant-governor.toml` is live: flipping
+waiters — link-slot waiters included), so
+`/usr/local/etc/intendant-governor.toml` is live: flipping
 `enabled = false` drains the governor within ~100ms, no listener
-restarts. Observability: one line per *governed* invocation in
-`<permit_dir>/governor.log` (timestamp, pid, class, permit, wait_ms;
-truncate-in-place rotation at 1MB keeping the last 256K — the hooks-log
-doctrine, because governed accounts can write the pre-created file but
-not create siblings in the root-owned dir).
+restarts. Observability: one acquisition line per *governed* invocation
+in `<permit_dir>/governor.log` — timestamp, pid, class, crate,
+`kind=compile` / `kind=link link_slot=… link_wait_ms=…` /
+`kind=link-ungated reason=off|degraded`, permit, wait_ms — plus one
+`kind=link-done runtime_ms=…` completion line per heavyweight link
+(gated or not): crate, both waits, and runtime are the soak data that
+size the link gate. Truncate-in-place rotation at 1MB keeping the last
+256K — the hooks-log doctrine, because governed accounts can write the
+pre-created file but not create siblings in the root-owned dir.
 
 ### Sizing, install, rollout
 
@@ -240,17 +291,27 @@ Per box: `local_reserved + ci_reserved` = the machine-wide ceiling of
 concurrent rustc processes; the per-account jobs cap still bounds any
 single cargo underneath it. The 24GB two-listener Mac runs 1 + 2.
 Don't set a class to 0 unless it truly never compiles — its members
-would then depend entirely on borrowing.
+would then depend entirely on borrowing. `link_slots` (default 1 in the
+binary, so a binary upgrade turns the gate on with pre-gate configs)
+sizes the heavyweight-link gate per box: keep 1 on small-memory hosts;
+a big-RAM box can raise it — after the installer re-run that mints the
+extra `link-<i>` files — or set 0 to opt out of link gating alone.
 
 ```bash
 cargo build --release -p rustc-governor
 sudo scripts/ci/install-governor-macos.sh   # binary + permit dir + conf
 ```
 
-The installer never edits account cargo configs; it prints the
+The installer mints config and lock assets BEFORE swapping the binary
+(old binaries ignore the new key and files; a new binary must never run
+ahead of the root-minted slot files it gates on), and upgrades deploy
+during a quiescent no-link interval — an already-running old governor
+cannot retroactively acquire a gate it never knew about. It never edits
+account cargo configs; it prints the
 `[build] rustc-wrapper = ".../rustc-governor"` line to set per account
-(replacing sccache as the wrapper — the governor execs sccache itself,
-via the conf's `wrap_with` key) and the legacy `rustc = ".../rustc-governor"`
+(replacing sccache as the wrapper — the governor runs sccache itself as
+a governed CHILD, per the conf's `wrap_with` key: parent-held locks,
+never an exec over them) and the legacy `rustc = ".../rustc-governor"`
 line to REMOVE (cargo passes the real compiler as argv[1] now; a
 leftover rustc= line would hand the governor itself, which it refuses
 with exit 127 rather than exec-looping). The installer never overwrites

@@ -27,6 +27,15 @@ CAP_GB=50         # total per cache root (2 listeners x 25G budget)
 #MEM_PAUSE_TICKS=2      # consecutive pressured ticks before pausing
 #MEM_RESUME_TICKS=2     # consecutive normal ticks before resuming
 
+# Ungoverned-rustc detector (runs every tick, even mid-job — read-only):
+# logs any substantial rustc with neither a rustc-governor nor an sccache
+# ancestor. on | off | auto; auto (the default) runs it only where the
+# governor config file exists. Set `on` explicitly on governed hosts so an
+# accidentally deleted governor config — the exact fail-open state worth
+# surfacing — cannot silence the detector along with the governor.
+#GOVERNOR_MONITOR=auto
+#GOVERNOR_CONF=/usr/local/etc/intendant-governor.toml
+
 VOLUME="/"
 STATE_DIR="/var/db/intendant-ci"        # /var/lib/intendant-ci on Linux
 LOG="/var/log/intendant-ci-watchdog.log"

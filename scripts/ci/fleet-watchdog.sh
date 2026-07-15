@@ -55,6 +55,12 @@ MEM_PRESSURE_LEVEL="${MEM_PRESSURE_LEVEL:-4}"
 MEM_PSI_PAUSE="${MEM_PSI_PAUSE:-40}"
 MEM_PAUSE_TICKS="${MEM_PAUSE_TICKS:-2}"
 MEM_RESUME_TICKS="${MEM_RESUME_TICKS:-2}"
+# Ungoverned-rustc detector: on | off | auto (auto = run only where the
+# governor config file exists). Set `on` explicitly on governed hosts so
+# an accidentally deleted governor config — the exact fail-open state the
+# detector should surface — cannot silence the detector with it.
+GOVERNOR_MONITOR="${GOVERNOR_MONITOR:-auto}"
+GOVERNOR_CONF="${GOVERNOR_CONF:-/usr/local/etc/intendant-governor.toml}"
 mkdir -p "$STATE_DIR"
 
 log() {
@@ -198,12 +204,14 @@ evict_until() {
 }
 
 # Policy-ceiling observability: a substantial rustc with neither a
-# rustc-governor nor an sccache ancestor means someone opted out of the
-# governor (env beats config: RUSTC_WRAPPER="" / RUSTC=… — seen in the
-# wild from an agent session). Log-only; the inhabitants are cooperative
-# agents and CLAUDE.md carries the doctrine. Known blind spot: a build
-# run with RUSTC_WRAPPER=sccache (bypassing the governor but keeping
-# sccache) is ancestry-indistinguishable from a governed compile.
+# rustc-governor nor an sccache ancestor means the governor was routed
+# around — env beats config (RUSTC_WRAPPER="" / RUSTC=…, seen in the wild
+# from an agent session), and a missing/disabled/malformed governor
+# config fails the whole governor open (by design) with the same
+# ancestry. Log-only; the inhabitants are cooperative agents and
+# CLAUDE.md carries the doctrine. Known blind spot: a build run with
+# RUSTC_WRAPPER=sccache (bypassing the governor but keeping sccache) is
+# ancestry-indistinguishable from a governed compile.
 detect_ungoverned_rustc() {
     ps -axo pid=,rss=,comm= 2>/dev/null | awk '$3 ~ /rustc$/ && $2 > 512000 {print $1, $2}'     | while read -r rpid rss; do
         p="$rpid" governed=0 hop=0
@@ -214,11 +222,26 @@ detect_ungoverned_rustc() {
             p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
             hop=$((hop + 1))
         done
-        [ "$governed" = 0 ] && log "ungoverned rustc pid=$rpid rss=$((rss / 1024))MB — no governor/sccache ancestor (RUSTC_WRAPPER override?)"
+        [ "$governed" = 0 ] && log "ungoverned rustc pid=$rpid rss=$((rss / 1024))MB — no governor/sccache ancestor (RUSTC_WRAPPER/RUSTC override, or governor config missing/disabled/malformed)"
     done
 }
 
+# The GOVERNOR_MONITOR gate around the detector. Read-only and cheap, so
+# it runs at the very top of every tick — BEFORE the job_running early
+# return: an active CI job is precisely when big compiles exist, and the
+# early return used to blind the detector through every one of them
+# (it also never observed a simultaneous local bypass during CI).
+monitor_ungoverned_rustc() {
+    case "$GOVERNOR_MONITOR" in
+        off) return ;;
+        auto) [ -f "$GOVERNOR_CONF" ] || return ;;
+    esac
+    detect_ungoverned_rustc
+}
+
 main() {
+    monitor_ungoverned_rustc
+
     free=$(free_gb)
 
     # macOS: purgeable space (local Time Machine snapshots) makes the
@@ -246,7 +269,6 @@ main() {
         fi
     fi
 
-    detect_ungoverned_rustc
     prune_stale_keys
     evict_until 0  # steady-state cap enforcement
 

@@ -34,6 +34,16 @@ pub struct Config {
     pub local_reserved: u32,
     /// Permits reserved for the CI accounts listed in `ci_users`.
     pub ci_reserved: u32,
+    /// Heavyweight final links (bin / `--test` targets that emit `link`)
+    /// additionally serialize through `link-<i>` slot files — concurrent
+    /// multi-GiB final links are what melt a small box, not ordinary rustc
+    /// concurrency (see link.rs). Machine-GLOBAL, deliberately classless:
+    /// host memory doesn't care whose link it is. `0` disables the link
+    /// gate (heavyweight links then take only their ordinary permit); the
+    /// gate also degrades to that when no slot file is usable (config
+    /// grown past the installer-minted files in a root-owned dir) — link
+    /// gating may degrade, ordinary governance never rides with it.
+    pub link_slots: u32,
     /// Usernames whose invocations are classed `ci`; everyone else is
     /// `local`.
     pub ci_users: Vec<String>,
@@ -56,6 +66,11 @@ impl Default for Config {
             permit_dir: PathBuf::from(DEFAULT_PERMIT_DIR),
             local_reserved: 1,
             ci_reserved: 2,
+            // Default ON at 1: a binary upgrade alone turns the gate on
+            // (the installer never overwrites live configs, and unknown
+            // keys are ignored, so pre-gate configs stay parseable while
+            // this default carries the policy).
+            link_slots: 1,
             ci_users: vec!["_intendant-ci".to_string(), "ci".to_string()],
             wrap_with: None,
         }
@@ -100,6 +115,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             "local_reserved" => cfg.local_reserved = parse_u32(value).map_err(|e| err(&e))?,
             "ci_reserved" => cfg.ci_reserved = parse_u32(value).map_err(|e| err(&e))?,
+            "link_slots" => cfg.link_slots = parse_u32(value).map_err(|e| err(&e))?,
             "ci_users" => cfg.ci_users = parse_string_array(value).map_err(|e| err(&e))?,
             "wrap_with" => {
                 // Empty means unset: the installer's here-doc always writes
@@ -244,6 +260,7 @@ enabled = true
 permit_dir = "/usr/local/var/intendant-governor"
 local_reserved = 1
 ci_reserved = 2   # per-box sizing
+link_slots = 1
 ci_users = ["_intendant-ci", "ci"]
 wrap_with = "/opt/homebrew/bin/sccache"
 "#;
@@ -269,6 +286,7 @@ wrap_with = "/opt/homebrew/bin/sccache"
             "permit_dir = \"/tmp/x\" # trailing comment\n",
             "local_reserved = 3\n",
             "ci_reserved = 0\n",
+            "link_slots = 4\n",
             "ci_users = [\"a\", \"b\",]\n",
             "wrap_with = \"/opt/sccache\"\n",
         );
@@ -277,8 +295,21 @@ wrap_with = "/opt/homebrew/bin/sccache"
         assert_eq!(cfg.permit_dir, PathBuf::from("/tmp/x"));
         assert_eq!(cfg.local_reserved, 3);
         assert_eq!(cfg.ci_reserved, 0);
+        assert_eq!(cfg.link_slots, 4);
         assert_eq!(cfg.ci_users, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(cfg.wrap_with, Some(PathBuf::from("/opt/sccache")));
+    }
+
+    /// Pre-gate configs carry no `link_slots` key: the code default (1)
+    /// turns the gate on with a binary upgrade alone — the rollout
+    /// property the deploy ordering relies on. `0` is the explicit
+    /// per-box opt-out.
+    #[test]
+    fn link_slots_defaults_on_and_zero_is_the_opt_out() {
+        assert_eq!(parse("enabled = true\n").unwrap().link_slots, 1);
+        assert_eq!(parse("link_slots = 0\n").unwrap().link_slots, 0);
+        assert!(parse("link_slots = -1\n").is_err());
+        assert!(parse("link_slots = many\n").is_err());
     }
 
     #[test]
