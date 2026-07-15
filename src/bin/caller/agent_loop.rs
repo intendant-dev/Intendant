@@ -1034,10 +1034,13 @@ pub(crate) async fn run_agent_loop(
             remaining,
         });
 
-        // When CU is enabled, the OpenAI computer tool rejects multiple images.
-        // Strip all but the most recent screenshot before each API call so the
-        // logged context matches the payload sent to the model.
-        if provider.cu_enabled() {
+        // The OpenAI computer tool rejects multiple non-CU images, so
+        // CU-enabled providers that need it get all but the most recent
+        // screenshot stripped before each API call (keeping the logged
+        // context matching the payload). Providers that accept multi-image
+        // histories (Anthropic) opt out: mutating old messages would
+        // invalidate their prompt-cache prefix from the mutation point.
+        if provider.requires_image_stripping() {
             conversation.strip_old_images();
         }
 
@@ -2074,12 +2077,24 @@ pub(crate) async fn run_agent_loop(
                 &batch.nonce_to_call_id,
                 &batch.call_id_names,
             );
+            // The context-budget line is appended once per turn — on the
+            // batch's final result — not on every result: N copies per turn
+            // were pure token filler (~25 tokens each, re-billed with the
+            // whole transcript on every subsequent request) and carried no
+            // extra signal for the model.
             let budget = conversation.budget_summary();
-            for (call_id, tool_name, result_text) in &tool_results {
+            let last_unhandled = tool_results
+                .iter()
+                .rposition(|(call_id, _, _)| !handled_call_ids.contains(call_id));
+            for (i, (call_id, tool_name, result_text)) in tool_results.iter().enumerate() {
                 if handled_call_ids.contains(call_id) {
                     continue;
                 }
-                let text = format!("{}\n\n{}", result_text, budget);
+                let text = if Some(i) == last_unhandled {
+                    format!("{}\n\n{}", result_text, budget)
+                } else {
+                    result_text.clone()
+                };
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
                         conversation.add_tool_result_with_images(call_id, tool_name, &text, images);

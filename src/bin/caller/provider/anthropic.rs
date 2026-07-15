@@ -207,9 +207,11 @@ impl AnthropicProvider {
 
     /// Build the messages POST through whichever auth path this instance
     /// carries. `headers` excludes credentials; the relay adds those.
+    /// Takes the request pre-serialized so the body is produced exactly once
+    /// per call (retries memcpy the bytes instead of re-walking the DOM).
     pub(crate) async fn post_messages(
         &self,
-        request_json: &serde_json::Value,
+        request_body: &[u8],
         beta_header: &str,
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
@@ -224,18 +226,18 @@ impl AnthropicProvider {
                         .header("anthropic-version", "2023-06-01")
                         .header("anthropic-beta", beta_header)
                         .header("content-type", "application/json")
-                        .json(request_json);
+                        .body(request_body.to_vec());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)
                     } else {
                         request
                     }
                 };
-                let response = if streaming {
-                    builder().send().await?
-                } else {
-                    send_with_retry(&self.client, builder, MAX_RETRIES).await?
-                };
+                // Streaming goes through the same retry policy: the status
+                // is known before any body bytes stream, so a 429/529/5xx at
+                // request-open — routine provider throttling — retries with
+                // backoff instead of killing the session turn.
+                let response = send_with_retry(&self.client, builder, MAX_RETRIES).await?;
                 Ok(ProviderHttpResponse::Direct(response))
             }
             ProviderAuth::ClientEgress { kind } => {
@@ -244,8 +246,7 @@ impl AnthropicProvider {
                     ("anthropic-beta".to_string(), beta_header.to_string()),
                     ("content-type".to_string(), "application/json".to_string()),
                 ];
-                let body = serde_json::to_vec(request_json).map_err(CallerError::Json)?;
-                crate::credential_egress::fetch(kind, "POST", &url, headers, body)
+                crate::credential_egress::fetch(kind, "POST", &url, headers, request_body.to_vec())
                     .await
                     .map(ProviderHttpResponse::Egress)
                     .map_err(CallerError::Provider)
@@ -331,7 +332,9 @@ impl ChatProvider for AnthropicProvider {
             stream: false,
         };
 
-        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
+        // Serialize once, straight to bytes — `to_value` + `.json()` walked
+        // the full request (images included) twice per call.
+        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
 
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
@@ -340,7 +343,7 @@ impl ChatProvider for AnthropicProvider {
         };
 
         let response = self
-            .post_messages(&request_json, beta_header, false)
+            .post_messages(&request_body, beta_header, false)
             .await?;
 
         if !response.status_success() {
@@ -455,6 +458,13 @@ impl ChatProvider for AnthropicProvider {
         self.cu_display = Some(dims);
     }
 
+    /// Anthropic accepts multi-image histories, so superseded screenshots
+    /// stay in place: `strip_old_images` mutates earlier messages, which
+    /// would invalidate the prompt-cache prefix from the mutation point.
+    fn requires_image_stripping(&self) -> bool {
+        false
+    }
+
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
             self.custom_tools
@@ -501,7 +511,7 @@ impl ChatProvider for AnthropicProvider {
             tools,
             stream: true,
         };
-        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
+        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
 
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
@@ -509,7 +519,7 @@ impl ChatProvider for AnthropicProvider {
             "prompt-caching-2024-07-31"
         };
 
-        let response = self.post_messages(&request_json, beta_header, true).await?;
+        let response = self.post_messages(&request_body, beta_header, true).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -833,6 +843,66 @@ pub(crate) fn anthropic_duration_ms(input: &serde_json::Value, default_ms: u64) 
     }
 }
 
+/// Number of rolling `cache_control` breakpoints placed on the conversation
+/// tail. Two (not one) so the chain survives Anthropic's ~20-content-block
+/// cache lookback: the marker on the previous user turn sits exactly where
+/// last request's tail marker sat, guaranteeing a hit there even when a
+/// large tool batch pushes the newest marker more than 20 blocks forward.
+const ROLLING_CACHE_BREAKPOINTS: usize = 2;
+
+/// Attach `cache_control: {type: "ephemeral"}` to the final content block of
+/// the last [`ROLLING_CACHE_BREAKPOINTS`] user-side messages. Anthropic
+/// caches the prefix up to each breakpoint, so a marker that advances with
+/// the conversation makes every request re-read the previous request's
+/// prefix at ~0.1× input price instead of re-billing the whole transcript
+/// at full rate each turn. Budget: 1 breakpoint on system (which also
+/// covers tools, rendered before it) + 2 rolling here = 3 of the allowed 4.
+fn apply_rolling_cache_breakpoints(api_messages: &mut [AnthropicMessage]) {
+    let mut remaining = ROLLING_CACHE_BREAKPOINTS;
+    for msg in api_messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        // Anchor on user-side messages only (plain user turns and
+        // tool_result carriers): the last message of every request is
+        // user-side, and anchoring the same two positions across
+        // consecutive requests is what makes the prefix re-readable.
+        if msg.role == "user" && attach_cache_control(&mut msg.content) {
+            remaining -= 1;
+        }
+    }
+}
+
+/// Set `cache_control` on the final content block of a message body.
+/// Plain-string content is promoted to an equivalent single text block
+/// (the API-documented shorthand equivalence, so the promotion itself
+/// never changes the cached prefix). Returns false when the message has
+/// no block to carry the marker (e.g. empty text).
+fn attach_cache_control(content: &mut serde_json::Value) -> bool {
+    let marker = serde_json::json!({"type": "ephemeral"});
+    match content {
+        serde_json::Value::Array(blocks) => match blocks.last_mut() {
+            Some(serde_json::Value::Object(block)) => {
+                block.insert("cache_control".to_string(), marker);
+                true
+            }
+            _ => false,
+        },
+        serde_json::Value::String(text) => {
+            if text.is_empty() {
+                return false;
+            }
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": std::mem::take(text),
+                "cache_control": marker,
+            }]);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn build_anthropic_messages(
     messages: &[Message],
 ) -> (serde_json::Value, Vec<AnthropicMessage>) {
@@ -941,6 +1011,7 @@ pub(crate) fn build_anthropic_messages(
             });
         }
     }
+    apply_rolling_cache_breakpoints(&mut api_messages);
     (system, api_messages)
 }
 
@@ -1264,5 +1335,127 @@ mod tests {
         let tool_result = &content[0];
         // content should be a plain string, not an array
         assert!(tool_result["content"].is_string());
+    }
+
+    // --- Rolling conversation cache breakpoints ---
+
+    fn user_text(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn tool_result_msg(call_id: &str, text: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: text.to_string(),
+            tool_call_id: Some(call_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Final content block of a built message, as an object.
+    fn last_block(msg: &AnthropicMessage) -> &serde_json::Map<String, serde_json::Value> {
+        msg.content
+            .as_array()
+            .and_then(|blocks| blocks.last())
+            .and_then(|b| b.as_object())
+            .expect("anchored message should have a block-array body")
+    }
+
+    fn has_marker(block: &serde_json::Map<String, serde_json::Value>) -> bool {
+        block.get("cache_control") == Some(&serde_json::json!({"type": "ephemeral"}))
+    }
+
+    #[test]
+    fn rolling_breakpoints_land_on_last_two_user_messages() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            user_text("turn one"),
+            assistant_text("reply one"),
+            tool_result_msg("call_1", "older result"),
+            assistant_text("reply two"),
+            tool_result_msg("call_2", "newest result"),
+        ];
+        let (system, api_msgs) = build_anthropic_messages(&messages);
+        assert_eq!(api_msgs.len(), 5);
+
+        // The two newest user-side messages carry the marker...
+        assert!(has_marker(last_block(&api_msgs[4])), "newest tool_result");
+        assert!(has_marker(last_block(&api_msgs[2])), "previous tool_result");
+        // ...and it rides the tool_result block itself.
+        assert_eq!(
+            last_block(&api_msgs[4])
+                .get("type")
+                .and_then(|t| t.as_str()),
+            Some("tool_result")
+        );
+
+        // Older user turns and assistant turns stay unmarked (byte-stable
+        // prefix), and assistant bodies remain plain strings.
+        assert!(api_msgs[0].content.is_string(), "older user turn untouched");
+        assert!(api_msgs[1].content.is_string(), "assistant untouched");
+        assert!(api_msgs[3].content.is_string(), "assistant untouched");
+
+        // Whole-request budget: system + 2 rolling = 3 of Anthropic's 4.
+        let serialized = serde_json::to_string(&(system, api_msgs)).unwrap();
+        assert_eq!(serialized.matches("cache_control").count(), 3);
+    }
+
+    #[test]
+    fn rolling_breakpoint_promotes_plain_string_user_message() {
+        let messages = vec![user_text("hello")];
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        let block = last_block(&api_msgs[0]);
+        assert_eq!(block.get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(block.get("text").and_then(|t| t.as_str()), Some("hello"));
+        assert!(has_marker(block));
+    }
+
+    #[test]
+    fn rolling_breakpoint_rides_final_image_block() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            tool_msg_with_images(),
+        ];
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        // tool_result carrier: the marker goes on the tool_result block
+        // (the message's final block), leaving its inner content intact.
+        let block = last_block(&api_msgs[0]);
+        assert_eq!(
+            block.get("type").and_then(|t| t.as_str()),
+            Some("tool_result")
+        );
+        assert!(has_marker(block));
+        let inner = block["content"].as_array().unwrap();
+        assert_eq!(inner[1]["type"].as_str(), Some("image"));
+        assert!(inner[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn rolling_breakpoints_skip_empty_user_messages() {
+        let messages = vec![user_text("real turn"), user_text("")];
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        // The empty tail can't carry a marker; the previous turn still does.
+        assert!(api_msgs[1].content.is_string());
+        assert!(has_marker(last_block(&api_msgs[0])));
     }
 }

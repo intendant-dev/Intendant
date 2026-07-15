@@ -103,11 +103,12 @@ impl GeminiProvider {
 
     /// POST a generateContent-family request through whichever auth path
     /// this instance carries. Auth never rides an egress request — the
-    /// relay attaches `x-goog-api-key` from the vault.
+    /// relay attaches `x-goog-api-key` from the vault. Takes the request
+    /// pre-serialized so the body is produced exactly once per call.
     pub(crate) async fn post_generate(
         &self,
         url: &str,
-        request_body: &serde_json::Value,
+        request_body: &[u8],
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
         match &self.auth {
@@ -118,24 +119,23 @@ impl GeminiProvider {
                         .post(url)
                         .header("content-type", "application/json")
                         .header("x-goog-api-key", api_key)
-                        .json(request_body);
+                        .body(request_body.to_vec());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)
                     } else {
                         request
                     }
                 };
-                let response = if streaming {
-                    builder().send().await?
-                } else {
-                    send_with_retry(&self.client, builder, MAX_RETRIES).await?
-                };
+                // Streaming goes through the same retry policy: the status
+                // is known before any body bytes stream, so a 429/5xx at
+                // request-open retries with backoff instead of killing the
+                // session turn.
+                let response = send_with_retry(&self.client, builder, MAX_RETRIES).await?;
                 Ok(ProviderHttpResponse::Direct(response))
             }
             ProviderAuth::ClientEgress { kind } => {
                 let headers = vec![("content-type".to_string(), "application/json".to_string())];
-                let body = serde_json::to_vec(request_body).map_err(CallerError::Json)?;
-                crate::credential_egress::fetch(kind, "POST", url, headers, body)
+                crate::credential_egress::fetch(kind, "POST", url, headers, request_body.to_vec())
                     .await
                     .map(ProviderHttpResponse::Egress)
                     .map_err(CallerError::Provider)
@@ -161,7 +161,7 @@ impl ChatProvider for GeminiProvider {
         stream: bool,
     ) -> Result<(String, serde_json::Value), CallerError> {
         let _ = stream;
-        let (system_text, _contents, mut request_body) = build_gemini_request_parts(messages, self);
+        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
 
         if let Some(ref sys) = system_text {
             request_body["systemInstruction"] = serde_json::json!({
@@ -176,7 +176,7 @@ impl ChatProvider for GeminiProvider {
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (system_text, _contents, mut request_body) = build_gemini_request_parts(messages, self);
+        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
 
         if let Some(ref sys) = system_text {
             request_body["systemInstruction"] = serde_json::json!({
@@ -191,7 +191,8 @@ impl ChatProvider for GeminiProvider {
             self.endpoint, self.model
         );
 
-        let response = self.post_generate(&url, &request_body, false).await?;
+        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
+        let response = self.post_generate(&url, &body_bytes, false).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -346,9 +347,8 @@ impl ChatProvider for GeminiProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (system_text, contents, request_body_base) = build_gemini_request_parts(messages, self);
+        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
 
-        let mut request_body = request_body_base;
         if let Some(ref sys) = system_text {
             request_body["systemInstruction"] = serde_json::json!({
                 "parts": [{"text": sys}]
@@ -361,7 +361,8 @@ impl ChatProvider for GeminiProvider {
             self.endpoint, self.model
         );
 
-        let response = self.post_generate(&url, &request_body, true).await?;
+        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
+        let response = self.post_generate(&url, &body_bytes, true).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -483,8 +484,12 @@ impl ChatProvider for GeminiProvider {
         }
 
         let content = text_parts.join("");
-        let _ = (contents, system_text); // consumed above
-                                         // Store raw parts for echo-back (preserves thoughtSignature for Gemini CU)
+        // Store raw parts for echo-back (preserves thoughtSignature for
+        // Gemini CU). Adjacent pure-text delta parts are coalesced first:
+        // streaming produced one `{"text": …}` fragment per delta, and
+        // echoing hundreds of them back in every subsequent request body
+        // was pure wire/parse bloat.
+        let raw_model_parts = coalesce_adjacent_text_parts(raw_model_parts);
         let raw_output = if !raw_model_parts.is_empty() {
             Some(raw_model_parts)
         } else {
@@ -504,11 +509,44 @@ impl ChatProvider for GeminiProvider {
     }
 }
 
-/// Build Gemini request parts (shared between streaming and non-streaming).
+/// Merge runs of pure-text parts (objects whose only key is `"text"`) into
+/// single parts. Streaming pushes one raw part per delta, so an echoed-back
+/// model turn otherwise carries hundreds of one-word `{"text": …}`
+/// fragments in every subsequent request. Parts with any other field
+/// (`functionCall`, `thoughtSignature`, `inlineData`, …) are kept verbatim
+/// and act as merge boundaries.
+pub(crate) fn coalesce_adjacent_text_parts(
+    parts: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let is_pure_text = |part: &serde_json::Value| -> bool {
+        part.as_object()
+            .is_some_and(|obj| obj.len() == 1 && obj.get("text").is_some_and(|t| t.is_string()))
+    };
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if is_pure_text(&part) {
+            if let Some(last) = out.last_mut() {
+                if is_pure_text(last) {
+                    let addition = part["text"].as_str().unwrap_or_default().to_string();
+                    if let Some(serde_json::Value::String(text)) = last.get_mut("text") {
+                        text.push_str(&addition);
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(part);
+    }
+    out
+}
+
+/// Build the Gemini request body (shared between streaming and
+/// non-streaming): `(system_text, request_body)` with the transcript
+/// already in `request_body["contents"]`.
 pub(crate) fn build_gemini_request_parts(
     messages: &[Message],
     provider: &GeminiProvider,
-) -> (Option<String>, Vec<serde_json::Value>, serde_json::Value) {
+) -> (Option<String>, serde_json::Value) {
     let system_text = messages
         .iter()
         .find(|m| m.role == "system")
@@ -645,11 +683,14 @@ pub(crate) fn build_gemini_request_parts(
     }
 
     let mut request_body = serde_json::json!({
-        "contents": contents,
         "generationConfig": {
             "maxOutputTokens": provider.max_output_tokens,
         }
     });
+    // Move the contents tree into the body: `json!({"contents": contents})`
+    // serialized a deep copy of the whole transcript (base64 screenshots
+    // included) that every caller then dropped.
+    request_body["contents"] = serde_json::Value::Array(contents);
 
     let has_func_tools = provider.use_tools;
     let has_cu = provider.cu_enabled;
@@ -675,7 +716,7 @@ pub(crate) fn build_gemini_request_parts(
         request_body["tools"] = serde_json::Value::Array(tools_arr);
     }
 
-    (system_text, contents, request_body)
+    (system_text, request_body)
 }
 
 /// CU function names used by Gemini's computer_use tool.
@@ -888,10 +929,11 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (sys, contents, body) = build_gemini_request_parts(&messages, &provider);
+        let (sys, body) = build_gemini_request_parts(&messages, &provider);
         assert_eq!(sys.as_deref(), Some("System"));
+        let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
-        assert!(body.get("contents").is_some());
+        assert_eq!(contents[0]["parts"][0]["text"].as_str(), Some("Hi"));
     }
 
     #[test]
@@ -910,7 +952,8 @@ mod tests {
             },
             tool_msg_with_images(),
         ];
-        let (_sys, contents, _body) = build_gemini_request_parts(&messages, &provider);
+        let (_sys, body) = build_gemini_request_parts(&messages, &provider);
+        let contents = body["contents"].as_array().unwrap();
         // Should have functionResponse + user message with inlineData
         assert_eq!(contents.len(), 2);
         let img_msg = &contents[1];
@@ -952,8 +995,41 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (_sys, contents, _body) = build_gemini_request_parts(&messages, &provider);
+        let (_sys, body) = build_gemini_request_parts(&messages, &provider);
         // Should have only the functionResponse, no user image message
-        assert_eq!(contents.len(), 1);
+        assert_eq!(body["contents"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coalesce_merges_adjacent_text_runs_only() {
+        let parts = vec![
+            serde_json::json!({"text": "Hel"}),
+            serde_json::json!({"text": "lo "}),
+            serde_json::json!({"text": "world"}),
+            serde_json::json!({"functionCall": {"name": "f", "args": {}}}),
+            serde_json::json!({"text": "tail "}),
+            serde_json::json!({"text": "end"}),
+        ];
+        let out = coalesce_adjacent_text_parts(parts);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], serde_json::json!({"text": "Hello world"}));
+        assert!(out[1].get("functionCall").is_some());
+        assert_eq!(out[2], serde_json::json!({"text": "tail end"}));
+    }
+
+    #[test]
+    fn coalesce_never_merges_parts_with_extra_fields() {
+        // thoughtSignature must be echoed back verbatim — a part carrying
+        // it is not "pure text" even though it has a text field.
+        let parts = vec![
+            serde_json::json!({"text": "a", "thoughtSignature": "sig1"}),
+            serde_json::json!({"text": "b"}),
+            serde_json::json!({"text": "c"}),
+        ];
+        let out = coalesce_adjacent_text_parts(parts);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["thoughtSignature"].as_str(), Some("sig1"));
+        assert_eq!(out[0]["text"].as_str(), Some("a"));
+        assert_eq!(out[1], serde_json::json!({"text": "bc"}));
     }
 }

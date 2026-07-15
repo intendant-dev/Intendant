@@ -44,22 +44,35 @@ async fn send_with_retry(
     build_request: impl Fn() -> reqwest::RequestBuilder,
     max_retries: u32,
 ) -> Result<reqwest::Response, CallerError> {
-    let mut last_err = None;
+    let mut last_err: Option<CallerError> = None;
     for attempt in 0..=max_retries {
-        let response = build_request().send().await?;
-        if response.status().is_success() || !is_retryable_status(response.status()) {
-            return Ok(response);
+        match build_request().send().await {
+            Ok(response) => {
+                if response.status().is_success() || !is_retryable_status(response.status()) {
+                    return Ok(response);
+                }
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_err = Some(CallerError::Provider(format!(
+                    "{}: {}",
+                    status,
+                    mask_api_keys(&body)
+                )));
+            }
+            // Transport-level failure before a response arrived (connection
+            // reset, refused, DNS): as retryable as a 5xx — nothing was
+            // consumed. Timeouts are excluded: each attempt already waited
+            // the full request timeout, so backoff-retrying them multiplies
+            // a hung endpoint into `timeout × (retries+1)` of wall clock.
+            Err(e) if !e.is_timeout() => last_err = Some(CallerError::Http(e)),
+            Err(e) => return Err(CallerError::Http(e)),
         }
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        last_err = Some(format!("{}: {}", status, mask_api_keys(&body)));
         if attempt < max_retries {
             tokio::time::sleep(backoff_delay(attempt)).await;
         }
     }
-    Err(CallerError::Provider(last_err.unwrap_or_else(|| {
-        "request failed after retries".to_string()
-    })))
+    Err(last_err
+        .unwrap_or_else(|| CallerError::Provider("request failed after retries".to_string())))
 }
 
 /// Parse Server-Sent Events from a byte stream. Returns (event_type, data) pairs.
@@ -372,6 +385,17 @@ pub trait ChatProvider: Send + Sync {
     /// differs from the default (e.g. user's real display vs virtual display).
     fn set_cu_display(&mut self, _dims: (u32, u32)) {}
 
+    /// Whether the agent loop must strip superseded non-CU screenshots from
+    /// the conversation before each request (`Conversation::strip_old_images`).
+    /// The OpenAI `computer` tool rejects requests carrying more than one
+    /// non-CU image, so CU-enabled OpenAI instances require it. Anthropic
+    /// overrides this to `false`: it accepts multi-image histories, and
+    /// mutating old messages would invalidate its prompt-cache prefix from
+    /// the mutation point on every new screenshot.
+    fn requires_image_stripping(&self) -> bool {
+        self.cu_enabled()
+    }
+
     /// Return tool definitions when native tool calling is enabled.
     #[allow(dead_code)]
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -424,7 +448,15 @@ fn default_max_output_tokens(model: &str) -> u64 {
     match model {
         m if m.starts_with("gpt-5") => 128_000,
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 100_000,
-        m if m.contains("claude") => 8_192,
+        // Anthropic ceilings by family: the Claude 3 generation caps at 8K
+        // and Opus 4/4.1 at 32K, while every 4.5+ model accepts at least
+        // 64K output. The old blanket 8_192 was a Claude-3-era default that
+        // truncated long completions (or forced continuation turns, each
+        // re-billing the full prompt). `max_tokens` is a ceiling, not a
+        // target — raising it costs nothing unless output is generated.
+        m if m.starts_with("claude-3") => 8_192,
+        m if m.starts_with("claude-opus-4-1") || m.starts_with("claude-opus-4-2") => 32_000,
+        m if m.contains("claude") => 64_000,
         m if m.starts_with("gemini") => 65_536,
         _ => 16_384,
     }
@@ -1253,10 +1285,27 @@ mod tests {
     fn default_max_output_known_models() {
         assert_eq!(default_max_output_tokens("gpt-5.2-codex"), 128_000);
         assert_eq!(default_max_output_tokens("gpt-5"), 128_000);
+        // 4.5-generation Claude models accept 64K output; the old 8_192
+        // blanket default truncated long completions.
         assert_eq!(
             default_max_output_tokens("claude-sonnet-4-5-20250929"),
+            64_000
+        );
+        assert_eq!(
+            default_max_output_tokens("claude-haiku-4-5-20251001"),
+            64_000
+        );
+        // Older families keep their real ceilings: Claude 3 at 8K,
+        // Opus 4/4.1 at 32K.
+        assert_eq!(
+            default_max_output_tokens("claude-3-5-sonnet-20241022"),
             8_192
         );
+        assert_eq!(
+            default_max_output_tokens("claude-opus-4-1-20250805"),
+            32_000
+        );
+        assert_eq!(default_max_output_tokens("claude-opus-4-20250514"), 32_000);
         assert_eq!(default_max_output_tokens("o1-preview"), 100_000);
     }
 
