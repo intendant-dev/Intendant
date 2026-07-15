@@ -1,22 +1,26 @@
 # D0-A Gate-A Discrepancy Audit — amended after the repair tranche
 
-**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane)
+**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15 (predicate complete)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
 **Spec:** `owner-plane-d0a-spec.md` v0.5.20, SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef` (the ratification amendments; v0.5.19 = `410880e0…`, archived byte-exact)
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `a3d6f779d30492978d6871b97d42037143f4a95c97256aaa92bf5aaa8be0f319` (amendments #1–#4; #3 = the phrase-derive negative arm, #4 = the erase-crash `rotation_ops` control context)
 **Corpus:** 157 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×26, f08×4, f09×11, f10×7, f11×30, f12×15, f13×16, f14×4)
-**Suites at this amendment:** core 140/140 · reducer 33/33 · the strict harness 157/157 with a nonzero-exit gate · the portable-storage lane 19/19 on real files · fmt/clippy clean both crates · mint byte-idempotent (vectors + coverage map)
+**Suites at this amendment:** core 140/140 · reducer 35/35 · the strict harness 157/157 with a nonzero-exit gate · the portable-storage lane 19/19 on real files · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate) · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage map)
 
-> **VERDICT: FAIL.** Gate A is **not** stamped. The original
-> recommendation (PASS conditional on twelve ratifications) rested on
-> two unratified scope reductions — treating never-executed browser
-> and per-OS storage lanes as annotation-satisfiable, and carrying
-> the §13.3/§10.4 coverage debt untracked — and on four artifact
-> defects the repair tranche has since closed (a gate that could not
-> go red, vacuous convergence orders, an erase-lane oracle that read
-> the answer from the stream under replay, and a journal reopen trace
-> whose cited invalidation could not kill its basis). §5 states the
-> amended predicate; Gate A passes only when every clause holds.
+> **VERDICT: PREDICATE SATISFIED — awaiting the owner's Gate-A
+> stamp (§16).** Gate A is **not** hereby stamped; this document
+> issues no PASS. The 2026-07-14 FAIL rested on two unratified scope
+> reductions (never-executed browser and per-OS storage lanes
+> treated as annotation-satisfiable; the §13.3/§10.4 coverage debt
+> untracked) and four artifact defects the repair tranche closed (a
+> gate that could not go red, vacuous convergence orders, an
+> erase-lane oracle that read the answer from the stream under
+> replay, and a journal reopen trace whose cited invalidation could
+> not kill its basis). Since then: the owner's rulings landed
+> (D-201..D-203), the C.1 mechanisms and coverage machinery
+> executed, and BOTH execution lanes delivered with green CI —
+> as of 2026-07-15 every clause of the §5 predicate holds. The
+> freeze-time prose ratifications and the stamp are the owner's.
 
 ## 0. Scope and method
 
@@ -306,17 +310,32 @@ two enforced artifacts:
 
 Both artifacts state the executed surfaces are exactly
 `rust-core` + `rust-reducer` — a vector's `surfaces` array is a
-§13.2 applicability ANNOTATION, never execution — with ONE lane now
-genuinely executing beyond them: the **portable-storage lane**
-(`reducer --bin storage_lane`, 2026-07-15) runs every
+§13.2 applicability ANNOTATION, never execution — with BOTH funded
+lanes now genuinely executing beyond them. The **portable-storage
+lane** (`reducer --bin storage_lane`, 2026-07-15) runs every
 storage-annotated vector on real files (byte round-trips, real
 truncations per crash cut, the lock matrix across two real
 processes on OS advisory locks) and rides the advisory workflow as
-a 3-OS matrix job. It covers the PORTABLE subset only; the Gate-B
-production concerns (fsync ordering, keystores, IndexedDB
-failure/eviction, Firefox/Safari, quota pressure) stay
-distinguishable and named. The **Chromium lane** remains the open
-funded lane (2–4 sessions, `execution-lanes-plan.md`).
+a 3-OS matrix job. The **browser lane** (`browser-lane/`,
+2026-07-15) runs every browser-annotated vector in headless
+Chromium over raw CDP: semantics through a WebCrypto backend
+(Ed25519/P-256 verification with the §3 low-S policy enforced on
+raw signature bytes before verify — the high-S rejection vector
+passing is live proof, since bare WebCrypto accepts high-S; HPKE
+composed per RFC 9180 from ECDH `deriveBits` plus an HMAC-built
+labeled-HKDF schedule; AES-GCM; HKDF/PBKDF2 `deriveBits`), and
+family 13's §13.2 cell — the IndexedDB Txn subset + Web Locks —
+executed as the fixture substrate (one record per awaited IDB
+transaction, frame-per-record stream storage at the reducer
+walker's REAL frame boundaries, fixture-layer crash cuts against
+the in-memory prefix, the lock matrix over `navigator.locks` with
+worker actors and the denied loser's store-read proof). Negative
+controls verified red on both lanes (a flipped verify expectation;
+a flipped lock-denial step caught independently by the in-memory
+lane AND the real Web Locks denial). Both lanes cover the
+portable/Txn subset only; the Gate-B production concerns (fsync
+ordering, keystores, IndexedDB failure injection/eviction,
+Firefox/Safari, quota pressure) stay distinguishable and named.
 
 The reducer's honest frontier shrank with the C.1 work; none of
 the remaining `Unimplemented` sites is reachable from the committed
@@ -332,9 +351,15 @@ every §C.2 row is the binding fail-closed contract — two of them
 
 ## 5. Gate-A verdict
 
-**FAIL.** Gate A is not stamped, and this document must not be read
-as a conditional pass. The amended predicate — every clause must hold
-before a future audit may say PASS:
+**PREDICATE SATISFIED — the verdict is the owner's to stamp
+(§16).** Gate A is NOT hereby stamped: under this audit's
+conventions a PASS is a fresh audit judgment plus the owner's
+stamp, and this document issues neither. What it records is that
+as of 2026-07-15 every clause of the amended predicate holds — the
+prior FAIL's sole stated basis (the funded Chromium browser lane
+and its first green CI run) was resolved by the lane's delivery.
+The amended predicate — every clause must hold before a future
+audit may say PASS:
 
 1. **The strict gate stands** (nonzero exit on any structural
    failure, semantic FAIL, or Unimplemented; argv handled; the
@@ -366,11 +391,14 @@ before a future audit may say PASS:
    reference-artifact workflow exists. — **holds** (tranche 7).
 10. **Execution lanes**: Chromium and per-OS storage lanes either
     EXECUTED or covered by the ratified plan with the annotation
-    caveat stated everywhere coverage is claimed. — **the
-    portable-storage lane is EXECUTED** (19/19 on real files with a
-    real cross-process lock denial; the 3-OS matrix job rides the
-    advisory workflow); **the Chromium lane has not run** (funded,
-    planned, 2–4 sessions).
+    caveat stated everywhere coverage is claimed. — **BOTH lanes
+    are EXECUTED**: the portable-storage lane (19/19 on real files
+    with a real cross-process lock denial; the 3-OS matrix job) and
+    the browser lane (56/56 browser-annotated vectors in headless
+    Chromium — WebCrypto semantics plus the family-13
+    IndexedDB/Web-Locks substrate, 16 substrate vectors: records=37,
+    bytes=30 781, frames=72, cuts=11 — green on CI at the delivering
+    commit `94848163`, job `browser execution (Chromium)`).
 11. **The P1 v1 profile ratified**: every unimplemented normative
     mechanism implemented+vectored or fail-closed by owner
     ratification. — **RATIFIED (D-203) and EXECUTED**: all five
@@ -383,12 +411,15 @@ before a future audit may say PASS:
     recorded** (spec v0.5.20, D-201..D-203; the wire gap is shelved
     for v1 with the reducer's honest Unimplemented standing).
 
-Still open: clause 10's Chromium leg — the ONE remaining item.
-Clauses 1–9, 11, and 12 hold; the storage half of clause 10 is
-executed. Therefore **FAIL**, resting solely on the funded Chromium
-browser lane (WebCrypto + IndexedDB execution, 2–4 sessions per the
-plan) and its first green CI run. No owner decision is outstanding;
-no other artifact work is known to be required.
+All twelve clauses hold. The 2026-07-14 FAIL rested solely on
+clause 10's Chromium leg; that lane was delivered 2026-07-15
+(WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate,
+negative controls red, 56/56 green locally and on CI at
+`94848163`). No owner decision is outstanding; no other artifact
+work is known to be required. The auditor's finding of record:
+the predicate is satisfied and the Gate-A decision now rests with
+the owner — the freeze-time prose ratifications (§3 conventions)
+and the §16 stamp are the owner's acts, not this document's.
 
 Nothing in this verdict stamps the spec, opens P1, or amends the
 Gate-A predicate silently; P1 writes stay barred until Gate B and
