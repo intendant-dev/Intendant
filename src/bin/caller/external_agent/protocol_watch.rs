@@ -1504,7 +1504,7 @@ impl ProtocolWatchStore {
         if stale.len() <= keep_stale {
             return;
         }
-        stale.sort_by(|a, b| b.0.cmp(&a.0));
+        stale.sort_by_key(|(recency, _)| std::cmp::Reverse(*recency));
         for (_, path) in stale.drain(keep_stale..) {
             let _ = std::fs::remove_dir_all(&path);
         }
