@@ -316,46 +316,69 @@ async fn run_agent_inner(
     let hard_timeout_secs: u64 = if has_human { u64::MAX / 2 } else { 120 };
     let hard_timeout = Duration::from_secs(hard_timeout_secs);
 
-    // Read stdout and stderr (bounded), then wait for exit, all under a single hard timeout
+    // Read stdout and stderr (bounded), then wait for exit, all under a
+    // single hard timeout. The buffers live outside the timed future so a
+    // hard-timeout kill can still salvage the results of commands that
+    // completed before the deadline — the runtime streams each command's
+    // JSONL result line as that command finishes.
+    let mut stdout_buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut stderr_buf: Vec<u8> = Vec::with_capacity(8192);
+
     let result = timeout(hard_timeout, async {
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
 
         let read_stdout = async {
-            let mut buf = Vec::with_capacity(8192);
             if let Some(ref mut out) = stdout {
                 out.take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut buf)
+                    .read_to_end(&mut stdout_buf)
                     .await?;
             }
-            Ok::<_, std::io::Error>(buf)
+            Ok::<_, std::io::Error>(())
         };
         let read_stderr = async {
-            let mut buf = Vec::with_capacity(8192);
             if let Some(ref mut err) = stderr {
                 err.take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut buf)
+                    .read_to_end(&mut stderr_buf)
                     .await?;
             }
-            Ok::<_, std::io::Error>(buf)
+            Ok::<_, std::io::Error>(())
         };
 
-        let (stdout_buf, stderr_buf, status) = tokio::join!(read_stdout, read_stderr, child.wait());
-        Ok::<_, CallerError>((stdout_buf?, stderr_buf?, status?))
+        let (stdout_res, stderr_res, status) = tokio::join!(read_stdout, read_stderr, child.wait());
+        stdout_res?;
+        stderr_res?;
+        Ok::<_, CallerError>(status?)
     })
     .await;
 
     match result {
-        Ok(Ok((stdout_buf, stderr_buf, status))) => {
-            output_with_exit_status(stdout_buf, stderr_buf, status)
-        }
+        Ok(Ok(status)) => output_with_exit_status(stdout_buf, stderr_buf, status),
         Ok(Err(err)) => Err(err),
         Err(_) => {
             let _ = child.kill().await;
-            Err(CallerError::Agent(format!(
-                "Agent timed out after {}s",
-                hard_timeout_secs
-            )))
+            // Everything that finished before the deadline is intact JSONL
+            // in the buffer (a possibly truncated trailing line is skipped
+            // by the caller's line-tolerant parser). Salvage it instead of
+            // discarding completed work the model would just redo; commands
+            // with no result line surface as missing downstream.
+            if has_parseable_runtime_output(&stdout_buf) {
+                let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+                let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+                if !stderr.ends_with('\n') && !stderr.is_empty() {
+                    stderr.push('\n');
+                }
+                stderr.push_str(&format!(
+                    "sandboxed runtime killed after the {hard_timeout_secs}s batch hard-timeout; \
+                     results above are from the commands that completed before the deadline"
+                ));
+                Ok(AgentOutput { stdout, stderr })
+            } else {
+                Err(CallerError::Agent(format!(
+                    "Agent timed out after {}s",
+                    hard_timeout_secs
+                )))
+            }
         }
     }
 }
