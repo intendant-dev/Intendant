@@ -18,7 +18,7 @@ Intendant is an open-source operating environment for autonomous AI agents, writ
 
 Your everyday directory can be a browser tab. Hosted Connect gives any browser zero-install route linking, discovery, and fleet presence, but the default binary gives hosted-origin code an immutable `role:none`: it cannot open a daemon-control session, even after a local grant or configuration edit. Its rendezvous-controlled fleet WebPKI names are likewise discovery-only. Administration and ordinary control start from a trusted local console or an independently reached daemon-served direct/mTLS dashboard. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha; an `-unsigned-dev` artifact is for development, not a distribution trust anchor.
 
-And it doesn't stop at one box. Daemons federate into fleets, and people and organizations grant other people — and other agents — scoped access to their machines, infrastructure, and resources. Every session's authority is minted by the target machine's own IAM, never by a hosted service. The goal is a **network of agentic networks**.
+And it doesn't stop at one box. Daemons federate into fleets, and people and organizations grant other people — and other agents — scoped access to their machines, infrastructure, and resources. Every session's authority is minted by the target machine's own IAM, never by a hosted service. The result is a **network of agentic networks**.
 
 <p align="center">
   <img src="src/bin/connect/assets/landing-hero.webp" alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing job with an auto-approved command, proposes a diff, waits for an approval-gated run, and reports the verified result." />

@@ -10,11 +10,11 @@
 > the fleet-level operating model built on these mechanisms — which client
 > for which daemon, custody per tier — is [Trust Tiers](./trust-tiers.md).
 
-Intendant's goal is a **network of agentic networks**: daemons (agents) owned
-by people and organizations, where an owner can grant other people and other
-daemons scoped IAM access to their machines, infrastructure, and resources —
-with pleasant abstractions (passkeys, single-use route linking, and route
-discovery) on top. The discovery client stays a plain web browser. Daemon
+The access system is built for a **network of agentic networks**: daemons
+(agents) owned by people and organizations, where an owner can grant other
+people and other daemons scoped IAM access to their machines, infrastructure,
+and resources — with pleasant abstractions (passkeys, single-use route
+linking, and route discovery) on top. The discovery client stays a plain web browser. Daemon
 control requires local presence or a browser enrolled for independently
 reached direct mTLS by a trusted owner; root remains on one of those trusted
 surfaces. The packaged macOS app contains a local mTLS bridge, but no Developer
