@@ -980,11 +980,26 @@ fn find_wrapper_config_for_external_session(
     }
 
     let entries = std::fs::read_dir(logs_dir).ok()?;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
+    // Newest first: a resumed session is almost always among the most recent
+    // stores, and the per-directory identity check below can end up reading
+    // session logs — in readdir order a hit near the end pays that cost
+    // across the whole store.
+    let mut dirs: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, dir))
+        })
+        .collect();
+    dirs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, dir) in dirs {
         let Some(mut config) = read_log_dir_config(&dir) else {
             continue;
         };
