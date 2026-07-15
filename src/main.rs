@@ -86,7 +86,12 @@ fn write_line(stdout: &mut io::StdoutLock, line: &str) -> bool {
     writeln!(stdout, "{}", line).is_ok() && stdout.flush().is_ok()
 }
 
-#[tokio::main]
+// Single-threaded runtime: the executor runs its batch strictly
+// sequentially (PTY draining runs on dedicated std threads), so the default
+// multi-threaded flavor's per-core worker threads bought nothing while
+// costing startup time and thread stacks on every tool batch — this binary
+// is spawned fresh per batch.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), AgentError> {
     // Version/provenance probe — MUST run before anything touches stdin
     // (the runtime otherwise blocks reading its one-shot JSON input) and
@@ -151,17 +156,17 @@ async fn main() -> Result<(), AgentError> {
     // Create agent instance
     let agent = Agent::new()?;
 
-    // Process commands sequentially and get results
-    let results = agent.process_input(input).await?;
-
-    // Print results; exit gracefully on broken pipe
+    // Process commands sequentially, streaming each JSONL result line as its
+    // command completes — the caller consumes partial output when the
+    // runtime dies early, so a hard-timeout kill no longer discards the
+    // results of commands that already finished. write_line flushes per
+    // line and returns false on broken pipe (the caller is gone), which
+    // stops the batch gracefully.
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    for result in results {
-        if !write_line(&mut stdout, &result) {
-            return Ok(());
-        }
-    }
+    agent
+        .process_input(input, |line| write_line(&mut stdout, line))
+        .await?;
 
     Ok(())
 }

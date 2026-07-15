@@ -173,7 +173,29 @@ impl Agent {
         None
     }
 
+    /// True when the previously merged session Xauthority is at least as new
+    /// as every cookie source that currently exists — later runtime
+    /// invocations in the same session can then skip the merge subprocesses.
+    /// Missing sources constrain nothing (they contribute nothing to a
+    /// merge); a missing merged file is never fresh.
+    #[cfg(any(test, not(target_os = "macos")))]
+    fn merged_xauthority_is_fresh(merged: &Path, sources: &[PathBuf]) -> bool {
+        let Ok(merged_mtime) = fs::metadata(merged).and_then(|m| m.modified()) else {
+            return false;
+        };
+        sources.iter().all(|src| match fs::metadata(src) {
+            Ok(meta) => matches!(meta.modified(), Ok(mtime) if mtime <= merged_mtime),
+            Err(_) => true,
+        })
+    }
+
     /// Merge xauth cookies from all discovered displays into a session-scoped file.
+    ///
+    /// The runtime is spawned fresh for every tool batch, so this runs on
+    /// every invocation; the freshness check keeps the per-display
+    /// `xauth nlist`/`nmerge` subprocess round-trips (plus a `sudo -n xauth`
+    /// attempt for lightdm cookies) to the session's first batch — later
+    /// batches reuse the merged file unless a source cookie file changed.
     #[cfg(not(target_os = "macos"))]
     fn setup_merged_xauthority(displays: &[i32], log_dir: &Path) -> Option<PathBuf> {
         if displays.is_empty() {
@@ -185,6 +207,16 @@ impl Agent {
         // Candidate source paths for xauth cookies
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let user_xauth = PathBuf::from(&home).join(".Xauthority");
+
+        let mut sources = vec![user_xauth.clone()];
+        sources.extend(
+            displays
+                .iter()
+                .map(|disp| PathBuf::from(format!("/var/run/lightdm/root/:{}", disp))),
+        );
+        if Self::merged_xauthority_is_fresh(&merged_path, &sources) {
+            return Some(merged_path);
+        }
 
         for &disp in displays {
             let display_str = format!(":{}", disp);
@@ -813,25 +845,23 @@ impl Agent {
         // a shell that goes quiet (no output, no EOF) can't wedge us.
         let timeout_duration = Duration::from_secs(30);
         let start = std::time::Instant::now();
-        let mut output = String::new();
-        // Where this call's output ends within the shared buffer; advanced past
-        // the consumed bytes once we're done so the next call starts fresh.
-        let mut consumed_to = session.read_offset;
+        // Where this call's bytes begin within the shared buffer.
+        let call_start = session.read_offset;
+        let marker_bytes = marker.as_bytes();
+        let mut scanned_to = call_start;
+        let mut marker_found = false;
 
         loop {
-            // Snapshot the bytes produced for this call so far.
             {
                 let guard = session
                     .output
                     .lock()
                     .map_err(|_| AgentError::Process("PTY reader buffer poisoned".to_string()))?;
-                if guard.len() > session.read_offset {
-                    output = String::from_utf8_lossy(&guard[session.read_offset..]).into_owned();
-                    consumed_to = guard.len();
-                }
+                marker_found =
+                    incremental_marker_scan(&guard, marker_bytes, call_start, &mut scanned_to);
             }
 
-            if output.contains(&marker) {
+            if marker_found {
                 break;
             }
             if start.elapsed() >= timeout_duration {
@@ -839,8 +869,16 @@ impl Agent {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Mark this call's bytes consumed regardless of outcome.
-        session.read_offset = consumed_to;
+        // Mark this call's bytes consumed regardless of outcome, and decode
+        // them once, now that the scan is over.
+        session.read_offset = scanned_to;
+        let output = {
+            let guard = session
+                .output
+                .lock()
+                .map_err(|_| AgentError::Process("PTY reader buffer poisoned".to_string()))?;
+            String::from_utf8_lossy(&guard[call_start..scanned_to]).into_owned()
+        };
 
         // Clean output: strip ANSI escapes and carriage returns
         let cleaned = ANSI_RE.replace_all(&output, "").to_string();
@@ -884,21 +922,24 @@ impl Agent {
             lines.pop();
         }
 
-        // Remove lines that are echo commands for the markers
-        lines.retain(|line| {
-            let trimmed = line.trim();
-            !trimmed.contains(&format!("echo '{}'", start_marker))
-                && !trimmed.contains(&format!("echo '{}'", marker))
-                && !trimmed.contains(&start_marker)
-                && !trimmed.contains(&marker)
-        });
+        // Remove lines that mention the markers — both the echoed
+        // `echo '<marker>'` input lines and the marker output lines (a line
+        // containing the echo form necessarily contains the marker itself,
+        // so these two checks subsume the old per-line `format!` pairs).
+        lines.retain(|line| !line.contains(&start_marker) && !line.contains(&marker));
 
         let final_output = lines.join("\n");
+
+        let (final_output, truncated) = cap_pty_output(
+            final_output,
+            &self.log_dir.join(format!("{}_pty.log", cmd.nonce)),
+        );
 
         Ok(serde_json::json!({
             "success": true,
             "shell_id": shell_id,
-            "output": final_output
+            "output": final_output,
+            "truncated": truncated
         })
         .to_string())
     }
@@ -1485,100 +1526,75 @@ impl Agent {
         .to_string()
     }
 
-    pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
-        let mut results = Vec::new();
+    fn result_or_error(nonce: u64, result: Result<String, AgentError>) -> String {
+        match result {
+            Ok(result) => Self::result_json(nonce, &result),
+            Err(e) => Self::result_json(nonce, &format!("Error: {}", e)),
+        }
+    }
 
-        // Process commands sequentially — each blocks until completion
-        for cmd in input.commands {
-            match cmd.function.as_str() {
+    /// Process commands sequentially, handing each command's JSONL result
+    /// line to `emit` as soon as that command completes. Streaming — rather
+    /// than buffering the whole batch and printing at exit — means the
+    /// caller's hard batch timeout can no longer discard the results of
+    /// commands that already finished (it parses partial stdout), and the
+    /// runtime doesn't peak-hold every result in memory. `emit` returns
+    /// false to stop early (broken pipe: the consumer is gone).
+    pub async fn process_input<F>(&self, input: AgentInput, mut emit: F) -> Result<(), AgentError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        for mut cmd in input.commands {
+            let line = match cmd.function.as_str() {
                 "execAsAgent" => {
                     let result = self.exec_as_agent(&cmd).await?;
-                    results.push(Self::result_json(cmd.nonce, &result));
+                    Self::result_json(cmd.nonce, &result)
                 }
                 "captureScreen" => {
                     let result = self.capture_screen(&cmd).await?;
-                    results.push(Self::result_json(cmd.nonce, &result));
+                    Self::result_json(cmd.nonce, &result)
                 }
-                "inspectPath" => match self.inspect_path(&cmd) {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
-                "editFile" => match self.edit_file(&cmd) {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
+                "inspectPath" => Self::result_or_error(cmd.nonce, self.inspect_path(&cmd)),
+                "editFile" => Self::result_or_error(cmd.nonce, self.edit_file(&cmd)),
                 "writeFile" => {
-                    let mut edit_cmd = cmd.clone();
-                    edit_cmd.function = "editFile".to_string();
-                    if edit_cmd.operation.is_none() {
-                        edit_cmd.operation = Some("write".to_string());
+                    // writeFile is editFile with the operation defaulted to
+                    // "write"; rewrite the owned command in place (cloning it
+                    // deep-copied the whole content payload just to rename).
+                    cmd.function = "editFile".to_string();
+                    if cmd.operation.is_none() {
+                        cmd.operation = Some("write".to_string());
                     }
-                    match self.edit_file(&edit_cmd) {
-                        Ok(result) => {
-                            results.push(Self::result_json(cmd.nonce, &result));
-                        }
-                        Err(e) => {
-                            results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                        }
-                    }
+                    Self::result_or_error(cmd.nonce, self.edit_file(&cmd))
                 }
-                "browse" => match self.browse(&cmd).await {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
-                "askHuman" => match self.ask_human(&cmd).await {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
-                "execPty" => match self.exec_pty(&cmd).await {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
-                "storeMemory" => match self.store_memory(&cmd) {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
-                "recallMemory" => match self.recall_memory(&cmd) {
-                    Ok(result) => {
-                        results.push(Self::result_json(cmd.nonce, &result));
-                    }
-                    Err(e) => {
-                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
-                    }
-                },
+                "browse" => Self::result_or_error(cmd.nonce, self.browse(&cmd).await),
+                "askHuman" => Self::result_or_error(cmd.nonce, self.ask_human(&cmd).await),
+                "execPty" => Self::result_or_error(cmd.nonce, self.exec_pty(&cmd).await),
+                "storeMemory" => Self::result_or_error(cmd.nonce, self.store_memory(&cmd)),
+                "recallMemory" => Self::result_or_error(cmd.nonce, self.recall_memory(&cmd)),
                 _ => {
                     return Err(AgentError::Process(format!(
                         "Unknown function: {}",
                         cmd.function
                     )))
                 }
+            };
+            if !emit(&line) {
+                return Ok(());
             }
         }
 
+        Ok(())
+    }
+
+    /// Test helper: run the batch and collect the emitted result lines.
+    #[cfg(test)]
+    async fn process_input_collect(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
+        let mut results = Vec::new();
+        self.process_input(input, |line| {
+            results.push(line.to_string());
+            true
+        })
+        .await?;
         Ok(results)
     }
 
@@ -1636,6 +1652,75 @@ pub(crate) fn truncate_utf8_by_bytes(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Tail counterpart of `truncate_utf8_by_bytes`: the last `max` bytes of
+/// `s`, nudged forward to the next char boundary.
+fn tail_utf8_by_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// One incremental tick of the PTY end-marker scan: examine only the bytes
+/// beyond `scanned_to` — plus a `marker.len() - 1` overlap (clamped to
+/// `call_start`) so a marker straddling two reader chunks is still found —
+/// advance `scanned_to` to `buf.len()`, and report whether the marker was
+/// seen. Total work across a command is O(bytes) — re-decoding and
+/// re-scanning the whole accumulated buffer on every 20 ms tick was
+/// quadratic on chatty commands. The marker is pure ASCII, so searching the
+/// raw bytes is equivalent to searching the lossy-decoded string.
+fn incremental_marker_scan(
+    buf: &[u8],
+    marker: &[u8],
+    call_start: usize,
+    scanned_to: &mut usize,
+) -> bool {
+    if marker.is_empty() {
+        // Degenerate marker: trivially present (windows(0) would panic).
+        *scanned_to = buf.len();
+        return true;
+    }
+    if buf.len() <= *scanned_to {
+        return false;
+    }
+    let scan_from = scanned_to
+        .saturating_sub(marker.len() - 1)
+        .max(call_start)
+        .min(buf.len());
+    let found = buf[scan_from..].windows(marker.len()).any(|w| w == marker);
+    *scanned_to = buf.len();
+    found
+}
+
+/// Tail-cap a PTY command's output before it returns into the model
+/// conversation, mirroring exec_as_agent's 10 KB stdout/stderr tails — an
+/// uncapped PTY transcript (a cargo build, a full test suite) otherwise
+/// rides in the context for the rest of the session. Over-cap output is
+/// preserved in full at `full_log_path` and the truncation marker names it.
+fn cap_pty_output(final_output: String, full_log_path: &Path) -> (String, bool) {
+    let tail_cap = LOG_TAIL_BYTES as usize;
+    if final_output.len() <= tail_cap {
+        return (final_output, false);
+    }
+    let log_note = match fs::write(full_log_path, &final_output) {
+        Ok(()) => format!("; full output: {}", full_log_path.display()),
+        Err(_) => String::new(),
+    };
+    let tail = tail_utf8_by_bytes(&final_output, tail_cap);
+    let capped = format!(
+        "[execPty output truncated: showing last {} of {} bytes{}]\n{}",
+        tail.len(),
+        final_output.len(),
+        log_note,
+        tail
+    );
+    (capped, true)
 }
 
 #[cfg(test)]
@@ -1867,7 +1952,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let results = agent.process_input(input).await.unwrap();
+        let results = agent.process_input_collect(input).await.unwrap();
         assert_eq!(results.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
         assert_eq!(parsed["type"], "result");
@@ -1888,7 +1973,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let result = agent.process_input(input).await;
+        let result = agent.process_input_collect(input).await;
         assert!(result.is_err());
     }
 
@@ -1905,7 +1990,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let results = agent.process_input(input).await.unwrap();
+        let results = agent.process_input_collect(input).await.unwrap();
         assert_eq!(results.len(), 1);
         let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
         assert_eq!(wrapper["type"], "result");
@@ -1914,6 +1999,39 @@ mod tests {
             serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["exists"], true);
         assert_eq!(parsed["type"], "directory");
+    }
+
+    /// `emit` returning false (broken pipe) stops the batch without error.
+    #[tokio::test]
+    async fn process_input_stops_when_emit_declines() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let (agent, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![
+                AgentCommand {
+                    function: "inspectPath".to_string(),
+                    nonce: 1,
+                    path: Some(dir.clone()),
+                    ..Default::default()
+                },
+                AgentCommand {
+                    function: "inspectPath".to_string(),
+                    nonce: 2,
+                    path: Some(dir),
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut seen = Vec::new();
+        agent
+            .process_input(input, |line| {
+                seen.push(line.to_string());
+                false
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen.len(), 1, "batch must stop after emit declines");
     }
 
     #[tokio::test]
@@ -2192,7 +2310,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let results = agent.process_input(input).await.unwrap();
+        let results = agent.process_input_collect(input).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(fs::read_to_string(&fp).unwrap(), "integrated");
     }
@@ -2316,6 +2434,191 @@ mod tests {
             ..Default::default()
         };
         assert!(agent.exec_pty(&cmd).await.is_err());
+    }
+
+    /// Run one throwaway command to absorb the fresh-shell echo race: bytes
+    /// written before the shell's line editor turns tty echo off get echoed
+    /// by the tty driver — including the harness's own end-marker line — so
+    /// the FIRST command on a new PTY shell can capture its echoed input
+    /// instead of its output (pre-existing behavior; readline serializes
+    /// echo for every later command). Returns false when PTYs aren't
+    /// available in this environment.
+    #[cfg(unix)]
+    async fn warm_up_pty_shell(agent: &Agent) -> bool {
+        let warmup = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 9_000,
+            command: Some("echo warm".to_string()),
+            ..Default::default()
+        };
+        match agent.exec_pty(&warmup).await {
+            Ok(_) => true,
+            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => false,
+            Err(e) => panic!("unexpected exec_pty error: {}", e),
+        }
+    }
+
+    /// Sequential commands on a warmed shell must each see only their own
+    /// output — pins the read-offset bookkeeping the incremental marker
+    /// scan relies on. Unix-only: ConPTY repaints can legitimately re-emit
+    /// earlier lines into later byte ranges, which would false-positive the
+    /// isolation assertion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_pty_sequential_commands_isolate_output() {
+        let (agent, _log) = create_test_agent();
+        if !warm_up_pty_shell(&agent).await {
+            return;
+        }
+        let first = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 1,
+            command: Some("echo first_out".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&first).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["output"].as_str().unwrap().contains("first_out"));
+
+        let second = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 2,
+            command: Some("echo second_out".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&second).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("second_out"), "output: {output}");
+        assert!(
+            !output.contains("first_out"),
+            "second call must not re-consume the first call's bytes: {output}"
+        );
+    }
+
+    /// Large PTY output is tail-capped for the model conversation, with the
+    /// full transcript preserved on disk (mirrors exec_as_agent's 10 KB
+    /// tails). Unix-only: the generator loop is bash syntax.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_pty_output_tail_capped() {
+        let (agent, log_dir) = create_test_agent();
+        if !warm_up_pty_shell(&agent).await {
+            return;
+        }
+        // ~13 KB across 400 lines — over the 10 KB cap, quick to produce.
+        let cmd = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 77,
+            command: Some(
+                "for i in {1..400}; do printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\n'; done"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["truncated"], true);
+        let output = parsed["output"].as_str().unwrap();
+        assert!(
+            output.starts_with("[execPty output truncated: showing last "),
+            "capped output must lead with the truncation marker: {}",
+            &output[..output.len().min(120)]
+        );
+        // Marker line + 10 KB tail, nowhere near the full transcript.
+        assert!(output.len() < 11 * 1024, "output len {}", output.len());
+        // The full transcript is preserved on disk.
+        let full = fs::read_to_string(log_dir.path().join("77_pty.log")).unwrap();
+        assert!(
+            full.len() > LOG_TAIL_BYTES as usize,
+            "full log should exceed the cap, got {}",
+            full.len()
+        );
+    }
+
+    #[test]
+    fn tail_utf8_by_bytes_stops_at_char_boundary() {
+        let text = format!("{}{}", "\u{00e9}", "a".repeat(199));
+        // Cutting 200 bytes from the end would split the 2-byte é; the tail
+        // must nudge forward past it.
+        assert_eq!(tail_utf8_by_bytes(&text, 200), "a".repeat(199));
+        assert_eq!(tail_utf8_by_bytes("short", 200), "short");
+        assert_eq!(tail_utf8_by_bytes("abcdef", 3), "def");
+    }
+
+    /// The incremental scan must find markers wholly inside new bytes,
+    /// markers straddling two appends (via the overlap re-scan), and must
+    /// never look before `call_start`.
+    #[test]
+    fn incremental_marker_scan_finds_straddled_markers() {
+        let marker = b"__END__";
+        let mut buf: Vec<u8> = Vec::new();
+        let mut scanned_to = 0usize;
+
+        // Nothing new: not found.
+        assert!(!incremental_marker_scan(&buf, marker, 0, &mut scanned_to));
+
+        // Marker wholly inside the first chunk.
+        buf.extend_from_slice(b"hello __END__ world");
+        assert!(incremental_marker_scan(&buf, marker, 0, &mut scanned_to));
+        assert_eq!(scanned_to, buf.len());
+
+        // Marker straddling two chunks: first half in one append…
+        let mut buf: Vec<u8> = Vec::new();
+        let mut scanned_to = 0usize;
+        buf.extend_from_slice(b"aaaa__EN");
+        assert!(!incremental_marker_scan(&buf, marker, 0, &mut scanned_to));
+        // …second half in the next; the overlap re-scan must catch it.
+        buf.extend_from_slice(b"D__bbbb");
+        assert!(incremental_marker_scan(&buf, marker, 0, &mut scanned_to));
+
+        // A marker entirely before call_start belongs to a previous command
+        // and must not match.
+        let buf = b"__END__ tail".to_vec();
+        let call_start = 7; // just past the marker
+        let mut scanned_to = call_start;
+        assert!(!incremental_marker_scan(
+            &buf,
+            marker,
+            call_start,
+            &mut scanned_to
+        ));
+
+        // A tick with no new bytes reports nothing and keeps the cursor.
+        let mut scanned_to_again = scanned_to;
+        assert!(!incremental_marker_scan(
+            &buf,
+            marker,
+            call_start,
+            &mut scanned_to_again
+        ));
+        assert_eq!(scanned_to_again, scanned_to);
+    }
+
+    /// The tail cap leaves small output untouched and rewrites large output
+    /// as marker + 10 KB tail while preserving the full transcript on disk.
+    #[test]
+    fn cap_pty_output_caps_and_preserves_full_log() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("1_pty.log");
+
+        // Under the cap: untouched, no log file.
+        let small = "small output".to_string();
+        let (out, truncated) = cap_pty_output(small.clone(), &log_path);
+        assert_eq!(out, small);
+        assert!(!truncated);
+        assert!(!log_path.exists());
+
+        // Over the cap: marker + tail, full transcript on disk.
+        let big = "z".repeat(20_000);
+        let (out, truncated) = cap_pty_output(big.clone(), &log_path);
+        assert!(truncated);
+        assert!(out.starts_with("[execPty output truncated: showing last "));
+        assert!(out.contains(&log_path.display().to_string()));
+        assert!(out.ends_with(&"z".repeat(LOG_TAIL_BYTES as usize)));
+        assert!(out.len() < 11 * 1024, "capped len {}", out.len());
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), big);
     }
 
     // --- storeMemory / recallMemory tests ---
@@ -2583,7 +2886,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let results = agent.process_input(input).await.unwrap();
+        let results = agent.process_input_collect(input).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2601,7 +2904,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let results = agent.process_input(input).await.unwrap();
+        let results = agent.process_input_collect(input).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2675,6 +2978,47 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = Agent::setup_merged_xauthority(&[], tmp.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn merged_xauthority_freshness() {
+        let tmp = TempDir::new().unwrap();
+        let merged = tmp.path().join("session.Xauthority");
+        let source = tmp.path().join("Xauthority");
+        let missing = tmp.path().join("nope");
+
+        let set_mtime = |path: &Path, secs: u64| {
+            let f = OpenOptions::new().write(true).open(path).unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+
+        // No merged file yet: never fresh.
+        fs::write(&source, "cookie").unwrap();
+        assert!(!Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone()]
+        ));
+
+        // Merged newer than every existing source: fresh (missing sources
+        // constrain nothing).
+        fs::write(&merged, "merged").unwrap();
+        set_mtime(&source, 1_000);
+        set_mtime(&merged, 2_000);
+        assert!(Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone(), missing.clone()]
+        ));
+
+        // A source updated after the merge invalidates it.
+        set_mtime(&source, 3_000);
+        assert!(!Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone()]
+        ));
+
+        // Missing sources alone constrain nothing.
+        assert!(Agent::merged_xauthority_is_fresh(&merged, &[missing]));
     }
 
     #[test]
