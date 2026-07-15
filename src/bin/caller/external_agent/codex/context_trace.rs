@@ -30,6 +30,7 @@ pub(crate) struct CodexResponsePayloadRef {
     pub(crate) response_id: String,
 }
 
+#[derive(Default)]
 pub(crate) struct CodexTraceIndex {
     pub(crate) requests: Vec<CodexRequestPayloadRef>,
     pub(crate) requests_by_call: HashMap<String, CodexRequestPayloadRef>,
@@ -51,24 +52,29 @@ pub(crate) fn codex_context_snapshot_not_ready(err: &CallerError) -> bool {
     )
 }
 
+/// One-shot form of [`CodexTraceIndexCache::latest_snapshot`] for callers
+/// without a live cache (tests, ad-hoc reads). Builds the index fresh and
+/// resolves ONLY the newest request — never every historical request.
 pub(crate) async fn read_latest_codex_context_payload(
     root: &Path,
     thread_id: Option<&str>,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
-    let snapshots = read_codex_context_payloads(root, thread_id).await?;
-    snapshots.into_iter().last().ok_or_else(|| {
-        CallerError::ExternalAgent(format!(
-            "no Codex inference request payload found in {}",
-            root.display()
-        ))
-    })
+    let mut cache = CodexTraceIndexCache::default();
+    cache.latest_snapshot(root, thread_id).await
 }
 
+/// One-shot read of every request snapshot in order — test surface for the
+/// full-archive behavior the cache exposes through
+/// [`CodexTraceIndexCache::snapshots_excluding`].
+#[cfg(test)]
 pub(crate) async fn read_codex_context_payloads(
     root: &Path,
     thread_id: Option<&str>,
 ) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
-    read_codex_context_payloads_excluding(root, thread_id, &HashSet::new()).await
+    let mut cache = CodexTraceIndexCache::default();
+    cache
+        .snapshots_excluding(root, thread_id, &HashSet::new())
+        .await
 }
 
 pub(crate) fn context_snapshots_from_trace_archive(
@@ -112,7 +118,7 @@ pub(crate) fn read_codex_context_payloads_sync(
 ) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
     let index = read_codex_trace_index_sync(root, thread_id)?;
     let mut requests = index.requests.clone();
-    requests.sort_by_key(codex_request_sort_key);
+    requests.sort_by(codex_request_order_cmp);
 
     let mut snapshots = Vec::with_capacity(requests.len());
     for (idx, request_ref) in requests.iter().enumerate() {
@@ -125,38 +131,25 @@ pub(crate) fn read_codex_context_payloads_sync(
     Ok(snapshots)
 }
 
-pub(crate) async fn read_codex_context_payloads_excluding(
-    root: &Path,
-    thread_id: Option<&str>,
-    seen_request_ids: &HashSet<String>,
-) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
-    let index = read_codex_trace_index(root, thread_id).await?;
-    let mut requests = index.requests.clone();
-    requests.sort_by_key(codex_request_sort_key);
-
-    let mut snapshots = Vec::with_capacity(requests.len());
-    for (idx, request_ref) in requests.iter().enumerate() {
-        if seen_request_ids.contains(&codex_request_id(request_ref)) {
-            continue;
-        }
-        snapshots.push(codex_context_payload_snapshot(&index, request_ref, idx as u64 + 1).await?);
-    }
-    Ok(snapshots)
-}
-
 pub(crate) async fn codex_context_payload_snapshot(
     index: &CodexTraceIndex,
     request_ref: &CodexRequestPayloadRef,
     request_index: u64,
+    resolved_chain: &mut Option<CodexResolvedChain>,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
     let payload =
         read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
     let format = codex_request_format(request_ref.provider_name.as_deref());
     let request_id = codex_request_id(request_ref);
     if format == "openai.responses.request.v1" {
-        let resolved =
-            resolve_openai_responses_context_payload(index, request_ref, request_index, payload)
-                .await?;
+        let resolved = resolve_openai_responses_context_payload(
+            index,
+            request_ref,
+            request_index,
+            payload,
+            resolved_chain,
+        )
+        .await?;
         return Ok(CodexRequestPayloadSnapshot {
             label: "Codex resolved request payload".to_string(),
             request_id,
@@ -209,16 +202,18 @@ pub(crate) fn codex_context_payload_snapshot_sync(
     })
 }
 
-pub(crate) fn codex_request_sort_key(
-    request: &CodexRequestPayloadRef,
-) -> (i64, u64, String, String, String) {
-    (
-        request.order.0,
-        request.order.1,
-        request.bundle_dir.to_string_lossy().to_string(),
-        request.relative_path.clone(),
-        request.inference_call_id.clone(),
-    )
+/// Total order over request refs: trace timestamp, then line index, with the
+/// stable path/call-id tie-breaks. Comparator form (no per-comparison String
+/// allocations — the old tuple sort key allocated three per call).
+pub(crate) fn codex_request_order_cmp(
+    a: &CodexRequestPayloadRef,
+    b: &CodexRequestPayloadRef,
+) -> std::cmp::Ordering {
+    a.order
+        .cmp(&b.order)
+        .then_with(|| a.bundle_dir.cmp(&b.bundle_dir))
+        .then_with(|| a.relative_path.cmp(&b.relative_path))
+        .then_with(|| a.inference_call_id.cmp(&b.inference_call_id))
 }
 
 pub(crate) fn codex_request_id(request: &CodexRequestPayloadRef) -> String {
@@ -602,54 +597,459 @@ pub(crate) fn codex_context_archive_payload(
     })
 }
 
-pub(crate) async fn read_codex_trace_index(
-    root: &Path,
-    thread_id: Option<&str>,
-) -> Result<CodexTraceIndex, CallerError> {
-    let bundle_dirs = collect_codex_trace_bundle_dirs(root, thread_id).await?;
-    let mut requests = Vec::new();
-    let mut requests_by_call = HashMap::new();
-    let mut responses_by_id = HashMap::new();
+// ---------------------------------------------------------------------------
+// Incremental trace-index cache
+// ---------------------------------------------------------------------------
 
-    for bundle_dir in bundle_dirs {
-        let trace_path = bundle_dir.join("trace.jsonl");
-        let contents = match tokio::fs::read_to_string(&trace_path).await {
-            Ok(contents) => contents,
-            Err(_) => continue,
-        };
+/// Byte/line cursor into one `trace.jsonl`: how much of the file has already
+/// been folded into the cached index. `bytes` only ever advances past
+/// COMPLETE lines — a trailing partial line the writer is still flushing is
+/// left for the next refresh, exactly like the historical full re-scan
+/// picked it up once complete.
+#[derive(Debug, Default, Clone, Copy)]
+struct CodexTraceFileCursor {
+    bytes: u64,
+    lines: u64,
+}
 
-        for (line_idx, line) in contents.lines().enumerate() {
-            if line.trim().is_empty() {
+/// Cross-session auxiliary bundle dirs (other sessions' trace roots whose
+/// bundle names match the thread), cached against the logs root's directory
+/// mtime so the exact-archive fingerprint tick doesn't re-enumerate every
+/// historical session directory at 1 Hz. Session dirs are created and
+/// removed directly under the logs root, so those events bump its mtime and
+/// invalidate the sweep; bundles for the LIVE session land under the primary
+/// root, which is always enumerated fresh.
+struct CodexAuxBundleDirs {
+    logs_root: PathBuf,
+    modified: Option<SystemTime>,
+    bundle_dirs: Vec<PathBuf>,
+}
+
+/// Resolved `previous_response_id` chain for the most recently resolved
+/// `openai.responses` request. Chains are append-only: the next request's
+/// resolution extends this one by the new hops only, reading just the new
+/// payload files instead of re-walking (and re-reading) the whole history
+/// on every snapshot.
+pub(crate) struct CodexResolvedChain {
+    /// [`codex_trace_call_key`] of the request whose resolution is cached.
+    call_key: String,
+    /// The fully resolved conversation: every previous (input, output_items)
+    /// pair plus the cached request's own input items.
+    resolved_input: Vec<serde_json::Value>,
+    /// Unresolved-tail marker inherited by any resolution built on this
+    /// prefix.
+    unresolved_previous_response_id: Option<String>,
+}
+
+/// Incrementally maintained view of a Codex trace archive for one
+/// `(trace root, thread)`: parsed request/response refs plus the resolved
+/// chain of the newest request. A refresh stats the known `trace.jsonl`
+/// files and parses only appended lines; a shrunk or vanished file (trace
+/// rewrite, temporary-root cleanup) triggers a full rebuild — the safe
+/// fallback. Same-length in-place rewrites are undetectable here, the same
+/// blind spot the (len, mtime) fingerprint gate has always had.
+#[derive(Default)]
+pub(crate) struct CodexTraceIndexCache {
+    key: Option<(PathBuf, Option<String>)>,
+    cursors: HashMap<PathBuf, CodexTraceFileCursor>,
+    index: CodexTraceIndex,
+    aux_bundles: Option<CodexAuxBundleDirs>,
+    resolved_chain: Option<CodexResolvedChain>,
+}
+
+impl CodexTraceIndexCache {
+    /// The current request refs, sorted by [`codex_request_order_cmp`]. Only
+    /// meaningful after a [`Self::refresh`].
+    pub(crate) fn requests(&self) -> &[CodexRequestPayloadRef] {
+        &self.index.requests
+    }
+
+    fn reset_for_key(&mut self, root: &Path, thread_id: Option<&str>) {
+        let key_matches = self
+            .key
+            .as_ref()
+            .is_some_and(|(cached_root, cached_thread)| {
+                cached_root == root && cached_thread.as_deref() == thread_id
+            });
+        if !key_matches {
+            *self = Self {
+                key: Some((root.to_path_buf(), thread_id.map(str::to_string))),
+                ..Self::default()
+            };
+        }
+    }
+
+    /// Stat-guarded fingerprint over the archive's `trace.jsonl` files —
+    /// same shape and semantics as the historical full-scan fingerprint,
+    /// minus the per-call re-enumeration of every session directory (see
+    /// [`CodexAuxBundleDirs`]).
+    pub(crate) async fn fingerprint(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+    ) -> Result<CodexTraceFingerprint, CallerError> {
+        self.reset_for_key(root, thread_id);
+        let bundle_dirs = self.collect_bundle_dirs(root, thread_id).await?;
+        let mut files = Vec::new();
+        for bundle_dir in bundle_dirs {
+            let path = bundle_dir.join("trace.jsonl");
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            files.push(CodexTraceFileFingerprint {
+                path,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(CodexTraceFingerprint { files })
+    }
+
+    /// Bring the cached index up to date with the archive: stat every
+    /// bundle's `trace.jsonl`, tail-read files that grew, rebuild from
+    /// scratch if any known file shrank or vanished.
+    pub(crate) async fn refresh(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+    ) -> Result<(), CallerError> {
+        self.reset_for_key(root, thread_id);
+        let mut files = self.stat_trace_files(root, thread_id).await?;
+
+        // A shrunk or vanished file means lines already folded into the
+        // index can no longer be attributed; drop everything and rescan.
+        let lens: HashMap<&Path, u64> = files
+            .iter()
+            .map(|(_, path, len)| (path.as_path(), *len))
+            .collect();
+        let stale = self.cursors.iter().any(|(path, cursor)| {
+            lens.get(path.as_path())
+                .map_or(cursor.bytes > 0, |len| *len < cursor.bytes)
+        });
+        drop(lens);
+        if stale {
+            self.cursors.clear();
+            self.index = CodexTraceIndex::default();
+            self.aux_bundles = None;
+            self.resolved_chain = None;
+            files = self.stat_trace_files(root, thread_id).await?;
+        }
+
+        let mut appended = false;
+        for (bundle_dir, path, len) in files {
+            let start = self.cursors.get(&path).copied().unwrap_or_default();
+            if len == start.bytes {
                 continue;
             }
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some((text, consumed)) = read_new_complete_lines(&path, start.bytes).await else {
+                // No complete new line yet (partial flush) or unreadable —
+                // leave the cursor alone and retry on the next refresh.
                 continue;
             };
-            if let Some(candidate) =
-                codex_inference_request_ref(&bundle_dir, &event, line_idx as u64)
-            {
-                if thread_id
-                    .zip(candidate.thread_id.as_deref())
-                    .map(|(expected, actual)| expected != actual)
-                    .unwrap_or(false)
-                {
-                    continue;
+            let next_line =
+                fold_codex_trace_lines(&mut self.index, &bundle_dir, thread_id, &text, start.lines);
+            self.cursors.insert(
+                path,
+                CodexTraceFileCursor {
+                    bytes: start.bytes + consumed,
+                    lines: next_line,
+                },
+            );
+            appended = true;
+        }
+        if appended {
+            self.index.requests.sort_by(codex_request_order_cmp);
+        }
+        Ok(())
+    }
+
+    async fn stat_trace_files(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<(PathBuf, PathBuf, u64)>, CallerError> {
+        let bundle_dirs = self.collect_bundle_dirs(root, thread_id).await?;
+        let mut files = Vec::with_capacity(bundle_dirs.len());
+        for bundle_dir in bundle_dirs {
+            let path = bundle_dir.join("trace.jsonl");
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            files.push((bundle_dir, path, metadata.len()));
+        }
+        Ok(files)
+    }
+
+    /// Enumerate the archive's bundle dirs: the primary root fresh every
+    /// call (the live session's bundles land there), the cross-session
+    /// auxiliary sweep from cache unless the logs root's mtime moved.
+    async fn collect_bundle_dirs(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<PathBuf>, CallerError> {
+        let mut bundle_dirs = Vec::new();
+        let mut seen = HashSet::new();
+        collect_codex_bundle_dirs_in(root, thread_id, true, &mut bundle_dirs, &mut seen).await?;
+        if thread_id.is_some() {
+            if let Some(logs_root) = codex_logs_root_for_trace_root(root) {
+                let modified = tokio::fs::metadata(&logs_root)
+                    .await
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                let cached = self
+                    .aux_bundles
+                    .as_ref()
+                    .is_some_and(|aux| aux.logs_root == logs_root && aux.modified == modified);
+                if !cached {
+                    let aux_dirs =
+                        collect_codex_aux_bundle_dirs(&logs_root, root, thread_id).await?;
+                    self.aux_bundles = Some(CodexAuxBundleDirs {
+                        logs_root,
+                        modified,
+                        bundle_dirs: aux_dirs,
+                    });
                 }
-                requests_by_call.insert(codex_trace_call_key(&candidate), candidate.clone());
-                requests.push(candidate);
+                if let Some(aux) = self.aux_bundles.as_ref() {
+                    for bundle_dir in &aux.bundle_dirs {
+                        if seen.insert(bundle_dir.clone()) {
+                            bundle_dirs.push(bundle_dir.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(bundle_dirs)
+    }
+
+    /// Refresh, then snapshot ONLY the newest request (one chain resolution
+    /// instead of the historical resolve-all-R-then-`.last()`, which was
+    /// O(R²) file reads per call).
+    pub(crate) async fn latest_snapshot(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+    ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
+        self.refresh(root, thread_id).await?;
+        let request_index = self.index.requests.len() as u64;
+        let Self {
+            index,
+            resolved_chain,
+            ..
+        } = self;
+        let Some(request_ref) = index.requests.last() else {
+            return Err(CallerError::ExternalAgent(format!(
+                "no Codex inference request payload found in {}",
+                root.display()
+            )));
+        };
+        codex_context_payload_snapshot(index, request_ref, request_index, resolved_chain).await
+    }
+
+    /// Refresh, then snapshot every request not in `seen_request_ids`, in
+    /// request order. Resolving in ascending order lets each new request
+    /// extend the previous one's cached chain, so a poll that finds k new
+    /// requests reads O(k) payload files instead of O(k · chain length).
+    pub(crate) async fn snapshots_excluding(
+        &mut self,
+        root: &Path,
+        thread_id: Option<&str>,
+        seen_request_ids: &HashSet<String>,
+    ) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
+        self.refresh(root, thread_id).await?;
+        let Self {
+            index,
+            resolved_chain,
+            ..
+        } = self;
+        let mut snapshots = Vec::new();
+        for (idx, request_ref) in index.requests.iter().enumerate() {
+            if seen_request_ids.contains(&codex_request_id(request_ref)) {
                 continue;
             }
-            if let Some(response) = codex_inference_response_ref(&bundle_dir, &event) {
-                responses_by_id.insert(response.response_id.clone(), response);
+            snapshots.push(
+                codex_context_payload_snapshot(index, request_ref, idx as u64 + 1, resolved_chain)
+                    .await?,
+            );
+        }
+        Ok(snapshots)
+    }
+}
+
+/// Read the consumable lines appended to `path` past `offset`
+/// ([`consumable_jsonl_prefix`]). Returns the consumed text and its byte
+/// length; `None` when nothing consumable arrived (or the file cannot be
+/// read). Never consumes a partially flushed trailing line.
+async fn read_new_complete_lines(path: &Path, offset: u64) -> Option<(String, u64)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await.ok()?;
+    let consumed = consumable_jsonl_prefix(&buf)?;
+    buf.truncate(consumed);
+    // Trace files are serde-written JSON and therefore valid UTF-8; on the
+    // pathological non-UTF-8 file the historical full scan skipped the whole
+    // file, and skipping without advancing the cursor lands in the same
+    // place.
+    let text = String::from_utf8(buf).ok()?;
+    Some((text, consumed as u64))
+}
+
+/// The byte length of the foldable JSONL prefix of `buf`: every complete
+/// (newline-terminated) line, plus an unterminated final line iff it already
+/// parses as a complete JSON value. Event lines are JSON objects and no
+/// strict prefix of a JSON object parses, so a parsing tail is a whole event
+/// whose newline just hasn't landed — or a writer that never terminates its
+/// final line, which the historical full re-scan accepted. `None` when
+/// nothing is consumable yet. (A sync twin lives in `lineage_ledger.rs` for
+/// the session-log fold.)
+fn consumable_jsonl_prefix(buf: &[u8]) -> Option<usize> {
+    let complete = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let tail = &buf[complete..];
+    let consumed = if !tail.is_empty() && serde_json::from_slice::<serde_json::Value>(tail).is_ok()
+    {
+        buf.len()
+    } else {
+        complete
+    };
+    (consumed > 0).then_some(consumed)
+}
+
+/// Fold trace lines into the index — the one parse loop shared by full
+/// rebuilds (cursor at zero) and incremental tail reads. `first_line_idx`
+/// keeps `order.1` identical to what a from-scratch enumerate would assign.
+/// Returns the next line index.
+fn fold_codex_trace_lines(
+    index: &mut CodexTraceIndex,
+    bundle_dir: &Path,
+    thread_id: Option<&str>,
+    text: &str,
+    first_line_idx: u64,
+) -> u64 {
+    let mut line_idx = first_line_idx;
+    for line in text.lines() {
+        let this_idx = line_idx;
+        line_idx += 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(candidate) = codex_inference_request_ref(bundle_dir, &event, this_idx) {
+            if thread_id
+                .zip(candidate.thread_id.as_deref())
+                .map(|(expected, actual)| expected != actual)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            index
+                .requests_by_call
+                .insert(codex_trace_call_key(&candidate), candidate.clone());
+            index.requests.push(candidate);
+            continue;
+        }
+        if let Some(response) = codex_inference_response_ref(bundle_dir, &event) {
+            index
+                .responses_by_id
+                .insert(response.response_id.clone(), response);
+        }
+    }
+    line_idx
+}
+
+/// Enumerate the bundle dirs directly under one trace root, honoring the
+/// thread-name filter. The `primary` root must be readable (its failure is
+/// the caller's error); auxiliary roots that fail to read are skipped,
+/// matching the historical full-scan behavior.
+async fn collect_codex_bundle_dirs_in(
+    trace_root: &Path,
+    thread_id: Option<&str>,
+    primary: bool,
+    bundle_dirs: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<(), CallerError> {
+    let mut dirs = match tokio::fs::read_dir(trace_root).await {
+        Ok(dirs) => dirs,
+        Err(e) if primary => {
+            return Err(CallerError::ExternalAgent(format!(
+                "read Codex request trace root {}: {e}",
+                trace_root.display()
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+    while let Some(entry) = dirs
+        .next_entry()
+        .await
+        .map_err(|e| CallerError::ExternalAgent(format!("read Codex request trace entry: {e}")))?
+    {
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let bundle_dir = entry.path();
+        if let Some(thread_id) = thread_id {
+            let name = bundle_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !name.contains(thread_id) {
+                continue;
+            }
+        }
+        if seen.insert(bundle_dir.clone()) {
+            bundle_dirs.push(bundle_dir);
+        }
+    }
+    Ok(())
+}
+
+/// Sweep every OTHER session's `model-request-traces` root under the logs
+/// root for bundle dirs matching the thread. Expensive against a large
+/// permanent history — callers cache the result behind the logs root's
+/// mtime ([`CodexAuxBundleDirs`]).
+async fn collect_codex_aux_bundle_dirs(
+    logs_root: &Path,
+    primary_root: &Path,
+    thread_id: Option<&str>,
+) -> Result<Vec<PathBuf>, CallerError> {
+    let mut trace_roots = Vec::new();
+    if let Ok(mut sessions) = tokio::fs::read_dir(logs_root).await {
+        while let Ok(Some(entry)) = sessions.next_entry().await {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                let trace_root = entry.path().join("model-request-traces");
+                if trace_root != primary_root {
+                    trace_roots.push(trace_root);
+                }
             }
         }
     }
 
-    Ok(CodexTraceIndex {
-        requests,
-        requests_by_call,
-        responses_by_id,
-    })
+    let mut bundle_dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for trace_root in trace_roots {
+        collect_codex_bundle_dirs_in(&trace_root, thread_id, false, &mut bundle_dirs, &mut seen)
+            .await?;
+    }
+    Ok(bundle_dirs)
 }
 
 pub(crate) fn read_codex_trace_index_sync(
@@ -700,98 +1100,6 @@ pub(crate) fn read_codex_trace_index_sync(
         requests_by_call,
         responses_by_id,
     })
-}
-
-pub(crate) async fn collect_codex_trace_bundle_dirs(
-    root: &Path,
-    thread_id: Option<&str>,
-) -> Result<Vec<PathBuf>, CallerError> {
-    let mut trace_roots = vec![root.to_path_buf()];
-    if thread_id.is_some() {
-        if let Some(logs_root) = codex_logs_root_for_trace_root(root) {
-            if let Ok(mut sessions) = tokio::fs::read_dir(&logs_root).await {
-                while let Ok(Some(entry)) = sessions.next_entry().await {
-                    let file_type = match entry.file_type().await {
-                        Ok(file_type) => file_type,
-                        Err(_) => continue,
-                    };
-                    if file_type.is_dir() {
-                        let trace_root = entry.path().join("model-request-traces");
-                        if trace_root != root {
-                            trace_roots.push(trace_root);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut seen_roots = HashSet::new();
-    trace_roots.retain(|path| seen_roots.insert(path.clone()));
-
-    let mut bundle_dirs = Vec::new();
-    let mut seen_bundles = HashSet::new();
-    for trace_root in trace_roots {
-        let mut dirs = match tokio::fs::read_dir(&trace_root).await {
-            Ok(dirs) => dirs,
-            Err(e) if trace_root == root => {
-                return Err(CallerError::ExternalAgent(format!(
-                    "read Codex request trace root {}: {e}",
-                    root.display()
-                )));
-            }
-            Err(_) => continue,
-        };
-
-        while let Some(entry) = dirs.next_entry().await.map_err(|e| {
-            CallerError::ExternalAgent(format!("read Codex request trace entry: {e}"))
-        })? {
-            let file_type = match entry.file_type().await {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let bundle_dir = entry.path();
-            if let Some(thread_id) = thread_id {
-                let name = bundle_dir
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                if !name.contains(thread_id) {
-                    continue;
-                }
-            }
-            if seen_bundles.insert(bundle_dir.clone()) {
-                bundle_dirs.push(bundle_dir);
-            }
-        }
-    }
-
-    Ok(bundle_dirs)
-}
-
-pub(crate) async fn codex_context_trace_fingerprint(
-    root: &Path,
-    thread_id: Option<&str>,
-) -> Result<CodexTraceFingerprint, CallerError> {
-    let bundle_dirs = collect_codex_trace_bundle_dirs(root, thread_id).await?;
-    let mut files = Vec::new();
-    for bundle_dir in bundle_dirs {
-        let path = bundle_dir.join("trace.jsonl");
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        files.push(CodexTraceFileFingerprint {
-            path,
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        });
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(CodexTraceFingerprint { files })
 }
 
 pub(crate) fn collect_codex_trace_bundle_dirs_sync(
@@ -868,59 +1176,119 @@ pub(crate) fn read_codex_json_payload_sync(
     serde_json::from_str::<serde_json::Value>(&contents).map_err(CallerError::Json)
 }
 
+/// Resolve the full conversation behind an `openai.responses` request by
+/// walking its `previous_response_id` chain — incrementally when
+/// `chain_cache` holds a previously resolved prefix (the chain is
+/// append-only, so only the new hops' payload files are read), from scratch
+/// otherwise. The cache is updated to this request's resolution.
+///
+/// NOTE: [`resolve_openai_responses_context_payload_sync`] below is the
+/// uncached twin for one-shot sync callers (session-catalog rehydration);
+/// changes to the chain-walk or payload-stamp semantics must land in both.
 pub(crate) async fn resolve_openai_responses_context_payload(
     index: &CodexTraceIndex,
     latest_ref: &CodexRequestPayloadRef,
     request_index: u64,
     latest_payload: serde_json::Value,
+    chain_cache: &mut Option<CodexResolvedChain>,
 ) -> Result<serde_json::Value, CallerError> {
-    let mut previous_pairs = Vec::new();
-    let mut unresolved_previous_response_id = None;
-    let mut seen_response_ids = HashSet::new();
-    let mut previous_response_id = codex_previous_response_id(&latest_payload).map(str::to_string);
+    let latest_call_key = codex_trace_call_key(latest_ref);
+    let cache_hit = chain_cache
+        .as_ref()
+        .is_some_and(|cached| cached.call_key == latest_call_key);
 
-    while let Some(response_id) = previous_response_id {
-        if !seen_response_ids.insert(response_id.clone()) {
-            unresolved_previous_response_id = Some(response_id);
-            break;
+    let (resolved_input, unresolved_previous_response_id) = if cache_hit {
+        // Unchanged latest request: reuse the cached resolution outright —
+        // no chain walk, no payload reads beyond the request itself.
+        let cached = chain_cache.as_ref().expect("cache hit just checked");
+        (
+            cached.resolved_input.clone(),
+            cached.unresolved_previous_response_id.clone(),
+        )
+    } else {
+        let mut previous_pairs = Vec::new();
+        let mut cached_prefix: Option<(Vec<serde_json::Value>, Option<String>)> = None;
+        let mut walk_unresolved = None;
+        let mut seen_response_ids = HashSet::new();
+        let mut previous_response_id =
+            codex_previous_response_id(&latest_payload).map(str::to_string);
+
+        while let Some(response_id) = previous_response_id {
+            if !seen_response_ids.insert(response_id.clone()) {
+                walk_unresolved = Some(response_id);
+                break;
+            }
+            let Some(response_ref) = index.responses_by_id.get(&response_id) else {
+                walk_unresolved = Some(response_id);
+                break;
+            };
+            let request_key = codex_trace_call_key_parts(
+                &response_ref.bundle_dir,
+                &response_ref.inference_call_id,
+            );
+            if !index.requests_by_call.contains_key(&request_key) {
+                walk_unresolved = Some(response_id);
+                break;
+            }
+            if let Some(cached) = chain_cache
+                .as_ref()
+                .filter(|cached| cached.call_key == request_key)
+            {
+                // Append-only chain: the cached resolution already contains
+                // everything up to and including this request's own input;
+                // only its response payload is new to this walk.
+                let response_payload =
+                    read_codex_json_payload(&response_ref.bundle_dir, &response_ref.relative_path)
+                        .await?;
+                let mut prefix = cached.resolved_input.clone();
+                codex_extend_array_field(&mut prefix, &response_payload, "output_items");
+                cached_prefix = Some((prefix, cached.unresolved_previous_response_id.clone()));
+                break;
+            }
+            let request_ref = index
+                .requests_by_call
+                .get(&request_key)
+                .expect("request ref presence just checked");
+            let request_payload =
+                read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path)
+                    .await?;
+            let response_payload =
+                read_codex_json_payload(&response_ref.bundle_dir, &response_ref.relative_path)
+                    .await?;
+            previous_response_id = codex_previous_response_id(&request_payload).map(str::to_string);
+            previous_pairs.push((request_payload, response_payload));
         }
-        let Some(response_ref) = index.responses_by_id.get(&response_id).cloned() else {
-            unresolved_previous_response_id = Some(response_id);
-            break;
-        };
-        let request_key =
-            codex_trace_call_key_parts(&response_ref.bundle_dir, &response_ref.inference_call_id);
-        let Some(request_ref) = index.requests_by_call.get(&request_key).cloned() else {
-            unresolved_previous_response_id = Some(response_id);
-            break;
-        };
-        let request_payload =
-            read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
-        let response_payload =
-            read_codex_json_payload(&response_ref.bundle_dir, &response_ref.relative_path).await?;
-        previous_response_id = codex_previous_response_id(&request_payload).map(str::to_string);
-        previous_pairs.push((request_payload, response_payload));
-    }
 
-    previous_pairs.reverse();
+        previous_pairs.reverse();
+        let (mut resolved_input, unresolved) = match cached_prefix {
+            Some((prefix, inherited_unresolved)) => (prefix, inherited_unresolved),
+            None => (Vec::new(), walk_unresolved),
+        };
+        for (request_payload, response_payload) in previous_pairs {
+            codex_extend_array_field(&mut resolved_input, &request_payload, "input");
+            codex_extend_array_field(&mut resolved_input, &response_payload, "output_items");
+        }
+        codex_extend_array_field(&mut resolved_input, &latest_payload, "input");
 
-    let mut resolved_input = Vec::new();
-    for (request_payload, response_payload) in previous_pairs {
-        codex_extend_array_field(&mut resolved_input, &request_payload, "input");
-        codex_extend_array_field(&mut resolved_input, &response_payload, "output_items");
-    }
-    codex_extend_array_field(&mut resolved_input, &latest_payload, "input");
+        *chain_cache = Some(CodexResolvedChain {
+            call_key: latest_call_key,
+            resolved_input: resolved_input.clone(),
+            unresolved_previous_response_id: unresolved.clone(),
+        });
+        (resolved_input, unresolved)
+    };
 
     let latest_request_input_count = latest_payload
         .get("input")
         .and_then(|input| input.as_array())
         .map(Vec::len)
         .unwrap_or(0);
+    let resolved_input_count = resolved_input.len();
     let mut resolved_payload = latest_payload;
     if let serde_json::Value::Object(map) = &mut resolved_payload {
         map.insert(
             "input".to_string(),
-            serde_json::Value::Array(resolved_input.clone()),
+            serde_json::Value::Array(resolved_input),
         );
         map.insert(
             "_intendant_context".to_string(),
@@ -931,7 +1299,7 @@ pub(crate) async fn resolve_openai_responses_context_payload(
                 "request_index": request_index,
                 "inference_call_id": latest_ref.inference_call_id.clone(),
                 "latest_request_input_count": latest_request_input_count,
-                "resolved_input_count": resolved_input.len(),
+                "resolved_input_count": resolved_input_count,
                 "unresolved_previous_response_id": unresolved_previous_response_id,
             }),
         );
@@ -940,6 +1308,9 @@ pub(crate) async fn resolve_openai_responses_context_payload(
     Ok(resolved_payload)
 }
 
+/// Uncached sync twin of [`resolve_openai_responses_context_payload`], for
+/// one-shot callers (session-catalog trace rehydration). Chain-walk and
+/// payload-stamp changes must land in both.
 pub(crate) fn resolve_openai_responses_context_payload_sync(
     index: &CodexTraceIndex,
     latest_ref: &CodexRequestPayloadRef,
@@ -988,11 +1359,12 @@ pub(crate) fn resolve_openai_responses_context_payload_sync(
         .and_then(|input| input.as_array())
         .map(Vec::len)
         .unwrap_or(0);
+    let resolved_input_count = resolved_input.len();
     let mut resolved_payload = latest_payload;
     if let serde_json::Value::Object(map) = &mut resolved_payload {
         map.insert(
             "input".to_string(),
-            serde_json::Value::Array(resolved_input.clone()),
+            serde_json::Value::Array(resolved_input),
         );
         map.insert(
             "_intendant_context".to_string(),
@@ -1003,7 +1375,7 @@ pub(crate) fn resolve_openai_responses_context_payload_sync(
                 "request_index": request_index,
                 "inference_call_id": latest_ref.inference_call_id.clone(),
                 "latest_request_input_count": latest_request_input_count,
-                "resolved_input_count": resolved_input.len(),
+                "resolved_input_count": resolved_input_count,
                 "unresolved_previous_response_id": unresolved_previous_response_id,
             }),
         );
@@ -1903,6 +2275,271 @@ mod tests {
         assert!(snapshots
             .windows(2)
             .all(|pair| pair[0].request_id != pair[1].request_id));
+    }
+
+    fn write_trace_request_line(
+        trace: &Path,
+        ts: i64,
+        call_id: &str,
+        payload_rel: &str,
+        payload: &serde_json::Value,
+        previous_response_id: Option<&str>,
+    ) -> String {
+        std::fs::create_dir_all(trace.join("payloads")).unwrap();
+        let mut payload = payload.clone();
+        if let (Some(previous), Some(map)) = (previous_response_id, payload.as_object_mut()) {
+            map.insert(
+                "previous_response_id".to_string(),
+                serde_json::json!(previous),
+            );
+        }
+        std::fs::write(trace.join(payload_rel), payload.to_string()).unwrap();
+        serde_json::json!({
+            "schema_version": 1,
+            "wall_time_unix_ms": ts,
+            "payload": {
+                "type": "inference_started",
+                "provider_name": "OpenAI",
+                "thread_id": "thread-abc",
+                "inference_call_id": call_id,
+                "request_payload": {
+                    "kind": {"type": "inference_request"},
+                    "path": payload_rel
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn write_trace_response_line(
+        trace: &Path,
+        ts: i64,
+        call_id: &str,
+        response_id: &str,
+        payload_rel: &str,
+        output_text: &str,
+    ) -> String {
+        std::fs::create_dir_all(trace.join("payloads")).unwrap();
+        std::fs::write(
+            trace.join(payload_rel),
+            serde_json::json!({
+                "response_id": response_id,
+                "output_items": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": output_text}]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        serde_json::json!({
+            "schema_version": 1,
+            "wall_time_unix_ms": ts,
+            "payload": {
+                "type": "inference_completed",
+                "inference_call_id": call_id,
+                "response_id": response_id,
+                "response_payload": {
+                    "kind": {"type": "inference_response"},
+                    "path": payload_rel
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn user_request_payload(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-test",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn trace_index_cache_folds_appends_and_rebuilds_on_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let first = write_trace_request_line(
+            &trace,
+            10,
+            "inference:1",
+            "payloads/request-1.json",
+            &user_request_payload("first"),
+            None,
+        );
+        std::fs::write(trace.join("trace.jsonl"), format!("{first}\n")).unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+
+        // Append: only the new line is folded; order stays sorted.
+        let second = write_trace_request_line(
+            &trace,
+            20,
+            "inference:2",
+            "payloads/request-2.json",
+            &user_request_payload("second"),
+            None,
+        );
+        let mut contents = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+        contents.push_str(&second);
+        contents.push('\n');
+        std::fs::write(trace.join("trace.jsonl"), &contents).unwrap();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 2);
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:1");
+        assert_eq!(cache.requests()[1].inference_call_id, "inference:2");
+
+        // Idempotent when nothing changed.
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 2);
+
+        // Truncation (trace rewrite) triggers a full rebuild.
+        std::fs::write(trace.join("trace.jsonl"), format!("{first}\n")).unwrap();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:1");
+    }
+
+    #[tokio::test]
+    async fn trace_index_cache_leaves_partial_trailing_line_for_next_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let first = write_trace_request_line(
+            &trace,
+            10,
+            "inference:1",
+            "payloads/request-1.json",
+            &user_request_payload("first"),
+            None,
+        );
+        let second = write_trace_request_line(
+            &trace,
+            20,
+            "inference:2",
+            "payloads/request-2.json",
+            &user_request_payload("second"),
+            None,
+        );
+        let (head, tail) = second.split_at(second.len() / 2);
+        std::fs::write(trace.join("trace.jsonl"), format!("{first}\n{head}")).unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+
+        // Completing the flushed line folds it — once, with the right index.
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            format!("{first}\n{head}{tail}\n"),
+        )
+        .unwrap();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 2);
+        assert_eq!(cache.requests()[1].inference_call_id, "inference:2");
+    }
+
+    #[tokio::test]
+    async fn resolved_chain_cache_extends_without_rereading_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line1 = write_trace_request_line(
+            &trace,
+            10,
+            "inference:1",
+            "payloads/request-1.json",
+            &user_request_payload("first user message"),
+            None,
+        );
+        let line2 = write_trace_response_line(
+            &trace,
+            20,
+            "inference:1",
+            "resp_1",
+            "payloads/response-1.json",
+            "first assistant reply",
+        );
+        let line3 = write_trace_request_line(
+            &trace,
+            30,
+            "inference:2",
+            "payloads/request-2.json",
+            &user_request_payload("second user message"),
+            Some("resp_1"),
+        );
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            format!("{line1}\n{line2}\n{line3}\n"),
+        )
+        .unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        let snapshot = cache
+            .latest_snapshot(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.request_index, 2);
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 3);
+
+        // The chain is now cached: the historical payload files are no
+        // longer needed. Deleting them proves extension never re-reads them.
+        std::fs::remove_file(trace.join("payloads/request-1.json")).unwrap();
+        std::fs::remove_file(trace.join("payloads/response-1.json")).unwrap();
+
+        let line4 = write_trace_response_line(
+            &trace,
+            40,
+            "inference:2",
+            "resp_2",
+            "payloads/response-2.json",
+            "second assistant reply",
+        );
+        let line5 = write_trace_request_line(
+            &trace,
+            50,
+            "inference:3",
+            "payloads/request-3.json",
+            &user_request_payload("third user message"),
+            Some("resp_2"),
+        );
+        let mut contents = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+        contents.push_str(&format!("{line4}\n{line5}\n"));
+        std::fs::write(trace.join("trace.jsonl"), &contents).unwrap();
+
+        let snapshot = cache
+            .latest_snapshot(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.request_index, 3);
+        let rendered = serde_json::to_string(&snapshot.payload).unwrap();
+        assert!(rendered.contains("first user message"));
+        assert!(rendered.contains("first assistant reply"));
+        assert!(rendered.contains("second user message"));
+        assert!(rendered.contains("second assistant reply"));
+        assert!(rendered.contains("third user message"));
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["resolved_input_count"],
+            serde_json::json!(5)
+        );
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["unresolved_previous_response_id"],
+            serde_json::Value::Null
+        );
+
+        // Unchanged latest request: served from the cached resolution — even
+        // the immediately previous response payload is no longer read.
+        std::fs::remove_file(trace.join("payloads/request-2.json")).unwrap();
+        std::fs::remove_file(trace.join("payloads/response-2.json")).unwrap();
+        let snapshot = cache
+            .latest_snapshot(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.request_index, 3);
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 5);
     }
 
     #[test]

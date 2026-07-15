@@ -214,6 +214,9 @@ pub struct CodexAgent {
     context_archive: String,
     context_seen_request_ids: HashSet<String>,
     context_trace_fingerprint: Option<CodexTraceFingerprint>,
+    /// Incrementally maintained trace index + resolved-chain cache; spares
+    /// the per-turn context snapshots from re-reading the whole archive.
+    context_trace_cache: CodexTraceIndexCache,
     child: Option<Child>,
     writer: Option<SharedCodexWriter>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -522,17 +525,17 @@ impl CodexAgent {
         let Some(root) = self.request_trace_root.clone() else {
             return Ok(0);
         };
-        let index = read_codex_trace_index(&root, thread_id).await?;
+        self.context_trace_cache.refresh(&root, thread_id).await?;
         let mut inserted = 0usize;
-        for request in index.requests {
+        for request in self.context_trace_cache.requests() {
             if self
                 .context_seen_request_ids
-                .insert(codex_request_id(&request))
+                .insert(codex_request_id(request))
             {
                 inserted += 1;
             }
         }
-        if let Ok(fingerprint) = codex_context_trace_fingerprint(&root, thread_id).await {
+        if let Ok(fingerprint) = self.context_trace_cache.fingerprint(&root, thread_id).await {
             self.context_trace_fingerprint = Some(fingerprint);
         }
         Ok(inserted)
@@ -717,6 +720,7 @@ impl CodexAgent {
             context_archive: "summary".to_string(),
             context_seen_request_ids: HashSet::new(),
             context_trace_fingerprint: None,
+            context_trace_cache: CodexTraceIndexCache::default(),
             child: None,
             writer: None,
             event_tx: None,
@@ -881,13 +885,16 @@ impl CodexAgent {
     }
 
     async fn read_context_snapshot(&mut self) -> Result<AgentContextSnapshot, CallerError> {
-        let root = self.request_trace_root.as_deref().ok_or_else(|| {
+        let root = self.request_trace_root.clone().ok_or_else(|| {
             CallerError::ExternalAgent(
                 "Codex request payload tracing was not configured".to_string(),
             )
         })?;
         let thread_id = self.active_thread_id.lock().await.clone();
-        let trace = read_latest_codex_context_payload(root, thread_id.as_deref()).await?;
+        let trace = self
+            .context_trace_cache
+            .latest_snapshot(&root, thread_id.as_deref())
+            .await?;
         let rollout_path = match thread_id.as_deref() {
             Some(thread_id) => self
                 .read_thread_snapshot(thread_id)
@@ -1211,6 +1218,7 @@ impl ExternalAgent for CodexAgent {
             crate::project::normalize_codex_context_archive(&config.context_archive);
         self.context_seen_request_ids.clear();
         self.context_trace_fingerprint = None;
+        self.context_trace_cache = CodexTraceIndexCache::default();
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
@@ -1531,7 +1539,11 @@ impl ExternalAgent for CodexAgent {
             return Ok(Vec::new());
         };
         let thread_id = self.active_thread_id.lock().await.clone();
-        let fingerprint = match codex_context_trace_fingerprint(&root, thread_id.as_deref()).await {
+        let fingerprint = match self
+            .context_trace_cache
+            .fingerprint(&root, thread_id.as_deref())
+            .await
+        {
             Ok(fingerprint) => fingerprint,
             Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
             Err(err) => return Err(err),
@@ -1539,12 +1551,10 @@ impl ExternalAgent for CodexAgent {
         if self.context_trace_fingerprint.as_ref() == Some(&fingerprint) {
             return Ok(Vec::new());
         }
-        let traces = match read_codex_context_payloads_excluding(
-            &root,
-            thread_id.as_deref(),
-            &self.context_seen_request_ids,
-        )
-        .await
+        let traces = match self
+            .context_trace_cache
+            .snapshots_excluding(&root, thread_id.as_deref(), &self.context_seen_request_ids)
+            .await
         {
             Ok(traces) => traces,
             Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
