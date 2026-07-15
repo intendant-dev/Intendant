@@ -1259,6 +1259,7 @@ pub(crate) async fn run_with_presence(
                             direct: Some(true),
                             fork: false,
                             relationship_kind: None,
+                            auto_attach: false,
                             attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
                             codex_sandbox: Some(crate::project::normalize_sandbox_mode(

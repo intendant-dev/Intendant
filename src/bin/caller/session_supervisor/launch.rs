@@ -444,6 +444,31 @@ impl SessionSupervisor {
         Some(launched_session_id)
     }
 
+    /// The user-halt gate for a resume request (see
+    /// `ControlMsg::ResumeSession::auto_attach`): a frontend auto-attach
+    /// escalation carrying a task is cancelled when the user
+    /// interrupted/stopped the target session after the prompt was sent —
+    /// launching it would run the very work the user tried to halt
+    /// (observed live 2026-07-15: send → stop → late failure echo →
+    /// auto-resume ran the prompt anyway). A deliberate resume is never
+    /// blocked and clears any halt marks for its ids (latest intent wins).
+    /// Returns true when the resume must be cancelled.
+    pub(crate) async fn resume_cancelled_by_user_halt(
+        &self,
+        auto_attach: bool,
+        has_task: bool,
+        session_id: &str,
+        resume_token: &str,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if auto_attach {
+            has_task && state.unmanaged_user_halt_active([session_id, resume_token])
+        } else {
+            state.clear_unmanaged_user_halts([session_id, resume_token]);
+            false
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn resume_session(
         &self,
@@ -458,6 +483,7 @@ impl SessionSupervisor {
         relationship_kind: Option<String>,
         overrides: LaunchOverrides,
         force_new: bool,
+        auto_attach: bool,
     ) {
         // A fork never attaches to (or dedupes against) the thread it forks
         // from: it always materializes as a fresh wrapper session that keeps
@@ -485,6 +511,24 @@ impl SessionSupervisor {
         };
         let is_external = external_backend.is_some();
         let requested_resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        if self
+            .resume_cancelled_by_user_halt(
+                auto_attach,
+                resume_task.is_some(),
+                &session_id,
+                &requested_resume_token,
+            )
+            .await
+        {
+            let message = format!(
+                "Auto-resume of {} session {} cancelled: the user stopped it after the prompt was sent",
+                source_norm,
+                short_session(&session_id)
+            );
+            eprintln!("[supervisor] {}", message);
+            self.warn(&message);
+            return;
+        }
         let resume_token = if is_external {
             effective_external_resume_token_in_home(
                 &self.logs_home(),
@@ -2051,6 +2095,7 @@ mod tests {
                 None,
                 LaunchOverrides::default(),
                 false,
+                false,
             )
             .await;
 
@@ -2104,6 +2149,7 @@ mod tests {
                 false,
                 None,
                 LaunchOverrides::default(),
+                false,
                 false,
             )
             .await;
@@ -2294,6 +2340,7 @@ mod tests {
                 None,
                 LaunchOverrides::default(),
                 false,
+                false,
             ),
         )
         .await
@@ -2386,6 +2433,7 @@ mod tests {
                 false,
                 None,
                 LaunchOverrides::default(),
+                false,
                 false,
             )
             .await;

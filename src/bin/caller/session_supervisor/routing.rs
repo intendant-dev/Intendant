@@ -15,7 +15,7 @@ impl SessionSupervisor {
         follow_up_id: Option<String>,
     ) {
         let (target_id, entry) = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let requested_id = session_id.or_else(|| state.active_session_id.clone());
             let Some(requested_id) = requested_id else {
                 drop(state);
@@ -25,6 +25,11 @@ impl SessionSupervisor {
             let target_id = state
                 .resolve_session_id(&requested_id)
                 .unwrap_or_else(|| requested_id.clone());
+            // A fresh prompt aimed at this session supersedes any earlier
+            // user halt (route_interrupt documents the mark): the newest
+            // intent wins, so this text's own auto-attach escalation may
+            // relaunch the session even after an older stop.
+            state.clear_unmanaged_user_halts([requested_id.as_str(), target_id.as_str()]);
             let entry = state.sessions.get(&target_id).map(|s| {
                 let relation = state.related_sessions.get(&requested_id).cloned();
                 (
@@ -303,6 +308,7 @@ impl SessionSupervisor {
                     false,
                     None,
                     LaunchOverrides::default(),
+                    false,
                     false,
                 )
                 .await;
@@ -663,10 +669,38 @@ impl SessionSupervisor {
             }
         }
         if !self.session_is_managed(&target_id).await {
-            self.warn(&format!(
+            // The user said stop for a session nothing is running here.
+            // Acknowledge loudly instead of evaporating (verified live
+            // 2026-07-15: a silently dropped interrupt left the user's stop
+            // doing nothing while a pending dashboard escalation resumed
+            // the session with the halted prompt anyway):
+            //  - eprintln reaches the daemon log via the fd tee (bus log
+            //    entries are dashboard-only) — mirrors the FollowUp drop;
+            //  - the halt mark cancels a frontend auto-attach escalation
+            //    that arrives after this stop (see `resume_session`);
+            //  - `Interrupted` is the ack frontends already render (session
+            //    log line + phase reset), honest for a session with no
+            //    running turn.
+            let message = format!(
                 "Interrupt dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
-            ));
+            );
+            eprintln!("[supervisor] {}", message);
+            self.warn(&message);
+            {
+                let mut state = self.state.lock().await;
+                state.mark_unmanaged_user_halts(
+                    requested_id
+                        .as_deref()
+                        .into_iter()
+                        .chain([target_id.as_str()]),
+                );
+            }
+            self.config.bus.send(AppEvent::Interrupted {
+                session_id: requested_id.or(Some(target_id)),
+                reason: "session is not attached to this daemon; nothing is running to interrupt"
+                    .to_string(),
+            });
             return;
         }
         self.config.bus.send(AppEvent::InterruptRequested {
@@ -713,11 +747,19 @@ impl SessionSupervisor {
                 return None;
             }
             let Some(target_id) = state.resolve_session_id(&requested_id) else {
+                // Mirror the interrupt treatment: the halt mark cancels a
+                // pending frontend auto-attach escalation for this session
+                // (see `resume_session`) instead of letting it relaunch
+                // stopped work, and the eprintln puts the drop in the
+                // daemon log (bus warns are dashboard-only).
+                state.mark_unmanaged_user_halts([requested_id.as_str()]);
                 drop(state);
-                self.warn(&format!(
+                let message = format!(
                     "Stop session dropped: session {} is not managed by this daemon",
                     short_session(&requested_id)
-                ));
+                );
+                eprintln!("[supervisor] {}", message);
+                self.warn(&message);
                 return None;
             };
             state.remove_session(&target_id)
@@ -816,6 +858,7 @@ impl SessionSupervisor {
             None,
             overrides,
             true,
+            false,
         )
         .await;
     }
@@ -1582,6 +1625,203 @@ mod tests {
         );
         let state = supervisor.state.lock().await;
         assert!(state.sessions.contains_key("parent"));
+    }
+
+    /// The 2026-07-15 incident class: a stop/interrupt aimed at a session
+    /// this daemon does not manage must be acknowledged — the drop warn plus
+    /// the `Interrupted` ack frontends already render — never silently
+    /// evaporate, and it must not fan out as `InterruptRequested` (nothing
+    /// is subscribed for that session).
+    #[tokio::test]
+    async fn interrupt_for_unmanaged_session_is_acknowledged() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::Interrupt {
+                session_id: Some("07ca095f-ghost".to_string()),
+                expected_turn: None,
+            })
+            .await;
+
+        let mut saw_drop_warn = false;
+        let mut ack: Option<(Option<String>, String)> = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::LogEntry { level, content, .. }
+                    if level == "warn" && content.contains("Interrupt dropped") =>
+                {
+                    saw_drop_warn = true;
+                }
+                AppEvent::Interrupted { session_id, reason } => {
+                    ack = Some((session_id, reason));
+                }
+                AppEvent::InterruptRequested { session_id } => {
+                    panic!(
+                        "unmanaged interrupt must not fan out as InterruptRequested ({session_id:?})"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_drop_warn, "expected the Interrupt dropped warn");
+        let (session_id, reason) = ack.expect("expected the Interrupted acknowledgment");
+        assert_eq!(session_id.as_deref(), Some("07ca095f-ghost"));
+        assert!(
+            reason.contains("not attached"),
+            "ack should say nothing is attached, got: {reason}"
+        );
+    }
+
+    /// Part two of the incident fix: the user's stop cancels the pending
+    /// dashboard escalation. After an interrupt aimed at the unmanaged
+    /// session, an auto-attach resume carrying the halted prompt is
+    /// cancelled instead of launching it.
+    #[tokio::test]
+    async fn user_halt_cancels_auto_attach_resume_with_task() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus.clone());
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::Interrupt {
+                session_id: Some("ghost-halted".to_string()),
+                expected_turn: None,
+            })
+            .await;
+        supervisor
+            .handle_control_msg(event::ControlMsg::ResumeSession {
+                source: "codex".to_string(),
+                session_id: "ghost-halted".to_string(),
+                resume_id: Some("ghost-halted".to_string()),
+                project_root: Some(project_dir.path().to_string_lossy().to_string()),
+                task: Some("run the halted prompt".to_string()),
+                direct: Some(true),
+                attachments: Vec::new(),
+                fork: false,
+                relationship_kind: None,
+                auto_attach: true,
+                agent_command: None,
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_managed_context: None,
+                codex_context_archive: None,
+            })
+            .await;
+
+        // The cancel is synchronous inside handle_control_msg: nothing may
+        // have launched or registered by the time it returned.
+        let mut saw_cancel_warn = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::SessionStarted { session_id, .. } => {
+                    panic!("cancelled escalation must not launch (started {session_id})");
+                }
+                AppEvent::LogEntry { level, content, .. }
+                    if level == "warn" && content.contains("Auto-resume") =>
+                {
+                    saw_cancel_warn = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_cancel_warn, "expected the auto-resume cancel warn");
+        let mut state = supervisor.state.lock().await;
+        assert!(!state.session_is_managed("ghost-halted"));
+        assert!(
+            state.unmanaged_user_halt_active(["ghost-halted"]),
+            "the halt stays armed for further escalations in the window"
+        );
+    }
+
+    /// The gate decision matrix (`resume_cancelled_by_user_halt`): only a
+    /// task-carrying auto-attach escalation for a halted id is cancelled.
+    /// Attach-only auto resumes and every deliberate resume pass — and a
+    /// deliberate resume clears the halt (latest intent wins).
+    #[tokio::test]
+    async fn user_halt_gate_only_cancels_task_carrying_auto_attach() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+
+        // No halt recorded: the escalation passes.
+        assert!(
+            !supervisor
+                .resume_cancelled_by_user_halt(true, true, "ghost", "ghost")
+                .await
+        );
+
+        supervisor
+            .state
+            .lock()
+            .await
+            .mark_unmanaged_user_halts(["ghost"]);
+        // Attach-only auto resume: never blocked (nothing to run).
+        assert!(
+            !supervisor
+                .resume_cancelled_by_user_halt(true, false, "ghost", "ghost")
+                .await
+        );
+        // Task-carrying escalation for the halted id: cancelled, and the
+        // resume token matches too.
+        assert!(
+            supervisor
+                .resume_cancelled_by_user_halt(true, true, "other", "ghost")
+                .await
+        );
+        // A deliberate resume passes AND clears the halt.
+        assert!(
+            !supervisor
+                .resume_cancelled_by_user_halt(false, true, "ghost", "ghost")
+                .await
+        );
+        assert!(
+            !supervisor
+                .resume_cancelled_by_user_halt(true, true, "ghost", "ghost")
+                .await,
+            "the deliberate resume cleared the halt"
+        );
+    }
+
+    /// Latest intent wins: a NEW prompt aimed at the halted session — even
+    /// one that itself drops "not managed by this daemon" — clears the halt,
+    /// so that prompt's own auto-attach escalation may relaunch the session.
+    #[tokio::test]
+    async fn new_follow_up_clears_unmanaged_user_halt() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::Interrupt {
+                session_id: Some("ghost-repermit".to_string()),
+                expected_turn: None,
+            })
+            .await;
+        assert!(supervisor
+            .state
+            .lock()
+            .await
+            .unmanaged_user_halt_active(["ghost-repermit"]));
+
+        supervisor
+            .route_follow_up(
+                Some("ghost-repermit".to_string()),
+                "a newer prompt".to_string(),
+                Some(true),
+                Vec::new(),
+                Some("follow-2".to_string()),
+            )
+            .await;
+
+        assert!(
+            !supervisor
+                .state
+                .lock()
+                .await
+                .unmanaged_user_halt_active(["ghost-repermit"]),
+            "a fresh prompt supersedes the halt"
+        );
     }
 
     #[tokio::test]

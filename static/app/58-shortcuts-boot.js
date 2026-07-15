@@ -100,6 +100,11 @@ window.sendQuestionAnswer = function(opts) {
 window.sendInterrupt = function() {
   if (!app) return;
   const targetSessionId = resolvePromptTargetSessionId();
+  // The stop also disarms any pending auto-attach escalation for this
+  // window — without this, a follow-up that later fails "not managed by
+  // this daemon" resumes the session with the very prompt the user just
+  // tried to halt (see haltPendingFollowUpEscalations).
+  if (targetSessionId) haltPendingFollowUpEscalations(targetSessionId);
   if (targetSessionId && sessionWindowIsDetached(targetSessionId)) {
     showControlToast('error', 'Attach the session before interrupting it');
     updateStopButtonVisibility(currentPhase);

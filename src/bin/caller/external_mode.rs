@@ -74,6 +74,18 @@ pub(crate) async fn run_external_agent_mode(
     } else if backend == external_agent::AgentBackend::ClaudeCode {
         emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
     }
+    // Use one control receiver across idle waits and active turn drains.
+    // A second parked receiver would retain mid-turn controls and replay them
+    // as new idle follow-ups after the turn completes. Subscribed BEFORE the
+    // backend spawn below: creating the process (and loading a large resume)
+    // can take seconds, and the supervisor routes Stop/Interrupt at this
+    // session from the moment it registered the launch — a receiver created
+    // only after the spawn silently dropped anything sent in that window
+    // (verified live 2026-07-15: a stop during the attach window left the
+    // backend running the task it was meant to abort). Events emitted while
+    // the backend starts are buffered here and consumed at the first
+    // idle/drain poll.
+    let mut external_control_rx = bus.subscribe();
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
         &project,
@@ -252,10 +264,6 @@ pub(crate) async fn run_external_agent_mode(
         headless,
         context_injection: &context_injection,
     };
-    // Use one control receiver across idle waits and active turn drains.
-    // A second parked receiver would retain mid-turn controls and replay them
-    // as new idle follow-ups after the turn completes.
-    let mut external_control_rx = bus.subscribe();
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
     if let Some(ready_tx) = ready_for_thread_actions {
         let _ = ready_tx.send(());

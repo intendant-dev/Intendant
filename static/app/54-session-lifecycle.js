@@ -609,11 +609,30 @@ function clearPendingFollowUpsForSession(sessionId, reason = 'session closed') {
   }
 }
 
+// A user stop/interrupt aimed at a session disarms its pending
+// escalations: a follow-up of that session that later fails "not managed
+// by this daemon" must fail honestly instead of auto-attaching — the
+// resume would relaunch the session with the very prompt the user tried
+// to halt (observed live 2026-07-15: send → stop → late failure echo →
+// auto-resume ran the prompt anyway). Entries stay in the map so
+// delivered/failed echoes still resolve their strip rows; only the
+// escalation is disarmed. Prompts sent after the stop create fresh
+// entries and may escalate again (latest intent wins).
+function haltPendingFollowUpEscalations(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  for (const pending of pendingFollowUpsById.values()) {
+    if (String(pending.sessionId || '').trim() !== sid) continue;
+    pending.haltedByUser = true;
+  }
+}
+
 function autoAttachUnmanagedFollowUp(evt = {}) {
   const id = String(evt.id || '').trim();
   const pending = id ? pendingFollowUpsById.get(id) : null;
   const sessionId = String(evt.session_id || evt.sessionId || pending?.sessionId || '').trim();
   if (!sessionId || !pending || pending.attempts > 0) return false;
+  if (pending.haltedByUser) return false;
   const resume = detachedSessionResumeMessage(
     sessionId,
     pending.text,
@@ -621,6 +640,10 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
     pending.attachments
   );
   if (!resume) return false;
+  // Mark the escalation for the daemon-side halt gate too: a stop the
+  // user issued after this prompt (possibly from another tab, or racing
+  // this message on the wire) cancels the relaunch there as well.
+  resume.auto_attach = true;
   pending.attempts += 1;
   pendingFollowUpsById.set(id, pending);
   dispatchControlMsg(resume);

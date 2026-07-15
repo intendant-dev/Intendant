@@ -86,6 +86,12 @@ const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::
 /// a peer that mints endless delegation ids from growing the map.
 const MAX_DELEGATION_RECEIPTS: usize = 128;
 const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
+/// Freshness window for [`SupervisorState::unmanaged_user_halts`]. Wide
+/// enough to outlive a slow event lane's round trip (the observed live
+/// escalation arrived 13s after the prompt; polling fallback lanes are
+/// slower), narrow enough that a stale mark cannot block work minutes
+/// later — and any newer prompt or deliberate resume clears it early.
+const UNMANAGED_USER_HALT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(not(test))]
 const EDIT_ATTACH_ROUTE_TIMEOUT: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
 #[cfg(test)]
@@ -125,6 +131,14 @@ pub(crate) struct SupervisorState {
     /// (tracked in `delegation_receipt_order`).
     delegation_receipts: HashMap<String, String>,
     delegation_receipt_order: std::collections::VecDeque<String>,
+    /// Session ids the user explicitly halted (interrupt / stop) while no
+    /// session here answered to them, with the halt time. A frontend
+    /// auto-attach escalation (`ResumeSession { auto_attach: true, task:
+    /// Some(..) }`) arriving inside [`UNMANAGED_USER_HALT_WINDOW`] is
+    /// cancelled instead of launching the very work the user tried to halt;
+    /// any newer follow-up or deliberate resume for the id clears the mark
+    /// (latest intent wins).
+    unmanaged_user_halts: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +434,40 @@ impl SupervisorState {
         for key in keys {
             self.external_attach_dedupe.remove(key);
         }
+    }
+
+    /// Record a user stop/interrupt aimed at ids no session here answers
+    /// to (see the field docs on `unmanaged_user_halts`). Prunes expired
+    /// marks as a side effect so the map cannot grow unbounded.
+    fn mark_unmanaged_user_halts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        let now = std::time::Instant::now();
+        self.unmanaged_user_halts
+            .retain(|_, at| now.duration_since(*at) < UNMANAGED_USER_HALT_WINDOW);
+        for id in ids {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            self.unmanaged_user_halts.insert(id.to_string(), now);
+        }
+    }
+
+    /// Drop any user-halt marks for `ids`: a newer prompt or a deliberate
+    /// resume supersedes an earlier halt (latest intent wins).
+    fn clear_unmanaged_user_halts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            self.unmanaged_user_halts.remove(id.trim());
+        }
+    }
+
+    /// True when any of `ids` was user-halted within
+    /// [`UNMANAGED_USER_HALT_WINDOW`]. Prunes expired marks as a side effect.
+    fn unmanaged_user_halt_active<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> bool {
+        let now = std::time::Instant::now();
+        self.unmanaged_user_halts
+            .retain(|_, at| now.duration_since(*at) < UNMANAGED_USER_HALT_WINDOW);
+        ids.into_iter()
+            .any(|id| self.unmanaged_user_halts.contains_key(id.trim()))
     }
 
     /// The session a delegation id was already dispatched as, if any.
@@ -864,5 +912,34 @@ mod tests {
         assert!(state.mark_restart_requested("codex:thread"));
         assert!(!state.mark_restart_requested("codex:thread"));
         assert!(state.mark_restart_requested("codex:other-thread"));
+    }
+
+    /// The user-halt ledger behind the auto-attach cancel: marks are
+    /// per-id, clearable (newer intent wins), and expire after
+    /// [`UNMANAGED_USER_HALT_WINDOW`] instead of blocking work forever.
+    #[test]
+    fn unmanaged_user_halts_mark_clear_and_expire() {
+        let mut state = SupervisorState::default();
+        state.mark_unmanaged_user_halts(["ghost-a", "ghost-b", "  ", ""]);
+        assert!(state.unmanaged_user_halt_active(["ghost-a"]));
+        assert!(state.unmanaged_user_halt_active(["unrelated", "ghost-b"]));
+        assert!(!state.unmanaged_user_halt_active(["unrelated"]));
+        assert_eq!(state.unmanaged_user_halts.len(), 2, "blank ids ignored");
+
+        state.clear_unmanaged_user_halts(["ghost-a"]);
+        assert!(!state.unmanaged_user_halt_active(["ghost-a"]));
+        assert!(state.unmanaged_user_halt_active(["ghost-b"]));
+
+        // Stale marks expire (and are pruned) instead of cancelling a
+        // resume minutes later.
+        if let Some(stale) = std::time::Instant::now()
+            .checked_sub(UNMANAGED_USER_HALT_WINDOW + std::time::Duration::from_secs(1))
+        {
+            state
+                .unmanaged_user_halts
+                .insert("ghost-b".to_string(), stale);
+            assert!(!state.unmanaged_user_halt_active(["ghost-b"]));
+            assert!(state.unmanaged_user_halts.is_empty());
+        }
     }
 }

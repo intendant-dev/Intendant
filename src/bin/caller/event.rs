@@ -1648,6 +1648,16 @@ pub enum ControlMsg {
         /// respawned forks rather than in-process threads.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relationship_kind: Option<String>,
+        /// Marks a frontend-initiated automatic escalation: a follow-up that
+        /// failed "not managed by this daemon" being retried by the
+        /// dashboard as a resume-with-task. The supervisor cancels an
+        /// auto-attach resume when the user interrupted/stopped the target
+        /// session after the prompt was sent — the resume would relaunch
+        /// the very work the user tried to halt (observed live 2026-07-15).
+        /// Deliberate resumes leave this false/absent and are never subject
+        /// to that gate.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        auto_attach: bool,
         /// Per-session executable override. When omitted, the supervisor
         /// rehydrates the persisted session value before falling back to the
         /// global Settings value.
@@ -4769,6 +4779,7 @@ mod tests {
                 direct,
                 attachments,
                 fork,
+                auto_attach,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -4777,6 +4788,7 @@ mod tests {
             } => {
                 assert_eq!(source, "codex");
                 assert!(!fork);
+                assert!(!auto_attach, "absent auto_attach must default to false");
                 assert_eq!(session_id, "thread-1");
                 assert_eq!(resume_id.as_deref(), Some("thread-1"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));

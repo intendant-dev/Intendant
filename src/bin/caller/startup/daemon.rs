@@ -235,6 +235,7 @@ pub(crate) async fn run_daemon(
             attachments: Vec::new(),
             fork: false,
             relationship_kind: None,
+            auto_attach: false,
             agent_command: None,
             codex_sandbox: None,
             codex_approval_policy: None,
