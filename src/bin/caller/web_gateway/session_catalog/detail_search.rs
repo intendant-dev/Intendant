@@ -685,38 +685,17 @@ pub(crate) fn session_log_search_file_path(
 }
 
 pub(crate) fn find_claude_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
-    collect_recent_files(
-        &home.join(".claude").join("projects"),
-        ".jsonl",
-        EXTERNAL_SESSION_SCAN_LIMIT,
-    )
-    .into_iter()
-    .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
+    // Exact-name lookup: the direct per-project probe (and walk
+    // fallback) replaces a store-wide walk + mtime sort whose ordering
+    // never mattered for finding one stem.
+    find_claude_session_file_for_transcript(home, session_id)
 }
 
 pub(crate) fn find_gemini_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
-    collect_recent_files(
-        &home.join(".gemini").join("tmp"),
-        ".json",
-        EXTERNAL_SESSION_SCAN_LIMIT,
-    )
-    .into_iter()
-    .filter(|path| {
-        path.parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            == Some("chats")
-    })
-    .find(|path| {
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        serde_json::from_str::<serde_json::Value>(&contents)
-            .ok()
-            .and_then(|obj| value_str(&obj, "sessionId"))
-            .as_deref()
-            == Some(session_id)
-    })
+    // Exact-id lookup: the cached transcript resolver verifies one
+    // remembered file per repeat fetch instead of read+parsing every
+    // chat in the store under an mtime sort that never mattered here.
+    find_gemini_session_file_for_transcript(home, session_id)
 }
 
 pub(crate) fn search_session_log_file(

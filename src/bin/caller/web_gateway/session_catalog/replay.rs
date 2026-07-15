@@ -853,11 +853,11 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
     source: &str,
     session_id: &str,
 ) {
-    let Some(transcript) = external_session_entries_from_home(home, source, session_id) else {
+    let Some(transcript) = external_session_entries_from_home_arc(home, source, session_id) else {
         return;
     };
     let user_turns: Vec<serde_json::Value> = transcript
-        .into_iter()
+        .iter()
         .filter(|entry| entry.get("source").and_then(|v| v.as_str()) == Some("user"))
         .filter(|entry| {
             entry
@@ -869,6 +869,9 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
                     .and_then(|v| v.as_u64())
                     .is_some()
         })
+        // Clone only the matched user turns; the shared transcript
+        // snapshot itself is never deep-cloned on this path anymore.
+        .cloned()
         .collect();
     if user_turns.is_empty() {
         return;
