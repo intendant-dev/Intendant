@@ -12,6 +12,15 @@
 //! available). A new action after rollback branches off the abandoned path and
 //! stores it in
 //! `abandoned_branches` for later pruning.
+//!
+//! Cost model: round scans are fingerprint-cached — every file is stat'd,
+//! only files whose (size, mtime) moved are re-read and re-hashed — so
+//! per-round work is proportional to actual changes. Durable state is split
+//! between a slim `history.json` index (round scalars + changed paths,
+//! format 2) and one `rounds/round_{id}/manifest.json` per round holding
+//! that round's full path→hash maps; a no-op round writes a tiny
+//! `maps_from_round` backreference instead of duplicating maps. Only the
+//! head round's maps stay in memory.
 
 use crate::error::CallerError;
 use crate::event::{AppEvent, EventBus};
@@ -57,11 +66,18 @@ pub struct HistoryRound {
     /// Full restorable state at the end of this round: supported,
     /// non-ignored text files under `SNAPSHOT_MAX_FILE_BYTES`, path → sha256
     /// hex. Rollback restores exactly this map.
+    ///
+    /// Populated when this struct is a per-round manifest
+    /// (`rounds/round_{id}/manifest.json`) with inline maps. The in-memory
+    /// `History` and the persisted `history.json` index keep it empty — the
+    /// manifests are the durable source; see [`FileWatcher`]'s head-maps
+    /// cache and `resolved_round_maps`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub files_at_end: HashMap<String, String>,
     /// Display-state mirror that also includes non-restorable tracked files
     /// that were inspected but not stored as text blobs. Rollback still uses
     /// `files_at_end`; this lets timeline counts match what the Changes tab
-    /// reports.
+    /// reports. Same manifest-only population as `files_at_end`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub all_files_at_end: HashMap<String, String>,
     /// Number of agent turns executed in this round (from `RoundComplete.turns_in_round`).
@@ -77,6 +93,14 @@ pub struct HistoryRound {
     /// rollback instead.
     #[serde(default)]
     pub native_message_count: Option<u32>,
+    /// When this round's tree state is identical to an earlier round's
+    /// (a no-op round — e.g. a `RoundComplete` that changed no files), the
+    /// maps are not duplicated: this names the round whose manifest holds
+    /// them inline. Backreferences are written depth-1 (they point at the
+    /// nearest round with inline maps, never at another backreference).
+    /// `None` for rounds with inline maps and for legacy manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maps_from_round: Option<u64>,
 }
 
 /// A branch of rounds that was replaced by a rollback-then-new-action. Kept
@@ -150,7 +174,8 @@ type SnapshotObjectMaps = (HashMap<String, String>, HashMap<String, String>);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TextFileSnapshot {
-    pub bytes: Vec<u8>,
+    /// UTF-8 content. The raw bytes are exactly `text.as_bytes()` — the
+    /// snapshot deliberately holds one copy, not a bytes+text pair.
     pub text: String,
     pub hash: [u8; 32],
     pub hash_hex: String,
@@ -336,7 +361,7 @@ pub(crate) fn inspect_file(path: &Path) -> std::io::Result<InspectedFile> {
         }));
     }
 
-    let text = match String::from_utf8(bytes.clone()) {
+    let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(_) => {
             return Ok(InspectedFile::Unsupported(UnsupportedFileSnapshot {
@@ -349,7 +374,6 @@ pub(crate) fn inspect_file(path: &Path) -> std::io::Result<InspectedFile> {
     };
 
     Ok(InspectedFile::Text(TextFileSnapshot {
-        bytes,
         text,
         hash,
         hash_hex,
@@ -390,6 +414,48 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Compute the list of paths whose content in `current` differs from the
+/// parent round's display mirror (or restorable map for legacy rounds
+/// recorded before the mirror existed), or from the baseline when there is
+/// no resolvable parent round.
+fn compute_files_changed(
+    parent: Option<&ResolvedRoundMaps>,
+    current: &HashMap<String, String>,
+    baseline_manifest: &BaselineManifest,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    let baseline_hex: HashMap<String, String>;
+    let prev: &HashMap<String, String> = match parent {
+        Some(parent) => {
+            if parent.all_files_at_end.is_empty() {
+                &parent.files_at_end
+            } else {
+                &parent.all_files_at_end
+            }
+        }
+        None => {
+            // First round (or unresolvable parent): compare against the
+            // baseline manifest, which records a hash for every inspected
+            // file at session start.
+            baseline_hex = baseline_manifest
+                .iter()
+                .map(|(path, meta)| (path.clone(), meta.hash.clone()))
+                .collect();
+            &baseline_hex
+        }
+    };
+    let mut keys: HashSet<&String> = prev.keys().collect();
+    keys.extend(current.keys());
+    for k in keys {
+        match (prev.get(k), current.get(k)) {
+            (Some(a), Some(b)) if a == b => continue,
+            _ => changed.push(k.clone()),
+        }
+    }
+    changed.sort();
+    changed
 }
 
 /// Persist a named tempfile at `dest_path`, using an atomic rename when the
@@ -446,6 +512,103 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Format tag stamped into `history.json` since it became a slim index
+/// (round scalars + `files_changed` only; the per-round path→hash maps live
+/// in `rounds/round_{id}/manifest.json`). Older binaries fail to parse a
+/// round without `files_at_end` and fall back to an empty history — a safe
+/// "no rollback offered" downgrade instead of restoring from empty maps.
+const HISTORY_INDEX_FORMAT: u64 = 2;
+
+/// Path of the on-disk manifest carrying one round's full snapshot record.
+fn round_manifest_path(snapshot_dir: &Path, round_id: u64) -> PathBuf {
+    snapshot_dir
+        .join("rounds")
+        .join(format!("round_{}", round_id))
+        .join("manifest.json")
+}
+
+/// Load `history.json`, migrating legacy full-fat files (per-round maps
+/// inline) to per-round manifests so the maps stay restorable after the
+/// in-memory copy goes slim. Returns a `History` whose rounds carry scalars
+/// and `files_changed` only.
+fn load_history_from_disk(snapshot_dir: &Path) -> History {
+    let history_path = snapshot_dir.join("history.json");
+    let Ok(bytes) = std::fs::read(&history_path) else {
+        return History::default();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return History::default();
+    };
+    let format = value.get("format").and_then(|v| v.as_u64()).unwrap_or(0);
+    let Ok(mut history) = serde_json::from_value::<History>(value) else {
+        return History::default();
+    };
+    if format < HISTORY_INDEX_FORMAT {
+        migrate_legacy_history_maps(&mut history, snapshot_dir);
+    } else {
+        // Defensive: a format-2 index never carries maps, but strip any that
+        // slipped in so the in-memory invariant (slim rounds) always holds.
+        strip_round_maps(&mut history);
+    }
+    history
+}
+
+/// Write a per-round manifest for every legacy round that has inline maps
+/// but no manifest on disk (manifests have been written since the feature
+/// shipped, so this normally touches nothing), then drop the inline maps
+/// from memory. Rounds inside abandoned branches migrate too.
+fn migrate_legacy_history_maps(history: &mut History, snapshot_dir: &Path) {
+    let migrate_round = |round: &mut HistoryRound| {
+        let manifest_path = round_manifest_path(snapshot_dir, round.id);
+        if !manifest_path.exists() {
+            // Write even when the maps are empty: an explicit "empty tree"
+            // record keeps restore-to-empty semantics distinct from a
+            // missing manifest (which rollback refuses).
+            if let Ok(bytes) = serde_json::to_vec_pretty(&round) {
+                let _ = atomic_write(&manifest_path, &bytes);
+            }
+        }
+        round.files_at_end = HashMap::new();
+        round.all_files_at_end = HashMap::new();
+    };
+    for round in &mut history.rounds {
+        migrate_round(round);
+    }
+    for branch in &mut history.abandoned_branches {
+        for round in &mut branch.rounds {
+            migrate_round(round);
+        }
+    }
+}
+
+fn strip_round_maps(history: &mut History) {
+    for round in &mut history.rounds {
+        round.files_at_end = HashMap::new();
+        round.all_files_at_end = HashMap::new();
+    }
+    for branch in &mut history.abandoned_branches {
+        for round in &mut branch.rounds {
+            round.files_at_end = HashMap::new();
+            round.all_files_at_end = HashMap::new();
+        }
+    }
+}
+
+/// Decode a 64-char lowercase/uppercase hex sha256 into raw bytes.
+fn hex_decode_hash(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
 /// Recursively sum file bytes under `path`.
 fn dir_byte_size(path: &Path) -> u64 {
     let mut total = 0u64;
@@ -482,13 +645,117 @@ fn dir_byte_size(path: &Path) -> u64 {
 /// coordinate without racing.
 pub type SharedFileWatcher = Arc<AsyncMutex<FileWatcher>>;
 
+/// One registry row: (project_root, snapshot_dir, watcher).
+type LiveWatcherEntry = (PathBuf, PathBuf, std::sync::Weak<AsyncMutex<FileWatcher>>);
+
+/// Registry of live watchers, keyed by (project_root, snapshot_dir). A
+/// daemon runs at most one, but the key keeps concurrent in-process tests
+/// isolated. The gateway's changes endpoint uses it to serve change lists
+/// from watcher state instead of re-reading the whole project per request;
+/// entries are `Weak`, so a dropped watcher unregisters itself.
+static LIVE_WATCHERS: std::sync::OnceLock<std::sync::Mutex<Vec<LiveWatcherEntry>>> =
+    std::sync::OnceLock::new();
+
+fn live_watchers() -> &'static std::sync::Mutex<Vec<LiveWatcherEntry>> {
+    LIVE_WATCHERS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn register_live_watcher(project_root: PathBuf, snapshot_dir: PathBuf, shared: &SharedFileWatcher) {
+    let Ok(mut registry) = live_watchers().lock() else {
+        return;
+    };
+    registry.retain(|(_, _, weak)| weak.strong_count() > 0);
+    registry.push((project_root, snapshot_dir, Arc::downgrade(shared)));
+}
+
+/// Compare paths tolerating symlinked spellings (`/tmp` vs `/private/tmp`
+/// on macOS) by canonicalizing when possible.
+fn watcher_paths_match(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Look up the live watcher covering exactly this (project_root,
+/// snapshot_dir) pair. `None` when no watcher matches — callers fall back
+/// to their disk-scan path (external session targets, watcher-less
+/// daemons).
+pub(crate) fn live_watcher_for(
+    project_root: &Path,
+    snapshot_dir: &Path,
+) -> Option<SharedFileWatcher> {
+    let registry = live_watchers().lock().ok()?;
+    for (root, snap, weak) in registry.iter() {
+        if watcher_paths_match(root, project_root) && watcher_paths_match(snap, snapshot_dir) {
+            if let Some(shared) = weak.upgrade() {
+                return Some(shared);
+            }
+        }
+    }
+    None
+}
+
+/// Point-in-time view of the watcher state the changes endpoint needs to
+/// compute the changed-key set without touching the project tree: the
+/// session-start baseline metadata and the last-known content hash per
+/// tracked path.
+pub(crate) struct ChangesIndexSnapshot {
+    pub(crate) baseline_manifest: BaselineManifest,
+    /// Relative path key → lowercase sha256 hex of last-known content.
+    pub(crate) current_hashes: HashMap<String, String>,
+}
+
+/// Cached result of hashing one tracked file, keyed by its metadata
+/// fingerprint. Round scans stat every file (cheap) and only re-read and
+/// re-hash the ones whose fingerprint moved, so per-round work is
+/// proportional to actual changes instead of the whole tree.
+///
+/// The fingerprint is always taken from a stat performed *before* the
+/// content read it describes, so a write racing the read can only cause a
+/// spurious cache miss (extra work), never a stale hit.
+#[derive(Debug, Clone)]
+struct ScanCacheEntry {
+    fingerprint: FileFingerprint,
+    hash: [u8; 32],
+    hash_hex: String,
+    /// True when the file was a supported text file (stored in `objects/`
+    /// and restorable); false for inspected-but-unsupported files that only
+    /// feed the display mirror.
+    restorable: bool,
+}
+
+/// The maps of the round `current_head_id` points at, kept in memory so the
+/// next round's diff does not have to re-read a manifest. All other rounds'
+/// maps live only on disk in `rounds/round_{id}/manifest.json`.
+#[derive(Debug, Clone)]
+struct HeadMapsCache {
+    round_id: u64,
+    /// The round whose manifest holds these maps inline (`round_id` itself
+    /// for changed rounds; an earlier round for no-op rounds recorded via
+    /// `maps_from_round` backreferences).
+    source_round_id: u64,
+    files_at_end: HashMap<String, String>,
+    all_files_at_end: HashMap<String, String>,
+}
+
+/// Maps of one round resolved from the head cache or its on-disk manifest.
+struct ResolvedRoundMaps {
+    /// Round whose manifest carries the maps inline.
+    source_round_id: u64,
+    files_at_end: HashMap<String, String>,
+    all_files_at_end: HashMap<String, String>,
+}
+
 pub struct FileWatcher {
     project_root: PathBuf,
     snapshot_dir: PathBuf,
     bus: EventBus,
-    /// Baseline file content (original at session start), keyed by relative path.
-    baselines: HashMap<PathBuf, Vec<u8>>,
     /// Metadata for every non-ignored file that existed at session start.
+    /// Baseline *content* is not held in memory: the `baseline/` shadow copy
+    /// written at startup is read on demand (per changed file), so RSS no
+    /// longer scales with project size for the daemon's lifetime.
     baseline_manifest: BaselineManifest,
     /// SHA-256 hashes of last-known content, for change deduplication.
     hashes: HashMap<PathBuf, [u8; 32]>,
@@ -496,6 +763,18 @@ pub struct FileWatcher {
     /// not snapshotted, and duplicate notify events can otherwise re-hash tens
     /// of megabytes repeatedly while an editor writes temp files.
     large_file_fingerprints: HashMap<PathBuf, FileFingerprint>,
+    /// Per-file fingerprint → hash cache for round scans and post-restore
+    /// re-syncs. Rebuilt on every walk so deleted paths fall out.
+    round_scan_cache: HashMap<PathBuf, ScanCacheEntry>,
+    /// Maps of the current head round (see [`HeadMapsCache`]).
+    head_maps: Option<HeadMapsCache>,
+    /// Running estimate of bytes under `snapshot_dir`, maintained from the
+    /// writes/GCs this watcher performs. The soft-cap check walks the real
+    /// tree only when the estimate crosses the cap.
+    snapshot_dir_size_estimate: u64,
+    /// Size of the last persisted `history.json`, so rewrites adjust the
+    /// estimate by the delta instead of double-counting.
+    last_history_index_bytes: u64,
     /// Persistent session history of per-round snapshots.
     history: History,
 }
@@ -515,7 +794,6 @@ impl FileWatcher {
         std::fs::create_dir_all(snapshot_dir.join("rounds"))
             .map_err(|e| CallerError::Config(format!("create rounds dir: {}", e)))?;
 
-        let mut baselines = HashMap::new();
         let mut baseline_manifest = BaselineManifest::new();
         let mut hashes = HashMap::new();
         let mut large_file_fingerprints = HashMap::new();
@@ -577,14 +855,13 @@ impl FileWatcher {
                                 ))
                             })?;
                         }
-                        std::fs::write(&baseline_path, &snapshot.bytes).map_err(|e| {
+                        std::fs::write(&baseline_path, snapshot.text.as_bytes()).map_err(|e| {
                             CallerError::Config(format!(
                                 "write baseline {}: {}",
                                 baseline_path.display(),
                                 e
                             ))
                         })?;
-                        baselines.insert(rel.clone(), snapshot.bytes);
                         hashes.insert(rel, snapshot.hash);
                         baseline_manifest.insert(
                             rel_key,
@@ -625,30 +902,53 @@ impl FileWatcher {
             .map_err(|e| CallerError::Config(format!("baseline manifest serialize: {}", e)))?;
         atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
 
-        // Load history.json if it exists (session resume / restart).
-        let history_path = snapshot_dir.join("history.json");
-        let history = match std::fs::read(&history_path) {
-            Ok(bytes) => serde_json::from_slice::<History>(&bytes).unwrap_or_default(),
-            Err(_) => History::default(),
-        };
+        // Load history.json if it exists (session resume / restart). Legacy
+        // full-fat files (per-round maps inline) are migrated to per-round
+        // manifests + a slim index on the next persist.
+        let history = load_history_from_disk(&snapshot_dir);
+
+        // One boot-time walk seeds the size estimate the soft-cap check
+        // maintains incrementally afterwards (it used to re-walk per round).
+        let snapshot_dir_size_estimate = dir_byte_size(&snapshot_dir);
+        let last_history_index_bytes = std::fs::metadata(snapshot_dir.join("history.json"))
+            .map(|meta| meta.len())
+            .unwrap_or(0);
 
         Ok(Self {
             project_root,
             snapshot_dir,
             bus,
-            baselines,
             baseline_manifest,
             hashes,
             large_file_fingerprints,
+            round_scan_cache: HashMap::new(),
+            head_maps: None,
+            snapshot_dir_size_estimate,
+            last_history_index_bytes,
             history,
         })
     }
 
     /// Read-only accessor for the history state. Callers hold the mutex for
     /// the duration, so callers should clone the result if they need to use
-    /// it after releasing the lock.
+    /// it after releasing the lock. Rounds are slim (scalars +
+    /// `files_changed`); the per-round maps live in the round manifests.
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// Snapshot the state the changes endpoint needs to compute the
+    /// changed-key set without walking the project tree. Cheap relative to
+    /// a tree read (two O(files) map clones), taken under the watcher lock.
+    pub(crate) fn changes_index_snapshot(&self) -> ChangesIndexSnapshot {
+        ChangesIndexSnapshot {
+            baseline_manifest: self.baseline_manifest.clone(),
+            current_hashes: self
+                .hashes
+                .iter()
+                .map(|(rel, hash)| (rel_path_key(rel), hex_encode(hash)))
+                .collect(),
+        }
     }
 
     /// Wrap `self` in an async-mutex-backed shared handle and spawn the
@@ -657,7 +957,9 @@ impl FileWatcher {
     pub fn start_shared(self) -> (SharedFileWatcher, JoinHandle<()>, JoinHandle<()>) {
         let bus = self.bus.clone();
         let project_root = self.project_root.clone();
+        let snapshot_dir = self.snapshot_dir.clone();
         let shared = Arc::new(AsyncMutex::new(self));
+        register_live_watcher(project_root.clone(), snapshot_dir, &shared);
 
         let watcher_handle = {
             let shared = shared.clone();
@@ -675,6 +977,14 @@ impl FileWatcher {
             tokio::task::spawn(async move {
                 loop {
                     match rx.recv().await {
+                        // Deliberately unfiltered by `session_id`: the event
+                        // carries one, but nothing on the bus maps a session
+                        // to its working root, so rounds from sessions in
+                        // other roots (worktrees, external backends) also
+                        // land here — a known attribution wart. Since the
+                        // fingerprint cache + backreference manifests, such
+                        // foreign rounds cost a stat-walk and an O(1)
+                        // persist, not a tree re-read.
                         Ok(AppEvent::RoundComplete {
                             round,
                             turns_in_round,
@@ -711,7 +1021,7 @@ impl FileWatcher {
         watcher_handle
     }
 
-    fn process_change(&mut self, abs_path: &Path, kind: &notify::EventKind) {
+    pub(crate) fn process_change(&mut self, abs_path: &Path, kind: &notify::EventKind) {
         // Compute relative path.
         let rel = match abs_path.strip_prefix(&self.project_root) {
             Ok(r) => r.to_path_buf(),
@@ -723,8 +1033,7 @@ impl FileWatcher {
         }
 
         let rel_key = rel_path_key(&rel);
-        let existed_at_baseline =
-            self.baselines.contains_key(&rel) || self.baseline_manifest.contains_key(&rel_key);
+        let existed_at_baseline = self.baseline_manifest.contains_key(&rel_key);
         let known_file = existed_at_baseline || self.hashes.contains_key(&rel);
         let change_kind = match kind {
             notify::EventKind::Create(_) => {
@@ -774,8 +1083,7 @@ impl FileWatcher {
                         self.hashes.insert(rel.clone(), snapshot.hash);
 
                         let (lines_added, lines_removed) =
-                            if let Some(baseline_bytes) = self.baselines.get(&rel) {
-                                let baseline_str = String::from_utf8_lossy(baseline_bytes);
+                            if let Some(baseline_str) = self.baseline_text_for(&rel) {
                                 diff_stats(&baseline_str, &snapshot.text)
                             } else if existed_at_baseline {
                                 (0, 0)
@@ -821,9 +1129,8 @@ impl FileWatcher {
             FileChangeKind::Deleted => {
                 if known_file {
                     let lines_removed = self
-                        .baselines
-                        .get(&rel)
-                        .map(|bytes| String::from_utf8_lossy(bytes).lines().count() as u32)
+                        .baseline_text_for(&rel)
+                        .map(|text| text.lines().count() as u32)
                         .unwrap_or(0);
                     self.bus.send(AppEvent::FileChanged {
                         path: rel_key,
@@ -857,16 +1164,35 @@ impl FileWatcher {
         turn_count: Option<u32>,
         native_message_count: Option<u32>,
     ) -> Result<(), CallerError> {
-        // Walk project and compute file hashes + write objects.
+        // Walk the project and compute file hashes + write any new objects.
+        // Fingerprint-cached: unchanged files are stat'd, not re-read.
         let (files_at_end, all_files_at_end) = self.scan_and_store_objects()?;
 
         // Determine parent + files_changed by diffing against previous round
         // (or baseline if first round).
         let parent_id = self.history.current_head_id;
-        let files_changed = self.compute_files_changed(parent_id, &all_files_at_end);
+        let parent_maps = parent_id.and_then(|pid| self.resolved_round_maps(pid));
+        let files_changed = compute_files_changed(
+            parent_maps.as_ref(),
+            &all_files_at_end,
+            &self.baseline_manifest,
+        );
+
+        // A no-op round (tree identical to the parent's recorded state)
+        // records a depth-1 backreference instead of duplicating the maps.
+        // Compared directly (not via files_changed) so legacy parents whose
+        // display mirror predates `all_files_at_end` never alias.
+        let maps_source_id = parent_maps
+            .as_ref()
+            .filter(|parent| {
+                parent.files_at_end == files_at_end && parent.all_files_at_end == all_files_at_end
+            })
+            .map(|parent| parent.source_round_id);
 
         // If current head is not the last round, branch: move trailing rounds
-        // into abandoned_branches before appending.
+        // into abandoned_branches before appending. (Backreference targets
+        // are always ancestors of the rounds that reference them, so a
+        // drained tail never strands a live round's maps.)
         if let Some(head_id) = self.history.current_head_id {
             if let Some(pos) = self.history.rounds.iter().position(|r| r.id == head_id) {
                 if pos + 1 < self.history.rounds.len() {
@@ -882,30 +1208,47 @@ impl FileWatcher {
 
         let id = self.history.next_id;
         self.history.next_id += 1;
-        let round = HistoryRound {
+        let stub = HistoryRound {
             id,
             parent_id,
             summary,
             timestamp_unix: now_unix(),
             files_changed,
-            files_at_end,
-            all_files_at_end,
+            files_at_end: HashMap::new(),
+            all_files_at_end: HashMap::new(),
             turn_count,
             native_message_count,
+            maps_from_round: maps_source_id,
         };
 
-        // Write per-round manifest.
-        let manifest_path = self
-            .snapshot_dir
-            .join("rounds")
-            .join(format!("round_{}", id))
-            .join("manifest.json");
-        let manifest_bytes = serde_json::to_vec_pretty(&round)
+        // Write the per-round manifest — the durable home of the maps. A
+        // no-op round writes a tiny backreference stub; a changed round
+        // inlines its maps.
+        let manifest = if maps_source_id.is_some() {
+            stub.clone()
+        } else {
+            HistoryRound {
+                files_at_end: files_at_end.clone(),
+                all_files_at_end: all_files_at_end.clone(),
+                ..stub.clone()
+            }
+        };
+        let manifest_path = round_manifest_path(&self.snapshot_dir, id);
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| CallerError::Config(format!("manifest serialize: {}", e)))?;
         atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
+        self.snapshot_dir_size_estimate = self
+            .snapshot_dir_size_estimate
+            .saturating_add(manifest_bytes.len() as u64);
 
-        self.history.rounds.push(round);
+        self.history.rounds.push(stub);
         self.history.current_head_id = Some(id);
+        self.head_maps = Some(HeadMapsCache {
+            round_id: id,
+            source_round_id: maps_source_id.unwrap_or(id),
+            files_at_end,
+            all_files_at_end,
+        });
 
         self.persist_history()?;
 
@@ -937,26 +1280,38 @@ impl FileWatcher {
                 ))
             })?;
 
-        let target = self.history.rounds[target_idx].clone();
-        let from_id = self.history.current_head_id.unwrap_or(target.id);
+        let target_id = self.history.rounds[target_idx].id;
+        let from_id = self.history.current_head_id.unwrap_or(target_id);
+        let target_maps = self.resolved_round_maps(target_id).ok_or_else(|| {
+            CallerError::Config(format!(
+                "round {} snapshot manifest is missing or unreadable — cannot restore",
+                target_id
+            ))
+        })?;
 
-        let files_reverted = self.restore_to_state(&target.files_at_end)?;
+        let files_reverted = self.restore_to_state(&target_maps.files_at_end)?;
 
         // Refresh in-memory hash/baseline mirrors so the watcher doesn't
         // re-emit spurious "modified" events for paths we just rewrote.
         self.refresh_hashes_from_tree();
 
-        self.history.current_head_id = Some(target.id);
+        self.history.current_head_id = Some(target_id);
+        self.head_maps = Some(HeadMapsCache {
+            round_id: target_id,
+            source_round_id: target_maps.source_round_id,
+            files_at_end: target_maps.files_at_end,
+            all_files_at_end: target_maps.all_files_at_end,
+        });
         self.persist_history()?;
 
         self.bus.send(AppEvent::RolledBack {
             from_id,
-            to_id: target.id,
+            to_id: target_id,
             files_reverted,
         });
 
         Ok(RollbackResult {
-            to_round_id: target.id,
+            to_round_id: target_id,
             files_reverted,
         })
     }
@@ -981,17 +1336,29 @@ impl FileWatcher {
             return Err(CallerError::Config("nothing to redo".to_string()));
         }
 
-        let next = self.history.rounds[pos + 1].clone();
-        let files_reverted = self.restore_to_state(&next.files_at_end)?;
+        let next_id = self.history.rounds[pos + 1].id;
+        let next_maps = self.resolved_round_maps(next_id).ok_or_else(|| {
+            CallerError::Config(format!(
+                "round {} snapshot manifest is missing or unreadable — cannot restore",
+                next_id
+            ))
+        })?;
+        let files_reverted = self.restore_to_state(&next_maps.files_at_end)?;
         self.refresh_hashes_from_tree();
 
-        self.history.current_head_id = Some(next.id);
+        self.history.current_head_id = Some(next_id);
+        self.head_maps = Some(HeadMapsCache {
+            round_id: next_id,
+            source_round_id: next_maps.source_round_id,
+            files_at_end: next_maps.files_at_end,
+            all_files_at_end: next_maps.all_files_at_end,
+        });
         self.persist_history()?;
 
-        self.bus.send(AppEvent::Redone { to_id: next.id });
+        self.bus.send(AppEvent::Redone { to_id: next_id });
 
         Ok(RedoResult {
-            to_round_id: next.id,
+            to_round_id: next_id,
             files_reverted,
         })
     }
@@ -1003,6 +1370,8 @@ impl FileWatcher {
         self.history.abandoned_branches.clear();
 
         let bytes_freed = self.gc_orphaned_objects();
+        self.snapshot_dir_size_estimate =
+            self.snapshot_dir_size_estimate.saturating_sub(bytes_freed);
 
         self.persist_history()?;
 
@@ -1023,12 +1392,20 @@ impl FileWatcher {
     /// Supported text files under the size cap are written to `objects/{hash}`
     /// and appear in both maps; inspected non-restorable files appear only in
     /// the display mirror. Ignored and oversized files are skipped.
-    fn scan_and_store_objects(&self) -> Result<SnapshotObjectMaps, CallerError> {
+    ///
+    /// Fingerprint-cached: every file is stat'd, but only files whose
+    /// (size, mtime) moved since the last walk are re-read and re-hashed.
+    /// A cached restorable entry is only trusted when its object blob still
+    /// exists on disk, so every hash recorded in `files_at_end` is
+    /// restorable by construction.
+    fn scan_and_store_objects(&mut self) -> Result<SnapshotObjectMaps, CallerError> {
         let mut out: HashMap<String, String> = HashMap::new();
         let mut all: HashMap<String, String> = HashMap::new();
         let objects_dir = self.snapshot_dir.join("objects");
         std::fs::create_dir_all(&objects_dir)
             .map_err(|e| CallerError::Config(format!("create objects dir: {}", e)))?;
+        let mut next_cache: HashMap<PathBuf, ScanCacheEntry> =
+            HashMap::with_capacity(self.round_scan_cache.len());
 
         let mut stack = vec![self.project_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -1060,11 +1437,34 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                if std::fs::metadata(&path)
-                    .map(|meta| meta.len() > SNAPSHOT_MAX_FILE_BYTES)
-                    .unwrap_or(false)
-                {
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
                     continue;
+                }
+                // Stat-before-read: this fingerprint describes content no
+                // newer than what a subsequent read returns.
+                let fingerprint = metadata_fingerprint(&meta);
+                if let Some(cached) = self.round_scan_cache.get(&rel) {
+                    if cached.fingerprint == fingerprint {
+                        let key = rel_path_key(&rel);
+                        if cached.restorable {
+                            if objects_dir.join(&cached.hash_hex).exists() {
+                                all.insert(key.clone(), cached.hash_hex.clone());
+                                out.insert(key, cached.hash_hex.clone());
+                                next_cache.insert(rel, cached.clone());
+                                continue;
+                            }
+                            // Object missing (fresh objects dir, failed
+                            // write): fall through and re-store it.
+                        } else {
+                            all.insert(key, cached.hash_hex.clone());
+                            next_cache.insert(rel, cached.clone());
+                            continue;
+                        }
+                    }
                 }
                 let snapshot = match inspect_file(&path) {
                     Ok(snapshot) => snapshot,
@@ -1074,77 +1474,104 @@ impl FileWatcher {
                     InspectedFile::Text(snapshot) => {
                         all.insert(rel_path_key(&rel), snapshot.hash_hex.clone());
                         let obj_path = objects_dir.join(&snapshot.hash_hex);
-                        if !obj_path.exists() {
-                            let _ = atomic_write(&obj_path, &snapshot.bytes);
+                        if !obj_path.exists()
+                            && atomic_write(&obj_path, snapshot.text.as_bytes()).is_ok()
+                        {
+                            self.snapshot_dir_size_estimate = self
+                                .snapshot_dir_size_estimate
+                                .saturating_add(snapshot.size);
                         }
+                        next_cache.insert(
+                            rel.clone(),
+                            ScanCacheEntry {
+                                fingerprint,
+                                hash: snapshot.hash,
+                                hash_hex: snapshot.hash_hex.clone(),
+                                restorable: true,
+                            },
+                        );
                         out.insert(rel_path_key(&rel), snapshot.hash_hex);
                     }
                     InspectedFile::Unsupported(snapshot) => {
-                        all.insert(rel_path_key(&rel), snapshot.hash_hex);
+                        all.insert(rel_path_key(&rel), snapshot.hash_hex.clone());
+                        next_cache.insert(
+                            rel,
+                            ScanCacheEntry {
+                                fingerprint,
+                                hash: snapshot.hash,
+                                hash_hex: snapshot.hash_hex,
+                                restorable: false,
+                            },
+                        );
                     }
                 }
             }
         }
+        self.round_scan_cache = next_cache;
         Ok((out, all))
     }
 
-    /// Compute the list of paths whose content in `current` differs from the
-    /// previous round's display mirror (or restorable map for older history
-    /// files), or from the baseline when there is no previous round.
-    fn compute_files_changed(
-        &self,
-        parent_id: Option<u64>,
-        current: &HashMap<String, String>,
-    ) -> Vec<String> {
-        let mut changed = Vec::new();
-        if let Some(pid) = parent_id {
-            if let Some(parent) = self.history.rounds.iter().find(|r| r.id == pid) {
-                let prev = if parent.all_files_at_end.is_empty() {
-                    &parent.files_at_end
-                } else {
-                    &parent.all_files_at_end
-                };
-                // Union of keys from both sides.
-                let mut keys: HashSet<&String> = prev.keys().collect();
-                keys.extend(current.keys());
-                for k in keys {
-                    match (prev.get(k), current.get(k)) {
-                        (Some(a), Some(b)) if a == b => continue,
-                        _ => changed.push(k.clone()),
-                    }
+    /// Read one baseline file's text from the on-disk `baseline/` shadow
+    /// copy. `None` when the path had no supported-text baseline.
+    fn baseline_text_for(&self, rel: &Path) -> Option<String> {
+        std::fs::read_to_string(self.snapshot_dir.join("baseline").join(rel)).ok()
+    }
+
+    /// Resolve one round's maps: from the head cache when it matches, else
+    /// from the round's on-disk manifest, following its (depth-1)
+    /// `maps_from_round` backreference. `None` when the round is unknown or
+    /// its manifest chain is missing/unreadable.
+    fn resolved_round_maps(&self, round_id: u64) -> Option<ResolvedRoundMaps> {
+        if let Some(cache) = &self.head_maps {
+            if cache.round_id == round_id {
+                return Some(ResolvedRoundMaps {
+                    source_round_id: cache.source_round_id,
+                    files_at_end: cache.files_at_end.clone(),
+                    all_files_at_end: cache.all_files_at_end.clone(),
+                });
+            }
+        }
+        // Prefer the in-memory stub's backreference (skips one manifest
+        // read); fall back to whatever the manifest chain says so maps stay
+        // resolvable even if the index was rebuilt from scratch.
+        let stub_source = self
+            .history
+            .rounds
+            .iter()
+            .find(|r| r.id == round_id)
+            .and_then(|r| r.maps_from_round);
+        let mut source_id = stub_source.unwrap_or(round_id);
+        // Backreferences are written depth-1; the bound is purely defensive.
+        for _ in 0..32 {
+            let manifest_path = round_manifest_path(&self.snapshot_dir, source_id);
+            let bytes = std::fs::read(&manifest_path).ok()?;
+            let manifest = serde_json::from_slice::<HistoryRound>(&bytes).ok()?;
+            match manifest.maps_from_round {
+                Some(next) if next != source_id => source_id = next,
+                _ => {
+                    return Some(ResolvedRoundMaps {
+                        source_round_id: source_id,
+                        files_at_end: manifest.files_at_end,
+                        all_files_at_end: manifest.all_files_at_end,
+                    });
                 }
-                changed.sort();
-                return changed;
             }
         }
-        // First round: compare against baseline in-memory mirror.
-        let mut baseline_hex: HashMap<String, String> = HashMap::new();
-        for (path, meta) in &self.baseline_manifest {
-            baseline_hex.insert(path.clone(), meta.hash.clone());
-        }
-        for (rel, bytes) in &self.baselines {
-            baseline_hex
-                .entry(rel_path_key(rel))
-                .or_insert_with(|| hex_encode(&sha256_hash(bytes)));
-        }
-        let mut keys: HashSet<&String> = baseline_hex.keys().collect();
-        keys.extend(current.keys());
-        for k in keys {
-            match (baseline_hex.get(k), current.get(k)) {
-                (Some(a), Some(b)) if a == b => continue,
-                _ => changed.push(k.clone()),
-            }
-        }
-        changed.sort();
-        changed
+        None
     }
 
     /// Reconcile the on-disk project tree with the given `target` state:
     /// delete any tracked file absent from `target`, restore any file whose
     /// hash differs (or doesn't exist). Returns the count of paths touched.
-    fn restore_to_state(&self, target: &HashMap<String, String>) -> Result<u32, CallerError> {
+    ///
+    /// Fingerprint-cached like the round scan: unchanged files contribute
+    /// their cached hash from a stat instead of a full read. After each
+    /// restore/delete the cache is updated so the follow-up
+    /// [`Self::refresh_hashes_from_tree`] walk is also mostly stats.
+    fn restore_to_state(&mut self, target: &HashMap<String, String>) -> Result<u32, CallerError> {
         let objects_dir = self.snapshot_dir.join("objects");
-        // Build the current tree's path set.
+        // Build the current tree's path set (restorable text files only,
+        // exactly like the round scan's `files_at_end`).
         let mut current: HashMap<String, [u8; 32]> = HashMap::new();
         let mut stack = vec![self.project_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -1176,21 +1603,79 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                if std::fs::metadata(&path)
-                    .map(|meta| meta.len() > SNAPSHOT_MAX_FILE_BYTES)
-                    .unwrap_or(false)
-                {
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
                     continue;
+                }
+                let fingerprint = metadata_fingerprint(&meta);
+                if let Some(cached) = self.round_scan_cache.get(&rel) {
+                    if cached.fingerprint == fingerprint {
+                        if cached.restorable {
+                            current.insert(rel_path_key(&rel), cached.hash);
+                        }
+                        continue;
+                    }
                 }
                 let snapshot = match inspect_file(&path) {
                     Ok(InspectedFile::Text(snapshot)) => snapshot,
-                    Ok(InspectedFile::Unsupported(_)) | Err(_) => continue,
+                    Ok(InspectedFile::Unsupported(snapshot)) => {
+                        self.round_scan_cache.insert(
+                            rel,
+                            ScanCacheEntry {
+                                fingerprint,
+                                hash: snapshot.hash,
+                                hash_hex: snapshot.hash_hex,
+                                restorable: false,
+                            },
+                        );
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
+                self.round_scan_cache.insert(
+                    rel.clone(),
+                    ScanCacheEntry {
+                        fingerprint,
+                        hash: snapshot.hash,
+                        hash_hex: snapshot.hash_hex,
+                        restorable: true,
+                    },
+                );
                 current.insert(rel_path_key(&rel), snapshot.hash);
             }
         }
 
         let mut touched: u32 = 0;
+        let restore_one = |watcher: &mut Self, rel: &str, target_hex: &str| -> bool {
+            let obj = objects_dir.join(target_hex);
+            let Ok(bytes) = std::fs::read(&obj) else {
+                return false;
+            };
+            let abs = watcher.project_root.join(rel);
+            if let Some(parent) = abs.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if atomic_write(&abs, &bytes).is_err() {
+                return false;
+            }
+            // Record the restored content in the scan cache so the
+            // post-restore re-sync walk does not re-read it.
+            if let (Ok(meta), Some(hash)) = (std::fs::metadata(&abs), hex_decode_hash(target_hex)) {
+                watcher.round_scan_cache.insert(
+                    PathBuf::from(rel),
+                    ScanCacheEntry {
+                        fingerprint: metadata_fingerprint(&meta),
+                        hash,
+                        hash_hex: target_hex.to_string(),
+                        restorable: true,
+                    },
+                );
+            }
+            true
+        };
 
         // 1. For each current file: if not in target → delete. If hash differs → restore.
         for (rel, cur_hash) in &current {
@@ -1200,19 +1685,11 @@ impl FileWatcher {
                     let abs = self.project_root.join(rel);
                     if std::fs::remove_file(&abs).is_ok() {
                         touched += 1;
+                        self.round_scan_cache.remove(Path::new(rel));
                     }
                 }
                 Some(target_hex) if target_hex != &cur_hex => {
-                    let obj = objects_dir.join(target_hex);
-                    if let Ok(bytes) = std::fs::read(&obj) {
-                        let abs = self.project_root.join(rel);
-                        if let Some(parent) = abs.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if atomic_write(&abs, &bytes).is_ok() {
-                            touched += 1;
-                        }
-                    }
+                    touched += u32::from(restore_one(self, rel, target_hex));
                 }
                 _ => {}
             }
@@ -1220,17 +1697,8 @@ impl FileWatcher {
 
         // 2. For each target file not currently present → restore.
         for (rel, target_hex) in target {
-            if !current.contains_key(rel) {
-                let obj = objects_dir.join(target_hex);
-                if let Ok(bytes) = std::fs::read(&obj) {
-                    let abs = self.project_root.join(rel);
-                    if let Some(parent) = abs.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if atomic_write(&abs, &bytes).is_ok() {
-                        touched += 1;
-                    }
-                }
+            if !current.contains_key(rel) && restore_one(self, rel, target_hex) {
+                touched += 1;
             }
         }
 
@@ -1240,9 +1708,15 @@ impl FileWatcher {
     /// After a bulk restore, walk the tree again to re-sync our in-memory
     /// hash mirror. Prevents the watcher from emitting spurious
     /// `FileChanged` events for paths we just rewrote.
+    ///
+    /// Cache-aware: `restore_to_state` refreshed the scan cache for every
+    /// path it touched, so this walk is stats plus reads of only the files
+    /// that changed outside the restore.
     fn refresh_hashes_from_tree(&mut self) {
         let mut new_hashes = HashMap::new();
         let mut large_file_fingerprints = HashMap::new();
+        let mut next_cache: HashMap<PathBuf, ScanCacheEntry> =
+            HashMap::with_capacity(self.round_scan_cache.len());
         let mut stack = vec![self.project_root.clone()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -1273,46 +1747,114 @@ impl FileWatcher {
                 if should_ignore(&rel) {
                     continue;
                 }
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                        large_file_fingerprints.insert(rel, metadata_fingerprint(&meta));
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
+                    let fingerprint = metadata_fingerprint(&meta);
+                    // Keep the last-known hash when the file is untouched
+                    // (its fingerprint matches) so the change index doesn't
+                    // treat it as deleted after a restore; a genuinely
+                    // changed oversized file gets one streaming re-hash.
+                    let hash = match self.hashes.get(&rel) {
+                        Some(prev)
+                            if self.large_file_fingerprints.get(&rel) == Some(&fingerprint) =>
+                        {
+                            Some(*prev)
+                        }
+                        _ => sha256_file(&path).ok(),
+                    };
+                    if let Some(hash) = hash {
+                        new_hashes.insert(rel.clone(), hash);
+                    }
+                    large_file_fingerprints.insert(rel, fingerprint);
+                    continue;
+                }
+                let fingerprint = metadata_fingerprint(&meta);
+                if let Some(cached) = self.round_scan_cache.get(&rel) {
+                    if cached.fingerprint == fingerprint {
+                        new_hashes.insert(rel.clone(), cached.hash);
+                        next_cache.insert(rel, cached.clone());
                         continue;
                     }
                 }
                 if let Ok(snapshot) = inspect_file(&path) {
-                    let hash = match snapshot {
-                        InspectedFile::Text(snapshot) => snapshot.hash,
-                        InspectedFile::Unsupported(snapshot) => snapshot.hash,
+                    let (hash, hash_hex, restorable) = match snapshot {
+                        InspectedFile::Text(snapshot) => (snapshot.hash, snapshot.hash_hex, true),
+                        InspectedFile::Unsupported(snapshot) => {
+                            (snapshot.hash, snapshot.hash_hex, false)
+                        }
                     };
-                    new_hashes.insert(rel, hash);
+                    new_hashes.insert(rel.clone(), hash);
+                    next_cache.insert(
+                        rel,
+                        ScanCacheEntry {
+                            fingerprint,
+                            hash,
+                            hash_hex,
+                            restorable,
+                        },
+                    );
                 }
             }
         }
         self.hashes = new_hashes;
         self.large_file_fingerprints = large_file_fingerprints;
+        self.round_scan_cache = next_cache;
     }
 
     /// Persist `history.json` atomically via tmp + rename.
-    fn persist_history(&self) -> Result<(), CallerError> {
+    ///
+    /// The file is a slim index (format 2): round scalars + `files_changed`,
+    /// never the per-round path→hash maps — those live once per round in
+    /// `rounds/round_{id}/manifest.json`. The rewrite therefore stays small
+    /// and roughly constant per round instead of growing with
+    /// rounds × files. Binaries from before format 2 fail to parse a round
+    /// without `files_at_end` and fall back to an empty history — no
+    /// rollback offered, never a restore from an empty map.
+    fn persist_history(&mut self) -> Result<(), CallerError> {
         let path = self.snapshot_dir.join("history.json");
-        let bytes = serde_json::to_vec_pretty(&self.history)
+        let mut value = serde_json::to_value(&self.history)
+            .map_err(|e| CallerError::Config(format!("history serialize: {}", e)))?;
+        value["format"] = serde_json::Value::from(HISTORY_INDEX_FORMAT);
+        let bytes = serde_json::to_vec_pretty(&value)
             .map_err(|e| CallerError::Config(format!("history serialize: {}", e)))?;
         atomic_write(&path, &bytes).map_err(CallerError::Io)?;
+        let new_len = bytes.len() as u64;
+        self.snapshot_dir_size_estimate = self
+            .snapshot_dir_size_estimate
+            .saturating_sub(self.last_history_index_bytes)
+            .saturating_add(new_len);
+        self.last_history_index_bytes = new_len;
         Ok(())
     }
 
     /// Collect the set of hashes that are still referenced by any live round
     /// (active path) plus the baseline, and delete any `objects/{hash}` file
     /// not in that set. Returns bytes freed.
+    ///
+    /// Referenced hashes resolve through the per-round manifests (deduped by
+    /// backreference source). Fail-safe: if any live round's maps cannot be
+    /// resolved, nothing is deleted — an unreadable manifest must never
+    /// orphan objects a rollback still needs.
     fn gc_orphaned_objects(&self) -> u64 {
         let mut referenced: HashSet<String> = HashSet::new();
-        for r in &self.history.rounds {
-            for h in r.files_at_end.values() {
-                referenced.insert(h.clone());
-            }
+        let sources: HashSet<u64> = self
+            .history
+            .rounds
+            .iter()
+            .map(|r| r.maps_from_round.unwrap_or(r.id))
+            .collect();
+        for source_id in sources {
+            let Some(maps) = self.resolved_round_maps(source_id) else {
+                return 0;
+            };
+            referenced.extend(maps.files_at_end.into_values());
         }
-        for bytes in self.baselines.values() {
-            referenced.insert(hex_encode(&sha256_hash(bytes)));
+        for meta in self.baseline_manifest.values() {
+            if meta.supported_text {
+                referenced.insert(meta.hash.clone());
+            }
         }
 
         let objects_dir = self.snapshot_dir.join("objects");
@@ -1340,8 +1882,16 @@ impl FileWatcher {
     /// Enforce the soft cap on total snapshot dir size. Drops oldest
     /// abandoned branches first, then GCs their orphaned objects. Active
     /// rounds are never touched.
+    ///
+    /// Gated on the incrementally maintained size estimate: the authoritative
+    /// full-tree walk only runs when the estimate crosses the cap (it used to
+    /// run on every round).
     fn enforce_soft_cap(&mut self) -> Result<(), CallerError> {
+        if self.snapshot_dir_size_estimate <= SNAPSHOT_DIR_SOFT_CAP_BYTES {
+            return Ok(());
+        }
         let mut size = dir_byte_size(&self.snapshot_dir);
+        self.snapshot_dir_size_estimate = size;
         if size <= SNAPSHOT_DIR_SOFT_CAP_BYTES {
             return Ok(());
         }
@@ -1353,6 +1903,7 @@ impl FileWatcher {
             self.history.abandoned_branches.remove(0);
             let freed = self.gc_orphaned_objects();
             size = size.saturating_sub(freed);
+            self.snapshot_dir_size_estimate = self.snapshot_dir_size_estimate.saturating_sub(freed);
             if freed == 0 {
                 break;
             }
@@ -1505,7 +2056,7 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(!snap.path().join("baseline").join("empty.txt").exists());
-        assert!(!watcher.baselines.contains_key(Path::new("empty.txt")));
+        assert!(!watcher.baseline_manifest.contains_key("empty.txt"));
     }
 
     #[test]
@@ -1672,15 +2223,19 @@ mod tests {
         watcher
             .on_round_complete("created files".to_string(), None, None)
             .unwrap();
+        let round_id = watcher.history.rounds.last().expect("round").id;
         let round = watcher.history.rounds.last().expect("round");
 
         assert_eq!(
             round.files_changed,
             vec!["data.dat".to_string(), "text.txt".to_string()]
         );
-        assert!(round.files_at_end.contains_key("text.txt"));
-        assert!(!round.files_at_end.contains_key("data.dat"));
-        assert!(round.all_files_at_end.contains_key("data.dat"));
+        let maps = watcher
+            .resolved_round_maps(round_id)
+            .expect("resolved maps");
+        assert!(maps.files_at_end.contains_key("text.txt"));
+        assert!(!maps.files_at_end.contains_key("data.dat"));
+        assert!(maps.all_files_at_end.contains_key("data.dat"));
     }
 
     #[test]
@@ -1910,11 +2465,8 @@ mod tests {
 
         // The "branch-only-content" hash exists in objects/.
         let target = w
-            .history
-            .rounds
-            .iter()
-            .find(|r| r.id == r2)
-            .unwrap()
+            .resolved_round_maps(r2)
+            .expect("resolved maps")
             .files_at_end
             .get("a.txt")
             .cloned()
@@ -1961,6 +2513,7 @@ mod tests {
                 all_files_at_end: HashMap::new(),
                 turn_count: None,
                 native_message_count: None,
+                maps_from_round: None,
             };
             w.history.abandoned_branches.push(AbandonedBranch {
                 branched_from_id: r1,
@@ -1990,5 +2543,260 @@ mod tests {
         // Active history (r1) still intact.
         assert_eq!(w.history.rounds.len(), 1);
         assert_eq!(w.history.current_head_id, Some(r1));
+    }
+
+    /// Round scans must not re-read files whose (size, mtime) fingerprint is
+    /// unchanged. Proven through the short-circuit's one observable: content
+    /// rewritten at identical length with a restored mtime keeps the
+    /// previously recorded hash (nothing re-read it), while a rewrite whose
+    /// mtime moves is picked up again.
+    #[test]
+    fn round_scan_short_circuits_unchanged_fingerprints() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"round-1!").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        let r1_hash = w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"].clone();
+
+        let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"round-2!").unwrap();
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle.set_modified(original_mtime).unwrap();
+        drop(handle);
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+        assert_eq!(
+            w.resolved_round_maps(r2).unwrap().files_at_end["a.txt"],
+            r1_hash,
+            "fingerprint-unchanged file must be served from the cache, not re-hashed"
+        );
+
+        std::fs::write(&file, b"round-3!").unwrap();
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle
+            .set_modified(original_mtime + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(handle);
+        w.on_round_complete("R3".into(), None, None).unwrap();
+        let r3 = w.history.current_head_id.unwrap();
+        let r3_maps = w.resolved_round_maps(r3).unwrap();
+        assert_ne!(
+            r3_maps.files_at_end["a.txt"], r1_hash,
+            "a moved fingerprint must be re-read"
+        );
+        assert_eq!(
+            r3_maps.files_at_end["a.txt"],
+            hex_encode(&sha256_hash(b"round-3!"))
+        );
+    }
+
+    /// A no-op round (tree identical to its parent) records a depth-1
+    /// `maps_from_round` backreference instead of duplicating the maps;
+    /// chains of no-ops keep pointing at the nearest changed round; and
+    /// rollback to a no-op round restores exactly the referenced state.
+    #[test]
+    fn noop_rounds_backreference_and_stay_restorable() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        w.on_round_complete("R2 noop".into(), None, None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+        w.on_round_complete("R3 noop".into(), None, None).unwrap();
+
+        assert_eq!(w.history.rounds[1].maps_from_round, Some(r1));
+        assert_eq!(
+            w.history.rounds[2].maps_from_round,
+            Some(r1),
+            "no-op chains compress to the nearest changed round (depth-1)"
+        );
+        let manifest_bytes =
+            std::fs::read(round_manifest_path(tmp_snap.path(), r2)).expect("noop manifest");
+        let manifest: HistoryRound = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(manifest.files_at_end.is_empty());
+        assert_eq!(manifest.maps_from_round, Some(r1));
+
+        std::fs::write(root.join("a.txt"), b"v4").unwrap();
+        w.on_round_complete("R4".into(), None, None).unwrap();
+        w.rollback(r2).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+    }
+
+    /// history.json is a slim format-2 index: no per-round maps regardless
+    /// of round count, while the maps stay resolvable via the round
+    /// manifests.
+    #[test]
+    fn history_json_is_a_slim_format2_index() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        std::fs::write(root.join("b.txt"), b"two").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), Some(1), None).unwrap();
+        std::fs::write(root.join("a.txt"), b"one-more").unwrap();
+        w.on_round_complete("R2".into(), Some(2), None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+
+        let text = std::fs::read_to_string(tmp_snap.path().join("history.json")).unwrap();
+        assert!(text.contains("\"format\": 2"));
+        assert!(
+            !text.contains("files_at_end"),
+            "the index must not carry per-round maps: {text}"
+        );
+
+        let parsed: History = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.rounds.len(), 2);
+        assert_eq!(parsed.rounds[1].turn_count, Some(2));
+
+        let maps = w.resolved_round_maps(r2).unwrap();
+        assert_eq!(maps.files_at_end.len(), 2);
+        assert_eq!(
+            maps.files_at_end["a.txt"],
+            hex_encode(&sha256_hash(b"one-more"))
+        );
+    }
+
+    /// A legacy (pre-format-2) history.json with inline maps still rolls
+    /// back exactly: loading migrates the maps into per-round manifests.
+    #[test]
+    fn legacy_history_json_migrates_and_rolls_back() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), Some(1), Some(3)).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R2".into(), Some(1), Some(5)).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+
+        // Rebuild the pre-format-2 on-disk layout: maps inline in
+        // history.json (no format marker), no round manifests.
+        let mut legacy = w.history.clone();
+        for round in &mut legacy.rounds {
+            let maps = w.resolved_round_maps(round.id).unwrap();
+            round.files_at_end = maps.files_at_end;
+            round.all_files_at_end = maps.all_files_at_end;
+            round.maps_from_round = None;
+        }
+        drop(w);
+        std::fs::remove_dir_all(tmp_snap.path().join("rounds")).unwrap();
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        atomic_write(&tmp_snap.path().join("history.json"), &legacy_bytes).unwrap();
+
+        let mut resumed = make_watcher(root, tmp_snap.path());
+        assert!(
+            round_manifest_path(tmp_snap.path(), r1).exists(),
+            "legacy load must materialize round manifests"
+        );
+        assert_eq!(resumed.history.rounds.len(), 2);
+        assert!(resumed
+            .history
+            .rounds
+            .iter()
+            .all(|r| r.files_at_end.is_empty()));
+        assert_eq!(resumed.history.rounds[1].native_message_count, Some(5));
+        assert_eq!(resumed.history.current_head_id, Some(r2));
+
+        resumed.rollback(r1).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+    }
+
+    /// Rollback and redo still work after a restart: a fresh watcher over
+    /// the same snapshot dir reloads the slim index and resolves maps from
+    /// the manifests (head cache starts cold), and the next round diffs
+    /// against the resolved parent.
+    #[test]
+    fn resumed_watcher_rolls_back_and_redoes_from_manifests() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        std::fs::write(root.join("b.txt"), b"new").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+        drop(w);
+
+        let mut resumed = make_watcher(root, tmp_snap.path());
+        resumed.rollback(r1).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+        assert!(!root.join("b.txt").exists());
+
+        let redo = resumed.redo().unwrap();
+        assert_eq!(redo.to_round_id, r2);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"new");
+
+        std::fs::write(root.join("a.txt"), b"v3").unwrap();
+        resumed.on_round_complete("R3".into(), None, None).unwrap();
+        let r3_round = resumed.history.rounds.last().unwrap();
+        assert_eq!(
+            r3_round.files_changed,
+            vec!["a.txt".to_string()],
+            "post-resume rounds must diff against the resolved parent maps"
+        );
+    }
+
+    /// Oversized files keep their last-known hash across a rollback's
+    /// hash re-sync, so the changes index does not misreport them as
+    /// deleted (they are stat'd, not re-hashed, when untouched).
+    #[test]
+    fn oversized_hash_survives_rollback_resync() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let big = vec![b'x'; SNAPSHOT_MAX_FILE_BYTES as usize + 1];
+        std::fs::write(root.join("big.csv"), &big).unwrap();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        let big_hash_before = w
+            .changes_index_snapshot()
+            .current_hashes
+            .get("big.csv")
+            .cloned()
+            .expect("oversized file hashed at baseline");
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+
+        w.rollback(r1).unwrap();
+        let index = w.changes_index_snapshot();
+        assert_eq!(
+            index.current_hashes.get("big.csv"),
+            Some(&big_hash_before),
+            "rollback re-sync must not drop oversized files from the hash index"
+        );
+    }
+
+    /// `start_shared` registers the watcher; the registry resolves it by
+    /// the exact (project_root, snapshot_dir) pair and nothing else.
+    #[tokio::test]
+    async fn live_watcher_registry_resolves_exact_pair() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        std::fs::write(tmp_proj.path().join("a.txt"), b"hello").unwrap();
+        let w = make_watcher(tmp_proj.path(), tmp_snap.path());
+        let (shared, _watcher_handle, _round_handle) = w.start_shared();
+
+        let found = live_watcher_for(tmp_proj.path(), tmp_snap.path()).expect("registered watcher");
+        assert!(Arc::ptr_eq(&found, &shared));
+
+        let other = TempDir::new().unwrap();
+        assert!(live_watcher_for(other.path(), tmp_snap.path()).is_none());
+        assert!(live_watcher_for(tmp_proj.path(), other.path()).is_none());
     }
 }
