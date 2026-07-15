@@ -103,7 +103,7 @@ loop.
 | | **Codex** (reference impl) | **Claude Code** |
 |---|---|---|
 | Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` |
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON string |
 | Multi-thread | Yes — many threads per process | No |
@@ -643,8 +643,14 @@ The Intendant MCP server is passed **inline** as a JSON string to
 bootstrap addendum naming the MCP bootstrap tools
 (`read_screen`/`take_screenshot`/`execute_cu_actions`, shared-view), the lazy
 `ctl --help` discovery flow, and the dashboard-validation helper.
-`--permission-mode` (normalized — the legacy Intendant value `auto` maps to
-the CLI default) and `--allowedTools` are added from config when set.
+`--permission-mode` is always passed explicitly (normalized; `manual` and
+empty map to `default`): when the flag is omitted the CLI resolves its
+default from the user's own `~/.claude/settings.json`
+(`permissions.defaultMode`), silently running a different mode than the one
+recorded in the session's launch config. The reader reconciles the
+`system:init` echo's `permissionMode` against the requested mode and logs a
+warning on divergence (once per distinct echoed value).
+`--allowedTools` is added from config when set.
 
 ## Dashboard and Station parity: Codex vs Claude Code
 
