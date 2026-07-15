@@ -1511,7 +1511,7 @@ mod tests {
                 grant_id: Some(result.grant.id.clone()),
                 ..crate::access::iam::AccessPrincipal::root_dashboard_session("scoped", "https")
             },
-            iam_state: Some(state),
+            iam_state: Some(std::sync::Arc::new(state)),
         };
         assert!(authorize_http_transfer_access(
             &scoped,

@@ -1548,6 +1548,23 @@ pub(crate) fn dashboard_fs_read_file(
     let (range_start, range_end, partial) = if let Some(range) = requested_range {
         (range.start, range.end.saturating_add(1), true)
     } else {
+        // Rangeless reads buffer the whole file in daemon memory: hold
+        // them to the same per-request cap as the tunnel's offset/length
+        // form ([`UPLOAD_MAX_BYTES`]) so one authorized GET of a huge
+        // recording cannot spike RSS by the file size (self-DoS). Larger
+        // files stay fully downloadable through ranged requests — the
+        // chunked flow the dashboard already uses.
+        if total_size > UPLOAD_MAX_BYTES as u64 {
+            return Err(DashboardFsReadError::new(
+                "413 Payload Too Large",
+                format!(
+                    "{} is {} bytes; full reads are capped at {} bytes — use Range requests for larger files",
+                    canonical.display(),
+                    total_size,
+                    UPLOAD_MAX_BYTES,
+                ),
+            ));
+        }
         (0, total_size, false)
     };
     let read_len = range_end.saturating_sub(range_start);
@@ -2955,7 +2972,7 @@ mod tests {
         (
             HttpAccessContext {
                 principal,
-                iam_state: Some(state.clone()),
+                iam_state: Some(std::sync::Arc::new(state.clone())),
             },
             state,
         )
@@ -2978,7 +2995,7 @@ mod tests {
                 Some("BB:66"),
                 "https",
             ),
-            iam_state: Some(crate::access::iam::LocalIamState::default()),
+            iam_state: Some(Default::default()),
         };
         assert!(authorized_dashboard_local_file_response_blocking(
             &request(&allowed),
@@ -3025,7 +3042,7 @@ mod tests {
         revoked_state.grants[0].revoked_at_unix_ms = Some(1);
         let revoked = HttpAccessContext {
             principal: scoped.principal.clone(),
-            iam_state: Some(revoked_state),
+            iam_state: Some(std::sync::Arc::new(revoked_state)),
         };
         assert!(authorized_dashboard_local_file_response_blocking(
             &request(&allowed),

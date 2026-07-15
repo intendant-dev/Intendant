@@ -257,7 +257,7 @@ pub(crate) fn access_overview_inbound_peer_identities(
 pub(crate) async fn handle_dashboard_targets(
     stream: DemuxStream,
     peer_registry: Option<crate::peer::PeerRegistry>,
-    agent_card_value_for_targets: serde_json::Value,
+    agent_card_value_for_targets: std::sync::Arc<serde_json::Value>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
     local_tier: Option<&str>,
@@ -272,18 +272,37 @@ pub(crate) async fn handle_dashboard_targets(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Run a synchronous authority-store operation off the async reactor.
+/// `authority_store::with_lock` waits for its process/file locks with
+/// blocking `std::thread::sleep` retries (up to its 2s timeout), so a
+/// daemon+CLI contention window would otherwise park a tokio worker —
+/// and every connection multiplexed on it — for the duration.
+async fn blocking_access_response(
+    task: impl FnOnce() -> ApiResponse + Send + 'static,
+) -> ApiResponse {
+    tokio::task::spawn_blocking(task)
+        .await
+        .unwrap_or_else(|error| {
+            ApiResponse::json_error(500, format!("authority task failed: {error}"))
+        })
+}
+
 pub(crate) async fn handle_access_org_grant_present(
     stream: DemuxStream,
     body_text: String,
     cert_dir: std::path::PathBuf,
-    agent_card_value_for_targets: serde_json::Value,
+    agent_card_value_for_targets: std::sync::Arc<serde_json::Value>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
     // Transport-owned body decode; the doorbell's parse-error 400 rides
     // the same public tail as its value errors.
     let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
         Ok(params) => {
-            access_org_present_api_response(&cert_dir, params, &agent_card_value_for_targets)
+            // Materializes grants — an authority transaction.
+            blocking_access_response(move || {
+                access_org_present_api_response(&cert_dir, params, &agent_card_value_for_targets)
+            })
+            .await
         }
         Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
@@ -313,13 +332,18 @@ pub(crate) async fn handle_access_org_apply_renew(
 ) {
     // The per-path caps (ORL vs grant-doc) live on the two table rows;
     // dispatch already read under the right one.
+    let is_orl_apply = req_path == "/api/access/orgs/revocations/apply";
     let response = match serde_json::from_str::<serde_json::Value>(&body_text) {
         Ok(params) => {
-            if req_path == "/api/access/orgs/revocations/apply" {
-                access_org_orl_apply_api_response(&cert_dir, params)
-            } else {
-                access_org_renew_api_response(&cert_dir, params)
-            }
+            // Both leaves run authority transactions.
+            blocking_access_response(move || {
+                if is_orl_apply {
+                    access_org_orl_apply_api_response(&cert_dir, params)
+                } else {
+                    access_org_renew_api_response(&cert_dir, params)
+                }
+            })
+            .await
         }
         Err(e) => ApiResponse::json_error(400, format!("invalid JSON: {e}")),
     };
@@ -350,21 +374,19 @@ pub(crate) async fn handle_access_iam_grants(
         .await;
         return;
     }
+    let is_update = req_path == "/api/access/iam/grants/update";
     let response = match parse_access_request_body(&body_text) {
         Ok(params) => {
-            if req_path == "/api/access/iam/grants/update" {
-                access_iam_update_grant_api_response(
-                    &cert_dir,
-                    params,
-                    &http_access_context.principal,
-                )
-            } else {
-                access_iam_upsert_user_client_grant_api_response(
-                    &cert_dir,
-                    params,
-                    &http_access_context.principal,
-                )
-            }
+            // Grant upsert/update are authority transactions.
+            let actor = http_access_context.principal.clone();
+            blocking_access_response(move || {
+                if is_update {
+                    access_iam_update_grant_api_response(&cert_dir, params, &actor)
+                } else {
+                    access_iam_upsert_user_client_grant_api_response(&cert_dir, params, &actor)
+                }
+            })
+            .await
         }
         Err(error) => *error,
     };
@@ -393,12 +415,15 @@ pub(crate) async fn handle_access_org_manage(
         .await;
         return;
     }
+    let leaf = OrgManageLeaf::from_req_path(req_path);
     let response = match parse_access_request_body(&body_text) {
-        Ok(params) => access_org_manage_api_response(
-            &cert_dir,
-            OrgManageLeaf::from_req_path(req_path),
-            params,
-        ),
+        // Every org-manage leaf mutates or signs authority state.
+        Ok(params) => {
+            blocking_access_response(move || {
+                access_org_manage_api_response(&cert_dir, leaf, params)
+            })
+            .await
+        }
         Err(error) => *error,
     };
     // Historical framing quirk, byte-pinned by the golden transcripts:
@@ -443,7 +468,12 @@ pub(crate) async fn handle_access_enrollment_decide(
     }
     let response = match parse_access_request_body(&body_text) {
         Ok(params) => {
-            access_enrollment_decide_api_response(&cert_dir, params, &http_access_context.principal)
+            // Approval upserts a grant — an authority transaction.
+            let actor = http_access_context.principal.clone();
+            blocking_access_response(move || {
+                access_enrollment_decide_api_response(&cert_dir, params, &actor)
+            })
+            .await
         }
         Err(error) => *error,
     };
@@ -1067,13 +1097,18 @@ pub(crate) async fn handle_fleet_cert_request(
         .await;
         return;
     }
-    let response = if body_text.trim().is_empty() {
-        fleet_cert_request_api_response(serde_json::json!({}))
+    let params = if body_text.trim().is_empty() {
+        Ok(serde_json::json!({}))
     } else {
-        match parse_access_request_body(&body_text) {
-            Ok(params) => fleet_cert_request_api_response(params),
-            Err(error) => *error,
+        parse_access_request_body(&body_text)
+    };
+    let response = match params {
+        // The request path persists fleet-origin provenance under the
+        // authority-store lock.
+        Ok(params) => {
+            blocking_access_response(move || fleet_cert_request_api_response(params)).await
         }
+        Err(error) => *error,
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
@@ -1083,7 +1118,7 @@ pub(crate) async fn handle_access_overview(
     cert_dir: std::path::PathBuf,
     http_access_context: HttpAccessContext,
     peer_registry: Option<crate::peer::PeerRegistry>,
-    agent_card_value_for_targets: serde_json::Value,
+    agent_card_value_for_targets: std::sync::Arc<serde_json::Value>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
@@ -1671,8 +1706,12 @@ pub(crate) async fn handle_access_tier_settings(
             }
         }
     };
-    let response =
-        access_tier_settings_api_response(&cert_dir, params, &http_access_context.principal);
+    // Tier changes are authority transactions.
+    let actor = http_access_context.principal.clone();
+    let response = blocking_access_response(move || {
+        access_tier_settings_api_response(&cert_dir, params, &actor)
+    })
+    .await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -1730,13 +1769,20 @@ pub(crate) fn fleet_access_origin_allowed(
     };
     if let Some(registry) = peer_registry {
         for handle in registry.list() {
-            let snapshot = handle.snapshot();
-            for candidate in [
-                snapshot.ws_url.as_deref(),
-                snapshot.browser_tcp_via_url.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
+            // Only two URL strings feed this gate — read them straight
+            // off the handle (the card snapshot is an `Arc` clone from
+            // the watch channel) instead of building a full
+            // `PeerSnapshot`, which re-serializes every capability and
+            // clones the folded sessions + displays vectors per peer,
+            // per fleet-CORS request and preflight.
+            let card = handle.card_snapshot();
+            let ws_url = card.transports.iter().find_map(|t| match t {
+                crate::peer::card::TransportSpec::IntendantWs { url } => Some(url.as_str()),
+                _ => None,
+            });
+            for candidate in [ws_url, handle.browser_tcp_via_url()]
+                .into_iter()
+                .flatten()
             {
                 if normalized_origin(candidate).as_deref() == Some(&normalized) {
                     return true;
@@ -2395,10 +2441,10 @@ pub(crate) fn access_enrollment_requests_response_value(
     // Route provenance is classified daemon-side (derive, don't mirror):
     // the browser gets a ready `origin_class` per request instead of
     // re-deriving hosted/fleet membership from its own copies.
-    let hosted_origins = crate::access::iam::load_state(cert_dir)
-        .map(|state| state.hosted_origins)
+    let hosted_origins = crate::access::iam::load_state_cached_arc(cert_dir)
+        .map(|state| state.hosted_origins.clone())
         .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let fleet_zone = crate::fleet_cert::fleet_zone();
     let requests: Vec<serde_json::Value> =
         crate::access::enrollment::pending_enrollments(crate::access::client_key::now_unix_ms())
             .into_iter()
@@ -2534,7 +2580,7 @@ pub(crate) type HttpAccessContext = RequestAuthority;
 fn browser_mtls_state_for_request(
     cert_dir: &std::path::Path,
     _fingerprint: &str,
-) -> Result<crate::access::iam::LocalIamState, String> {
+) -> Result<std::sync::Arc<crate::access::iam::LocalIamState>, String> {
     // Compatibility enrollment of the exact daemon-generated owner client.crt
     // runs at trusted web startup. Request authentication may durably apply a
     // fail-closed IAM schema migration, but it cannot mint or grant authority.
@@ -2613,7 +2659,7 @@ pub(crate) fn http_access_context(
 
 pub(crate) fn load_local_iam_state_for_request(
     cert_dir: &std::path::Path,
-) -> Result<Option<crate::access::iam::LocalIamState>, String> {
+) -> Result<Option<std::sync::Arc<crate::access::iam::LocalIamState>>, String> {
     let path = crate::access::iam::iam_state_path(cert_dir);
     if !path.exists() {
         return Ok(None);
@@ -2622,7 +2668,9 @@ pub(crate) fn load_local_iam_state_for_request(
     // statics) under browser mTLS, and the raw load re-reads + re-parses
     // the file every time. The cache re-checks the fingerprint on every
     // call, so out-of-process writers are still picked up immediately.
-    crate::access::iam::load_state_cached(cert_dir)
+    // The shared Arc keeps the per-request path free of deep clones —
+    // every consumer reads one consistent snapshot.
+    crate::access::iam::load_state_cached_arc(cert_dir)
         .map(Some)
         .map_err(|e| format!("local IAM state is invalid: {e}"))
 }
@@ -2655,6 +2703,7 @@ pub(crate) fn dashboard_control_grant_for_client(
                 principal,
                 iam_state: state,
                 iam_cert_dir: Some(cert_dir.to_path_buf()),
+                authority_memo: Default::default(),
             },
         );
     }
@@ -2666,6 +2715,7 @@ pub(crate) fn dashboard_control_grant_for_client(
                 principal,
                 iam_state: state,
                 iam_cert_dir: Some(cert_dir.to_path_buf()),
+                authority_memo: Default::default(),
             },
         );
     }
@@ -3669,6 +3719,7 @@ mod tests {
             principal: scoped.principal.clone(),
             iam_state: scoped.iam_state.clone().expect("scoped iam state"),
             iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: Default::default(),
         };
         assert!(!ws_grant_allows_control(&scoped_grant, None, &signal, &bus));
         assert!(!ws_grant_allows_control(
@@ -3849,8 +3900,9 @@ mod tests {
             .expect("bound principal resolves");
         let scoped = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
-            iam_state: state,
+            iam_state: std::sync::Arc::new(state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         };
 
         let bus = EventBus::new();
@@ -3909,8 +3961,9 @@ mod tests {
                 .expect("bound principal resolves");
         let observer = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal: observer_principal,
-            iam_state: observer_state,
+            iam_state: std::sync::Arc::new(observer_state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         };
         assert!(deny_ws_frame_if_unauthorized(
             &observer,
@@ -4140,7 +4193,15 @@ mod tests {
             crate::access::iam::AccessPrincipal::root_dashboard_session("golden-test", "local");
         let body = dashboard_targets_response_body(&card, None, None, Some(&principal));
         let response = collect_access_handler_response(|stream| {
-            handle_dashboard_targets(stream, None, card.clone(), cors, None, None, principal)
+            handle_dashboard_targets(
+                stream,
+                None,
+                std::sync::Arc::new(card.clone()),
+                cors,
+                None,
+                None,
+                principal,
+            )
         })
         .await;
         assert_eq!(
@@ -4217,7 +4278,15 @@ mod tests {
                 iam_state: None,
             };
             let response = collect_access_handler_response(|stream| {
-                handle_access_overview(stream, dir, context, None, card, cors, origin)
+                handle_access_overview(
+                    stream,
+                    dir,
+                    context,
+                    None,
+                    std::sync::Arc::new(card),
+                    cors,
+                    origin,
+                )
             })
             .await;
             assert_eq!(
@@ -4969,7 +5038,7 @@ mod tests {
                 stream,
                 "{}".to_string(),
                 cert_dir.clone(),
-                card.clone(),
+                std::sync::Arc::new(card.clone()),
                 public_cors("POST", "/api/access/org-grants"),
             )
         })
@@ -4989,7 +5058,7 @@ mod tests {
                 stream,
                 invalid.to_string(),
                 cert_dir.clone(),
-                card.clone(),
+                std::sync::Arc::new(card.clone()),
                 public_cors("POST", "/api/access/org-grants"),
             )
         })

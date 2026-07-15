@@ -359,11 +359,17 @@ pub(crate) async fn handle_mcp_http_request(
         }
     };
 
+    // Move, don't clone: tool results can carry multi-MB payloads (fs
+    // reads run under a 16 MB cap) and the original is dropped here anyway.
+    let (result, error) = match result {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error)),
+    };
     McpHttpOutcome::Response(McpHttpResponse {
         jsonrpc: "2.0".into(),
         id: request.id,
-        result: result.as_ref().ok().cloned(),
-        error: result.err(),
+        result,
+        error,
     })
 }
 
@@ -444,19 +450,31 @@ pub(crate) async fn handle_mcp_post(
             &mcp_access,
         )
         .await;
+        // Keep-alive opt-in (response leg): both shapes are self-framing
+        // (Content-Length), and dispatch consumed the body under the /mcp
+        // row's cap. Managed Codex/CC backends call /mcp once per tool
+        // call — closing here made every call pay a fresh TCP (+TLS)
+        // handshake, exactly the cost keep-alive removed elsewhere.
+        let reuse = stream.exchange_reusable();
         let http_response = match outcome {
             McpHttpOutcome::Response(resp) => {
                 let json = serde_json::to_string(&resp).unwrap_or_default();
                 HttpResponse::with_content("200 OK", "application/json", json)
                     .header_segment(&mcp_cors)
+                    .connection_reuse(reuse)
                     .into_string()
             }
             McpHttpOutcome::Accepted => HttpResponse::new("202 Accepted")
                 .header_segment(&mcp_cors)
                 .header("Content-Length", "0")
+                .connection_reuse(reuse)
                 .into_string(),
         };
-        let _ = stream.write_all(http_response.as_bytes()).await;
+        let write_ok = stream.write_all(http_response.as_bytes()).await.is_ok();
+        if reuse && write_ok {
+            stream.park().await;
+            return;
+        }
     } else {
         let err =
             r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
@@ -472,12 +490,18 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
     // are not supported by our stateless endpoint.  Return 405 so rmcp
     // gracefully falls back (skips SSE / ignores session delete).
     use tokio::io::AsyncWriteExt;
+    let reuse = stream.exchange_reusable();
     let http = HttpResponse::new("405 Method Not Allowed")
         .header_segment(&mcp_cors_header_segment(header_text, is_tls))
         .header("Content-Length", "0")
+        .connection_reuse(reuse)
         .into_string();
-    let _ = stream.write_all(http.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let write_ok = stream.write_all(http.as_bytes()).await.is_ok();
+    if reuse && write_ok {
+        stream.park().await;
+    } else {
+        finalize_http_stream(&mut stream).await;
+    }
 }
 
 /// Bind a `POST /mcp` request to an access principal, the same way the

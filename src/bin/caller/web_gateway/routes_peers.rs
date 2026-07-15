@@ -1622,17 +1622,18 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                 return;
             };
             // Delegation-lane attribution (docs/src/trust-tiers.md § Two
-            // lanes). The transport edge resolves the ambient IAM state;
-            // the resolution itself is the testable core below.
+            // lanes). The transport edge resolves the ambient IAM state
+            // (through the stat-fingerprint cache — this runs per relayed
+            // offer); the resolution itself is the testable core below.
             let cert_dir = crate::access::backend::select_backend().cert_dir();
-            let iam_state = crate::access::iam::load_state(&cert_dir).ok();
+            let iam_state = crate::access::iam::load_state_cached_arc(&cert_dir).ok();
             let attributed = match resolve_peer_offer_attribution(
                 &client_key,
                 registry.local_card_id().as_str(),
                 client_nonce.as_deref().unwrap_or(""),
                 &sdp,
                 crate::access::client_key::now_unix_ms(),
-                iam_state.as_ref(),
+                iam_state.as_deref(),
             ) {
                 Ok(attributed) => attributed,
                 Err(reason) => {

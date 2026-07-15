@@ -3425,8 +3425,9 @@ mod tests {
         .unwrap();
         DashboardControlGrant::UserClient {
             principal,
-            iam_state: state,
+            iam_state: std::sync::Arc::new(state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         }
     }
 
@@ -3435,7 +3436,7 @@ mod tests {
         let DashboardControlGrant::UserClient { iam_state, .. } = &mut grant else {
             unreachable!("observer fixture is a user client")
         };
-        let role = iam_state
+        let role = std::sync::Arc::make_mut(iam_state)
             .roles
             .iter_mut()
             .find(|role| role.id == "role:observer")
