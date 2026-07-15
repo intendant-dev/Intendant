@@ -2,7 +2,11 @@
  "$comment": "The §13.3 obligation ledger, hand-transcribed at clause-cluster granularity and machine-enforced by core coverage::tests::obligations_ledger_is_sound: quotes are verbatim §13.3 substrings, line ranges (1-indexed within the section) must jointly cover the whole section, vector names must exist, and statuses must match the vector lists. Statuses: vectored (fully exercised), partial (some clauses exercised - the note says which), pending (unvectored debt), code-test (executed by named Rust unit tests, no vector shape), structural (non-obligation lines).",
  "executed_surfaces": [
   "rust-core",
-  "rust-reducer"
+  "rust-reducer",
+  "browser-chromium",
+  "storage-macos",
+  "storage-linux",
+  "storage-windows"
  ],
  "surface_annotation_note": "A vector's surfaces array declares §13.2 applicability; it is NOT execution. See execution-lanes-plan.md for the browser and per-OS storage lanes.",
  "section_lines": 492,
@@ -23,11 +27,11 @@
    "storage-orphaned"
   ],
   "sagas": [
-   "f7 ratify/snapshot cutoff-algebra + checkpoint-machine ceremonies",
-   "f9 issuer feed chains (gap/fork/ancestry/cross-carrier registry)",
-   "f10 generation machine (gen >= 2 histories; fail-closed as lineage-gen in P1 v1)",
-   "f11 transfer composites (mimport battery, monotone-cause, adopted-erasure, effect keys)",
-   "f13 checkpoint/fence storage shapes + renewal custody predicates"
+   "f7 ratify/snapshot cutoff-algebra + checkpoint-machine ceremonies (D-203)",
+   "f9 issuer feed chains (gap/fork/ancestry/cross-carrier registry) (D-203)",
+   "f10 generation machine (gen >= 2 histories; fail-closed as lineage-gen in P1 v1) (D-203)",
+   "f11 transfer composites (mimport battery, monotone-cause, adopted-erasure, effect keys) (D-203)",
+   "f13 checkpoint/fence storage shapes + renewal custody predicates (audit-added deferral — NOT among the four sagas the D-203 ruling names; recorded per review R8.5)"
   ]
  },
  "obligations": [
@@ -587,6 +591,7 @@
    "obligation": "T5 window binding; issuer-fork recovery; GC-fence hardening; service-key resolution; per-posture issuance; witnessless-zone unusability.",
    "vectors": [
     "lease-late-then-timely-receipt-admits",
+    "lease-lifecycle-sticky-reproposal",
     "lease-missing-pends",
     "lease-online-grant-admits",
     "lease-overlong-window-invalid",
@@ -868,6 +873,11 @@
     "audit-duplicate-chunk-index",
     "audit-overlapping-result-sets",
     "audit-partition-two-chunks",
+    "audit-release-extra-result-refused",
+    "audit-release-missing-last-refused",
+    "audit-release-missing-middle-refused",
+    "audit-release-omitted-result-refused",
+    "audit-release-split-txn-refused",
     "audit-zero-result-single-chunk"
    ],
    "status": "partial",
@@ -973,8 +983,10 @@
    "obligation": "The reopenable journal fold: independent bases, C3-prime-cut reopen, collision-terminal unreachability, reopen before/after its invalidation, terminal-first reservation, the T0-R0-T1 battery (D-163/D-177/D-185/D-192/D-193).",
    "vectors": [
     "reopen-basis-op-kind-and-unheld-invalidation",
+    "reopen-forged-recovery-log-corrupt",
     "reopen-recovery-invalidation-unheld-pends",
     "reopen-recovery-keeps-basis-rejects",
+    "reopen-unadmitted-recovery-pends",
     "txn-internal-order-and-competing-terminals"
    ],
    "status": "partial",

@@ -4,12 +4,13 @@ name: Owner-plane reference artifacts
 # Rust core (vector mint + drift/coverage gates) and the independent
 # reducer (the differential harness) — on PRs touching the program.
 #
-# Naming is deliberate: green here means the TWO RUST SURFACES agree
-# on the committed corpus. It is not browser (WebCrypto/IndexedDB),
-# native-crypto-service, or per-OS portable-storage execution — those
-# lanes have never run and are planned in
-# rfcs/owner-plane/execution-lanes-plan.md; the §13.2 `surfaces`
-# arrays on vectors are applicability annotations, not execution.
+# Job naming stays honest per lane (review R8.7 caught this header
+# lagging the deliveries): the reference-artifacts job = the TWO
+# RUST SURFACES agreeing on the committed corpus; the browser and
+# 3-OS storage jobs below EXECUTE their §13.2 lanes for real (run
+# sets pinned to coverage/lane-manifests.json). native-crypto stays
+# an annotation (the Rust suites execute those primitives natively);
+# Gate-B concerns stay out per execution-lanes-plan.md.
 #
 # Advisory like audit.yml: a red run must not block unrelated
 # landings while the program is pre-Gate-A; the strict harness step
@@ -62,10 +63,10 @@ jobs:
         run: |
           cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features --all-targets -- -D warnings
           cargo test --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features
-      - name: browser-lane wasm scaffold (compile check only, NOT browser execution)
+      - name: browser-lane wasm build shape (clippy; execution is the browser job)
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo check --manifest-path rfcs/owner-plane/browser-lane/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path rfcs/owner-plane/browser-lane/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - name: mint idempotence (vectors + coverage map reproduce byte-exactly)
         run: |
           cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null

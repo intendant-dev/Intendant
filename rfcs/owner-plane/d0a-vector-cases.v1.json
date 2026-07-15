@@ -49,7 +49,7 @@
             }
           }
         },
-        "$comment": "Browser WebCrypto cannot inject signing randomness (§13.1): browsers get verify-fixed, never signing draws."
+        "$comment": "The sign-then-verify lane draws P-256 signing nonces from the vector RNG, and WebCrypto's ECDSA cannot inject them (Ed25519 signing is deterministic — the constraint is P-256's, review R8.10): browsers get verify-fixed, never signing draws."
       }
     }
   ],

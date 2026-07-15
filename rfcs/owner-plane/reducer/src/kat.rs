@@ -8,7 +8,9 @@
 //! invoke every primitive through it — the browser lane swaps in
 //! WebCrypto there. Native-only lanes keep direct crate calls by
 //! design: family-3 `sign-then-verify` (the companion schema bars
-//! `browser` there — WebCrypto cannot inject signing randomness) and
+//! `browser` there — the lane draws P-256 signing nonces, which
+//! WebCrypto's ECDSA cannot inject; Ed25519 signing is
+//! deterministic, so the constraint is P-256's) and
 //! the non-browser families 6, 11, and 14.
 //!
 //! This module carries the reducer's ONLY canonical-CBOR writer — a
@@ -487,8 +489,9 @@ async fn separation<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String
 
 // --------------------------------------------------------- family 3
 
-/// Native-only by the companion schema's surface guard (WebCrypto
-/// cannot inject signing randomness): direct crate calls via
+/// Native-only by the companion schema's surface guard (the lane
+/// draws P-256 signing nonces WebCrypto cannot inject —
+/// Ed25519 signing is deterministic): direct crate calls via
 /// [`crate::crypto::p256_sig`], no backend parameter.
 fn sign_then_verify(vector: &Json) -> Result<SemStatus, String> {
     use ed25519_dalek::Signer;

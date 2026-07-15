@@ -86,7 +86,7 @@ ob("f7-zone-policy-position", 7, 19, 28, "zone-policy-advances-epoch",
 
 ob("f7-compound-pipeline", 7, 29, 37, "one-live-compound-per-revocation_id",
    "One live compound per revocation_id; derived grant revocation; the arm-indexed control pipeline (body-before-precedence, D-99); cutoff algebra (D-93); authored-but-unwrapped revocation.",
-   ["second-live-compound-rejects","control-body-tamper","control-signature-tamper","control-wrong-proof-arm","c2-post-freeze-valid-op-frozen","c2-post-freeze-sig-invalid-kept","revoke-refs-post-wrap-exclusion-completes","revoke-refs-stale-rotation-rejects","revoke-cutoff-carried-head-completes","revoke-cutoff-head-hash-mismatch-rejects","revoke-cutoff-empty-heads-with-history-rejects","header-unknown-version-rejects"],
+   ["second-live-compound-rejects","control-body-tamper","control-signature-tamper","control-wrong-proof-arm","c2-post-freeze-valid-op-frozen","c2-post-freeze-sig-invalid-kept","revoke-refs-post-wrap-exclusion-completes","revoke-refs-stale-rotation-rejects","revoke-cutoff-carried-head-completes","revoke-cutoff-head-mismatch-selects","revoke-cutoff-empty-heads-with-history-rejects","header-unknown-version-rejects"],
    status="partial", note="post-C.1: the D-71 rotation-refs linkage pair, the D-93 carried-head/mismatch/D-143-exactness triple, and the unknown-version parse negative are vectored; the ratify/snapshot cutoff-algebra ceremonies and authored-but-unwrapped revocation remain deferred sagas (D-203).")
 
 ob("f7-revocation-constructibility", 7, 38, 47, "revocation constructibility",
@@ -179,7 +179,7 @@ ob("f9-receipts-deadlines", 9, 232, 237, "self-receipt",
 
 ob("f9-t5-lease", 9, 237, 243, "T5 window binding",
    "T5 window binding; issuer-fork recovery; GC-fence hardening; service-key resolution; per-posture issuance; witnessless-zone unusability.",
-   ["lease-stale-quarantines","lease-late-then-timely-receipt-admits","lease-online-grant-admits","lease-missing-pends","lease-present-no-receipt-pends","lease-overlong-window-invalid","witnessless-zone-deadline-unusable"],
+   ["lease-stale-quarantines","lease-late-then-timely-receipt-admits","lease-lifecycle-sticky-reproposal","lease-online-grant-admits","lease-missing-pends","lease-present-no-receipt-pends","lease-overlong-window-invalid","witnessless-zone-deadline-unusable"],
    status="partial", note="the T5/lease shapes (incl. the D5 negatives) and witnessless zone are vectored; issuer-fork recovery, GC hardening, service keys, and posture issuance are not.")
 
 ob("f9-succession-anchor", 9, 242, 249, "succession trio",
@@ -253,7 +253,7 @@ ob("f11-actor-id", 11, 328, 329, "actor-id minting per kind",
 
 ob("f11-audit-partition", 11, 329, 334, "audit trigger all three branches",
    "Audit trigger branches, typed principal, partition exactness, result-id domain, the 4096 cap, flow-deadline bound.",
-   ["audit-partition-two-chunks","audit-zero-result-single-chunk","audit-chunk-index-out-of-range","audit-duplicate-chunk-index","audit-changed-principal","audit-changed-scope","audit-changed-count","audit-overlapping-result-sets"],
+   ["audit-partition-two-chunks","audit-zero-result-single-chunk","audit-chunk-index-out-of-range","audit-duplicate-chunk-index","audit-changed-principal","audit-changed-scope","audit-changed-count","audit-overlapping-result-sets","audit-release-missing-middle-refused","audit-release-missing-last-refused","audit-release-omitted-result-refused","audit-release-extra-result-refused","audit-release-split-txn-refused"],
    status="partial", note="partition exactness (incl. the D9 conflicts) is vectored; trigger branches, the 4096 cap, and flow-deadline are not.")
 
 ob("f11-surcharge", 11, 333, 339, "content-independent surcharge accounting",
@@ -282,7 +282,7 @@ ob("f11-quarantine-cleanup", 11, 385, 389, "permanent-quarantine cleanup",
 
 ob("f11-reopenable-journal", 11, 388, 405, "the reopenable journal fold",
    "The reopenable journal fold: independent bases, C3-prime-cut reopen, collision-terminal unreachability, reopen before/after its invalidation, terminal-first reservation, the T0-R0-T1 battery (D-163/D-177/D-185/D-192/D-193).",
-   ["reopen-basis-op-kind-and-unheld-invalidation","reopen-recovery-invalidation-unheld-pends","reopen-recovery-keeps-basis-rejects","txn-internal-order-and-competing-terminals"],
+   ["reopen-basis-op-kind-and-unheld-invalidation","reopen-recovery-invalidation-unheld-pends","reopen-recovery-keeps-basis-rejects","reopen-forged-recovery-log-corrupt","reopen-unadmitted-recovery-pends","txn-internal-order-and-competing-terminals"],
    status="partial", note="reopen citation mechanics (pend/apply/verified-false, stmt-basis parse rejection, incarnation ordering, D-185 reservation) are vectored post-6b; the independent-bases pair and the full battery are not. The clause's held stmt-kind invalidation VERIFYING has no §4.7 wire shape to verify against - a Gate-A audit finding.")
 
 ob("f11-monotone-cause", 11, 405, 411, "monotone-cause trace",
@@ -400,18 +400,25 @@ if errs:
 
 doc = {
     "$comment": "The §13.3 obligation ledger, hand-transcribed at clause-cluster granularity and machine-enforced by core coverage::tests::obligations_ledger_is_sound: quotes are verbatim §13.3 substrings, line ranges (1-indexed within the section) must jointly cover the whole section, vector names must exist, and statuses must match the vector lists. Statuses: vectored (fully exercised), partial (some clauses exercised - the note says which), pending (unvectored debt), code-test (executed by named Rust unit tests, no vector shape), structural (non-obligation lines).",
-    "executed_surfaces": ["rust-core", "rust-reducer"],
+    "executed_surfaces": [
+        "rust-core",
+        "rust-reducer",
+        "browser-chromium",
+        "storage-macos",
+        "storage-linux",
+        "storage-windows",
+    ],
     "surface_annotation_note": "A vector's surfaces array declares §13.2 applicability; it is NOT execution. See execution-lanes-plan.md for the browser and per-OS storage lanes.",
     "section_lines": N,
     "gate_b_deferrals": {
         "$comment": "The owner's ratified scope line (D-203, 2026-07-14): the cheap single-op §10.4 negatives are closed pre-Gate-A; everything below is EXPLICITLY deferred to Gate B - a decision, not drift. The outcomes list must equal core coverage::UNCOVERED_10_4 exactly (test-enforced).",
         "outcomes": ["audit-unavailable", "cert-superseded", "class-ceiling", "class-excluded", "gen-first-op", "issuer-fork", "issuer-gap", "provenance-ceiling", "recovery-competition", "source-erased", "storage-io", "storage-orphaned"],
         "sagas": [
-            "f7 ratify/snapshot cutoff-algebra + checkpoint-machine ceremonies",
-            "f9 issuer feed chains (gap/fork/ancestry/cross-carrier registry)",
-            "f10 generation machine (gen >= 2 histories; fail-closed as lineage-gen in P1 v1)",
-            "f11 transfer composites (mimport battery, monotone-cause, adopted-erasure, effect keys)",
-            "f13 checkpoint/fence storage shapes + renewal custody predicates"
+            "f7 ratify/snapshot cutoff-algebra + checkpoint-machine ceremonies (D-203)",
+            "f9 issuer feed chains (gap/fork/ancestry/cross-carrier registry) (D-203)",
+            "f10 generation machine (gen >= 2 histories; fail-closed as lineage-gen in P1 v1) (D-203)",
+            "f11 transfer composites (mimport battery, monotone-cause, adopted-erasure, effect keys) (D-203)",
+            "f13 checkpoint/fence storage shapes + renewal custody predicates (audit-added deferral — NOT among the four sagas the D-203 ruling names; recorded per review R8.5)"
         ],
     },
     "obligations": E,

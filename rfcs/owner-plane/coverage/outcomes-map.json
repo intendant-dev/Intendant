@@ -204,9 +204,13 @@
   },
   "executed_surfaces": [
     "rust-core",
-    "rust-reducer"
+    "rust-reducer",
+    "browser-chromium",
+    "storage-macos",
+    "storage-linux",
+    "storage-windows"
   ],
-  "surface_annotation_note": "A vector's `surfaces` array declares §13.2 applicability; it is NOT execution. No browser, native-crypto, or per-OS storage lane has executed this corpus — see execution-lanes-plan.md.",
+  "surface_annotation_note": "A vector's `surfaces` array declares §13.2 applicability; execution is what the named lanes actually run. Executing today: the two Rust reference implementations, the Chromium browser lane (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate; run set pinned to lane-manifests.json), and the 3-OS portable-storage lane (real files, flush + atomic replacement, cross-process locks; same pin). native-crypto remains annotation-only (the Rust suites execute those primitives natively); Gate-B concerns stay out per execution-lanes-plan.md.",
   "uncovered": [
     "audit-unavailable",
     "cert-superseded",

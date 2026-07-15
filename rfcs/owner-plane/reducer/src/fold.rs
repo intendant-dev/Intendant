@@ -2935,17 +2935,9 @@ impl State {
                 }
             }
             if grant.online_lease {
-                // D-202 stickiness: an issued `lease-stale` is
-                // terminal on this replica — re-evaluation under
-                // later-arriving timely evidence returns it
-                // unchanged (the re-proposed op is the convergence
-                // carrier).
-                if false && self.stale_issued.contains(&op.op_hash()) {
-                    return ok(Err(Verdict::Rejected(
-                        "lease-stale",
-                        "quarantine-reproposal",
-                    )));
-                }
+                // (D-202 stickiness is consulted at the TOP of
+                // classify — the memoized terminal verdict answers
+                // before any pipeline stage.)
                 let max_age = grant.max_age_ms.unwrap_or(0);
                 let windows = self.qualified_lease_windows(op, &held_cert, &grant, max_age);
                 if windows.is_empty() {

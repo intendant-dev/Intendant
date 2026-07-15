@@ -3,9 +3,9 @@
 **Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
 **Spec:** `owner-plane-d0a-spec.md` v0.5.20, SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef` (the ratification amendments; v0.5.19 = `410880e0…`, archived byte-exact)
-**Companion:** `d0a-vector-cases.v1.json`, SHA-256 `a3d6f779d30492978d6871b97d42037143f4a95c97256aaa92bf5aaa8be0f319` (amendments #1–#4; #3 = the phrase-derive negative arm, #4 = the erase-crash `rotation_ops` control context)
-**Corpus:** 157 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×27, f08×4, f09×11, f10×7, f11×29, f12×15, f13×16, f14×4 — the earlier histogram miscounted f07/f11 by one each; review R8.4)
-**Suites at this amendment:** core 140/140 · reducer 35/35 · the strict harness 157/157 with a nonzero-exit gate · the portable-storage lane 19/19 on real files · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate) · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage map)
+**Companion:** `d0a-vector-cases.v1.json`, SHA-256 `11dd88972220cac3a120f6f729c9b3eb9cd9e6a9a332bff75b4765efd178aaba` (amendments #1–#6; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10)
+**Corpus:** 165 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×27, f08×4, f09×12, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated from the vectors directory after the repair tranche; the pre-tranche histogram miscount was review R8.4)
+**Suites at this amendment:** core 141/141 · reducer 36/36 (incl. the metamorphic-convergence corpus test and the arrival-order restoration control) · the strict harness 165/165 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files with flush+replacement invocation proof · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
 
 > **VERDICT: FAIL.** Gate A is **not** stamped. The interim
 > 2026-07-15 amendment claimed the twelve-clause predicate
@@ -349,13 +349,33 @@ The reducer's honest frontier shrank with the C.1 work; none of
 the remaining `Unimplemented` sites is reachable from the committed
 corpus (the strict gate proves it on every run). The RATIFIED
 `p1-v1-profile.md` (D-203) is now fully executed on its §C.1 side:
-all five implement-before-Gate-A mechanisms are implemented and
-vectored (erase-manifest fold admission; compromise-mode T4 with
-derived-lane retro-disqualification; rotation_refs post-last-wrap
-linkage; the D-93/D-143 frontier-head validation at every site; the
-cut-op re-fold arm resolved as an internal replay invariant), and
+rows one through four are implemented and vectored (erase-manifest
+fold admission; compromise-mode T4 with derived-lane
+retro-disqualification; rotation_refs post-last-wrap linkage; the
+D-93/D-143 frontier-head validation at every site), and row five —
+the cut-op re-fold arm — is implemented as an internal replay
+invariant, which is what the profile records (not a vector; R8.6),
+with
 every §C.2 row is the binding fail-closed contract — two of them
 (lineage-gen, op-unknown) now vectored.
+
+**Documentation-correction record (review R8, resolved this
+tranche):** the corpus histogram is regenerated from the vectors
+directory (R8.4); the fifth Gate-B saga is marked audit-added, not
+D-203-named (R8.5); clause 11 and this section state §C.1 row five
+as the internal replay invariant the profile records (R8.6); the
+executed-surface riders in `coverage/*.json`, the maintenance tool,
+and the workflow header state the delivered lanes (R8.7); the
+browser lane's wasm build is clippy-enforced in the advisory
+workflow (R8.8); the storage-lane header no longer overstates
+read-back substitution (R8.9); the family-3 browser exclusion is
+scoped to P-256 nonce injection — Ed25519 signing is deterministic
+(R8.10). One item is deliberately deferred to the owner's
+freeze-time pass (R8.11): the spec's D-151 decision row still says
+"two renewal-after-revocation vectors" — renewal machinery is
+fail-closed in the ratified P1 v1 profile and no such vectors
+exist; the row's claim is stale prose in an owner document, so it
+is RECORDED here rather than edited unilaterally.
 
 ## 5. Gate-A verdict
 
@@ -417,9 +437,12 @@ audit may say PASS:
     commit `94848163`, job `browser execution (Chromium)`).
 11. **The P1 v1 profile ratified**: every unimplemented normative
     mechanism implemented+vectored or fail-closed by owner
-    ratification. — **RATIFIED (D-203) and EXECUTED**: all five
-    §C.1 mechanisms implemented + vectored; the §C.2 fail-closed
-    contract stands with two rows (lineage-gen, op-unknown) now
+    ratification. — **RATIFIED (D-203) and EXECUTED**: §C.1 rows
+    one through four implemented + vectored; row five (the cut-op
+    re-fold arm) is implemented as an INTERNAL REPLAY INVARIANT,
+    exactly as the profile records it — not a vector (the earlier
+    wording here overstated it; review R8.6). The §C.2 fail-closed
+    contract stands with two rows (lineage-gen, op-unknown)
     vectored.
 12. **Owner rulings**: D2, D5 (lifecycle), D3/D7/D8/D10/D12 prose
     ratifications, D11's recorded acceptance, and the §4.7

@@ -50,11 +50,13 @@ review record, and the byte-exact baseline outranks path cosmetics.
   Gate B as recorded decisions), and the execution lanes funded.
   The corpus stands at 157 vectors, every one reproduced by the
   independent reducer.
-- **Post-ruling execution (2026-07-15)**: all five §C.1
-  implement-before-Gate-A mechanisms are implemented + vectored
-  (erase-manifest admission, compromise-mode T4 with derived-lane
-  retro-disqualification, rotation_refs linkage, D-93/D-143
-  frontier-head validation, the re-fold invariant); the cheap-gap
+- **Post-ruling execution (2026-07-15)**: the §C.1
+  implement-before-Gate-A mechanisms are executed — rows one
+  through four implemented + vectored (erase-manifest admission,
+  compromise-mode T4 with derived-lane retro-disqualification,
+  rotation_refs linkage, D-93/D-143 frontier-head validation), row
+  five as the internal replay invariant the profile records; the
+  cheap-gap
   batch closed ten §10.4 outcomes (22 → 12, the rest explicit
   test-tied Gate-B deferrals); and the **portable-storage execution
   lane is DELIVERED** — every storage-annotated vector runs on real
@@ -72,8 +74,20 @@ review record, and the byte-exact baseline outranks path cosmetics.
   exactness self-references, lane manifests are shrinkable, the
   storage lane omits flush/replacement, and D-202's lifecycle is
   unexecuted. The interim "predicate satisfied" audit claim is
-  withdrawn; the **bounded repair tranche is in progress** (owner
-  directive 2026-07-15, both optional items funded).
+  withdrawn; the **bounded repair tranche is EXECUTED** (owner
+  directive 2026-07-15, both optional items built): the canonical
+  set-derived fold makes order convergence structural (all eight
+  review orders committed as regressions + a metamorphic order
+  suite + an arrival-order restoration control), the D-99 pipeline
+  order and D-130 fork selection are implemented, Journal reopen
+  kills verify against authenticated ADMITTED facts, audit-partition
+  release derives from an independent read-release event, both
+  execution-lane run sets pin to `coverage/lane-manifests.json`, the
+  storage lane executes real flush + atomic replacement with
+  invocation proof, and the D-202 lifecycle is executable
+  (evidence-lifecycle lane; stickiness probed non-vacuous). The
+  next verdict is a FRESH review's to make — this repo never
+  self-stamps.
 - **Durable P1 Memory writes stay prohibited** until Gate B plus the
   umbrella's P0.5/tombed-cutover prerequisites (spec header) —
   independent of Gate A.

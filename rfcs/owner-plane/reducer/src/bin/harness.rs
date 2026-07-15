@@ -39,6 +39,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Review R8.1: an empty corpus is a setup error, never a green
+    // gate — all_green([]) is vacuously true and a mistyped
+    // directory would otherwise exit 0 silently.
+    if reports.is_empty() {
+        eprintln!("harness setup failed: no vectors in {}", dir.display());
+        std::process::exit(2);
+    }
     let mut structural_failures = 0;
     for r in &reports {
         let s = |x: &Result<(), String>| if x.is_ok() { "ok" } else { "FAIL" };
