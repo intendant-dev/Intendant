@@ -47,7 +47,7 @@ the workaround column says what v1 operators do instead).
 
 | Mechanism | Marker | Why fail-closing is unacceptable |
 |---|---|---|
-| Erase-manifest admission in the control fold (§5.4: `erase_op` cites an accepted `m.erase_request`, `target_op` ∈ its targets, item_addr binding) | `erase manifest` | Erase is a v1 pillar; the storage lane is now signed-manifest-bound (D6) but ADMISSION of manifest-carrying rotations is unvectored — rejecting them makes erasure unreachable. |
+| Erase-manifest admission in the control fold (§5.4: `erase_op` cites an accepted `m.erase_request`, `target_op` ∈ its targets, item_addr binding) | ~~`erase manifest`~~ **DONE** — implemented + vectored (`f07-kek-rotate-manifest-admits` / `-target-outside-rejects`; D-66 first-manifest-wins effects, unheld citation pends) | Erase is a v1 pillar; the storage lane is signed-manifest-bound (D6) and admission now enforces the portable §5.4 face. |
 | Compromise-mode device revocation (T4 `receipt_cutoffs`) | `compromise mode (T4 receipt cutoffs)`, `receipt_cutoffs under exclude` | The stolen-device response; v1 cannot ship with exclude-only revocation. |
 | `rotation_refs` typed linkage on revocation compounds | `rotation_refs linkage` | Mandatory on hosted planes (§7.5); hosted is a v1 posture. |
 | Frontier-close head validation (carried heads vs held ops) | `frontierclose heads` ×4, `cutoff heads below accepted ops`, `carried head mismatches the held op` (partially implemented; the markers are the residue) | Cutoff ceremonies are the revocation backbone; head validation is their integrity. |

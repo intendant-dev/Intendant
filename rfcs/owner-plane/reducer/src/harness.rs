@@ -891,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            146,
-            "the corpus through the D2/D5 ruling vectors"
+            148,
+            "the corpus through the manifest-admission pair"
         );
         for r in &reports {
             assert!(

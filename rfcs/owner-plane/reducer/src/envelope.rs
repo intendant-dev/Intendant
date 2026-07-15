@@ -428,10 +428,10 @@ mod tests {
         );
         // Every fold fixture folds its genesis (6 tranche + 12
         // fold-lane + 1 export-import + 9 status + 7 time/lease +
-        // 6 control-fold + 3 budget + 8 audit + 10 time corpus minus
+        // 8 control-fold + 3 budget + 8 audit + 10 time corpus minus
         // the journal four; every fold fixture delivers c1); the
         // four journal fixtures deliver Txn frames only.
-        assert_eq!(geneses, 57);
+        assert_eq!(geneses, 59);
     }
 
     /// Tampering any byte of the header breaks the signature; the

@@ -17,6 +17,7 @@
       "audit-duplicate-chunk-index",
       "audit-overlapping-result-sets",
       "issuance-to-revoked-device-rejects",
+      "kek-rotate-manifest-target-outside-rejects",
       "merkle-leftover-sibling-rejects",
       "projection-stamp-incomplete-rejects",
       "second-live-compound-rejects",

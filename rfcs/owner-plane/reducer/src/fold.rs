@@ -382,6 +382,13 @@ pub struct State {
     /// §11.1: targets flagged retrieval-excluded IMMEDIATELY at the
     /// erase request's acceptance.
     retrieval_excluded: Vec<[u8; 32]>,
+    /// Accepted `m.erase_request`s: op hash → targets (the §5.4
+    /// manifest-admission citation source).
+    erase_requests: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// `item_addr`s already manifested by an accepted rotation —
+    /// D-66 first-manifest-wins; re-appearance is an idempotent
+    /// skip.
+    manifested: Vec<[u8; 32]>,
     /// (zone, capability epoch) → the policy-in-force's
     /// `time_witnesses` devices (the T2 anchor, D-69). Absent epochs
     /// resolve DOWNWARD — a bare bump carries policy(e−1) forward.
@@ -1960,10 +1967,62 @@ impl State {
         if body.get("new_epoch").and_then(|n| n.as_uint()) != Some(cur + 1) {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
+        // The typed erase manifest (§5.4, D-66 — the P1 profile's
+        // first implement-before-Gate-A mechanism): entries
+        // `{item_addr, erase_op, target_op}`, an E7 set keyed and
+        // sorted by `item_addr`, at most 128 (E8). The PORTABLE
+        // admission checks: `erase_op` cites an ACCEPTED
+        // `m.erase_request` (unheld → pends; held-but-not-a-request
+        // → body-invariant) and `target_op` is a member of that
+        // request's `targets`. The `item_addr ↔ target_op` binding
+        // is author-attested (verifiable only by zone-key index
+        // rebuild, §5.6) and the D-198 nonterminal-journal
+        // eligibility is a LOCAL storage invariant — neither is a
+        // portable admission predicate. Cross-rotation re-appearance
+        // of a manifested `item_addr` is an idempotent skip (D-66):
+        // the entry re-admits, its effect does not repeat.
+        let mut manifest_effects: Vec<([u8; 32], [u8; 32])> = Vec::new();
         match body.get("erase_manifest").and_then(|m| m.as_array()) {
             None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-            Some(a) if !a.is_empty() => return Err(Unimplemented("erase manifest".into())),
-            Some(_) => {}
+            Some(entries) => {
+                if entries.len() > 128 {
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                }
+                let mut prev_addr: Option<[u8; 32]> = None;
+                for e in entries {
+                    if !keys_are_map(e, &["item_addr", "erase_op", "target_op"]) {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    }
+                    let (Some(addr), Some(erase_op), Some(target_op)) = (
+                        e.get("item_addr").and_then(|v| v.bytes_n::<32>()),
+                        e.get("erase_op").and_then(|v| v.bytes_n::<32>()),
+                        e.get("target_op").and_then(|v| v.bytes_n::<32>()),
+                    ) else {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    };
+                    if prev_addr.is_some_and(|p| p >= addr) {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    }
+                    prev_addr = Some(addr);
+                    let Some(targets) = self.erase_requests.get(&erase_op) else {
+                        if self.holds_op(&erase_op) {
+                            // Held but not an accepted erase request.
+                            return ok(Err(Verdict::Rejected(
+                                "body-invariant",
+                                "reject-permanent",
+                            )));
+                        }
+                        return ok(Err(Verdict::Pending(
+                            "ref-unresolved",
+                            "pending-dependency",
+                        )));
+                    };
+                    if !targets.contains(&target_op) {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    }
+                    manifest_effects.push((addr, target_op));
+                }
+            }
         }
         let plane = self
             .plane_id
@@ -1988,6 +2047,16 @@ impl State {
 
         // Accept: the new epoch's recipient set IS the wrap set.
         // Pending compounds re-evaluate through the fold's fixpoint.
+        // Manifest effects (D-66 first-manifest-wins): a fresh
+        // item_addr consumes its target's erase-queue entry; a
+        // re-appearing one skips idempotently.
+        for (addr, target_op) in manifest_effects {
+            if self.manifested.contains(&addr) {
+                continue;
+            }
+            self.manifested.push(addr);
+            self.erase_queue.retain(|t| *t != target_op);
+        }
         self.kek_epochs.insert(zone, cur + 1);
         for r in recipients {
             self.record_wrap(zone, cur + 1, r);
@@ -3323,6 +3392,7 @@ impl State {
 
         // Accept.
         self.record_tenant(op, &grant, None, None, None, None);
+        self.erase_requests.insert(op.op_hash(), resolved.clone());
         for t in resolved {
             if !self.erase_queue.contains(&t) {
                 self.erase_queue.push(t);

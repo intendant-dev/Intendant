@@ -26,9 +26,11 @@
 use crate::cbor::{self, Value};
 use crate::domains::{h_tag, Tag};
 use crate::shapes::control::{AdminKey, Crecovsucc};
-use crate::shapes::envelope::Signedop;
+use crate::shapes::envelope::{ActorKind, Signedop};
+use crate::shapes::memory::Merasereq;
 use crate::shapes::{
-    DeadlineFallback, Frontierclose, Sigalg, Strictness, TimeWitness, Verb, Zonepolicy,
+    DeadlineFallback, Erasemref, Frontierclose, Sigalg, Strictness, TimeWitness, ToValue, Verb,
+    Zonepolicy,
 };
 use crate::suite;
 use crate::tranche::{items, PlaneRig};
@@ -380,6 +382,143 @@ pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
     )
 }
 
+/// The §5.4 manifest-admission face (D-203 ratified the P1 profile;
+/// this is its first implement-before-Gate-A mechanism): a rotation
+/// whose typed `erase_manifest` cites an ACCEPTED `m.erase_request`
+/// with `target_op` in its `targets` ADMITS. The reversed order
+/// delivers the rotation before the request — it pends
+/// `ref-unresolved` and admits at the fixpoint (the citation is
+/// verifiable-when-held). The `item_addr` is author-attested (§5.6
+/// index territory), opaque to admission.
+pub fn f7_kek_rotate_manifest_admits() -> Vector {
+    let name = "f7-kek-rotate-manifest";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(
+        &dev2,
+        &grant2,
+        "i",
+        "the ledger holds a stray entry",
+        1,
+        None,
+    );
+    let e = rig.tenant_op_as(
+        ActorKind::Human,
+        &d1,
+        &g1,
+        "e",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![i.op_hash()],
+        }
+        .to_value(),
+        1,
+        None,
+    );
+    let k = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        let entry = Erasemref {
+            item_addr: rig.rng.draw32("erase.item_addr"),
+            erase_op: e.op_hash(),
+            target_op: i.op_hash(),
+        };
+        rig.kek_rotate_erasing(2, vec![w], vec![entry])
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "kek-rotate-manifest-admits",
+        "fold",
+        "5.4",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("e", &e), ("k", &k)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "e" },
+            { "item": "k" },
+        ]),
+        None,
+    )
+}
+
+/// The §5.4 membership negative: the manifest entry's `target_op` is
+/// a held, in-scope claim that the cited erase request does NOT
+/// list — `(body-invariant, reject-permanent)` on the rotation
+/// (portably checkable at admission, D-66).
+pub fn f7_kek_rotate_manifest_target_outside() -> Vector {
+    let name = "f7-kek-rotate-manifest-outside";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the requested target", 1, None);
+    let i2 = rig.claim(
+        &dev2,
+        &grant2,
+        "i2",
+        "the unrequested neighbor",
+        2,
+        Some(i.op_hash()),
+    );
+    let e = rig.tenant_op_as(
+        ActorKind::Human,
+        &d1,
+        &g1,
+        "e",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![i.op_hash()],
+        }
+        .to_value(),
+        1,
+        None,
+    );
+    let k = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        let entry = Erasemref {
+            item_addr: rig.rng.draw32("erase.item_addr"),
+            erase_op: e.op_hash(),
+            target_op: i2.op_hash(),
+        };
+        rig.kek_rotate_erasing(2, vec![w], vec![entry])
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "kek-rotate-manifest-target-outside-rejects",
+        "fold",
+        "5.4",
+        rig,
+        &[
+            ("c1", &c1),
+            ("c2", &c2),
+            ("i", &i),
+            ("i2", &i2),
+            ("e", &e),
+            ("k", &k),
+        ],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "i2" },
+            { "item": "e" },
+            { "item": "k", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
 pub fn corpus_ctrl() -> Vec<Vector> {
     vec![
         f7_hosted_solo_boot(),
@@ -390,6 +529,8 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_c3_branch_cut_below_head(),
         f7_post_freeze_valid_op_frozen(),
         f7_post_freeze_sig_invalid_kept(),
+        f7_kek_rotate_manifest_admits(),
+        f7_kek_rotate_manifest_target_outside(),
     ]
 }
 
