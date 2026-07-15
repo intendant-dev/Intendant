@@ -75,8 +75,7 @@ pub(crate) fn store_external_transcript_entries(
     // when the file still IS the keyed snapshot.
     match std::fs::metadata(Path::new(&key.path)) {
         Ok(metadata)
-            if metadata.len() == key.len
-                && metadata_mtime_nanos(&metadata) == key.mtime_nanos => {}
+            if metadata.len() == key.len && metadata_mtime_nanos(&metadata) == key.mtime_nanos => {}
         _ => return,
     }
     let slot = external_transcript_cache_slot(&key);
@@ -1657,8 +1656,8 @@ mod tests {
             "a parse of bytes that no longer match the keyed snapshot must not be cached"
         );
         // The steady case (file unchanged since the key) still caches.
-        let fresh_key = external_transcript_cache_key("codex", "post-parse-growth", &path)
-            .expect("fresh key");
+        let fresh_key =
+            external_transcript_cache_key("codex", "post-parse-growth", &path).expect("fresh key");
         store_external_transcript_entries(fresh_key.clone(), &entries);
         assert!(cached_external_transcript_entries(&fresh_key).is_some());
     }
