@@ -27,8 +27,9 @@
 //!   pending-dependency); a held QUALIFIED receipt outside every
 //!   valid lease window = `lease-stale` (staleness on the HELD
 //!   evidence — quarantine-reproposal, per the §10.5 disposition
-//!   split; whether a later timely receipt re-opens the verdict is
-//!   the open D5 lifecycle question, decisions-pending.md).
+//!   split; STICKY by the owner's D5 ruling: terminal where issued,
+//!   convergence rides the writer's re-proposal — while held timely
+//!   evidence beats held late evidence, the augmented-aux pair).
 
 use crate::cbor;
 use crate::keyschedule::{item_addr, seal_item};
@@ -383,6 +384,40 @@ pub fn f9_lease_stale_quarantines() -> Vector {
     )
 }
 
+/// The augmented-aux endpoint of the D5 pair (the stale-aux endpoint
+/// is `lease-stale-quarantines`): the SAME late receipt is held PLUS
+/// a timely in-window one — held timely evidence admits the claim.
+/// The lifecycle between the endpoints is RULED sticky (D5,
+/// alternative (ii), 2026-07-14): a store that already classified
+/// stale converges through the writer's re-proposed op, never by
+/// re-evaluating the original rejection.
+pub fn f9_lease_late_then_timely_receipt_admits() -> Vector {
+    let mut a = deadline_arc("f9-lease-late-then-timely", true);
+    let gid = grant_id_of(&a.ops[3].1);
+    let (d2, lineage, addr) = (a.d2.clone(), a.d1.lineage, a.addr);
+    let lease = a
+        .rig
+        .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 86_400_000);
+    let late = a
+        .rig
+        .accept_receipt(&d2, addr, T0_MS + 86_400_000 + 300_000 + 100_000);
+    let timely = a.rig.accept_receipt(&d2, addr, T0_MS + 43_200_000);
+    let aux = [
+        ("index", index_aux(&[(a.addr, a.claim_hash)])),
+        ("lease.d2", lease.encode()),
+        ("receipt.accept.d2", late.encode()),
+        ("receipt.accept2.d2", timely.encode()),
+    ];
+    let per_item = rows(&a.ops, None);
+    time_vector(
+        "lease-late-then-timely-receipt-admits",
+        a.rig,
+        &refs(&a.ops),
+        &aux,
+        per_item,
+    )
+}
+
 /// The c.grant op's grant_id (the body's `grant.grant_id`).
 fn grant_id_of(grant_op: &Signedop) -> [u8; 16] {
     let cbor::Value::Map(entries) = &grant_op.body else {
@@ -465,6 +500,7 @@ pub fn corpus_time() -> Vec<Vector> {
         f9_lease_online_grant_admits(),
         f9_lease_missing_pends(),
         f9_lease_stale_quarantines(),
+        f9_lease_late_then_timely_receipt_admits(),
         f9_lease_present_no_receipt_pends(),
         f9_lease_overlong_window_invalid(),
     ]

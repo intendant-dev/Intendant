@@ -427,11 +427,11 @@ mod tests {
             "unexpected body-hash failures"
         );
         // Every fold fixture folds its genesis (6 tranche + 12
-        // fold-lane + 1 export-import + 7 status + 7 time/lease +
-        // 6 control-fold + 3 budget + 8 audit + 9 time corpus minus
+        // fold-lane + 1 export-import + 9 status + 7 time/lease +
+        // 6 control-fold + 3 budget + 8 audit + 10 time corpus minus
         // the journal four; every fold fixture delivers c1); the
         // four journal fixtures deliver Txn frames only.
-        assert_eq!(geneses, 54);
+        assert_eq!(geneses, 57);
     }
 
     /// Tampering any byte of the header breaks the signature; the

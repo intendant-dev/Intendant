@@ -398,14 +398,13 @@ fn run_status_derive(vector: &Json) -> Result<SemStatus, String> {
         let bytes = items.get(name).ok_or("derived names unknown item")?;
         let hash = crate::domains::h("op", bytes);
         match state.claim_status(&hash, as_of) {
-            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
-            Ok(Some(got)) if got == want => {}
-            Ok(Some(got)) => {
+            Some(got) if got == want => {}
+            Some(got) => {
                 return Ok(SemStatus::Fail(format!(
                     "{name}: expected status {want}, reducer derived {got}"
                 )))
             }
-            Ok(None) => {
+            None => {
                 return Ok(SemStatus::Fail(format!(
                     "{name}: not a held claim in the final state"
                 )))
@@ -892,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            143,
-            "the corpus through the repair tranche's D6/6b reopen-kill triple"
+            146,
+            "the corpus through the D2/D5 ruling vectors"
         );
         for r in &reports {
             assert!(

@@ -1,11 +1,11 @@
 # D0-A Gate-A Discrepancy Audit — amended after the repair tranche
 
-**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche
+**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
-**Spec:** `owner-plane-d0a-spec.md` v0.5.19, SHA-256 `410880e04433b629d5d11956e322f59832494d8f25042b3dfcf34d8b694c6748` (unchanged)
+**Spec:** `owner-plane-d0a-spec.md` v0.5.20, SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef` (the ratification amendments; v0.5.19 = `410880e0…`, archived byte-exact)
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `a3d6f779d30492978d6871b97d42037143f4a95c97256aaa92bf5aaa8be0f319` (amendments #1–#4; #3 = the phrase-derive negative arm, #4 = the erase-crash `rotation_ops` control context)
-**Corpus:** 143 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×19, f08×4, f09×9, f10×7, f11×25, f12×15, f13×16, f14×4)
-**Suites at amendment:** core 140/140 · reducer 33/33 · the strict harness 143/143 with a nonzero-exit gate · fmt/clippy clean both crates · mint byte-idempotent (vectors + coverage map)
+**Corpus:** 146 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×19, f08×4, f09×10, f10×7, f11×27, f12×15, f13×16, f14×4)
+**Suites at the rulings:** core 140/140 · reducer 33/33 · the strict harness 146/146 with a nonzero-exit gate · fmt/clippy clean both crates · mint byte-idempotent (vectors + coverage map)
 
 > **VERDICT: FAIL.** Gate A is **not** stamped. The original
 > recommendation (PASS conditional on twelve ratifications) rested on
@@ -154,24 +154,22 @@ its own wordlist/entropy/SHA-256 computation (`key-malformed`,
 entropy↔phrase cross-check. No ruling remains.
 
 **D2. [#47] §11.4 has no actor-class row for a bare autonomous
-non-human unattested writer.** **REOPENED — awaiting ruling, mapping
-withdrawn:** the original recommendation (adopt the `session`
-derivation both engines used) silently granted bare daemons the
-status-counting authority B.2 reserves for attested sessions. The
-scaffold mapping is REMOVED: the derivation returns no class, and any
-path that would decide through it (a bare writer holding a judge
-verb; a status fold containing a standing bare-writer judgment)
-surfaces `Unimplemented` naming `decisions-pending.md`, which carries
-the four alternatives, their authority consequences against the
-PINNED B.2/B.3 bytes, and two discriminating vector drafts
-(deliberately unminted). Verified: no committed vector reaches the
-boundary.
+non-human unattested writer.** **CLOSED — RULED (D-201, owner
+2026-07-14): alternative (c), no class / no vote.** Bare writers
+never count toward status; their judgments are recordable where
+authoring verbs admit them and inert in the §11.2 fold; status
+influence requires attestation (the session path). The withdrawn
+session mapping had granted status-counting authority B.2 reserves
+for attested sessions. Pinned by the minted pair
+`f11-status-bare-daemon-retract-inert` /
+`f11-status-bare-daemon-supersede-inert` (both derive `candidate`
+where the mapping would have derived `retired`/`superseded`); §11.4
+carries the rule in prose (v0.5.20).
 
 **D3. [#63] No (outcome, disposition) exists for a control operation
-cut by a C3′ branch cut.** OPEN (prose ratification): both
-implementations classify `(cutoff, quarantine-reproposal)`, pinned by
-`f07-walkthrough-c3-branch-cut-below-head`. §10.4/§7.4 should name
-it.
+cut by a C3′ branch cut.** **CLOSED — ratified (D-203):** §7.4 now
+names `(cutoff, quarantine-reproposal)` with D-140 boundary-purpose
+permanence; pinned by `f07-walkthrough-c3-branch-cut-below-head`.
 
 **D4. [#65] No stated classification for a control op arriving while
 the plane is C2-frozen.** **CLOSED (implemented + vectored, stage
@@ -186,17 +184,18 @@ and `f07-c2-post-freeze-sig-invalid-kept` (`sig-invalid`,
 freeze.
 
 **D5. [#57] `lease-stale`'s firing condition is never stated.**
-**PARTIALLY CLOSED:** the boundary negatives are vectored
-(`f09-lease-present-no-receipt-pends` — a valid lease with NO receipt
-pends `lease-missing`; `f09-lease-overlong-window-invalid` — a window
-exceeding `max_age_ms` is not a lease). The "conclusive staleness"
-wording is withdrawn: `lease-stale` is staleness ON THE HELD EVIDENCE
-(the disposition is quarantine-reproposal precisely because it is
-re-proposable). What happens when a later TIMELY receipt reaches a
-store that already classified stale — the convergence lifecycle — is
-an owner decision: `decisions-pending.md` surfaces re-evaluation vs
-sticky-rejection-plus-reproposal vs timeboxed-pendency with paired
-endpoint vector drafts (unminted). No lifecycle is chosen or encoded.
+**CLOSED — RULED (D-202, owner 2026-07-14): alternative (ii), sticky
+rejection + writer re-proposal.** The firing condition and lifecycle
+are in the T5 prose (v0.5.20): a held qualified receipt outside every
+valid window classifies `(lease-stale, quarantine-reproposal)` on the
+evidence held at evaluation, terminal where issued; convergence rides
+the re-proposed op; the original op's verdict is knowingly
+evidence-order-relative. Endpoints pinned by the pair
+`f09-lease-stale-quarantines` /
+`f09-lease-late-then-timely-receipt-admits` (held timely evidence
+beats held late evidence); the boundary negatives
+(`f09-lease-present-no-receipt-pends`,
+`f09-lease-overlong-window-invalid`) stand.
 
 **D6. [#52] The §5.5 state-6 re-derivation vs the erase-crash
 contract.** **CLOSED (the oracle is gone):** finding 10 above —
@@ -204,13 +203,13 @@ companion amendment #4, signed rotation ops as the control context,
 tombstones bound to the signed manifest, all 8 vectors re-minted.
 
 **D7. [#54] The classification of a durable RewrapDone omitting an
-expected survivor.** OPEN (prose ratification): pinned `(log-corrupt,
-storage-quarantine)`; the D-89 serialization violation pins the same
-pair.
+expected survivor.** **CLOSED — ratified (D-203):** §5.5 now names
+`(log-corrupt, storage-quarantine)` for both the omission and the
+D-89 N+1-Fence serialization violation.
 
 **D8. [#61] The recovery arm's `repoch` on a NON-succession operation
-(`c.drill`).** OPEN (prose ratification): pinned as the CURRENT
-repoch.
+(`c.drill`).** **CLOSED — ratified (D-203):** the drill prose now
+states the CURRENT repoch (a drill proves, never advances).
 
 **D9. [#70] No outcome named for an audit row contradicting its
 read's established partition.** **CLOSED (implemented + vectored):**
@@ -220,15 +219,17 @@ changed scope, changed count, overlapping result sets), each
 chain. The prose row remains worth adding at freeze.
 
 **D10. [#22] The companion's "fresh fold of the union" names no
-arrival order.** OPEN (one clarifying sentence in §13.1).
+arrival order.** **CLOSED — ratified (D-203):** §13.1 now states the
+fresh fold commits to no arrival order.
 
 **D11. [#46] Umbrella App C #2 (offline expiry confirmation) remains
-unperformed.** OPEN — an explicitly-recorded owner choice;
-`f14-offline-expiry-confirmation-pending` keeps it visible. Gate A
-can pass with this open only by that recorded choice.
+unperformed.** **DISPOSITIONED (D-203):** stays a recorded open by
+owner choice; `f14-offline-expiry-confirmation-pending` keeps it
+visible.
 
 **D12. [#8] The op signature and op identity share the domain tag
-`op`.** OPEN (design observation; no failing trace exists).
+`op`.** **CLOSED — recorded as accepted (D-203):** disjoint shapes,
+no failing trace; no change.
 
 ## 3. Derived conventions to codify (clarifications, no behavior change)
 
@@ -337,13 +338,17 @@ before a future audit may say PASS:
    **holds** (tranche 6b).
 7. **No silent owner rulings**: D2 and D5 surfaced with alternatives
    and discriminating drafts, decided by NOTHING in the artifacts. —
-   **holds** (tranche 6c/6d); the RULINGS themselves remain open.
+   **holds**, and the rulings are now MADE (D-201 no-class/no-vote;
+   D-202 sticky + re-proposal) with the discriminating and endpoint
+   vectors minted.
 8. **Machine-enforced coverage**: the §10.4 map + §13.3 ledger
    enforced in CI-visible suites; executed-surface honesty stated in
-   the artifacts. — **holds** (tranche 7). The DEBT they expose (22
-   uncovered outcomes; 43 pending + 25 partial obligations) is
-   open: Gate A requires the owner to ratify a scope line through
-   it explicitly — this audit proposes none.
+   the artifacts. — **holds** (tranche 7), and the scope line is now
+   RATIFIED (D-203): cheap single-op §10.4 negatives close before
+   Gate A; the big ceremony sagas (f7 ratify/checkpoint arcs, f9
+   issuer feeds, f10 generation machine, f11 transfer composites)
+   defer to Gate B as recorded decisions. The cheap-gap closure is
+   in-flight work.
 9. **CI visibility**: the advisory, accurately-named
    reference-artifact workflow exists. — **holds** (tranche 7).
 10. **Execution lanes**: Chromium and per-OS storage lanes either
@@ -352,15 +357,21 @@ before a future audit may say PASS:
     lanes have not run.**
 11. **The P1 v1 profile ratified**: every unimplemented normative
     mechanism implemented+vectored or fail-closed by owner
-    ratification. — **written, unratified.**
+    ratification. — **RATIFIED as drafted (D-203)**; the five §C.1
+    implement-before-Gate-A mechanisms (erase-manifest fold
+    admission, compromise-mode T4, rotation_refs linkage,
+    frontier-head validation residue, the cut-op re-fold arm) are
+    thereby REQUIRED artifact work, in flight.
 12. **Owner rulings**: D2, D5 (lifecycle), D3/D7/D8/D10/D12 prose
     ratifications, D11's recorded acceptance, and the §4.7
-    fork-discovery wire gap (finding 12) dispositioned. — **open.**
+    fork-discovery wire gap dispositioned. — **all MADE and
+    recorded** (spec v0.5.20, D-201..D-203; the wire gap is shelved
+    for v1 with the reducer's honest Unimplemented standing).
 
-Clauses 10–12 are open; therefore **FAIL**. The remaining path is
-owner action (rulings, profile ratification, scope line) plus the
-execution lanes; no further artifact work is known to be required
-for clauses 1–9.
+Still open: clause 10 (the funded execution lanes have not run),
+clause 11's implement-before-Gate-A list, and clause 8's ratified
+cheap-gap closure; therefore **FAIL**. The remaining path is
+artifact work with no known owner decision outstanding.
 
 Nothing in this verdict stamps the spec, opens P1, or amends the
 Gate-A predicate silently; P1 writes stay barred until Gate B and

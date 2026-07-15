@@ -12,13 +12,15 @@
 //! - dev1 judges as OWNER (human actor on the genesis grant's
 //!   judge.full); dev2's human judgments are SAFE-HUMAN (grant2
 //!   carries no full rights); dev2's daemon-kind ops are the bare
-//!   autonomous writer (§11.4 has no explicit row — the engines
-//!   derive `session`; audit item).
+//!   autonomous writer — NO actor class by the owner's D2 ruling
+//!   (alternative (c), 2026-07-14): recorded where authoring verbs
+//!   admit them, counting toward no status rule (the two
+//!   `bare-daemon-*-inert` vectors pin it).
 
 use crate::shapes::envelope::ActorKind;
 use crate::shapes::memory::{BasicVerdict, Mjudge};
-use crate::shapes::{Polref, ToValue, Verb};
-use crate::tranche::{admits, items, PlaneRig, T0_MS};
+use crate::shapes::{Class, Polref, Spaceclass, Spacedef, ToValue, Verb};
+use crate::tranche::{admits, draw_id, items, PlaneRig, T0_MS};
 use crate::vector::{Expected, Vector};
 use serde_json::{json, Map as JsonMap, Value as Json};
 
@@ -327,6 +329,159 @@ pub fn f11_status_author_retract() -> Vector {
     )
 }
 
+/// The D2 ruling pinned (alternative (c), 2026-07-14): a bare
+/// daemon's self-retract ADMITS through `propose` + the author
+/// relation — recorded — but its writer has NO actor class, so no
+/// B.2 rule counts it and `i` stays `candidate`. The human twin is
+/// `status-author-retract` (safe-human matches the retract/author
+/// row → retired); under the withdrawn session mapping this vector
+/// would have derived `retired` too.
+pub fn f11_status_bare_daemon_retract_inert() -> Vector {
+    let name = "status-bare-daemon-retract-inert";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(
+        &dev2,
+        &grant2,
+        "i",
+        "the autonomous sweep flagged a duplicate entry",
+        1,
+        None,
+    );
+    let jr = rig.tenant_op_as(
+        ActorKind::Daemon,
+        &dev2,
+        &grant2,
+        "jr",
+        Mjudge::OP_TYPE,
+        judge_basic(BasicVerdict::Retract, i.op_hash(), wf_polref()),
+        2,
+        Some(i.op_hash()),
+    );
+    let c1 = rig.genesis_op.clone();
+    status_vector(
+        name,
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("jr", &jr)],
+        json!(["c1", "c2", "i", "jr"]),
+        json!([{ "item": "i", "value": "candidate" }]),
+        Json::Null,
+    )
+}
+
+/// The D2 ruling's workflow arm: on a WORKFLOW-class space the bare
+/// daemon's author-supersede admits through `propose` (the §11.1
+/// author row), but B.2's supersede/session/author rule does not
+/// match its `None` class — `i` stays `candidate` even though the
+/// replacement is owner-accepted. Under the withdrawn session
+/// mapping this vector would have derived `superseded`.
+pub fn f11_status_bare_daemon_supersede_inert() -> Vector {
+    let name = "status-bare-daemon-supersede-inert";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    // A workflow-class space on the genesis zone, workflow-v1-bound.
+    let wf_space = draw_id(&mut rig.rng, "wf.space_id");
+    let wf_name_hash = rig.rng.draw32("wf.space.name_hash");
+    let cs = rig.space_create(Spacedef {
+        space_id: wf_space,
+        zone_id: rig.zone_id,
+        name_hash: wf_name_hash,
+        space_class: Spaceclass::Workflow,
+        class_minimum: Class::Private,
+        status_policy: wf_polref(),
+    });
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.grant_in(
+        "grant2",
+        &dev2,
+        vec![Verb::Propose],
+        rig.zone_id,
+        vec![wf_space],
+    );
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    // The owner's judgment rights on the workflow space.
+    let g1wf = rig.grant_in(
+        "grant1wf",
+        &d1,
+        vec![Verb::JudgeFull],
+        rig.zone_id,
+        vec![wf_space],
+    );
+    let gw = rig.grant_op(g1wf.clone());
+    let i = rig.claim_in_space(
+        &dev2,
+        &grant2,
+        wf_space,
+        "i",
+        "the workflow draft cites the stale figure",
+        1,
+        None,
+    );
+    let r = rig.claim_in_space(
+        &dev2,
+        &grant2,
+        wf_space,
+        "r",
+        "the workflow draft cites the corrected figure",
+        2,
+        Some(i.op_hash()),
+    );
+    let zone = rig.zone_id;
+    let js = rig.tenant_op_in(
+        zone,
+        wf_space,
+        ActorKind::Daemon,
+        &dev2,
+        &grant2,
+        "js",
+        Mjudge::OP_TYPE,
+        Mjudge::Supersede {
+            target: i.op_hash(),
+            replacement: r.op_hash(),
+            policy: wf_polref(),
+            reason: None,
+        }
+        .to_value(),
+        3,
+        Some(r.op_hash()),
+    );
+    let ja = rig.tenant_op_in(
+        zone,
+        wf_space,
+        ActorKind::Human,
+        &d1,
+        &g1wf,
+        "ja",
+        Mjudge::OP_TYPE,
+        judge_basic(BasicVerdict::Accept, r.op_hash(), wf_polref()),
+        1,
+        None,
+    );
+    let c1 = rig.genesis_op.clone();
+    status_vector(
+        name,
+        rig,
+        &[
+            ("c1", &c1),
+            ("cs", &cs),
+            ("c2", &c2),
+            ("gw", &gw),
+            ("i", &i),
+            ("r", &r),
+            ("js", &js),
+            ("ja", &ja),
+        ],
+        json!(["c1", "cs", "c2", "gw", "i", "r", "js", "ja"]),
+        json!([
+            { "item": "i", "value": "candidate" },
+            { "item": "r", "value": "accepted" },
+        ]),
+        Json::Null,
+    )
+}
+
 /// Supersession and its loss: owner supersedes i→r and accepts r
 /// (i superseded); the second vector's extra owner retract of r
 /// drops status(r) from accepted — the supersession no longer holds
@@ -487,6 +642,8 @@ pub fn corpus_status() -> Vec<Vector> {
         f11_status_safe_human_dispute_counts(),
         f11_status_dispute_recorded_not_counting(),
         f11_status_author_retract(),
+        f11_status_bare_daemon_retract_inert(),
+        f11_status_bare_daemon_supersede_inert(),
         f11_status_superseded(),
         f11_status_revival_on_replacement_loss(),
         f11_policy_hash_mismatch(),

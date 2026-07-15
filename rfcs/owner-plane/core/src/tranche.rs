@@ -1019,6 +1019,31 @@ impl PlaneRig {
         writer_sequence: u64,
         previous_writer_hash: Option<Bytes32>,
     ) -> Signedop {
+        let home = self.home_space;
+        self.claim_in_space(
+            dev,
+            grant,
+            home,
+            tag,
+            statement,
+            writer_sequence,
+            previous_writer_hash,
+        )
+    }
+
+    /// [`Self::claim`] on an arbitrary space of the genesis zone
+    /// (daemon-actored, like every default claim).
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_in_space(
+        &mut self,
+        dev: &Device,
+        grant: &Grant,
+        space_id: Bytes16,
+        tag: &str,
+        statement: &str,
+        writer_sequence: u64,
+        previous_writer_hash: Option<Bytes32>,
+    ) -> Signedop {
         let body = Mclaim {
             kind: Kind::Observation,
             statement: statement.into(),
@@ -1034,7 +1059,11 @@ impl PlaneRig {
             supersedes: None,
             labels: None,
         };
-        self.tenant_op(
+        let zone_id = self.zone_id;
+        self.tenant_op_in(
+            zone_id,
+            space_id,
+            ActorKind::Daemon,
             dev,
             grant,
             tag,

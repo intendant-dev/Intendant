@@ -1,6 +1,9 @@
 # P1 v1 profile — every unimplemented normative mechanism, dispositioned
 
-Status: **recommendations pending the owner's ratification.** P1
+Status: **RATIFIED as drafted (owner, 2026-07-14; recorded in
+D-203).** The five §C.1 mechanisms are implement-before-Gate-A work;
+every §C.2 row is the binding fail-closed contract for a P1 v1
+build. P1
 writes stay barred until Gate B plus the P0.5/tombed-cutover
 sequence regardless of this file; the profile exists because the
 amended Gate-A predicate requires every normative v1 mechanism to be

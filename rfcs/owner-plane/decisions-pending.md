@@ -1,11 +1,30 @@
-# Open owner decisions (repair tranche, D2 / D5)
+# Owner decisions (repair tranche, D2 / D5) — RULED
 
-Status: **awaiting the owner's ruling — nothing in this file is
-chosen.** The repair tranche surfaced these two decision points and
-made the reference implementation honest about them (the touchpoints
-below return `Unimplemented` naming this file instead of deciding);
-the discriminating vectors are DRAFTS — deliberately unminted, so no
-answer ships as corpus bytes before the ruling.
+Status: **both decisions are RULED (owner, 2026-07-14) and recorded
+in the spec's decision table.** This file survives as the
+alternatives record the rulings chose from.
+
+- **D2 → alternative (c), no class / no vote (D-201).** Bare
+  non-human unattested writers never count toward status; their
+  judgments are recordable where authoring verbs admit them and
+  inert in the §11.2 fold; status influence requires attestation.
+  The discriminating drafts below are MINTED as
+  `f11-status-bare-daemon-retract-inert` and
+  `f11-status-bare-daemon-supersede-inert` (both derive `candidate`
+  where the withdrawn session mapping would have derived
+  `retired`/`superseded`), and the reference implementation's
+  `Unimplemented` boundaries are replaced by the ruled semantics.
+- **D5 → alternative (ii), sticky rejection + writer re-proposal
+  (D-202).** `lease-stale` is terminal where issued; convergence
+  rides the re-proposed op; the original op's verdict is knowingly
+  evidence-order-relative. Written into the T5 prose (v0.5.20).
+  Draft C was already committed as `f9-lease-stale-quarantines`;
+  draft D is MINTED as `f9-lease-late-then-timely-receipt-admits`
+  (held timely evidence beats held late evidence).
+
+The analysis below is preserved as written when the decisions were
+open; the reference-implementation touchpoint lists describe the
+PRE-ruling state and no longer match the code.
 
 Both decisions share one hard constraint: the **B.2/B.3 policy
 literals and their pinned hashes never change** (B.2 `workflow-v1`

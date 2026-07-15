@@ -151,7 +151,9 @@ struct HeldTenantOp {
     /// tranche's classes all admit human presence).
     human_evidence: bool,
     /// §11.4 derived actor class; `None` = a bare non-human
-    /// unattested writer, whose class awaits the owner's D2 ruling.
+    /// unattested writer — NO class by the owner's D2 ruling
+    /// (alternative (c)): recorded where authoring verbs admit it,
+    /// counts toward no status rule.
     actor_class: Option<&'static str>,
     /// The signed capability epoch — the §4.3 budget-window anchor.
     cap_epoch: u64,
@@ -2489,13 +2491,12 @@ impl State {
                         return ok(Err(Verdict::Pending("lease-missing", "pending-dependency")));
                     }
                     // A held qualified observation OUTSIDE every
-                    // valid window is staleness ON THE HELD
-                    // EVIDENCE — a later-arriving timely receipt is
-                    // not precluded, and whether it re-opens the
-                    // verdict is the open D5 lifecycle question
-                    // (decisions-pending.md); quarantine-reproposal
-                    // is the disposition precisely because the
-                    // rejection is re-proposable.
+                    // valid window is staleness on the held
+                    // evidence. The owner's D5 ruling (2026-07-14,
+                    // alternative (ii)): the rejection is STICKY —
+                    // terminal where issued; convergence rides the
+                    // writer's re-proposed op, which is exactly the
+                    // quarantine-reproposal disposition.
                     return ok(Err(Verdict::Rejected(
                         "lease-stale",
                         "quarantine-reproposal",
@@ -2873,12 +2874,12 @@ impl State {
     /// §11.4 derived actor class. Human evidence + full judgment
     /// rights = owner; human otherwise = safe-human; an attested
     /// actor = session (shape 2); service kind = service. A BARE
-    /// non-human unattested writer (autonomous daemon/browser) has
-    /// no §11.4 row — the class is `None`: UNSETTLED, awaiting the
-    /// owner's D2 ruling (decisions-pending.md). Mapping it to
-    /// `session` would silently grant status-counting authority the
-    /// B.2 rules reserve for attested sessions; consumers must
-    /// surface the gap, never decide through it.
+    /// non-human unattested writer (autonomous daemon/browser) is
+    /// `None` = NO CLASS by the owner's D2 ruling (2026-07-14,
+    /// alternative (c), decisions-pending.md): its judgments may be
+    /// recorded where authoring verbs admit them but count toward
+    /// NO status rule — an agent wanting status influence gets
+    /// attested (the session path).
     fn actor_class(op: &SignedOp, grant: &HeldGrant) -> Option<&'static str> {
         let h = &op.header;
         let human = h.actor_kind == "human" && h.attested_by.is_none();
@@ -3574,16 +3575,14 @@ impl State {
             _ => return ok(Err(bad())),
         };
 
-        // Verb selection (§11.1 rows).
+        // Verb selection (§11.1 rows). A bare non-human unattested
+        // writer has NO class (the owner's D2 ruling, alternative
+        // (c), 2026-07-14): no judge-verb row ever admits it —
+        // holding a judge verb fails the row invariant like any
+        // other class/evidence miss — while the author-relation
+        // authoring-verb paths below stay open (recorded; inert in
+        // the status fold).
         let human = h.actor_kind == "human" && h.attested_by.is_none();
-        // A bare non-human unattested writer's actor class is
-        // UNSETTLED (D2, decisions-pending.md): whether it may
-        // exercise judge verbs it holds depends on the ruling, so
-        // that path surfaces Unimplemented instead of silently
-        // deciding. Attested writers are sessions (§11.4 shape 2 —
-        // settled: no judge row admits them), and verbs the writer
-        // does not hold reject under every ruling.
-        let bare = h.attested_by.is_none() && h.actor_kind != "human" && h.actor_kind != "service";
         let has = |v: &str| grant.verbs.iter().any(|g| g == v);
         let owner_class = human && has("judge.full");
         let safe_kind = matches!(target_kind.as_str(), "observation" | "episode");
@@ -3604,14 +3603,6 @@ impl State {
                     "judge.full"
                 } else if has("judge.safe") && human && safe_kind {
                     "judge.safe"
-                } else if bare && (has("judge.safe") || has("judge.full")) {
-                    // The writer HOLDS a judge verb; only its
-                    // unsettled class blocks the row (D2).
-                    return Err(Unimplemented(
-                        "bare-writer actor class awaits the owner's D2 ruling \
-                         (decisions-pending.md)"
-                            .into(),
-                    ));
                 } else if has("judge.safe") || has("judge.full") {
                     // The verb exists; a row invariant fails
                     // (evidence / class / kind).
@@ -3627,12 +3618,6 @@ impl State {
                     "propose"
                 } else if author && has("assert") {
                     "assert"
-                } else if bare && has("judge.full") {
-                    return Err(Unimplemented(
-                        "bare-writer actor class awaits the owner's D2 ruling \
-                         (decisions-pending.md)"
-                            .into(),
-                    ));
                 } else if has("judge.full") || has("propose") || has("assert") {
                     return ok(Err(bad()));
                 } else {
@@ -3647,12 +3632,6 @@ impl State {
                     "propose"
                 } else if author && in_workflow && has("assert") {
                     "assert"
-                } else if bare && has("judge.full") {
-                    return Err(Unimplemented(
-                        "bare-writer actor class awaits the owner's D2 ruling \
-                         (decisions-pending.md)"
-                            .into(),
-                    ));
                 } else if has("judge.full") || has("propose") || has("assert") {
                     return ok(Err(bad()));
                 } else {
@@ -3774,15 +3753,11 @@ impl State {
     /// The §11.2 status fold. `as_of` is carried for the temporal
     /// terms (none of the corpus claims carry validity windows yet —
     /// the parameter is threaded, unused). Cycle detection per rule 2
-    /// (a supersession cycle derives `disputed`). A standing judgment
-    /// by a bare non-human unattested writer surfaces `Unimplemented`
-    /// — whether it counts awaits the owner's D2 ruling, and no
-    /// silent class mapping may decide it.
-    pub(crate) fn claim_status(
-        &self,
-        target_hash: &[u8; 32],
-        as_of: u64,
-    ) -> Result<Option<&'static str>, Unimplemented> {
+    /// (a supersession cycle derives `disputed`). A standing
+    /// bare-writer judgment participates like any other admitted
+    /// judgment EXCEPT that its `None` class matches no policy rule
+    /// (the D2 ruling: recorded, never counting).
+    pub(crate) fn claim_status(&self, target_hash: &[u8; 32], as_of: u64) -> Option<&'static str> {
         self.claim_status_inner(target_hash, as_of, &mut Vec::new())
     }
 
@@ -3795,36 +3770,25 @@ impl State {
         target_hash: &[u8; 32],
         as_of: u64,
         visiting: &mut Vec<[u8; 32]>,
-    ) -> Result<Option<&'static str>, Unimplemented> {
-        let Some(target) = self
+    ) -> Option<&'static str> {
+        let target = self
             .held_tenant
             .iter()
-            .find(|r| r.op_hash == *target_hash && r.claim.is_some())
-        else {
-            return Ok(None);
-        };
+            .find(|r| r.op_hash == *target_hash && r.claim.is_some())?;
         if !self.op_standing(target) {
             // A quarantined claim holds no status lane here; the
             // derived verdict already carries its state.
-            return Ok(Some("candidate"));
+            return Some("candidate");
         }
-        let mut judgments: Vec<&HeldTenantOp> = Vec::new();
-        for j in &self.held_tenant {
-            let targets_this = j.judge.as_ref().is_some_and(|jf| jf.target == *target_hash);
-            if !targets_this || !self.op_standing(j) {
-                continue;
-            }
-            if j.actor_class.is_none() {
-                return Err(Unimplemented(
-                    "bare non-human unattested writer's actor class awaits the owner's D2 ruling \
-                     (decisions-pending.md)"
-                        .into(),
-                ));
-            }
-            if self.judgment_counts(j, target) {
-                judgments.push(j);
-            }
-        }
+        let judgments: Vec<&HeldTenantOp> = self
+            .held_tenant
+            .iter()
+            .filter(|j| {
+                j.judge.as_ref().is_some_and(|jf| jf.target == *target_hash)
+                    && self.op_standing(j)
+                    && self.judgment_counts(j, target)
+            })
+            .collect();
         // 1: retract/retire.
         if judgments.iter().any(|j| {
             matches!(
@@ -3832,7 +3796,7 @@ impl State {
                 "retract" | "retire"
             )
         }) {
-            return Ok(Some("retired"));
+            return Some("retired");
         }
         // 2: supersede with an ACCEPTED replacement; cycles dispute.
         for j in &judgments {
@@ -3842,13 +3806,13 @@ impl State {
             }
             let Some(r) = jf.replacement else { continue };
             if visiting.contains(&r) || r == *target_hash {
-                return Ok(Some("disputed"));
+                return Some("disputed");
             }
             visiting.push(*target_hash);
             let r_status = self.claim_status_inner(&r, as_of, visiting);
             visiting.pop();
-            if r_status? == Some("accepted") {
-                return Ok(Some("superseded"));
+            if r_status == Some("accepted") {
+                return Some("superseded");
             }
         }
         // 3: an authorized dispute (ancestor-exempt accepts need
@@ -3857,17 +3821,17 @@ impl State {
             .iter()
             .any(|j| j.judge.as_ref().expect("filtered").verdict == "dispute")
         {
-            return Ok(Some("disputed"));
+            return Some("disputed");
         }
         // 4: accept.
         if judgments
             .iter()
             .any(|j| j.judge.as_ref().expect("filtered").verdict == "accept")
         {
-            return Ok(Some("accepted"));
+            return Some("accepted");
         }
         // 5.
-        Ok(Some("candidate"))
+        Some("candidate")
     }
 
     /// Dispatch one operation.
