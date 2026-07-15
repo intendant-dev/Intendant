@@ -16,7 +16,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
 | `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
-| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, an independent BIP-39 leg, B.2/B.3 transcription). `cargo run --bin harness` is a real gate: nonzero exit on any structural failure, semantic FAIL, or Unimplemented. The full 146-vector corpus is reproduced |
+| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, an independent BIP-39 leg, B.2/B.3 transcription). `cargo run --bin harness` is a real gate: nonzero exit on any structural failure, semantic FAIL, or Unimplemented. The full 157-vector corpus is reproduced; `--bin storage_lane` executes the storage-annotated subset on real files (the delivered per-OS lane) |
 | `gate-a-audit.md` | **The Gate-A discrepancy audit, amended after the repair tranche** (2026-07-14): the differential scoreboard incl. the tranche's findings (a real D-185 engine gap among them), the twelve D-items with per-item status, the conventions, the machine-enforced coverage pointers — and the **FAIL verdict** with the amended twelve-clause predicate |
 | `coverage/` | The **machine-enforced coverage inventory**: `outcomes-map.json` (generated §10.4 outcome → vector map; 22/59 uncovered, pinned shrink-only) and `obligations-13-3.json` (the §13.3 obligation ledger — verbatim quote pins + full line coverage of the section; 14 vectored / 25 partial / 43 pending) |
 | `decisions-pending.md` | The **D2/D5 decision record — both RULED 2026-07-14** (D-201 no-class/no-vote; D-202 sticky + re-proposal): the alternatives, authority consequences, and the drafts the rulings chose from, now minted |
@@ -47,12 +47,21 @@ review record, and the byte-exact baseline outranks path cosmetics.
   v1, the P1 v1 profile RATIFIED, the coverage scope line RATIFIED
   (cheap §10.4 gaps close pre-Gate-A; the ceremony sagas defer to
   Gate B as recorded decisions), and the execution lanes funded.
-  The corpus stands at 146 vectors, every one reproduced by the
+  The corpus stands at 157 vectors, every one reproduced by the
   independent reducer.
-- **Open before any PASS**: the five implement-before-Gate-A
-  mechanisms (P1 profile §C.1), the cheap §10.4 coverage gaps, and
-  the funded execution lanes (Chromium + per-OS storage). No owner
-  decision is outstanding.
+- **Post-ruling execution (2026-07-15)**: all five §C.1
+  implement-before-Gate-A mechanisms are implemented + vectored
+  (erase-manifest admission, compromise-mode T4 with derived-lane
+  retro-disqualification, rotation_refs linkage, D-93/D-143
+  frontier-head validation, the re-fold invariant); the cheap-gap
+  batch closed ten §10.4 outcomes (22 → 12, the rest explicit
+  test-tied Gate-B deferrals); and the **portable-storage execution
+  lane is DELIVERED** — every storage-annotated vector runs on real
+  files with real truncations and a real cross-process lock, on a
+  3-OS advisory CI matrix.
+- **Open before any PASS**: the funded Chromium browser lane
+  (WebCrypto + IndexedDB execution) — the sole remaining item. No
+  owner decision is outstanding.
 - **Durable P1 Memory writes stay prohibited** until Gate B plus the
   umbrella's P0.5/tombed-cutover prerequisites (spec header) —
   independent of Gate A.

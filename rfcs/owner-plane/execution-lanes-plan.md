@@ -74,6 +74,14 @@ committed, keyless, displayless).
 legs green on the full family-13/14 subset, job named
 `portable storage execution (macOS/Linux/Windows)`.
 
+**STATUS: DELIVERED (2026-07-15).** `reducer --bin storage_lane`
+executes all 19 storage-annotated vectors on real files (byte
+round-trips, real `set_len` truncations per crash cut, the lock
+matrix across two real processes on `std` advisory locks), then
+runs the unmodified harness semantics; the advisory workflow
+carries the 3-OS matrix job. Chromium (lane 1) remains the open
+funded lane.
+
 ## Explicitly Gate-B (distinguishable production concerns)
 
 Per the repair-tranche scope ruling these stay OUT of the lanes
